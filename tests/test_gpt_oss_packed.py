@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+import importlib.util
+import subprocess
+import sys
+import unittest
+
+from resin.moe_kernels import MoEKernelConfig
+
+
+class GptOssPackedImportTests(unittest.TestCase):
+    def test_import_is_framework_and_tokenizer_free(self) -> None:
+        script = """
+import sys
+import resin.backends.gpt_oss_packed
+for name in ('torch', 'transformers', 'tokenizers', 'flashinfer', 'triton'):
+    assert name not in sys.modules, name
+"""
+        subprocess.run([sys.executable, "-c", script], check=True)
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
+class GptOssPackedBridgeTests(unittest.TestCase):
+    def test_official_block_layout_is_flattened_and_installed(self) -> None:
+        import torch
+
+        from resin.backends.gpt_oss_packed import (
+            _make_kernel_expert_factory,
+            _PackedExpertCoordinator,
+        )
+
+        config = MoEKernelConfig(
+            architecture="sm90",
+            quantization="mxfp4",
+            activation="swiglu",
+            top_k=2,
+            num_experts=4,
+            hidden_size=32,
+            intermediate_size=32,
+            group_size=32,
+            expert_bias=True,
+            activation_alpha=1.702,
+            activation_limit=7.0,
+        )
+
+        class Kernel:
+            def __init__(self) -> None:
+                self.prepared = []
+
+            def prepare_weights(self, weights, actual_config):
+                self.prepared.append((weights, actual_config))
+                return weights
+
+            def forward(self, hidden, routing, weights, actual_config):
+                del routing, weights, actual_config
+                return hidden
+
+        class Args:
+            num_local_experts = 4
+            hidden_size = 32
+            intermediate_size = 32
+            num_experts_per_tok = 2
+
+        kernel = Kernel()
+        factory = _make_kernel_expert_factory(torch, kernel, config)
+
+        class MLP(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.experts = factory(Args())
+
+        class Layer(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.mlp = MLP()
+
+        class Backbone(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.layers = torch.nn.ModuleList([Layer()])
+
+        class Model(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.model = Backbone()
+
+        model = Model()
+        coordinator = _PackedExpertCoordinator(torch, model, kernel, config)
+        coordinator.begin_layer(0, {"num_hidden_layers": 1})
+        tensors = {
+            "gate_up_proj_blocks": torch.zeros(4, 64, 1, 16, dtype=torch.uint8),
+            "gate_up_proj_scales": torch.zeros(4, 64, 1, dtype=torch.uint8),
+            "gate_up_proj_bias": torch.zeros(4, 64),
+            "down_proj_blocks": torch.zeros(4, 32, 1, 16, dtype=torch.uint8),
+            "down_proj_scales": torch.zeros(4, 32, 1, dtype=torch.uint8),
+            "down_proj_bias": torch.zeros(4, 32),
+        }
+        for name, tensor in tensors.items():
+            coordinator.consume_tensor(0, name, tensor)
+        coordinator.finish_layer(0)
+
+        self.assertEqual(len(kernel.prepared), 1)
+        weights, actual_config = kernel.prepared[0]
+        self.assertIs(actual_config, config)
+        self.assertEqual(weights.gate_up.shape, (4, 64, 16))
+        self.assertEqual(weights.down.shape, (4, 32, 16))
+        self.assertTrue(model.model.layers[0].mlp.experts.is_prepared)
+
+
+if __name__ == "__main__":
+    unittest.main()

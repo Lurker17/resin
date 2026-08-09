@@ -1,0 +1,26 @@
+Resin
+
+The LFM2 PyTorch model implementation in
+src/resin/backends/lfm2_torch.py contains portions adapted from Hugging Face
+Transformers:
+
+  Copyright 2025 The HuggingFace Team
+  https://github.com/huggingface/transformers
+
+Hugging Face Transformers is licensed under the Apache License, Version 2.0.
+
+The GPT-OSS PyTorch model implementation in
+src/resin/backends/gpt_oss.py contains portions adapted from OpenAI gpt-oss and
+Hugging Face Transformers:
+
+  Copyright 2025 OpenAI
+  https://github.com/openai/gpt-oss
+
+  Copyright 2025 The HuggingFace Team
+  https://github.com/huggingface/transformers
+
+OpenAI gpt-oss and Hugging Face Transformers are licensed under the Apache
+License, Version 2.0.
+
+Model weights are not distributed with Resin. Users who download Liquid AI or
+OpenAI checkpoints are responsible for the checkpoints' separate license terms.
