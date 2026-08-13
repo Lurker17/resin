@@ -94,7 +94,7 @@ class GptOssPackedBridgeTests(unittest.TestCase):
             "down_proj_scales": torch.zeros(4, 32, 1, dtype=torch.uint8),
             "down_proj_bias": torch.zeros(4, 32),
         }
-        _install_expert_layer(torch, model, kernel, config, 0, tensors)
+        _install_expert_layer(model, kernel, config, 0, tensors)
 
         self.assertEqual(len(kernel.prepared), 1)
         weights, actual_config = kernel.prepared[0]

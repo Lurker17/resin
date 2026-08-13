@@ -105,7 +105,6 @@ def _make_kernel_expert_factory(torch, kernel, config: MoEKernelConfig):
 
 
 def _install_expert_layer(
-    torch,
     model,
     kernel,
     config: MoEKernelConfig,
@@ -134,8 +133,9 @@ def _install_expert_layer(
     )
     prepared = kernel.prepare_weights(raw, config)
     model.model.layers[layer_index].mlp.experts.install_prepared_weights(prepared)
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # Let PyTorch reuse released raw/padding allocations for the next layer.
+    # Emptying the CUDA cache here forces a sync and fresh allocations once per
+    # layer without making any additional memory available to this process.
 
 
 def load_mxfp4_model(
@@ -180,7 +180,7 @@ def load_mxfp4_model(
         num_hidden_layers=args.num_hidden_layers,
         expert_tensor_names=_EXPERT_CHECKPOINT_NAMES,
         install_expert_layer=lambda layer, tensors: _install_expert_layer(
-            torch, model, kernel, moe_config, layer, dict(tensors)
+            model, kernel, moe_config, layer, dict(tensors)
         ),
     )
 

@@ -20,6 +20,7 @@ from deploy.jit_cache import (
     install_flashinfer_hash_cache,
     run_cache_prewarm,
     run_cache_reuse_probe,
+    run_cached_workload,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -347,16 +348,28 @@ def _new_cuda_runner(
     cache_parent_capacity: int,
     cuda_graph_decode_shapes: tuple[tuple[int, int], ...] = (),
 ):
+    import torch
+
     from resin.models.gpt_oss.cuda import GptOssCudaRunner
     from resin.models.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
 
-    return GptOssCudaRunner(
+    moe_kernel = make_flashinfer_sm90_mxfp4_kernel()
+    print(f"[model-load] Loading model from {model_path}...", flush=True)
+    model_load_start = time.perf_counter()
+    runner = GptOssCudaRunner(
         model_path,
         cache_parent_capacity=cache_parent_capacity,
         device="cuda",
-        moe_kernel=make_flashinfer_sm90_mxfp4_kernel(),
+        moe_kernel=moe_kernel,
         cuda_graph_decode_shapes=cuda_graph_decode_shapes,
     )
+    torch.cuda.synchronize()
+    model_load_elapsed_s = time.perf_counter() - model_load_start
+    print(
+        f"[model-load] Model loaded in {model_load_elapsed_s:.2f} seconds",
+        flush=True,
+    )
+    return runner
 
 
 def _run_prompt(
@@ -421,7 +434,7 @@ def _run_prompt(
             "checkpoint": model_cache,
             "prompt_tokens": len(prompt_ids),
             "max_new_tokens": max_new_tokens,
-            "output_ids": output_ids,
+            "output_tokens": len(output_ids),
             "text": tokenizer.decode(rendered_output_ids, skip_special_tokens=False),
             "content": parsed.content,
             "reasoning_content": parsed.reasoning_content,
@@ -635,13 +648,21 @@ def run_model(
     context_length: int = 32768,
     schedule_conservativeness: float = 1.0,
 ) -> dict[str, object]:
-    return _run_prompt(
-        model_key,
-        prompt,
-        max_new_tokens,
-        context_length,
-        schedule_conservativeness,
-    )
+    def workload() -> dict[str, object]:
+        # Volume v2 does not preserve the nanosecond mtimes Ninja uses to
+        # validate FlashInfer JIT outputs. Install Resin's content-addressed
+        # loader before importing GPU packages so a fresh single-use container
+        # can load the cached shared library directly instead of rebuilding it.
+        install_flashinfer_hash_cache()
+        return _run_prompt(
+            model_key,
+            prompt,
+            max_new_tokens,
+            context_length,
+            schedule_conservativeness,
+        )
+
+    return run_cached_workload(kernel_cache_volume, workload)
 
 
 @app.function(
