@@ -7,11 +7,13 @@ import unittest
 from types import SimpleNamespace
 
 from resin import BatchPhase
-from resin.backends.gpt_oss.cuda import (
+from resin.backend.resources import CachePoolBinding
+from resin.backend.sampling import GreedySampler
+from resin.models.gpt_oss.cuda import (
     GptOssCudaRunner,
     _invoke_fa4_b22,
 )
-from resin.backends.gpt_oss.plan import build_attention_batches
+from resin.models.gpt_oss.plan import build_attention_batches
 
 
 def _group_plan(group_index, rows, first_logical_blocks, positions, indptr):
@@ -114,6 +116,17 @@ def _decode_plan():
 
 
 class GptOssCudaNativePlanTests(unittest.TestCase):
+    @staticmethod
+    def _binding_runner():
+        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
+        runner.cache_layout = object()
+        binding = CachePoolBinding(runner.cache_layout, resource="GPT-OSS KV")
+        runner._kv = SimpleNamespace(
+            bind=binding.bind,
+            check=lambda plan: binding.check(plan.cache_pool_id),
+        )
+        return runner
+
     def test_cuda_graphs_use_the_shared_static_step_lifecycle(self) -> None:
         parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
         source = inspect.getsource(GptOssCudaRunner)
@@ -132,32 +145,25 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         self.assertIn("build_attention_batches", source)
 
     def test_cache_pool_binding_is_exact_idempotent_and_permanent(self) -> None:
-        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        runner.cache_layout = object()
-        runner._cache_pool_id = None
+        runner = self._binding_runner()
 
         self.assertEqual(runner.bind_cache_pool(41, runner.cache_layout), 41)
         self.assertEqual(runner.bind_cache_pool(41, runner.cache_layout), 41)
-        fresh = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        fresh.cache_layout = object()
-        fresh._cache_pool_id = None
-        with self.assertRaisesRegex(ValueError, "frozen cache_layout object"):
+        fresh = self._binding_runner()
+        with self.assertRaisesRegex(ValueError, "frozen layout object"):
             fresh.bind_cache_pool(41, object())
         with self.assertRaisesRegex(ValueError, "different cache pool"):
             runner.bind_cache_pool(42, runner.cache_layout)
         for invalid in (0, -1, True, 1.5):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                fresh = GptOssCudaRunner.__new__(GptOssCudaRunner)
-                fresh.cache_layout = object()
-                fresh._cache_pool_id = None
+                fresh = self._binding_runner()
                 fresh.bind_cache_pool(invalid, fresh.cache_layout)
 
     def test_plan_binding_requires_the_one_bound_pool(self) -> None:
-        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        runner._cache_pool_id = None
+        runner = self._binding_runner()
         with self.assertRaisesRegex(ValueError, "not bound"):
             runner._validate_plan_binding(_prefill_plan())
-        runner._cache_pool_id = 41
+        runner.bind_cache_pool(41, runner.cache_layout)
         runner._validate_plan_binding(_prefill_plan())
         with self.assertRaisesRegex(ValueError, "does not match"):
             runner._validate_plan_binding(_flat_plan([0], [1], cache_pool_id=42))
@@ -288,18 +294,15 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         self.assertNotIn("_sequence_cache", source)
 
     def test_one_zeroed_parent_allocation_backs_both_group_views(self) -> None:
+        from resin.backend.cuda.paged_kv import PagedKvArena
+
         source = inspect.getsource(GptOssCudaRunner.__init__)
-        self.assertEqual(source.count("torch.zeros("), 1)
-        self.assertIn("self.cache_parent_capacity + 1", source)
-        self.assertIn("self._cache_parent_storage = torch.zeros(", source)
-        self.assertIn(
-            "self._window_k_cache = self._history_k_cache",
-            source,
-        )
-        self.assertIn(
-            "self._window_v_cache = self._history_v_cache",
-            source,
-        )
+        arena_source = inspect.getsource(PagedKvArena.__init__)
+        self.assertIn("self._kv = PagedKvArena(", source)
+        self.assertEqual(arena_source.count("torch.zeros("), 1)
+        self.assertIn("self.capacity + 1", arena_source)
+        self.assertIn("self.keys = self.storage[0]", arena_source)
+        self.assertIn("self.values = self.storage[1]", arena_source)
 
 
 class GptOssCudaFa4CallTests(unittest.TestCase):
@@ -349,6 +352,7 @@ class GptOssCudaTinyOracleTests(unittest.TestCase):
 
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
         runner._torch = torch
+        runner._sampler = GreedySampler(torch)
         runner.device = "cpu"
         runner.hidden_size = 3
         runner._model = SimpleNamespace(lm_head=lambda hidden: hidden)

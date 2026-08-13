@@ -6,7 +6,7 @@ History for full attention and Window for sliding attention.  Python derives
 the dense FA4 views from that generic ABI, addresses one shared physical BF16
 allocation, and executes the Resin-owned GPT-OSS module hierarchy.
 
-The eager :mod:`resin.backends.gpt_oss` runner remains the independent
+The eager :mod:`resin.models.gpt_oss` runner remains the independent
 correctness implementation.  In particular, this runner has no request-ID
 cache map and no Python page allocator.
 """
@@ -20,14 +20,20 @@ from typing import TYPE_CHECKING, Any
 
 from resin import BatchPhase, CacheGroupLayout, CacheLayout
 
-from .._common import default_device
-from ..cuda_graphs import (
+from ...backend.checks import positions as check_positions
+from ...backend.checks import positive_int
+from ...backend.checks import token_ids as check_token_ids
+from ...backend.cuda.graphs import (
     CudaGraphCache,
     CudaGraphStep,
     GraphInputError,
     GraphShape,
     graph_shapes,
 )
+from ...backend.cuda.paged_kv import PagedKvArena, PagedKvTable
+from ...backend.cuda.staging import TensorStager
+from ...backend.loading import default_device
+from ...backend.sampling import GreedySampler
 from .plan import (
     PAGE_SIZE,
     PREFILL_CHUNK_SIZE,
@@ -59,12 +65,6 @@ class _PostAcceptCudaError(RuntimeError):
     _resin_post_accept = True
 
 
-def _positive_int(name: str, value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
-
-
 @dataclass(frozen=True, slots=True)
 class _DeviceAttentionBatch:
     """FA4-ready tensors for one native attention batch."""
@@ -76,16 +76,8 @@ class _DeviceAttentionBatch:
     last_token_indices: Any
     cu_seqlens_q: Any
     max_seqlen_q: int
-    full_page_table: Any
-    full_seqused_k: Any
-    full_min_seqlen_k: int
-    full_max_seqlen_k: int
-    sliding_page_table: Any
-    sliding_seqused_k: Any
-    sliding_min_seqlen_k: int
-    sliding_max_seqlen_k: int
-    full_append_slots: Any
-    sliding_append_slots: Any
+    full: PagedKvTable
+    sliding: PagedKvTable
 
 
 def _invoke_fa4_b22(
@@ -156,7 +148,7 @@ class GptOssCudaRunner:
         moe_kernel=None,
         cuda_graph_decode_shapes: object = None,
     ) -> None:
-        self.cache_parent_capacity = _positive_int(
+        self.cache_parent_capacity = positive_int(
             "cache_parent_capacity", cache_parent_capacity
         )
         self.cache_layout = CacheLayout(
@@ -188,6 +180,7 @@ class GptOssCudaRunner:
         from flash_attn.cute import flash_attn_varlen_func
 
         self._torch = torch
+        self._sampler = GreedySampler(torch)
         self._fa4 = flash_attn_varlen_func
         self.device = torch.device(device or default_device(torch, require_cuda=True))
         if self.device.type != "cuda":
@@ -264,28 +257,20 @@ class GptOssCudaRunner:
             raise ValueError(
                 "GPT-OSS History and Window cache groups must have equal byte geometry"
             )
-        parent_shape = (
-            2,
-            len(self._full_layers),
-            self.cache_parent_capacity + 1,
-            _PAGE_SIZE,
-            self.num_kv_heads,
-            self.head_dim,
-        )
         # FA4's SM90 TMA path can load a complete physical page even when
         # ``seqused_k`` masks its unused tail.  Keep unwritten rows finite so a
         # masked PV operation can never encounter uninitialized NaN/Inf data.
-        self._cache_parent_storage = torch.zeros(
-            parent_shape, dtype=torch.bfloat16, device=self.device
+        self._kv = PagedKvArena(
+            torch,
+            self.device,
+            self.cache_layout,
+            layer_count=len(self._full_layers),
+            page_size=_PAGE_SIZE,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            dtype=torch.bfloat16,
+            resource="GPT-OSS KV",
         )
-        self._history_k_cache = self._cache_parent_storage[0]
-        self._history_v_cache = self._cache_parent_storage[1]
-        # Group membership is a native pool invariant. These views deliberately
-        # alias the same parent bytes: a live parent is interpreted as History
-        # or Window, never both.
-        self._window_k_cache = self._history_k_cache
-        self._window_v_cache = self._history_v_cache
-        self._cache_pool_id: int | None = None
 
         for layer in self._model.model.layers:
             if layer.self_attn.sinks.dtype is not torch.bfloat16:
@@ -298,28 +283,10 @@ class GptOssCudaRunner:
     def bind_cache_pool(self, pool_id: int, layout: CacheLayout) -> int:
         """Permanently bind this runner's frozen layout to one native pool."""
 
-        if not isinstance(pool_id, int) or isinstance(pool_id, bool) or pool_id <= 0:
-            raise ValueError("cache pool id must be a positive integer")
-        if layout is not self.cache_layout:
-            raise ValueError(
-                "cache pool binding must use this runner's frozen cache_layout object"
-            )
-        if self._cache_pool_id is not None and self._cache_pool_id != pool_id:
-            raise ValueError(
-                "this GPT-OSS parent allocation is already bound to a different "
-                "cache pool"
-            )
-        self._cache_pool_id = pool_id
-        return pool_id
+        return self._kv.bind(pool_id, layout)
 
     def _validate_plan_binding(self, plan: BatchPlan) -> None:
-        if self._cache_pool_id is None:
-            raise ValueError("GPT-OSS cache pool is not bound")
-        if plan.cache_pool_id != self._cache_pool_id:
-            raise ValueError(
-                f"BatchPlan cache pool id {plan.cache_pool_id!r} does not match "
-                f"the bound cache pool {self._cache_pool_id!r}"
-            )
+        self._kv.check(plan)
 
     def _synchronize_failed_eager_forward(self) -> None:
         """Make a launched eager failure quiescent or mark it post-accept."""
@@ -336,40 +303,57 @@ class GptOssCudaRunner:
                 "quarantined"
             ) from synchronization_error
 
-    def _tensorize(self, batch: AttentionBatch) -> _DeviceAttentionBatch:
+    def _tensorize(
+        self, batch: AttentionBatch, staging: TensorStager, prefix: str
+    ) -> _DeviceAttentionBatch:
         torch = self._torch
 
-        def int32(values):
-            return torch.tensor(values, dtype=torch.int32, device=self.device)
-
-        def indices(values):
-            return torch.tensor(values, dtype=torch.long, device=self.device)
+        def device(name, values, dtype):
+            return staging.device(f"{prefix}.{name}", values, dtype)
 
         cu_seqlens_q = [0]
         for length in batch.query_lengths:
             cu_seqlens_q.append(cu_seqlens_q[-1] + length)
         last_token_indices = tuple(end - 1 for end in cu_seqlens_q[1:])
         row_count = len(batch.sequence_indices)
+
+        def table(name, values, width, lengths, append_slots):
+            return PagedKvTable(
+                page_table=device(f"{name}.pages", values, torch.int32).view(
+                    row_count, width
+                ),
+                lengths=device(f"{name}.lengths", lengths, torch.int32),
+                append_slots=device(f"{name}.append", append_slots, torch.long),
+                min_length=min(lengths),
+                max_length=max(lengths),
+            )
+
         return _DeviceAttentionBatch(
             phase=batch.phase,
             round_index=0,
-            token_indices=indices(batch.token_indices),
-            sequence_indices=indices(batch.sequence_indices),
-            last_token_indices=indices(last_token_indices),
-            cu_seqlens_q=int32(cu_seqlens_q),
-            max_seqlen_q=max(batch.query_lengths),
-            full_page_table=int32(batch.full_table).view(row_count, batch.full_width),
-            full_seqused_k=int32(batch.full_lengths),
-            full_min_seqlen_k=min(batch.full_lengths),
-            full_max_seqlen_k=max(batch.full_lengths),
-            sliding_page_table=int32(batch.sliding_table).view(
-                row_count, batch.sliding_width
+            token_indices=device("token_indices", batch.token_indices, torch.long),
+            sequence_indices=device(
+                "sequence_indices", batch.sequence_indices, torch.long
             ),
-            sliding_seqused_k=int32(batch.sliding_lengths),
-            sliding_min_seqlen_k=min(batch.sliding_lengths),
-            sliding_max_seqlen_k=max(batch.sliding_lengths),
-            full_append_slots=indices(batch.full_append_slots),
-            sliding_append_slots=indices(batch.sliding_append_slots),
+            last_token_indices=device(
+                "last_token_indices", last_token_indices, torch.long
+            ),
+            cu_seqlens_q=device("cu_seqlens_q", cu_seqlens_q, torch.int32),
+            max_seqlen_q=max(batch.query_lengths),
+            full=table(
+                "full",
+                batch.full_table,
+                batch.full_width,
+                batch.full_lengths,
+                batch.full_append_slots,
+            ),
+            sliding=table(
+                "sliding",
+                batch.sliding_table,
+                batch.sliding_width,
+                batch.sliding_lengths,
+                batch.sliding_append_slots,
+            ),
         )
 
     def _apply_yarn_rotary(self, hidden, cos, sin):
@@ -414,28 +398,18 @@ class GptOssCudaRunner:
         sliding = layer_type == "sliding_attention"
         if sliding:
             slot = self._sliding_layer_slots[layer_index]
-            key_cache = self._window_k_cache[slot]
-            value_cache = self._window_v_cache[slot]
-            append_slots = batch.sliding_append_slots
-            page_table = batch.sliding_page_table
-            seqused_k = batch.sliding_seqused_k
-            min_seqlen_k = batch.sliding_min_seqlen_k
-            max_seqlen_k = batch.sliding_max_seqlen_k
+            group = batch.sliding
         else:
             slot = self._full_layer_slots[layer_index]
-            key_cache = self._history_k_cache[slot]
-            value_cache = self._history_v_cache[slot]
-            append_slots = batch.full_append_slots
-            page_table = batch.full_page_table
-            seqused_k = batch.full_seqused_k
-            min_seqlen_k = batch.full_min_seqlen_k
-            max_seqlen_k = batch.full_max_seqlen_k
+            group = batch.full
+        key_cache = self._kv.keys[slot]
+        value_cache = self._kv.values[slot]
 
         key_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
-            0, append_slots, key
+            0, group.append_slots, key
         )
         value_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
-            0, append_slots, value
+            0, group.append_slots, value
         )
         output = _invoke_fa4_b22(
             self._fa4,
@@ -444,10 +418,10 @@ class GptOssCudaRunner:
             value_cache,
             cu_seqlens_q=batch.cu_seqlens_q,
             max_seqlen_q=batch.max_seqlen_q,
-            page_table=page_table,
-            seqused_k=seqused_k,
-            min_seqlen_k=min_seqlen_k,
-            max_seqlen_k=max_seqlen_k,
+            page_table=group.page_table,
+            seqused_k=group.lengths,
+            min_seqlen_k=group.min_length,
+            max_seqlen_k=group.max_length,
             softmax_scale=self.softmax_scale,
             learnable_sink=attention.sinks,
             sliding=sliding,
@@ -516,16 +490,20 @@ class GptOssCudaRunner:
                 batch_size + 1, dtype=torch.int32, device=self.device
             ),
             max_seqlen_q=1,
-            full_page_table=empty(torch.int32, batch_size, full_width),
-            full_seqused_k=empty(torch.int32, batch_size),
-            full_min_seqlen_k=1,
-            full_max_seqlen_k=full_width * _PAGE_SIZE,
-            sliding_page_table=empty(torch.int32, batch_size, _WINDOW_TABLE_WIDTH),
-            sliding_seqused_k=empty(torch.int32, batch_size),
-            sliding_min_seqlen_k=1,
-            sliding_max_seqlen_k=_WINDOW_TABLE_WIDTH * _PAGE_SIZE,
-            full_append_slots=empty(torch.long, batch_size),
-            sliding_append_slots=empty(torch.long, batch_size),
+            full=PagedKvTable(
+                empty(torch.int32, batch_size, full_width),
+                empty(torch.int32, batch_size),
+                empty(torch.long, batch_size),
+                1,
+                full_width * _PAGE_SIZE,
+            ),
+            sliding=PagedKvTable(
+                empty(torch.int32, batch_size, _WINDOW_TABLE_WIDTH),
+                empty(torch.int32, batch_size),
+                empty(torch.long, batch_size),
+                1,
+                _WINDOW_TABLE_WIDTH * _PAGE_SIZE,
+            ),
         )
         token_ids = empty(torch.long, batch_size)
         positions = empty(torch.long, batch_size)
@@ -536,7 +514,7 @@ class GptOssCudaRunner:
             hidden = self._forward_batch(token_ids, positions, batch)
             final_hidden.index_copy_(0, batch.sequence_indices, hidden)
             logits = self._model.lm_head(final_hidden)
-            torch.argmax(logits, dim=-1, out=output_ids)
+            self._sampler(logits, out=output_ids)
 
         return CudaGraphStep(
             inputs={
@@ -544,12 +522,12 @@ class GptOssCudaRunner:
                 "positions": positions,
                 "token_indices": batch.token_indices,
                 "sequence_indices": batch.sequence_indices,
-                "full_page_table": batch.full_page_table,
-                "full_seqused_k": batch.full_seqused_k,
-                "sliding_page_table": batch.sliding_page_table,
-                "sliding_seqused_k": batch.sliding_seqused_k,
-                "full_append_slots": batch.full_append_slots,
-                "sliding_append_slots": batch.sliding_append_slots,
+                "full_page_table": batch.full.page_table,
+                "full_seqused_k": batch.full.lengths,
+                "sliding_page_table": batch.sliding.page_table,
+                "sliding_seqused_k": batch.sliding.lengths,
+                "full_append_slots": batch.full.append_slots,
+                "sliding_append_slots": batch.sliding.append_slots,
             },
             output=output_ids,
             launch=launch,
@@ -590,13 +568,8 @@ class GptOssCudaRunner:
     def forward(self, plan: BatchPlan) -> list[int]:
         self._graphs.check()
         self._validate_plan_binding(plan)
-        if any(token_id >= self.vocab_size for token_id in plan.token_ids):
-            raise ValueError("token id is out of range")
-        if any(
-            position >= self._model.args.max_position_embeddings
-            for position in plan.positions
-        ):
-            raise ValueError("position exceeds max_position_embeddings")
+        check_token_ids(plan.token_ids, self.vocab_size)
+        check_positions(plan.positions, self._model.args.max_position_embeddings)
 
         prefill_batches, decode_batch = build_attention_batches(
             plan, parent_capacity=self.cache_parent_capacity
@@ -618,8 +591,9 @@ class GptOssCudaRunner:
                 return graph_output
 
         torch = self._torch
-        token_ids = torch.tensor(plan.token_ids, dtype=torch.long, device=self.device)
-        positions = torch.tensor(plan.positions, dtype=torch.long, device=self.device)
+        staging = TensorStager(torch, self.device)
+        token_ids = staging.device("token_ids", plan.token_ids, torch.long)
+        positions = staging.device("positions", plan.positions, torch.long)
         final_hidden = torch.empty(
             len(plan.sequence_ids),
             self.hidden_size,
@@ -628,17 +602,17 @@ class GptOssCudaRunner:
         )
         try:
             with torch.inference_mode():
-                for host_batch in prefill_batches:
-                    batch = self._tensorize(host_batch)
+                for index, host_batch in enumerate(prefill_batches):
+                    batch = self._tensorize(host_batch, staging, f"prefill.{index}")
                     last_hidden = self._forward_batch(token_ids, positions, batch)
                     final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
                 if decode_batch is not None:
-                    batch = self._tensorize(decode_batch)
+                    batch = self._tensorize(decode_batch, staging, "decode")
                     last_hidden = self._forward_batch(token_ids, positions, batch)
                     final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
                 logits = self._model.lm_head(final_hidden)
 
-            return logits.argmax(dim=-1).tolist()
+            return self._sampler(logits).tolist()
         except BaseException:
             self._synchronize_failed_eager_forward()
             raise

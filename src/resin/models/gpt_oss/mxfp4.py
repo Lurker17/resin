@@ -19,7 +19,7 @@ from resin.moe_kernels import (
     MoERouting,
 )
 
-from .._common import resolve_dtype
+from ...backend.loading import resolve_dtype
 from .weights import load_gpt_oss_weights
 
 _CHECKPOINT_TO_STANDARD = {

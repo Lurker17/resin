@@ -1,12 +1,12 @@
-"""Small framework-neutral helpers shared by model backends."""
+"""Lazy, framework-neutral model loading helpers."""
 
 from __future__ import annotations
 
 import glob
 import json
-from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 MODEL_FILES = ("config.json", "model*.safetensors", "model.safetensors.index.json")
 
@@ -78,33 +78,3 @@ def load_safetensor_shards(model_path: Path, *, device, backend: str) -> dict[st
             raise ValueError(f"duplicate tensors across weight shards: {duplicates}")
         weights.update(shard)
     return weights
-
-
-@dataclass(frozen=True, slots=True)
-class PlanRow:
-    request_id: int
-    token_ids: list[int]
-    positions: list[int]
-    cache: Any
-
-
-def plan_rows(plan, caches: dict[int, Any], vocab_size: int) -> list[PlanRow]:
-    """Validate and split one native plan into request-local rows."""
-
-    rows = []
-    for index, request_id in enumerate(plan.sequence_ids):
-        start, end = plan.sequence_indptr[index : index + 2]
-        cache = caches.get(request_id)
-        offset = 0 if cache is None else cache.length
-        positions = plan.positions[start:end]
-        expected = list(range(offset, offset + end - start))
-        if positions != expected:
-            raise ValueError(
-                f"non-contiguous positions for request {request_id}: "
-                f"expected {expected}, got {positions}"
-            )
-        token_ids = plan.token_ids[start:end]
-        if any(token_id >= vocab_size for token_id in token_ids):
-            raise ValueError(f"token id is out of range for request {request_id}")
-        rows.append(PlanRow(request_id, token_ids, positions, cache))
-    return rows

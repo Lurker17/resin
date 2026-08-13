@@ -5,16 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .._common import (
+from ...backend.loading import (
     MODEL_FILES,
     default_device,
     load_safetensor_shards,
-    plan_rows,
     read_config,
     require_torch,
     resolve_dtype,
     resolve_model,
 )
+from ...backend.plans import plan_rows
 from .config import Lfm2Config
 from .model import Lfm2ForCausalLM, Lfm2State
 

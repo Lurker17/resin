@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from resin.backends.cuda_graphs import (
+from resin.backend.cuda.graphs import (
     CudaGraphCache,
     CudaGraphStep,
     GraphInputError,
@@ -37,7 +37,8 @@ class _Tensor:
         self.shape = shape
         return self
 
-    def copy_(self, source):
+    def copy_(self, source, *, non_blocking=False):
+        del non_blocking
         if self.copy_error is not None:
             raise self.copy_error
         self.values[:] = source.values
@@ -99,8 +100,9 @@ class _Torch:
     def inference_mode(self):
         return _Context()
 
-    def as_tensor(self, values, *, dtype, device):
+    def tensor(self, values, *, dtype, device, pin_memory=False):
         assert device == "cpu"
+        assert pin_memory
         return _Tensor(values, dtype=dtype)
 
     @staticmethod

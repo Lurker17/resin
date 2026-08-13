@@ -48,6 +48,10 @@ uv run ruff format src/resin/_resin.pyi
 The control-plane tests do not require a GPU. Accelerator runners import their
 dependencies lazily.
 
+Install `resin[torch]` for reference models or `resin[cuda]` for the CUDA
+runners. Reusable device-neutral helpers live in `resin.backend`; CUDA helpers
+are explicit imports from `resin.backend.cuda`.
+
 ## Developing
 
 The Modal harnesses are launched from the repository root. Install the
@@ -119,7 +123,7 @@ FlashInfer/FA4 packages are still required remotely.
 
 ```python
 from resin import Engine
-from resin.backends.lfm2.reference import Lfm2TorchRunner
+from resin.models.lfm2.reference import Lfm2TorchRunner
 
 runner = Lfm2TorchRunner()
 
@@ -209,7 +213,7 @@ StateMappingConfig
 mint_state_mapping_arena_id
 ```
 
-Concrete runners are explicit imports from `resin.backends` modules.
+Concrete runners are explicit imports from `resin.models` modules.
 
 ## Checks
 
@@ -233,7 +237,8 @@ unavailable accelerator libraries.
 - `crates/resin-core/src/scheduler.rs` — cohort selection and queue-age policy
 - `crates/resin-core/src/planning.rs` — typed token-range planning
 - `crates/resin-core/src/resources/` — KV, recurrent, allocator, and lease logic
-- `src/resin/backends/` — model definitions, loaders, and runners
+- `src/resin/backend/` — reusable execution and resource gadgets
+- `src/resin/models/` — concrete model definitions, loaders, and runners
 - `deploy/` — optional remote validation harnesses
 - `tests/` — native and runner-contract coverage
 

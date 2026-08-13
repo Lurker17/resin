@@ -165,7 +165,9 @@ intentionally makes no new GPU correctness or performance claim for the path.
 
 ## What is not in the boundary
 
-Resin does not standardize a tensor library, attention backend, compiler cache,
-CUDA graph policy, model checkpoint format, tokenizer, or sampling algorithm.
-Those can evolve independently as long as the runner honors the frozen plan,
-binding acknowledgements, dense output contract, and completion lifetime.
+Resin does not standardize a tensor library, attention backend, model checkpoint
+format, tokenizer, or sampling policy. `resin.backend.cuda` offers optional
+reusable graph, staging, and completion machinery, but graph shapes and use
+remain runner policy. These choices can evolve independently as long as the
+runner honors the frozen plan, binding acknowledgements, dense output contract,
+and completion lifetime.

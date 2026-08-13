@@ -346,8 +346,8 @@ def _new_cuda_runner(
     cache_parent_capacity: int,
     cuda_graph_decode_shapes: tuple[tuple[int, int], ...] = (),
 ):
-    from resin.backends.gpt_oss.cuda import GptOssCudaRunner
-    from resin.backends.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
+    from resin.models.gpt_oss.cuda import GptOssCudaRunner
+    from resin.models.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
 
     return GptOssCudaRunner(
         model_path,

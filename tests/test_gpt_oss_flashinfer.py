@@ -218,7 +218,7 @@ def _weights(torch, config=None):
 
 class FlashInferMXFP4AdapterTests(unittest.TestCase):
     def _kernel(self, *, capability=(9, 0)):
-        from resin.backends.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
+        from resin.models.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
 
         torch = _FakeTorch(capability)
         fused_moe = _FakeFusedMoE()
@@ -231,7 +231,7 @@ class FlashInferMXFP4AdapterTests(unittest.TestCase):
     def test_import_and_factory_are_accelerator_lazy(self) -> None:
         code = """
 import sys
-from resin.backends.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
+from resin.models.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
 make_flashinfer_sm90_mxfp4_kernel()
 for name in ('torch', 'flashinfer', 'triton'):
     assert name not in sys.modules, name

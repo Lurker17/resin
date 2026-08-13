@@ -276,6 +276,13 @@ Tokenization, chat formatting, detokenization, and text streaming remain outside
 Resin. A completed token buffer is transferred to the caller's `RequestLease`;
 the Engine does not retain completed outputs indefinitely.
 
+Reusable runner building blocks live under `resin.backend`. The device-neutral
+package provides plan, binding, and sampling helpers. `resin.backend.cuda`
+provides injected-framework CUDA graphs, asynchronous completion, tensor
+staging, paged KV, and mapped recurrent-state storage. Concrete architectures
+and their runners live separately under `resin.models`. None of these package
+imports loads PyTorch, FlashInfer, or FlashAttention.
+
 ## Code map
 
 - `src/lib.rs` — Python API, lifecycle, and transactional orchestration
@@ -285,4 +292,5 @@ the Engine does not retain completed outputs indefinitely.
 - `src/cache.rs` — layout and plan descriptors
 - `src/cache_pool.rs` — flat allocation, ownership, and access leases
 - `src/state_pool.rs` — state ownership, access, and physical mappings
-- `src/resin/backends/` — model definitions, loaders, and runners
+- `src/resin/backend/` — reusable execution and resource gadgets
+- `src/resin/models/` — concrete model definitions, loaders, and runners

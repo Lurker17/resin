@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
 
+from .staging import StagingError, TensorStager
+
 GraphShape = tuple[int, ...]
 
 
@@ -56,6 +58,7 @@ class CudaGraphStep:
 class _GraphEntry:
     shape: GraphShape
     step: CudaGraphStep | None = None
+    staging: TensorStager | None = None
     graph: Any = None
     captures: int = 0
     replays: int = 0
@@ -122,11 +125,12 @@ class CudaGraphCache:
             entry.step = self._build(shape)
         assert entry.step is not None
         try:
-            self._stage(entry.step, inputs)
-        except GraphInputError:
+            entry.staging = TensorStager(self.torch, self.device)
+            entry.staging.copy_into(entry.step.inputs, inputs)
+        except StagingError as error:
             if fresh:
                 entry.step = None
-            raise
+            raise GraphInputError(str(error)) from error
         except BaseException as error:
             self._fail("graph input copy", error)
             raise
@@ -150,26 +154,6 @@ class CudaGraphCache:
             raise
         entry.replays += 1
         return result
-
-    def _stage(self, step: CudaGraphStep, values: Mapping[str, object]) -> None:
-        if step.inputs.keys() != values.keys():
-            missing = step.inputs.keys() - values.keys()
-            extra = values.keys() - step.inputs.keys()
-            raise GraphInputError(
-                f"CUDA graph inputs do not match buffers (missing={sorted(missing)}, "
-                f"extra={sorted(extra)})"
-            )
-        staged = []
-        try:
-            for name, target in step.inputs.items():
-                source = self.torch.as_tensor(
-                    values[name], dtype=target.dtype, device="cpu"
-                ).view(target.shape)
-                staged.append((target, source))
-        except Exception as error:
-            raise GraphInputError("inputs do not fit CUDA graph buffers") from error
-        for target, source in staged:
-            target.copy_(source)
 
     def _capture(self, entry: _GraphEntry, allocation_before: int) -> None:
         torch, step = self.torch, entry.step
@@ -227,12 +211,3 @@ class CudaGraphCache:
             "poisoned": self._poison is not None,
             "poison_error": self._poison,
         }
-
-
-__all__ = [
-    "CudaGraphCache",
-    "CudaGraphStep",
-    "GraphInputError",
-    "GraphShape",
-    "graph_shapes",
-]

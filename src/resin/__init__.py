@@ -1,7 +1,7 @@
 """Resin's Rust control plane.
 
 Importing this module intentionally does not import an accelerator framework.
-Choose a runner from :mod:`resin.backends` only when constructing an engine.
+Choose a runner from :mod:`resin.models` only when constructing an engine.
 """
 
 from ._resin import (

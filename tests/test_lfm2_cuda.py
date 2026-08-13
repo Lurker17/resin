@@ -10,6 +10,11 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 from resin import BatchPhase
+from resin.backend.cuda.execution import CudaExecutor
+from resin.backend.cuda.mapped_state import MappedStateArena
+from resin.backend.cuda.paged_kv import PagedKvArena
+from resin.backend.resources import CachePoolBinding
+from resin.backend.sampling import GreedySampler
 
 
 class _FakeTensor:
@@ -285,20 +290,17 @@ class _RecordingDecode:
 
 class Lfm2CudaImportTests(unittest.TestCase):
     def test_physical_cache_slab_reserves_zero_as_the_null_page(self) -> None:
-        from resin.backends.lfm2.cuda import _cache_slab_shape
+        source = inspect.getsource(PagedKvArena.__init__)
 
-        slab = _cache_slab_shape(6, 256, 16, 8, 64)
-        self.assertEqual(slab, (6, 257, 16, 8, 64))
-        self.assertEqual(len(slab), 5)
-        self.assertEqual(len(slab[1:]), 4)
+        self.assertIn("self.capacity + 1", source)
+        self.assertIn("self.keys = self.storage[0]", source)
+        self.assertIn("self.values = self.storage[1]", source)
 
     def test_physical_cache_slab_zeroes_null_page_and_unwritten_tails(self) -> None:
-        from resin.backends.lfm2.cuda import Lfm2CudaRunner
+        from resin.models.lfm2.cuda import Lfm2CudaRunner
 
         constructor = inspect.getsource(Lfm2CudaRunner.__init__)
-        self.assertIn("self._k_cache = torch.zeros(", constructor)
-        self.assertIn("self._v_cache = torch.zeros_like(self._k_cache)", constructor)
-        self.assertNotIn("self._k_cache = torch.empty(", constructor)
+        self.assertIn("self._kv = PagedKvArena(", constructor)
         self.assertIn("self.cache_layout = CacheLayout(", constructor)
         self.assertIs(Lfm2CudaRunner.supports_continuation_prefill, True)
         self.assertIs(Lfm2CudaRunner.supports_recurrent_state_mapping, True)
@@ -326,15 +328,13 @@ class Lfm2CudaImportTests(unittest.TestCase):
 class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
     @staticmethod
     def _runner():
-        from resin.backends.lfm2.cuda import Lfm2CudaRunner
+        from resin.models.lfm2.cuda import Lfm2CudaRunner
 
         runner = Lfm2CudaRunner.__new__(Lfm2CudaRunner)
         runner._torch = _FakeTorch()
         runner._flashinfer = _LifetimeResource("flashinfer", runner._torch.log)
         runner._fa4 = _LifetimeResource("fa4", runner._torch.log)
         runner._model = _LifetimeResource("model", runner._torch.log)
-        runner._k_cache = _LifetimeResource("k_cache", runner._torch.log)
-        runner._v_cache = _LifetimeResource("v_cache", runner._torch.log)
         runner._decode_workspace = _LifetimeResource(
             "decode_workspace", runner._torch.log
         )
@@ -342,28 +342,43 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         runner.page_size = 16
         runner.max_pages = 8
         runner.cache_layout = object()
-        runner._cache_pool_id = None
+        runner._kv = PagedKvArena.__new__(PagedKvArena)
+        runner._kv.capacity = runner.max_pages
+        runner._kv.page_size = runner.page_size
+        runner._kv.binding = CachePoolBinding(runner.cache_layout, resource="LFM2 KV")
+        runner._kv.storage = _LifetimeResource("kv_storage", runner._torch.log)
+        runner._kv.keys = _LifetimeResource("k_cache", runner._torch.log)
+        runner._kv.values = _LifetimeResource("v_cache", runner._torch.log)
         runner._conv_layers = [0, 2, 4, 5]
         runner._conv_slot = {
             layer: slot for slot, layer in enumerate(runner._conv_layers)
         }
         runner.hidden_size = 8
         runner.conv_cache_length = 3
-        runner._state_mapping_binding = None
-        runner._state_mapping_arena_id = None
-        runner._conv_state_slab = None
-        runner._conv_state_generations = None
-        runner._conv_state_owners = None
         runner._decode = _RecordingDecode()
         runner.num_query_heads = 4
         runner.num_kv_heads = 2
         runner.head_dim = 64
         runner.scale = 0.125
         runner._stream = _FakeStream(runner._torch.log)
-        runner._completion_owner = object()
-        runner._inflight = None
+        runner._state = MappedStateArena(
+            runner._torch,
+            runner.device,
+            runner._stream,
+            protocol="lfm2.conv_state.v1",
+            layer_indices=runner._conv_layers,
+            row_shape=(runner.hidden_size, runner.conv_cache_length - 1),
+            dtype=runner._torch.bfloat16,
+            label="LFM2 recurrent state",
+        )
+        runner._sampler = GreedySampler(runner._torch)
+        runner._executor = CudaExecutor(
+            runner._torch,
+            runner.device,
+            runner._stream,
+            resources=runner._completion_resources,
+        )
         runner.vocab_size = 128
-        runner.forward_calls = 0
         return runner
 
     @staticmethod
@@ -418,7 +433,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
 
     def test_combined_binding_requires_the_exact_layout(self) -> None:
         runner = self._runner()
-        with self.assertRaisesRegex(ValueError, "frozen cache_layout object"):
+        with self.assertRaisesRegex(ValueError, "frozen layout object"):
             runner.bind_cache_and_recurrent_state(
                 41,
                 object(),
@@ -427,8 +442,8 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                 "lfm2.conv_state.v1",
                 None,
             )
-        self.assertIsNone(runner._cache_pool_id)
-        self.assertIsNone(runner._state_mapping_binding)
+        self.assertIsNone(runner._kv.binding.pool_id)
+        self.assertIsNone(runner._state.binding)
 
     def test_combined_binding_is_atomic_exact_and_idempotent(self) -> None:
         runner = self._runner()
@@ -438,9 +453,9 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         self.assertEqual(first[:4], (41, 53, 7, "lfm2.conv_state.v1"))
         self.assertGreater(first[-1], 0)
         self.assertEqual(second, first)
-        self.assertEqual(runner._cache_pool_id, 41)
-        self.assertEqual(runner._state_mapping_binding, (53, 7, "lfm2.conv_state.v1"))
-        self.assertEqual(runner._conv_state_slab.shape, (4, 7, 8, 2))
+        self.assertEqual(runner._kv.binding.pool_id, 41)
+        self.assertEqual(runner._state.binding, (53, 7, "lfm2.conv_state.v1"))
+        self.assertEqual(runner._state.slab.shape, (4, 7, 8, 2))
 
         with self.assertRaisesRegex(ValueError, "different cache pool"):
             runner.bind_cache_and_recurrent_state(
@@ -451,7 +466,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                 "lfm2.conv_state.v1",
                 None,
             )
-        with self.assertRaisesRegex(ValueError, "different recurrent-state"):
+        with self.assertRaisesRegex(ValueError, "different mapped-state"):
             runner.bind_cache_and_recurrent_state(
                 41,
                 runner.cache_layout,
@@ -462,9 +477,9 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             )
 
     def test_combined_binding_reuses_the_exact_registered_arena_object(self) -> None:
-        from resin.backends.lfm2.cuda import _RECURRENT_STATE_ARENAS
+        from resin.backend.cuda.mapped_state import _MAPPED_STATE_ARENAS
 
-        _RECURRENT_STATE_ARENAS.clear()
+        _MAPPED_STATE_ARENAS.clear()
         try:
             first = self._runner()
             with patch(
@@ -499,12 +514,12 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             mint.assert_not_called()
             self.assertEqual(first_ack[-1], 1234)
             self.assertEqual(second_ack[-1], 1234)
-            self.assertIs(second._conv_state_slab, first._conv_state_slab)
+            self.assertIs(second._state.slab, first._state.slab)
             self.assertIs(
-                second._conv_state_generations,
-                first._conv_state_generations,
+                second._state.generations,
+                first._state.generations,
             )
-            self.assertIs(second._conv_state_owners, first._conv_state_owners)
+            self.assertIs(second._state.owners, first._state.owners)
             self.assertFalse(
                 any(entry[0] == "zeros" for entry in second._torch.log),
                 "reusing an arena must not allocate replacement bytes",
@@ -512,6 +527,10 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
 
             incompatible = self._runner()
             incompatible.hidden_size += 1
+            incompatible._state.row_shape = (
+                incompatible.hidden_size,
+                incompatible.conv_cache_length - 1,
+            )
             with self.assertRaisesRegex(ValueError, "incompatible"):
                 incompatible.bind_cache_and_recurrent_state(
                     43,
@@ -521,10 +540,10 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                     "lfm2.conv_state.v1",
                     1234,
                 )
-            self.assertIsNone(incompatible._cache_pool_id)
-            self.assertIsNone(incompatible._state_mapping_binding)
+            self.assertIsNone(incompatible._kv.binding.pool_id)
+            self.assertIsNone(incompatible._state.binding)
         finally:
-            _RECURRENT_STATE_ARENAS.clear()
+            _MAPPED_STATE_ARENAS.clear()
 
     def test_combined_binding_allocation_failure_publishes_neither_identity(
         self,
@@ -551,12 +570,12 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                     None,
                 )
 
-        self.assertIsNone(runner._cache_pool_id)
-        self.assertIsNone(runner._state_mapping_binding)
-        self.assertIsNone(runner._state_mapping_arena_id)
-        self.assertIsNone(runner._conv_state_slab)
-        self.assertIsNone(runner._conv_state_generations)
-        self.assertIsNone(runner._conv_state_owners)
+        self.assertIsNone(runner._kv.binding.pool_id)
+        self.assertIsNone(runner._state.binding)
+        self.assertIsNone(runner._state.arena_id)
+        self.assertIsNone(runner._state.slab)
+        self.assertIsNone(runner._state.generations)
+        self.assertIsNone(runner._state.owners)
 
     def test_engine_combined_binding_rejects_unregistered_prebound_native_arena(
         self,
@@ -591,6 +610,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
 
         runner = self._runner()
         runner.cache_layout = CacheLayout(8, [CacheGroupLayout(16)])
+        runner._kv.binding.layout = runner.cache_layout
         with patch(
             "resin.mint_state_mapping_arena_id",
             side_effect=AssertionError("prebound native arena must not be reminted"),
@@ -600,8 +620,8 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                 Engine(runner, state_pool=pool)
 
         mint.assert_not_called()
-        self.assertIsNone(runner._cache_pool_id)
-        self.assertIsNone(runner._state_mapping_arena_id)
+        self.assertIsNone(runner._kv.binding.pool_id)
+        self.assertIsNone(runner._state.arena_id)
         self.assertEqual(pool.physical_mapping, ("lfm2.conv_state.v1", arena_id))
 
     def test_runner_only_tensorizes_frozen_rust_kernel_metadata(self) -> None:
@@ -683,7 +703,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         self.assertEqual(metadata["append_positions"].values, (18,))
 
     def test_explicit_continuation_rows_use_only_rust_post_append_pages(self) -> None:
-        from resin.backends.lfm2.plan import build_cache_metadata
+        from resin.models.lfm2.plan import build_cache_metadata
 
         plan = self._plan(
             block_indptr=[0, 1, 3, 6],
@@ -771,7 +791,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             self.assertEqual(metadata["_pinned"][name].device, "cpu")
 
     def test_continuation_rejects_stale_preappend_block_table(self) -> None:
-        from resin.backends.lfm2.plan import build_cache_metadata
+        from resin.models.lfm2.plan import build_cache_metadata
 
         plan = self._plan(
             block_indptr=[0, 1],
@@ -791,7 +811,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             build_cache_metadata(plan, 16)
 
     def test_one_token_prefill_is_not_inferred_to_be_decode(self) -> None:
-        from resin.backends.lfm2.plan import build_cache_metadata
+        from resin.models.lfm2.plan import build_cache_metadata
 
         plan = self._plan(
             block_indptr=[0, 1, 2],
@@ -815,7 +835,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         self.assertEqual(metadata.continuation_seqused_k, (9, 9))
 
     def test_runner_has_no_logical_page_or_length_mirror(self) -> None:
-        from resin.backends.lfm2.cuda import Lfm2CudaRunner
+        from resin.models.lfm2.cuda import Lfm2CudaRunner
 
         source = inspect.getsource(Lfm2CudaRunner)
         self.assertNotIn("_request_pages", source)
@@ -823,7 +843,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         self.assertNotIn("_free_pages", source)
         metadata_source = inspect.getsource(Lfm2CudaRunner._metadata)
         self.assertIn("_preflight_cache", metadata_source)
-        from resin.backends.lfm2.plan import build_cache_metadata
+        from resin.models.lfm2.plan import build_cache_metadata
 
         adapter_source = inspect.getsource(build_cache_metadata)
         self.assertIn("plan.phase", adapter_source)
@@ -850,10 +870,10 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
         self.assertEqual(first[:4], (41, 53, 7, "lfm2.conv_state.v1"))
         self.assertGreater(first[-1], 0)
         self.assertEqual(second, first)
-        self.assertEqual(runner._conv_state_slab.shape, (4, 7, 8, 2))
-        self.assertEqual(runner._conv_state_slab.dtype, "bfloat16")
-        self.assertEqual(runner._conv_state_generations, [None] * 7)
-        self.assertEqual(runner._conv_state_owners, [None] * 7)
+        self.assertEqual(runner._state.slab.shape, (4, 7, 8, 2))
+        self.assertEqual(runner._state.slab.dtype, "bfloat16")
+        self.assertEqual(runner._state.generations, [None] * 7)
+        self.assertEqual(runner._state.owners, [None] * 7)
         enter = runner._torch.log.index(("stream.enter", runner._stream))
         allocation = runner._torch.log.index(
             ("zeros", (4, 7, 8, 2), "bfloat16", "cuda:fake")
@@ -862,7 +882,7 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
         self.assertLess(enter, allocation)
         self.assertLess(allocation, exit_index)
 
-        with self.assertRaisesRegex(ValueError, "different recurrent-state"):
+        with self.assertRaisesRegex(ValueError, "different mapped-state"):
             runner.bind_cache_and_recurrent_state(
                 41,
                 runner.cache_layout,
@@ -871,7 +891,7 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
                 "lfm2.conv_state.v1",
                 None,
             )
-        with self.assertRaisesRegex(ValueError, "different recurrent-state"):
+        with self.assertRaisesRegex(ValueError, "different mapped-state"):
             runner.bind_cache_and_recurrent_state(
                 41,
                 runner.cache_layout,
@@ -907,7 +927,7 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
                             None,
                         )
                 mint.assert_not_called()
-                self.assertIsNone(runner._conv_state_slab)
+                self.assertIsNone(runner._state.slab)
 
     def test_preflight_guards_reject_before_start_event_acceptance(self) -> None:
         cases = (
@@ -919,7 +939,7 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
             ({"state_slots": [0, 4]}, "outside capacity"),
             (
                 {"state_slots": [0, 0], "state_generations": [1, 1]},
-                "duplicate recurrent-state",
+                "duplicate mapped-state",
             ),
             (
                 {"state_slots": [0, 0], "state_generations": [1, 2]},
@@ -932,8 +952,8 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
                 plan = Lfm2CudaCachePoolBoundaryTests._plan(**overrides)
                 with self.assertRaisesRegex(ValueError, message):
                     runner.dispatch(plan)
-                self.assertIsNone(runner._inflight)
-                self.assertEqual(runner.forward_calls, 0)
+                self.assertIsNone(runner._executor.inflight)
+                self.assertEqual(runner._executor.dispatch_count, 0)
                 self.assertFalse(runner._torch.cuda.events)
                 self.assertFalse(
                     any(entry[0] == "slab.zero" for entry in runner._torch.log)
@@ -943,38 +963,36 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
         runner = self._bound_runner()
         initial = Lfm2CudaCachePoolBoundaryTests._plan()
 
-        rows = runner._preflight_recurrent_state(initial)
+        rows = runner._state.rows(initial)
         with runner._torch.cuda.stream(runner._stream):
-            runner._prepare_recurrent_state(rows)
+            runner._state.prepare_rows(rows)
         self.assertEqual(
-            runner._conv_state_slab.zeroed, [(slice(None), 0), (slice(None), 1)]
+            runner._state.slab.zeroed, [(slice(None), 0), (slice(None), 1)]
         )
-        self.assertEqual(runner._conv_state_generations[:2], [1, 1])
-        self.assertEqual(runner._conv_state_owners[:2], [(71, 10), (71, 11)])
+        self.assertEqual(runner._state.generations[:2], [1, 1])
+        self.assertEqual(runner._state.owners[:2], [(71, 10), (71, 11)])
 
         same_owner_continuation = Lfm2CudaCachePoolBoundaryTests._plan(
             context_lengths=[2, 17],
             positions=[2, 3, 17],
         )
-        same_rows = runner._preflight_recurrent_state(same_owner_continuation)
+        same_rows = runner._state.rows(same_owner_continuation)
         with runner._torch.cuda.stream(runner._stream):
-            runner._prepare_recurrent_state(same_rows)
-        self.assertEqual(len(runner._conv_state_slab.zeroed), 2)
+            runner._state.prepare_rows(same_rows)
+        self.assertEqual(len(runner._state.slab.zeroed), 2)
 
         next_generation = Lfm2CudaCachePoolBoundaryTests._plan(state_generations=[2, 1])
         with runner._torch.cuda.stream(runner._stream):
-            runner._prepare_recurrent_state(
-                runner._preflight_recurrent_state(next_generation)
-            )
-        self.assertEqual(len(runner._conv_state_slab.zeroed), 3)
-        self.assertEqual(runner._conv_state_generations[0], 2)
-        self.assertEqual(runner._conv_state_owners[0], (71, 10))
+            runner._state.prepare_rows(runner._state.rows(next_generation))
+        self.assertEqual(len(runner._state.slab.zeroed), 3)
+        self.assertEqual(runner._state.generations[0], 2)
+        self.assertEqual(runner._state.owners[0], (71, 10))
 
         stale = Lfm2CudaCachePoolBoundaryTests._plan(state_generations=[1, 1])
         with self.assertRaisesRegex(ValueError, "stale"):
             runner.dispatch(stale)
         self.assertFalse(runner._torch.cuda.events)
-        self.assertEqual(len(runner._conv_state_slab.zeroed), 3)
+        self.assertEqual(len(runner._state.slab.zeroed), 3)
 
         substitutions = (
             ({"sequence_ids": [99, 11], "state_generations": [2, 1]}, "request"),
@@ -986,7 +1004,7 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     runner.dispatch(plan)
                 self.assertFalse(runner._torch.cuda.events)
-                self.assertEqual(len(runner._conv_state_slab.zeroed), 3)
+                self.assertEqual(len(runner._state.slab.zeroed), 3)
 
     def test_short_conv_assignment_updates_fixed_layer_slot_view_in_place(self) -> None:
         runner = self._bound_runner()
@@ -1017,32 +1035,14 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
         self.assertEqual(output.values, (4, 5))
         self.assertIs(observations[0][0], observations[0][1])
         self.assertEqual(
-            runner._conv_state_slab.copies,
+            runner._state.slab.copies,
             [((1, 3), replacement)],
         )
         self.assertIn(observations[0][0], ephemeral)
         self.assertNotIn(replacement, ephemeral)
 
-    def test_release_does_not_clear_slab_generation_or_owner(self) -> None:
-        runner = self._bound_runner()
-        plan = Lfm2CudaCachePoolBoundaryTests._plan()
-        with runner._torch.cuda.stream(runner._stream):
-            runner._prepare_recurrent_state(runner._preflight_recurrent_state(plan))
-        slab = runner._conv_state_slab
-        generations = list(runner._conv_state_generations)
-        owners = list(runner._conv_state_owners)
-        zero_count = len(slab.zeroed)
-
-        runner.release([10, 11])
-
-        self.assertIs(runner._conv_state_slab, slab)
-        self.assertEqual(runner._conv_state_generations, generations)
-        self.assertEqual(runner._conv_state_owners, owners)
-        self.assertEqual(len(slab.zeroed), zero_count)
-        self.assertEqual(runner.live_cache_count, 0)
-
     def test_source_has_no_request_keyed_convolution_cache(self) -> None:
-        from resin.backends.lfm2.cuda import Lfm2CudaRunner
+        from resin.models.lfm2.cuda import Lfm2CudaRunner
 
         source = inspect.getsource(Lfm2CudaRunner)
         self.assertNotIn("_conv_cache", source)
@@ -1051,7 +1051,7 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
 
 class Lfm2CudaFa4ContinuationTests(unittest.TestCase):
     def test_exact_b22_paged_surface(self) -> None:
-        from resin.backends.lfm2.cuda import _invoke_paged_fa4_b22
+        from resin.models.lfm2.cuda import _invoke_paged_fa4_b22
 
         calls = []
 
@@ -1097,7 +1097,7 @@ class Lfm2CudaFa4ContinuationTests(unittest.TestCase):
         self.assertFalse(kwargs["return_lse"])
 
     def test_bottom_right_causal_paged_call_matches_dense_suffix_oracle(self) -> None:
-        from resin.backends.lfm2.cuda import _invoke_paged_fa4_b22
+        from resin.models.lfm2.cuda import _invoke_paged_fa4_b22
 
         query = [[0.5, -0.25], [0.1, 0.8], [-0.4, 0.3]]
         key_cache = [
@@ -1234,14 +1234,14 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
 
         completion = runner.dispatch(plan)
 
-        self.assertIs(runner._inflight, completion)
+        self.assertIs(runner._executor.inflight, completion)
         self.assertIs(completion._plan, plan)
-        self.assertIsNotNone(completion._staging)
-        self.assertTrue(completion._ephemeral)
+        self.assertIsNotNone(completion.staging)
+        self.assertTrue(completion.ephemeral)
         for resource in (
-            runner._conv_state_slab,
-            runner._conv_state_generations,
-            runner._conv_state_owners,
+            runner._state.slab,
+            runner._state.generations,
+            runner._state.owners,
         ):
             self.assertTrue(
                 any(candidate is resource for candidate in completion._resources)
@@ -1249,17 +1249,17 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         self.assertIs(completion._start_event.recorded_stream, runner._stream)
         self.assertIs(completion._done_event.recorded_stream, runner._stream)
         self.assertIsNone(runner.poll(completion))
-        self.assertIs(runner._inflight, completion)
+        self.assertIs(runner._executor.inflight, completion)
         self.assertNotIn(("tolist",), runner._torch.log)
 
         completion._done_event.ready = True
         self.assertEqual(runner.poll(completion), [17, 23])
-        self.assertIsNone(runner._inflight)
+        self.assertIsNone(runner._executor.inflight)
         self.assertTrue(completion._retired)
         self.assertIsNone(completion._plan)
         self.assertIsNone(completion._resources)
-        self.assertIsNone(completion._staging)
-        self.assertIsNone(completion._ephemeral)
+        self.assertIsNone(completion.staging)
+        self.assertIsNone(completion.ephemeral)
         self.assertNotIn(("event.synchronize",), runner._torch.log)
         self.assertNotIn(("stream.synchronize",), runner._torch.log)
         with self.assertRaisesRegex(ValueError, "stale"):
@@ -1286,25 +1286,25 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         other, _ = self._runner_and_plan()
         with self.assertRaisesRegex(ValueError, "different"):
             other.poll(completion)
-        self.assertIs(runner._inflight, completion)
+        self.assertIs(runner._executor.inflight, completion)
 
     def test_poll_extraction_failure_preserves_all_lifetimes_for_retry(self) -> None:
         runner, plan = self._runner_and_plan()
         completion = runner.dispatch(plan)
-        staging = completion._staging
-        ephemeral = completion._ephemeral
+        staging = completion.staging
+        ephemeral = completion.ephemeral
         completion._done_event.ready = True
         completion._output_host.tolist_error = RuntimeError("host extraction failed")
 
         with self.assertRaisesRegex(RuntimeError, "host extraction failed"):
             runner.poll(completion)
-        self.assertIs(runner._inflight, completion)
-        self.assertIs(completion._staging, staging)
-        self.assertIs(completion._ephemeral, ephemeral)
+        self.assertIs(runner._executor.inflight, completion)
+        self.assertIs(completion.staging, staging)
+        self.assertIs(completion.ephemeral, ephemeral)
         self.assertFalse(completion._terminal)
 
         self.assertEqual(runner.poll(completion), [17, 23])
-        self.assertIsNone(runner._inflight)
+        self.assertIsNone(runner._executor.inflight)
 
     def test_start_event_failure_is_preacceptance_but_done_failure_is_not(self) -> None:
         runner, plan = self._runner_and_plan()
@@ -1312,8 +1312,8 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "start rejected"):
             runner.dispatch(plan)
-        self.assertIsNone(runner._inflight)
-        self.assertEqual(runner.forward_calls, 0)
+        self.assertIsNone(runner._executor.inflight)
+        self.assertEqual(runner._executor.dispatch_count, 0)
 
         runner._torch.cuda.event_record_errors = [
             None,
@@ -1323,8 +1323,8 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         self.assertFalse(completion._done_recorded)
         with self.assertRaisesRegex(RuntimeError, "after acceptance"):
             runner.poll(completion)
-        self.assertIs(runner._inflight, completion)
-        self.assertIsNotNone(completion._staging)
+        self.assertIs(runner._executor.inflight, completion)
+        self.assertIsNotNone(completion.staging)
 
     def test_post_acceptance_launch_error_is_deferred_to_poll_and_quarantined(
         self,
@@ -1336,18 +1336,18 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
 
         runner._run_model = fail_after_acceptance
         completion = runner.dispatch(plan)
-        staging = completion._staging
-        ephemeral = completion._ephemeral
-        self.assertIs(runner._inflight, completion)
+        staging = completion.staging
+        ephemeral = completion.ephemeral
+        self.assertIs(runner._executor.inflight, completion)
         self.assertTrue(completion._done_recorded)
         self.assertIsNone(runner.poll(completion))
 
         completion._done_event.ready = True
         with self.assertRaisesRegex(RuntimeError, "after acceptance"):
             runner.poll(completion)
-        self.assertIs(runner._inflight, completion)
-        self.assertIs(completion._staging, staging)
-        self.assertIs(completion._ephemeral, ephemeral)
+        self.assertIs(runner._executor.inflight, completion)
+        self.assertIs(completion.staging, staging)
+        self.assertIs(completion.ephemeral, ephemeral)
         self.assertFalse(completion._terminal)
 
     def test_all_list_staging_and_copies_are_pinned_and_nonblocking(self) -> None:
@@ -1396,8 +1396,8 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "does not match"):
             runner.dispatch(plan)
-        self.assertIsNone(runner._inflight)
-        self.assertEqual(runner.forward_calls, 0)
+        self.assertIsNone(runner._executor.inflight)
+        self.assertEqual(runner._executor.dispatch_count, 0)
 
     def test_completion_cannot_be_retired_while_pending(self) -> None:
         runner, plan = self._runner_and_plan()
@@ -1405,23 +1405,22 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "pending"):
             completion._retire()
-        self.assertIs(runner._inflight, completion)
+        self.assertIs(runner._executor.inflight, completion)
 
     def test_abandoned_ready_completion_outlives_runner_and_queries_before_release(
         self,
     ) -> None:
         runner, plan = self._runner_and_plan()
-        tracked_names = (
-            "_flashinfer",
-            "_fa4",
-            "_model",
-            "_k_cache",
-            "_v_cache",
-            "_decode_workspace",
-            "_decode",
-            "_conv_state_slab",
-        )
-        tracked = {name: weakref.ref(getattr(runner, name)) for name in tracked_names}
+        tracked = {
+            "flashinfer": weakref.ref(runner._flashinfer),
+            "fa4": weakref.ref(runner._fa4),
+            "model": weakref.ref(runner._model),
+            "k_cache": weakref.ref(runner._kv.keys),
+            "v_cache": weakref.ref(runner._kv.values),
+            "decode_workspace": weakref.ref(runner._decode_workspace),
+            "decode": weakref.ref(runner._decode),
+            "state_slab": weakref.ref(runner._state.slab),
+        }
         log = runner._torch.log
         runner_ref = weakref.ref(runner)
 
@@ -1429,8 +1428,7 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         completion._done_event.ready = True
         captured = completion._resources
         self.assertTrue(all(reference() in captured for reference in tracked.values()))
-        runner.release([plan.sequence_ids[0]])
-        self.assertIsNotNone(tracked["_conv_state_slab"]())
+        self.assertIsNotNone(tracked["state_slab"]())
 
         del captured
         del runner
@@ -1451,12 +1449,12 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
             all(
                 reference() is None
                 for name, reference in tracked.items()
-                if name != "_conv_state_slab"
+                if name != "state_slab"
             )
         )
         # The native arena registry intentionally outlives runner/completion
         # objects so its physical identity and owner tombstones remain reusable.
-        self.assertIsNotNone(tracked["_conv_state_slab"]())
+        self.assertIsNotNone(tracked["state_slab"]())
         self.assertNotIn(("event.synchronize",), log)
 
     def test_abandonment_queries_ready_stream_when_terminal_event_was_not_recorded(
@@ -1481,9 +1479,9 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         self.assertNotIn(("event.synchronize",), log)
 
     def test_abandonment_timeout_quarantines_every_lifetime(self) -> None:
-        from resin.backends.lfm2.cuda import _CUDA_COMPLETION_QUARANTINE
+        from resin.backend.cuda.execution import CUDA_COMPLETION_QUARANTINE
 
-        baseline = len(_CUDA_COMPLETION_QUARANTINE)
+        baseline = len(CUDA_COMPLETION_QUARANTINE)
         runner, plan = self._runner_and_plan()
         resource = runner._model
         resource_ref = weakref.ref(resource)
@@ -1499,29 +1497,29 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
 
         self.assertGreaterEqual(log.count(("event.query", False)), 2)
         self.assertNotIn(("event.synchronize",), log)
-        self.assertEqual(len(_CUDA_COMPLETION_QUARANTINE), baseline + 1)
+        self.assertEqual(len(CUDA_COMPLETION_QUARANTINE), baseline + 1)
         self.assertIsNotNone(resource_ref())
         self.assertNotIn(("resource.del", "model"), log)
-        payload = _CUDA_COMPLETION_QUARANTINE[-1]
-        self.assertIs(payload[7], done_event)
-        self.assertIn(resource_ref(), payload[1])
-        self.assertIsInstance(payload[9], TimeoutError)
+        payload = CUDA_COMPLETION_QUARANTINE[-1]
+        self.assertIs(payload["_done_event"], done_event)
+        self.assertIn(resource_ref(), payload["_resources"])
+        self.assertIsInstance(payload["wait_error"], TimeoutError)
 
         # Test-only cleanup after the fake event can prove completion.
         done_event.ready = True
         self.assertTrue(done_event.query())
-        del _CUDA_COMPLETION_QUARANTINE[baseline:]
+        del CUDA_COMPLETION_QUARANTINE[baseline:]
         del payload
         del done_event
         gc.collect()
         self.assertIsNone(resource_ref())
 
     def test_abandonment_query_error_quarantines_without_retrying(self) -> None:
-        from resin.backends.lfm2.cuda import _CUDA_COMPLETION_QUARANTINE
+        from resin.backend.cuda.execution import CUDA_COMPLETION_QUARANTINE
 
-        baseline = len(_CUDA_COMPLETION_QUARANTINE)
+        baseline = len(CUDA_COMPLETION_QUARANTINE)
         runner, plan = self._runner_and_plan()
-        resource_ref = weakref.ref(runner._k_cache)
+        resource_ref = weakref.ref(runner._kv.keys)
         log = runner._torch.log
 
         completion = runner.dispatch(plan)
@@ -1534,14 +1532,14 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
 
         self.assertEqual(log.count(("event.query", False)), 1)
         self.assertNotIn(("event.synchronize",), log)
-        self.assertEqual(len(_CUDA_COMPLETION_QUARANTINE), baseline + 1)
-        payload = _CUDA_COMPLETION_QUARANTINE[-1]
-        self.assertIsInstance(payload[9], RuntimeError)
+        self.assertEqual(len(CUDA_COMPLETION_QUARANTINE), baseline + 1)
+        payload = CUDA_COMPLETION_QUARANTINE[-1]
+        self.assertIsInstance(payload["wait_error"], RuntimeError)
         self.assertIsNotNone(resource_ref())
 
         done_event.ready = True
         self.assertTrue(done_event.query())
-        del _CUDA_COMPLETION_QUARANTINE[baseline:]
+        del CUDA_COMPLETION_QUARANTINE[baseline:]
         del payload
         del done_event
         gc.collect()
@@ -1550,39 +1548,47 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
 
 class Lfm2CudaAsyncStaticBoundaryTests(unittest.TestCase):
     def test_abandonment_is_bounded_and_query_only(self) -> None:
-        from resin.backends.lfm2.cuda import _Lfm2CudaCompletion
+        from resin.backend.cuda.execution import CudaCompletion
 
-        source = inspect.getsource(_Lfm2CudaCompletion._abandon)
+        source = inspect.getsource(CudaCompletion._abandon)
         self.assertIn("fence.query()", source)
         self.assertIn("deadline", source)
         self.assertIn("_quarantine_lifetimes", source)
         self.assertNotIn(".synchronize(", source)
 
     def test_poll_queries_without_synchronizing(self) -> None:
-        from resin.backends.lfm2.cuda import Lfm2CudaRunner
+        from resin.backend.cuda.execution import CudaExecutor
 
-        source = inspect.getsource(Lfm2CudaRunner.poll)
+        source = inspect.getsource(CudaExecutor.poll)
         self.assertIn(".query()", source)
         self.assertNotIn("synchronize", source)
 
     def test_dispatch_uses_private_stream_and_nonblocking_copies(self) -> None:
-        from resin.backends.lfm2.cuda import Lfm2CudaRunner
+        from resin.backend.cuda.execution import CudaExecutor
+        from resin.models.lfm2.cuda import Lfm2CudaRunner
 
-        source = inspect.getsource(Lfm2CudaRunner.dispatch)
-        self.assertIn("torch.cuda.stream(self._stream)", source)
-        self.assertIn("done_event.record(self._stream)", source)
+        source = inspect.getsource(CudaExecutor.dispatch)
+        self.assertIn("torch.cuda.stream(self.stream)", source)
+        self.assertIn("completion._done_event.record(self.stream)", source)
+        self.assertIn(
+            "self._executor.dispatch", inspect.getsource(Lfm2CudaRunner.dispatch)
+        )
         self.assertNotIn("torch.cuda.synchronize", inspect.getsource(Lfm2CudaRunner))
         self.assertNotIn("current_stream", inspect.getsource(Lfm2CudaRunner))
 
     def test_metadata_stages_decode_plan_on_pinned_cpu(self) -> None:
-        from resin.backends.lfm2.cuda import Lfm2CudaRunner
+        from resin.backend.cuda.execution import CudaExecutor
+        from resin.backend.cuda.staging import TensorStager
+        from resin.models.lfm2.cuda import Lfm2CudaRunner
 
         metadata_source = inspect.getsource(Lfm2CudaRunner._metadata)
-        poll_source = inspect.getsource(Lfm2CudaRunner.poll)
+        staging_source = inspect.getsource(TensorStager)
+        poll_source = inspect.getsource(CudaExecutor.poll)
         dispatch_source = inspect.getsource(Lfm2CudaRunner.dispatch)
-        self.assertIn('device="cpu"', metadata_source)
-        self.assertIn("pin_memory=True", metadata_source)
-        self.assertIn("non_blocking=True", metadata_source)
+        self.assertIn("TensorStager", metadata_source)
+        self.assertIn('device="cpu"', staging_source)
+        self.assertIn("pin_memory=True", staging_source)
+        self.assertIn("non_blocking=True", staging_source)
         self.assertNotIn(".tolist()", dispatch_source)
         self.assertIn(".tolist()", poll_source)
 

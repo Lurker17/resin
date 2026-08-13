@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, Self
 
-from .._common import resolve_dtype
+from ...backend.loading import resolve_dtype
 
 _EXPERT_KEY = re.compile(
     r"^model\.layers\.(?P<layer>[0-9]+)\.mlp\.experts\.(?P<name>.+)$"

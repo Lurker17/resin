@@ -6,7 +6,7 @@ the current code path, not historical benchmark results.
 
 ## Reference runner
 
-`resin.backends.gpt_oss.reference.GptOssRunner` is the readable PyTorch path. It owns
+`resin.models.gpt_oss.reference.GptOssRunner` is the readable PyTorch path. It owns
 per-request model cache in Python and implements synchronous `forward(plan)`.
 Equal-length rows execute as a physical batch; unsupported heterogeneous shapes
 fail rather than silently running serially under a batched label.
@@ -16,7 +16,7 @@ small correctness work. It does not exercise Resin's managed cache pool.
 
 ## CUDA runner
 
-`resin.backends.gpt_oss.cuda.GptOssCudaRunner` is the managed path. Its relevant
+`resin.models.gpt_oss.cuda.GptOssCudaRunner` is the managed path. Its relevant
 constructor surface is:
 
 ```python

@@ -1,7 +1,7 @@
 Resin
 
 The LFM2 PyTorch model implementation in
-src/resin/backends/lfm2_torch.py contains portions adapted from Hugging Face
+src/resin/models/lfm2_torch.py contains portions adapted from Hugging Face
 Transformers:
 
   Copyright 2025 The HuggingFace Team
@@ -10,7 +10,7 @@ Transformers:
 Hugging Face Transformers is licensed under the Apache License, Version 2.0.
 
 The GPT-OSS PyTorch model implementation in
-src/resin/backends/gpt_oss.py contains portions adapted from OpenAI gpt-oss and
+src/resin/models/gpt_oss.py contains portions adapted from OpenAI gpt-oss and
 Hugging Face Transformers:
 
   Copyright 2025 OpenAI

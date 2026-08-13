@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 def _tiny_args():
-    from resin.backends.gpt_oss.config import GptOssConfig
+    from resin.models.gpt_oss.config import GptOssConfig
 
     return GptOssConfig(
         vocab_size=43,
@@ -75,14 +75,14 @@ class GptOssImportTests(unittest.TestCase):
     def test_import_is_framework_and_tokenizer_free(self) -> None:
         script = """
 import sys
-import resin.backends.gpt_oss
+import resin.models.gpt_oss
 for name in ('torch', 'transformers', 'tokenizers', 'huggingface_hub', 'safetensors'):
     assert name not in sys.modules, name
 """
         subprocess.run([sys.executable, "-c", script], check=True)
 
     def test_configs_cover_both_released_model_shapes(self) -> None:
-        from resin.backends.gpt_oss.config import GptOssConfig
+        from resin.models.gpt_oss.config import GptOssConfig
 
         base = {
             "model_type": "gpt_oss",
@@ -125,7 +125,7 @@ for name in ('torch', 'transformers', 'tokenizers', 'huggingface_hub', 'safetens
             self.assertEqual(args.head_dim, 64)
 
     def test_args_reject_non_gpt_oss_checkpoint(self) -> None:
-        from resin.backends.gpt_oss.config import GptOssConfig
+        from resin.models.gpt_oss.config import GptOssConfig
 
         with self.assertRaisesRegex(ValueError, "expected a GPT-OSS"):
             GptOssConfig.from_dict({"model_type": "llama"})
@@ -136,7 +136,7 @@ class GptOssTorchTests(unittest.TestCase):
     def setUp(self) -> None:
         import torch
 
-        from resin.backends.gpt_oss.model import GptOssForCausalLM
+        from resin.models.gpt_oss.model import GptOssForCausalLM
 
         torch.manual_seed(11)
         self.torch = torch
@@ -200,7 +200,7 @@ class GptOssTorchTests(unittest.TestCase):
         )
 
     def test_expert_kernel_boundary_receives_all_routing_metadata(self) -> None:
-        from resin.backends.gpt_oss.model import GptOssForCausalLM
+        from resin.models.gpt_oss.model import GptOssForCausalLM
 
         torch = self.torch
         calls = []
@@ -301,7 +301,7 @@ class GptOssTorchTests(unittest.TestCase):
 
     def test_runner_consumes_rust_batch_plan_and_releases_caches(self) -> None:
         from resin import BatchPhase, BatchPlan
-        from resin.backends.gpt_oss.reference import GptOssRunner
+        from resin.models.gpt_oss.reference import GptOssRunner
 
         runner = GptOssRunner.__new__(GptOssRunner)
         runner.device = self.torch.device("cpu")
@@ -352,7 +352,7 @@ class GptOssTorchTests(unittest.TestCase):
 
     def test_runner_chunked_prefill_matches_single_chunk_and_cache_state(self) -> None:
         from resin import BatchPhase, BatchPlan
-        from resin.backends.gpt_oss.reference import GptOssRunner
+        from resin.models.gpt_oss.reference import GptOssRunner
 
         def make_runner(chunk_size):
             runner = GptOssRunner.__new__(GptOssRunner)
@@ -411,7 +411,7 @@ class GptOssTorchTests(unittest.TestCase):
 
     def test_runner_executes_one_model_call_per_plan(self) -> None:
         from resin import BatchPhase, BatchPlan
-        from resin.backends.gpt_oss.reference import GptOssRunner
+        from resin.models.gpt_oss.reference import GptOssRunner
 
         runner = GptOssRunner.__new__(GptOssRunner)
         runner.device = self.torch.device("cpu")
@@ -460,7 +460,7 @@ class GptOssTorchTests(unittest.TestCase):
 
     def test_runner_rejects_heterogeneous_plan_instead_of_serializing(self) -> None:
         from resin import BatchPlan
-        from resin.backends.gpt_oss.reference import GptOssRunner
+        from resin.models.gpt_oss.reference import GptOssRunner
 
         runner = GptOssRunner.__new__(GptOssRunner)
         runner.device = self.torch.device("cpu")
@@ -483,7 +483,7 @@ class GptOssTorchTests(unittest.TestCase):
         self.assertEqual(len(runner._cache), 0)
 
     def test_mxfp4_checkpoint_has_precise_kernel_boundary_error(self) -> None:
-        from resin.backends.gpt_oss.reference import load_model
+        from resin.models.gpt_oss.reference import load_model
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
@@ -501,7 +501,7 @@ class GptOssTorchTests(unittest.TestCase):
     def test_direct_dense_safetensors_loading_without_transformers(self) -> None:
         from safetensors.torch import save_file
 
-        from resin.backends.gpt_oss.reference import load_model
+        from resin.models.gpt_oss.reference import load_model
 
         tokens = self.torch.tensor([[1, 2, 3]])
         with self.torch.inference_mode():
