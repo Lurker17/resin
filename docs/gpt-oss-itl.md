@@ -81,12 +81,14 @@ The managed runner keeps policy boundaries narrow:
 - The model's MXFP4 expert path may use the configured FlashInfer fused-MoE
   adapter.
 - Greedy sampling remains runner-owned.
-- Configured decode shapes capture once and replay on later matching batches.
+- Configured decode shapes use Resin's reusable CUDA graph cache: the backend
+  declares stable tensors and one device launch, then the shared cache stages,
+  warms, captures, validates, and replays it automatically.
 
-CUDA graphs are strictly a runner-local execution optimization. A graph stages
-the current Rust-built decode plan into stable buffers; it does not plan a batch
-ahead, reserve future pages or recurrent state, or enable overlap scheduling.
-Prefill and unconfigured decode shapes use the eager path.
+CUDA graphs are strictly a current-batch execution optimization. The common
+graph layer stages the current Rust-built decode plan into stable buffers; it
+does not plan a batch ahead, reserve future pages or recurrent state, or enable
+overlap scheduling. Prefill and unconfigured decode shapes use the eager path.
 
 The runner implements synchronous `forward(plan)`. It materializes the dense
 token-ID result before returning; CUDA failures establish device

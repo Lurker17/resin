@@ -114,10 +114,14 @@ def _decode_plan():
 
 
 class GptOssCudaNativePlanTests(unittest.TestCase):
-    def test_cuda_graphs_are_an_explicit_decode_capability(self) -> None:
+    def test_cuda_graphs_use_the_shared_static_step_lifecycle(self) -> None:
         parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
+        source = inspect.getsource(GptOssCudaRunner)
         self.assertIn("cuda_graph_decode_shapes", parameters)
         self.assertTrue(hasattr(GptOssCudaRunner, "cuda_graph_stats"))
+        self.assertIn("CudaGraphCache(", source)
+        self.assertNotIn("CUDAGraph", source)
+        self.assertNotIn(".replay()", source)
 
     def test_runner_exposes_only_the_flat_grouped_cache_path(self) -> None:
         source = inspect.getsource(GptOssCudaRunner)
@@ -338,26 +342,25 @@ class GptOssCudaFa4CallTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
 class GptOssCudaTinyOracleTests(unittest.TestCase):
-    def test_graph_body_restores_rust_sequence_order_before_sampling(self) -> None:
+    def test_static_decode_step_restores_rust_sequence_order_before_sampling(
+        self,
+    ) -> None:
         import torch
 
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
         runner._torch = torch
+        runner.device = "cpu"
+        runner.hidden_size = 3
         runner._model = SimpleNamespace(lm_head=lambda hidden: hidden)
         runner._forward_batch = lambda *_args: torch.tensor(
-            [[0.0, 5.0, 1.0], [4.0, 0.0, 1.0]]
+            [[0.0, 5.0, 1.0], [4.0, 0.0, 1.0]], dtype=torch.bfloat16
         )
-        state = SimpleNamespace(
-            token_ids=torch.empty(2, dtype=torch.long),
-            positions=torch.empty(2, dtype=torch.long),
-            batch=SimpleNamespace(sequence_indices=torch.tensor([1, 0])),
-            final_hidden=torch.empty(2, 3),
-            output_ids=torch.empty(2, dtype=torch.long),
-        )
+        step = runner._new_decode_graph_step((2, 1))
+        step.inputs["sequence_indices"].copy_(torch.tensor([1, 0]))
 
-        runner._graph_body(state)
+        step.launch()
 
-        self.assertEqual(state.output_ids.tolist(), [0, 1])
+        self.assertEqual(step.output.tolist(), [0, 1])
 
     def test_rotary_path_matches_reference_formula_without_dtype_promotion(
         self,

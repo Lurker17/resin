@@ -21,7 +21,13 @@ from typing import TYPE_CHECKING, Any
 from resin import BatchPhase, CacheGroupLayout, CacheLayout
 
 from .._common import default_device
-from .graphs import DecodeGraphs, GraphInputError, GraphShape
+from ..cuda_graphs import (
+    CudaGraphCache,
+    CudaGraphStep,
+    GraphInputError,
+    GraphShape,
+    graph_shapes,
+)
 from .plan import (
     PAGE_SIZE,
     PREFILL_CHUNK_SIZE,
@@ -80,15 +86,6 @@ class _DeviceAttentionBatch:
     sliding_max_seqlen_k: int
     full_append_slots: Any
     sliding_append_slots: Any
-
-
-@dataclass(slots=True)
-class _GraphDecodeState:
-    token_ids: Any
-    positions: Any
-    batch: _DeviceAttentionBatch
-    final_hidden: Any
-    output_ids: Any
 
 
 def _invoke_fa4_b22(
@@ -197,11 +194,15 @@ class GptOssCudaRunner:
             raise RuntimeError("GptOssCudaRunner requires CUDA")
         if torch.cuda.get_device_capability(self.device)[0] != 9:
             raise RuntimeError("the pinned GPT-OSS FA4 runner requires an SM90 GPU")
-        self._graphs = DecodeGraphs(
+        decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
+        if any(width > self.cache_parent_capacity for _, width in decode_graph_shapes):
+            raise ValueError("CUDA graph table width exceeds cache capacity")
+        self._graphs = CudaGraphCache(
             torch,
             self.device,
-            cuda_graph_decode_shapes,
-            capacity=self.cache_parent_capacity,
+            decode_graph_shapes,
+            build=self._new_decode_graph_step,
+            synchronize_failure=self._synchronize_failed_eager_forward,
         )
 
         resolved_dtype = torch.bfloat16 if dtype is None else dtype
@@ -496,7 +497,7 @@ class GptOssCudaRunner:
             padded.extend((pages[0],) * (width - source_width))
         return tuple(padded)
 
-    def _new_graph_state(self, shape: GraphShape) -> _GraphDecodeState:
+    def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         batch_size, full_width = shape
         torch = self._torch
 
@@ -526,18 +527,37 @@ class GptOssCudaRunner:
             full_append_slots=empty(torch.long, batch_size),
             sliding_append_slots=empty(torch.long, batch_size),
         )
-        return _GraphDecodeState(
-            token_ids=empty(torch.long, batch_size),
-            positions=empty(torch.long, batch_size),
-            batch=batch,
-            final_hidden=empty(torch.bfloat16, batch_size, self.hidden_size),
-            output_ids=empty(torch.long, batch_size),
+        token_ids = empty(torch.long, batch_size)
+        positions = empty(torch.long, batch_size)
+        final_hidden = empty(torch.bfloat16, batch_size, self.hidden_size)
+        output_ids = empty(torch.long, batch_size)
+
+        def launch() -> None:
+            hidden = self._forward_batch(token_ids, positions, batch)
+            final_hidden.index_copy_(0, batch.sequence_indices, hidden)
+            logits = self._model.lm_head(final_hidden)
+            torch.argmax(logits, dim=-1, out=output_ids)
+
+        return CudaGraphStep(
+            inputs={
+                "token_ids": token_ids,
+                "positions": positions,
+                "token_indices": batch.token_indices,
+                "sequence_indices": batch.sequence_indices,
+                "full_page_table": batch.full_page_table,
+                "full_seqused_k": batch.full_seqused_k,
+                "sliding_page_table": batch.sliding_page_table,
+                "sliding_seqused_k": batch.sliding_seqused_k,
+                "full_append_slots": batch.full_append_slots,
+                "sliding_append_slots": batch.sliding_append_slots,
+            },
+            output=output_ids,
+            launch=launch,
         )
 
-    def _stage_graph_state(
-        self, state: _GraphDecodeState, plan: BatchPlan, host: AttentionBatch
-    ) -> None:
-        batch = state.batch
+    def _graph_forward(self, plan: BatchPlan, host: AttentionBatch) -> list[int] | None:
+        if not self._graphs.shapes:
+            return None
         rows = len(plan.sequence_ids)
         if (
             host.phase != BatchPhase.DECODE
@@ -545,56 +565,26 @@ class GptOssCudaRunner:
             or host.sliding_width != _WINDOW_TABLE_WIDTH
         ):
             raise GraphInputError("plan is not a fixed-shape decode batch")
-        values = (
-            (state.token_ids, plan.token_ids),
-            (state.positions, plan.positions),
-            (batch.token_indices, host.token_indices),
-            (batch.sequence_indices, host.sequence_indices),
-            (
-                batch.full_page_table,
-                self._pad_page_table(host, batch.full_page_table.shape[1]),
-            ),
-            (batch.full_seqused_k, host.full_lengths),
-            (batch.sliding_page_table, host.sliding_table),
-            (batch.sliding_seqused_k, host.sliding_lengths),
-            (batch.full_append_slots, host.full_append_slots),
-            (batch.sliding_append_slots, host.sliding_append_slots),
+        shape = self._graphs.match(
+            lambda candidate: candidate[0] == rows and candidate[1] >= host.full_width
         )
-        try:
-            staged = tuple(
-                (
-                    target,
-                    self._torch.as_tensor(
-                        source, dtype=target.dtype, device="cpu"
-                    ).view(target.shape),
-                )
-                for target, source in values
-            )
-        except Exception as error:
-            raise GraphInputError("plan does not fit CUDA graph buffers") from error
-        for target, source in staged:
-            target.copy_(source)
-
-    def _graph_body(self, state: _GraphDecodeState) -> None:
-        hidden = self._forward_batch(state.token_ids, state.positions, state.batch)
-        state.final_hidden.index_copy_(0, state.batch.sequence_indices, hidden)
-        logits = self._model.lm_head(state.final_hidden)
-        self._torch.argmax(logits, dim=-1, out=state.output_ids)
-
-    def _graph_forward(self, plan: BatchPlan, host: AttentionBatch) -> list[int] | None:
-        if not self._graphs.shapes:
-            return None
-        shape = self._graphs.select(len(plan.sequence_ids), host.full_width)
         if shape is None:
             self._graphs.fallback("shape")
             return None
         return self._graphs.run(
             shape,
-            allocate=self._new_graph_state,
-            stage=lambda state: self._stage_graph_state(state, plan, host),
-            body=self._graph_body,
-            output=lambda state: state.output_ids,
-            synchronize_failure=self._synchronize_failed_eager_forward,
+            {
+                "token_ids": plan.token_ids,
+                "positions": plan.positions,
+                "token_indices": host.token_indices,
+                "sequence_indices": host.sequence_indices,
+                "full_page_table": self._pad_page_table(host, shape[1]),
+                "full_seqused_k": host.full_lengths,
+                "sliding_page_table": host.sliding_table,
+                "sliding_seqused_k": host.sliding_lengths,
+                "full_append_slots": host.full_append_slots,
+                "sliding_append_slots": host.sliding_append_slots,
+            },
         )
 
     def forward(self, plan: BatchPlan) -> list[int]:
