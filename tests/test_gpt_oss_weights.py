@@ -72,7 +72,7 @@ class GptOssWeightLoaderTests(unittest.TestCase):
         save_file(tensors, root / "model.safetensors")
 
     def test_single_file_streams_ordinary_and_experts_by_layer(self) -> None:
-        from resin.backends.gpt_oss_weights import load_gpt_oss_weights
+        from resin.backends.gpt_oss.weights import load_gpt_oss_weights
 
         previous: weakref.ReferenceType | None = None
 
@@ -144,7 +144,7 @@ class GptOssWeightLoaderTests(unittest.TestCase):
     def test_index_is_checked_against_physical_shards(self) -> None:
         from safetensors.torch import save_file
 
-        from resin.backends.gpt_oss_weights import inspect_gpt_oss_checkpoint
+        from resin.backends.gpt_oss.weights import inspect_gpt_oss_checkpoint
 
         tensors = self._tensors(layers=1)
         first_keys = {"model.embed_tokens.weight", "lm_head.weight"}
@@ -172,7 +172,7 @@ class GptOssWeightLoaderTests(unittest.TestCase):
     def test_duplicate_tensor_across_shards_is_rejected(self) -> None:
         from safetensors.torch import save_file
 
-        from resin.backends.gpt_oss_weights import (
+        from resin.backends.gpt_oss.weights import (
             CheckpointFormatError,
             inspect_gpt_oss_checkpoint,
         )
@@ -203,7 +203,7 @@ class GptOssWeightLoaderTests(unittest.TestCase):
     def test_wrong_index_location_is_rejected(self) -> None:
         from safetensors.torch import save_file
 
-        from resin.backends.gpt_oss_weights import (
+        from resin.backends.gpt_oss.weights import (
             CheckpointFormatError,
             inspect_gpt_oss_checkpoint,
         )
@@ -231,7 +231,7 @@ class GptOssWeightLoaderTests(unittest.TestCase):
     def test_missing_and_unexpected_model_coverage_is_rejected_before_assignment(
         self,
     ) -> None:
-        from resin.backends.gpt_oss_weights import (
+        from resin.backends.gpt_oss.weights import (
             CheckpointCoverageError,
             load_gpt_oss_weights,
         )
@@ -266,7 +266,7 @@ class GptOssWeightLoaderTests(unittest.TestCase):
         self.assertTrue(model.model.embed_tokens.weight.is_meta)
 
     def test_shape_mismatch_is_rejected(self) -> None:
-        from resin.backends.gpt_oss_weights import (
+        from resin.backends.gpt_oss.weights import (
             CheckpointCoverageError,
             load_gpt_oss_weights,
         )
@@ -298,7 +298,7 @@ class GptOssWeightLoaderTests(unittest.TestCase):
         from safetensors import safe_open as real_safe_open
         from safetensors.torch import save_file
 
-        from resin.backends import gpt_oss_weights
+        from resin.backends.gpt_oss import weights as gpt_oss_weights
 
         class Builder:
             def expected_tensor_names(self, layer_index, config):
@@ -362,7 +362,7 @@ class GptOssWeightLoaderImportTests(unittest.TestCase):
     def test_import_is_tensor_and_tokenizer_free(self) -> None:
         script = """
 import sys
-import resin.backends.gpt_oss_weights
+import resin.backends.gpt_oss.weights
 for name in ('torch', 'transformers', 'tokenizers', 'huggingface_hub', 'safetensors'):
     assert name not in sys.modules, name
 """

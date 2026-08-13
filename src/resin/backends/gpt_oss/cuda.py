@@ -13,20 +13,18 @@ cache map and no Python page allocator.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 from resin import BatchPhase, CacheGroupLayout, CacheLayout
 
-from .gpt_oss import (
+from .._common import default_device
+from .reference import (
     DEFAULT_MODEL,
-    _default_device,
-    _load_model,
-    _resolve_model,
+    load_model,
+    resolve_model_path,
 )
 
 if TYPE_CHECKING:
@@ -38,7 +36,6 @@ _PAGE_SIZE = 128
 _SLIDING_WINDOW = 128
 _PREFILL_CHUNK_SIZE = 128
 _WINDOW_TABLE_WIDTH = 1 + ((_SLIDING_WINDOW - 1 + _PAGE_SIZE - 1) // _PAGE_SIZE)
-_CUDA_GRAPH_WARMUP_STEPS = 3
 
 
 class _PostAcceptCudaError(RuntimeError):
@@ -51,42 +48,6 @@ def _positive_int(name: str, value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
-
-
-def _normalize_cuda_graph_decode_shapes(
-    value: object,
-) -> tuple[tuple[int, int], ...]:
-    """Snapshot an immutable, deterministic CUDA-graph shape registry."""
-
-    if value is None:
-        return ()
-    if isinstance(value, Mapping):
-        raw_shapes = tuple(value.items())
-    elif isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
-        raw_shapes = tuple(value)
-    else:
-        raise TypeError(
-            "cuda_graph_decode_shapes must be an iterable of "
-            "(batch_size, full_page_table_width) tuples, a mapping from "
-            "batch size to full page-table width, or None"
-        )
-
-    shapes: list[tuple[int, int]] = []
-    for raw_shape in raw_shapes:
-        if not isinstance(raw_shape, tuple) or len(raw_shape) != 2:
-            raise TypeError(
-                "each cuda_graph_decode_shapes entry must be a "
-                "(batch_size, full_page_table_width) tuple"
-            )
-        batch_size, full_page_table_width = raw_shape
-        shape = (
-            _positive_int("CUDA graph decode batch size", batch_size),
-            _positive_int("CUDA graph full page-table width", full_page_table_width),
-        )
-        if shape in shapes:
-            raise ValueError(f"duplicate CUDA graph decode shape: {shape!r}")
-        shapes.append(shape)
-    return tuple(sorted(shapes))
 
 
 def _append_slots(
@@ -209,60 +170,6 @@ class _DeviceAttentionBatch:
     sliding_append_slots: Any
 
 
-@dataclass(slots=True)
-class _CudaGraphDecodeState:
-    """Long-lived addresses captured by one runner-local decode graph."""
-
-    token_ids: Any
-    positions: Any
-    attention_batch: _DeviceAttentionBatch
-    final_hidden: Any
-    output_ids: Any
-    graph: Any | None = None
-
-
-@dataclass(slots=True)
-class _CudaGraphDecodeRegistryEntry:
-    """One configured shape and its independently resident graph state."""
-
-    shape: tuple[int, int]
-    state: _CudaGraphDecodeState | None = None
-    capture_count: int = 0
-    replay_count: int = 0
-    hit_count: int = 0
-    miss_count: int = 0
-    warmup_count: int = 0
-    capture_ms: float | None = None
-    capture_memory_bytes: int | None = None
-
-
-class _CudaGraphStagingValidationError(ValueError):
-    """Host metadata could not be shaped before any CUDA copy was launched."""
-
-
-def _fixed_width_full_page_table(
-    batch: _HostAttentionBatch, fixed_width: int
-) -> tuple[int, ...]:
-    """Physically pad Rust-frozen rows without inventing logical pages."""
-
-    _positive_int("fixed full page-table width", fixed_width)
-    if batch.full_page_table_width > fixed_width:
-        raise ValueError(
-            "Rust full page-table width exceeds the configured CUDA graph width"
-        )
-    padded: list[int] = []
-    source_width = batch.full_page_table_width
-    for row_index in range(len(batch.sequence_indices)):
-        start = row_index * source_width
-        row = batch.full_page_table[start : start + source_width]
-        padded.extend(row)
-        # ``seqused_k`` masks these columns.  Repeating a page already owned by
-        # the sequence keeps every physical page ID valid without allocating
-        # or exposing graph padding to the native logical allocator.
-        padded.extend((row[0],) * (fixed_width - source_width))
-    return tuple(padded)
-
-
 def _invoke_fa4_b22(
     kernel,
     query,
@@ -329,9 +236,6 @@ class GptOssCudaRunner:
         device: str | None = None,
         dtype=None,
         moe_kernel=None,
-        cuda_graph_decode_shapes: (
-            Iterable[tuple[int, int]] | Mapping[int, int] | None
-        ) = None,
     ) -> None:
         self.cache_parent_capacity = _positive_int(
             "cache_parent_capacity", cache_parent_capacity
@@ -347,31 +251,6 @@ class GptOssCudaRunner:
                 ),
             ],
         )
-        configured_cuda_graph_decode_shapes = _normalize_cuda_graph_decode_shapes(
-            cuda_graph_decode_shapes
-        )
-        if any(
-            shape[1] > self.cache_parent_capacity
-            for shape in configured_cuda_graph_decode_shapes
-        ):
-            raise ValueError(
-                "CUDA graph full_page_table_width cannot exceed cache_parent_capacity"
-            )
-        self._cuda_graph_decode_shapes = configured_cuda_graph_decode_shapes
-        self._cuda_graph_decode_registry = {
-            shape: _CudaGraphDecodeRegistryEntry(shape)
-            for shape in configured_cuda_graph_decode_shapes
-        }
-        self._cuda_graph_capture_count = 0
-        self._cuda_graph_replay_count = 0
-        self._cuda_graph_hit_count = 0
-        self._cuda_graph_miss_count = 0
-        self._cuda_graph_eager_fallback_count = 0
-        self._cuda_graph_prefill_fallback_count = 0
-        self._cuda_graph_shape_fallback_count = 0
-        self._cuda_graph_warmup_count = 0
-        self._cuda_graph_poisoned_error: str | None = None
-
         try:
             import torch
         except ImportError as error:
@@ -391,7 +270,7 @@ class GptOssCudaRunner:
 
         self._torch = torch
         self._fa4 = flash_attn_varlen_func
-        self.device = torch.device(device or _default_device(torch))
+        self.device = torch.device(device or default_device(torch, require_cuda=True))
         if self.device.type != "cuda":
             raise RuntimeError("GptOssCudaRunner requires CUDA")
         if torch.cuda.get_device_capability(self.device)[0] != 9:
@@ -403,12 +282,12 @@ class GptOssCudaRunner:
         if resolved_dtype is not torch.bfloat16:
             raise ValueError("the GPT-OSS FA4 runner requires bfloat16 activations")
 
-        self.model_path = _resolve_model(
+        self.model_path = resolve_model_path(
             model,
             revision,
             allow_mxfp4=moe_kernel is not None,
         )
-        self._torch, self._model, self.config = _load_model(
+        self._torch, self._model, self.config = load_model(
             self.model_path,
             device=self.device,
             dtype=torch.bfloat16,
@@ -482,358 +361,6 @@ class GptOssCudaRunner:
         for layer in self._model.model.layers:
             if layer.self_attn.sinks.dtype is not torch.bfloat16:
                 raise TypeError("FA4 learnable sink tensors must be bfloat16")
-
-    @property
-    def cuda_graph_stats(self) -> dict[str, object]:
-        """Return a snapshot of this runner's local decode-graph activity."""
-
-        shape_stats: list[dict[str, object]] = []
-        for shape in self._cuda_graph_decode_shapes:
-            entry = self._cuda_graph_decode_registry[shape]
-            state = entry.state
-            captured = state is not None and state.graph is not None
-            shape_stats.append(
-                {
-                    "shape": shape,
-                    "captured": captured,
-                    "capture_count": entry.capture_count,
-                    "replay_count": entry.replay_count,
-                    "graph_hit_count": entry.hit_count,
-                    "graph_miss_count": entry.miss_count,
-                    "warmup_count": entry.warmup_count,
-                    "capture_ms": entry.capture_ms,
-                    "capture_memory_bytes": entry.capture_memory_bytes,
-                }
-            )
-        captured_shapes = tuple(
-            stats["shape"] for stats in shape_stats if stats["captured"]
-        )
-        return {
-            "enabled": bool(self._cuda_graph_decode_shapes),
-            "configured_shapes": self._cuda_graph_decode_shapes,
-            "captured": bool(captured_shapes),
-            "captured_shapes": captured_shapes,
-            "shape_stats": tuple(shape_stats),
-            "capture_count": self._cuda_graph_capture_count,
-            "replay_count": self._cuda_graph_replay_count,
-            "graph_hit_count": self._cuda_graph_hit_count,
-            "graph_miss_count": self._cuda_graph_miss_count,
-            "eager_fallback_count": self._cuda_graph_eager_fallback_count,
-            "prefill_fallback_count": self._cuda_graph_prefill_fallback_count,
-            "shape_fallback_count": self._cuda_graph_shape_fallback_count,
-            "warmup_count": self._cuda_graph_warmup_count,
-            "poisoned": self._cuda_graph_poisoned_error is not None,
-            "poison_error": self._cuda_graph_poisoned_error,
-        }
-
-    def _poison_cuda_graph(self, stage: str, error: Exception) -> None:
-        """Make CUDA execution fail-stop after an unsafe graph-path error."""
-
-        if self._cuda_graph_poisoned_error is None:
-            self._cuda_graph_poisoned_error = (
-                f"{stage}: {type(error).__name__}: {error}"
-            )
-
-    def _raise_if_cuda_graph_poisoned(self) -> None:
-        error = self._cuda_graph_poisoned_error
-        if error is not None:
-            raise RuntimeError(
-                "this GPT-OSS runner is poisoned after a CUDA graph failure; "
-                f"construct a fresh runner ({error})"
-            )
-
-    def _cuda_graph_fallback_kind(
-        self,
-        plan: BatchPlan,
-        prefill_batches: tuple[_HostAttentionBatch, ...],
-        decode_batch: _HostAttentionBatch | None,
-    ) -> str | None:
-        """Classify batches that must stay on the ordinary eager path."""
-
-        if not self._cuda_graph_decode_shapes:
-            return "disabled"
-        if prefill_batches:
-            return "prefill"
-        if decode_batch is None:
-            return "shape"
-
-        shape = self._select_cuda_graph_decode_shape(plan, decode_batch)
-        if shape is None:
-            return "shape"
-        batch_size, fixed_full_width = shape
-        if (
-            len(plan.sequence_ids) != batch_size
-            or len(plan.token_ids) != batch_size
-            or len(plan.positions) != batch_size
-            or len(decode_batch.token_indices) != batch_size
-            or len(decode_batch.sequence_indices) != batch_size
-            or decode_batch.q_lengths != (1,) * batch_size
-            or decode_batch.full_page_table_width > fixed_full_width
-            or decode_batch.sliding_page_table_width != _WINDOW_TABLE_WIDTH
-        ):
-            return "shape"
-        return None
-
-    def _select_cuda_graph_decode_shape(
-        self,
-        plan: BatchPlan,
-        decode_batch: _HostAttentionBatch,
-    ) -> tuple[int, int] | None:
-        """Select the smallest exact registered shape that fits this plan."""
-
-        logical_width = decode_batch.full_page_table_width
-        return next(
-            (
-                shape
-                for shape in self._cuda_graph_decode_shapes
-                if shape[0] == len(plan.sequence_ids) and shape[1] >= logical_width
-            ),
-            None,
-        )
-
-    def _record_cuda_graph_fallback(self, kind: str) -> None:
-        if kind == "disabled":
-            return
-        self._cuda_graph_eager_fallback_count += 1
-        if kind == "prefill":
-            self._cuda_graph_prefill_fallback_count += 1
-        else:
-            self._cuda_graph_shape_fallback_count += 1
-
-    def _new_cuda_graph_decode_state(
-        self, shape: tuple[int, int]
-    ) -> _CudaGraphDecodeState:
-        """Allocate every address whose identity is frozen by capture."""
-
-        batch_size, full_width = shape
-        torch = self._torch
-
-        def empty_int32(*tensor_shape: int):
-            return torch.empty(tensor_shape, dtype=torch.int32, device=self.device)
-
-        def empty_indices(*tensor_shape: int):
-            return torch.empty(tensor_shape, dtype=torch.long, device=self.device)
-
-        attention_batch = _DeviceAttentionBatch(
-            phase=BatchPhase.DECODE,
-            round_index=0,
-            token_indices=empty_indices(batch_size),
-            sequence_indices=empty_indices(batch_size),
-            last_token_indices=torch.arange(
-                batch_size, dtype=torch.long, device=self.device
-            ),
-            cu_seqlens_q=torch.arange(
-                batch_size + 1, dtype=torch.int32, device=self.device
-            ),
-            max_seqlen_q=1,
-            full_page_table=empty_int32(batch_size, full_width),
-            full_seqused_k=empty_int32(batch_size),
-            full_min_seqlen_k=1,
-            full_max_seqlen_k=full_width * _PAGE_SIZE,
-            sliding_page_table=empty_int32(batch_size, _WINDOW_TABLE_WIDTH),
-            sliding_seqused_k=empty_int32(batch_size),
-            sliding_min_seqlen_k=1,
-            sliding_max_seqlen_k=_WINDOW_TABLE_WIDTH * _PAGE_SIZE,
-            full_append_slots=empty_indices(batch_size),
-            sliding_append_slots=empty_indices(batch_size),
-        )
-        return _CudaGraphDecodeState(
-            token_ids=empty_indices(batch_size),
-            positions=empty_indices(batch_size),
-            attention_batch=attention_batch,
-            final_hidden=torch.empty(
-                batch_size,
-                self.hidden_size,
-                dtype=torch.bfloat16,
-                device=self.device,
-            ),
-            output_ids=empty_indices(batch_size),
-        )
-
-    def _stage_cuda_graph_decode(
-        self,
-        state: _CudaGraphDecodeState,
-        plan: BatchPlan,
-        host_batch: _HostAttentionBatch,
-    ) -> None:
-        """Copy one exact Rust plan into the graph's stable device buffers."""
-
-        torch = self._torch
-        device_batch = state.attention_batch
-        padded_full_page_table = _fixed_width_full_page_table(
-            host_batch, device_batch.full_page_table.shape[1]
-        )
-        values_by_target = (
-            (state.token_ids, plan.token_ids),
-            (state.positions, plan.positions),
-            (device_batch.token_indices, host_batch.token_indices),
-            (device_batch.sequence_indices, host_batch.sequence_indices),
-            (device_batch.full_page_table, padded_full_page_table),
-            (device_batch.full_seqused_k, host_batch.full_seqused_k),
-            (device_batch.sliding_page_table, host_batch.sliding_page_table),
-            (device_batch.sliding_seqused_k, host_batch.sliding_seqused_k),
-            (device_batch.full_append_slots, host_batch.full_append_slots),
-            (device_batch.sliding_append_slots, host_batch.sliding_append_slots),
-        )
-        try:
-            staged = tuple(
-                (
-                    target,
-                    torch.as_tensor(values, dtype=target.dtype, device="cpu").view(
-                        target.shape
-                    ),
-                )
-                for target, values in values_by_target
-            )
-        except Exception as error:
-            raise _CudaGraphStagingValidationError(
-                "CUDA graph host metadata does not match its persistent buffer"
-            ) from error
-        for target, source in staged:
-            target.copy_(source)
-
-    def _cuda_graph_decode_body(self, state: _CudaGraphDecodeState) -> None:
-        """The complete GPU model step captured for one pure-decode shape."""
-
-        batch = state.attention_batch
-        last_hidden = self._forward_batch(state.token_ids, state.positions, batch)
-        # Rust's sequence order is logical truth and may differ from attention
-        # row order.  Keep the permutation inside the graph before sampling.
-        state.final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
-        logits = self._model.lm_head(state.final_hidden)
-        self._torch.argmax(logits, dim=-1, out=state.output_ids)
-
-    def _validate_cuda_graph_decode_output_ids(
-        self, eager_output_ids, replay_output_ids
-    ) -> None:
-        """Require the first graph replay to match its eager warmup exactly."""
-
-        if not bool(self._torch.equal(eager_output_ids, replay_output_ids)):
-            raise RuntimeError(
-                "CUDA graph validation replay output IDs do not exactly match "
-                "the final eager warmup"
-            )
-
-    def _capture_cuda_graph_decode(
-        self,
-        state: _CudaGraphDecodeState,
-        *,
-        allocation_before: int,
-        shape: tuple[int, int],
-    ) -> None:
-        """Warm the fixed physical shape, capture it, and validate one replay."""
-
-        torch = self._torch
-        current_stream = torch.cuda.current_stream(self.device)
-        warmup_stream = torch.cuda.Stream(device=self.device)
-        warmup_stream.wait_stream(current_stream)
-        with torch.cuda.stream(warmup_stream), torch.inference_mode():
-            for _ in range(_CUDA_GRAPH_WARMUP_STEPS):
-                self._cuda_graph_decode_body(state)
-            warmup_output_ids = state.output_ids.clone()
-        current_stream.wait_stream(warmup_stream)
-        self._cuda_graph_warmup_count += _CUDA_GRAPH_WARMUP_STEPS
-        entry = self._cuda_graph_decode_registry[shape]
-        entry.warmup_count += _CUDA_GRAPH_WARMUP_STEPS
-        torch.cuda.synchronize(self.device)
-
-        capture_started = perf_counter()
-        with torch.cuda.device(self.device):
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph), torch.inference_mode():
-                self._cuda_graph_decode_body(state)
-            # Validate one launch now so instantiation/replay failures surface
-            # before Rust commits the plan.  Repeated writes target the same KV
-            # slots with identical values and are therefore idempotent.
-            graph.replay()
-        torch.cuda.synchronize(self.device)
-        self._validate_cuda_graph_decode_output_ids(warmup_output_ids, state.output_ids)
-        del warmup_output_ids
-
-        capture_ms = (perf_counter() - capture_started) * 1000
-        allocation_after = torch.cuda.memory_allocated(self.device)
-        capture_memory_bytes = max(0, allocation_after - allocation_before)
-        state.graph = graph
-        self._cuda_graph_capture_count += 1
-        entry.capture_ms = capture_ms
-        entry.capture_memory_bytes = capture_memory_bytes
-        entry.capture_count += 1
-
-    def _forward_cuda_graph_decode(
-        self,
-        plan: BatchPlan,
-        host_batch: _HostAttentionBatch,
-        shape: tuple[int, int],
-    ) -> list[int]:
-        """Capture once and replay thereafter for one selected registry shape."""
-
-        entry = self._cuda_graph_decode_registry[shape]
-        state = entry.state
-        if state is None:
-            torch = self._torch
-            allocation_before = torch.cuda.memory_allocated(self.device)
-            state = self._new_cuda_graph_decode_state(shape)
-            entry.state = state
-            try:
-                self._stage_cuda_graph_decode(state, plan, host_batch)
-            except (ValueError, _CudaGraphStagingValidationError):
-                # Host-shape and staging validation has not launched the graph,
-                # so it remains safe to repair the plan and retry.
-                if entry.state is state:
-                    entry.state = None
-                raise
-            except Exception as error:
-                self._cuda_graph_miss_count += 1
-                entry.miss_count += 1
-                self._poison_cuda_graph("decode graph staging", error)
-                raise
-            try:
-                self._capture_cuda_graph_decode(
-                    state,
-                    allocation_before=allocation_before,
-                    shape=shape,
-                )
-                output_ids = state.output_ids.tolist()
-            except Exception as error:
-                self._cuda_graph_miss_count += 1
-                entry.miss_count += 1
-                self._poison_cuda_graph("decode graph capture", error)
-                self._synchronize_failed_eager_forward()
-                raise
-            self._cuda_graph_hit_count += 1
-            entry.hit_count += 1
-            return output_ids
-
-        try:
-            self._stage_cuda_graph_decode(state, plan, host_batch)
-        except (ValueError, _CudaGraphStagingValidationError):
-            raise
-        except Exception as error:
-            self._cuda_graph_miss_count += 1
-            entry.miss_count += 1
-            self._poison_cuda_graph("decode graph staging", error)
-            raise
-        if state.graph is None:  # pragma: no cover - capture errors are raised
-            self._cuda_graph_miss_count += 1
-            entry.miss_count += 1
-            error = RuntimeError("the configured CUDA decode graph was not captured")
-            self._poison_cuda_graph("decode graph state", error)
-            raise error
-        try:
-            with self._torch.cuda.device(self.device):
-                state.graph.replay()
-            output_ids = state.output_ids.tolist()
-        except Exception as error:
-            self._cuda_graph_miss_count += 1
-            entry.miss_count += 1
-            self._poison_cuda_graph("decode graph replay", error)
-            self._synchronize_failed_eager_forward()
-            raise
-        self._cuda_graph_replay_count += 1
-        self._cuda_graph_hit_count += 1
-        entry.replay_count += 1
-        entry.hit_count += 1
-        return output_ids
 
     def bind_cache_pool(self, pool_id: int, layout: CacheLayout) -> int:
         """Permanently bind this runner's frozen layout to one native pool."""
@@ -1389,7 +916,6 @@ class GptOssCudaRunner:
         return hidden.index_select(0, batch.last_token_indices)
 
     def forward(self, plan: BatchPlan) -> list[int]:
-        self._raise_if_cuda_graph_poisoned()
         self._validate_plan_binding(plan)
         if any(token_id >= self.vocab_size for token_id in plan.token_ids):
             raise ValueError("token id is out of range")
@@ -1410,16 +936,6 @@ class GptOssCudaRunner:
             raise ValueError(
                 "native attention batches do not cover every plan sequence"
             )
-
-        graph_fallback = self._cuda_graph_fallback_kind(
-            plan, prefill_batches, decode_batch
-        )
-        if graph_fallback is None:
-            assert decode_batch is not None
-            cuda_graph_shape = self._select_cuda_graph_decode_shape(plan, decode_batch)
-            assert cuda_graph_shape is not None
-            return self._forward_cuda_graph_decode(plan, decode_batch, cuda_graph_shape)
-        self._record_cuda_graph_fallback(graph_fallback)
 
         torch = self._torch
         token_ids = torch.tensor(plan.token_ids, dtype=torch.long, device=self.device)

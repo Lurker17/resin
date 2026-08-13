@@ -16,7 +16,7 @@ small correctness work. It does not exercise Resin's managed cache pool.
 
 ## CUDA runner
 
-`resin.backends.gpt_oss_cuda.GptOssCudaRunner` is the managed path. Its relevant
+`resin.backends.gpt_oss.cuda.GptOssCudaRunner` is the managed path. Its relevant
 constructor surface is:
 
 ```python
@@ -27,7 +27,6 @@ runner = GptOssCudaRunner(
     device=None,
     dtype=None,
     moe_kernel=None,
-    cuda_graph_decode_shapes=None,
 )
 
 engine = Engine(runner, eos_token_id=runner.eos_token_id)
@@ -81,16 +80,8 @@ The managed runner keeps policy boundaries narrow:
 - The model's MXFP4 expert path may use the configured FlashInfer fused-MoE
   adapter.
 - Greedy sampling remains runner-owned.
-- Optional decode CUDA graphs are runner-local and keyed by explicitly
-  configured shapes; they are not native scheduler policy.
-
-`cuda_graph_decode_shapes` is the only graph configuration surface. It is
-normalized into one immutable shape tuple and one exact registry entry per
-shape. Each entry owns its capture state, timing, memory, hit, miss, and replay
-metrics; `cuda_graph_stats` reports those rows alongside aggregate counts.
-
 The runner implements synchronous `forward(plan)`. It materializes the dense
-token-ID result before returning; eager and graph failures establish CUDA
+token-ID result before returning; CUDA failures establish device
 quiescence before reporting a retryable exception, or mark the exception
 post-accept when quiescence cannot be proven. Resin retains the accepted result
 and ownership leases until `Engine.poll()` commits it.
@@ -99,8 +90,7 @@ and ownership leases until `Engine.poll()` commits it.
 
 `cache_parent_capacity` is one shared physical-parent budget, not a capacity per
 attention type. A positive page ID addresses one row in the aliased parent slab;
-page zero is the initialized null row. Configured decode-graph table widths may
-not exceed this capacity.
+page zero is the initialized null row.
 
 GPT-OSS currently pins 128-token cache blocks, a 128-token sliding window,
 64 query heads, eight KV heads, and head dimension 64. Unsupported checkpoint or
@@ -120,8 +110,7 @@ A new GPU proof should establish, on the current tree:
 3. separate prefill/decode scheduling and request retirement;
 4. flat-pool exhaustion and complete parent recovery;
 5. post-accept failure quarantine;
-6. graph and eager equivalence for each claimed decode shape;
-7. only then, fresh latency and throughput measurements.
+6. only then, fresh latency and throughput measurements.
 
 Until that run exists, the accurate claim is that GPT-OSS is implemented on the
 new local code path, not that the migrated path has a new remote performance

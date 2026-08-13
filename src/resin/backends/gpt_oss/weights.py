@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, Self
 
+from .._common import resolve_dtype
+
 _EXPERT_KEY = re.compile(
     r"^model\.layers\.(?P<layer>[0-9]+)\.mlp\.experts\.(?P<name>.+)$"
 )
@@ -410,16 +412,6 @@ def _resolve_target(model: Any, key: str) -> tuple[Any, str, Any, bool]:
     raise CheckpointCoverageError(f"{key!r} is not a model parameter or buffer")
 
 
-def _resolve_dtype(torch, dtype):
-    if dtype is None or not isinstance(dtype, str):
-        return dtype
-    name = dtype.removeprefix("torch.")
-    result = getattr(torch, name, None)
-    if result is None or not isinstance(result, torch.dtype):
-        raise ValueError(f"unknown torch dtype: {dtype!r}")
-    return result
-
-
 def _tensor_bytes(tensor: Any) -> int:
     return int(tensor.numel()) * int(tensor.element_size())
 
@@ -485,7 +477,7 @@ def load_gpt_oss_weights(
     target = torch.device(device)
     if target.type == "meta":
         raise ValueError("GPT-OSS weights must be loaded onto a material device")
-    resolved_dtype = _resolve_dtype(torch, dtype)
+    resolved_dtype = resolve_dtype(torch, dtype)
     if resolved_dtype is not None and not resolved_dtype.is_floating_point:
         raise ValueError("model dtype must be floating point")
 

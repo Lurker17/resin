@@ -19,7 +19,8 @@ from resin.moe_kernels import (
     MoERouting,
 )
 
-from .gpt_oss_weights import load_gpt_oss_weights
+from .._common import resolve_dtype
+from .weights import load_gpt_oss_weights
 
 _CHECKPOINT_TO_STANDARD = {
     "gate_up_proj_blocks": "gate_up",
@@ -193,20 +194,21 @@ def load_mxfp4_model(
     except ImportError as error:
         raise ImportError("packed GPT-OSS execution requires PyTorch") from error
 
-    from .gpt_oss import _GptOssArgs, _make_model_class, _resolve_dtype
+    from .config import GptOssConfig
+    from .model import make_model_class
 
     path = Path(model_path)
     config_path = path / "config.json"
     if not config_path.is_file():
         raise FileNotFoundError(f"missing model config: {config_path}")
     config = json.loads(config_path.read_text())
-    args = _GptOssArgs.from_config(config)
+    args = GptOssConfig.from_dict(config)
     quantization = config.get("quantization_config") or config.get("quantization")
     if not quantization or quantization.get("quant_method") != "mxfp4":
         raise ValueError("load_mxfp4_model requires an MXFP4 GPT-OSS checkpoint")
 
     target = torch.device(device)
-    resolved_dtype = _resolve_dtype(torch, dtype)
+    resolved_dtype = resolve_dtype(torch, dtype)
     if resolved_dtype not in {None, torch.bfloat16}:
         raise ValueError("the packed SM90 GPT-OSS path requires bfloat16 activations")
     architecture = _cuda_architecture(torch, target)
@@ -214,7 +216,7 @@ def load_mxfp4_model(
     kernel.validate(moe_config)
 
     expert_factory = _make_kernel_expert_factory(torch, kernel, moe_config)
-    model_class = _make_model_class(torch, expert_factory=expert_factory)
+    model_class = make_model_class(torch, expert_factory=expert_factory)
     with torch.device("meta"):
         model = model_class(args)
 

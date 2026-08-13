@@ -468,7 +468,7 @@ def _benchmark_report() -> dict[str, object]:
     import torch
 
     from resin import Engine
-    from resin.backends.lfm2_torch import Lfm2TorchRunner
+    from resin.backends.lfm2 import Lfm2TorchRunner
 
     torch.cuda.reset_peak_memory_stats()
     load_start = time.perf_counter()
@@ -517,7 +517,7 @@ def _kernel_benchmark_report() -> dict[str, object]:
 
     install_flashinfer_hash_cache()
     from resin import Engine, StatePool
-    from resin.backends.lfm2_cuda import Lfm2CudaRunner
+    from resin.backends.lfm2.cuda import Lfm2CudaRunner
 
     page_size = 16
     max_pages = 64
@@ -601,7 +601,7 @@ def _async_completion_report() -> dict[str, object]:
 
     install_flashinfer_hash_cache()
     from resin import Engine, StatePool
-    from resin.backends.lfm2_cuda import Lfm2CudaRunner
+    from resin.backends.lfm2.cuda import Lfm2CudaRunner
 
     device_name, capability = _validated_h100(torch)
     torch.cuda.reset_peak_memory_stats()
@@ -837,7 +837,7 @@ def _native_continuation_scheduler_report() -> dict[str, object]:
 
     install_flashinfer_hash_cache()
     from resin import Engine, SchedulerConfig, StatePool
-    from resin.backends.lfm2_cuda import Lfm2CudaRunner
+    from resin.backends.lfm2.cuda import Lfm2CudaRunner
 
     class RecordingRunner:
         supports_continuation_prefill = True

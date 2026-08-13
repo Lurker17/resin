@@ -193,9 +193,9 @@ class SchedulerConfigContractTests(unittest.TestCase):
 
     def test_builtin_runner_continuation_capabilities_are_explicit(self) -> None:
         from resin.backends.gpt_oss import GptOssRunner
-        from resin.backends.gpt_oss_cuda import GptOssCudaRunner
-        from resin.backends.lfm2_cuda import Lfm2CudaRunner
-        from resin.backends.lfm2_torch import Lfm2TorchRunner
+        from resin.backends.gpt_oss.cuda import GptOssCudaRunner
+        from resin.backends.lfm2 import Lfm2TorchRunner
+        from resin.backends.lfm2.cuda import Lfm2CudaRunner
 
         self.assertIs(GptOssCudaRunner.supports_continuation_prefill, True)
         self.assertIs(Lfm2CudaRunner.supports_continuation_prefill, True)

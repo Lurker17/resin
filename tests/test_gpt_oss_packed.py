@@ -12,7 +12,7 @@ class GptOssPackedImportTests(unittest.TestCase):
     def test_import_is_framework_and_tokenizer_free(self) -> None:
         script = """
 import sys
-import resin.backends.gpt_oss_packed
+import resin.backends.gpt_oss.mxfp4
 for name in ('torch', 'transformers', 'tokenizers', 'flashinfer', 'triton'):
     assert name not in sys.modules, name
 """
@@ -24,7 +24,7 @@ class GptOssPackedBridgeTests(unittest.TestCase):
     def test_official_block_layout_is_flattened_and_installed(self) -> None:
         import torch
 
-        from resin.backends.gpt_oss_packed import (
+        from resin.backends.gpt_oss.mxfp4 import (
             _make_kernel_expert_factory,
             _PackedExpertCoordinator,
         )

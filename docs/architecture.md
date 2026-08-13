@@ -3,7 +3,7 @@
 Resin is a Rust control plane for token-ID-in/token-ID-out inference. Rust owns
 requests, scheduling, logical progress, native storage ownership, and cleanup.
 Python runners own model weights, physical tensor layouts, kernels, streams,
-events, and optional CUDA graphs.
+and completion events.
 
 ```text
 token IDs -> Engine -> immutable BatchPlan -> model runner -> token IDs
@@ -23,7 +23,7 @@ handoff's completion. Tensor payloads never pass through Rust.
 | Cohort selection, token budgets, phase and sample masks | Tensorization and forward execution |
 | Flat cache allocation, group placement, references, and writer leases | Physical cache slabs addressed by plan page IDs |
 | State-slot generations, references, pins, and access leases | Model-specific recurrent-state tensors |
-| Frozen and validated plan metadata | Kernels, streams, completion events, and graphs |
+| Frozen and validated plan metadata | Kernels, streams, and completion events |
 | Completion validation and fail-stop quarantine | Optional physical request cleanup |
 
 The runner cannot admit work or commit logical progress. It executes a plan and

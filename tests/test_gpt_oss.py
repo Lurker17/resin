@@ -10,9 +10,9 @@ from pathlib import Path
 
 
 def _tiny_args():
-    from resin.backends.gpt_oss import _GptOssArgs
+    from resin.backends.gpt_oss import GptOssConfig
 
-    return _GptOssArgs(
+    return GptOssConfig(
         vocab_size=43,
         hidden_size=8,
         intermediate_size=6,
@@ -82,7 +82,7 @@ for name in ('torch', 'transformers', 'tokenizers', 'huggingface_hub', 'safetens
         subprocess.run([sys.executable, "-c", script], check=True)
 
     def test_configs_cover_both_released_model_shapes(self) -> None:
-        from resin.backends.gpt_oss import _GptOssArgs
+        from resin.backends.gpt_oss import GptOssConfig
 
         base = {
             "model_type": "gpt_oss",
@@ -118,17 +118,17 @@ for name in ('torch', 'transformers', 'tokenizers', 'huggingface_hub', 'safetens
                     for index in range(layers)
                 ],
             )
-            args = _GptOssArgs.from_config(config)
+            args = GptOssConfig.from_dict(config)
             self.assertEqual(args.num_hidden_layers, layers)
             self.assertEqual(args.num_local_experts, experts)
             self.assertEqual(args.num_experts_per_tok, 4)
             self.assertEqual(args.head_dim, 64)
 
     def test_args_reject_non_gpt_oss_checkpoint(self) -> None:
-        from resin.backends.gpt_oss import _GptOssArgs
+        from resin.backends.gpt_oss import GptOssConfig
 
         with self.assertRaisesRegex(ValueError, "expected a GPT-OSS"):
-            _GptOssArgs.from_config({"model_type": "llama"})
+            GptOssConfig.from_dict({"model_type": "llama"})
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
@@ -136,12 +136,12 @@ class GptOssTorchTests(unittest.TestCase):
     def setUp(self) -> None:
         import torch
 
-        from resin.backends.gpt_oss import _make_model_class
+        from resin.backends.gpt_oss import make_model_class
 
         torch.manual_seed(11)
         self.torch = torch
         self.args = _tiny_args()
-        self.model = _make_model_class(torch)(self.args).eval()
+        self.model = make_model_class(torch)(self.args).eval()
 
     def test_cached_chunks_match_full_forward(self) -> None:
         torch = self.torch
@@ -200,7 +200,7 @@ class GptOssTorchTests(unittest.TestCase):
         )
 
     def test_expert_kernel_boundary_receives_all_routing_metadata(self) -> None:
-        from resin.backends.gpt_oss import _make_model_class
+        from resin.backends.gpt_oss import make_model_class
 
         torch = self.torch
         calls = []
@@ -210,7 +210,7 @@ class GptOssTorchTests(unittest.TestCase):
                 calls.append((hidden.shape, indices.shape, weights.shape, logits.shape))
                 return torch.zeros_like(hidden)
 
-        model = _make_model_class(
+        model = make_model_class(
             torch, expert_factory=lambda _args: RecordingExperts()
         )(self.args).eval()
         with torch.inference_mode():
@@ -483,7 +483,7 @@ class GptOssTorchTests(unittest.TestCase):
         self.assertEqual(len(runner._cache), 0)
 
     def test_mxfp4_checkpoint_has_precise_kernel_boundary_error(self) -> None:
-        from resin.backends.gpt_oss import _load_model
+        from resin.backends.gpt_oss.reference import load_model
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
@@ -493,7 +493,7 @@ class GptOssTorchTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 NotImplementedError, "MXFP4 expert weights.*H100 MXFP4 expert kernel"
             ):
-                _load_model(path, device="cpu")
+                load_model(path, device="cpu")
 
     @unittest.skipUnless(
         importlib.util.find_spec("safetensors"), "safetensors is not installed"
@@ -501,7 +501,7 @@ class GptOssTorchTests(unittest.TestCase):
     def test_direct_dense_safetensors_loading_without_transformers(self) -> None:
         from safetensors.torch import save_file
 
-        from resin.backends.gpt_oss import _load_model
+        from resin.backends.gpt_oss.reference import load_model
 
         tokens = self.torch.tensor([[1, 2, 3]])
         with self.torch.inference_mode():
@@ -511,7 +511,7 @@ class GptOssTorchTests(unittest.TestCase):
             path = Path(directory)
             (path / "config.json").write_text(json.dumps(_config(self.args)))
             save_file(self.model.state_dict(), path / "model.safetensors")
-            torch, loaded, loaded_config = _load_model(path, device="cpu")
+            torch, loaded, loaded_config = load_model(path, device="cpu")
             self.assertNotIn("transformers", sys.modules)
             self.assertNotIn("tokenizers", sys.modules)
             with torch.inference_mode():

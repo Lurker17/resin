@@ -14,11 +14,11 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from resin import BatchPhase, CacheGroupLayout, CacheLayout, StateMappingConfig
 
-from .lfm2_torch import (
+from .reference import (
     DEFAULT_MODEL,
     DEFAULT_REVISION,
-    _load_model,
-    _resolve_model,
+    load_model,
+    resolve_model_path,
 )
 
 if TYPE_CHECKING:
@@ -558,11 +558,11 @@ class Lfm2CudaRunner:
             max_pages,
             [CacheGroupLayout(page_size)],
         )
-        self.model_path = _resolve_model(model, revision)
+        self.model_path = resolve_model_path(model, revision)
         # Persistent CUDA state is created on the same private stream used for
         # every launch, so dispatch never needs an implicit default-stream handoff.
         with torch.cuda.stream(self._stream):
-            self._torch, self._model, self.config = _load_model(
+            self._torch, self._model, self.config = load_model(
                 self.model_path, device=self.device
             )
             self.eos_token_id = self.config.get("eos_token_id")

@@ -289,14 +289,14 @@ class Lfm2CudaImportTests(unittest.TestCase):
     def test_import_is_lazy(self) -> None:
         script = """
 import sys
-import resin.backends.lfm2_cuda
+import resin.backends.lfm2.cuda
 for name in ('torch', 'flashinfer', 'flash_attn', 'transformers', 'tokenizers'):
     assert name not in sys.modules
 """
         subprocess.run([sys.executable, "-c", script], check=True)
 
     def test_physical_cache_slab_reserves_zero_as_the_null_page(self) -> None:
-        from resin.backends.lfm2_cuda import _cache_slab_shape
+        from resin.backends.lfm2.cuda import _cache_slab_shape
 
         slab = _cache_slab_shape(6, 256, 16, 8, 64)
         self.assertEqual(slab, (6, 257, 16, 8, 64))
@@ -304,7 +304,7 @@ for name in ('torch', 'flashinfer', 'flash_attn', 'transformers', 'tokenizers'):
         self.assertEqual(len(slab[1:]), 4)
 
     def test_physical_cache_slab_zeroes_null_page_and_unwritten_tails(self) -> None:
-        from resin.backends.lfm2_cuda import Lfm2CudaRunner
+        from resin.backends.lfm2.cuda import Lfm2CudaRunner
 
         constructor = inspect.getsource(Lfm2CudaRunner.__init__)
         self.assertIn("self._k_cache = torch.zeros(", constructor)
@@ -337,7 +337,7 @@ for name in ('torch', 'flashinfer', 'flash_attn', 'transformers', 'tokenizers'):
 class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
     @staticmethod
     def _runner():
-        from resin.backends.lfm2_cuda import Lfm2CudaRunner
+        from resin.backends.lfm2.cuda import Lfm2CudaRunner
 
         runner = Lfm2CudaRunner.__new__(Lfm2CudaRunner)
         runner._torch = _FakeTorch()
@@ -473,7 +473,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             )
 
     def test_combined_binding_reuses_the_exact_registered_arena_object(self) -> None:
-        from resin.backends.lfm2_cuda import _RECURRENT_STATE_ARENAS
+        from resin.backends.lfm2.cuda import _RECURRENT_STATE_ARENAS
 
         _RECURRENT_STATE_ARENAS.clear()
         try:
@@ -694,7 +694,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         self.assertEqual(metadata["append_positions"].values, (18,))
 
     def test_explicit_continuation_rows_use_only_rust_post_append_pages(self) -> None:
-        from resin.backends.lfm2_cuda import _prefill_kernel_metadata
+        from resin.backends.lfm2.cuda import _prefill_kernel_metadata
 
         plan = self._plan(
             block_indptr=[0, 1, 3, 6],
@@ -782,7 +782,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             self.assertEqual(metadata["_pinned"][name].device, "cpu")
 
     def test_continuation_rejects_stale_preappend_block_table(self) -> None:
-        from resin.backends.lfm2_cuda import _prefill_kernel_metadata
+        from resin.backends.lfm2.cuda import _prefill_kernel_metadata
 
         plan = self._plan(
             block_indptr=[0, 1],
@@ -802,7 +802,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             _prefill_kernel_metadata(plan, 16)
 
     def test_one_token_prefill_is_not_inferred_to_be_decode(self) -> None:
-        from resin.backends.lfm2_cuda import _prefill_kernel_metadata
+        from resin.backends.lfm2.cuda import _prefill_kernel_metadata
 
         plan = self._plan(
             block_indptr=[0, 1, 2],
@@ -826,7 +826,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         self.assertEqual(metadata.continuation_seqused_k, (9, 9))
 
     def test_runner_has_no_logical_page_or_length_mirror(self) -> None:
-        from resin.backends.lfm2_cuda import Lfm2CudaRunner
+        from resin.backends.lfm2.cuda import Lfm2CudaRunner
 
         source = inspect.getsource(Lfm2CudaRunner)
         self.assertNotIn("_request_pages", source)
@@ -834,7 +834,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         self.assertNotIn("_free_pages", source)
         metadata_source = inspect.getsource(Lfm2CudaRunner._metadata)
         self.assertIn("_preflight_cache", metadata_source)
-        from resin.backends.lfm2_cuda import _cache_kernel_metadata
+        from resin.backends.lfm2.cuda import _cache_kernel_metadata
 
         adapter_source = inspect.getsource(_cache_kernel_metadata)
         self.assertIn("plan.phase", adapter_source)
@@ -1053,7 +1053,7 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
         self.assertEqual(runner.live_cache_count, 0)
 
     def test_source_has_no_request_keyed_convolution_cache(self) -> None:
-        from resin.backends.lfm2_cuda import Lfm2CudaRunner
+        from resin.backends.lfm2.cuda import Lfm2CudaRunner
 
         source = inspect.getsource(Lfm2CudaRunner)
         self.assertNotIn("_conv_cache", source)
@@ -1062,7 +1062,7 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
 
 class Lfm2CudaFa4ContinuationTests(unittest.TestCase):
     def test_exact_b22_paged_surface(self) -> None:
-        from resin.backends.lfm2_cuda import _invoke_paged_fa4_b22
+        from resin.backends.lfm2.cuda import _invoke_paged_fa4_b22
 
         calls = []
 
@@ -1108,7 +1108,7 @@ class Lfm2CudaFa4ContinuationTests(unittest.TestCase):
         self.assertFalse(kwargs["return_lse"])
 
     def test_bottom_right_causal_paged_call_matches_dense_suffix_oracle(self) -> None:
-        from resin.backends.lfm2_cuda import _invoke_paged_fa4_b22
+        from resin.backends.lfm2.cuda import _invoke_paged_fa4_b22
 
         query = [[0.5, -0.25], [0.1, 0.8], [-0.4, 0.3]]
         key_cache = [
@@ -1492,7 +1492,7 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         self.assertNotIn(("event.synchronize",), log)
 
     def test_abandonment_timeout_quarantines_every_lifetime(self) -> None:
-        from resin.backends.lfm2_cuda import _CUDA_COMPLETION_QUARANTINE
+        from resin.backends.lfm2.cuda import _CUDA_COMPLETION_QUARANTINE
 
         baseline = len(_CUDA_COMPLETION_QUARANTINE)
         runner, plan = self._runner_and_plan()
@@ -1528,7 +1528,7 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         self.assertIsNone(resource_ref())
 
     def test_abandonment_query_error_quarantines_without_retrying(self) -> None:
-        from resin.backends.lfm2_cuda import _CUDA_COMPLETION_QUARANTINE
+        from resin.backends.lfm2.cuda import _CUDA_COMPLETION_QUARANTINE
 
         baseline = len(_CUDA_COMPLETION_QUARANTINE)
         runner, plan = self._runner_and_plan()
@@ -1561,7 +1561,7 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
 
 class Lfm2CudaAsyncStaticBoundaryTests(unittest.TestCase):
     def test_abandonment_is_bounded_and_query_only(self) -> None:
-        from resin.backends.lfm2_cuda import _Lfm2CudaCompletion
+        from resin.backends.lfm2.cuda import _Lfm2CudaCompletion
 
         source = inspect.getsource(_Lfm2CudaCompletion._abandon)
         self.assertIn("fence.query()", source)
@@ -1570,14 +1570,14 @@ class Lfm2CudaAsyncStaticBoundaryTests(unittest.TestCase):
         self.assertNotIn(".synchronize(", source)
 
     def test_poll_queries_without_synchronizing(self) -> None:
-        from resin.backends.lfm2_cuda import Lfm2CudaRunner
+        from resin.backends.lfm2.cuda import Lfm2CudaRunner
 
         source = inspect.getsource(Lfm2CudaRunner.poll)
         self.assertIn(".query()", source)
         self.assertNotIn("synchronize", source)
 
     def test_dispatch_uses_private_stream_and_nonblocking_copies(self) -> None:
-        from resin.backends.lfm2_cuda import Lfm2CudaRunner
+        from resin.backends.lfm2.cuda import Lfm2CudaRunner
 
         source = inspect.getsource(Lfm2CudaRunner.dispatch)
         self.assertIn("torch.cuda.stream(self._stream)", source)
@@ -1586,7 +1586,7 @@ class Lfm2CudaAsyncStaticBoundaryTests(unittest.TestCase):
         self.assertNotIn("current_stream", inspect.getsource(Lfm2CudaRunner))
 
     def test_metadata_stages_decode_plan_on_pinned_cpu(self) -> None:
-        from resin.backends.lfm2_cuda import Lfm2CudaRunner
+        from resin.backends.lfm2.cuda import Lfm2CudaRunner
 
         metadata_source = inspect.getsource(Lfm2CudaRunner._metadata)
         poll_source = inspect.getsource(Lfm2CudaRunner.poll)

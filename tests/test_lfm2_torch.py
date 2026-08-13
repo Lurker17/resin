@@ -11,9 +11,9 @@ from pathlib import Path
 
 
 def _tiny_args():
-    from resin.backends.lfm2_torch import _Lfm2TorchArgs
+    from resin.backends.lfm2 import Lfm2Config
 
-    return _Lfm2TorchArgs(
+    return Lfm2Config(
         vocab_size=64,
         hidden_size=16,
         num_hidden_layers=2,
@@ -35,17 +35,17 @@ class Lfm2TorchImportTests(unittest.TestCase):
     def test_import_does_not_import_torch(self) -> None:
         script = """
 import sys
-import resin.backends.lfm2_torch
+import resin.backends.lfm2
 for name in ('torch', 'transformers', 'tokenizers', 'huggingface_hub', 'safetensors'):
     assert name not in sys.modules
 """
         subprocess.run([sys.executable, "-c", script], check=True)
 
     def test_args_reject_non_lfm_checkpoint(self) -> None:
-        from resin.backends.lfm2_torch import _Lfm2TorchArgs
+        from resin.backends.lfm2 import Lfm2Config
 
         with self.assertRaisesRegex(ValueError, "expected an LFM2"):
-            _Lfm2TorchArgs.from_config({"model_type": "llama"})
+            Lfm2Config.from_dict({"model_type": "llama"})
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
@@ -53,12 +53,12 @@ class Lfm2TorchTests(unittest.TestCase):
     def setUp(self) -> None:
         import torch
 
-        from resin.backends.lfm2_torch import _make_model_class
+        from resin.backends.lfm2 import make_model_class
 
         torch.manual_seed(7)
         self.torch = torch
         self.args = _tiny_args()
-        self.model = _make_model_class(torch)(self.args).eval()
+        self.model = make_model_class(torch)(self.args).eval()
 
     def test_cached_chunks_match_full_forward(self) -> None:
         torch = self.torch
@@ -75,7 +75,7 @@ class Lfm2TorchTests(unittest.TestCase):
 
     def test_runner_consumes_batch_plan_and_releases_per_request_cache(self) -> None:
         from resin import BatchPhase, BatchPlan
-        from resin.backends.lfm2_torch import Lfm2TorchRunner
+        from resin.backends.lfm2 import Lfm2TorchRunner
 
         runner = Lfm2TorchRunner.__new__(Lfm2TorchRunner)
         runner.device = self.torch.device("cpu")
@@ -118,7 +118,7 @@ class Lfm2TorchTests(unittest.TestCase):
     def test_direct_safetensors_loading_without_transformers(self) -> None:
         from safetensors.torch import save_file
 
-        from resin.backends.lfm2_torch import _load_model
+        from resin.backends.lfm2.reference import load_model
 
         config = {
             "model_type": "lfm2",
@@ -149,7 +149,7 @@ class Lfm2TorchTests(unittest.TestCase):
             path = Path(directory)
             (path / "config.json").write_text(json.dumps(config))
             save_file(self.model.state_dict(), path / "model.safetensors")
-            torch, loaded, loaded_config = _load_model(path, device="cpu")
+            torch, loaded, loaded_config = load_model(path, device="cpu")
             self.assertNotIn("transformers", sys.modules)
             self.assertNotIn("tokenizers", sys.modules)
             with torch.inference_mode():
@@ -163,7 +163,7 @@ class Lfm2TorchTests(unittest.TestCase):
     )
     def test_pretrained_runner_generates_expected_tokens(self) -> None:
         from resin import Engine
-        from resin.backends.lfm2_torch import Lfm2TorchRunner
+        from resin.backends.lfm2 import Lfm2TorchRunner
 
         runner = Lfm2TorchRunner(
             Path(os.environ["RESIN_LFM2_TORCH_MODEL"]), device="cpu"
