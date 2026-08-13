@@ -224,7 +224,7 @@ def load_mxfp4_model(
         kernel,
         moe_config,
     )
-    loaded_config, report = load_gpt_oss_weights(
+    loaded_config, _ = load_gpt_oss_weights(
         path,
         model,
         device=target,
@@ -253,8 +253,6 @@ def load_mxfp4_model(
             "ordinary model parameters remain on meta: " + ", ".join(remaining_meta[:8])
         )
     model.eval()
-    model._resin_moe_kernel_config = moe_config
-    model._resin_weight_load_report = report
     return torch, model, config
 
 

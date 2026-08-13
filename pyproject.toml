@@ -25,6 +25,7 @@ torch = [
   "safetensors>=0.5",
 ]
 demo = [
+    "renderers>=0.1.9",
     "tokenizers>=0.21",
 ]
 dev = [

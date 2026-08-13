@@ -907,19 +907,7 @@ class GptOssRunner:
     """
 
     supports_continuation_prefill = True
-    physical_batching = True
-    physical_decode_batching = True
-    supports_true_batching = True
-    execution_mode = "equal_length_chunked_physical_batch"
-    prefill_strategy = "equal_length_chunked_physical_batch"
     prefill_chunk_size = 8192
-    batching_capabilities = frozenset(
-        {
-            "equal_length_chunked_prefill",
-            "equal_length_decode",
-            "per_request_kv_cache",
-        }
-    )
 
     def __init__(
         self,
@@ -929,10 +917,7 @@ class GptOssRunner:
         device: str | None = None,
         dtype=None,
         moe_kernel=None,
-        validate_first_logits: bool = False,
     ) -> None:
-        if not isinstance(validate_first_logits, bool):
-            raise TypeError("validate_first_logits must be a boolean")
         try:
             import torch
         except ImportError as error:
@@ -950,19 +935,9 @@ class GptOssRunner:
             dtype=dtype,
             moe_kernel=moe_kernel,
         )
-        self.moe_kernel = moe_kernel
-        self.kernel_adapter = (
-            "dense" if moe_kernel is None else moe_kernel.capabilities.kernel_id
-        )
-        self.expert_storage_format = "dense" if moe_kernel is None else "mxfp4"
-        self.weight_load_report = getattr(
-            self._model, "_resin_weight_load_report", None
-        )
         self.eos_token_id = self.config.get("eos_token_id")
         self.vocab_size = self.config["vocab_size"]
         self._cache: dict[int, _SequenceCache] = {}
-        self.forward_calls = 0
-        self._validate_next_logits = validate_first_logits
 
     def forward(self, plan: BatchPlan) -> list[int]:
         torch = self._torch
@@ -970,7 +945,6 @@ class GptOssRunner:
         positions = plan.positions
         indptr = plan.sequence_indptr
         work = []
-        self.forward_calls += 1
         for index, request_id in enumerate(plan.sequence_ids):
             start, end = indptr[index : index + 2]
             cache = self._cache.get(request_id)
@@ -1019,12 +993,6 @@ class GptOssRunner:
                 position_tensor,
                 logits_to_keep=1,
             )
-        if getattr(self, "_validate_next_logits", False):
-            if not bool(torch.isfinite(logits).all().item()):
-                raise FloatingPointError(
-                    "GPT-OSS produced non-finite logits during first-forward validation"
-                )
-            self._validate_next_logits = False
         output = logits[:, -1, :].argmax(dim=-1).tolist()
 
         for (request_id, _, _, old_cache), cache in zip(
@@ -1037,7 +1005,3 @@ class GptOssRunner:
     def release(self, request_ids: list[int]) -> None:
         for request_id in request_ids:
             self._cache.pop(request_id, None)
-
-    @property
-    def live_cache_count(self) -> int:
-        return len(self._cache)

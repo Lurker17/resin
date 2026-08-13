@@ -424,9 +424,9 @@ image = (
         "triton==3.7.1",
         "blake3==1.0.9",
     )
-    .run_commands(
-        "python -m pip install flashinfer-cubin==0.6.15.post1 "
-        "--index-url https://flashinfer.ai/whl"
+    .uv_pip_install(
+        "flashinfer-cubin==0.6.15.post1",
+        extra_index_url="https://flashinfer.ai/whl",
     )
     .add_local_file(ROOT / "deploy/__init__.py", "/root/deploy/__init__.py", copy=True)
     .add_local_file(

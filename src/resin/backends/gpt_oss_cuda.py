@@ -192,7 +192,6 @@ class _DeviceAttentionBatch:
 
     phase: str
     round_index: int
-    diagnostic_context: str
     token_indices: Any
     sequence_indices: Any
     last_token_indices: Any
@@ -317,22 +316,9 @@ class GptOssCudaRunner:
     # token. Sparse History/Window rows are chronological; dense FA4 tables and
     # page-aligned execution rounds are derived locally without any cache state.
     supports_continuation_prefill = True
-    physical_batching = True
-    physical_decode_batching = True
-    supports_true_batching = True
-    execution_mode = "flat_cache_fa4_b22"
-    prefill_strategy = "derived_128_token_rounds"
     page_size = _PAGE_SIZE
     sliding_window = _SLIDING_WINDOW
     prefill_chunk_size = _PREFILL_CHUNK_SIZE
-    batching_capabilities = frozenset(
-        {
-            "heterogeneous_chunked_prefill",
-            "heterogeneous_decode",
-            "native_flat_cache_pool",
-            "ordered_history_window_groups",
-        }
-    )
 
     def __init__(
         self,
@@ -343,17 +329,10 @@ class GptOssCudaRunner:
         device: str | None = None,
         dtype=None,
         moe_kernel=None,
-        validate_first_logits: bool = False,
-        diagnose_nonfinite: bool = False,
         cuda_graph_decode_shapes: (
             Iterable[tuple[int, int]] | Mapping[int, int] | None
         ) = None,
     ) -> None:
-        if not isinstance(validate_first_logits, bool):
-            raise TypeError("validate_first_logits must be a boolean")
-        if not isinstance(diagnose_nonfinite, bool):
-            raise TypeError("diagnose_nonfinite must be a boolean")
-        self._diagnose_nonfinite = diagnose_nonfinite
         self.cache_parent_capacity = _positive_int(
             "cache_parent_capacity", cache_parent_capacity
         )
@@ -456,14 +435,6 @@ class GptOssCudaRunner:
         self.hidden_size = args.hidden_size
         self.vocab_size = args.vocab_size
         self.eos_token_id = self.config.get("eos_token_id")
-        self.moe_kernel = moe_kernel
-        self.kernel_adapter = (
-            "dense" if moe_kernel is None else moe_kernel.capabilities.kernel_id
-        )
-        self.expert_storage_format = "dense" if moe_kernel is None else "mxfp4"
-        self.weight_load_report = getattr(
-            self._model, "_resin_weight_load_report", None
-        )
 
         self._full_layers = tuple(
             index
@@ -507,134 +478,10 @@ class GptOssCudaRunner:
         self._window_k_cache = self._history_k_cache
         self._window_v_cache = self._history_v_cache
         self._cache_pool_id: int | None = None
-        self.forward_calls = 0
-        self._validate_next_logits = validate_first_logits
 
         for layer in self._model.model.layers:
             if layer.self_attn.sinks.dtype is not torch.bfloat16:
                 raise TypeError("FA4 learnable sink tensors must be bfloat16")
-        self._validate_static_finite()
-
-    @staticmethod
-    def _bounded_metadata(
-        values: tuple[int, ...], *, limit: int = 64
-    ) -> tuple[object, ...]:
-        """Keep exceptional diagnostic messages useful at large batch sizes."""
-
-        if len(values) <= limit:
-            return values
-        edge = limit // 2
-        return (*values[:edge], "...", *values[-edge:])
-
-    @classmethod
-    def _batch_diagnostic_context(cls, batch: _HostAttentionBatch) -> str:
-        full_minmax = (min(batch.full_seqused_k), max(batch.full_seqused_k))
-        sliding_minmax = (
-            min(batch.sliding_seqused_k),
-            max(batch.sliding_seqused_k),
-        )
-        return "; ".join(
-            (
-                f"sequence_indices={batch.sequence_indices!r}",
-                f"q_lengths={batch.q_lengths!r}",
-                (f"token_indices={cls._bounded_metadata(batch.token_indices)!r}"),
-                f"full_page_table_width={batch.full_page_table_width}",
-                (f"full_page_table={cls._bounded_metadata(batch.full_page_table)!r}"),
-                f"full_seqused_k={batch.full_seqused_k!r}",
-                f"full_seqused_minmax={full_minmax!r}",
-                (
-                    "full_append_slots="
-                    f"{cls._bounded_metadata(batch.full_append_slots)!r}"
-                ),
-                f"sliding_page_table_width={batch.sliding_page_table_width}",
-                (
-                    "sliding_page_table="
-                    f"{cls._bounded_metadata(batch.sliding_page_table)!r}"
-                ),
-                f"sliding_seqused_k={batch.sliding_seqused_k!r}",
-                f"sliding_seqused_minmax={sliding_minmax!r}",
-                (
-                    "sliding_append_slots="
-                    f"{cls._bounded_metadata(batch.sliding_append_slots)!r}"
-                ),
-            )
-        )
-
-    def _check_finite(
-        self,
-        tensor,
-        name: str,
-        *,
-        batch: _DeviceAttentionBatch | None = None,
-        layer_index: int | None = None,
-        layer_type: str | None = None,
-    ) -> None:
-        """Raise at the first bad CUDA boundary when explicitly enabled.
-
-        The flag is checked before any tensor operation, so normal inference
-        never executes ``isfinite`` or introduces a host/device sync.
-        """
-
-        if not self._diagnose_nonfinite:
-            return
-        finite = self._torch.isfinite(tensor)
-        if bool(finite.all().item()):
-            return
-
-        nonfinite = ~finite
-        nonfinite_count = int(nonfinite.sum().item())
-        first_index = tuple(
-            int(index) for index in nonfinite.nonzero(as_tuple=False)[0].tolist()
-        )
-        finite_values = tensor.detach().masked_select(finite)
-        if finite_values.numel():
-            finite_minmax: tuple[float, float] | None = (
-                float(finite_values.min().item()),
-                float(finite_values.max().item()),
-            )
-        else:
-            finite_minmax = None
-
-        phase = "initialization" if batch is None else batch.phase
-        round_index: int | None = None if batch is None else batch.round_index
-        details = [
-            "GPT-OSS CUDA non-finite diagnostic",
-            f"tensor={name}",
-            f"phase={phase}",
-            f"round={round_index}",
-            f"layer={layer_index}",
-            f"layer_type={layer_type}",
-            f"shape={tuple(tensor.shape)!r}",
-            f"dtype={tensor.dtype}",
-            f"nonfinite_count={nonfinite_count}",
-            f"first_nonfinite_index={first_index!r}",
-            f"finite_minmax={finite_minmax!r}",
-        ]
-        if batch is not None:
-            details.append(batch.diagnostic_context)
-        raise FloatingPointError("; ".join(details))
-
-    def _validate_static_finite(self) -> None:
-        """Scan floating model and prepared-MoE weights once in debug mode."""
-
-        if not self._diagnose_nonfinite:
-            return
-        torch = self._torch
-        for name, parameter in self._model.named_parameters():
-            if parameter.is_floating_point():
-                self._check_finite(parameter, f"weight:{name}")
-
-        for layer_index, layer in enumerate(self._model.model.layers):
-            prepared = getattr(layer.mlp.experts, "_prepared_weights", None)
-            for field_name in getattr(prepared, "__slots__", ()):
-                value = getattr(prepared, field_name)
-                if isinstance(value, torch.Tensor) and value.is_floating_point():
-                    self._check_finite(
-                        value,
-                        f"prepared_moe_weight:{field_name}",
-                        layer_index=layer_index,
-                        layer_type=layer.self_attn.layer_type,
-                    )
 
     @property
     def cuda_graph_stats(self) -> dict[str, object]:
@@ -707,8 +554,6 @@ class GptOssCudaRunner:
             return "disabled"
         if prefill_batches:
             return "prefill"
-        if self._diagnose_nonfinite:
-            return "shape"
         if decode_batch is None:
             return "shape"
 
@@ -772,7 +617,6 @@ class GptOssCudaRunner:
         attention_batch = _DeviceAttentionBatch(
             phase="decode",
             round_index=0,
-            diagnostic_context="",
             token_indices=empty_indices(batch_size),
             sequence_indices=empty_indices(batch_size),
             last_token_indices=torch.arange(
@@ -848,7 +692,7 @@ class GptOssCudaRunner:
         for target, source in staged:
             target.copy_(source)
 
-    def _cuda_graph_decode_body(self, state: _CudaGraphDecodeState):
+    def _cuda_graph_decode_body(self, state: _CudaGraphDecodeState) -> None:
         """The complete GPU model step captured for one pure-decode shape."""
 
         batch = state.attention_batch
@@ -858,17 +702,6 @@ class GptOssCudaRunner:
         state.final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
         logits = self._model.lm_head(state.final_hidden)
         self._torch.argmax(logits, dim=-1, out=state.output_ids)
-        return logits
-
-    def _validate_first_forward_logits(self, logits) -> None:
-        if not self._validate_next_logits:
-            return
-        torch = self._torch
-        if not bool(torch.isfinite(logits).all().item()):
-            raise FloatingPointError(
-                "GPT-OSS produced non-finite logits during first-forward validation"
-            )
-        self._validate_next_logits = False
 
     def _validate_cuda_graph_decode_output_ids(
         self, eager_output_ids, replay_output_ids
@@ -896,14 +729,12 @@ class GptOssCudaRunner:
         warmup_stream.wait_stream(current_stream)
         with torch.cuda.stream(warmup_stream), torch.inference_mode():
             for _ in range(_CUDA_GRAPH_WARMUP_STEPS):
-                warmup_logits = self._cuda_graph_decode_body(state)
+                self._cuda_graph_decode_body(state)
             warmup_output_ids = state.output_ids.clone()
         current_stream.wait_stream(warmup_stream)
         self._cuda_graph_warmup_count += _CUDA_GRAPH_WARMUP_STEPS
         entry = self._cuda_graph_decode_registry[shape]
         entry.warmup_count += _CUDA_GRAPH_WARMUP_STEPS
-        self._validate_first_forward_logits(warmup_logits)
-        del warmup_logits
         torch.cuda.synchronize(self.device)
 
         capture_started = perf_counter()
@@ -1436,11 +1267,6 @@ class GptOssCudaRunner:
         return _DeviceAttentionBatch(
             phase=batch.phase,
             round_index=batch.round_index,
-            diagnostic_context=(
-                self._batch_diagnostic_context(batch)
-                if self._diagnose_nonfinite
-                else ""
-            ),
             token_indices=indices(batch.token_indices),
             sequence_indices=indices(batch.sequence_indices),
             last_token_indices=indices(last_token_indices),
@@ -1494,28 +1320,6 @@ class GptOssCudaRunner:
         query = self._apply_yarn_rotary(query, cos, sin)
         key = self._apply_yarn_rotary(key, cos, sin)
         layer_type = attention.layer_type
-        if self._diagnose_nonfinite:
-            self._check_finite(
-                query,
-                "query",
-                batch=batch,
-                layer_index=layer_index,
-                layer_type=layer_type,
-            )
-            self._check_finite(
-                key,
-                "key",
-                batch=batch,
-                layer_index=layer_index,
-                layer_type=layer_type,
-            )
-            self._check_finite(
-                value,
-                "value",
-                batch=batch,
-                layer_index=layer_index,
-                layer_type=layer_type,
-            )
         if query.dtype is not torch.bfloat16:
             raise TypeError("FA4 query tensor must be bfloat16")
         if key.dtype is not torch.bfloat16 or value.dtype is not torch.bfloat16:
@@ -1566,24 +1370,7 @@ class GptOssCudaRunner:
         )
         if output.dtype is not torch.bfloat16:
             raise TypeError("FA4 output tensor must be bfloat16")
-        if self._diagnose_nonfinite:
-            self._check_finite(
-                output,
-                "fa4_output",
-                batch=batch,
-                layer_index=layer_index,
-                layer_type=layer_type,
-            )
-        attention_out = attention.o_proj(output.reshape(1, token_count, -1))
-        if self._diagnose_nonfinite:
-            self._check_finite(
-                attention_out,
-                "attention_out",
-                batch=batch,
-                layer_index=layer_index,
-                layer_type=layer_type,
-            )
-        return attention_out
+        return attention.o_proj(output.reshape(1, token_count, -1))
 
     def _forward_batch(self, token_ids, positions, batch: _DeviceAttentionBatch):
         selected_tokens = token_ids.index_select(0, batch.token_indices)
@@ -1592,20 +1379,9 @@ class GptOssCudaRunner:
         position_embeddings = self._model.model.rotary_emb(
             selected_positions.unsqueeze(0), hidden.dtype
         )
-        if self._diagnose_nonfinite:
-            self._check_finite(hidden, "round_input_hidden", batch=batch)
         for layer_index, layer in enumerate(self._model.model.layers):
-            layer_type = layer.self_attn.layer_type
             residual = hidden
             normalized = layer.input_layernorm(hidden)
-            if self._diagnose_nonfinite:
-                self._check_finite(
-                    normalized,
-                    "normalized_attention_input",
-                    batch=batch,
-                    layer_index=layer_index,
-                    layer_type=layer_type,
-                )
             attention_out = self._attention(
                 layer_index,
                 layer.self_attn,
@@ -1614,45 +1390,11 @@ class GptOssCudaRunner:
                 batch,
             )
             hidden = residual + attention_out
-            if self._diagnose_nonfinite:
-                self._check_finite(
-                    hidden,
-                    "post_attention_residual",
-                    batch=batch,
-                    layer_index=layer_index,
-                    layer_type=layer_type,
-                )
             residual = hidden
             normalized_mlp_input = layer.post_attention_layernorm(hidden)
-            if self._diagnose_nonfinite:
-                self._check_finite(
-                    normalized_mlp_input,
-                    "normalized_mlp_input",
-                    batch=batch,
-                    layer_index=layer_index,
-                    layer_type=layer_type,
-                )
             moe_output = layer.mlp(normalized_mlp_input)
-            if self._diagnose_nonfinite:
-                self._check_finite(
-                    moe_output,
-                    "moe_output",
-                    batch=batch,
-                    layer_index=layer_index,
-                    layer_type=layer_type,
-                )
             hidden = residual + moe_output
-            if self._diagnose_nonfinite:
-                self._check_finite(
-                    hidden,
-                    "post_mlp_hidden",
-                    batch=batch,
-                    layer_index=layer_index,
-                    layer_type=layer_type,
-                )
         hidden = self._model.model.norm(hidden).squeeze(0)
-        if self._diagnose_nonfinite:
-            self._check_finite(hidden, "round_output_hidden", batch=batch)
         return hidden.index_select(0, batch.last_token_indices)
 
     def forward(self, plan: BatchPlan) -> list[int]:
@@ -1678,7 +1420,6 @@ class GptOssCudaRunner:
                 "native attention batches do not cover every plan sequence"
             )
 
-        self.forward_calls += 1
         graph_fallback = self._cuda_graph_fallback_kind(
             plan, prefill_batches, decode_batch
         )
@@ -1708,13 +1449,8 @@ class GptOssCudaRunner:
                     batch = self._tensorize(decode_batch)
                     last_hidden = self._forward_batch(token_ids, positions, batch)
                     final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
-                if self._diagnose_nonfinite:
-                    self._check_finite(final_hidden, "assembled_final_hidden")
                 logits = self._model.lm_head(final_hidden)
-                if self._diagnose_nonfinite:
-                    self._check_finite(logits, "logits")
 
-            self._validate_first_forward_logits(logits)
             return logits.argmax(dim=-1).tolist()
         except BaseException:
             self._synchronize_failed_eager_forward()

@@ -27,8 +27,6 @@ runner = GptOssCudaRunner(
     device=None,
     dtype=None,
     moe_kernel=None,
-    validate_first_logits=False,
-    diagnose_nonfinite=False,
     cuda_graph_decode_shapes=None,
 )
 

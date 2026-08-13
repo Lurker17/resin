@@ -89,27 +89,31 @@ uv run modal run deploy/modal_lfm2.py --mode native-continuation-probe
 ```
 
 Run GPT-OSS from the flat-cache path as follows. The checkpoint step is
-explicit: the smoke path fails closed if the pinned model is not already in
-the Modal volume.
+explicit: GPU modes fail closed if the pinned model and tokenizer are not
+already in the Modal volume.
 
 ```bash
 # Download and validate the pinned 20B checkpoint once.
 uv run modal run deploy/modal_gpt_oss.py --mode download --model 20b
 
-# Run the H100 smoke workload and prewarm its kernel artifacts.
+# Run one prompt on H200. Quote the prompt so Modal receives it as one argument.
 uv run modal run deploy/modal_gpt_oss.py \
-  --mode smoke --model 20b --cache-mode prewarm
+  --mode run --model 120b \
+  --prompt "Explain why batching improves language-model throughput."
 
-# Re-run without changing the saved artifacts.
+# Sweep 8k prompt / 256 output at batch sizes 1,2,8,16,32.
 uv run modal run deploy/modal_gpt_oss.py \
-  --mode smoke --model 20b --cache-mode verify
+  --mode bench --model 120b --cache-mode prewarm
+
+# Re-run the benchmark without changing saved kernel artifacts.
+uv run modal run deploy/modal_gpt_oss.py \
+  --mode bench --model 120b --cache-mode verify
 ```
 
-Use `--model 120b` for the larger checkpoint, and
-`--cache-parent-capacity N` to change the native flat-pool capacity. These
-commands submit the repository's local source into the Modal image; they do
-not require a locally installed CUDA runtime. GPU quota, the pinned model
-volume, and the required FlashInfer/FA4 packages are still required remotely.
+Use `--model 120b` for the larger checkpoint. These commands submit the
+repository's local source into the Modal image; they do not require a locally
+installed CUDA runtime. GPU quota, the pinned model volume, and the required
+FlashInfer/FA4 packages are still required remotely.
 
 ## Minimal use
 

@@ -168,7 +168,6 @@ def _cuda_graph_registry_runner(shapes):
     runner._cuda_graph_shape_fallback_count = 0
     runner._cuda_graph_warmup_count = 0
     runner._cuda_graph_poisoned_error = None
-    runner._diagnose_nonfinite = False
     runner.device = "cuda:0"
     runner._torch = SimpleNamespace(
         cuda=SimpleNamespace(
@@ -215,9 +214,9 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
     def test_runner_exposes_only_the_flat_grouped_cache_path(self) -> None:
         source = inspect.getsource(GptOssCudaRunner)
         self.assertIs(GptOssCudaRunner.supports_continuation_prefill, True)
-        self.assertEqual(GptOssCudaRunner.execution_mode, "flat_cache_fa4_b22")
         self.assertIn("bind_cache_pool", source)
-        self.assertIn("ordered_history_window_groups", source)
+        self.assertIn("CacheGroupLayout(_PAGE_SIZE)", source)
+        self.assertIn('retention="window"', source)
         self.assertIn("plan.cache_groups", source)
 
     def test_cache_pool_binding_is_exact_idempotent_and_permanent(self) -> None:
@@ -476,7 +475,6 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         runner._torch = Torch
         runner.device = "cuda:1"
         runner._cuda_graph_decode_body = lambda state: events.append(("body",))
-        runner._validate_first_forward_logits = lambda logits: None
         runner._validate_cuda_graph_decode_output_ids = lambda *args: None
         state = SimpleNamespace(graph=None, output_ids=OutputIds())
         runner._cuda_graph_decode_registry[(1, 4)].state = state
@@ -843,7 +841,7 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
             output_ids="output_ids",
         )
 
-        self.assertEqual(runner._cuda_graph_decode_body(state), "logits")
+        runner._cuda_graph_decode_body(state)
         self.assertEqual(
             calls,
             [
@@ -992,146 +990,6 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
             "self._window_v_cache = self._history_v_cache",
             source,
         )
-
-    def test_nonfinite_checks_are_opt_in_and_cover_attention_and_moe(self) -> None:
-        class TorchMustNotRun:
-            @staticmethod
-            def isfinite(tensor):
-                del tensor
-                raise AssertionError("normal inference must not check finiteness")
-
-        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        runner._diagnose_nonfinite = False
-        runner._torch = TorchMustNotRun
-        runner._check_finite(object(), "hidden")
-
-        attention_source = inspect.getsource(GptOssCudaRunner._attention)
-        forward_source = inspect.getsource(GptOssCudaRunner._forward_batch)
-        for boundary in (
-            "query",
-            "key",
-            "value",
-            "fa4_output",
-            "attention_out",
-        ):
-            self.assertIn(f'"{boundary}"', attention_source)
-        for boundary in (
-            "round_input_hidden",
-            "normalized_attention_input",
-            "post_attention_residual",
-            "normalized_mlp_input",
-            "moe_output",
-            "post_mlp_hidden",
-            "round_output_hidden",
-        ):
-            self.assertIn(f'"{boundary}"', forward_source)
-
-    def test_nonfinite_error_contains_exact_frozen_batch_context(self) -> None:
-        class Scalar:
-            def __init__(self, value):
-                self.value = value
-
-            def item(self):
-                return self.value
-
-        class FirstIndex:
-            @staticmethod
-            def tolist():
-                return [0, 3]
-
-        class Nonzero:
-            @staticmethod
-            def __getitem__(index):
-                del index
-                return FirstIndex()
-
-        class NonfiniteMask:
-            @staticmethod
-            def sum():
-                return Scalar(1)
-
-            @staticmethod
-            def nonzero(*, as_tuple):
-                assert not as_tuple
-                return Nonzero()
-
-        class FiniteMask:
-            @staticmethod
-            def all():
-                return Scalar(False)
-
-            @staticmethod
-            def __invert__():
-                return NonfiniteMask()
-
-        class FiniteValues:
-            @staticmethod
-            def numel():
-                return 3
-
-            @staticmethod
-            def min():
-                return Scalar(-2.0)
-
-            @staticmethod
-            def max():
-                return Scalar(4.0)
-
-        class Tensor:
-            shape = (2, 4)
-            dtype = "bfloat16"
-
-            def detach(self):
-                return self
-
-            @staticmethod
-            def masked_select(mask):
-                del mask
-                return FiniteValues()
-
-        class FakeTorch:
-            @staticmethod
-            def isfinite(tensor):
-                del tensor
-                return FiniteMask()
-
-        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        runner._diagnose_nonfinite = True
-        runner._torch = FakeTorch
-        batch = SimpleNamespace(
-            phase="prefill",
-            round_index=2,
-            diagnostic_context=(
-                "full_page_table=(0, 1, 2); full_seqused_k=(260,); "
-                "full_seqused_minmax=(260, 260); "
-                "sliding_page_table=(11, 10); sliding_seqused_k=(132,); "
-                "sliding_seqused_minmax=(132, 132)"
-            ),
-        )
-
-        with self.assertRaises(FloatingPointError) as caught:
-            runner._check_finite(
-                Tensor(),
-                "fa4_output",
-                batch=batch,
-                layer_index=7,
-                layer_type="sliding_attention",
-            )
-        message = str(caught.exception)
-        for expected in (
-            "tensor=fa4_output",
-            "phase=prefill",
-            "round=2",
-            "layer=7",
-            "layer_type=sliding_attention",
-            "first_nonfinite_index=(0, 3)",
-            "finite_minmax=(-2.0, 4.0)",
-            "full_page_table=(0, 1, 2)",
-            "full_seqused_k=(260,)",
-            "sliding_page_table=(11, 10)",
-            "sliding_seqused_k=(132,)",
-        ):
-            self.assertIn(expected, message)
 
 
 class GptOssCudaFa4CallTests(unittest.TestCase):

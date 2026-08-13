@@ -311,8 +311,6 @@ class GptOssTorchTests(unittest.TestCase):
         runner.eos_token_id = None
         runner.vocab_size = self.args.vocab_size
         runner._cache = {}
-        runner.forward_calls = 0
-        runner._validate_next_logits = True
 
         model_calls = 0
 
@@ -332,12 +330,8 @@ class GptOssTorchTests(unittest.TestCase):
         )
         first = runner.forward(prefill)
         self.assertEqual(len(first), 2)
-        self.assertFalse(runner._validate_next_logits)
-        self.assertEqual(runner.live_cache_count, 2)
+        self.assertEqual(len(runner._cache), 2)
         self.assertEqual(model_calls, 1)
-        self.assertTrue(runner.physical_batching)
-        self.assertTrue(runner.physical_decode_batching)
-        self.assertEqual(runner.prefill_strategy, "equal_length_chunked_physical_batch")
 
         decode = BatchPlan(
             first,
@@ -354,42 +348,11 @@ class GptOssTorchTests(unittest.TestCase):
         self.assertTrue(all(0 <= token < self.args.vocab_size for token in second))
         self.assertEqual(model_calls, 2)
         runner.release([17])
-        self.assertEqual(runner.live_cache_count, 1)
+        self.assertEqual(len(runner._cache), 1)
         self.assertIn(23, runner._cache)
         runner.release([23])
-        self.assertEqual(runner.live_cache_count, 0)
+        self.assertEqual(len(runner._cache), 0)
         handle.remove()
-
-    def test_runner_first_forward_rejects_nonfinite_logits(self) -> None:
-        from resin import BatchPlan
-        from resin.backends.gpt_oss import GptOssRunner
-
-        runner = GptOssRunner.__new__(GptOssRunner)
-        runner.device = self.torch.device("cpu")
-        runner._torch = self.torch
-        runner._model = self.model
-        runner.config = {"vocab_size": self.args.vocab_size}
-        runner.eos_token_id = None
-        runner.vocab_size = self.args.vocab_size
-        runner.prefill_chunk_size = 128
-        runner._cache = {}
-        runner.forward_calls = 0
-        runner._validate_next_logits = True
-        with self.torch.no_grad():
-            runner._model.lm_head.weight[0, 0] = float("nan")
-
-        plan = BatchPlan(
-            [1, 2],
-            [0, 1],
-            [17],
-            [0, 2],
-            [0],
-            prefill_sequence_indices=[0],
-            decode_sequence_indices=[],
-        )
-        with self.assertRaisesRegex(FloatingPointError, "non-finite logits"):
-            runner.forward(plan)
-        self.assertTrue(runner._validate_next_logits)
 
     def test_runner_chunked_prefill_matches_single_chunk_and_cache_state(self) -> None:
         from resin import BatchPlan
@@ -405,7 +368,6 @@ class GptOssTorchTests(unittest.TestCase):
             runner.vocab_size = self.args.vocab_size
             runner.prefill_chunk_size = chunk_size
             runner._cache = {}
-            runner.forward_calls = 0
             return runner
 
         plan = BatchPlan(
@@ -423,8 +385,8 @@ class GptOssTorchTests(unittest.TestCase):
         expected = single_chunk.forward(plan)
         actual = chunked.forward(plan)
         self.assertEqual(actual, expected)
-        self.assertEqual(single_chunk.live_cache_count, 2)
-        self.assertEqual(chunked.live_cache_count, 2)
+        self.assertEqual(len(single_chunk._cache), 2)
+        self.assertEqual(len(chunked._cache), 2)
         for request_id in plan.sequence_ids:
             expected_cache = single_chunk._cache[request_id]
             actual_cache = chunked._cache[request_id]
@@ -452,8 +414,8 @@ class GptOssTorchTests(unittest.TestCase):
         self.assertEqual(chunked.forward(decode), single_chunk.forward(decode))
         single_chunk.release([17, 23])
         chunked.release([17, 23])
-        self.assertEqual(single_chunk.live_cache_count, 0)
-        self.assertEqual(chunked.live_cache_count, 0)
+        self.assertEqual(len(single_chunk._cache), 0)
+        self.assertEqual(len(chunked._cache), 0)
 
     def test_runner_executes_one_model_call_per_plan(self) -> None:
         from resin import BatchPlan
@@ -468,7 +430,6 @@ class GptOssTorchTests(unittest.TestCase):
         runner.vocab_size = self.args.vocab_size
         runner.prefill_chunk_size = 2
         runner._cache = {}
-        runner.forward_calls = 0
 
         model_calls = 0
 
@@ -521,7 +482,6 @@ class GptOssTorchTests(unittest.TestCase):
         runner.eos_token_id = None
         runner.vocab_size = self.args.vocab_size
         runner._cache = {}
-        runner.forward_calls = 0
         plan = BatchPlan(
             [1, 2, 8],
             [0, 1, 0],
@@ -534,7 +494,7 @@ class GptOssTorchTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "equal token counts"):
             runner.forward(plan)
-        self.assertEqual(runner.live_cache_count, 0)
+        self.assertEqual(len(runner._cache), 0)
 
     def test_mxfp4_checkpoint_has_precise_kernel_boundary_error(self) -> None:
         from resin.backends.gpt_oss import _load_model
