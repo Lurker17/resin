@@ -17,7 +17,7 @@ from .._common import (
     resolve_model,
 )
 from .config import GptOssConfig
-from .model import GptOssState, make_model_class
+from .model import GptOssForCausalLM, GptOssState
 
 if TYPE_CHECKING:
     from resin import BatchPlan
@@ -106,9 +106,8 @@ def load_model(model_path: Path, *, device, dtype=None, moe_kernel=None):
 
     target = torch.device(device)
     load_target = target if target.type in {"cpu", "cuda"} else torch.device("cpu")
-    model_class = make_model_class(torch)
     with torch.device("meta"):
-        model = model_class(args)
+        model = GptOssForCausalLM(args)
 
     weights = load_safetensor_shards(model_path, device=load_target, backend="GPT-OSS")
     model.load_state_dict(weights, strict=True, assign=True)

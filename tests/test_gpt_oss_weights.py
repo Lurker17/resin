@@ -298,7 +298,7 @@ class GptOssWeightLoaderTests(unittest.TestCase):
         from safetensors import safe_open as real_safe_open
         from safetensors.torch import save_file
 
-        from resin.backends.gpt_oss import weights as gpt_oss_weights
+        import resin.backends.gpt_oss.weights as gpt_oss_weights
 
         class Builder:
             def expected_tensor_names(self, layer_index, config):

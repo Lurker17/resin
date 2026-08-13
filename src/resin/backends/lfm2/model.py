@@ -1,299 +1,272 @@
-# Portions of the model implementation are adapted from Hugging Face Transformers.
-# Copyright 2025 The HuggingFace Team. Licensed under Apache-2.0.
+# Portions are adapted from Hugging Face Transformers (Apache-2.0).
 
-"""Tokenizer-free LFM2 model and request-owned recurrent state."""
+"""LFM2 modules and the three pieces of request-owned model state."""
 
 from __future__ import annotations
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
 
 from .config import Lfm2Config
 
 
 class FullAttentionState:
-    """Growing full-attention state for one request and one layer."""
+    """All keys and values produced by one full-attention layer."""
 
-    def __init__(self, torch) -> None:
-        self._torch = torch
-        self.keys = None
-        self.values = None
+    def __init__(self) -> None:
+        self.keys: Tensor | None = None
+        self.values: Tensor | None = None
 
     @property
-    def offset(self) -> int:
+    def length(self) -> int:
         return 0 if self.keys is None else self.keys.shape[-2]
 
-    def update_and_fetch(self, keys, values):
+    def append(self, keys: Tensor, values: Tensor) -> tuple[Tensor, Tensor]:
         if self.keys is None:
-            self.keys = keys
-            self.values = values
+            self.keys, self.values = keys, values
         else:
-            self.keys = self._torch.cat((self.keys, keys), dim=-2)
-            self.values = self._torch.cat((self.values, values), dim=-2)
+            self.keys = torch.cat((self.keys, keys), dim=-2)
+            self.values = torch.cat((self.values, values), dim=-2)
         return self.keys, self.values
 
 
-class ShortConvState:
-    """Fixed-size recurrent state for one short-convolution layer."""
+class RecurrentState:
+    """The fixed-width history consumed by one short-convolution layer."""
 
     def __init__(self) -> None:
-        self.state = None
+        self.value: Tensor | None = None
+
+
+LayerState = FullAttentionState | RecurrentState
 
 
 class Lfm2State:
-    """Per-request state with an explicit representation for each layer kind."""
+    """One request's ordered full-attention and recurrent layer state."""
 
-    def __init__(self, torch, layer_types: tuple[str, ...]) -> None:
-        self.layers = [
-            FullAttentionState(torch)
-            if layer_type == "full_attention"
-            else ShortConvState()
+    def __init__(self, layer_types: tuple[str, ...]) -> None:
+        self.layers: list[LayerState] = [
+            FullAttentionState() if layer_type == "full_attention" else RecurrentState()
             for layer_type in layer_types
         ]
-        self.offset = 0
+        self.length = 0
 
 
-def make_model_class(torch):
-    """Create the module hierarchy lazily, without importing torch at module import."""
+class RMSNorm(nn.Module):
+    def __init__(self, width: int, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(width))
+        self.eps = eps
 
-    nn = torch.nn
-    functional = torch.nn.functional
+    def forward(self, hidden: Tensor) -> Tensor:
+        dtype = hidden.dtype
+        normalized = hidden.float()
+        normalized *= torch.rsqrt(normalized.square().mean(-1, keepdim=True) + self.eps)
+        return self.weight * normalized.to(dtype)
 
-    class RMSNorm(nn.Module):
-        def __init__(self, hidden_size: int, eps: float) -> None:
-            super().__init__()
-            self.weight = nn.Parameter(torch.ones(hidden_size))
-            self.variance_epsilon = eps
 
-        def forward(self, hidden):
-            input_dtype = hidden.dtype
-            normalized = hidden.float()
-            variance = normalized.square().mean(dim=-1, keepdim=True)
-            normalized = normalized * torch.rsqrt(variance + self.variance_epsilon)
-            return self.weight * normalized.to(input_dtype)
+def _rotate_half(hidden: Tensor) -> Tensor:
+    first, second = hidden.chunk(2, dim=-1)
+    return torch.cat((-second, first), dim=-1)
 
-    def rotate_half(hidden):
-        first, second = hidden.chunk(2, dim=-1)
-        return torch.cat((-second, first), dim=-1)
 
-    class Attention(nn.Module):
-        def __init__(self, args: Lfm2Config) -> None:
-            super().__init__()
-            dim = args.hidden_size
-            self.num_heads = args.num_attention_heads
-            self.num_kv_heads = args.num_key_value_heads
-            self.num_kv_groups = self.num_heads // self.num_kv_heads
-            self.head_dim = dim // self.num_heads
-            self.scale = self.head_dim**-0.5
-            self.rope_theta = args.rope_theta
-            self.q_layernorm = RMSNorm(self.head_dim, args.norm_eps)
-            self.k_layernorm = RMSNorm(self.head_dim, args.norm_eps)
-            self.q_proj = nn.Linear(dim, self.num_heads * self.head_dim, bias=False)
-            self.k_proj = nn.Linear(dim, self.num_kv_heads * self.head_dim, bias=False)
-            self.v_proj = nn.Linear(dim, self.num_kv_heads * self.head_dim, bias=False)
-            self.out_proj = nn.Linear(self.num_heads * self.head_dim, dim, bias=False)
-            self.register_buffer(
-                "inv_freq",
-                self._make_inv_freq(self.q_proj.weight.device),
-                persistent=False,
+class Attention(nn.Module):
+    def __init__(self, config: Lfm2Config) -> None:
+        super().__init__()
+        width = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.kv_groups = self.num_heads // self.num_kv_heads
+        self.head_dim = width // self.num_heads
+        self.scale = self.head_dim**-0.5
+        self.rope_theta = config.rope_theta
+        self.q_layernorm = RMSNorm(self.head_dim, config.norm_eps)
+        self.k_layernorm = RMSNorm(self.head_dim, config.norm_eps)
+        self.q_proj = nn.Linear(width, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(width, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(width, self.num_kv_heads * self.head_dim, bias=False)
+        self.out_proj = nn.Linear(self.num_heads * self.head_dim, width, bias=False)
+        self.register_buffer(
+            "inv_freq", self._frequencies(self.q_proj.weight.device), persistent=False
+        )
+
+    def _frequencies(self, device) -> Tensor:
+        exponents = torch.arange(
+            0, self.head_dim, 2, device=device, dtype=torch.float32
+        )
+        return 1.0 / self.rope_theta ** (exponents / self.head_dim)
+
+    def materialize(self, device) -> None:
+        self.inv_freq = self._frequencies(device)
+
+    def forward(
+        self, hidden: Tensor, positions: Tensor, state: FullAttentionState
+    ) -> Tensor:
+        batch, length, _ = hidden.shape
+        queries = self.q_proj(hidden).view(batch, length, self.num_heads, self.head_dim)
+        keys = self.k_proj(hidden).view(batch, length, self.num_kv_heads, self.head_dim)
+        values = self.v_proj(hidden).view(
+            batch, length, self.num_kv_heads, self.head_dim
+        )
+        queries = self.q_layernorm(queries).transpose(1, 2)
+        keys = self.k_layernorm(keys).transpose(1, 2)
+        values = values.transpose(1, 2)
+
+        angles = torch.einsum("bl,d->bld", positions.float(), self.inv_freq.float())
+        angles = torch.cat((angles, angles), dim=-1)
+        cos = angles.cos().to(queries.dtype).unsqueeze(1)
+        sin = angles.sin().to(queries.dtype).unsqueeze(1)
+        queries = queries * cos + _rotate_half(queries) * sin
+        keys = keys * cos + _rotate_half(keys) * sin
+
+        previous = state.length
+        keys, values = state.append(keys, values)
+        keys = keys.repeat_interleave(self.kv_groups, dim=1)
+        values = values.repeat_interleave(self.kv_groups, dim=1)
+        mask = None
+        if length > 1:
+            query_positions = torch.arange(
+                previous, previous + length, device=hidden.device
             )
+            key_positions = torch.arange(keys.shape[-2], device=hidden.device)
+            mask = key_positions[None, :] <= query_positions[:, None]
+        output = F.scaled_dot_product_attention(
+            queries, keys, values, attn_mask=mask, dropout_p=0.0, scale=self.scale
+        )
+        output = output.transpose(1, 2).contiguous().view(batch, length, -1)
+        return self.out_proj(output)
 
-        def _make_inv_freq(self, device):
-            exponents = torch.arange(
-                0, self.head_dim, 2, device=device, dtype=torch.float32
+
+class ShortConv(nn.Module):
+    def __init__(self, config: Lfm2Config) -> None:
+        super().__init__()
+        self.width = config.hidden_size
+        self.state_length = config.conv_cache_length - 1
+        self.conv = nn.Conv1d(
+            self.width,
+            self.width,
+            kernel_size=config.conv_cache_length,
+            groups=self.width,
+            bias=config.conv_bias,
+        )
+        self.in_proj = nn.Linear(self.width, 3 * self.width, bias=config.conv_bias)
+        self.out_proj = nn.Linear(self.width, self.width, bias=config.conv_bias)
+
+    def forward(self, hidden: Tensor, state: RecurrentState) -> Tensor:
+        gate_b, gate_c, value = self.in_proj(hidden).chunk(3, dim=-1)
+        gated = (gate_b * value).transpose(1, 2)
+        previous = state.value
+        if previous is None:
+            previous = gated.new_zeros(
+                gated.shape[0], gated.shape[1], self.state_length
             )
-            return 1.0 / (self.rope_theta ** (exponents / self.head_dim))
+        convolution_input = torch.cat((previous, gated), dim=-1)
+        state.value = (
+            convolution_input[..., -self.state_length :]
+            if self.state_length
+            else convolution_input[..., :0]
+        )
+        output = F.conv1d(
+            convolution_input, self.conv.weight, self.conv.bias, groups=self.width
+        )
+        return self.out_proj(gate_c * output.transpose(1, 2))
 
-        def materialize_rope(self, device) -> None:
-            self.inv_freq = self._make_inv_freq(device)
 
-        def _apply_rope(self, queries, keys, positions):
-            frequencies = torch.einsum(
-                "bl,d->bld", positions.float(), self.inv_freq.float()
+class MLP(nn.Module):
+    def __init__(self, config: Lfm2Config) -> None:
+        super().__init__()
+        size = config.intermediate_size
+        if config.auto_adjust_ff_dim:
+            size = int(config.ffn_dim_multiplier * int(2 * size / 3))
+            size = config.multiple_of * (
+                (size + config.multiple_of - 1) // config.multiple_of
             )
-            embeddings = torch.cat((frequencies, frequencies), dim=-1)
-            cos = embeddings.cos().to(queries.dtype).unsqueeze(1)
-            sin = embeddings.sin().to(queries.dtype).unsqueeze(1)
-            queries = (queries * cos) + (rotate_half(queries) * sin)
-            keys = (keys * cos) + (rotate_half(keys) * sin)
-            return queries, keys
+        self.w1 = nn.Linear(config.hidden_size, size, bias=False)
+        self.w3 = nn.Linear(config.hidden_size, size, bias=False)
+        self.w2 = nn.Linear(size, config.hidden_size, bias=False)
 
-        def forward(self, hidden, positions, cache: FullAttentionState):
-            batch, length, _ = hidden.shape
-            queries = self.q_proj(hidden).view(
-                batch, length, self.num_heads, self.head_dim
-            )
-            keys = self.k_proj(hidden).view(
-                batch, length, self.num_kv_heads, self.head_dim
-            )
-            values = self.v_proj(hidden).view(
-                batch, length, self.num_kv_heads, self.head_dim
-            )
-            queries = self.q_layernorm(queries).transpose(1, 2)
-            keys = self.k_layernorm(keys).transpose(1, 2)
-            values = values.transpose(1, 2)
-            queries, keys = self._apply_rope(queries, keys, positions)
+    def forward(self, hidden: Tensor) -> Tensor:
+        return self.w2(F.silu(self.w1(hidden)) * self.w3(hidden))
 
-            previous = cache.offset
-            keys, values = cache.update_and_fetch(keys, values)
-            keys = keys.repeat_interleave(self.num_kv_groups, dim=1)
-            values = values.repeat_interleave(self.num_kv_groups, dim=1)
 
-            attention_mask = None
-            if length > 1:
-                query_positions = torch.arange(
-                    previous, previous + length, device=hidden.device
-                )
-                key_positions = torch.arange(keys.shape[-2], device=hidden.device)
-                attention_mask = key_positions[None, :] <= query_positions[:, None]
-            output = functional.scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-                scale=self.scale,
-            )
-            output = output.transpose(1, 2).contiguous().view(batch, length, -1)
-            return self.out_proj(output)
+class DecoderLayer(nn.Module):
+    def __init__(self, config: Lfm2Config, layer_type: str) -> None:
+        super().__init__()
+        self.is_attention_layer = layer_type == "full_attention"
+        if self.is_attention_layer:
+            self.self_attn = Attention(config)
+        else:
+            self.conv = ShortConv(config)
+        self.feed_forward = MLP(config)
+        self.operator_norm = RMSNorm(config.hidden_size, config.norm_eps)
+        self.ffn_norm = RMSNorm(config.hidden_size, config.norm_eps)
 
-    class ShortConv(nn.Module):
-        def __init__(self, args: Lfm2Config) -> None:
-            super().__init__()
-            self.hidden_size = args.hidden_size
-            self.cache_length = args.conv_cache_length
-            self.conv = nn.Conv1d(
-                args.hidden_size,
-                args.hidden_size,
-                kernel_size=self.cache_length,
-                groups=args.hidden_size,
-                bias=args.conv_bias,
-                padding=0,
-            )
-            self.in_proj = nn.Linear(
-                args.hidden_size, 3 * args.hidden_size, bias=args.conv_bias
-            )
-            self.out_proj = nn.Linear(
-                args.hidden_size, args.hidden_size, bias=args.conv_bias
-            )
+    def forward(self, hidden: Tensor, positions: Tensor, state: LayerState) -> Tensor:
+        normalized = self.operator_norm(hidden)
+        if self.is_attention_layer:
+            hidden = hidden + self.self_attn(normalized, positions, state)
+        else:
+            hidden = hidden + self.conv(normalized, state)
+        return hidden + self.feed_forward(self.ffn_norm(hidden))
 
-        def forward(self, hidden, cache: ShortConvState):
-            gate_b, gate_c, value = self.in_proj(hidden).chunk(3, dim=-1)
-            gated = (gate_b * value).transpose(1, 2)
-            if cache.state is None:
-                state = gated.new_zeros(
-                    gated.shape[0], gated.shape[1], self.cache_length - 1
-                )
-            else:
-                state = cache.state
-            convolution_input = torch.cat((state, gated), dim=-1)
-            if self.cache_length > 1:
-                cache.state = convolution_input[..., -(self.cache_length - 1) :]
-            else:
-                cache.state = convolution_input[..., :0]
-            output = functional.conv1d(
-                convolution_input,
-                self.conv.weight,
-                self.conv.bias,
-                groups=self.hidden_size,
-            )
-            return self.out_proj(gate_c * output.transpose(1, 2))
 
-    class MLP(nn.Module):
-        def __init__(self, args: Lfm2Config) -> None:
-            super().__init__()
-            size = args.intermediate_size
-            if args.auto_adjust_ff_dim:
-                size = int(2 * size / 3)
-                size = int(args.ffn_dim_multiplier * size)
-                size = args.multiple_of * (
-                    (size + args.multiple_of - 1) // args.multiple_of
-                )
-            self.w1 = nn.Linear(args.hidden_size, size, bias=False)
-            self.w3 = nn.Linear(args.hidden_size, size, bias=False)
-            self.w2 = nn.Linear(size, args.hidden_size, bias=False)
+class Lfm2Model(nn.Module):
+    def __init__(self, config: Lfm2Config) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
+        )
+        self.layers = nn.ModuleList(
+            DecoderLayer(config, layer_type) for layer_type in config.layer_types
+        )
+        self.embedding_norm = RMSNorm(config.hidden_size, config.norm_eps)
 
-        def forward(self, hidden):
-            return self.w2(functional.silu(self.w1(hidden)) * self.w3(hidden))
+    def forward(self, tokens: Tensor, positions: Tensor, state: Lfm2State) -> Tensor:
+        hidden = self.embed_tokens(tokens)
+        for layer, layer_state in zip(self.layers, state.layers, strict=True):
+            hidden = layer(hidden, positions, layer_state)
+        return self.embedding_norm(hidden)
 
-    class DecoderLayer(nn.Module):
-        def __init__(self, args: Lfm2Config, layer_type: str) -> None:
-            super().__init__()
-            self.is_attention_layer = layer_type == "full_attention"
-            if self.is_attention_layer:
-                self.self_attn = Attention(args)
-            else:
-                self.conv = ShortConv(args)
-            self.feed_forward = MLP(args)
-            self.operator_norm = RMSNorm(args.hidden_size, args.norm_eps)
-            self.ffn_norm = RMSNorm(args.hidden_size, args.norm_eps)
 
-        def forward(self, hidden, positions, cache):
-            normalized = self.operator_norm(hidden)
-            if self.is_attention_layer:
-                residual = self.self_attn(normalized, positions, cache)
-            else:
-                residual = self.conv(normalized, cache)
-            hidden = hidden + residual
-            return hidden + self.feed_forward(self.ffn_norm(hidden))
+class Lfm2ForCausalLM(nn.Module):
+    def __init__(self, config: Lfm2Config) -> None:
+        super().__init__()
+        self.config = config
+        self.args = config
+        self.model = Lfm2Model(config)
 
-    class Backbone(nn.Module):
-        def __init__(self, args: Lfm2Config) -> None:
-            super().__init__()
-            self.embed_tokens = nn.Embedding(
-                args.vocab_size, args.hidden_size, padding_idx=args.pad_token_id
-            )
-            self.layers = nn.ModuleList(
-                [DecoderLayer(args, layer_type) for layer_type in args.layer_types]
-            )
-            self.embedding_norm = RMSNorm(args.hidden_size, args.norm_eps)
+    def make_cache(self) -> Lfm2State:
+        return Lfm2State(self.config.layer_types)
 
-        def forward(self, inputs, positions, cache: Lfm2State):
-            hidden = self.embed_tokens(inputs)
-            for layer, layer_cache in zip(self.layers, cache.layers, strict=True):
-                hidden = layer(hidden, positions, layer_cache)
-            return self.embedding_norm(hidden)
+    def materialize_buffers(self, device) -> None:
+        for module in self.modules():
+            if isinstance(module, Attention):
+                module.materialize(device)
 
-    class Lfm2ForCausalLM(nn.Module):
-        def __init__(self, args: Lfm2Config) -> None:
-            super().__init__()
-            self.args = args
-            self.model = Backbone(args)
-
-        def make_cache(self) -> Lfm2State:
-            return Lfm2State(torch, self.args.layer_types)
-
-        def materialize_buffers(self, device) -> None:
-            for module in self.modules():
-                if isinstance(module, Attention):
-                    module.materialize_rope(device)
-
-        def forward(
-            self,
-            inputs,
-            cache: Lfm2State | None = None,
-            positions=None,
-            *,
-            logits_to_keep: int | None = None,
-        ):
-            if inputs.ndim != 2:
-                raise ValueError("inputs must have shape [batch, sequence]")
-            if inputs.shape[0] != 1:
-                raise ValueError("a physical request cache holds exactly one sequence")
-            if cache is None:
-                cache = self.make_cache()
-            if positions is None:
-                positions = torch.arange(
-                    cache.offset,
-                    cache.offset + inputs.shape[1],
-                    dtype=torch.long,
-                    device=inputs.device,
-                ).unsqueeze(0)
-            if positions.shape != inputs.shape:
-                raise ValueError("positions must have the same shape as inputs")
-            hidden = self.model(inputs, positions, cache)
-            cache.offset += inputs.shape[1]
-            if logits_to_keep is not None:
-                if logits_to_keep <= 0:
-                    raise ValueError("logits_to_keep must be positive")
-                hidden = hidden[:, -logits_to_keep:, :]
-            return functional.linear(hidden, self.model.embed_tokens.weight)
-
-    return Lfm2ForCausalLM
+    def forward(
+        self,
+        tokens: Tensor,
+        state: Lfm2State | None = None,
+        positions: Tensor | None = None,
+        *,
+        logits_to_keep: int | None = None,
+    ) -> Tensor:
+        if tokens.ndim != 2 or tokens.shape[0] != 1:
+            raise ValueError("tokens must contain exactly one sequence")
+        state = self.make_cache() if state is None else state
+        if positions is None:
+            positions = torch.arange(
+                state.length,
+                state.length + tokens.shape[1],
+                dtype=torch.long,
+                device=tokens.device,
+            ).unsqueeze(0)
+        if positions.shape != tokens.shape:
+            raise ValueError("positions must have the same shape as tokens")
+        hidden = self.model(tokens, positions, state)
+        state.length += tokens.shape[1]
+        if logits_to_keep is not None:
+            if logits_to_keep <= 0:
+                raise ValueError("logits_to_keep must be positive")
+            hidden = hidden[:, -logits_to_keep:]
+        return F.linear(hidden, self.model.embed_tokens.weight)

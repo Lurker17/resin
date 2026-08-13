@@ -3,8 +3,6 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import math
-import subprocess
-import sys
 import unittest
 from types import SimpleNamespace
 
@@ -13,6 +11,7 @@ from resin.backends.gpt_oss.cuda import (
     GptOssCudaRunner,
     _invoke_fa4_b22,
 )
+from resin.backends.gpt_oss.plan import build_attention_batches
 
 
 def _group_plan(group_index, rows, first_logical_blocks, positions, indptr):
@@ -114,25 +113,19 @@ def _decode_plan():
     )
 
 
-class GptOssCudaImportTests(unittest.TestCase):
-    def test_import_is_lazy(self) -> None:
-        script = """
-import sys
-import resin.backends.gpt_oss.cuda
-for name in ('torch', 'flash_attn', 'flashinfer', 'transformers', 'tokenizers'):
-    assert name not in sys.modules, name
-"""
-        subprocess.run([sys.executable, "-c", script], check=True)
-
-
 class GptOssCudaNativePlanTests(unittest.TestCase):
+    def test_cuda_graphs_are_an_explicit_decode_capability(self) -> None:
+        parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
+        self.assertIn("cuda_graph_decode_shapes", parameters)
+        self.assertTrue(hasattr(GptOssCudaRunner, "cuda_graph_stats"))
+
     def test_runner_exposes_only_the_flat_grouped_cache_path(self) -> None:
         source = inspect.getsource(GptOssCudaRunner)
         self.assertIs(GptOssCudaRunner.supports_continuation_prefill, True)
         self.assertIn("bind_cache_pool", source)
         self.assertIn("CacheGroupLayout(_PAGE_SIZE)", source)
         self.assertIn('retention="window"', source)
-        self.assertIn("plan.cache_groups", source)
+        self.assertIn("build_attention_batches", source)
 
     def test_cache_pool_binding_is_exact_idempotent_and_permanent(self) -> None:
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
@@ -166,52 +159,60 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
             runner._validate_plan_binding(_flat_plan([0], [1], cache_pool_id=42))
 
     def test_prefill_tables_are_derived_from_history_and_window_csr(self) -> None:
-        batches, decode = GptOssCudaRunner._attention_batches(_prefill_plan())
+        batches, decode = build_attention_batches(_prefill_plan())
 
         self.assertIsNone(decode)
         self.assertEqual(len(batches), 1)
         batch = batches[0]
-        self.assertEqual((batch.phase, batch.round_index), (BatchPhase.PREFILL, 0))
+        self.assertEqual(batch.phase, BatchPhase.PREFILL)
         self.assertEqual(batch.sequence_indices, (0, 1))
-        self.assertEqual(batch.q_lengths, (128, 5))
+        self.assertEqual(batch.query_lengths, (128, 5))
         self.assertEqual(batch.token_indices[:3], (0, 1, 2))
         self.assertEqual(batch.token_indices[-3:], (130, 131, 132))
-        self.assertEqual(batch.full_page_table_width, 2)
-        self.assertEqual(batch.full_page_table, (1, 1, 17, 18))
-        self.assertEqual(batch.full_seqused_k, (128, 135))
-        self.assertEqual(batch.sliding_page_table_width, 2)
-        self.assertEqual(batch.sliding_page_table, (129, 129, 145, 146))
-        self.assertEqual(batch.sliding_seqused_k, (128, 135))
+        self.assertEqual(batch.full_width, 2)
+        self.assertEqual(batch.full_table, (1, 1, 17, 18))
+        self.assertEqual(batch.full_lengths, (128, 135))
+        self.assertEqual(batch.sliding_width, 2)
+        self.assertEqual(batch.sliding_table, (129, 129, 145, 146))
+        self.assertEqual(batch.sliding_lengths, (128, 135))
         self.assertEqual(batch.full_append_slots[0], 128)
         self.assertEqual(batch.full_append_slots[-1], 18 * 128 + 6)
         self.assertEqual(batch.sliding_append_slots[-1], 146 * 128 + 6)
 
     def test_one_token_continuation_remains_explicit_prefill(self) -> None:
         plan = _flat_plan([260], [1])
-        prefill, decode = GptOssCudaRunner._attention_batches(plan)
+        prefill, decode = build_attention_batches(plan)
 
         self.assertIsNone(decode)
         self.assertEqual(len(prefill), 1)
         batch = prefill[0]
-        self.assertEqual(batch.q_lengths, (1,))
+        self.assertEqual(batch.query_lengths, (1,))
         self.assertEqual(batch.token_indices, (0,))
-        self.assertEqual(batch.full_page_table, (1, 2, 3))
-        self.assertEqual(batch.full_seqused_k, (261,))
-        self.assertEqual(batch.sliding_page_table, (130, 129))
-        self.assertEqual(batch.sliding_seqused_k, (133,))
+        self.assertEqual(batch.full_table, (1, 2, 3))
+        self.assertEqual(batch.full_lengths, (261,))
+        self.assertEqual(batch.sliding_table, (130, 129))
+        self.assertEqual(batch.sliding_lengths, (133,))
+
+    def test_graph_padding_repeats_only_pages_owned_by_each_row(self) -> None:
+        _, batch = build_attention_batches(_decode_plan())
+        assert batch is not None
+        self.assertEqual(
+            GptOssCudaRunner._pad_page_table(batch, 4),
+            (1, 2, 1, 1, 17, 18, 19, 17),
+        )
 
     def test_decode_tables_and_append_slots_come_from_sparse_groups(self) -> None:
-        batch = GptOssCudaRunner._decode_batch(_decode_plan())
+        _, batch = build_attention_batches(_decode_plan())
 
         self.assertIsNotNone(batch)
         assert batch is not None
         self.assertEqual(batch.sequence_indices, (0, 1))
-        self.assertEqual(batch.q_lengths, (1, 1))
-        self.assertEqual(batch.full_page_table_width, 3)
-        self.assertEqual(batch.full_page_table, (1, 2, 1, 17, 18, 19))
-        self.assertEqual(batch.full_seqused_k, (131, 261))
-        self.assertEqual(batch.sliding_page_table, (129, 130, 146, 145))
-        self.assertEqual(batch.sliding_seqused_k, (131, 133))
+        self.assertEqual(batch.query_lengths, (1, 1))
+        self.assertEqual(batch.full_width, 3)
+        self.assertEqual(batch.full_table, (1, 2, 1, 17, 18, 19))
+        self.assertEqual(batch.full_lengths, (131, 261))
+        self.assertEqual(batch.sliding_table, (129, 130, 146, 145))
+        self.assertEqual(batch.sliding_lengths, (131, 133))
         self.assertEqual(batch.full_append_slots, (2 * 128 + 2, 19 * 128 + 4))
         self.assertEqual(
             batch.sliding_append_slots,
@@ -222,33 +223,33 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         plan = _prefill_plan()
         plan.cache_groups[1].append_block_ids[0] += 1
         with self.assertRaisesRegex(ValueError, "append destinations"):
-            GptOssCudaRunner._attention_batches(plan)
+            build_attention_batches(plan)
 
     def test_group_order_suffix_and_parent_ownership_fail_closed(self) -> None:
         plan = _prefill_plan()
         plan.cache_groups[0].group_index = 1
         with self.assertRaisesRegex(ValueError, "ordered"):
-            GptOssCudaRunner._attention_batches(plan)
+            build_attention_batches(plan)
 
         plan = _flat_plan([260], [1])
         plan.cache_groups[1].first_logical_blocks[0] = 0
         with self.assertRaisesRegex(ValueError, "active suffix"):
-            GptOssCudaRunner._attention_batches(plan)
+            build_attention_batches(plan)
 
         plan = _flat_plan([0], [1])
         plan.cache_groups[1].block_ids[0] = plan.cache_groups[0].block_ids[0]
         plan.cache_groups[1].append_block_ids[0] = plan.cache_groups[0].block_ids[0]
-        with self.assertRaisesRegex(ValueError, "cannot be interpreted"):
-            GptOssCudaRunner._attention_batches(plan)
+        with self.assertRaisesRegex(ValueError, "cannot address"):
+            build_attention_batches(plan)
 
         plan = _flat_plan([0], [1])
         with self.assertRaisesRegex(ValueError, "outside"):
-            GptOssCudaRunner._attention_batches(plan, parent_capacity=64)
+            build_attention_batches(plan, parent_capacity=64)
 
     def test_window_prefill_boundary_is_validated_before_device_work(self) -> None:
         plan = _flat_plan([127], [2])
         with self.assertRaisesRegex(ValueError, "within one logical"):
-            GptOssCudaRunner._attention_batches(plan)
+            build_attention_batches(plan)
 
     def test_failed_eager_work_must_quiesce_or_be_post_accept(self) -> None:
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
@@ -337,6 +338,27 @@ class GptOssCudaFa4CallTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
 class GptOssCudaTinyOracleTests(unittest.TestCase):
+    def test_graph_body_restores_rust_sequence_order_before_sampling(self) -> None:
+        import torch
+
+        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
+        runner._torch = torch
+        runner._model = SimpleNamespace(lm_head=lambda hidden: hidden)
+        runner._forward_batch = lambda *_args: torch.tensor(
+            [[0.0, 5.0, 1.0], [4.0, 0.0, 1.0]]
+        )
+        state = SimpleNamespace(
+            token_ids=torch.empty(2, dtype=torch.long),
+            positions=torch.empty(2, dtype=torch.long),
+            batch=SimpleNamespace(sequence_indices=torch.tensor([1, 0])),
+            final_hidden=torch.empty(2, 3),
+            output_ids=torch.empty(2, dtype=torch.long),
+        )
+
+        runner._graph_body(state)
+
+        self.assertEqual(state.output_ids.tolist(), [0, 1])
+
     def test_rotary_path_matches_reference_formula_without_dtype_promotion(
         self,
     ) -> None:

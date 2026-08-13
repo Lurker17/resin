@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 def _tiny_args():
-    from resin.backends.lfm2 import Lfm2Config
+    from resin.backends.lfm2.config import Lfm2Config
 
     return Lfm2Config(
         vocab_size=64,
@@ -42,7 +42,7 @@ for name in ('torch', 'transformers', 'tokenizers', 'huggingface_hub', 'safetens
         subprocess.run([sys.executable, "-c", script], check=True)
 
     def test_args_reject_non_lfm_checkpoint(self) -> None:
-        from resin.backends.lfm2 import Lfm2Config
+        from resin.backends.lfm2.config import Lfm2Config
 
         with self.assertRaisesRegex(ValueError, "expected an LFM2"):
             Lfm2Config.from_dict({"model_type": "llama"})
@@ -53,12 +53,12 @@ class Lfm2TorchTests(unittest.TestCase):
     def setUp(self) -> None:
         import torch
 
-        from resin.backends.lfm2 import make_model_class
+        from resin.backends.lfm2.model import Lfm2ForCausalLM
 
         torch.manual_seed(7)
         self.torch = torch
         self.args = _tiny_args()
-        self.model = make_model_class(torch)(self.args).eval()
+        self.model = Lfm2ForCausalLM(self.args).eval()
 
     def test_cached_chunks_match_full_forward(self) -> None:
         torch = self.torch
@@ -73,9 +73,17 @@ class Lfm2TorchTests(unittest.TestCase):
                     full[:, split:], cached, rtol=1e-5, atol=1e-5
                 )
 
+    def test_checkpoint_parameter_paths_match_the_released_layout(self) -> None:
+        keys = set(self.model.state_dict())
+        self.assertIn("model.layers.0.conv.in_proj.weight", keys)
+        self.assertIn("model.layers.1.self_attn.q_layernorm.weight", keys)
+        self.assertIn("model.layers.1.feed_forward.w1.weight", keys)
+        self.assertIn("model.embedding_norm.weight", keys)
+        self.assertFalse(any(".operator." in key for key in keys))
+
     def test_runner_consumes_batch_plan_and_releases_per_request_cache(self) -> None:
         from resin import BatchPhase, BatchPlan
-        from resin.backends.lfm2 import Lfm2TorchRunner
+        from resin.backends.lfm2.reference import Lfm2TorchRunner
 
         runner = Lfm2TorchRunner.__new__(Lfm2TorchRunner)
         runner.device = self.torch.device("cpu")
@@ -163,7 +171,7 @@ class Lfm2TorchTests(unittest.TestCase):
     )
     def test_pretrained_runner_generates_expected_tokens(self) -> None:
         from resin import Engine
-        from resin.backends.lfm2 import Lfm2TorchRunner
+        from resin.backends.lfm2.reference import Lfm2TorchRunner
 
         runner = Lfm2TorchRunner(
             Path(os.environ["RESIN_LFM2_TORCH_MODEL"]), device="cpu"

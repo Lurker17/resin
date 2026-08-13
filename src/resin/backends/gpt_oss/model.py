@@ -1,583 +1,496 @@
-# Portions of the model implementation are adapted from OpenAI gpt-oss and
-# Hugging Face Transformers.
-# Copyright 2025 OpenAI and The HuggingFace Team. Licensed under Apache-2.0.
+# Portions are adapted from OpenAI gpt-oss and Hugging Face Transformers
+# (Apache-2.0).
 
-"""Tokenizer-free GPT-OSS model and request-owned attention state.
-
-The expert factory is the sole seam between the readable dense implementation
-and packed MXFP4 kernels. Attention, routing, and state ownership stay the same.
-"""
+"""GPT-OSS modules and explicit full/sliding attention state."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Callable
 
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
 from .config import GptOssConfig
 
 
 class AttentionState:
-    """Physical KV state for one request and one attention layer.
+    """Keys and values retained by one full or sliding attention layer."""
 
-    Full-attention layers retain all keys. Sliding layers retain exactly the
-    preceding ``window - 1`` keys needed by the next token. A multi-token chunk
-    still attends over its complete local chunk before retained state is cut.
-    """
-
-    def __init__(self, torch, sliding_window: int | None) -> None:
-        self._torch = torch
-        self.sliding_window = sliding_window
-        self.keys = None
-        self.values = None
-        self.offset = 0
+    def __init__(self, window: int | None) -> None:
+        self.window = window
+        self.keys: Tensor | None = None
+        self.values: Tensor | None = None
+        self.length = 0
 
     @property
-    def stored_tokens(self) -> int:
+    def stored(self) -> int:
         return 0 if self.keys is None else self.keys.shape[-2]
 
-    def update_and_fetch(self, keys, values):
-        previous = self.stored_tokens
-        key_start = self.offset - previous
+    def append(self, keys: Tensor, values: Tensor) -> tuple[Tensor, Tensor, int]:
+        key_start = self.length - self.stored
         if key_start < 0:
-            raise ValueError("KV cache contains more tokens than the request has seen")
-
-        if self.keys is None:
-            combined_keys = keys
-            combined_values = values
+            raise ValueError("attention state is longer than its request")
+        all_keys = keys if self.keys is None else torch.cat((self.keys, keys), dim=-2)
+        all_values = (
+            values if self.values is None else torch.cat((self.values, values), dim=-2)
+        )
+        if self.window is None:
+            self.keys, self.values = all_keys, all_values
         else:
-            combined_keys = self._torch.cat((self.keys, keys), dim=-2)
-            combined_values = self._torch.cat((self.values, values), dim=-2)
-
-        if self.sliding_window is None:
-            self.keys = combined_keys
-            self.values = combined_values
-        else:
-            keep = self.sliding_window - 1
-            if keep:
-                self.keys = combined_keys[..., -keep:, :]
-                self.values = combined_values[..., -keep:, :]
-            else:
-                self.keys = combined_keys[..., :0, :]
-                self.values = combined_values[..., :0, :]
-        self.offset += keys.shape[-2]
-        return combined_keys, combined_values, key_start
+            keep = self.window - 1
+            self.keys = all_keys[..., -keep:, :] if keep else all_keys[..., :0, :]
+            self.values = all_values[..., -keep:, :] if keep else all_values[..., :0, :]
+        self.length += keys.shape[-2]
+        return all_keys, all_values, key_start
 
 
 class GptOssState:
-    """Per-request state with explicit full and sliding attention layers."""
+    """One request's ordered full and sliding attention state."""
 
-    def __init__(self, torch, args: GptOssConfig) -> None:
+    def __init__(self, config: GptOssConfig) -> None:
         self.layers = [
             AttentionState(
-                torch,
-                args.sliding_window if layer_type == "sliding_attention" else None,
+                config.sliding_window if kind == "sliding_attention" else None
             )
-            for layer_type in args.layer_types
+            for kind in config.layer_types
         ]
-        self.offset = 0
+        self.length = 0
 
 
 class BatchedAttentionState:
-    """A transient tensor view over equally sized per-request layer caches."""
+    """A transient batched view that preserves request-owned allocations."""
 
-    def __init__(self, torch, caches: tuple[AttentionState, ...]) -> None:
-        if not caches:
-            raise ValueError("a physical cache batch must contain at least one request")
-        self._torch = torch
-        self._caches = caches
-        self.sliding_window = caches[0].sliding_window
-        if any(cache.sliding_window != self.sliding_window for cache in caches[1:]):
-            raise ValueError("batched KV caches must use the same attention window")
-        stored_tokens = caches[0].stored_tokens
-        if any(cache.stored_tokens != stored_tokens for cache in caches[1:]):
-            raise ValueError(
-                "physical batching requires equal per-layer KV cache lengths"
+    def __init__(self, states: tuple[AttentionState, ...]) -> None:
+        if not states:
+            raise ValueError("an attention-state batch cannot be empty")
+        self.states = states
+        self.window = states[0].window
+        if any(state.window != self.window for state in states[1:]):
+            raise ValueError("batched attention states must use one window")
+        if any(state.stored != states[0].stored for state in states[1:]):
+            raise ValueError("batched attention states must have equal lengths")
+
+    def append(self, keys: Tensor, values: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        if keys.shape[0] != len(self.states) or values.shape[0] != len(self.states):
+            raise ValueError("tensor and physical state batch sizes differ")
+        rows = [
+            state.append(
+                keys[index : index + 1].clone(), values[index : index + 1].clone()
             )
-
-    def update_and_fetch(self, keys, values):
-        if keys.shape[0] != len(self._caches) or values.shape[0] != len(self._caches):
-            raise ValueError("the tensor batch does not match the physical cache batch")
-
-        combined_keys = []
-        combined_values = []
-        key_starts = []
-        for index, cache in enumerate(self._caches):
-            # Keep request ownership physical as well as logical. A mere batch
-            # slice would retain the entire projection allocation after sibling
-            # requests are released.
-            request_keys, request_values, key_start = cache.update_and_fetch(
-                keys[index : index + 1].clone(),
-                values[index : index + 1].clone(),
-            )
-            combined_keys.append(request_keys)
-            combined_values.append(request_values)
-            key_starts.append(key_start)
+            for index, state in enumerate(self.states)
+        ]
         return (
-            self._torch.cat(combined_keys, dim=0),
-            self._torch.cat(combined_values, dim=0),
-            self._torch.tensor(key_starts, dtype=self._torch.long, device=keys.device),
+            torch.cat([row[0] for row in rows]),
+            torch.cat([row[1] for row in rows]),
+            torch.tensor(
+                [row[2] for row in rows], dtype=torch.long, device=keys.device
+            ),
         )
 
 
 class BatchedGptOssState:
-    """One model-call view that preserves independent request cache ownership."""
+    """One physical model-call view over independent request states."""
 
-    def __init__(self, torch, caches: tuple[GptOssState, ...]) -> None:
-        if len(caches) < 2:
-            raise ValueError("a physical cache batch requires at least two requests")
-        layer_count = len(caches[0].layers)
-        if any(len(cache.layers) != layer_count for cache in caches[1:]):
-            raise ValueError("batched sequence caches must have identical layer counts")
-        for cache in caches:
-            if any(layer.offset != cache.offset for layer in cache.layers):
-                raise ValueError("sequence and layer cache offsets are inconsistent")
-        self._caches = caches
+    def __init__(self, states: tuple[GptOssState, ...]) -> None:
+        if len(states) < 2:
+            raise ValueError("a state batch requires at least two requests")
+        layer_count = len(states[0].layers)
+        if any(len(state.layers) != layer_count for state in states[1:]):
+            raise ValueError("batched requests must have identical layer counts")
+        if any(
+            layer.length != state.length for state in states for layer in state.layers
+        ):
+            raise ValueError("request and layer state lengths differ")
+        self.states = states
         self.layers = [
-            BatchedAttentionState(
-                torch,
-                tuple(cache.layers[layer_index] for cache in caches),
-            )
-            for layer_index in range(layer_count)
+            BatchedAttentionState(tuple(state.layers[index] for state in states))
+            for index in range(layer_count)
         ]
 
     @property
     def batch_size(self) -> int:
-        return len(self._caches)
+        return len(self.states)
 
     @property
-    def offsets(self) -> tuple[int, ...]:
-        return tuple(cache.offset for cache in self._caches)
+    def lengths(self) -> tuple[int, ...]:
+        return tuple(state.length for state in self.states)
 
-    def advance(self, token_count: int) -> None:
-        for cache in self._caches:
-            cache.offset += token_count
+    def advance(self, count: int) -> None:
+        for state in self.states:
+            state.length += count
 
 
-def make_model_class(torch, *, expert_factory: Callable | None = None):
-    """Build the module hierarchy lazily, without a module-level torch import.
+class RMSNorm(nn.Module):
+    def __init__(self, width: int, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(width, dtype=torch.float32))
+        self.eps = eps
 
-    ``expert_factory`` is the intentional kernel seam. It receives parsed model
-    arguments and must return a module implementing
-    ``forward(tokens, topk_indices, topk_weights, router_logits)``. Packed
-    kernels use the full logits to build gather/scatter metadata; the default
-    stores dense expert matrices for correctness tests and unquantized
-    checkpoints.
-    """
+    def forward(self, hidden: Tensor) -> Tensor:
+        dtype = hidden.dtype
+        normalized = hidden.float()
+        normalized *= torch.rsqrt(normalized.square().mean(-1, keepdim=True) + self.eps)
+        return (self.weight * normalized).to(dtype)
 
-    nn = torch.nn
 
-    class RMSNorm(nn.Module):
-        def __init__(self, hidden_size: int, eps: float) -> None:
-            super().__init__()
-            self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
-            self.variance_epsilon = eps
-
-        def forward(self, hidden):
-            input_dtype = hidden.dtype
-            normalized = hidden.float()
-            variance = normalized.square().mean(dim=-1, keepdim=True)
-            normalized = normalized * torch.rsqrt(variance + self.variance_epsilon)
-            return (self.weight * normalized).to(input_dtype)
-
-    class RotaryEmbedding(nn.Module):
-        def __init__(self, args: GptOssConfig) -> None:
-            super().__init__()
-            self.head_dim = args.head_dim
-            self.base = args.rope_theta
-            self.initial_context_length = args.initial_context_length
-            self.scaling_factor = args.rope_scaling_factor
-            # OpenAI's reference calls these NTK beta and alpha respectively.
-            self.ntk_beta = args.rope_beta_fast
-            self.ntk_alpha = args.rope_beta_slow
-            self.register_buffer(
-                "inv_freq",
-                self._make_inv_freq(torch.device("cpu")),
-                persistent=False,
-            )
-            self.concentration = self._concentration()
-
-        def _concentration(self) -> float:
-            if self.scaling_factor > 1.0:
-                return 0.1 * math.log(self.scaling_factor) + 1.0
-            return 1.0
-
-        def _make_inv_freq(self, device):
-            freq = self.base ** (
-                torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device)
-                / self.head_dim
-            )
-            if self.scaling_factor <= 1.0:
-                return 1.0 / freq
-
-            half_dim = self.head_dim / 2
-            low = (
-                half_dim
-                * math.log(self.initial_context_length / (self.ntk_beta * 2 * math.pi))
-                / math.log(self.base)
-            )
-            high = (
-                half_dim
-                * math.log(self.initial_context_length / (self.ntk_alpha * 2 * math.pi))
-                / math.log(self.base)
-            )
-            if not 0 < low < high < half_dim - 1:
-                raise ValueError(
-                    "invalid YaRN parameters for the configured GPT-OSS head size"
-                )
-            interpolation = 1.0 / (self.scaling_factor * freq)
-            extrapolation = 1.0 / freq
-            ramp = (
-                torch.arange(half_dim, dtype=torch.float32, device=device) - low
-            ) / (high - low)
-            mask = 1 - ramp.clamp(0, 1)
-            return interpolation * (1 - mask) + extrapolation * mask
-
-        def materialize(self, device) -> None:
-            self.inv_freq = self._make_inv_freq(device)
-
-        def forward(self, positions, dtype):
-            frequencies = torch.einsum(
-                "bl,d->bld", positions.float(), self.inv_freq.float()
-            )
-            return (
-                (frequencies.cos() * self.concentration).to(dtype),
-                (frequencies.sin() * self.concentration).to(dtype),
-            )
-
-    def apply_rotary(hidden, cos, sin):
-        first, second = hidden.chunk(2, dim=-1)
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        return torch.cat(
-            (first * cos - second * sin, second * cos + first * sin), dim=-1
+class RotaryEmbedding(nn.Module):
+    def __init__(self, config: GptOssConfig) -> None:
+        super().__init__()
+        self.head_dim = config.head_dim
+        self.base = config.rope_theta
+        self.initial_context = config.initial_context_length
+        self.factor = config.rope_scaling_factor
+        self.beta_fast = config.rope_beta_fast
+        self.beta_slow = config.rope_beta_slow
+        self.concentration = (
+            0.1 * math.log(self.factor) + 1.0 if self.factor > 1 else 1.0
+        )
+        self.register_buffer(
+            "inv_freq", self._frequencies(torch.device("cpu")), persistent=False
         )
 
-    class Attention(nn.Module):
-        def __init__(self, args: GptOssConfig, layer_idx: int) -> None:
-            super().__init__()
-            self.layer_type = args.layer_types[layer_idx]
-            self.head_dim = args.head_dim
-            self.num_heads = args.num_attention_heads
-            self.num_kv_heads = args.num_key_value_heads
-            self.num_kv_groups = self.num_heads // self.num_kv_heads
-            self.scale = self.head_dim**-0.5
-            self.sliding_window = (
-                args.sliding_window if self.layer_type == "sliding_attention" else None
-            )
-            self.q_proj = nn.Linear(
-                args.hidden_size,
-                self.num_heads * self.head_dim,
-                bias=args.attention_bias,
-            )
-            self.k_proj = nn.Linear(
-                args.hidden_size,
-                self.num_kv_heads * self.head_dim,
-                bias=args.attention_bias,
-            )
-            self.v_proj = nn.Linear(
-                args.hidden_size,
-                self.num_kv_heads * self.head_dim,
-                bias=args.attention_bias,
-            )
-            self.o_proj = nn.Linear(
-                self.num_heads * self.head_dim,
-                args.hidden_size,
-                bias=args.attention_bias,
-            )
-            self.sinks = nn.Parameter(torch.empty(self.num_heads))
+    def _frequencies(self, device) -> Tensor:
+        frequencies = self.base ** (
+            torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device)
+            / self.head_dim
+        )
+        if self.factor <= 1:
+            return 1.0 / frequencies
+        half_dim = self.head_dim / 2
+        low = (
+            half_dim
+            * math.log(self.initial_context / (self.beta_fast * 2 * math.pi))
+            / math.log(self.base)
+        )
+        high = (
+            half_dim
+            * math.log(self.initial_context / (self.beta_slow * 2 * math.pi))
+            / math.log(self.base)
+        )
+        if not 0 < low < high < half_dim - 1:
+            raise ValueError("invalid YaRN parameters for the GPT-OSS head size")
+        interpolation = 1.0 / (self.factor * frequencies)
+        extrapolation = 1.0 / frequencies
+        ramp = (torch.arange(half_dim, device=device) - low) / (high - low)
+        mask = 1 - ramp.clamp(0, 1)
+        return interpolation * (1 - mask) + extrapolation * mask
 
-        def forward(self, hidden, positions, position_embeddings, cache):
-            batch, length, _ = hidden.shape
-            query = self.q_proj(hidden).view(
-                batch, length, self.num_heads, self.head_dim
-            )
-            key = self.k_proj(hidden).view(
-                batch, length, self.num_kv_heads, self.head_dim
-            )
-            value = self.v_proj(hidden).view(
-                batch, length, self.num_kv_heads, self.head_dim
-            )
-            query = query.transpose(1, 2)
-            key = key.transpose(1, 2)
-            value = value.transpose(1, 2)
-            cos, sin = position_embeddings
-            query = apply_rotary(query, cos, sin)
-            key = apply_rotary(key, cos, sin)
+    def materialize(self, device) -> None:
+        self.inv_freq = self._frequencies(device)
 
-            key, value, key_start = cache.update_and_fetch(key, value)
-            key = key.repeat_interleave(self.num_kv_groups, dim=1)
-            value = value.repeat_interleave(self.num_kv_groups, dim=1)
+    def forward(self, positions: Tensor, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        angles = torch.einsum("bl,d->bld", positions.float(), self.inv_freq.float())
+        return (
+            (angles.cos() * self.concentration).to(dtype),
+            (angles.sin() * self.concentration).to(dtype),
+        )
 
-            if isinstance(key_start, int):
-                key_start = torch.full(
-                    (batch,),
-                    key_start,
-                    dtype=positions.dtype,
-                    device=positions.device,
+
+def apply_rotary(hidden: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    first, second = hidden.chunk(2, dim=-1)
+    cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+    return torch.cat((first * cos - second * sin, second * cos + first * sin), dim=-1)
+
+
+class Attention(nn.Module):
+    def __init__(self, config: GptOssConfig, layer_index: int) -> None:
+        super().__init__()
+        self.layer_type = config.layer_types[layer_index]
+        self.head_dim = config.head_dim
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.kv_groups = self.num_heads // self.num_kv_heads
+        self.scale = self.head_dim**-0.5
+        self.sliding_window = (
+            config.sliding_window if self.layer_type == "sliding_attention" else None
+        )
+        width = config.hidden_size
+        self.q_proj = nn.Linear(
+            width, self.num_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            width, self.num_kv_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            width, self.num_kv_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, width, bias=config.attention_bias
+        )
+        self.sinks = nn.Parameter(torch.empty(self.num_heads))
+
+    def forward(
+        self,
+        hidden: Tensor,
+        positions: Tensor,
+        rotary: tuple[Tensor, Tensor],
+        state: AttentionState | BatchedAttentionState,
+    ) -> Tensor:
+        batch, length, _ = hidden.shape
+        query = (
+            self.q_proj(hidden)
+            .view(batch, length, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        key = (
+            self.k_proj(hidden)
+            .view(batch, length, self.num_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        value = (
+            self.v_proj(hidden)
+            .view(batch, length, self.num_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        query = apply_rotary(query, *rotary)
+        key = apply_rotary(key, *rotary)
+        key, value, key_start = state.append(key, value)
+        key = key.repeat_interleave(self.kv_groups, dim=1)
+        value = value.repeat_interleave(self.kv_groups, dim=1)
+
+        starts = (
+            torch.full((batch,), key_start, device=positions.device)
+            if isinstance(key_start, int)
+            else key_start
+        )
+        starts = starts.to(dtype=positions.dtype)
+        key_positions = starts[:, None] + torch.arange(
+            key.shape[-2], device=positions.device
+        )
+        allowed = key_positions[:, None] <= positions[:, :, None]
+        if self.sliding_window is not None:
+            allowed &= (
+                key_positions[:, None]
+                >= positions[:, :, None] - self.sliding_window + 1
+            )
+        logits = torch.matmul(query.float(), key.float().transpose(-2, -1)) * self.scale
+        logits = logits.masked_fill(~allowed[:, None], -float("inf"))
+        sinks = (
+            self.sinks.float()
+            .view(1, self.num_heads, 1, 1)
+            .expand(batch, -1, length, -1)
+        )
+        probabilities = torch.softmax(torch.cat((logits, sinks), -1), -1)[..., :-1]
+        output = torch.matmul(probabilities, value.float()).to(hidden.dtype)
+        return self.o_proj(output.transpose(1, 2).contiguous().view(batch, length, -1))
+
+
+class TopKRouter(nn.Module):
+    def __init__(self, config: GptOssConfig) -> None:
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.weight = nn.Parameter(
+            torch.empty(config.num_local_experts, config.hidden_size)
+        )
+        self.bias = nn.Parameter(torch.empty(config.num_local_experts))
+
+    def forward(self, hidden: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        logits = F.linear(hidden, self.weight, self.bias)
+        values, indices = torch.topk(logits, self.top_k, dim=-1, sorted=True)
+        return logits, torch.softmax(values, dim=-1), indices
+
+
+class DenseExperts(nn.Module):
+    """Readable dense experts used by tests and unquantized checkpoints."""
+
+    storage_format = "dense"
+
+    def __init__(self, config: GptOssConfig) -> None:
+        super().__init__()
+        experts, hidden, intermediate = (
+            config.num_local_experts,
+            config.hidden_size,
+            config.intermediate_size,
+        )
+        self.intermediate_size = intermediate
+        self.swiglu_limit = config.swiglu_limit
+        self.gate_up_proj = nn.Parameter(torch.empty(experts, hidden, 2 * intermediate))
+        self.gate_up_proj_bias = nn.Parameter(torch.empty(experts, 2 * intermediate))
+        self.down_proj = nn.Parameter(torch.empty(experts, intermediate, hidden))
+        self.down_proj_bias = nn.Parameter(torch.empty(experts, hidden))
+
+    def forward(
+        self,
+        hidden: Tensor,
+        expert_indices: Tensor,
+        routing_weights: Tensor,
+        router_logits: Tensor | None = None,
+    ) -> Tensor:
+        del router_logits
+        gate_up = torch.einsum(
+            "tkhi,th->tki", self.gate_up_proj[expert_indices], hidden
+        )
+        gate_up += self.gate_up_proj_bias[expert_indices]
+        gate = gate_up[..., ::2].clamp(max=self.swiglu_limit)
+        up = gate_up[..., 1::2].clamp(-self.swiglu_limit, self.swiglu_limit)
+        activated = gate * torch.sigmoid(1.702 * gate) * (up + 1)
+        output = torch.einsum(
+            "tkih,tki->tkh", self.down_proj[expert_indices], activated
+        )
+        output += self.down_proj_bias[expert_indices]
+        return torch.einsum("tkh,tk->th", output, routing_weights)
+
+
+ExpertFactory = Callable[[GptOssConfig], nn.Module]
+
+
+class MLP(nn.Module):
+    def __init__(
+        self, config: GptOssConfig, expert_factory: ExpertFactory | None
+    ) -> None:
+        super().__init__()
+        self.router = TopKRouter(config)
+        self.experts = (
+            DenseExperts(config) if expert_factory is None else expert_factory(config)
+        )
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        shape = hidden.shape
+        flat = hidden.reshape(-1, shape[-1])
+        logits, weights, indices = self.router(flat)
+        return self.experts(flat, indices, weights, logits).reshape(shape)
+
+
+class DecoderLayer(nn.Module):
+    def __init__(
+        self,
+        config: GptOssConfig,
+        layer_index: int,
+        expert_factory: ExpertFactory | None,
+    ) -> None:
+        super().__init__()
+        self.self_attn = Attention(config, layer_index)
+        self.mlp = MLP(config, expert_factory)
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+
+    def forward(self, hidden: Tensor, positions: Tensor, rotary, state) -> Tensor:
+        hidden = hidden + self.self_attn(
+            self.input_layernorm(hidden), positions, rotary, state
+        )
+        return hidden + self.mlp(self.post_attention_layernorm(hidden))
+
+
+class GptOssModel(nn.Module):
+    def __init__(
+        self, config: GptOssConfig, expert_factory: ExpertFactory | None
+    ) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
+        )
+        self.layers = nn.ModuleList(
+            DecoderLayer(config, index, expert_factory)
+            for index in range(config.num_hidden_layers)
+        )
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.rotary_emb = RotaryEmbedding(config)
+
+    def forward(self, tokens: Tensor, positions: Tensor, state) -> Tensor:
+        hidden = self.embed_tokens(tokens)
+        rotary = self.rotary_emb(positions, hidden.dtype)
+        for layer, layer_state in zip(self.layers, state.layers, strict=True):
+            hidden = layer(hidden, positions, rotary, layer_state)
+        return self.norm(hidden)
+
+
+class GptOssForCausalLM(nn.Module):
+    def __init__(
+        self, config: GptOssConfig, expert_factory: ExpertFactory | None = None
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.args = config
+        self.model = GptOssModel(config, expert_factory)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.apply(self._initialize)
+
+    def _initialize(self, module: nn.Module) -> None:
+        std = self.config.initializer_range
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, std=std)
+            if getattr(module, "bias", None) is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, RMSNorm):
+            nn.init.ones_(module.weight)
+        elif isinstance(module, Attention):
+            nn.init.normal_(module.sinks, std=std)
+        elif isinstance(module, TopKRouter):
+            nn.init.normal_(module.weight, std=std)
+            nn.init.normal_(module.bias, std=std)
+        elif isinstance(module, DenseExperts):
+            nn.init.normal_(module.gate_up_proj, std=std)
+            nn.init.zeros_(module.gate_up_proj_bias)
+            nn.init.normal_(module.down_proj, std=std)
+            nn.init.zeros_(module.down_proj_bias)
+
+    def make_cache(self) -> GptOssState:
+        return GptOssState(self.config)
+
+    def make_batch_cache(self, states) -> BatchedGptOssState:
+        return BatchedGptOssState(tuple(states))
+
+    def materialize_buffers(self, device) -> None:
+        self.model.rotary_emb.materialize(device)
+
+    def forward(
+        self,
+        tokens: Tensor,
+        state: GptOssState | BatchedGptOssState | None = None,
+        positions: Tensor | None = None,
+        *,
+        logits_to_keep: int | None = None,
+    ) -> Tensor:
+        if tokens.ndim != 2 or tokens.shape[1] == 0:
+            raise ValueError("tokens must have shape [batch, nonempty sequence]")
+        if state is None:
+            if tokens.shape[0] != 1:
+                raise ValueError("batched tokens require explicit request states")
+            state = self.make_cache()
+        if isinstance(state, GptOssState):
+            if tokens.shape[0] != 1:
+                raise ValueError("one request state cannot serve a tensor batch")
+            lengths = (state.length,)
+        else:
+            if tokens.shape[0] != state.batch_size:
+                raise ValueError("tensor and physical state batch sizes differ")
+            lengths = state.lengths
+        if positions is None:
+            positions = torch.stack(
+                [
+                    torch.arange(
+                        length,
+                        length + tokens.shape[1],
+                        dtype=torch.long,
+                        device=tokens.device,
+                    )
+                    for length in lengths
+                ]
+            )
+        if positions.shape != tokens.shape:
+            raise ValueError("positions must have the same shape as tokens")
+        if positions.device.type == "cpu":
+            for row, length in zip(positions, lengths, strict=True):
+                expected = torch.arange(
+                    length, length + tokens.shape[1], dtype=row.dtype
                 )
-            else:
-                key_start = key_start.to(dtype=positions.dtype)
-            key_positions = key_start[:, None] + torch.arange(
-                key.shape[-2],
-                dtype=positions.dtype,
-                device=positions.device,
-            )
-            allowed = key_positions[:, None, :] <= positions[:, :, None]
-            if self.sliding_window is not None:
-                allowed &= key_positions[:, None, :] >= (
-                    positions[:, :, None] - self.sliding_window + 1
-                )
-
-            logits = torch.matmul(query.float(), key.float().transpose(-2, -1))
-            logits = logits * self.scale
-            logits = logits.masked_fill(~allowed[:, None, :, :], -float("inf"))
-            sinks = self.sinks.float().view(1, self.num_heads, 1, 1)
-            sinks = sinks.expand(batch, -1, length, -1)
-            combined_logits = torch.cat((logits, sinks), dim=-1)
-            probabilities = torch.softmax(combined_logits, dim=-1)[..., :-1]
-            output = torch.matmul(probabilities, value.float()).to(hidden.dtype)
-            output = output.transpose(1, 2).contiguous().view(batch, length, -1)
-            return self.o_proj(output)
-
-    class TopKRouter(nn.Module):
-        def __init__(self, args: GptOssConfig) -> None:
-            super().__init__()
-            self.top_k = args.num_experts_per_tok
-            self.weight = nn.Parameter(
-                torch.empty(args.num_local_experts, args.hidden_size)
-            )
-            self.bias = nn.Parameter(torch.empty(args.num_local_experts))
-
-        def forward(self, hidden):
-            logits = nn.functional.linear(hidden, self.weight, self.bias)
-            top_values, indices = torch.topk(logits, self.top_k, dim=-1, sorted=True)
-            weights = torch.softmax(top_values, dim=-1, dtype=top_values.dtype)
-            return logits, weights, indices
-
-    class DenseExperts(nn.Module):
-        """Dense reference expert linears; replace this module for MXFP4."""
-
-        storage_format = "dense"
-
-        def __init__(self, args: GptOssConfig) -> None:
-            super().__init__()
-            self.intermediate_size = args.intermediate_size
-            self.swiglu_limit = args.swiglu_limit
-            self.gate_up_proj = nn.Parameter(
-                torch.empty(
-                    args.num_local_experts,
-                    args.hidden_size,
-                    2 * args.intermediate_size,
-                )
-            )
-            self.gate_up_proj_bias = nn.Parameter(
-                torch.empty(args.num_local_experts, 2 * args.intermediate_size)
-            )
-            self.down_proj = nn.Parameter(
-                torch.empty(
-                    args.num_local_experts,
-                    args.intermediate_size,
-                    args.hidden_size,
-                )
-            )
-            self.down_proj_bias = nn.Parameter(
-                torch.empty(args.num_local_experts, args.hidden_size)
-            )
-
-        def _apply_gate(self, gate_up):
-            gate = gate_up[..., ::2].clamp(max=self.swiglu_limit)
-            up = gate_up[..., 1::2].clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-            glu = gate * torch.sigmoid(1.702 * gate)
-            return glu * (up + 1)
-
-        def forward(self, hidden, router_indices, routing_weights, router_logits=None):
-            del router_logits
-            gate_up_weights = self.gate_up_proj[router_indices]
-            gate_up_bias = self.gate_up_proj_bias[router_indices]
-            gate_up = (
-                torch.einsum("tkhi,th->tki", gate_up_weights, hidden) + gate_up_bias
-            )
-            activated = self._apply_gate(gate_up)
-            down_weights = self.down_proj[router_indices]
-            down_bias = self.down_proj_bias[router_indices]
-            output = torch.einsum("tkih,tki->tkh", down_weights, activated) + down_bias
-            return torch.einsum("tkh,tk->th", output, routing_weights)
-
-    class MLP(nn.Module):
-        def __init__(self, args: GptOssConfig) -> None:
-            super().__init__()
-            self.router = TopKRouter(args)
-            self.experts = (
-                DenseExperts(args) if expert_factory is None else expert_factory(args)
-            )
-
-        def forward(self, hidden):
-            batch, length, width = hidden.shape
-            flat = hidden.reshape(-1, width)
-            router_logits, routing_weights, router_indices = self.router(flat)
-            output = self.experts(flat, router_indices, routing_weights, router_logits)
-            return output.reshape(batch, length, width)
-
-    class DecoderLayer(nn.Module):
-        def __init__(self, args: GptOssConfig, layer_idx: int) -> None:
-            super().__init__()
-            self.self_attn = Attention(args, layer_idx)
-            self.mlp = MLP(args)
-            self.input_layernorm = RMSNorm(args.hidden_size, args.rms_norm_eps)
-            self.post_attention_layernorm = RMSNorm(args.hidden_size, args.rms_norm_eps)
-
-        def forward(self, hidden, positions, position_embeddings, cache):
-            residual = hidden
-            hidden = self.input_layernorm(hidden)
-            hidden = self.self_attn(hidden, positions, position_embeddings, cache)
-            hidden = residual + hidden
-            residual = hidden
-            hidden = self.post_attention_layernorm(hidden)
-            hidden = self.mlp(hidden)
-            return residual + hidden
-
-    class Backbone(nn.Module):
-        def __init__(self, args: GptOssConfig) -> None:
-            super().__init__()
-            self.embed_tokens = nn.Embedding(
-                args.vocab_size, args.hidden_size, padding_idx=args.pad_token_id
-            )
-            self.layers = nn.ModuleList(
-                [DecoderLayer(args, index) for index in range(args.num_hidden_layers)]
-            )
-            self.norm = RMSNorm(args.hidden_size, args.rms_norm_eps)
-            self.rotary_emb = RotaryEmbedding(args)
-
-        def forward(self, inputs, positions, cache: GptOssState):
-            hidden = self.embed_tokens(inputs)
-            position_embeddings = self.rotary_emb(positions, hidden.dtype)
-            for layer, layer_cache in zip(self.layers, cache.layers, strict=True):
-                hidden = layer(hidden, positions, position_embeddings, layer_cache)
-            return self.norm(hidden)
-
-    class GptOssForCausalLM(nn.Module):
-        def __init__(self, args: GptOssConfig) -> None:
-            super().__init__()
-            self.args = args
-            self.model = Backbone(args)
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-            self.apply(self._initialize)
-
-        def _initialize(self, module) -> None:
-            if isinstance(module, (nn.Linear, nn.Embedding)):
-                nn.init.normal_(
-                    module.weight, mean=0.0, std=self.args.initializer_range
-                )
-                if getattr(module, "bias", None) is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, RMSNorm):
-                nn.init.ones_(module.weight)
-            elif isinstance(module, Attention):
-                nn.init.normal_(module.sinks, mean=0.0, std=self.args.initializer_range)
-            elif isinstance(module, TopKRouter):
-                nn.init.normal_(
-                    module.weight, mean=0.0, std=self.args.initializer_range
-                )
-                nn.init.normal_(module.bias, mean=0.0, std=self.args.initializer_range)
-            elif isinstance(module, DenseExperts):
-                nn.init.normal_(
-                    module.gate_up_proj,
-                    mean=0.0,
-                    std=self.args.initializer_range,
-                )
-                nn.init.zeros_(module.gate_up_proj_bias)
-                nn.init.normal_(
-                    module.down_proj,
-                    mean=0.0,
-                    std=self.args.initializer_range,
-                )
-                nn.init.zeros_(module.down_proj_bias)
-
-        def make_cache(self) -> GptOssState:
-            return GptOssState(torch, self.args)
-
-        def make_batch_cache(
-            self, caches: list[GptOssState] | tuple[GptOssState, ...]
-        ) -> BatchedGptOssState:
-            return BatchedGptOssState(torch, tuple(caches))
-
-        def materialize_buffers(self, device) -> None:
-            self.model.rotary_emb.materialize(device)
-
-        def forward(
-            self,
-            inputs,
-            cache: GptOssState | None = None,
-            positions=None,
-            *,
-            logits_to_keep: int | None = None,
+                if not torch.equal(row, expected):
+                    raise ValueError("positions must continue the request state")
+        if any(
+            length + tokens.shape[1] > self.config.max_position_embeddings
+            for length in lengths
         ):
-            if inputs.ndim != 2:
-                raise ValueError("inputs must have shape [batch, sequence]")
-            if inputs.shape[1] == 0:
-                raise ValueError("inputs must contain at least one token")
-            if cache is None:
-                if inputs.shape[0] != 1:
-                    raise ValueError(
-                        "batched inputs require explicit per-request physical caches"
-                    )
-                cache = self.make_cache()
-            if isinstance(cache, GptOssState):
-                if inputs.shape[0] != 1:
-                    raise ValueError(
-                        "one physical request cache cannot serve multiple sequences"
-                    )
-                offsets = (cache.offset,)
-            else:
-                if inputs.shape[0] != cache.batch_size:
-                    raise ValueError(
-                        "the input batch does not match the physical cache batch"
-                    )
-                offsets = cache.offsets
-            if positions is None:
-                positions = torch.stack(
-                    [
-                        torch.arange(
-                            offset,
-                            offset + inputs.shape[1],
-                            dtype=torch.long,
-                            device=inputs.device,
-                        )
-                        for offset in offsets
-                    ]
-                )
-            if positions.shape != inputs.shape:
-                raise ValueError("positions must have the same shape as inputs")
-            # The runner validates GPU-bound metadata while it is still a
-            # Python list. Keep this defensive check for direct CPU use without
-            # introducing a host synchronization in every CUDA decode step.
-            if positions.device.type == "cpu":
-                for index, offset in enumerate(offsets):
-                    expected = torch.arange(
-                        offset,
-                        offset + inputs.shape[1],
-                        dtype=positions.dtype,
-                        device=positions.device,
-                    )
-                    if not bool(torch.equal(positions[index], expected)):
-                        raise ValueError(
-                            "positions must be contiguous with the request cache"
-                        )
-            if any(
-                offset + inputs.shape[1] > self.args.max_position_embeddings
-                for offset in offsets
-            ):
-                raise ValueError("position exceeds max_position_embeddings")
+            raise ValueError("position exceeds max_position_embeddings")
 
-            hidden = self.model(inputs, positions, cache)
-            if isinstance(cache, GptOssState):
-                cache.offset += inputs.shape[1]
-            else:
-                cache.advance(inputs.shape[1])
-            if logits_to_keep is not None:
-                if logits_to_keep <= 0:
-                    raise ValueError("logits_to_keep must be positive")
-                hidden = hidden[:, -logits_to_keep:, :]
-            return self.lm_head(hidden)
-
-    return GptOssForCausalLM
+        hidden = self.model(tokens, positions, state)
+        if isinstance(state, GptOssState):
+            state.length += tokens.shape[1]
+        else:
+            state.advance(tokens.shape[1])
+        if logits_to_keep is not None:
+            if logits_to_keep <= 0:
+                raise ValueError("logits_to_keep must be positive")
+            hidden = hidden[:, -logits_to_keep:]
+        return self.lm_head(hidden)

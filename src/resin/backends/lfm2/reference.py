@@ -16,7 +16,7 @@ from .._common import (
     resolve_model,
 )
 from .config import Lfm2Config
-from .model import Lfm2State, make_model_class
+from .model import Lfm2ForCausalLM, Lfm2State
 
 if TYPE_CHECKING:
     from resin import BatchPlan
@@ -59,9 +59,8 @@ def load_model(model_path: Path, *, device, dtype=None):
     target = torch.device(device)
     load_target = target if target.type in {"cpu", "cuda"} else torch.device("cpu")
 
-    model_class = make_model_class(torch)
     with torch.device("meta"):
-        model = model_class(args)
+        model = Lfm2ForCausalLM(args)
 
     weights = load_safetensor_shards(model_path, device=load_target, backend="LFM2")
     model.load_state_dict(weights, strict=True, assign=True)

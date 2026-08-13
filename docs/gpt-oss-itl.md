@@ -6,7 +6,7 @@ the current code path, not historical benchmark results.
 
 ## Reference runner
 
-`resin.backends.gpt_oss.GptOssRunner` is the readable PyTorch path. It owns
+`resin.backends.gpt_oss.reference.GptOssRunner` is the readable PyTorch path. It owns
 per-request model cache in Python and implements synchronous `forward(plan)`.
 Equal-length rows execute as a physical batch; unsupported heterogeneous shapes
 fail rather than silently running serially under a batched label.
@@ -27,6 +27,7 @@ runner = GptOssCudaRunner(
     device=None,
     dtype=None,
     moe_kernel=None,
+    cuda_graph_decode_shapes=((1, full_page_table_width),),
 )
 
 engine = Engine(runner, eos_token_id=runner.eos_token_id)
@@ -80,6 +81,13 @@ The managed runner keeps policy boundaries narrow:
 - The model's MXFP4 expert path may use the configured FlashInfer fused-MoE
   adapter.
 - Greedy sampling remains runner-owned.
+- Configured decode shapes capture once and replay on later matching batches.
+
+CUDA graphs are strictly a runner-local execution optimization. A graph stages
+the current Rust-built decode plan into stable buffers; it does not plan a batch
+ahead, reserve future pages or recurrent state, or enable overlap scheduling.
+Prefill and unconfigured decode shapes use the eager path.
+
 The runner implements synchronous `forward(plan)`. It materializes the dense
 token-ID result before returning; CUDA failures establish device
 quiescence before reporting a retryable exception, or mark the exception
@@ -91,6 +99,11 @@ and ownership leases until `Engine.poll()` commits it.
 `cache_parent_capacity` is one shared physical-parent budget, not a capacity per
 attention type. A positive page ID addresses one row in the aliased parent slab;
 page zero is the initialized null row.
+
+Each `cuda_graph_decode_shapes` entry is `(batch_size,
+full_page_table_width)`. The runner selects the smallest configured width that
+fits the current decode batch. `cuda_graph_stats` reports capture, replay, and
+fallback counts.
 
 GPT-OSS currently pins 128-token cache blocks, a 128-token sliding window,
 64 query heads, eight KV heads, and head dimension 64. Unsupported checkpoint or
@@ -110,7 +123,8 @@ A new GPU proof should establish, on the current tree:
 3. separate prefill/decode scheduling and request retirement;
 4. flat-pool exhaustion and complete parent recovery;
 5. post-accept failure quarantine;
-6. only then, fresh latency and throughput measurements.
+6. graph/eager output equivalence for every configured decode shape;
+7. only then, fresh latency and throughput measurements.
 
 Until that run exists, the accurate claim is that GPT-OSS is implemented on the
 new local code path, not that the migrated path has a new remote performance

@@ -95,7 +95,7 @@ def plan_rows(plan, caches: dict[int, Any], vocab_size: int) -> list[PlanRow]:
     for index, request_id in enumerate(plan.sequence_ids):
         start, end = plan.sequence_indptr[index : index + 2]
         cache = caches.get(request_id)
-        offset = 0 if cache is None else cache.offset
+        offset = 0 if cache is None else cache.length
         positions = plan.positions[start:end]
         expected = list(range(offset, offset + end - start))
         if positions != expected:

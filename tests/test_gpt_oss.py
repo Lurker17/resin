@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 def _tiny_args():
-    from resin.backends.gpt_oss import GptOssConfig
+    from resin.backends.gpt_oss.config import GptOssConfig
 
     return GptOssConfig(
         vocab_size=43,
@@ -82,7 +82,7 @@ for name in ('torch', 'transformers', 'tokenizers', 'huggingface_hub', 'safetens
         subprocess.run([sys.executable, "-c", script], check=True)
 
     def test_configs_cover_both_released_model_shapes(self) -> None:
-        from resin.backends.gpt_oss import GptOssConfig
+        from resin.backends.gpt_oss.config import GptOssConfig
 
         base = {
             "model_type": "gpt_oss",
@@ -125,7 +125,7 @@ for name in ('torch', 'transformers', 'tokenizers', 'huggingface_hub', 'safetens
             self.assertEqual(args.head_dim, 64)
 
     def test_args_reject_non_gpt_oss_checkpoint(self) -> None:
-        from resin.backends.gpt_oss import GptOssConfig
+        from resin.backends.gpt_oss.config import GptOssConfig
 
         with self.assertRaisesRegex(ValueError, "expected a GPT-OSS"):
             GptOssConfig.from_dict({"model_type": "llama"})
@@ -136,12 +136,12 @@ class GptOssTorchTests(unittest.TestCase):
     def setUp(self) -> None:
         import torch
 
-        from resin.backends.gpt_oss import make_model_class
+        from resin.backends.gpt_oss.model import GptOssForCausalLM
 
         torch.manual_seed(11)
         self.torch = torch
         self.args = _tiny_args()
-        self.model = make_model_class(torch)(self.args).eval()
+        self.model = GptOssForCausalLM(self.args).eval()
 
     def test_cached_chunks_match_full_forward(self) -> None:
         torch = self.torch
@@ -170,8 +170,8 @@ class GptOssTorchTests(unittest.TestCase):
             first = attention(original, positions, rope, first_cache)
             second = attention(changed, positions, rope, second_cache)
         torch.testing.assert_close(first[:, -1], second[:, -1], rtol=0, atol=0)
-        self.assertEqual(first_cache.stored_tokens, self.args.sliding_window - 1)
-        self.assertEqual(second_cache.stored_tokens, self.args.sliding_window - 1)
+        self.assertEqual(first_cache.stored, self.args.sliding_window - 1)
+        self.assertEqual(second_cache.stored, self.args.sliding_window - 1)
 
     def test_topk_moe_routes_and_weights_selected_experts(self) -> None:
         torch = self.torch
@@ -200,7 +200,7 @@ class GptOssTorchTests(unittest.TestCase):
         )
 
     def test_expert_kernel_boundary_receives_all_routing_metadata(self) -> None:
-        from resin.backends.gpt_oss import make_model_class
+        from resin.backends.gpt_oss.model import GptOssForCausalLM
 
         torch = self.torch
         calls = []
@@ -210,9 +210,9 @@ class GptOssTorchTests(unittest.TestCase):
                 calls.append((hidden.shape, indices.shape, weights.shape, logits.shape))
                 return torch.zeros_like(hidden)
 
-        model = make_model_class(
-            torch, expert_factory=lambda _args: RecordingExperts()
-        )(self.args).eval()
+        model = GptOssForCausalLM(
+            self.args, expert_factory=lambda _args: RecordingExperts()
+        ).eval()
         with torch.inference_mode():
             output = model(torch.tensor([[1, 2, 3]]), model.make_cache())
         self.assertEqual(output.shape, (1, 3, self.args.vocab_size))
@@ -266,7 +266,7 @@ class GptOssTorchTests(unittest.TestCase):
                 dim=0,
             )
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-        self.assertEqual([cache.offset for cache in batched_caches], [3, 3])
+        self.assertEqual([cache.length for cache in batched_caches], [3, 3])
         self.assertIsNot(batched_caches[0], batched_caches[1])
         for layer_index in range(self.args.num_hidden_layers):
             self.assertIsNot(
@@ -301,7 +301,7 @@ class GptOssTorchTests(unittest.TestCase):
 
     def test_runner_consumes_rust_batch_plan_and_releases_caches(self) -> None:
         from resin import BatchPhase, BatchPlan
-        from resin.backends.gpt_oss import GptOssRunner
+        from resin.backends.gpt_oss.reference import GptOssRunner
 
         runner = GptOssRunner.__new__(GptOssRunner)
         runner.device = self.torch.device("cpu")
@@ -352,7 +352,7 @@ class GptOssTorchTests(unittest.TestCase):
 
     def test_runner_chunked_prefill_matches_single_chunk_and_cache_state(self) -> None:
         from resin import BatchPhase, BatchPlan
-        from resin.backends.gpt_oss import GptOssRunner
+        from resin.backends.gpt_oss.reference import GptOssRunner
 
         def make_runner(chunk_size):
             runner = GptOssRunner.__new__(GptOssRunner)
@@ -384,7 +384,7 @@ class GptOssTorchTests(unittest.TestCase):
         for request_id in plan.sequence_ids:
             expected_cache = single_chunk._cache[request_id]
             actual_cache = chunked._cache[request_id]
-            self.assertEqual(actual_cache.offset, expected_cache.offset)
+            self.assertEqual(actual_cache.length, expected_cache.length)
             for expected_layer, actual_layer in zip(
                 expected_cache.layers, actual_cache.layers, strict=True
             ):
@@ -411,7 +411,7 @@ class GptOssTorchTests(unittest.TestCase):
 
     def test_runner_executes_one_model_call_per_plan(self) -> None:
         from resin import BatchPhase, BatchPlan
-        from resin.backends.gpt_oss import GptOssRunner
+        from resin.backends.gpt_oss.reference import GptOssRunner
 
         runner = GptOssRunner.__new__(GptOssRunner)
         runner.device = self.torch.device("cpu")
@@ -440,7 +440,7 @@ class GptOssTorchTests(unittest.TestCase):
         first = runner.forward(prefill)
         self.assertEqual(model_calls, 1)
         self.assertEqual(
-            [runner._cache[request_id].offset for request_id in (17, 23)], [5, 5]
+            [runner._cache[request_id].length for request_id in (17, 23)], [5, 5]
         )
 
         decode = BatchPlan(
@@ -454,13 +454,13 @@ class GptOssTorchTests(unittest.TestCase):
         runner.forward(decode)
         self.assertEqual(model_calls, 2)
         self.assertEqual(
-            [runner._cache[request_id].offset for request_id in (17, 23)], [6, 6]
+            [runner._cache[request_id].length for request_id in (17, 23)], [6, 6]
         )
         handle.remove()
 
     def test_runner_rejects_heterogeneous_plan_instead_of_serializing(self) -> None:
         from resin import BatchPlan
-        from resin.backends.gpt_oss import GptOssRunner
+        from resin.backends.gpt_oss.reference import GptOssRunner
 
         runner = GptOssRunner.__new__(GptOssRunner)
         runner.device = self.torch.device("cpu")

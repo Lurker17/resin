@@ -195,7 +195,7 @@ def load_mxfp4_model(
         raise ImportError("packed GPT-OSS execution requires PyTorch") from error
 
     from .config import GptOssConfig
-    from .model import make_model_class
+    from .model import GptOssForCausalLM
 
     path = Path(model_path)
     config_path = path / "config.json"
@@ -216,9 +216,8 @@ def load_mxfp4_model(
     kernel.validate(moe_config)
 
     expert_factory = _make_kernel_expert_factory(torch, kernel, moe_config)
-    model_class = make_model_class(torch, expert_factory=expert_factory)
     with torch.device("meta"):
-        model = model_class(args)
+        model = GptOssForCausalLM(args, expert_factory)
 
     coordinator = _PackedExpertCoordinator(
         torch,

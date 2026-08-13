@@ -322,6 +322,11 @@ def _required_parent_capacity(
     return history_blocks + WINDOW_RESIDENT_BLOCKS
 
 
+def _required_history_width(prompt_tokens: int, max_new_tokens: int) -> int:
+    maximum_input = prompt_tokens + max_new_tokens - 1
+    return (maximum_input + PAGE_TOKENS - 1) // PAGE_TOKENS
+
+
 def _autotune_path(model_key: str, protocol: str) -> Path:
     revision = MODEL_SPECS[model_key]["revision"][:12]
     return (
@@ -339,6 +344,7 @@ def _workload_name(model_key: str, protocol: str) -> str:
 def _new_cuda_runner(
     model_path: Path,
     cache_parent_capacity: int,
+    cuda_graph_decode_shapes: tuple[tuple[int, int], ...] = (),
 ):
     from resin.backends.gpt_oss.cuda import GptOssCudaRunner
     from resin.backends.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
@@ -348,6 +354,7 @@ def _new_cuda_runner(
         cache_parent_capacity=cache_parent_capacity,
         device="cuda",
         moe_kernel=make_flashinfer_sm90_mxfp4_kernel(),
+        cuda_graph_decode_shapes=cuda_graph_decode_shapes,
     )
 
 
@@ -372,7 +379,13 @@ def _run_prompt(
     if len(prompt_ids) + max_new_tokens - 1 > context_length:
         raise ValueError("prompt plus max_new_tokens exceeds context_length")
     cache_parent_capacity = _required_parent_capacity(len(prompt_ids), max_new_tokens)
-    runner = _new_cuda_runner(model_path, cache_parent_capacity)
+    runner = _new_cuda_runner(
+        model_path,
+        cache_parent_capacity,
+        cuda_graph_decode_shapes=(
+            (1, _required_history_width(len(prompt_ids), max_new_tokens)),
+        ),
+    )
     engine = Engine(
         runner,
         max_running_requests=1,
@@ -382,7 +395,7 @@ def _run_prompt(
     output_events = []
     first_token_time = None
     try:
-        # Warm kernels and allocator state before timing the visible request.
+        # Warm kernels and capture the configured B=1 decode graph before timing.
         warmup = engine.submit(prompt_ids, max_new_tokens=2)
         while engine.has_work():
             engine.step()
@@ -412,6 +425,7 @@ def _run_prompt(
             "content": parsed.content,
             "reasoning_content": parsed.reasoning_content,
             "tool_calls": [tool_call.__dict__ for tool_call in parsed.tool_calls],
+            "cuda_graph": runner.cuda_graph_stats,
             "time_to_first_token_ms": (
                 None if first_token_time is None else (first_token_time - start) * 1000
             ),
@@ -442,7 +456,14 @@ def _bench_cuda(
     cache_parent_capacity = _required_parent_capacity(
         prompt_tokens, max_new_tokens
     ) * max(batch_sizes)
-    runner = _new_cuda_runner(model_path, cache_parent_capacity)
+    graph_width = _required_history_width(prompt_tokens, max_new_tokens)
+    runner = _new_cuda_runner(
+        model_path,
+        cache_parent_capacity,
+        cuda_graph_decode_shapes=tuple(
+            (batch_size, graph_width) for batch_size in batch_sizes
+        ),
+    )
     engine = Engine(
         runner,
         max_running_requests=max(batch_sizes),

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from resin import BatchPhase, CacheGroupLayout, CacheLayout, StateMappingConfig
 
+from .plan import CacheMetadata, build_cache_metadata
 from .reference import (
     DEFAULT_MODEL,
     DEFAULT_REVISION,
@@ -51,37 +52,6 @@ def _cache_slab_shape(
     return (num_layers, max_pages + 1, page_size, num_kv_heads, head_dim)
 
 
-class _PrefillKernelMetadata(NamedTuple):
-    """Kernel-shaped views derived only from one frozen Rust batch plan."""
-
-    dense_token_indices: tuple[int, ...]
-    dense_cu_seqlens: tuple[int, ...]
-    dense_max_q_len: int
-    continuation_token_indices: tuple[int, ...]
-    continuation_cu_seqlens: tuple[int, ...]
-    continuation_max_q_len: int
-    continuation_page_table: tuple[int, ...]
-    continuation_page_table_width: int
-    continuation_seqused_k: tuple[int, ...]
-    continuation_min_seqlen_k: int
-    continuation_max_seqlen_k: int
-
-
-class _CacheKernelMetadata(NamedTuple):
-    """FlashInfer-shaped metadata derived from one generic cache group."""
-
-    block_indptr: tuple[int, ...]
-    block_ids: tuple[int, ...]
-    last_block_lengths: tuple[int, ...]
-    append_batch_indices: tuple[int, ...]
-    append_positions: tuple[int, ...]
-    decode_token_indices: tuple[int, ...]
-    decode_block_indptr: tuple[int, ...]
-    decode_block_ids: tuple[int, ...]
-    decode_last_block_lengths: tuple[int, ...]
-    prefill: _PrefillKernelMetadata
-
-
 class _RecurrentStateRow(NamedTuple):
     """One validated row's physical recurrent-state address and owner."""
 
@@ -113,8 +83,8 @@ class _RecurrentStateArena(NamedTuple):
 _RECURRENT_STATE_ARENAS: dict[int, _RecurrentStateArena] = {}
 
 
-class _InPlaceConvCache:
-    """ShortConv cache facade that can never detach from its slab view."""
+class _InPlaceRecurrentState:
+    """Recurrent-state facade that cannot detach from its mapped slab view."""
 
     __slots__ = ("_state",)
 
@@ -122,205 +92,14 @@ class _InPlaceConvCache:
         self._state = state
 
     @property
-    def state(self):
+    def value(self):
         return self._state
 
-    @state.setter
-    def state(self, value) -> None:
+    @value.setter
+    def value(self, value) -> None:
         if value is None:
             raise ValueError("mapped convolution state cannot be cleared")
         self._state.copy_(value)
-
-
-def _cache_kernel_metadata(plan: BatchPlan, page_size: int) -> _CacheKernelMetadata:
-    """Derive all LFM2 kernel views from the generic History-group plan.
-
-    Context length chooses the kernel only *after* Rust has explicitly labeled a
-    row as prefill. In particular, a one-token prefill continuation remains on
-    the paged prefill path rather than being inferred to be decode. The native
-    group's exact append destinations are also checked against the row tables
-    before any device work; FlashInfer then receives the equivalent derived
-    batch/position inputs.
-    """
-
-    if page_size <= 0:
-        raise ValueError("page_size must be positive")
-
-    sequence_count = len(plan.sequence_ids)
-    sequence_indptr = tuple(plan.sequence_indptr)
-    context_lengths = tuple(plan.context_lengths)
-    if plan.phase == BatchPhase.PREFILL:
-        prefill_rows = tuple(range(sequence_count))
-        decode_rows: tuple[int, ...] = ()
-    elif plan.phase == BatchPhase.DECODE:
-        prefill_rows = ()
-        decode_rows = tuple(range(sequence_count))
-    else:
-        raise ValueError("plan phase must be BatchPhase.PREFILL or BatchPhase.DECODE")
-    positions = tuple(plan.positions)
-    token_count = len(plan.token_ids)
-    groups = tuple(plan.cache_groups)
-    if len(groups) != 1:
-        raise ValueError("LFM2 requires exactly one cache group")
-    group = groups[0]
-    if group.group_index != 0:
-        raise ValueError("LFM2 cache group must have group_index zero")
-    block_indptr = tuple(group.block_indptr)
-    block_ids = tuple(group.block_ids)
-    first_logical_blocks = tuple(group.first_logical_blocks)
-    frozen_append_block_ids = tuple(group.append_block_ids)
-    frozen_append_block_offsets = tuple(group.append_block_offsets)
-
-    if len(sequence_indptr) != sequence_count + 1:
-        raise ValueError("sequence_indptr does not cover every batch row")
-    if sequence_indptr[0] != 0 or sequence_indptr[-1] != token_count:
-        raise ValueError("sequence_indptr does not cover every query token")
-    if any(start > end for start, end in zip(sequence_indptr, sequence_indptr[1:])):
-        raise ValueError("sequence_indptr must be monotonic")
-    if len(positions) != token_count:
-        raise ValueError("positions does not cover every query token")
-    if len(context_lengths) != sequence_count:
-        raise ValueError("context_lengths does not cover every batch row")
-    if len(block_indptr) != sequence_count + 1:
-        raise ValueError("cache block_indptr does not cover every batch row")
-    if block_indptr[0] != 0 or block_indptr[-1] != len(block_ids):
-        raise ValueError("cache block_indptr does not cover every block ID")
-    if any(start > end for start, end in zip(block_indptr, block_indptr[1:])):
-        raise ValueError("cache block_indptr must be monotonic")
-    if len(first_logical_blocks) != sequence_count:
-        raise ValueError("first_logical_blocks does not cover every batch row")
-    if (
-        len(frozen_append_block_ids) != token_count
-        or len(frozen_append_block_offsets) != token_count
-    ):
-        raise ValueError("cache append metadata does not cover every query token")
-    prefill_row_set = set(prefill_rows)
-    decode_row_set = set(decode_rows)
-
-    dense_tokens: list[int] = []
-    dense_cu = [0]
-    dense_max_q_len = 0
-    continuation_tokens: list[int] = []
-    continuation_cu = [0]
-    continuation_max_q_len = 0
-    continuation_page_rows: list[tuple[int, ...]] = []
-    continuation_seqused_k: list[int] = []
-    last_block_lengths: list[int] = []
-    append_batch_indices: list[int] = []
-    append_positions: list[int] = []
-    decode_token_indices: list[int] = []
-    decode_block_indptr = [0]
-    decode_block_ids: list[int] = []
-    decode_last_block_lengths: list[int] = []
-
-    for sequence_index in range(sequence_count):
-        token_start, token_end = sequence_indptr[sequence_index : sequence_index + 2]
-        q_length = token_end - token_start
-        if q_length <= 0:
-            raise ValueError("LFM2 cache rows must contain at least one query token")
-        context_length = context_lengths[sequence_index]
-        if context_length < 0:
-            raise ValueError("context lengths must be nonnegative")
-        row_positions = positions[token_start:token_end]
-        expected_positions = tuple(range(context_length, context_length + q_length))
-        if row_positions != expected_positions:
-            raise ValueError("query positions do not match row context and length")
-
-        block_start, block_end = block_indptr[sequence_index : sequence_index + 2]
-        blocks = tuple(block_ids[block_start:block_end])
-        first_logical_block = first_logical_blocks[sequence_index]
-        if first_logical_block != 0:
-            raise ValueError("LFM2 History cache rows must start at logical block zero")
-        post_append_length = context_length + q_length
-        expected_block_count = (post_append_length + page_size - 1) // page_size
-        if len(blocks) != expected_block_count:
-            raise ValueError(
-                "cache block table is not the exact post-append History view"
-            )
-        if not blocks or any(block_id <= 0 for block_id in blocks):
-            raise ValueError("cache block IDs must be positive")
-        last_block_length = (post_append_length - 1) % page_size + 1
-        last_block_lengths.append(last_block_length)
-
-        append_batch_indices.extend([sequence_index] * q_length)
-        append_positions.extend(row_positions)
-        token_cursor = token_start
-        while token_cursor < token_end:
-            relative_position = positions[token_cursor]
-            logical_offset = relative_position // page_size
-            block_offset = relative_position % page_size
-            span = min(token_end - token_cursor, page_size - block_offset)
-            span_end = token_cursor + span
-            if frozen_append_block_ids[token_cursor:span_end] != (
-                blocks[logical_offset],
-            ) * span or frozen_append_block_offsets[token_cursor:span_end] != tuple(
-                range(block_offset, block_offset + span)
-            ):
-                raise ValueError(
-                    "cache append destinations do not match the frozen group plan"
-                )
-            token_cursor = span_end
-
-        if sequence_index in decode_row_set:
-            if q_length != 1:
-                raise ValueError("decode rows must contain exactly one query token")
-            decode_token_indices.append(token_start)
-            decode_block_ids.extend(blocks)
-            decode_block_indptr.append(len(decode_block_ids))
-            decode_last_block_lengths.append(last_block_length)
-
-        if sequence_index not in prefill_row_set:
-            continue
-        row_tokens = list(range(token_start, token_end))
-
-        if context_length == 0:
-            dense_tokens.extend(row_tokens)
-            dense_cu.append(len(dense_tokens))
-            dense_max_q_len = max(dense_max_q_len, q_length)
-            continue
-
-        continuation_tokens.extend(row_tokens)
-        continuation_cu.append(len(continuation_tokens))
-        continuation_max_q_len = max(continuation_max_q_len, q_length)
-        continuation_page_rows.append(blocks)
-        continuation_seqused_k.append(post_append_length)
-
-    page_table_width = max(map(len, continuation_page_rows), default=0)
-    page_table: list[int] = []
-    for pages in continuation_page_rows:
-        page_table.extend(pages)
-        page_table.extend((pages[0],) * (page_table_width - len(pages)))
-
-    return _CacheKernelMetadata(
-        block_indptr=block_indptr,
-        block_ids=block_ids,
-        last_block_lengths=tuple(last_block_lengths),
-        append_batch_indices=tuple(append_batch_indices),
-        append_positions=tuple(append_positions),
-        decode_token_indices=tuple(decode_token_indices),
-        decode_block_indptr=tuple(decode_block_indptr),
-        decode_block_ids=tuple(decode_block_ids),
-        decode_last_block_lengths=tuple(decode_last_block_lengths),
-        prefill=_PrefillKernelMetadata(
-            dense_token_indices=tuple(dense_tokens),
-            dense_cu_seqlens=tuple(dense_cu),
-            dense_max_q_len=dense_max_q_len,
-            continuation_token_indices=tuple(continuation_tokens),
-            continuation_cu_seqlens=tuple(continuation_cu),
-            continuation_max_q_len=continuation_max_q_len,
-            continuation_page_table=tuple(page_table),
-            continuation_page_table_width=page_table_width,
-            continuation_seqused_k=tuple(continuation_seqused_k),
-            continuation_min_seqlen_k=min(continuation_seqused_k, default=0),
-            continuation_max_seqlen_k=max(continuation_seqused_k, default=0),
-        ),
-    )
-
-
-def _prefill_kernel_metadata(plan: BatchPlan, page_size: int) -> _PrefillKernelMetadata:
-    """Return the prefill subset of generic cache-group metadata."""
-
-    return _cache_kernel_metadata(plan, page_size).prefill
 
 
 def _invoke_paged_fa4_b22(
@@ -845,11 +624,11 @@ class Lfm2CudaRunner:
         if len(groups) != 1 or groups[0].group_index != 0:
             raise ValueError("BatchPlan does not contain LFM2 cache group zero")
 
-    def _preflight_cache(self, plan: BatchPlan) -> _CacheKernelMetadata:
+    def _preflight_cache(self, plan: BatchPlan) -> CacheMetadata:
         """Validate and derive the complete cache launch before CUDA acceptance."""
 
         self._validate_cache_binding(plan)
-        derived = _cache_kernel_metadata(plan, self.page_size)
+        derived = build_cache_metadata(plan, self.page_size)
         if any(block_id > self.max_pages for block_id in derived.block_ids):
             raise ValueError("BatchPlan cache block ID is outside the physical slab")
         return derived
@@ -962,7 +741,7 @@ class Lfm2CudaRunner:
     def _metadata(
         self,
         plan: BatchPlan,
-        derived: _CacheKernelMetadata | None = None,
+        derived: CacheMetadata | None = None,
     ):
         torch = self._torch
         if derived is None:
@@ -1201,8 +980,8 @@ class Lfm2CudaRunner:
         for index, row in enumerate(recurrent_rows):
             start, end = plan.sequence_indptr[index : index + 2]
             state = slab[conv_slot, row.slot].unsqueeze(0)
-            cache = _InPlaceConvCache(state)
-            # The facade turns ShortConv's ``cache.state = next_state`` into an
+            cache = _InPlaceRecurrentState(state)
+            # The facade turns ShortConv's ``state.value = next_state`` into an
             # in-place copy and therefore cannot detach this generation from its
             # fixed physical slab address. Retain both view and facade until the
             # terminal event proves every dependent kernel complete.

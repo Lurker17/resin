@@ -468,7 +468,7 @@ def _benchmark_report() -> dict[str, object]:
     import torch
 
     from resin import Engine
-    from resin.backends.lfm2 import Lfm2TorchRunner
+    from resin.backends.lfm2.reference import Lfm2TorchRunner
 
     torch.cuda.reset_peak_memory_stats()
     load_start = time.perf_counter()

@@ -119,7 +119,7 @@ FlashInfer/FA4 packages are still required remotely.
 
 ```python
 from resin import Engine
-from resin.backends.lfm2 import Lfm2TorchRunner
+from resin.backends.lfm2.reference import Lfm2TorchRunner
 
 runner = Lfm2TorchRunner()
 

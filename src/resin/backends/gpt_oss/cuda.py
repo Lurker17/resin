@@ -21,6 +21,15 @@ from typing import TYPE_CHECKING, Any
 from resin import BatchPhase, CacheGroupLayout, CacheLayout
 
 from .._common import default_device
+from .graphs import DecodeGraphs, GraphInputError, GraphShape
+from .plan import (
+    PAGE_SIZE,
+    PREFILL_CHUNK_SIZE,
+    SLIDING_WINDOW,
+    WINDOW_TABLE_WIDTH,
+    AttentionBatch,
+    build_attention_batches,
+)
 from .reference import (
     DEFAULT_MODEL,
     load_model,
@@ -32,10 +41,10 @@ if TYPE_CHECKING:
 
 
 _FA4_VERSION = "4.0.0b22"
-_PAGE_SIZE = 128
-_SLIDING_WINDOW = 128
-_PREFILL_CHUNK_SIZE = 128
-_WINDOW_TABLE_WIDTH = 1 + ((_SLIDING_WINDOW - 1 + _PAGE_SIZE - 1) // _PAGE_SIZE)
+_PAGE_SIZE = PAGE_SIZE
+_SLIDING_WINDOW = SLIDING_WINDOW
+_PREFILL_CHUNK_SIZE = PREFILL_CHUNK_SIZE
+_WINDOW_TABLE_WIDTH = WINDOW_TABLE_WIDTH
 
 
 class _PostAcceptCudaError(RuntimeError):
@@ -48,103 +57,6 @@ def _positive_int(name: str, value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
-
-
-def _append_slots(
-    token_indices: tuple[int, ...],
-    pages: tuple[int, ...],
-    offsets: tuple[int, ...],
-    *,
-    page_size: int,
-) -> tuple[int, ...]:
-    """Turn Rust-provided page/offset pairs into physical slab row indices."""
-
-    if len(pages) != len(offsets):
-        raise ValueError("append page and offset arrays must have equal length")
-    try:
-        selected = tuple(
-            pages[token_index] * page_size + offsets[token_index]
-            for token_index in token_indices
-        )
-    except IndexError as error:
-        raise ValueError(
-            "append metadata does not cover every selected token"
-        ) from error
-    if any(offsets[token_index] >= page_size for token_index in token_indices):
-        raise ValueError("append page offset is outside the physical page")
-    return selected
-
-
-@dataclass(frozen=True, slots=True)
-class _HostAttentionBatch:
-    """One Rust-frozen decode batch or prefill round before tensorization."""
-
-    phase: BatchPhase
-    round_index: int
-    token_indices: tuple[int, ...]
-    sequence_indices: tuple[int, ...]
-    q_lengths: tuple[int, ...]
-    full_page_table_width: int
-    full_page_table: tuple[int, ...]
-    full_seqused_k: tuple[int, ...]
-    sliding_page_table_width: int
-    sliding_page_table: tuple[int, ...]
-    sliding_seqused_k: tuple[int, ...]
-    full_append_slots: tuple[int, ...]
-    sliding_append_slots: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        if self.phase not in {BatchPhase.PREFILL, BatchPhase.DECODE}:
-            raise ValueError("attention batch phase must be a BatchPhase")
-        if self.round_index < 0:
-            raise ValueError("attention batch round index cannot be negative")
-        row_count = len(self.sequence_indices)
-        if row_count == 0:
-            raise ValueError("an attention batch must contain at least one sequence")
-        if len(set(self.sequence_indices)) != row_count:
-            raise ValueError("an attention round cannot contain a sequence twice")
-        if len(self.q_lengths) != row_count or any(
-            length <= 0 or length > _PREFILL_CHUNK_SIZE for length in self.q_lengths
-        ):
-            raise ValueError("query lengths do not match the native chunk rows")
-        token_count = sum(self.q_lengths)
-        if len(self.token_indices) != token_count:
-            raise ValueError("query lengths do not cover the selected tokens")
-        if (
-            len(self.full_append_slots) != token_count
-            or len(self.sliding_append_slots) != token_count
-        ):
-            raise ValueError("append slots must contain one item per query token")
-        _positive_int("full_page_table_width", self.full_page_table_width)
-        if len(self.full_page_table) != row_count * self.full_page_table_width:
-            raise ValueError("full page table does not match its frozen shape")
-        _positive_int("sliding_page_table_width", self.sliding_page_table_width)
-        if len(self.sliding_page_table) != row_count * self.sliding_page_table_width:
-            raise ValueError("sliding page table does not match its frozen shape")
-        for name, lengths, width in (
-            ("full", self.full_seqused_k, self.full_page_table_width),
-            ("sliding", self.sliding_seqused_k, self.sliding_page_table_width),
-        ):
-            if len(lengths) != row_count:
-                raise ValueError(f"{name} key lengths do not match the table rows")
-            if any(length <= 0 or length > width * _PAGE_SIZE for length in lengths):
-                raise ValueError(f"{name} key length is outside its frozen page table")
-
-
-@dataclass(frozen=True, slots=True)
-class _HostCacheGroup:
-    """Validated generic cache-group metadata before kernel shaping."""
-
-    group_index: int
-    block_indptr: tuple[int, ...]
-    block_ids: tuple[int, ...]
-    first_logical_blocks: tuple[int, ...]
-    append_block_ids: tuple[int, ...]
-    append_block_offsets: tuple[int, ...]
-
-    def row(self, sequence_index: int) -> tuple[int, ...]:
-        start, end = self.block_indptr[sequence_index : sequence_index + 2]
-        return self.block_ids[start:end]
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +80,15 @@ class _DeviceAttentionBatch:
     sliding_max_seqlen_k: int
     full_append_slots: Any
     sliding_append_slots: Any
+
+
+@dataclass(slots=True)
+class _GraphDecodeState:
+    token_ids: Any
+    positions: Any
+    batch: _DeviceAttentionBatch
+    final_hidden: Any
+    output_ids: Any
 
 
 def _invoke_fa4_b22(
@@ -236,6 +157,7 @@ class GptOssCudaRunner:
         device: str | None = None,
         dtype=None,
         moe_kernel=None,
+        cuda_graph_decode_shapes: object = None,
     ) -> None:
         self.cache_parent_capacity = _positive_int(
             "cache_parent_capacity", cache_parent_capacity
@@ -275,6 +197,12 @@ class GptOssCudaRunner:
             raise RuntimeError("GptOssCudaRunner requires CUDA")
         if torch.cuda.get_device_capability(self.device)[0] != 9:
             raise RuntimeError("the pinned GPT-OSS FA4 runner requires an SM90 GPU")
+        self._graphs = DecodeGraphs(
+            torch,
+            self.device,
+            cuda_graph_decode_shapes,
+            capacity=self.cache_parent_capacity,
+        )
 
         resolved_dtype = torch.bfloat16 if dtype is None else dtype
         if isinstance(resolved_dtype, str):
@@ -362,6 +290,10 @@ class GptOssCudaRunner:
             if layer.self_attn.sinks.dtype is not torch.bfloat16:
                 raise TypeError("FA4 learnable sink tensors must be bfloat16")
 
+    @property
+    def cuda_graph_stats(self) -> dict[str, object]:
+        return self._graphs.stats
+
     def bind_cache_pool(self, pool_id: int, layout: CacheLayout) -> int:
         """Permanently bind this runner's frozen layout to one native pool."""
 
@@ -388,371 +320,6 @@ class GptOssCudaRunner:
                 f"the bound cache pool {self._cache_pool_id!r}"
             )
 
-    @staticmethod
-    def _integer_tuple(
-        name: str,
-        values: object,
-        *,
-        positive: bool = False,
-    ) -> tuple[int, ...]:
-        try:
-            result = tuple(values)
-        except TypeError as error:
-            raise ValueError(f"{name} must be iterable") from error
-        lower_bound = 1 if positive else 0
-        if any(
-            isinstance(value, bool) or not isinstance(value, int) or value < lower_bound
-            for value in result
-        ):
-            qualifier = "positive" if positive else "nonnegative"
-            raise ValueError(f"{name} must contain {qualifier} integers")
-        return result
-
-    @classmethod
-    def _cache_group_metadata(
-        cls,
-        plan: BatchPlan,
-        *,
-        sequence_count: int,
-        token_count: int,
-        parent_capacity: int | None,
-    ) -> tuple[_HostCacheGroup, _HostCacheGroup]:
-        try:
-            raw_groups = tuple(plan.cache_groups)
-        except (AttributeError, TypeError) as error:
-            raise ValueError("BatchPlan cache_groups must be iterable") from error
-        if len(raw_groups) != 2:
-            raise ValueError(
-                "GPT-OSS requires exactly two ordered cache groups: History, Window"
-            )
-
-        groups = []
-        for expected_index, raw_group in enumerate(raw_groups):
-            if raw_group.group_index != expected_index:
-                raise ValueError(
-                    "GPT-OSS cache groups must be ordered as History then Window"
-                )
-            block_indptr = cls._integer_tuple(
-                f"cache group {expected_index} block_indptr",
-                raw_group.block_indptr,
-            )
-            block_ids = cls._integer_tuple(
-                f"cache group {expected_index} block_ids",
-                raw_group.block_ids,
-                positive=True,
-            )
-            first_logical_blocks = cls._integer_tuple(
-                f"cache group {expected_index} first_logical_blocks",
-                raw_group.first_logical_blocks,
-            )
-            append_block_ids = cls._integer_tuple(
-                f"cache group {expected_index} append_block_ids",
-                raw_group.append_block_ids,
-                positive=True,
-            )
-            append_block_offsets = cls._integer_tuple(
-                f"cache group {expected_index} append_block_offsets",
-                raw_group.append_block_offsets,
-            )
-            if len(block_indptr) != sequence_count + 1:
-                raise ValueError(
-                    f"cache group {expected_index} block_indptr does not cover "
-                    "every sequence"
-                )
-            if (
-                block_indptr[0] != 0
-                or block_indptr[-1] != len(block_ids)
-                or any(
-                    left > right for left, right in zip(block_indptr, block_indptr[1:])
-                )
-            ):
-                raise ValueError(
-                    f"cache group {expected_index} block_indptr is malformed"
-                )
-            if len(first_logical_blocks) != sequence_count:
-                raise ValueError(
-                    f"cache group {expected_index} first_logical_blocks does not "
-                    "cover every sequence"
-                )
-            if (
-                len(append_block_ids) != token_count
-                or len(append_block_offsets) != token_count
-            ):
-                raise ValueError(
-                    f"cache group {expected_index} append metadata does not cover "
-                    "every query token"
-                )
-            if any(offset >= _PAGE_SIZE for offset in append_block_offsets):
-                raise ValueError(
-                    f"cache group {expected_index} append offset is outside its block"
-                )
-            if parent_capacity is not None and any(
-                block_id > parent_capacity
-                for block_id in (*block_ids, *append_block_ids)
-            ):
-                raise ValueError(
-                    f"cache group {expected_index} contains a physical block outside "
-                    "the bound parent allocation"
-                )
-            groups.append(
-                _HostCacheGroup(
-                    group_index=expected_index,
-                    block_indptr=block_indptr,
-                    block_ids=block_ids,
-                    first_logical_blocks=first_logical_blocks,
-                    append_block_ids=append_block_ids,
-                    append_block_offsets=append_block_offsets,
-                )
-            )
-
-        history, window = groups
-        if set(history.block_ids) & set(window.block_ids):
-            raise ValueError(
-                "one physical parent cannot be interpreted by History and Window "
-                "in the same batch"
-            )
-        return history, window
-
-    @staticmethod
-    def _padded_page_table(
-        rows: tuple[tuple[int, ...], ...],
-        *,
-        minimum_width: int = 1,
-    ) -> tuple[int, tuple[int, ...]]:
-        width = max(minimum_width, *(len(row) for row in rows))
-        table = []
-        for row in rows:
-            if not row:
-                raise ValueError("cache page-table rows must be nonempty")
-            table.extend(row)
-            table.extend((row[0],) * (width - len(row)))
-        return width, tuple(table)
-
-    @classmethod
-    def _attention_batches(
-        cls,
-        plan: BatchPlan,
-        *,
-        parent_capacity: int | None = None,
-    ) -> tuple[tuple[_HostAttentionBatch, ...], _HostAttentionBatch | None]:
-        """Derive all dense FA4 views from the generic grouped cache plan."""
-
-        sequence_ids = cls._integer_tuple("sequence_ids", plan.sequence_ids)
-        sequence_count = len(sequence_ids)
-        if sequence_count == 0:
-            raise ValueError("GPT-OSS cannot execute an empty batch")
-        token_ids = cls._integer_tuple("token_ids", plan.token_ids)
-        token_count = len(token_ids)
-        positions = cls._integer_tuple("positions", plan.positions)
-        sequence_indptr = cls._integer_tuple("sequence_indptr", plan.sequence_indptr)
-        context_lengths = cls._integer_tuple("context_lengths", plan.context_lengths)
-        if plan.phase == BatchPhase.PREFILL:
-            prefill_rows = tuple(range(sequence_count))
-            decode_rows: tuple[int, ...] = ()
-        elif plan.phase == BatchPhase.DECODE:
-            prefill_rows = ()
-            decode_rows = tuple(range(sequence_count))
-        else:
-            raise ValueError(
-                "plan phase must be BatchPhase.PREFILL or BatchPhase.DECODE"
-            )
-
-        if len(positions) != token_count:
-            raise ValueError("positions do not cover every query token")
-        if len(sequence_indptr) != sequence_count + 1:
-            raise ValueError("sequence_indptr does not cover every sequence")
-        if (
-            sequence_indptr[0] != 0
-            or sequence_indptr[-1] != token_count
-            or any(
-                left >= right
-                for left, right in zip(sequence_indptr, sequence_indptr[1:])
-            )
-        ):
-            raise ValueError(
-                "sequence_indptr must contain one nonempty query range per sequence"
-            )
-        if len(context_lengths) != sequence_count:
-            raise ValueError("context_lengths do not cover every sequence")
-        history, window = cls._cache_group_metadata(
-            plan,
-            sequence_count=sequence_count,
-            token_count=token_count,
-            parent_capacity=parent_capacity,
-        )
-        post_lengths: list[int] = []
-
-        for sequence_index in range(sequence_count):
-            token_start, token_end = sequence_indptr[
-                sequence_index : sequence_index + 2
-            ]
-            context_length = context_lengths[sequence_index]
-            q_length = token_end - token_start
-            if positions[token_start:token_end] != tuple(
-                range(context_length, context_length + q_length)
-            ):
-                raise ValueError(
-                    "query positions must be contiguous from each row's context"
-                )
-            post_length = context_length + q_length
-            post_lengths.append(post_length)
-            last_logical_block = (post_length - 1) // _PAGE_SIZE
-
-            history_row = history.row(sequence_index)
-            if (
-                history.first_logical_blocks[sequence_index] != 0
-                or len(history_row) != last_logical_block + 1
-            ):
-                raise ValueError(
-                    "History group rows must be the exact post-append prefix"
-                )
-
-            expected_window_first = max(0, last_logical_block + 1 - _WINDOW_TABLE_WIDTH)
-            window_row = window.row(sequence_index)
-            if (
-                window.first_logical_blocks[sequence_index] != expected_window_first
-                or len(window_row) != last_logical_block - expected_window_first + 1
-            ):
-                raise ValueError(
-                    "Window group rows must be the exact chronological active suffix"
-                )
-
-            for group, row in ((history, history_row), (window, window_row)):
-                first_logical_block = group.first_logical_blocks[sequence_index]
-                for token_index in range(token_start, token_end):
-                    position = positions[token_index]
-                    relative_block = position // _PAGE_SIZE - first_logical_block
-                    if relative_block < 0 or relative_block >= len(row):
-                        raise ValueError(
-                            f"cache group {group.group_index} does not cover every "
-                            "query append"
-                        )
-                    if (
-                        group.append_block_ids[token_index] != row[relative_block]
-                        or group.append_block_offsets[token_index]
-                        != position % _PAGE_SIZE
-                    ):
-                        raise ValueError(
-                            f"cache group {group.group_index} append destinations "
-                            "do not match its chronological row"
-                        )
-
-            if sequence_index in prefill_rows:
-                if (
-                    q_length > _PREFILL_CHUNK_SIZE
-                    or context_length // _PAGE_SIZE != (post_length - 1) // _PAGE_SIZE
-                ):
-                    raise ValueError(
-                        "Window prefill dispatch must stay within one logical "
-                        "cache block"
-                    )
-            elif q_length != 1:
-                raise ValueError("decode rows must contain exactly one query token")
-
-        def cache_rows(
-            group: _HostCacheGroup, row_indices: tuple[int, ...]
-        ) -> tuple[tuple[tuple[int, ...], ...], tuple[int, ...]]:
-            rows = tuple(group.row(index) for index in row_indices)
-            lengths = tuple(
-                post_lengths[index] - group.first_logical_blocks[index] * _PAGE_SIZE
-                for index in row_indices
-            )
-            return rows, lengths
-
-        prefill_batches: tuple[_HostAttentionBatch, ...] = ()
-        if prefill_rows:
-            token_indices = tuple(
-                token_index
-                for sequence_index in prefill_rows
-                for token_index in range(
-                    sequence_indptr[sequence_index],
-                    sequence_indptr[sequence_index + 1],
-                )
-            )
-            q_lengths = tuple(
-                sequence_indptr[index + 1] - sequence_indptr[index]
-                for index in prefill_rows
-            )
-            history_rows, history_lengths = cache_rows(history, prefill_rows)
-            window_rows, window_lengths = cache_rows(window, prefill_rows)
-            history_width, history_table = cls._padded_page_table(history_rows)
-            window_width, window_table = cls._padded_page_table(
-                window_rows, minimum_width=_WINDOW_TABLE_WIDTH
-            )
-            prefill_batches = (
-                _HostAttentionBatch(
-                    phase=BatchPhase.PREFILL,
-                    round_index=0,
-                    token_indices=token_indices,
-                    sequence_indices=prefill_rows,
-                    q_lengths=q_lengths,
-                    full_page_table_width=history_width,
-                    full_page_table=history_table,
-                    full_seqused_k=history_lengths,
-                    sliding_page_table_width=window_width,
-                    sliding_page_table=window_table,
-                    sliding_seqused_k=window_lengths,
-                    full_append_slots=_append_slots(
-                        token_indices,
-                        history.append_block_ids,
-                        history.append_block_offsets,
-                        page_size=_PAGE_SIZE,
-                    ),
-                    sliding_append_slots=_append_slots(
-                        token_indices,
-                        window.append_block_ids,
-                        window.append_block_offsets,
-                        page_size=_PAGE_SIZE,
-                    ),
-                ),
-            )
-
-        decode_batch = None
-        if decode_rows:
-            token_indices = tuple(
-                sequence_indptr[sequence_index] for sequence_index in decode_rows
-            )
-            history_rows, history_lengths = cache_rows(history, decode_rows)
-            window_rows, window_lengths = cache_rows(window, decode_rows)
-            history_width, history_table = cls._padded_page_table(history_rows)
-            window_width, window_table = cls._padded_page_table(
-                window_rows, minimum_width=_WINDOW_TABLE_WIDTH
-            )
-            decode_batch = _HostAttentionBatch(
-                phase=BatchPhase.DECODE,
-                round_index=0,
-                token_indices=token_indices,
-                sequence_indices=decode_rows,
-                q_lengths=(1,) * len(decode_rows),
-                full_page_table_width=history_width,
-                full_page_table=history_table,
-                full_seqused_k=history_lengths,
-                sliding_page_table_width=window_width,
-                sliding_page_table=window_table,
-                sliding_seqused_k=window_lengths,
-                full_append_slots=_append_slots(
-                    token_indices,
-                    history.append_block_ids,
-                    history.append_block_offsets,
-                    page_size=_PAGE_SIZE,
-                ),
-                sliding_append_slots=_append_slots(
-                    token_indices,
-                    window.append_block_ids,
-                    window.append_block_offsets,
-                    page_size=_PAGE_SIZE,
-                ),
-            )
-        return prefill_batches, decode_batch
-
-    @classmethod
-    def _prefill_batches(cls, plan: BatchPlan) -> tuple[_HostAttentionBatch, ...]:
-        return cls._attention_batches(plan)[0]
-
-    @classmethod
-    def _decode_batch(cls, plan: BatchPlan) -> _HostAttentionBatch | None:
-        return cls._attention_batches(plan)[1]
-
     def _synchronize_failed_eager_forward(self) -> None:
         """Make a launched eager failure quiescent or mark it post-accept."""
 
@@ -768,7 +335,7 @@ class GptOssCudaRunner:
                 "quarantined"
             ) from synchronization_error
 
-    def _tensorize(self, batch: _HostAttentionBatch) -> _DeviceAttentionBatch:
+    def _tensorize(self, batch: AttentionBatch) -> _DeviceAttentionBatch:
         torch = self._torch
 
         def int32(values):
@@ -778,30 +345,28 @@ class GptOssCudaRunner:
             return torch.tensor(values, dtype=torch.long, device=self.device)
 
         cu_seqlens_q = [0]
-        for length in batch.q_lengths:
+        for length in batch.query_lengths:
             cu_seqlens_q.append(cu_seqlens_q[-1] + length)
         last_token_indices = tuple(end - 1 for end in cu_seqlens_q[1:])
         row_count = len(batch.sequence_indices)
         return _DeviceAttentionBatch(
             phase=batch.phase,
-            round_index=batch.round_index,
+            round_index=0,
             token_indices=indices(batch.token_indices),
             sequence_indices=indices(batch.sequence_indices),
             last_token_indices=indices(last_token_indices),
             cu_seqlens_q=int32(cu_seqlens_q),
-            max_seqlen_q=max(batch.q_lengths),
-            full_page_table=int32(batch.full_page_table).view(
-                row_count, batch.full_page_table_width
+            max_seqlen_q=max(batch.query_lengths),
+            full_page_table=int32(batch.full_table).view(row_count, batch.full_width),
+            full_seqused_k=int32(batch.full_lengths),
+            full_min_seqlen_k=min(batch.full_lengths),
+            full_max_seqlen_k=max(batch.full_lengths),
+            sliding_page_table=int32(batch.sliding_table).view(
+                row_count, batch.sliding_width
             ),
-            full_seqused_k=int32(batch.full_seqused_k),
-            full_min_seqlen_k=min(batch.full_seqused_k),
-            full_max_seqlen_k=max(batch.full_seqused_k),
-            sliding_page_table=int32(batch.sliding_page_table).view(
-                row_count, batch.sliding_page_table_width
-            ),
-            sliding_seqused_k=int32(batch.sliding_seqused_k),
-            sliding_min_seqlen_k=min(batch.sliding_seqused_k),
-            sliding_max_seqlen_k=max(batch.sliding_seqused_k),
+            sliding_seqused_k=int32(batch.sliding_lengths),
+            sliding_min_seqlen_k=min(batch.sliding_lengths),
+            sliding_max_seqlen_k=max(batch.sliding_lengths),
             full_append_slots=indices(batch.full_append_slots),
             sliding_append_slots=indices(batch.sliding_append_slots),
         )
@@ -915,7 +480,125 @@ class GptOssCudaRunner:
         hidden = self._model.model.norm(hidden).squeeze(0)
         return hidden.index_select(0, batch.last_token_indices)
 
+    @staticmethod
+    def _pad_page_table(batch: AttentionBatch, width: int) -> tuple[int, ...]:
+        """Pad each row by repeating one page already owned by that row."""
+
+        if batch.full_width > width:
+            raise GraphInputError("decode page table exceeds CUDA graph shape")
+        padded = []
+        source_width = batch.full_width
+        for row in range(len(batch.sequence_indices)):
+            pages = batch.full_table[row * source_width : (row + 1) * source_width]
+            if not pages:
+                raise GraphInputError("decode page-table row is empty")
+            padded.extend(pages)
+            padded.extend((pages[0],) * (width - source_width))
+        return tuple(padded)
+
+    def _new_graph_state(self, shape: GraphShape) -> _GraphDecodeState:
+        batch_size, full_width = shape
+        torch = self._torch
+
+        def empty(dtype, *shape):
+            return torch.empty(shape, dtype=dtype, device=self.device)
+
+        batch = _DeviceAttentionBatch(
+            phase=BatchPhase.DECODE,
+            round_index=0,
+            token_indices=empty(torch.long, batch_size),
+            sequence_indices=empty(torch.long, batch_size),
+            last_token_indices=torch.arange(
+                batch_size, dtype=torch.long, device=self.device
+            ),
+            cu_seqlens_q=torch.arange(
+                batch_size + 1, dtype=torch.int32, device=self.device
+            ),
+            max_seqlen_q=1,
+            full_page_table=empty(torch.int32, batch_size, full_width),
+            full_seqused_k=empty(torch.int32, batch_size),
+            full_min_seqlen_k=1,
+            full_max_seqlen_k=full_width * _PAGE_SIZE,
+            sliding_page_table=empty(torch.int32, batch_size, _WINDOW_TABLE_WIDTH),
+            sliding_seqused_k=empty(torch.int32, batch_size),
+            sliding_min_seqlen_k=1,
+            sliding_max_seqlen_k=_WINDOW_TABLE_WIDTH * _PAGE_SIZE,
+            full_append_slots=empty(torch.long, batch_size),
+            sliding_append_slots=empty(torch.long, batch_size),
+        )
+        return _GraphDecodeState(
+            token_ids=empty(torch.long, batch_size),
+            positions=empty(torch.long, batch_size),
+            batch=batch,
+            final_hidden=empty(torch.bfloat16, batch_size, self.hidden_size),
+            output_ids=empty(torch.long, batch_size),
+        )
+
+    def _stage_graph_state(
+        self, state: _GraphDecodeState, plan: BatchPlan, host: AttentionBatch
+    ) -> None:
+        batch = state.batch
+        rows = len(plan.sequence_ids)
+        if (
+            host.phase != BatchPhase.DECODE
+            or host.query_lengths != (1,) * rows
+            or host.sliding_width != _WINDOW_TABLE_WIDTH
+        ):
+            raise GraphInputError("plan is not a fixed-shape decode batch")
+        values = (
+            (state.token_ids, plan.token_ids),
+            (state.positions, plan.positions),
+            (batch.token_indices, host.token_indices),
+            (batch.sequence_indices, host.sequence_indices),
+            (
+                batch.full_page_table,
+                self._pad_page_table(host, batch.full_page_table.shape[1]),
+            ),
+            (batch.full_seqused_k, host.full_lengths),
+            (batch.sliding_page_table, host.sliding_table),
+            (batch.sliding_seqused_k, host.sliding_lengths),
+            (batch.full_append_slots, host.full_append_slots),
+            (batch.sliding_append_slots, host.sliding_append_slots),
+        )
+        try:
+            staged = tuple(
+                (
+                    target,
+                    self._torch.as_tensor(
+                        source, dtype=target.dtype, device="cpu"
+                    ).view(target.shape),
+                )
+                for target, source in values
+            )
+        except Exception as error:
+            raise GraphInputError("plan does not fit CUDA graph buffers") from error
+        for target, source in staged:
+            target.copy_(source)
+
+    def _graph_body(self, state: _GraphDecodeState) -> None:
+        hidden = self._forward_batch(state.token_ids, state.positions, state.batch)
+        state.final_hidden.index_copy_(0, state.batch.sequence_indices, hidden)
+        logits = self._model.lm_head(state.final_hidden)
+        self._torch.argmax(logits, dim=-1, out=state.output_ids)
+
+    def _graph_forward(self, plan: BatchPlan, host: AttentionBatch) -> list[int] | None:
+        if not self._graphs.shapes:
+            return None
+        shape = self._graphs.select(len(plan.sequence_ids), host.full_width)
+        if shape is None:
+            self._graphs.fallback("shape")
+            return None
+        return self._graphs.run(
+            shape,
+            allocate=self._new_graph_state,
+            stage=lambda state: self._stage_graph_state(state, plan, host),
+            body=self._graph_body,
+            output=lambda state: state.output_ids,
+            synchronize_failure=self._synchronize_failed_eager_forward,
+        )
+
     def forward(self, plan: BatchPlan) -> list[int]:
+        self._graphs.check()
         self._validate_plan_binding(plan)
         if any(token_id >= self.vocab_size for token_id in plan.token_ids):
             raise ValueError("token id is out of range")
@@ -925,7 +608,7 @@ class GptOssCudaRunner:
         ):
             raise ValueError("position exceeds max_position_embeddings")
 
-        prefill_batches, decode_batch = self._attention_batches(
+        prefill_batches, decode_batch = build_attention_batches(
             plan, parent_capacity=self.cache_parent_capacity
         )
         host_batches = prefill_batches + (
@@ -936,6 +619,13 @@ class GptOssCudaRunner:
             raise ValueError(
                 "native attention batches do not cover every plan sequence"
             )
+
+        if prefill_batches:
+            self._graphs.fallback("prefill")
+        elif decode_batch is not None:
+            graph_output = self._graph_forward(plan, decode_batch)
+            if graph_output is not None:
+                return graph_output
 
         torch = self._torch
         token_ids = torch.tensor(plan.token_ids, dtype=torch.long, device=self.device)

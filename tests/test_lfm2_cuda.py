@@ -3,8 +3,6 @@ from __future__ import annotations
 import gc
 import inspect
 import math
-import subprocess
-import sys
 import unittest
 import weakref
 from contextlib import nullcontext
@@ -286,15 +284,6 @@ class _RecordingDecode:
 
 
 class Lfm2CudaImportTests(unittest.TestCase):
-    def test_import_is_lazy(self) -> None:
-        script = """
-import sys
-import resin.backends.lfm2.cuda
-for name in ('torch', 'flashinfer', 'flash_attn', 'transformers', 'tokenizers'):
-    assert name not in sys.modules
-"""
-        subprocess.run([sys.executable, "-c", script], check=True)
-
     def test_physical_cache_slab_reserves_zero_as_the_null_page(self) -> None:
         from resin.backends.lfm2.cuda import _cache_slab_shape
 
@@ -694,7 +683,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         self.assertEqual(metadata["append_positions"].values, (18,))
 
     def test_explicit_continuation_rows_use_only_rust_post_append_pages(self) -> None:
-        from resin.backends.lfm2.cuda import _prefill_kernel_metadata
+        from resin.backends.lfm2.plan import build_cache_metadata
 
         plan = self._plan(
             block_indptr=[0, 1, 3, 6],
@@ -711,7 +700,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             token_ids=[1, 2, 3, 4, 5],
         )
 
-        metadata = _prefill_kernel_metadata(plan, 4)
+        metadata = build_cache_metadata(plan, 4).prefill
 
         self.assertEqual(metadata.dense_token_indices, (0, 1))
         self.assertEqual(metadata.dense_cu_seqlens, (0, 2))
@@ -782,7 +771,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             self.assertEqual(metadata["_pinned"][name].device, "cpu")
 
     def test_continuation_rejects_stale_preappend_block_table(self) -> None:
-        from resin.backends.lfm2.cuda import _prefill_kernel_metadata
+        from resin.backends.lfm2.plan import build_cache_metadata
 
         plan = self._plan(
             block_indptr=[0, 1],
@@ -799,10 +788,10 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             positions=[15, 16],
         )
         with self.assertRaisesRegex(ValueError, "post-append"):
-            _prefill_kernel_metadata(plan, 16)
+            build_cache_metadata(plan, 16)
 
     def test_one_token_prefill_is_not_inferred_to_be_decode(self) -> None:
-        from resin.backends.lfm2.cuda import _prefill_kernel_metadata
+        from resin.backends.lfm2.plan import build_cache_metadata
 
         plan = self._plan(
             block_indptr=[0, 1, 2],
@@ -819,7 +808,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             positions=[8, 8],
         )
 
-        metadata = _prefill_kernel_metadata(plan, 16)
+        metadata = build_cache_metadata(plan, 16).prefill
 
         self.assertEqual(metadata.continuation_token_indices, (0, 1))
         self.assertEqual(metadata.continuation_cu_seqlens, (0, 1, 2))
@@ -834,9 +823,9 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         self.assertNotIn("_free_pages", source)
         metadata_source = inspect.getsource(Lfm2CudaRunner._metadata)
         self.assertIn("_preflight_cache", metadata_source)
-        from resin.backends.lfm2.cuda import _cache_kernel_metadata
+        from resin.backends.lfm2.plan import build_cache_metadata
 
-        adapter_source = inspect.getsource(_cache_kernel_metadata)
+        adapter_source = inspect.getsource(build_cache_metadata)
         self.assertIn("plan.phase", adapter_source)
         self.assertIn("group.append_block_ids", adapter_source)
         self.assertIn("group.append_block_offsets", adapter_source)
@@ -1010,9 +999,9 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
         observations = []
 
         def layer(value, cache):
-            original = cache.state
-            cache.state = replacement
-            observations.append((original, cache.state))
+            original = cache.value
+            cache.value = replacement
+            observations.append((original, cache.value))
             return value
 
         ephemeral = []
@@ -1057,7 +1046,7 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
 
         source = inspect.getsource(Lfm2CudaRunner)
         self.assertNotIn("_conv_cache", source)
-        self.assertIn("_InPlaceConvCache", source)
+        self.assertIn("_InPlaceRecurrentState", source)
 
 
 class Lfm2CudaFa4ContinuationTests(unittest.TestCase):
