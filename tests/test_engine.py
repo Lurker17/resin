@@ -9,6 +9,7 @@ from resin import (
     CacheLayout,
     Engine,
     RequestLease,
+    SchedulerConfig,
     StatePool,
 )
 
@@ -38,6 +39,13 @@ class EngineTests(unittest.TestCase):
             engine.submit([1, 2, 3], max_new_tokens=3)
         with self.assertRaisesRegex(ValueError, "context_length must be positive"):
             Engine(RecordingRunner(), context_length=0)
+
+    def test_missing_generation_limit_uses_remaining_model_context(self) -> None:
+        engine = Engine(RecordingRunner(), context_length=3)
+        request = engine.submit([1, 2])
+        while engine.has_work():
+            engine.step()
+        self.assertEqual(request.take_result(), [3, 4])
 
     def test_request_lease_owns_result_without_engine_retention(self) -> None:
         engine = Engine(RecordingRunner())
@@ -102,19 +110,23 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "1 sequences"):
             engine.step()
 
-    def test_batch_limit_rotates_requests_fairly(self) -> None:
+    def test_batch_limit_keeps_running_request_ahead_of_waiter(self) -> None:
         runner = RecordingRunner()
         engine = Engine(runner, max_running_requests=1)
         first = engine.submit([1], max_new_tokens=3)
         second = engine.submit([10], max_new_tokens=1)
         engine.step()
         event = engine.step()[0]
-        self.assertEqual(event.request_id, second)
+        self.assertEqual(event.request_id, first)
         self.assertFalse(first.done)
+        self.assertFalse(second.done)
+        engine.step()
+        event = engine.step()[0]
+        self.assertEqual(event.request_id, second)
         self.assertTrue(second.done)
         self.assertEqual(second.take_result(), [11])
 
-    def test_decode_survivor_runs_after_the_ready_prefill_tail(self) -> None:
+    def test_ready_prefill_fills_a_vacancy_before_decode_resumes(self) -> None:
         runner = RecordingRunner()
         engine = Engine(runner, max_running_requests=2)
         surviving = engine.submit([1], max_new_tokens=3)
@@ -135,12 +147,16 @@ class EngineTests(unittest.TestCase):
         )
         self.assertEqual(runner.plans[1].sequence_ids, [untouched])
         self.assertTrue(untouched.done)
-        self.assertEqual(untouched.take_result(), [21])
         self.assertFalse(surviving.done)
 
         third_events = engine.step()
         self.assertEqual([event.request_id for event in third_events], [surviving])
         self.assertEqual(runner.plans[2].sequence_ids, [surviving])
+
+        fourth_events = engine.step()
+        self.assertEqual([event.request_id for event in fourth_events], [surviving])
+        self.assertEqual(runner.plans[3].sequence_ids, [surviving])
+        self.assertEqual(untouched.take_result(), [21])
 
     def test_public_batch_plan_validates_indptr(self) -> None:
         with self.assertRaisesRegex(ValueError, "end at the token count"):
@@ -208,10 +224,12 @@ class EngineTests(unittest.TestCase):
 
         self.assertEqual(runner.binding, (engine.cache_pool_id, layout))
         self.assertIs(runner.binding[1], layout)
-        self.assertEqual(engine.cache_occupied_block_count, 2)
-        self.assertEqual(engine.cache_free_parent_count, 1)
+        self.assertEqual(engine.cache_occupied_block_count, 0)
+        self.assertEqual(engine.cache_free_parent_count, 3)
 
         engine.step()
+        self.assertEqual(engine.cache_occupied_block_count, 2)
+        self.assertEqual(engine.cache_free_parent_count, 1)
         prefill = runner.plans[0]
         self.assertEqual(prefill.cache_pool_id, engine.cache_pool_id)
         self.assertEqual(len(prefill.cache_groups), 1)
@@ -235,6 +253,63 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(runner.released, [request])
         self.assertEqual(engine.cache_occupied_block_count, 0)
         self.assertEqual(engine.cache_free_parent_count, 3)
+
+    def test_kv_grows_on_demand_and_retracts_for_replay(self) -> None:
+        layout = CacheLayout(3, [CacheGroupLayout(1)])
+
+        class TinyCachedRunner(RecordingRunner):
+            cache_layout = layout
+            supports_continuation_prefill = True
+
+            def bind_cache_pool(self, pool_id, bound_layout):
+                self.binding = (pool_id, bound_layout)
+                return pool_id
+
+        runner = TinyCachedRunner()
+        engine = Engine(
+            runner,
+            max_running_requests=2,
+            context_length=3,
+            scheduler_config=SchedulerConfig(schedule_conservativeness=0.0),
+        )
+        first = engine.submit([1], max_new_tokens=3)
+        second = engine.submit([10], max_new_tokens=3)
+
+        engine.step()
+        self.assertEqual(engine.cache_occupied_block_count, 2)
+        self.assertEqual(runner.plans[-1].sequence_ids, [first, second])
+
+        while engine.has_work():
+            engine.step()
+
+        self.assertEqual(second.take_result(), [11, 12, 13])
+        self.assertEqual(first.take_result(), [2, 3, 4])
+        self.assertEqual(runner.released, [first, second, first])
+        first_replay = next(
+            plan
+            for plan in runner.plans[1:]
+            if plan.sequence_ids == [first] and plan.phase == BatchPhase.PREFILL
+        )
+        self.assertEqual(first_replay.sample_sequence_indices, [])
+        self.assertEqual(engine.cache_occupied_block_count, 0)
+
+    def test_conservativeness_limits_initial_kv_admission(self) -> None:
+        layout = CacheLayout(3, [CacheGroupLayout(1)])
+
+        class TinyCachedRunner(RecordingRunner):
+            cache_layout = layout
+
+            def bind_cache_pool(self, pool_id, bound_layout):
+                return pool_id
+
+        runner = TinyCachedRunner()
+        engine = Engine(runner, max_running_requests=2, context_length=3)
+        first = engine.submit([1], max_new_tokens=3)
+        second = engine.submit([10], max_new_tokens=3)
+        engine.step()
+        self.assertEqual(runner.plans[-1].sequence_ids, [first])
+        self.assertFalse(second.done)
+        engine.close()
 
 
 if __name__ == "__main__":

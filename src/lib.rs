@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,9 +19,7 @@ use resin_core::resources::paged::{CachePoolError, RequestPages, WriterAccessLea
 use resin_core::resources::paged_kv::{PagedKvError, PagedKvResources};
 use resin_core::resources::slots::SlotHandle as CoreStateHandle;
 use resin_core::resources::{RequestResourceRef, ResourceSet, WithResources};
-use resin_core::{
-    Phase, QueueMode, RequestId, Schedulable, Scheduler, SchedulerPolicy, SequenceStep,
-};
+use resin_core::{Phase, RequestId, Schedulable, Scheduler, SequenceStep};
 use runner::{
     RunnerExecution, bind_runner_resources, resolve_runner_contract,
     resolve_runner_prefill_chunk_size, resolve_runner_resources, runner_error_is_post_accept,
@@ -42,21 +41,25 @@ fn mint_engine_id() -> PyResult<u64> {
 }
 
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct SchedulerConfig {
-    policy: SchedulerPolicy,
     max_batch_tokens: Option<NonZeroU32>,
     prefill_chunk_size: NonZeroU32,
+    schedule_conservativeness: f64,
 }
 
 const DEFAULT_PREFILL_CHUNK_SIZE: NonZeroU32 = NonZeroU32::new(8192).unwrap();
+const INITIAL_NEW_TOKEN_RATIO: f64 = 0.7;
+const MIN_NEW_TOKEN_RATIO_FACTOR: f64 = 0.14;
+const NEW_TOKEN_RATIO_DECAY_STEPS: f64 = 600.0;
+const RETRACTION_DECODE_HEADROOM: usize = 20;
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            policy: SchedulerPolicy::default(),
             max_batch_tokens: None,
             prefill_chunk_size: DEFAULT_PREFILL_CHUNK_SIZE,
+            schedule_conservativeness: 1.0,
         }
     }
 }
@@ -66,26 +69,21 @@ impl SchedulerConfig {
     #[new]
     #[pyo3(signature = (
         *,
-        queue_mode = "round_robin",
         max_batch_tokens = None,
-        prefill_chunk_size = 8192
+        prefill_chunk_size = 8192,
+        schedule_conservativeness = 1.0
     ))]
     fn new(
-        queue_mode: &str,
         max_batch_tokens: Option<u32>,
         prefill_chunk_size: u32,
+        schedule_conservativeness: f64,
     ) -> PyResult<Self> {
-        let queue_mode = match queue_mode {
-            "round_robin" => QueueMode::RoundRobin,
-            "fifo" => QueueMode::Fifo,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "queue_mode must be 'round_robin' or 'fifo'",
-                ));
-            }
-        };
+        if !schedule_conservativeness.is_finite() || schedule_conservativeness < 0.0 {
+            return Err(PyValueError::new_err(
+                "schedule_conservativeness must be finite and non-negative",
+            ));
+        }
         Ok(Self {
-            policy: SchedulerPolicy { queue_mode },
             max_batch_tokens: max_batch_tokens
                 .map(|value| {
                     NonZeroU32::new(value)
@@ -94,12 +92,8 @@ impl SchedulerConfig {
                 .transpose()?,
             prefill_chunk_size: NonZeroU32::new(prefill_chunk_size)
                 .ok_or_else(|| PyValueError::new_err("prefill_chunk_size must be positive"))?,
+            schedule_conservativeness,
         })
-    }
-
-    #[getter]
-    fn queue_mode(&self) -> &'static str {
-        self.policy.queue_mode.as_str()
     }
 
     #[getter]
@@ -112,13 +106,18 @@ impl SchedulerConfig {
         self.prefill_chunk_size.get()
     }
 
+    #[getter]
+    fn schedule_conservativeness(&self) -> f64 {
+        self.schedule_conservativeness
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "SchedulerConfig(queue_mode='{}', max_batch_tokens={}, prefill_chunk_size={})",
-            self.queue_mode(),
+            "SchedulerConfig(max_batch_tokens={}, prefill_chunk_size={}, schedule_conservativeness={:?})",
             self.max_batch_tokens()
                 .map_or_else(|| "None".to_owned(), |value| value.to_string()),
             self.prefill_chunk_size(),
+            self.schedule_conservativeness,
         )
     }
 }
@@ -155,6 +154,10 @@ impl SchedulerConfig {
             prefill_chunk_size: self.prefill_chunk_size.min(runner_limit),
             ..self
         }
+    }
+
+    fn initial_new_token_ratio(self) -> f64 {
+        (INITIAL_NEW_TOKEN_RATIO * self.schedule_conservativeness).min(1.0)
     }
 }
 
@@ -834,8 +837,9 @@ struct RequestData {
     priority: i32,
     batch_key: Option<u64>,
     turn_ordinal: u128,
+    running: bool,
     prompt: Vec<u32>,
-    prefill_cursor: u32,
+    resident_tokens: u32,
     generated: Vec<u32>,
     max_new_tokens: usize,
     cancel_pending: bool,
@@ -855,30 +859,33 @@ impl RequestData {
         u32::try_from(self.prompt.len()).expect("submit bounds prompt length to u32")
     }
 
-    fn logical_context(&self) -> PyResult<u32> {
-        let prompt_length = self.prompt_length();
-        if self.generated.is_empty() {
-            if self.prefill_cursor >= prompt_length {
-                return Err(PyRuntimeError::new_err(format!(
-                    "request {} has an invalid prefill cursor {} for prompt length {prompt_length}",
-                    self.id, self.prefill_cursor
-                )));
-            }
-            Ok(self.prefill_cursor)
-        } else {
-            if self.prefill_cursor != prompt_length {
-                return Err(PyRuntimeError::new_err(format!(
-                    "request {} entered decode before its prompt was fully committed",
-                    self.id
-                )));
-            }
-            let generated_inputs = u32::try_from(self.generated.len() - 1).map_err(|_| {
+    fn prefill_length(&self) -> PyResult<u32> {
+        let generated_inputs =
+            u32::try_from(self.generated.len().saturating_sub(1)).map_err(|_| {
                 PyValueError::new_err("generated sequence length exceeds the u32 metadata range")
             })?;
-            prompt_length.checked_add(generated_inputs).ok_or_else(|| {
+        self.prompt_length()
+            .checked_add(generated_inputs)
+            .ok_or_else(|| {
                 PyValueError::new_err("sequence position exceeds the u32 metadata range")
             })
+    }
+
+    fn logical_context(&self) -> PyResult<u32> {
+        let prefill_length = self.prefill_length()?;
+        if self.resident_tokens > prefill_length
+            || (self.resident_tokens == prefill_length && self.generated.is_empty())
+        {
+            return Err(PyRuntimeError::new_err(format!(
+                "request {} has invalid resident progress {} for input length {prefill_length}",
+                self.id, self.resident_tokens
+            )));
         }
+        Ok(self.resident_tokens)
+    }
+
+    fn sample_at_prefill_end(&self) -> bool {
+        self.generated.is_empty()
     }
 }
 
@@ -892,11 +899,20 @@ impl Schedulable for RequestData {
     }
 
     fn phase(&self) -> Phase {
-        if self.generated.is_empty() {
+        let input_length = self.prompt.len() + self.generated.len().saturating_sub(1);
+        if (self.resident_tokens as usize) < input_length {
             Phase::Prefill
         } else {
             Phase::Decode
         }
+    }
+
+    fn is_running(&self) -> bool {
+        self.running
+    }
+
+    fn set_running(&mut self, running: bool) {
+        self.running = running;
     }
 
     fn turn_ordinal(&self) -> u128 {
@@ -966,7 +982,7 @@ struct InFlightRow {
 
 struct PreparedProgress {
     apply: bool,
-    prefill_cursor: u32,
+    resident_tokens: u32,
     sampled_token: Option<u32>,
 }
 
@@ -996,6 +1012,9 @@ struct Engine {
     runner_prefill_chunk_size: Option<NonZeroU32>,
     scheduler: Scheduler<Request>,
     scheduler_config: SchedulerConfig,
+    new_token_ratio: f64,
+    minimum_new_token_ratio: f64,
+    new_token_ratio_decay: f64,
     context_length: NonZeroU32,
     eos_token_id: Option<u32>,
     engine_id: u64,
@@ -1064,6 +1083,10 @@ impl Engine {
             .as_ref()
             .map(|config| *config.borrow(py))
             .unwrap_or_default();
+        let new_token_ratio = scheduler_config.initial_new_token_ratio();
+        let minimum_new_token_ratio = new_token_ratio * MIN_NEW_TOKEN_RATIO_FACTOR;
+        let new_token_ratio_decay =
+            (new_token_ratio - minimum_new_token_ratio) / NEW_TOKEN_RATIO_DECAY_STEPS;
         let (runner_execution, runner_release) = resolve_runner_contract(py, runner.bind(py))?;
         let runner_prefill_chunk_size = resolve_runner_prefill_chunk_size(py, runner.bind(py))?;
 
@@ -1094,9 +1117,11 @@ impl Engine {
             runner_prefill_chunk_size,
             scheduler: Scheduler::new(
                 NonZeroUsize::new(max_running_requests).expect("validated positive batch limit"),
-                scheduler_config.policy,
             ),
             scheduler_config,
+            new_token_ratio,
+            minimum_new_token_ratio,
+            new_token_ratio_decay,
             context_length,
             eos_token_id,
             engine_id,
@@ -1113,7 +1138,7 @@ impl Engine {
 
     #[pyo3(signature = (
         token_ids,
-        max_new_tokens,
+        max_new_tokens = None,
         *,
         state_handles = None,
         state_access_modes = None,
@@ -1125,7 +1150,7 @@ impl Engine {
         &mut self,
         py: Python<'_>,
         token_ids: Vec<u32>,
-        max_new_tokens: usize,
+        max_new_tokens: Option<usize>,
         state_handles: Option<Vec<Py<StateHandle>>>,
         state_access_modes: Option<Vec<String>>,
         priority: i32,
@@ -1135,9 +1160,12 @@ impl Engine {
         if token_ids.is_empty() {
             return Err(PyValueError::new_err("token_ids must be non-empty"));
         }
-        if max_new_tokens == 0 {
+        if max_new_tokens == Some(0) {
             return Err(PyValueError::new_err("max_new_tokens must be positive"));
         }
+        let max_new_tokens = max_new_tokens.unwrap_or_else(|| {
+            (self.context_length.get() as usize).saturating_sub(token_ids.len()) + 1
+        });
         let max_input_tokens = token_ids
             .len()
             .checked_add(max_new_tokens - 1)
@@ -1205,7 +1233,7 @@ impl Engine {
             .as_mut()
             .map(|resources| {
                 resources
-                    .attach(core_request_id(request_id), max_input_tokens)
+                    .attach(core_request_id(request_id), 0)
                     .map_err(cache_pool_error)
             })
             .transpose()?;
@@ -1248,8 +1276,9 @@ impl Engine {
                 priority,
                 batch_key,
                 turn_ordinal: 0,
+                running: false,
                 prompt: token_ids,
-                prefill_cursor: 0,
+                resident_tokens: 0,
                 generated: Vec::new(),
                 max_new_tokens,
                 cancel_pending: false,
@@ -1273,6 +1302,16 @@ impl Engine {
 
         let (scheduled_rows, selection) = {
             let (mut selected_requests, mut selection) = self.scheduler.selected();
+            let admitted = self.admission_prefix_len(&selected_requests)?;
+            if admitted == 0 {
+                (selected_requests, selection) = self.scheduler.selected_running();
+            } else {
+                selected_requests.truncate(admitted);
+                selection.truncate(admitted);
+            }
+            if selected_requests.is_empty() {
+                return Ok(None);
+            }
             let compatible = state_compatible_prefix_len(&selected_requests);
             debug_assert_ne!(compatible, 0);
             selected_requests.truncate(compatible);
@@ -1306,7 +1345,34 @@ impl Engine {
             .next_batch_id
             .checked_add(1)
             .ok_or_else(|| PyRuntimeError::new_err("batch id space is exhausted"))?;
-        let scheduled = self.scheduler.take_selected(selection);
+        let mut scheduled = self.scheduler.take_selected(selection);
+
+        if let Some(resources) = self.kv_resources.as_mut() {
+            let mut growth_error = None;
+            for (request, row) in scheduled.iter_mut().zip(&scheduled_rows) {
+                let context = row
+                    .token_end()
+                    .ok_or_else(|| PyValueError::new_err("scheduled token range overflows u32"))?;
+                let pages = request
+                    .resources
+                    .attention
+                    .as_mut()
+                    .expect("managed requests keep their KV resource state");
+                if let Err(error) = resources.ensure_context(pages, context) {
+                    growth_error = Some(error);
+                    break;
+                }
+            }
+            if let Some(error) = growth_error {
+                self.scheduler.restore_rejected(scheduled);
+                if matches!(error, CachePoolError::InsufficientCapacity { .. })
+                    && self.retract_one(py)?
+                {
+                    return self.dispatch(py);
+                }
+                return Err(cache_pool_error(error));
+            }
+        }
 
         let mut acquired_kv = match self.kv_resources.as_mut() {
             Some(resources) => {
@@ -1515,6 +1581,10 @@ impl Engine {
             ));
             return self.quarantine(batch, "runner poll protocol failure", error);
         }
+        let decoded_batch = batch
+            .rows
+            .first()
+            .is_some_and(|row| row.scheduled.phase == Phase::Decode);
 
         let mut retired = Vec::with_capacity(batch.rows.len());
         let mut retired_ids = Vec::new();
@@ -1664,6 +1734,9 @@ impl Engine {
             }
         }
         self.scheduler.requeue_survivors(survivors);
+        if decoded_batch {
+            self.decay_new_token_ratio();
+        }
         Ok(events)
     }
 
@@ -1830,8 +1903,12 @@ impl Engine {
 
     #[getter]
     fn scheduler_config(&self, py: Python<'_>) -> PyResult<Py<SchedulerConfig>> {
-        debug_assert_eq!(self.scheduler_config.policy, self.scheduler.policy());
         Py::new(py, self.scheduler_config)
+    }
+
+    #[getter]
+    fn new_token_ratio(&self) -> f64 {
+        self.new_token_ratio
     }
 
     #[getter]
@@ -1893,6 +1970,144 @@ impl Engine {
 }
 
 impl Engine {
+    fn estimated_context(&self, request: &Request) -> u32 {
+        let future_inputs = request.max_new_tokens.saturating_sub(1);
+        let estimated_future = ((future_inputs as f64) * self.new_token_ratio).ceil() as usize;
+        let estimate = request
+            .prompt
+            .len()
+            .saturating_add(estimated_future)
+            .max(
+                request
+                    .prefill_length()
+                    .expect("active request length is valid") as usize,
+            )
+            .min(self.context_length.get() as usize);
+        estimate as u32
+    }
+
+    fn admission_prefix_len(&self, selected: &[&Request]) -> PyResult<usize> {
+        let Some(resources) = &self.kv_resources else {
+            return Ok(selected.len());
+        };
+        if selected.iter().all(|request| request.is_running()) {
+            return Ok(selected.len());
+        }
+
+        let mut contexts = self
+            .scheduler
+            .iter()
+            .filter(|request| request.is_running())
+            .map(|request| self.estimated_context(request))
+            .collect::<Vec<_>>();
+        let running_count = contexts.len();
+        let selected_running = selected
+            .iter()
+            .take_while(|request| request.is_running())
+            .count();
+        let mut admitted = selected_running;
+        for request in &selected[selected_running..] {
+            contexts.push(self.estimated_context(request));
+            let parents = resources
+                .estimated_parent_count(&contexts)
+                .map_err(cache_pool_error)?;
+            if parents > u64::from(resources.parent_capacity())
+                && (running_count != 0 || admitted != 0)
+            {
+                contexts.pop();
+                break;
+            }
+            admitted += 1;
+        }
+        Ok(admitted.max(usize::from(running_count == 0 && !selected.is_empty())))
+    }
+
+    fn decay_new_token_ratio(&mut self) {
+        self.new_token_ratio =
+            (self.new_token_ratio - self.new_token_ratio_decay).max(self.minimum_new_token_ratio);
+    }
+
+    fn update_new_token_ratio_after_retraction(&mut self) {
+        let running = self.scheduler.iter().filter(|request| request.is_running());
+        let (count, generated, limits) = running.fold(
+            (0usize, 0usize, 0usize),
+            |(count, generated, limits), request| {
+                (
+                    count + 1,
+                    generated.saturating_add(request.generated.len()),
+                    limits.saturating_add(request.max_new_tokens),
+                )
+            },
+        );
+        self.new_token_ratio = if count == 0 {
+            self.scheduler_config.initial_new_token_ratio()
+        } else {
+            ((generated.saturating_add(RETRACTION_DECODE_HEADROOM * count)) as f64
+                / limits.saturating_add(1) as f64)
+                .min(1.0)
+        };
+    }
+
+    fn retract_one(&mut self, py: Python<'_>) -> PyResult<bool> {
+        let running_count = self
+            .scheduler
+            .iter()
+            .filter(|request| request.is_running())
+            .count();
+        if running_count <= 1 {
+            return Ok(false);
+        }
+        let Some(request_id) = self
+            .scheduler
+            .iter()
+            .filter(|request| {
+                request.is_running()
+                    && request.resources.attention.is_some()
+                    && request.resources.recurrent.handles.is_empty()
+            })
+            .min_by_key(|request| (request.generated.len(), Reverse(request.prompt.len())))
+            .map(|request| request.id)
+        else {
+            return Ok(false);
+        };
+        let index = self
+            .scheduler
+            .position(|request| request.id == request_id)
+            .expect("selected retraction victim remains ready");
+        let mut request = self.scheduler.remove(index);
+
+        if let Some(release) = &self.runner_release
+            && let Err(error) = release.bind(py).call1((vec![request.id],))
+        {
+            self.scheduler.restore(index, request);
+            self.poison("runner release failed during request retraction", &error);
+            return Err(error);
+        }
+        let pages = request
+            .resources
+            .attention
+            .as_mut()
+            .expect("retraction victim owns managed attention state");
+        if let Err(error) = self
+            .kv_resources
+            .as_mut()
+            .expect("managed attention state keeps its allocator")
+            .reset(pages)
+        {
+            self.scheduler.restore(index, request);
+            let error = cache_pool_error(error);
+            self.poison(
+                "native cache reset failed during request retraction",
+                &error,
+            );
+            return Err(error);
+        }
+        request.resident_tokens = 0;
+        self.scheduler.requeue_retracted(request);
+        self.update_new_token_ratio_after_retraction();
+        Ok(true)
+    }
+
     fn raise_if_open(&self) -> PyResult<()> {
         if self.closed {
             return Err(PyRuntimeError::new_err("Engine is closed"));
@@ -2054,7 +2269,9 @@ impl Engine {
                 .token_end()
                 .ok_or_else(|| PyValueError::new_err("scheduled token range overflows u32"))?;
             let expected_sample = match scheduled.phase {
-                Phase::Prefill => token_end == request.prompt_length(),
+                Phase::Prefill => {
+                    request.sample_at_prefill_end() && token_end == request.prefill_length()?
+                }
                 Phase::Decode => {
                     if scheduled.token_count().get() != 1 {
                         return Err(PyRuntimeError::new_err(
@@ -2069,15 +2286,15 @@ impl Engine {
                     "frozen sampling metadata does not match scheduled progress",
                 ));
             }
-            if scheduled.phase == Phase::Prefill && token_end > request.prompt_length() {
+            if scheduled.phase == Phase::Prefill && token_end > request.prefill_length()? {
                 return Err(PyRuntimeError::new_err(
-                    "scheduled prefill commit exceeds the request prompt",
+                    "scheduled prefill commit exceeds the request replay input",
                 ));
             }
             if request.cancel_pending {
                 prepared.push(PreparedProgress {
                     apply: false,
-                    prefill_cursor: request.prefill_cursor,
+                    resident_tokens: request.resident_tokens,
                     sampled_token: None,
                 });
                 continue;
@@ -2089,10 +2306,7 @@ impl Engine {
             }
             prepared.push(PreparedProgress {
                 apply: true,
-                prefill_cursor: match scheduled.phase {
-                    Phase::Prefill => token_end,
-                    Phase::Decode => request.prompt_length(),
-                },
+                resident_tokens: token_end,
                 sampled_token: scheduled.sample.then_some(token_id),
             });
         }
@@ -2105,7 +2319,7 @@ impl Engine {
             if !progress.apply {
                 continue;
             }
-            row.request.prefill_cursor = progress.prefill_cursor;
+            row.request.resident_tokens = progress.resident_tokens;
             if let Some(token_id) = progress.sampled_token {
                 row.request.generated.push(token_id);
             }
@@ -2306,11 +2520,12 @@ mod tests {
                 priority: 0,
                 batch_key: None,
                 turn_ordinal: 0,
+                running: false,
                 prompt: prompt.to_vec(),
-                prefill_cursor: if generated.is_empty() {
+                resident_tokens: if generated.is_empty() {
                     0
                 } else {
-                    prompt.len() as u32
+                    (prompt.len() + generated.len() - 1) as u32
                 },
                 generated: generated.to_vec(),
                 max_new_tokens: 8,
@@ -2365,7 +2580,7 @@ mod tests {
         let mut resources = PagedKvResources::new(layout.inner_native().clone()).unwrap();
         let pages = resources.attach(core_request_id(41), 10).unwrap();
         let mut managed = request(41, &[1, 2, 3, 4, 5, 6], &[], Some(pages));
-        managed.prefill_cursor = 4;
+        managed.resident_tokens = 4;
         let scheduled = [&managed];
         let rows = schedule_ready_prefix(&scheduled, SchedulerConfig::default()).unwrap();
         let resource_refs = [RequestResourceRef {
@@ -2415,7 +2630,7 @@ mod tests {
             &[],
             Some(pages),
         );
-        managed.prefill_cursor = 8;
+        managed.resident_tokens = 8;
         let scheduled = [&managed];
         let rows =
             schedule_ready_prefix_for_layout(&scheduled, SchedulerConfig::default(), Some(&layout))
@@ -2452,7 +2667,7 @@ mod tests {
     fn window_prefill_never_crosses_a_logical_block_boundary() {
         let layout = window_layout();
         let mut first = request(1, &[1, 2, 3, 4, 5, 6], &[], None);
-        first.prefill_cursor = 3;
+        first.resident_tokens = 3;
         let second = request(2, &[7, 8, 9, 10, 11, 12], &[], None);
         let scheduled = [&first, &second];
         let rows =

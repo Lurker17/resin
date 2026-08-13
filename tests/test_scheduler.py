@@ -90,23 +90,13 @@ class SchedulerConfigContractTests(unittest.TestCase):
 
     def test_config_is_frozen_keyword_only_and_validated(self) -> None:
         default = SchedulerConfig()
-        self.assertEqual(default.queue_mode, "round_robin")
         self.assertEqual(
             repr(default),
-            "SchedulerConfig(queue_mode='round_robin', max_batch_tokens=None, "
-            "prefill_chunk_size=8192)",
+            "SchedulerConfig(max_batch_tokens=None, prefill_chunk_size=8192, schedule_conservativeness=1.0)",
         )
 
-        fifo = SchedulerConfig(queue_mode="fifo")
-        self.assertEqual(fifo.queue_mode, "fifo")
-        with self.assertRaises(AttributeError):
-            fifo.queue_mode = "round_robin"
         with self.assertRaises(TypeError):
-            SchedulerConfig("fifo")
-        with self.assertRaisesRegex(
-            ValueError, "queue_mode must be 'round_robin' or 'fifo'"
-        ):
-            SchedulerConfig(queue_mode="priority")
+            SchedulerConfig(17)
         limited = SchedulerConfig(max_batch_tokens=17, prefill_chunk_size=5)
         self.assertEqual(
             (limited.max_batch_tokens, limited.prefill_chunk_size),
@@ -114,8 +104,7 @@ class SchedulerConfigContractTests(unittest.TestCase):
         )
         self.assertEqual(
             repr(limited),
-            "SchedulerConfig(queue_mode='round_robin', max_batch_tokens=17, "
-            "prefill_chunk_size=5)",
+            "SchedulerConfig(max_batch_tokens=17, prefill_chunk_size=5, schedule_conservativeness=1.0)",
         )
         for field in ("max_batch_tokens", "prefill_chunk_size"):
             with (
@@ -123,6 +112,22 @@ class SchedulerConfigContractTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, f"{field} must be positive"),
             ):
                 SchedulerConfig(**{field: 0})
+        for value in (-0.1, float("inf"), float("nan")):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "schedule_conservativeness must be finite and non-negative"
+            ):
+                SchedulerConfig(schedule_conservativeness=value)
+        aggressive = SchedulerConfig(schedule_conservativeness=0.0)
+        self.assertEqual(aggressive.schedule_conservativeness, 0.0)
+        default_engine = Engine(RecordingRunner())
+        self.assertEqual(default_engine.new_token_ratio, 0.7)
+        default_engine.close()
+        conservative = Engine(
+            RecordingRunner(),
+            scheduler_config=SchedulerConfig(schedule_conservativeness=2.0),
+        )
+        self.assertEqual(conservative.new_token_ratio, 1.0)
+        conservative.close()
 
     def test_continuation_capability_is_exact_and_only_read_when_enabled(self) -> None:
         class Missing:
@@ -204,16 +209,14 @@ class SchedulerConfigContractTests(unittest.TestCase):
 
     def test_engine_freezes_a_copy_of_the_effective_config(self) -> None:
         runner = RecordingRunner()
-        engine = Engine(
-            runner,
-            scheduler_config=SchedulerConfig(queue_mode="fifo"),
-        )
-        self.assertEqual(engine.scheduler_config.queue_mode, "fifo")
+        config = SchedulerConfig(max_batch_tokens=17)
+        engine = Engine(runner, scheduler_config=config)
+        self.assertEqual(engine.scheduler_config.max_batch_tokens, 17)
         with self.assertRaises(TypeError):
             Engine(runner, scheduler_config=object())
 
         default = Engine(RecordingRunner())
-        self.assertEqual(default.scheduler_config.queue_mode, "round_robin")
+        self.assertIsNone(default.scheduler_config.max_batch_tokens)
 
     def test_batch_plan_batch_key_defaults_and_range_validation(self) -> None:
         default = BatchPlan([1], [0], [7], [0, 1], [0])
@@ -290,7 +293,7 @@ class SchedulerConfigContractTests(unittest.TestCase):
 
 
 class NativePolicyIntegrationTests(unittest.TestCase):
-    def test_default_config_has_exact_legacy_round_robin_trace(self) -> None:
+    def test_default_config_keeps_survivors_ahead_of_waiting_requests(self) -> None:
         def trace(config: SchedulerConfig | None) -> list[list[int]]:
             runner = RecordingRunner()
             kwargs: dict[str, Any] = {"max_running_requests": 2}
@@ -352,47 +355,34 @@ class NativePolicyIntegrationTests(unittest.TestCase):
         self.assertEqual(runner.plans[-1].sequence_ids, [zero])
         self.assertEqual(runner.plans[-1].batch_key, 0)
 
-    def test_decode_survivor_is_separate_from_fresh_prefill(self) -> None:
+    def test_fresh_prefill_runs_before_the_decode_batch_resumes(self) -> None:
         runner = RecordingRunner()
         engine = Engine(runner, max_running_requests=2)
         decode = engine.submit([10], 2)
         engine.step()
         fresh = engine.submit([20], 1)
         engine.step()
-        self.assertEqual(runner.plans[-1].sequence_ids, [decode])
-        self.assertEqual(runner.plans[-1].phase, BatchPhase.DECODE)
-        engine.step()
         self.assertEqual(runner.plans[-1].sequence_ids, [fresh])
         self.assertEqual(runner.plans[-1].phase, BatchPhase.PREFILL)
+        engine.step()
+        self.assertEqual(runner.plans[-1].sequence_ids, [decode])
+        self.assertEqual(runner.plans[-1].phase, BatchPhase.DECODE)
 
-    def test_fifo_and_round_robin_diverge_only_in_survivor_turn_refresh(self) -> None:
-        def next_batch(queue_mode: str) -> list[int]:
-            runner = ControlledAsyncRunner([None, [11, 21], [31, 41]])
-            engine = Engine(
-                runner,
-                max_running_requests=2,
-                scheduler_config=SchedulerConfig(queue_mode=queue_mode),
-            )
-            first = engine.submit([10], 3)
-            second = engine.submit([20], 3)
-            third = engine.submit([30], 1)
-            engine.dispatch()
-            fourth = engine.submit([40], 1)
-            self.assertEqual(engine.poll(), [])
-            engine.poll()
+    def test_survivors_stay_ahead_of_inflight_submissions(self) -> None:
+        runner = ControlledAsyncRunner([None, [11, 21], [12, 22]])
+        engine = Engine(runner, max_running_requests=2)
+        first = engine.submit([10], 3)
+        second = engine.submit([20], 3)
+        engine.dispatch()
+        engine.submit([30], 1)
+        engine.submit([40], 1)
+        self.assertEqual(engine.poll(), [])
+        engine.poll()
 
-            engine.dispatch()
-            selected = runner.dispatch_plans[-1].sequence_ids
-            engine.poll()
-            engine.close()
-            if queue_mode == "fifo":
-                self.assertEqual(selected, [first, second])
-            else:
-                self.assertEqual(selected, [third, fourth])
-            return selected
-
-        self.assertEqual(next_batch("round_robin"), [3, 4])
-        self.assertEqual(next_batch("fifo"), [1, 2])
+        engine.dispatch()
+        self.assertEqual(runner.dispatch_plans[-1].sequence_ids, [first, second])
+        engine.poll()
+        engine.close()
 
     def test_noncontiguous_async_rejection_restores_exact_cohort_and_age(
         self,
@@ -478,52 +468,47 @@ class NativePolicyIntegrationTests(unittest.TestCase):
 
         events = engine.step()
         plan = runner.plans[-1]
-        self.assertEqual(plan.sequence_ids, [decoding])
-        self.assertEqual(plan.phase, BatchPhase.DECODE)
-        self.assertEqual(plan.token_ids, [11])
-        self.assertEqual(plan.context_lengths, [1])
-        self.assertEqual(plan.sample_sequence_indices, [0])
-        self.assertEqual([event.request_id for event in events], [decoding])
-        self.assertEqual([event.token_id for event in events], [12])
-        self.assertFalse(partial.done)
-        self.assertEqual(runner.released, [decoding])
-
-        events = engine.step()
+        self.assertEqual(plan.sequence_ids, [partial])
+        self.assertEqual(plan.phase, BatchPhase.PREFILL)
+        self.assertEqual(plan.token_ids, [20, 21])
+        self.assertEqual(plan.context_lengths, [0])
+        self.assertEqual(plan.sample_sequence_indices, [])
         self.assertEqual(events, [])
-        self.assertEqual(runner.plans[-1].phase, BatchPhase.PREFILL)
-        self.assertEqual(runner.plans[-1].context_lengths, [0])
-        self.assertEqual(runner.plans[-1].sample_sequence_indices, [])
         self.assertFalse(partial.done)
+        self.assertEqual(runner.released, [])
 
         events = engine.step()
+        self.assertEqual(runner.plans[-1].phase, BatchPhase.PREFILL)
         self.assertEqual(runner.plans[-1].context_lengths, [2])
         self.assertEqual(runner.plans[-1].sample_sequence_indices, [0])
         self.assertEqual([event.request_id for event in events], [partial])
         self.assertTrue(partial.done)
         self.assertEqual(partial.take_result(), [24])
-        self.assertEqual(runner.released, [decoding, partial])
+        self.assertEqual(runner.released, [partial])
 
-    def test_partial_prefill_survivors_obey_fifo_and_round_robin(self) -> None:
-        def trace(queue_mode: str) -> list[int]:
-            runner = ContinuationRecordingRunner()
-            engine = Engine(
-                runner,
-                max_running_requests=2,
-                scheduler_config=SchedulerConfig(
-                    queue_mode=queue_mode,
-                    max_batch_tokens=1,
-                    prefill_chunk_size=1,
-                ),
-            )
-            first = engine.submit([1, 2], 1)
-            second = engine.submit([10, 11], 1)
-            while engine.has_work():
-                engine.step()
-            self.assertEqual((first.take_result(), second.take_result()), ([3], [12]))
-            return [plan.sequence_ids[0] for plan in runner.plans]
+        events = engine.step()
+        self.assertEqual(runner.plans[-1].sequence_ids, [decoding])
+        self.assertEqual(runner.plans[-1].phase, BatchPhase.DECODE)
+        self.assertEqual(runner.plans[-1].token_ids, [11])
+        self.assertEqual([event.request_id for event in events], [decoding])
+        self.assertEqual(runner.released, [partial, decoding])
 
-        self.assertEqual(trace("fifo"), [1, 1, 2, 2])
-        self.assertEqual(trace("round_robin"), [1, 2, 1, 2])
+    def test_partial_prefill_survivor_finishes_before_waiting_request(self) -> None:
+        runner = ContinuationRecordingRunner()
+        engine = Engine(
+            runner,
+            max_running_requests=2,
+            scheduler_config=SchedulerConfig(
+                max_batch_tokens=1,
+                prefill_chunk_size=1,
+            ),
+        )
+        first = engine.submit([1, 2], 1)
+        second = engine.submit([10, 11], 1)
+        while engine.has_work():
+            engine.step()
+        self.assertEqual((first.take_result(), second.take_result()), ([3], [12]))
+        self.assertEqual([plan.sequence_ids[0] for plan in runner.plans], [1, 1, 2, 2])
 
     def test_async_partial_cancel_discards_dense_output_and_compact_output_poisoned(
         self,

@@ -113,10 +113,10 @@ attention geometry is rejected during runner construction.
 
 ## Validation status
 
-The local code, host-side contract tests, and Modal GPT-OSS harness have been
-migrated to the flat History/Window plan. The harness has not been launched.
-Earlier measurements exercised a different cache protocol and are intentionally
-not carried forward as evidence.
+The local code, host-side contract tests, and Modal GPT-OSS harness use the flat
+History/Window plan. A single-sequence H200 run has validated prefill, decode,
+and reusable decode-graph replay. Earlier measurements exercised a different
+cache protocol and are intentionally not carried forward as evidence.
 
 A new GPU proof should establish, on the current tree:
 

@@ -44,8 +44,9 @@ pub(super) fn schedule_ready_prefix_for_layout<R: RequestLike>(
             let request = item.as_request();
             Ok(RequestProgress {
                 phase: request.phase(),
-                prompt_length: request.prompt_length(),
+                prefill_length: request.prefill_length()?,
                 logical_context: request.logical_context()?,
+                sample_at_prefill_end: request.sample_at_prefill_end(),
             })
         })
         .collect::<PyResult<Vec<_>>>()?;
@@ -171,7 +172,9 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
             .token_end()
             .ok_or_else(|| PyValueError::new_err("scheduled token range overflows u32"))?;
         let expected_sample = match scheduled.phase {
-            Phase::Prefill => token_end == request.prompt_length(),
+            Phase::Prefill => {
+                request.sample_at_prefill_end() && token_end == request.prefill_length()?
+            }
             Phase::Decode => true,
         };
         if scheduled.sample != expected_sample {
@@ -181,14 +184,22 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
         }
         match scheduled.phase {
             Phase::Prefill => {
-                if token_end > request.prompt_length() {
+                if token_end > request.prefill_length()? {
                     return Err(PyRuntimeError::new_err(
-                        "scheduled prefill range exceeds the request prompt",
+                        "scheduled prefill range exceeds the request replay input",
                     ));
                 }
-                token_ids.extend_from_slice(
-                    &request.prompt[scheduled.token_start() as usize..token_end as usize],
-                );
+                let start = scheduled.token_start() as usize;
+                let end = token_end as usize;
+                let prompt_end = end.min(request.prompt.len());
+                if start < prompt_end {
+                    token_ids.extend_from_slice(&request.prompt[start..prompt_end]);
+                }
+                if end > request.prompt.len() {
+                    let generated_start = start.saturating_sub(request.prompt.len());
+                    let generated_end = end - request.prompt.len();
+                    token_ids.extend_from_slice(&request.generated[generated_start..generated_end]);
+                }
                 positions.extend(scheduled.token_start()..token_end);
                 context_lengths.push(scheduled.token_start());
             }

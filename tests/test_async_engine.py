@@ -103,13 +103,16 @@ class AsyncEngineContractTests(unittest.TestCase):
         self.assertEqual([event.request_id for event in first_events], [first])
         self.assertFalse(first.done)
 
-        # Existing step() remains one dispatch plus one poll. Round-robin keeps
-        # the previously unscheduled request at the front.
+        # Existing step() remains one dispatch plus one poll. Sticky admission
+        # keeps the surviving request running.
         second_events = engine.step()
-        self.assertEqual([event.request_id for event in second_events], [second])
-        self.assertTrue(second.done)
+        self.assertEqual([event.request_id for event in second_events], [first])
+        self.assertTrue(first.done)
+        self.assertFalse(second.done)
+        final_events = engine.step()
+        self.assertEqual([event.request_id for event in final_events], [second])
         self.assertEqual(second.take_result(), [11])
-        self.assertEqual(runner.released, [second])
+        self.assertEqual(runner.released, [first, second])
 
     def test_marked_sync_failure_quarantines_accepted_native_resources(self) -> None:
         class PostAcceptError(RuntimeError):
@@ -344,8 +347,8 @@ class AsyncEngineContractTests(unittest.TestCase):
 
         self.assertEqual(engine.poll(), [])
         self.assertEqual(pool.counts(state), (1, 1))
-        with self.assertRaises(MemoryError):
-            engine.submit([9], max_new_tokens=1)
+        waiting = engine.submit([9], max_new_tokens=1)
+        self.assertEqual(engine.cache_occupied_block_count, 1)
 
         events = engine.poll()
         self.assertEqual([event.token_id for event in events], [7])
@@ -357,6 +360,7 @@ class AsyncEngineContractTests(unittest.TestCase):
             (1, 0),
         )
         self.assertEqual(engine.in_flight_request_count, 0)
+        self.assertTrue(engine.cancel(waiting))
 
     def test_in_flight_cancel_waits_for_terminal_poll_and_discards_output(self) -> None:
         pool = StatePool(1)
@@ -374,9 +378,9 @@ class AsyncEngineContractTests(unittest.TestCase):
         self.assertTrue(engine.cancel(request))
         self.assertEqual(engine.poll(), [])
         self.assertEqual(pool.counts(state), (1, 1))
-        self.assertEqual(engine.cache_occupied_block_count, 2)
-        with self.assertRaises(MemoryError):
-            engine.submit([8], max_new_tokens=1)
+        self.assertEqual(engine.cache_occupied_block_count, 1)
+        waiting = engine.submit([8], max_new_tokens=1)
+        self.assertEqual(engine.cache_occupied_block_count, 1)
 
         self.assertEqual(engine.poll(), [])
         self.assertTrue(request.done)
@@ -387,6 +391,8 @@ class AsyncEngineContractTests(unittest.TestCase):
             (engine.cache_free_parent_count, engine.cache_occupied_block_count),
             (2, 0),
         )
+        self.assertTrue(engine.cancel(waiting))
+        self.assertEqual(runner.released, [request, waiting])
         self.assertFalse(engine.has_work())
 
     def test_in_flight_cancel_preserves_result_alignment_for_survivors(self) -> None:
@@ -425,8 +431,8 @@ class AsyncEngineContractTests(unittest.TestCase):
             (0, 2),
         )
         self.assertEqual(engine.poll(), [])
-        with self.assertRaises(MemoryError):
-            engine.submit([2], max_new_tokens=1)
+        waiting = engine.submit([2], max_new_tokens=1)
+        self.assertEqual(engine.cache_occupied_block_count, 2)
 
         events = engine.poll()
         self.assertEqual([event.request_id for event in events], [request])
@@ -434,6 +440,7 @@ class AsyncEngineContractTests(unittest.TestCase):
             (engine.cache_free_parent_count, engine.cache_occupied_block_count),
             (2, 0),
         )
+        self.assertTrue(engine.cancel(waiting))
 
     def test_ready_cancel_retires_existing_physical_state_immediately(self) -> None:
         runner = ControlledAsyncRunner([[3]], cache_layout=history_layout(2))
@@ -444,7 +451,7 @@ class AsyncEngineContractTests(unittest.TestCase):
         events = engine.poll()
         self.assertFalse(events[0].finished)
         self.assertEqual(engine.ready_request_count, 1)
-        self.assertEqual(engine.cache_occupied_block_count, 2)
+        self.assertEqual(engine.cache_occupied_block_count, 1)
 
         self.assertTrue(engine.cancel(request))
         self.assertFalse(engine.cancel(request))

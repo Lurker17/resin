@@ -189,6 +189,8 @@ class Engine:
     @property
     def max_running_requests(self, /) -> int: ...
     @property
+    def new_token_ratio(self, /) -> float: ...
+    @property
     def poison_error(self, /) -> str | None: ...
     @property
     def poisoned(self, /) -> bool: ...
@@ -202,7 +204,7 @@ class Engine:
         self,
         /,
         token_ids: Sequence[int],
-        max_new_tokens: int,
+        max_new_tokens: int | None = None,
         *,
         state_handles: Sequence[StateHandle] | None = None,
         state_access_modes: Sequence[str] | None = None,
@@ -243,9 +245,9 @@ class SchedulerConfig:
         cls,
         /,
         *,
-        queue_mode: str = "round_robin",
         max_batch_tokens: int | None = None,
         prefill_chunk_size: int = 8192,
+        schedule_conservativeness: float = 1.0,
     ) -> SchedulerConfig: ...
     def __repr__(self, /) -> str: ...
     @property
@@ -253,7 +255,7 @@ class SchedulerConfig:
     @property
     def prefill_chunk_size(self, /) -> int: ...
     @property
-    def queue_mode(self, /) -> str: ...
+    def schedule_conservativeness(self, /) -> float: ...
 
 @final
 class StateHandle:

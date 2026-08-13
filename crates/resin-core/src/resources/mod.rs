@@ -42,6 +42,14 @@ impl<T: Schedulable, R> Schedulable for WithResources<T, R> {
         self.inner.phase()
     }
 
+    fn is_running(&self) -> bool {
+        self.inner.is_running()
+    }
+
+    fn set_running(&mut self, running: bool) {
+        self.inner.set_running(running);
+    }
+
     fn turn_ordinal(&self) -> u128 {
         self.inner.turn_ordinal()
     }

@@ -114,6 +114,10 @@ uv run modal run deploy/modal_gpt_oss.py \
   --mode bench --model 120b --cache-mode verify
 ```
 
+Both GPU modes also accept `--schedule-conservativeness`; larger values leave
+more estimated KV headroom, while smaller values admit more work and may cause
+retraction/replay.
+
 Use `--model 120b` for the larger checkpoint. These commands submit the
 repository's local source into the Modal image; they do not require a locally
 installed CUDA runtime. GPU quota, the pinned model volume, and the required
@@ -155,7 +159,7 @@ the Engine binds once during construction.
 
 The native layer currently provides:
 
-- strict priority with FIFO or round-robin continual batching;
+- sticky continual batching with prefill priority and memory retraction;
 - phase-homogeneous prefill or decode batches, token budgets, and prefill chunks;
 - one flat physical cache pool shared by ordered History and Window groups;
 - sparse, chronological `CacheGroupPlan` rows and exact append destinations;
@@ -168,8 +172,8 @@ and sliding-window KV resources, recurrent-slot resources, allocation, and
 leases. The root crate adapts those types to Python and coordinates runner
 acceptance and completion.
 
-History cache grows for the declared request lifetime. Window cache is bounded
-private cyclic storage whose plan row is projected into chronological order.
+History cache grows on demand to each frozen plan. Window cache grows toward
+bounded private cyclic storage whose plan row is projected into chronological order.
 Cache retention is exactly History or Window. Recurrent model state is a
 separate resource owned through `StatePool`.
 
@@ -179,9 +183,8 @@ runner placement.
 
 Implemented runner modules include synchronous LFM2 and GPT-OSS references and
 local CUDA implementations for LFM2 and GPT-OSS. The GPT-OSS CUDA path uses one
-History group and one Window group over the flat pool. Its deployment harness is
-migrated locally but has not been launched, so the repository does not claim a
-fresh GPU result for this architecture.
+History group and one Window group over the flat pool. Its deployment harness
+has been verified on an H200 with reusable decode CUDA graphs.
 
 The LFM2 CUDA runner has one route: atomic cache-plus-state binding followed by
 asynchronous dispatch/poll. Its continuation harness uses native Engine plans;

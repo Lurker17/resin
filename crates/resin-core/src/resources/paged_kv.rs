@@ -33,38 +33,74 @@ impl PagedKvResources {
         &self.pool
     }
 
+    pub fn parent_capacity(&self) -> u32 {
+        self.layout.parent_capacity().get()
+    }
+
     pub fn attach(
         &mut self,
         request_id: RequestId,
         maximum_context: u32,
     ) -> Result<RequestPages, CachePoolError> {
-        let demands = self
-            .layout
-            .groups()
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(index, group)| {
-                let blocks = match group.retention() {
-                    KvRetention::FullContext => {
-                        maximum_context.div_ceil(group.block_tokens().get())
-                    }
-                    KvRetention::SlidingWindow { .. } => group
-                        .window_resident_blocks()
-                        .expect("sliding window has a resident width")
-                        .get(),
-                };
-                GroupDemand::new(GroupId::new(index as u32), blocks as usize)
-            })
-            .collect::<Vec<_>>();
+        let demands = self.demands(maximum_context);
         let pending = self
             .pool
             .reserve_request(SequenceId::new(request_id.get()), &demands)?;
         Ok(self.pool.promote_request(pending))
     }
 
+    /// Grow one request just enough to address `context` tokens.
+    pub fn ensure_context(
+        &mut self,
+        state: &mut RequestPages,
+        context: u32,
+    ) -> Result<(), CachePoolError> {
+        let demands = self.demands(context);
+        self.pool.grow_request(state, &demands)
+    }
+
+    /// Drop resident KV while retaining the request's allocator identity.
+    pub fn reset(&mut self, state: &mut RequestPages) -> Result<(), CachePoolError> {
+        self.pool.clear_request(state)
+    }
+
+    /// Physical-parent budget for a set of estimated request contexts.
+    pub fn estimated_parent_count(&self, contexts: &[u32]) -> Result<u64, CachePoolError> {
+        let mut parents = 0u64;
+        for (index, group) in self.layout.groups().iter().copied().enumerate() {
+            let blocks = contexts.iter().try_fold(0u64, |total, context| {
+                let (_, blocks) = active_blocks(group, *context);
+                total
+                    .checked_add(u64::from(blocks))
+                    .ok_or(CachePoolError::DemandOverflow)
+            })?;
+            let packing = u64::from(
+                self.pool
+                    .blocks_per_parent(GroupId::new(index as u32))?
+                    .get(),
+            );
+            parents = parents
+                .checked_add(blocks.div_ceil(packing))
+                .ok_or(CachePoolError::DemandOverflow)?;
+        }
+        Ok(parents)
+    }
+
     pub fn retire(&mut self, state: RequestPages) -> Result<(), RetireRequestFailure> {
         self.pool.retire_request(state)
+    }
+
+    fn demands(&self, context: u32) -> Vec<GroupDemand> {
+        self.layout
+            .groups()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, group)| {
+                let (_, blocks) = active_blocks(group, context);
+                GroupDemand::new(GroupId::new(index as u32), blocks as usize)
+            })
+            .collect()
     }
 
     pub fn release(&mut self, lease: WriterAccessLease) {
@@ -295,5 +331,35 @@ mod tests {
         assert!(resources.acquire(&requests, &[step]).is_err());
         resources.release(access.lease);
         resources.retire(state).unwrap();
+    }
+
+    #[test]
+    fn request_pages_grow_on_demand_and_reset_for_replay() {
+        let layout = KvLayout::new(
+            2,
+            vec![KvGroupLayout::new(4, 1, KvRetention::FullContext).unwrap()],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::new(layout).unwrap();
+        let id = RequestId::new(NonZeroU64::new(1).unwrap());
+        let mut state = resources.attach(id, 0).unwrap();
+        assert_eq!(resources.pool().occupied_block_count(), 0);
+
+        resources.ensure_context(&mut state, 5).unwrap();
+        assert_eq!(state.groups()[0].pages().len(), 2);
+        assert_eq!(resources.pool().occupied_block_count(), 2);
+        assert!(matches!(
+            resources.ensure_context(&mut state, 9),
+            Err(CachePoolError::InsufficientCapacity { .. })
+        ));
+        assert_eq!(state.groups()[0].pages().len(), 2);
+
+        resources.reset(&mut state).unwrap();
+        assert!(state.groups()[0].pages().is_empty());
+        assert_eq!(resources.pool().occupied_block_count(), 0);
+        resources.ensure_context(&mut state, 4).unwrap();
+        assert_eq!(state.groups()[0].pages().len(), 1);
+        resources.retire(state).unwrap();
+        assert_eq!(resources.pool().occupied_block_count(), 0);
     }
 }

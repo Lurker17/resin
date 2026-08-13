@@ -92,9 +92,9 @@ accelerator framework.
 ```python
 SchedulerConfig(
     *,
-    queue_mode="round_robin",      # or "fifo"
     max_batch_tokens=None,
     prefill_chunk_size=8192,
+    schedule_conservativeness=1.0,
 )
 
 CacheGroupLayout(
@@ -136,7 +136,7 @@ The Engine lifecycle is:
 ```python
 request = engine.submit(
     token_ids,
-    max_new_tokens,
+    max_new_tokens=None,
     *,
     state_handles=None,
     state_access_modes=None,
@@ -186,9 +186,9 @@ only owns placement and lifetime.
 
 Retention describes request ownership:
 
-- **History** reserves all blocks needed through the maximum input length and
-  exposes the growing logical prefix.
-- **Window** reserves a bounded private set of blocks. Physical storage cycles
+- **History** grows transactionally to each scheduled token range and exposes
+  the growing logical prefix.
+- **Window** grows toward a bounded private set of blocks. Physical storage cycles
   as logical blocks advance, while each plan row projects the retained suffix
   back into chronological order. Prefill ranges stop at a Window block boundary
   so one accepted plan never overwrites a block it still reads.

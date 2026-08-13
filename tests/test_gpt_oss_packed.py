@@ -26,8 +26,8 @@ class GptOssPackedBridgeTests(unittest.TestCase):
         import torch
 
         from resin.models.gpt_oss.mxfp4 import (
+            _install_expert_layer,
             _make_kernel_expert_factory,
-            _PackedExpertCoordinator,
         )
 
         config = MoEKernelConfig(
@@ -86,8 +86,6 @@ class GptOssPackedBridgeTests(unittest.TestCase):
                 self.model = Backbone()
 
         model = Model()
-        coordinator = _PackedExpertCoordinator(torch, model, kernel, config)
-        coordinator.begin_layer(0, {"num_hidden_layers": 1})
         tensors = {
             "gate_up_proj_blocks": torch.zeros(4, 64, 1, 16, dtype=torch.uint8),
             "gate_up_proj_scales": torch.zeros(4, 64, 1, dtype=torch.uint8),
@@ -96,9 +94,7 @@ class GptOssPackedBridgeTests(unittest.TestCase):
             "down_proj_scales": torch.zeros(4, 32, 1, dtype=torch.uint8),
             "down_proj_bias": torch.zeros(4, 32),
         }
-        for name, tensor in tensors.items():
-            coordinator.consume_tensor(0, name, tensor)
-        coordinator.finish_layer(0)
+        _install_expert_layer(torch, model, kernel, config, 0, tensors)
 
         self.assertEqual(len(kernel.prepared), 1)
         weights, actual_config = kernel.prepared[0]

@@ -159,9 +159,9 @@ layers to Window, while both groups draw from one flat parent pool. FA4 attentio
 FlashInfer fused MoE, and optional runner-local decode graph code remain
 execution-plane details.
 
-The local runner implementations and GPT-OSS deployment harness have been
-migrated to this plan shape. The harness has not been launched, so this document
-intentionally makes no new GPU correctness or performance claim for the path.
+The local runner implementations and GPT-OSS deployment harness use this plan
+shape. A single-sequence H200 run has validated prefill, decode, and reusable
+decode-graph replay; broader performance claims still require dedicated runs.
 
 ## What is not in the boundary
 

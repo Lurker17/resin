@@ -60,11 +60,11 @@ count. Resin does not describe layers, K/V planes, dtypes, or strides.
 
 History and Window share the allocator but have different request tables.
 
-History reserves enough blocks at submission for the maximum possible input
-length, `len(prompt) + max_new_tokens - 1`. Its plan row starts at logical block
-zero and grows as the request advances.
+History starts with an empty request table. Immediately before dispatch, it
+grows transactionally to the end of the frozen token range. Its plan row starts
+at logical block zero and grows as the request advances.
 
-Window reserves a private bounded width:
+Window also starts empty and grows toward its private bounded width:
 
 ```text
 resident blocks = 1 + ceil((window_tokens - 1) / block_tokens)
@@ -127,9 +127,11 @@ two independently fallible publication callbacks for the two resources.
 
 ## Ownership and failure
 
-Submission reserves all groups atomically. If any group cannot be satisfied, no
-partial request allocation becomes visible. Request tables retain their blocks
-until completion or cancellation.
+Submission creates empty ordered group tables and consumes no physical parent.
+Before dispatch, all additional group blocks for one request are placed
+atomically. If growth cannot be satisfied, its existing tables are unchanged.
+Request tables retain allocated blocks until completion, cancellation, or
+memory retraction.
 
 Before dispatch, Resin prepares and acquires an exact writer lease over the
 blocks addressable by that plan. The lease spans runner acceptance, asynchronous
@@ -140,6 +142,11 @@ the batch and lease instead of making possibly addressed memory reusable.
 Engine diagnostics expose `cache_pool_id`, `cache_parent_capacity`,
 `cache_free_parent_count`, and `cache_occupied_block_count`. The allocator itself
 is not public Python API.
+
+Under memory pressure, eligible attention-only requests can release all pages
+while retaining their allocator identity. The scheduler later replays committed
+inputs into newly grown tables. Recurrent state is separate and currently makes
+a request ineligible for this reset path.
 
 ## Content reuse status
 

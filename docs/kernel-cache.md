@@ -110,5 +110,5 @@ model warmup.
 - The FlashInfer wrapper is version-specific and must be revalidated on upgrade.
 - The prewarm protocol has no distributed lock.
 - A validated compiled artifact says nothing about live cache correctness.
-- The GPT-OSS deployment harness is migrated locally but has not been launched,
-  so no previous remote run proves the flat-cache runner.
+- The GPT-OSS deployment harness has completed a single-sequence H200 run on
+  the flat-cache runner; broader cold-worker and multi-shape validation remains.

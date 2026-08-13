@@ -1,34 +1,5 @@
 use std::num::NonZeroUsize;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum QueueMode {
-    #[default]
-    RoundRobin,
-    Fifo,
-}
-
-impl QueueMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::RoundRobin => "round_robin",
-            Self::Fifo => "fifo",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SchedulerPolicy {
-    pub queue_mode: QueueMode,
-}
-
-impl Default for SchedulerPolicy {
-    fn default() -> Self {
-        Self {
-            queue_mode: QueueMode::RoundRobin,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
     Prefill,
@@ -45,6 +16,8 @@ pub trait Schedulable {
     fn priority(&self) -> i32;
     fn batch_key(&self) -> Option<u64>;
     fn phase(&self) -> Phase;
+    fn is_running(&self) -> bool;
+    fn set_running(&mut self, running: bool);
     fn turn_ordinal(&self) -> u128;
     fn set_turn_ordinal(&mut self, turn: u128);
 }
@@ -77,27 +50,24 @@ impl Selection {
     }
 }
 
-/// Strict-priority homogeneous scheduling with stable native turn ordinals.
+/// Prefill-first homogeneous scheduling with sticky request admission.
 ///
-/// The oldest request at the highest ready priority anchors a batch. Matching
-/// requests share its priority, batch key, and phase. FIFO survivors retain
-/// their original age; round-robin survivors receive fresh turns after every
-/// request already waiting.
+/// Admitted prefill continues before decode, and waiting prefill may use a
+/// vacant running slot. Priority and age order compatible requests within the
+/// chosen phase. Survivors remain admitted until completion or retraction.
 #[derive(Debug)]
 pub struct Scheduler<T> {
     ready: Vec<T>,
     max_running_requests: NonZeroUsize,
-    policy: SchedulerPolicy,
     next_turn: u128,
     epoch: u64,
 }
 
 impl<T: Schedulable> Scheduler<T> {
-    pub fn new(max_running_requests: NonZeroUsize, policy: SchedulerPolicy) -> Self {
+    pub fn new(max_running_requests: NonZeroUsize) -> Self {
         Self {
             ready: Vec::new(),
             max_running_requests,
-            policy,
             next_turn: 1,
             epoch: 0,
         }
@@ -105,10 +75,6 @@ impl<T: Schedulable> Scheduler<T> {
 
     pub fn max_running_requests(&self) -> usize {
         self.max_running_requests.get()
-    }
-
-    pub fn policy(&self) -> SchedulerPolicy {
-        self.policy
     }
 
     pub fn len(&self) -> usize {
@@ -128,6 +94,16 @@ impl<T: Schedulable> Scheduler<T> {
 
     pub fn selected(&self) -> (Vec<&T>, Selection) {
         let selected = self.selected_identities();
+        self.selection(selected)
+    }
+
+    /// Select already-admitted work without considering waiting requests.
+    pub fn selected_running(&self) -> (Vec<&T>, Selection) {
+        let selected = self.running_identities();
+        self.selection(selected)
+    }
+
+    fn selection(&self, selected: Vec<SelectedIdentity>) -> (Vec<&T>, Selection) {
         let items = selected
             .iter()
             .map(|identity| &self.ready[identity.index])
@@ -147,34 +123,43 @@ impl<T: Schedulable> Scheduler<T> {
             "ready queue changed after its dispatch cohort was selected"
         );
         let current = self.selected_identities();
+        let running = self.running_identities();
+        let matches = |candidate: &[SelectedIdentity]| {
+            selection.selected.len() <= candidate.len()
+                && selection.selected == candidate[..selection.selected.len()]
+        };
         assert!(
-            selection.selected.len() <= current.len()
-                && selection.selected == current[..selection.selected.len()],
+            matches(&current) || matches(&running),
             "selected dispatch cohort no longer matches the ready queue"
         );
 
-        let mut selected = Vec::with_capacity(selection.selected.len());
+        let mut selected = std::iter::repeat_with(|| None)
+            .take(selection.selected.len())
+            .collect::<Vec<Option<T>>>();
         let mut remaining = Vec::with_capacity(self.ready.len() - selection.selected.len());
-        let mut identities = selection.selected.into_iter().peekable();
         for (index, item) in self.ready.drain(..).enumerate() {
-            if identities
-                .peek()
-                .is_some_and(|identity| identity.index == index)
+            if let Some((position, identity)) = selection
+                .selected
+                .iter()
+                .enumerate()
+                .find(|(_, identity)| identity.index == index)
             {
-                let identity = identities.next().expect("peeked selected identity");
                 assert_eq!(item.turn_ordinal(), identity.turn);
-                selected.push(item);
+                selected[position] = Some(item);
             } else {
                 remaining.push(item);
             }
         }
         assert!(
-            identities.next().is_none(),
+            selected.iter().all(Option::is_some),
             "selected index is out of range"
         );
         self.ready = remaining;
         self.bump_epoch();
         selected
+            .into_iter()
+            .map(|item| item.expect("selected item was found"))
+            .collect()
     }
 
     pub fn restore_rejected(&mut self, selected: Vec<T>) {
@@ -190,14 +175,20 @@ impl<T: Schedulable> Scheduler<T> {
         if survivors.is_empty() {
             return;
         }
-        if self.policy.queue_mode == QueueMode::RoundRobin {
-            for survivor in &mut survivors {
-                let turn = self.take_fresh_turn();
-                survivor.set_turn_ordinal(turn);
-            }
+        for survivor in &mut survivors {
+            survivor.set_running(true);
         }
         self.ready.extend(survivors);
         self.sort_by_turn();
+        self.bump_epoch();
+    }
+
+    /// Return a memory-retracted request to the waiting tail.
+    pub fn requeue_retracted(&mut self, mut item: T) {
+        item.set_running(false);
+        let turn = self.take_fresh_turn();
+        item.set_turn_ordinal(turn);
+        self.ready.push(item);
         self.bump_epoch();
     }
 
@@ -226,25 +217,128 @@ impl<T: Schedulable> Scheduler<T> {
     }
 
     fn selected_identities(&self) -> Vec<SelectedIdentity> {
-        let Some(max_priority) = self.ready.iter().map(Schedulable::priority).max() else {
+        let limit = self.max_running_requests.get();
+        let running = self.running_identities();
+        let running_count = self.ready.iter().filter(|item| item.is_running()).count();
+        if running
+            .first()
+            .is_some_and(|identity| self.ready[identity.index].phase() == Phase::Prefill)
+        {
+            let anchor = &self.ready[running[0].index];
+            let free = limit - running_count;
+            if free == 0 {
+                return running;
+            }
+            let waiting = self.ready.iter().filter(|item| {
+                !item.is_running()
+                    && item.batch_key() == anchor.batch_key()
+                    && item.phase() == anchor.phase()
+            });
+            let Some(max_priority) = waiting.clone().map(Schedulable::priority).max() else {
+                return running;
+            };
+            let mut selected = running;
+            selected.extend(
+                self.ready
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| {
+                        !item.is_running()
+                            && item.priority() == max_priority
+                            && item.batch_key() == anchor.batch_key()
+                            && item.phase() == anchor.phase()
+                    })
+                    .take(free)
+                    .map(|(index, item)| SelectedIdentity {
+                        index,
+                        turn: item.turn_ordinal(),
+                    }),
+            );
+            return selected;
+        }
+
+        if running_count < limit {
+            let running_key = self
+                .ready
+                .iter()
+                .find(|item| item.is_running())
+                .and_then(Schedulable::batch_key);
+            let waiting = self.ready.iter().filter(|item| {
+                !item.is_running()
+                    && item.phase() == Phase::Prefill
+                    && (running_count == 0 || item.batch_key() == running_key)
+            });
+            if let Some(max_priority) = waiting.clone().map(Schedulable::priority).max() {
+                let anchor = waiting
+                    .clone()
+                    .find(|item| item.priority() == max_priority)
+                    .expect("maximum waiting priority has an anchor");
+                return self
+                    .ready
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| {
+                        !item.is_running()
+                            && item.priority() == max_priority
+                            && item.batch_key() == anchor.batch_key()
+                            && item.phase() == Phase::Prefill
+                    })
+                    .take(limit - running_count)
+                    .map(|(index, item)| SelectedIdentity {
+                        index,
+                        turn: item.turn_ordinal(),
+                    })
+                    .collect();
+            }
+        }
+        if !running.is_empty() {
+            return running;
+        }
+
+        let waiting = self.ready.iter();
+        let Some(max_priority) = waiting.clone().map(Schedulable::priority).max() else {
             return Vec::new();
         };
-        let anchor = self
+        let anchor = waiting
+            .clone()
+            .find(|item| item.priority() == max_priority)
+            .expect("maximum waiting priority has an anchor");
+        self.ready
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.priority() == max_priority
+                    && item.batch_key() == anchor.batch_key()
+                    && item.phase() == anchor.phase()
+            })
+            .take(limit)
+            .map(|(index, item)| SelectedIdentity {
+                index,
+                turn: item.turn_ordinal(),
+            })
+            .collect()
+    }
+
+    fn running_identities(&self) -> Vec<SelectedIdentity> {
+        let limit = self.max_running_requests.get();
+        let Some(anchor) = self
             .ready
             .iter()
-            .find(|item| item.priority() == max_priority)
-            .expect("maximum ready priority has an anchor");
+            .filter(|item| item.is_running())
+            .find(|item| item.phase() == Phase::Prefill)
+            .or_else(|| self.ready.iter().find(|item| item.is_running()))
+        else {
+            return Vec::new();
+        };
         let anchor_key = anchor.batch_key();
         let anchor_phase = anchor.phase();
         self.ready
             .iter()
             .enumerate()
             .filter(|(_, item)| {
-                item.priority() == max_priority
-                    && item.batch_key() == anchor_key
-                    && item.phase() == anchor_phase
+                item.is_running() && item.batch_key() == anchor_key && item.phase() == anchor_phase
             })
-            .take(self.max_running_requests.get())
+            .take(limit)
             .map(|(index, item)| SelectedIdentity {
                 index,
                 turn: item.turn_ordinal(),
@@ -274,7 +368,7 @@ impl<T: Schedulable> Scheduler<T> {
 mod tests {
     use std::num::NonZeroUsize;
 
-    use super::{Phase, QueueMode, Schedulable, Scheduler, SchedulerPolicy};
+    use super::{Phase, Schedulable, Scheduler};
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct Item {
@@ -282,6 +376,7 @@ mod tests {
         priority: i32,
         key: Option<u64>,
         phase: Phase,
+        running: bool,
         turn: u128,
     }
 
@@ -296,6 +391,14 @@ mod tests {
 
         fn phase(&self) -> Phase {
             self.phase
+        }
+
+        fn is_running(&self) -> bool {
+            self.running
+        }
+
+        fn set_running(&mut self, running: bool) {
+            self.running = running;
         }
 
         fn turn_ordinal(&self) -> u128 {
@@ -313,12 +416,13 @@ mod tests {
             priority,
             key,
             phase,
+            running: false,
             turn: 0,
         }
     }
 
-    fn scheduler(limit: usize, policy: SchedulerPolicy, items: Vec<Item>) -> Scheduler<Item> {
-        let mut scheduler = Scheduler::new(NonZeroUsize::new(limit).unwrap(), policy);
+    fn scheduler(limit: usize, items: Vec<Item>) -> Scheduler<Item> {
+        let mut scheduler = Scheduler::new(NonZeroUsize::new(limit).unwrap());
         for item in items {
             scheduler.enqueue(item);
         }
@@ -328,7 +432,6 @@ mod tests {
     fn default_scheduler(limit: usize, count: u32) -> Scheduler<Item> {
         scheduler(
             limit,
-            SchedulerPolicy::default(),
             (0..count)
                 .map(|id| item(id, 0, None, Phase::Prefill))
                 .collect(),
@@ -353,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_preserves_every_legacy_prefix_and_completion_mask() {
+    fn survivors_remain_ahead_of_waiting_requests() {
         for queue_len in 0_u32..=8 {
             for limit in 1_usize..=8 {
                 let scheduler = default_scheduler(limit, queue_len);
@@ -379,8 +482,8 @@ mod tests {
                     let survivor_ids = survivors.iter().map(|item| item.id).collect::<Vec<_>>();
                     scheduler.requeue_survivors(survivors);
 
-                    let mut expected = (selected_len as u32..queue_len).collect::<Vec<_>>();
-                    expected.extend(survivor_ids);
+                    let mut expected = survivor_ids;
+                    expected.extend(selected_len as u32..queue_len);
                     assert_eq!(
                         ready_ids(&scheduler),
                         expected,
@@ -389,6 +492,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn admitted_survivors_fill_vacancies_without_yielding_the_running_set() {
+        let mut scheduler = default_scheduler(2, 3);
+        let (_, selection) = scheduler.selected();
+        let mut admitted = scheduler.take_selected(selection);
+        admitted.pop();
+        scheduler.requeue_survivors(admitted);
+        assert_eq!(selected_ids(&scheduler), vec![0, 2]);
+
+        let (_, selection) = scheduler.selected();
+        let newcomer = scheduler.take_selected(selection);
+        scheduler.requeue_survivors(newcomer);
+        assert_eq!(selected_ids(&scheduler), vec![0, 2]);
+        assert_eq!(
+            scheduler
+                .selected_running()
+                .0
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn retracted_request_returns_to_the_waiting_tail() {
+        let mut scheduler = default_scheduler(2, 3);
+        let (_, selection) = scheduler.selected();
+        let mut admitted = scheduler.take_selected(selection);
+        let retracted = admitted.remove(0);
+        scheduler.requeue_survivors(admitted);
+        scheduler.requeue_retracted(retracted);
+        assert_eq!(ready_ids(&scheduler), vec![1, 2, 0]);
+        assert_eq!(selected_ids(&scheduler), vec![1, 2]);
     }
 
     #[test]
@@ -413,11 +552,21 @@ mod tests {
                     items.push(item(id, priority, key, phase));
                 }
                 for limit in 1..=queue_len as usize {
-                    let scheduler = scheduler(limit, SchedulerPolicy::default(), items.clone());
-                    let max_priority = items.iter().map(|item| item.priority).max().unwrap();
+                    let scheduler = scheduler(limit, items.clone());
+                    let preferred_phase = if items.iter().any(|item| item.phase == Phase::Prefill) {
+                        Phase::Prefill
+                    } else {
+                        Phase::Decode
+                    };
+                    let max_priority = items
+                        .iter()
+                        .filter(|item| item.phase == preferred_phase)
+                        .map(|item| item.priority)
+                        .max()
+                        .unwrap();
                     let anchor = items
                         .iter()
-                        .find(|item| item.priority == max_priority)
+                        .find(|item| item.priority == max_priority && item.phase == preferred_phase)
                         .unwrap();
                     let expected = items
                         .iter()
@@ -439,7 +588,6 @@ mod tests {
     fn priority_is_strict_and_never_backfills_an_incompatible_cohort() {
         let scheduler = scheduler(
             4,
-            SchedulerPolicy::default(),
             vec![
                 item(0, 0, None, Phase::Prefill),
                 item(1, 2, Some(9), Phase::Prefill),
@@ -457,17 +605,14 @@ mod tests {
             item(1, 0, Some(0), Phase::Prefill),
             item(2, 0, None, Phase::Decode),
         ];
-        let phase_homogeneous = scheduler(3, SchedulerPolicy::default(), items);
+        let phase_homogeneous = scheduler(3, items);
         assert_eq!(selected_ids(&phase_homogeneous), vec![0]);
     }
 
     #[test]
-    fn fifo_survivors_retain_age_ahead_of_tail_and_inflight_submissions() {
+    fn survivors_retain_age_ahead_of_tail_and_inflight_submissions() {
         let mut scheduler = scheduler(
             2,
-            SchedulerPolicy {
-                queue_mode: QueueMode::Fifo,
-            },
             (0..3).map(|id| item(id, 0, None, Phase::Prefill)).collect(),
         );
         let original_turns = ready_id_turns(&scheduler);
@@ -480,25 +625,9 @@ mod tests {
     }
 
     #[test]
-    fn round_robin_survivors_get_fresh_age_after_waiters_and_submissions() {
-        let mut scheduler = default_scheduler(2, 3);
-        let (_, selection) = scheduler.selected();
-        let selected = scheduler.take_selected(selection);
-        scheduler.enqueue(item(3, 0, None, Phase::Prefill));
-        scheduler.requeue_survivors(selected);
-        assert_eq!(ready_ids(&scheduler), vec![2, 3, 0, 1]);
-        assert!(
-            ready_id_turns(&scheduler)
-                .windows(2)
-                .all(|pair| pair[0].1 < pair[1].1)
-        );
-    }
-
-    #[test]
     fn rejection_restores_exact_noncontiguous_items_and_ordinals() {
         let mut scheduler = scheduler(
             3,
-            SchedulerPolicy::default(),
             vec![
                 item(0, 1, None, Phase::Prefill),
                 item(1, 0, None, Phase::Prefill),
@@ -519,7 +648,6 @@ mod tests {
     fn truncated_noncontiguous_prefix_takes_and_restores_exact_identities() {
         let mut scheduler = scheduler(
             4,
-            SchedulerPolicy::default(),
             vec![
                 item(0, 1, Some(7), Phase::Prefill),
                 item(1, 1, None, Phase::Prefill),

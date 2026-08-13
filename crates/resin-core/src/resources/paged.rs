@@ -800,6 +800,106 @@ impl CachePool {
         }
     }
 
+    /// Grow an executable request to the supplied total block counts.
+    ///
+    /// Placement is all-or-nothing. Existing pages and request identity stay
+    /// unchanged on failure.
+    pub fn grow_request(
+        &mut self,
+        request: &mut RequestPages,
+        demands: &[GroupDemand],
+    ) -> Result<(), CachePoolError> {
+        self.validate_request_idle(request)?;
+        if demands.len() != request.groups.len()
+            || demands
+                .iter()
+                .zip(&request.groups)
+                .any(|(demand, group)| demand.group != group.group)
+        {
+            return Err(CachePoolError::StaleHandle);
+        }
+
+        let mut total_blocks = 0usize;
+        let mut additions = Vec::new();
+        additions
+            .try_reserve_exact(demands.len())
+            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        for (demand, group) in demands.iter().zip(&mut request.groups) {
+            let additional = demand
+                .blocks
+                .checked_sub(group.pages.len())
+                .ok_or(CachePoolError::StaleHandle)?;
+            group
+                .pages
+                .try_reserve_exact(additional)
+                .map_err(|_| CachePoolError::MetadataAllocation)?;
+            total_blocks = total_blocks
+                .checked_add(additional)
+                .ok_or(CachePoolError::DemandOverflow)?;
+            let mut pages = Vec::new();
+            pages
+                .try_reserve_exact(additional)
+                .map_err(|_| CachePoolError::MetadataAllocation)?;
+            additions.push(GroupTable {
+                group: demand.group,
+                pages,
+            });
+        }
+        if total_blocks == 0 {
+            return Ok(());
+        }
+        self.occupied_blocks
+            .checked_add(total_blocks)
+            .ok_or(CachePoolError::DemandOverflow)?;
+
+        let mut plan =
+            PlacementPlan::new(self.group_packings.len(), total_blocks, self.parents.len())?;
+        for ((addition, demand), group) in additions.iter_mut().zip(demands).zip(&request.groups) {
+            let additional = demand.blocks - group.pages.len();
+            self.plan_partition(
+                &mut plan,
+                request.writer,
+                GroupDemand::new(addition.group, additional),
+                &mut addition.pages,
+            )?;
+        }
+        debug_assert_eq!(plan.block_count, total_blocks);
+
+        self.commit_plan(plan);
+        for page in additions.iter().flat_map(|group| &group.pages) {
+            let slot = self.slot_mut(page.handle);
+            debug_assert_eq!(
+                slot.mode,
+                Some(PageMode::Reserved {
+                    writer: request.writer
+                })
+            );
+            debug_assert_eq!(slot.request_refs, 0);
+            slot.mode = Some(PageMode::Mutable {
+                writer: request.writer,
+            });
+            slot.request_refs = 1;
+        }
+        for (group, mut addition) in request.groups.iter_mut().zip(additions) {
+            group.pages.append(&mut addition.pages);
+        }
+        Ok(())
+    }
+
+    /// Release every page while retaining the request's sequence and writer.
+    pub fn clear_request(&mut self, request: &mut RequestPages) -> Result<(), CachePoolError> {
+        self.validate_request_idle(request)?;
+        for group in request.groups.iter_mut().rev() {
+            for page in group.pages.drain(..).rev() {
+                let slot = self.slot_mut(page.handle);
+                debug_assert_ne!(slot.request_refs, 0);
+                slot.request_refs -= 1;
+                self.retire_slot_if_unused(page.handle);
+            }
+        }
+        Ok(())
+    }
+
     /// Discard a fresh request reservation. Like promotion, this is infallible
     /// after successful reservation.
     pub fn abort_request(&mut self, pending: PendingRequestPages) {
@@ -1094,6 +1194,16 @@ impl CachePool {
                     }
                     _ => return Err(CachePoolError::StaleHandle),
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_request_idle(&self, request: &RequestPages) -> Result<(), CachePoolError> {
+        self.validate_request(request)?;
+        for page in request.groups.iter().flat_map(|group| &group.pages) {
+            if self.validate_live_handle(page.handle)?.lease != LeaseState::Idle {
+                return Err(CachePoolError::AccessConflict);
             }
         }
         Ok(())

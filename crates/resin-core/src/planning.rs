@@ -12,8 +12,9 @@ pub struct PlanningConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RequestProgress {
     pub phase: Phase,
-    pub prompt_length: u32,
+    pub prefill_length: u32,
     pub logical_context: u32,
+    pub sample_at_prefill_end: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,7 +65,7 @@ pub fn schedule_ready_prefix(
         }
         let mut desired = match request.phase {
             Phase::Prefill => request
-                .prompt_length
+                .prefill_length
                 .checked_sub(request.logical_context)
                 .filter(|remaining| *remaining != 0)
                 .ok_or(PlanningError::InvalidPrefillProgress)?
@@ -91,7 +92,7 @@ pub fn schedule_ready_prefix(
                 count,
             },
             sample: match request.phase {
-                Phase::Prefill => end == request.prompt_length,
+                Phase::Prefill => request.sample_at_prefill_end && end == request.prefill_length,
                 Phase::Decode => true,
             },
         });
@@ -106,11 +107,12 @@ pub fn schedule_ready_prefix(
 mod tests {
     use super::*;
 
-    fn prefill(prompt_length: u32, logical_context: u32) -> RequestProgress {
+    fn prefill(prefill_length: u32, logical_context: u32) -> RequestProgress {
         RequestProgress {
             phase: Phase::Prefill,
-            prompt_length,
+            prefill_length,
             logical_context,
+            sample_at_prefill_end: true,
         }
     }
 
@@ -147,11 +149,32 @@ mod tests {
     }
 
     #[test]
+    fn replay_prefill_does_not_sample_an_already_generated_token() {
+        let steps = schedule_ready_prefix(
+            &[RequestProgress {
+                phase: Phase::Prefill,
+                prefill_length: 6,
+                logical_context: 0,
+                sample_at_prefill_end: false,
+            }],
+            PlanningConfig {
+                max_batch_tokens: None,
+                prefill_chunk_size: NonZeroU32::new(8).unwrap(),
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(steps[0].token_end(), Some(6));
+        assert!(!steps[0].sample);
+    }
+
+    #[test]
     fn phases_must_be_homogeneous() {
         let decode = RequestProgress {
             phase: Phase::Decode,
-            prompt_length: 4,
+            prefill_length: 4,
             logical_context: 4,
+            sample_at_prefill_end: false,
         };
         assert_eq!(
             schedule_ready_prefix(

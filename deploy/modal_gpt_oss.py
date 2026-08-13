@@ -101,6 +101,7 @@ image = (
     .add_local_file(ROOT / "Cargo.lock", "/opt/resin/Cargo.lock", copy=True)
     .add_local_file(ROOT / "pyproject.toml", "/opt/resin/pyproject.toml", copy=True)
     .add_local_file(ROOT / "README.md", "/opt/resin/README.md", copy=True)
+    .add_local_dir(ROOT / "crates", "/opt/resin/crates", copy=True)
     .add_local_dir(ROOT / "src", "/opt/resin/src", copy=True)
     .run_commands("python -m pip install --no-deps /opt/resin")
     .env(KERNEL_CACHE_ENV)
@@ -363,10 +364,11 @@ def _run_prompt(
     prompt: str,
     max_new_tokens: int,
     context_length: int,
+    schedule_conservativeness: float,
 ) -> dict[str, object]:
     import torch
 
-    from resin import Engine
+    from resin import Engine, SchedulerConfig
 
     if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
         raise ValueError("max_new_tokens must be an integer")
@@ -390,6 +392,9 @@ def _run_prompt(
         runner,
         max_running_requests=1,
         context_length=context_length,
+        scheduler_config=SchedulerConfig(
+            schedule_conservativeness=schedule_conservativeness
+        ),
         eos_token_id=runner.eos_token_id,
     )
     output_events = []
@@ -446,10 +451,11 @@ def _bench_cuda(
     max_new_tokens: int,
     batch_sizes: tuple[int, ...],
     context_length: int,
+    schedule_conservativeness: float,
 ) -> dict[str, object]:
     import torch
 
-    from resin import Engine
+    from resin import Engine, SchedulerConfig
 
     tokenizer, _renderer = _load_renderer(model_path)
     prompt_ids = _bench_prompt_ids(tokenizer, prompt_tokens)
@@ -468,6 +474,9 @@ def _bench_cuda(
         runner,
         max_running_requests=max(batch_sizes),
         context_length=context_length,
+        scheduler_config=SchedulerConfig(
+            schedule_conservativeness=schedule_conservativeness
+        ),
         eos_token_id=runner.eos_token_id,
     )
 
@@ -537,6 +546,7 @@ def _run_bench(
     max_new_tokens: int,
     batch_sizes: tuple[int, ...],
     context_length: int,
+    schedule_conservativeness: float,
 ) -> dict[str, object]:
     if model_key not in MODEL_SPECS:
         raise ValueError("model must be '20b' or '120b'")
@@ -598,6 +608,7 @@ def _run_bench(
                 max_new_tokens,
                 batch_sizes,
                 context_length,
+                schedule_conservativeness,
             )
         if not path.is_file():
             raise RuntimeError("FlashInfer did not publish its benchmark tactic file")
@@ -643,8 +654,15 @@ def run_model(
     prompt: str,
     max_new_tokens: int = 256,
     context_length: int = 32768,
+    schedule_conservativeness: float = 1.0,
 ) -> dict[str, object]:
-    return _run_prompt(model_key, prompt, max_new_tokens, context_length)
+    return _run_prompt(
+        model_key,
+        prompt,
+        max_new_tokens,
+        context_length,
+        schedule_conservativeness,
+    )
 
 
 @app.function(
@@ -661,6 +679,7 @@ def bench_model(
     max_new_tokens: int = 256,
     batch_sizes: tuple[int, ...] = (1, 2, 8, 16, 32),
     context_length: int = 32768,
+    schedule_conservativeness: float = 1.0,
 ) -> dict[str, object]:
     return _run_bench(
         model_key,
@@ -669,6 +688,7 @@ def bench_model(
         max_new_tokens,
         batch_sizes,
         context_length,
+        schedule_conservativeness,
     )
 
 
@@ -682,13 +702,20 @@ def main(
     prompt_tokens: int = 8192,
     batch_sizes: str = "1,2,8,16,32",
     context_length: int = 32768,
+    schedule_conservativeness: float = 1.0,
 ) -> None:
     """Download a checkpoint, run one prompt, or benchmark throughput."""
 
     if mode == "download":
         report = cache_checkpoint.remote(model)
     elif mode == "run":
-        report = run_model.remote(model, prompt, max_new_tokens, context_length)
+        report = run_model.remote(
+            model,
+            prompt,
+            max_new_tokens,
+            context_length,
+            schedule_conservativeness,
+        )
     elif mode == "bench":
         try:
             parsed_batch_sizes = tuple(int(value) for value in batch_sizes.split(","))
@@ -703,6 +730,7 @@ def main(
             max_new_tokens,
             parsed_batch_sizes,
             context_length,
+            schedule_conservativeness,
         )
     else:
         raise ValueError("mode must be 'download', 'run', or 'bench'")

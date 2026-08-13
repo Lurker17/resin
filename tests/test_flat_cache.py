@@ -187,9 +187,11 @@ class FlatCacheEngineTests(unittest.TestCase):
         engine = Engine(runner)
         request = engine.submit([4, 5, 6], max_new_tokens=2)
 
+        self.assertEqual(engine.cache_free_parent_count, 3)
+        self.assertEqual(engine.cache_occupied_block_count, 0)
+        first_event = engine.step()[0]
         self.assertEqual(engine.cache_free_parent_count, 1)
         self.assertEqual(engine.cache_occupied_block_count, 2)
-        first_event = engine.step()[0]
         self.assertFalse(first_event.finished)
         prefill = runner.plans[0]
         self.assertEqual(prefill.cache_pool_id, engine.cache_pool_id)
@@ -228,8 +230,8 @@ class FlatCacheEngineTests(unittest.TestCase):
         engine = Engine(runner)
         engine.submit([1, 2, 3], max_new_tokens=2)
 
-        self.assertEqual(engine.cache_free_parent_count, 1)
-        self.assertEqual(engine.cache_occupied_block_count, 3)
+        self.assertEqual(engine.cache_free_parent_count, 3)
+        self.assertEqual(engine.cache_occupied_block_count, 0)
         engine.step()
         plan = runner.plans[0]
         self.assertEqual([group.group_index for group in plan.cache_groups], [0, 1])

@@ -21,4 +21,4 @@ mod scheduler;
 pub use batch::{SequenceStep, TokenRange};
 pub use ids::RequestId;
 pub use planning::{PlanningConfig, PlanningError, RequestProgress, schedule_ready_prefix};
-pub use scheduler::{Phase, QueueMode, Schedulable, Scheduler, SchedulerPolicy, Selection};
+pub use scheduler::{Phase, Schedulable, Scheduler, Selection};

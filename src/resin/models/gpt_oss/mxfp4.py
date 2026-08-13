@@ -9,7 +9,6 @@ time.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -105,43 +104,17 @@ def _make_kernel_expert_factory(torch, kernel, config: MoEKernelConfig):
     return lambda args: KernelExperts(args)
 
 
-class _PackedExpertCoordinator:
-    """Connect the generic tensor streamer to one prepared module per layer."""
-
-    def __init__(self, torch, model, kernel, config: MoEKernelConfig) -> None:
-        self._torch = torch
-        self._model = model
-        self._kernel = kernel
-        self._config = config
-        self._active_layer: int | None = None
-        self._raw: dict[str, Any] = {}
-
-    def expected_tensor_names(
-        self, layer_index: int, config: Mapping[str, Any]
-    ) -> tuple[str, ...]:
-        del layer_index, config
-        return _EXPERT_CHECKPOINT_NAMES
-
-    def begin_layer(self, layer_index: int, config: Mapping[str, Any]) -> None:
-        del config
-        if self._active_layer is not None:
-            raise RuntimeError("the previous packed expert layer was not finished")
-        module = self._model.model.layers[layer_index].mlp.experts
-        if not hasattr(module, "install_prepared_weights"):
-            raise TypeError(f"layer {layer_index} does not use a kernel expert module")
-        self._active_layer = layer_index
-        self._raw = {}
-
-    def consume_tensor(self, layer_index: int, name: str, tensor: Any) -> None:
-        if layer_index != self._active_layer:
-            raise RuntimeError("packed expert tensor arrived outside its layer scope")
-        try:
-            standard_name = _CHECKPOINT_TO_STANDARD[name]
-        except KeyError as error:
-            raise KeyError(f"unknown GPT-OSS expert tensor {name!r}") from error
-        if standard_name in self._raw:
-            raise ValueError(f"duplicate GPT-OSS expert tensor {name!r}")
-
+def _install_expert_layer(
+    torch,
+    model,
+    kernel,
+    config: MoEKernelConfig,
+    layer_index: int,
+    checkpoint_tensors: dict[str, Any],
+) -> None:
+    raw_tensors = {}
+    for name, tensor in checkpoint_tensors.items():
+        standard_name = _CHECKPOINT_TO_STANDARD[name]
         if name.endswith("_blocks"):
             if tensor.ndim != 4 or tensor.shape[-1] != 16:
                 raise ValueError(
@@ -149,36 +122,20 @@ class _PackedExpertCoordinator:
                     f"got {tuple(tensor.shape)}"
                 )
             tensor = tensor.reshape(tensor.shape[0], tensor.shape[1], -1)
-        self._raw[standard_name] = tensor
+        raw_tensors[standard_name] = tensor
 
-    def finish_layer(self, layer_index: int) -> None:
-        if layer_index != self._active_layer:
-            raise RuntimeError("cannot finish an inactive packed expert layer")
-        missing = set(_CHECKPOINT_TO_STANDARD.values()) - self._raw.keys()
-        if missing:
-            raise ValueError(
-                "missing GPT-OSS expert tensors: " + ", ".join(sorted(missing))
-            )
-
-        raw = MoEExpertWeights(
-            gate_up=self._raw["gate_up"],
-            down=self._raw["down"],
-            gate_up_scales=self._raw["gate_up_scales"],
-            down_scales=self._raw["down_scales"],
-            gate_up_bias=self._raw["gate_up_bias"],
-            down_bias=self._raw["down_bias"],
-        )
-        prepared = self._kernel.prepare_weights(raw, self._config)
-        module = self._model.model.layers[layer_index].mlp.experts
-        module.install_prepared_weights(prepared)
-
-        # The prepared tensors stay referenced by the layer.  Release raw and
-        # padding/interleave temporaries before reading the next large layer.
-        self._raw = {}
-        self._active_layer = None
-        del raw, prepared
-        if self._torch.cuda.is_available():
-            self._torch.cuda.empty_cache()
+    raw = MoEExpertWeights(
+        gate_up=raw_tensors["gate_up"],
+        down=raw_tensors["down"],
+        gate_up_scales=raw_tensors["gate_up_scales"],
+        down_scales=raw_tensors["down_scales"],
+        gate_up_bias=raw_tensors["gate_up_bias"],
+        down_bias=raw_tensors["down_bias"],
+    )
+    prepared = kernel.prepare_weights(raw, config)
+    model.model.layers[layer_index].mlp.experts.install_prepared_weights(prepared)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def load_mxfp4_model(
@@ -215,21 +172,17 @@ def load_mxfp4_model(
     with torch.device("meta"):
         model = GptOssForCausalLM(args, expert_factory)
 
-    coordinator = _PackedExpertCoordinator(
-        torch,
-        model,
-        kernel,
-        moe_config,
-    )
-    loaded_config, _ = load_gpt_oss_weights(
+    load_gpt_oss_weights(
         path,
         model,
         device=target,
         dtype=torch.bfloat16,
-        expert_builder=coordinator,
+        num_hidden_layers=args.num_hidden_layers,
+        expert_tensor_names=_EXPERT_CHECKPOINT_NAMES,
+        install_expert_layer=lambda layer, tensors: _install_expert_layer(
+            torch, model, kernel, moe_config, layer, dict(tensors)
+        ),
     )
-    if dict(loaded_config) != config:
-        raise RuntimeError("checkpoint config changed while weights were loading")
 
     model.materialize_buffers(target)
     for module in model.modules():
