@@ -158,6 +158,12 @@ The native layer currently provides:
 - generation-checked `StatePool` slots with shared-read/exclusive-write access;
 - retryable pre-accept failure and fail-stop post-accept quarantine.
 
+The native implementation is split in two. `crates/resin-core` is ordinary,
+PyO3-free Rust containing typed scheduling, token-range planning, full-context
+and sliding-window KV resources, recurrent-slot resources, allocation, and
+leases. The root crate adapts those types to Python and coordinates runner
+acceptance and completion.
+
 History cache grows for the declared request lifetime. Window cache is bounded
 private cyclic storage whose plan row is projected into chronological order.
 Cache retention is exactly History or Window. Recurrent model state is a
@@ -220,12 +226,13 @@ unavailable accelerator libraries.
 ## Repository map
 
 - `src/lib.rs` — Python API, Engine lifecycle, and transactional orchestration
-- `src/planning.rs` — deterministic row scheduling and plan construction
+- `src/planning.rs` — conversion from core batch/resource views to `BatchPlan`
 - `src/runner.rs` — execution discovery and one-time resource binding
-- `src/scheduler.rs` — cohort selection and queue-age policy
-- `src/cache.rs` — public cache layout and grouped plan descriptors
-- `src/cache_pool.rs` — flat parent allocator, request ownership, and leases
-- `src/state_pool.rs` — generic state ownership, access, and physical mappings
+- `src/cache.rs` — Python adapters for core KV descriptors
+- `src/state_pool.rs` — Python adapter for the core recurrent-slot pool
+- `crates/resin-core/src/scheduler.rs` — cohort selection and queue-age policy
+- `crates/resin-core/src/planning.rs` — typed token-range planning
+- `crates/resin-core/src/resources/` — KV, recurrent, allocator, and lease logic
 - `src/resin/backends/` — model definitions, loaders, and runners
 - `deploy/` — optional remote validation harnesses
 - `tests/` — native and runner-contract coverage

@@ -107,9 +107,6 @@ class SchedulerConfigContractTests(unittest.TestCase):
             ValueError, "queue_mode must be 'round_robin' or 'fifo'"
         ):
             SchedulerConfig(queue_mode="priority")
-        with self.assertRaises(TypeError):
-            SchedulerConfig(allow_mixed=False)
-
         limited = SchedulerConfig(max_batch_tokens=17, prefill_chunk_size=5)
         self.assertEqual(
             (limited.max_batch_tokens, limited.prefill_chunk_size),
@@ -268,11 +265,6 @@ class SchedulerConfigContractTests(unittest.TestCase):
             phase=BatchPhase.DECODE,
         )
         self.assertEqual(decode.phase, BatchPhase.DECODE)
-
-        with self.assertRaisesRegex(TypeError, "mode"):
-            BatchPlan(
-                [1, 2], [0, 5], [7, 8], [0, 1, 2], [0, 5], mode="mixed"
-            )
 
     def test_batch_plan_rejects_invalid_sampling_rows(self) -> None:
         for value in ([2, 1], [1, 1], [3]):

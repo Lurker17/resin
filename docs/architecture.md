@@ -30,6 +30,31 @@ The runner cannot admit work or commit logical progress. It executes a plan and
 returns one token ID per sequence row. Resin decides which returned IDs become
 events through the plan's sampling mask.
 
+## Native crate boundary
+
+`resin-core` is PyO3-free. It owns typed request identities, homogeneous
+phase selection, token-range planning, and resource lifetimes. The root
+`_resin` crate is the Python/runner adapter and translates core views into the
+public `BatchPlan` ABI.
+
+The Engine uses the same small generic shape at its two ownership boundaries:
+`WithResources<Owner, ResourceSet<Attention, Recurrent>>`. The concrete fields
+make durable request state visibly different from temporary accepted-batch
+access:
+
+| Resource | Request-owned state | Accepted-batch state | Executor view |
+| --- | --- | --- | --- |
+| Full-context attention | Private pages for maximum context | Writer lease on the active prefix | Chronological CSR block table and append targets |
+| Sliding-window attention | Bounded private cyclic pages | Writer lease on the resident suffix | Chronological suffix plus current append targets |
+| Recurrent state | Generation-checked handles and access modes | Pinned handles and shared-read/exclusive-write lease | Slot/generation CSR and access modes |
+
+The paged-KV coordinator returns its executor view and exact writer lease
+together and rejects a second acquisition until release. Recurrent access is
+similarly retained by the accepted batch. Resin intentionally does not support
+overlap scheduling, future-batch planning, or speculative recurrent-state
+locks/residency. A quarantined accepted batch therefore keeps every capability
+that could still be addressed by device work.
+
 ## Request lifecycle
 
 1. `submit()` validates the prompt and optional state handles and returns a
@@ -43,7 +68,8 @@ events through the plan's sampling mask.
    leases before runner acceptance.
 4. A synchronous runner receives `forward(plan)`. An asynchronous runner receives
    `dispatch(plan)` followed by zero or more `poll(completion)` calls. One batch
-   may currently be in flight per Engine.
+   may be in flight per Engine; this is an intentional resource contract, not an
+   overlap-scheduling feature gap.
 5. On success, optional runner cleanup runs first. Resin then unpins state,
    releases cache/state access, and retires terminal physical storage. Only
    after those steps succeed does it expose logical progress, requeue survivors,

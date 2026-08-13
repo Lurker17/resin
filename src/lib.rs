@@ -1,4 +1,4 @@
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -8,25 +8,24 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
 mod cache;
-mod cache_pool;
 mod planning;
 mod runner;
-mod scheduler;
 mod state_pool;
 
-use cache::{CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention};
-use cache_pool::{
-    CachePool, CachePoolError, GroupDemand, GroupId, RequestPages, SequenceId, WriterAccessLease,
-};
-use planning::{
-    build_plan_for_engine, schedule_ready_prefix_for_layout, scheduled_writer_access_claims,
+use cache::{CacheGroupLayout, CacheGroupPlan, CacheLayout};
+use planning::{build_plan_for_engine, schedule_ready_prefix_for_layout};
+use resin_core::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
+use resin_core::resources::paged_kv::{PagedKvError, PagedKvResources};
+use resin_core::resources::slots::SlotHandle as CoreStateHandle;
+use resin_core::resources::{RequestResourceRef, ResourceSet, WithResources};
+use resin_core::{
+    Phase, QueueMode, RequestId, Schedulable, Scheduler, SchedulerPolicy, SequenceStep,
 };
 use runner::{
     RunnerExecution, bind_runner_resources, resolve_runner_contract,
     resolve_runner_prefill_chunk_size, resolve_runner_resources, runner_error_is_post_accept,
     runner_supports_continuation_prefill,
 };
-use scheduler::{Phase, QueueMode, Schedulable, Scheduler, SchedulerPolicy};
 use state_pool::{
     PreparedStateAccessLease, StateAccessClaim, StateAccessLease, StateAccessMode, StateHandle,
     StatePool,
@@ -440,28 +439,29 @@ impl BatchPlan {
 
         for (group_index, group) in self.cache_groups.iter().enumerate() {
             group.validate_local()?;
-            if group.group_index_native() != group_index as u32 {
+            let group = group.inner_native();
+            if group.group_index != group_index as u32 {
                 return Err(PyValueError::new_err(
                     "cache_groups must be ordered by contiguous group_index",
                 ));
             }
-            if group.first_logical_blocks_native().len() != self.sequence_ids.len() {
+            if group.first_logical_blocks.len() != self.sequence_ids.len() {
                 return Err(PyValueError::new_err(
                     "each cache group must contain one block-table row per sequence",
                 ));
             }
-            if group.append_block_ids_native().len() != self.token_ids.len() {
+            if group.append_block_ids.len() != self.token_ids.len() {
                 return Err(PyValueError::new_err(
                     "each cache group must contain one append target per batch token",
                 ));
             }
             for sequence_index in 0..self.sequence_ids.len() {
-                let block_start = group.block_indptr_native()[sequence_index] as usize;
-                let block_end = group.block_indptr_native()[sequence_index + 1] as usize;
-                let row_blocks = &group.block_ids_native()[block_start..block_end];
+                let block_start = group.block_indptr[sequence_index] as usize;
+                let block_end = group.block_indptr[sequence_index + 1] as usize;
+                let row_blocks = &group.block_ids[block_start..block_end];
                 let token_start = self.sequence_indptr[sequence_index] as usize;
                 let token_end = self.sequence_indptr[sequence_index + 1] as usize;
-                if group.append_block_ids_native()[token_start..token_end]
+                if group.append_block_ids[token_start..token_end]
                     .iter()
                     .any(|page_id| !row_blocks.contains(page_id))
                 {
@@ -828,7 +828,7 @@ impl TokenEvent {
 }
 
 #[derive(Debug)]
-struct Request {
+struct RequestData {
     id: u64,
     lease: Arc<Mutex<RequestLeaseState>>,
     priority: i32,
@@ -838,13 +838,19 @@ struct Request {
     prefill_cursor: u32,
     generated: Vec<u32>,
     max_new_tokens: usize,
-    state_handles: Vec<StateHandle>,
-    state_access_modes: Vec<StateAccessMode>,
-    pages: Option<RequestPages>,
     cancel_pending: bool,
 }
 
-impl Request {
+#[derive(Debug)]
+struct RecurrentRequestState {
+    handles: Vec<CoreStateHandle>,
+    access_modes: Vec<StateAccessMode>,
+}
+
+type RequestResources = ResourceSet<Option<RequestPages>, RecurrentRequestState>;
+type Request = WithResources<RequestData, RequestResources>;
+
+impl RequestData {
     fn prompt_length(&self) -> u32 {
         u32::try_from(self.prompt.len()).expect("submit bounds prompt length to u32")
     }
@@ -876,7 +882,7 @@ impl Request {
     }
 }
 
-impl Schedulable for Request {
+impl Schedulable for RequestData {
     fn priority(&self) -> i32 {
         self.priority
     }
@@ -906,15 +912,17 @@ fn state_compatible_prefix_len(requests: &[&Request]) -> usize {
     let mut batch_claims = std::collections::BTreeMap::new();
     for (row_index, request) in requests.iter().enumerate() {
         debug_assert_eq!(
-            request.state_handles.len(),
-            request.state_access_modes.len()
+            request.resources.recurrent.handles.len(),
+            request.resources.recurrent.access_modes.len()
         );
         let mut row_claims = std::collections::BTreeMap::new();
         for (handle, mode) in request
-            .state_handles
+            .resources
+            .recurrent
+            .handles
             .iter()
             .cloned()
-            .zip(request.state_access_modes.iter().copied())
+            .zip(request.resources.recurrent.access_modes.iter().copied())
         {
             row_claims
                 .entry(handle)
@@ -949,21 +957,7 @@ enum RunnerCallOutcome {
     FailedAfterAcceptance { stage: &'static str, error: PyErr },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ScheduledRow {
-    phase: Phase,
-    token_start: u32,
-    token_count: NonZeroU32,
-    sample: bool,
-}
-
-impl ScheduledRow {
-    fn token_end(self) -> PyResult<u32> {
-        self.token_start
-            .checked_add(self.token_count.get())
-            .ok_or_else(|| PyValueError::new_err("scheduled token range overflows u32"))
-    }
-}
+type ScheduledRow = SequenceStep;
 
 struct InFlightRow {
     request: Request,
@@ -976,14 +970,19 @@ struct PreparedProgress {
     sampled_token: Option<u32>,
 }
 
-struct InFlightBatch {
+struct InFlightData {
     batch_id: u64,
     rows: Vec<InFlightRow>,
-    scheduled_state: Vec<StateHandle>,
-    state_access: Option<StateAccessLease>,
-    writer_access: Option<WriterAccessLease>,
     execution: InFlightExecution,
 }
+
+struct RecurrentBatchState {
+    handles: Vec<CoreStateHandle>,
+    access: Option<StateAccessLease>,
+}
+
+type BatchResources = ResourceSet<Option<WriterAccessLease>, RecurrentBatchState>;
+type InFlightBatch = WithResources<InFlightData, BatchResources>;
 
 #[pyclass(module = "resin._resin")]
 struct Engine {
@@ -1005,7 +1004,7 @@ struct Engine {
     state_pool: Option<Py<StatePool>>,
     recurrent_state_mapping: Option<StateMappingConfig>,
     cache_layout: Option<CacheLayout>,
-    cache_pool: Option<CachePool>,
+    kv_resources: Option<PagedKvResources>,
     poisoned_error: Option<String>,
     closed: bool,
 }
@@ -1020,6 +1019,17 @@ fn cache_pool_error(error: CachePoolError) -> PyErr {
         }
         _ => PyRuntimeError::new_err(error.to_string()),
     }
+}
+
+fn paged_kv_error(error: PagedKvError) -> PyErr {
+    match error {
+        PagedKvError::Cache(error) => cache_pool_error(error),
+        PagedKvError::Invalid(_) => PyRuntimeError::new_err(error.to_string()),
+    }
+}
+
+fn core_request_id(request_id: u64) -> RequestId {
+    RequestId::new(NonZeroU64::new(request_id).expect("Engine request ids are positive"))
 }
 
 #[pymethods]
@@ -1058,13 +1068,12 @@ impl Engine {
         let runner_prefill_chunk_size = resolve_runner_prefill_chunk_size(py, runner.bind(py))?;
 
         let runner_resources = resolve_runner_resources(py, runner.bind(py), state_pool.as_ref())?;
-        let cache_pool = runner_resources
+        let kv_resources = runner_resources
             .cache_layout
             .as_ref()
             .map(|layout| {
                 let layout = layout.borrow(py);
-                CachePool::new(layout.parent_capacity_native().get(), &layout.packings())
-                    .map_err(cache_pool_error)
+                PagedKvResources::new(layout.inner_native().clone()).map_err(cache_pool_error)
             })
             .transpose()?;
         // Complete every fallible native allocation before the runner's one
@@ -1073,7 +1082,7 @@ impl Engine {
         let (cache_layout, recurrent_state_mapping) = bind_runner_resources(
             py,
             &runner_resources,
-            cache_pool.as_ref().map(CachePool::id),
+            kv_resources.as_ref().map(|resources| resources.pool().id()),
             state_pool.as_ref(),
         )?;
 
@@ -1096,7 +1105,7 @@ impl Engine {
             state_pool,
             recurrent_state_mapping,
             cache_layout,
-            cache_pool,
+            kv_resources,
             poisoned_error: None,
             closed: false,
         })
@@ -1150,7 +1159,7 @@ impl Engine {
         let state_handles = state_handles
             .unwrap_or_default()
             .into_iter()
-            .map(|handle| handle.borrow(py).clone())
+            .map(|handle| handle.borrow(py).inner())
             .collect::<Vec<_>>();
         let state_access_modes = parse_state_access_modes(state_access_modes, state_handles.len())?;
         if let Some(mapping) = &self.recurrent_state_mapping
@@ -1191,45 +1200,24 @@ impl Engine {
             },
         )?;
 
-        let demands = self.cache_layout.as_ref().map(|layout| {
-            layout
-                .groups_native()
-                .iter()
-                .enumerate()
-                .map(|(group_index, group)| {
-                    let blocks = match group.retention_native() {
-                        CacheRetention::History => {
-                            max_input_tokens.div_ceil(group.block_tokens_native().get())
-                        }
-                        CacheRetention::Window { .. } => group
-                            .window_resident_blocks()
-                            .expect("window retention has a resident width")
-                            .get(),
-                    };
-                    GroupDemand::new(GroupId::new(group_index as u32), blocks as usize)
-                })
-                .collect::<Vec<_>>()
-        });
-        let mut pending_pages = match (demands.as_deref(), self.cache_pool.as_mut()) {
-            (Some(demands), Some(pool)) => Some(
-                pool.reserve_request(SequenceId::new(request_id), demands)
-                    .map_err(cache_pool_error)?,
-            ),
-            (None, None) => None,
-            _ => {
-                return Err(PyRuntimeError::new_err(
-                    "Engine cache layout and cache pool disagree",
-                ));
-            }
-        };
+        let mut pages = self
+            .kv_resources
+            .as_mut()
+            .map(|resources| {
+                resources
+                    .attach(core_request_id(request_id), max_input_tokens)
+                    .map_err(cache_pool_error)
+            })
+            .transpose()?;
 
         if !state_handles.is_empty() {
             let Some(state_pool) = &self.state_pool else {
-                if let Some(pending) = pending_pages.take() {
-                    self.cache_pool
+                if let Some(pages) = pages.take() {
+                    self.kv_resources
                         .as_mut()
-                        .expect("pending cache pages keep their pool")
-                        .abort_request(pending);
+                        .expect("attached KV pages keep their resources")
+                        .retire(pages)
+                        .expect("unleased newly attached KV pages retire");
                 }
                 return Err(PyValueError::new_err(
                     "state_handles require an Engine state_pool",
@@ -1242,39 +1230,37 @@ impl Engine {
                 .borrow_mut()
                 .retain_handles(&state_handles)
             {
-                if let Some(pending) = pending_pages.take() {
-                    self.cache_pool
+                if let Some(pages) = pages.take() {
+                    self.kv_resources
                         .as_mut()
-                        .expect("pending cache pages keep their pool")
-                        .abort_request(pending);
+                        .expect("attached KV pages keep their resources")
+                        .retire(pages)
+                        .expect("unleased newly attached KV pages retire");
                 }
                 return Err(error);
             }
         }
-
-        // Every fallible admission step is complete. Promotion is an
-        // allocation-free publication of all declared History groups.
-        let pages = pending_pages.map(|pending| {
-            self.cache_pool
-                .as_mut()
-                .expect("pending cache pages keep their pool")
-                .promote_request(pending)
-        });
         self.next_request_id = next_request_id;
         self.scheduler.enqueue(Request {
-            id: request_id,
-            lease: lease_state,
-            priority,
-            batch_key,
-            turn_ordinal: 0,
-            prompt: token_ids,
-            prefill_cursor: 0,
-            generated: Vec::new(),
-            max_new_tokens,
-            state_handles,
-            state_access_modes,
-            pages,
-            cancel_pending: false,
+            inner: RequestData {
+                id: request_id,
+                lease: lease_state,
+                priority,
+                batch_key,
+                turn_ordinal: 0,
+                prompt: token_ids,
+                prefill_cursor: 0,
+                generated: Vec::new(),
+                max_new_tokens,
+                cancel_pending: false,
+            },
+            resources: ResourceSet {
+                attention: pages,
+                recurrent: RecurrentRequestState {
+                    handles: state_handles,
+                    access_modes: state_access_modes,
+                },
+            },
         });
         Ok(lease)
     }
@@ -1322,16 +1308,51 @@ impl Engine {
             .ok_or_else(|| PyRuntimeError::new_err("batch id space is exhausted"))?;
         let scheduled = self.scheduler.take_selected(selection);
 
+        let mut acquired_kv = match self.kv_resources.as_mut() {
+            Some(resources) => {
+                let requests = scheduled
+                    .iter()
+                    .map(|request| RequestResourceRef {
+                        request_id: core_request_id(request.id),
+                        state: request
+                            .resources
+                            .attention
+                            .as_ref()
+                            .expect("managed requests keep their KV resource state"),
+                    })
+                    .collect::<Vec<_>>();
+                match resources.acquire(&requests, &scheduled_rows) {
+                    Ok(acquired) => Some(acquired),
+                    Err(error) => {
+                        self.scheduler.restore_rejected(scheduled);
+                        return Err(paged_kv_error(error));
+                    }
+                }
+            }
+            None => {
+                if scheduled
+                    .iter()
+                    .any(|request| request.resources.attention.is_some())
+                {
+                    self.scheduler.restore_rejected(scheduled);
+                    return Err(PyRuntimeError::new_err(
+                        "unmanaged Engine request unexpectedly owns KV resource state",
+                    ));
+                }
+                None
+            }
+        };
+
         let plan = match build_plan_for_engine(
             batch_id,
             Some(self.engine_id),
             &scheduled,
             &scheduled_rows,
-            self.cache_layout.as_ref(),
-            self.cache_pool.as_ref(),
+            acquired_kv.as_ref().map(|acquired| &acquired.view),
         ) {
             Ok(plan) => plan,
             Err(error) => {
+                self.release_kv_access(acquired_kv.take().map(|access| access.lease));
                 self.scheduler.restore_rejected(scheduled);
                 return Err(error);
             }
@@ -1339,78 +1360,22 @@ impl Engine {
         let plan = match Py::new(py, plan) {
             Ok(plan) => plan,
             Err(error) => {
+                self.release_kv_access(acquired_kv.take().map(|access| access.lease));
                 self.scheduler.restore_rejected(scheduled);
                 return Err(error);
             }
         };
-        let scheduled_state = scheduled
-            .iter()
-            .flat_map(|request| request.state_handles.iter().cloned())
-            .collect::<Vec<_>>();
-        let prepared_state_access = match self.prepare_state_access(py, &scheduled) {
-            Ok(prepared) => prepared,
+        let recurrent = match self.acquire_recurrent_resources(py, &scheduled) {
+            Ok(resources) => resources,
             Err(error) => {
+                self.release_kv_access(acquired_kv.take().map(|access| access.lease));
                 self.scheduler.restore_rejected(scheduled);
                 return Err(error);
             }
         };
-        let writer_claims = match scheduled_writer_access_claims(
-            &scheduled,
-            &scheduled_rows,
-            self.cache_layout.as_ref(),
-            self.cache_pool.as_ref(),
-        ) {
-            Ok(claims) => claims,
-            Err(error) => {
-                self.scheduler.restore_rejected(scheduled);
-                return Err(error);
-            }
-        };
-        let prepared_writer_access = match (self.cache_pool.as_ref(), writer_claims.is_empty()) {
-            (Some(pool), _) => match pool.prepare_writer_access(writer_claims) {
-                Ok(prepared) => Some(prepared),
-                Err(error) => {
-                    self.scheduler.restore_rejected(scheduled);
-                    return Err(cache_pool_error(error));
-                }
-            },
-            (None, true) => None,
-            (None, false) => {
-                self.scheduler.restore_rejected(scheduled);
-                return Err(PyRuntimeError::new_err(
-                    "cache writer claims exist without a cache pool",
-                ));
-            }
-        };
-
-        if let Err(error) = self.pin_state(py, &scheduled_state) {
-            self.scheduler.restore_rejected(scheduled);
-            return Err(error);
-        }
-        let state_access = match self.acquire_state_access(py, prepared_state_access) {
-            Ok(access) => access,
-            Err(error) => {
-                self.unpin_after_error(py, &scheduled_state);
-                self.scheduler.restore_rejected(scheduled);
-                return Err(error);
-            }
-        };
-        let writer_access = match prepared_writer_access {
-            Some(prepared) => match self
-                .cache_pool
-                .as_mut()
-                .expect("prepared cache access keeps its pool")
-                .acquire_writer_access(prepared)
-            {
-                Ok(access) => Some(access),
-                Err(error) => {
-                    self.release_state_access(py, state_access);
-                    self.unpin_after_error(py, &scheduled_state);
-                    self.scheduler.restore_rejected(scheduled);
-                    return Err(cache_pool_error(error));
-                }
-            },
-            None => None,
+        let mut batch_resources = ResourceSet {
+            attention: acquired_kv.map(|access| access.lease),
+            recurrent,
         };
 
         // The lease spans runner acceptance and every pending poll. A
@@ -1464,44 +1429,37 @@ impl Engine {
             RunnerCallOutcome::Accepted(execution) => execution,
             RunnerCallOutcome::FailedAfterAcceptance { stage, error } => {
                 let batch = InFlightBatch {
-                    batch_id,
-                    rows: scheduled
-                        .into_iter()
-                        .zip(scheduled_rows)
-                        .map(|(request, scheduled)| InFlightRow { request, scheduled })
-                        .collect(),
-                    scheduled_state,
-                    state_access,
-                    writer_access,
-                    execution: InFlightExecution::FailedAfterAcceptance,
+                    inner: InFlightData {
+                        batch_id,
+                        rows: scheduled
+                            .into_iter()
+                            .zip(scheduled_rows)
+                            .map(|(request, scheduled)| InFlightRow { request, scheduled })
+                            .collect(),
+                        execution: InFlightExecution::FailedAfterAcceptance,
+                    },
+                    resources: batch_resources,
                 };
                 return self.quarantine(batch, stage, error);
             }
             RunnerCallOutcome::Rejected(error) => {
-                if let Some(access) = writer_access {
-                    self.cache_pool
-                        .as_mut()
-                        .expect("writer access keeps its cache pool")
-                        .release_writer_access(access);
-                }
-                self.release_state_access(py, state_access);
-                self.unpin_after_error(py, &scheduled_state);
+                self.rollback_batch_resources(py, &mut batch_resources);
                 self.scheduler.restore_rejected(scheduled);
                 return Err(error);
             }
         };
 
         self.in_flight = Some(InFlightBatch {
-            batch_id,
-            rows: scheduled
-                .into_iter()
-                .zip(scheduled_rows)
-                .map(|(request, scheduled)| InFlightRow { request, scheduled })
-                .collect(),
-            scheduled_state,
-            state_access,
-            writer_access,
-            execution,
+            inner: InFlightData {
+                batch_id,
+                rows: scheduled
+                    .into_iter()
+                    .zip(scheduled_rows)
+                    .map(|(request, scheduled)| InFlightRow { request, scheduled })
+                    .collect(),
+                execution,
+            },
+            resources: batch_resources,
         });
         Ok(Some(batch_id))
     }
@@ -1610,15 +1568,18 @@ impl Engine {
             .iter()
             .zip(&retired)
             .filter(|(_, retire)| **retire)
-            .flat_map(|(row, _)| row.request.state_handles.iter().cloned())
+            .flat_map(|(row, _)| row.request.resources.recurrent.handles.iter().cloned())
             .collect::<Vec<_>>();
         for (row, retire) in batch.rows.iter().zip(&retired) {
             if !*retire {
                 continue;
             }
-            match (self.cache_pool.as_ref(), row.request.pages.as_ref()) {
-                (Some(pool), Some(pages)) => {
-                    if let Err(error) = pool.validate_request(pages) {
+            match (
+                self.kv_resources.as_ref(),
+                row.request.resources.attention.as_ref(),
+            ) {
+                (Some(resources), Some(pages)) => {
+                    if let Err(error) = resources.pool().validate_request(pages) {
                         return self.quarantine(
                             batch,
                             "native cache retirement failed",
@@ -1650,38 +1611,33 @@ impl Engine {
         {
             return self.quarantine(batch, "runner release failed", error);
         }
-        if let Err(error) = self.unpin_state(py, &batch.scheduled_state) {
+        if let Err(error) = self.unpin_state(py, &batch.resources.recurrent.handles) {
             return self.quarantine(batch, "native completion unpin failed", error);
         }
 
         // Runner cleanup and generic-state unpinning prove physical execution
         // is terminal. Only now may the single cache writer lease return.
-        if let Some(access) = batch.writer_access.take() {
-            self.cache_pool
-                .as_mut()
-                .expect("writer access keeps its cache pool")
-                .release_writer_access(access);
-        }
+        self.release_kv_access(batch.resources.attention.take());
 
         if let Err(error) = self.release_state(py, &finished_state) {
             return self.quarantine(batch, "native state retirement failed", error);
         }
-        let state_access = batch.state_access.take();
+        let state_access = batch.resources.recurrent.access.take();
         self.release_state_access(py, state_access);
 
         for (row_index, retire) in retired.iter().copied().enumerate() {
             if !retire {
                 continue;
             }
-            let Some(pages) = batch.rows[row_index].request.pages.take() else {
+            let Some(pages) = batch.rows[row_index].request.resources.attention.take() else {
                 continue;
             };
-            let pool = self
-                .cache_pool
+            let resources = self
+                .kv_resources
                 .as_mut()
-                .expect("request cache pages keep their pool");
-            if let Err(failure) = pool.retire_request(pages) {
-                batch.rows[row_index].request.pages = Some(failure.request);
+                .expect("request KV pages keep their resources");
+            if let Err(failure) = resources.retire(pages) {
+                batch.rows[row_index].request.resources.attention = Some(failure.request);
                 return self.quarantine(
                     batch,
                     "native cache retirement failed after preflight",
@@ -1696,7 +1652,13 @@ impl Engine {
         for (row, retire) in batch.rows.drain(..).zip(retired) {
             let request = row.request;
             if retire {
-                complete_request_lease(&request.lease, request.generated, request.cancel_pending);
+                let RequestData {
+                    lease,
+                    generated,
+                    cancel_pending,
+                    ..
+                } = request.inner;
+                complete_request_lease(&lease, generated, cancel_pending);
             } else {
                 survivors.push(request);
             }
@@ -1721,9 +1683,12 @@ impl Engine {
         let request_id = request.request_id;
         if let Some(index) = self.scheduler.position(|request| request.id == request_id) {
             let mut request = self.scheduler.remove(index);
-            match (self.cache_pool.as_ref(), request.pages.as_ref()) {
-                (Some(pool), Some(pages)) => {
-                    if let Err(error) = pool.validate_request(pages) {
+            match (
+                self.kv_resources.as_ref(),
+                request.resources.attention.as_ref(),
+            ) {
+                (Some(resources), Some(pages)) => {
+                    if let Err(error) = resources.pool().validate_request(pages) {
                         self.scheduler.restore(index, request);
                         let error = cache_pool_error(error);
                         self.poison("native cache cancellation retirement failed", &error);
@@ -1747,19 +1712,19 @@ impl Engine {
                 self.poison("runner release failed during ready cancellation", &error);
                 return Err(error);
             }
-            if let Err(error) = self.release_state(py, &request.state_handles) {
+            if let Err(error) = self.release_state(py, &request.resources.recurrent.handles) {
                 self.scheduler.restore(index, request);
                 self.poison("native state cancellation retirement failed", &error);
                 return Err(error);
             }
-            if let Some(pages) = request.pages.take()
+            if let Some(pages) = request.resources.attention.take()
                 && let Err(failure) = self
-                    .cache_pool
+                    .kv_resources
                     .as_mut()
-                    .expect("request cache pages keep their pool")
-                    .retire_request(pages)
+                    .expect("request KV pages keep their resources")
+                    .retire(pages)
             {
-                request.pages = Some(failure.request);
+                request.resources.attention = Some(failure.request);
                 self.scheduler.restore(index, request);
                 let error = cache_pool_error(failure.error);
                 self.poison(
@@ -1768,7 +1733,8 @@ impl Engine {
                 );
                 return Err(error);
             }
-            complete_request_lease(&request.lease, request.generated, true);
+            let generated = std::mem::take(&mut request.inner.generated);
+            complete_request_lease(&request.lease, generated, true);
             return Ok(true);
         }
 
@@ -1884,26 +1850,30 @@ impl Engine {
 
     #[getter]
     fn cache_pool_id(&self) -> Option<u64> {
-        self.cache_pool.as_ref().map(CachePool::id)
+        self.kv_resources
+            .as_ref()
+            .map(|resources| resources.pool().id())
     }
 
     #[getter]
     fn cache_parent_capacity(&self) -> Option<u32> {
         self.cache_layout
             .as_ref()
-            .map(|layout| layout.parent_capacity_native().get())
+            .map(|layout| layout.inner_native().parent_capacity().get())
     }
 
     #[getter]
     fn cache_free_parent_count(&self) -> Option<usize> {
-        self.cache_pool.as_ref().map(CachePool::free_parent_count)
+        self.kv_resources
+            .as_ref()
+            .map(|resources| resources.pool().free_parent_count())
     }
 
     #[getter]
     fn cache_occupied_block_count(&self) -> Option<usize> {
-        self.cache_pool
+        self.kv_resources
             .as_ref()
-            .map(CachePool::occupied_block_count)
+            .map(|resources| resources.pool().occupied_block_count())
     }
 
     fn __repr__(&self) -> String {
@@ -1915,9 +1885,9 @@ impl Engine {
             self.context_length(),
             self.closed,
             self.poisoned(),
-            self.cache_pool
+            self.kv_resources
                 .as_ref()
-                .map_or(0, CachePool::occupied_block_count)
+                .map_or(0, |resources| resources.pool().occupied_block_count())
         )
     }
 }
@@ -1998,8 +1968,14 @@ impl Engine {
             .map(|request| request.id)
             .collect::<Vec<_>>();
         let retirement_validation = self.scheduler.iter().try_for_each(|request| {
-            match (self.cache_pool.as_ref(), request.pages.as_ref()) {
-                (Some(pool), Some(pages)) => pool.validate_request(pages).map_err(cache_pool_error),
+            match (
+                self.kv_resources.as_ref(),
+                request.resources.attention.as_ref(),
+            ) {
+                (Some(resources), Some(pages)) => resources
+                    .pool()
+                    .validate_request(pages)
+                    .map_err(cache_pool_error),
                 (None, None) => Ok(()),
                 _ => Err(PyRuntimeError::new_err(
                     "ready request and Engine cache ownership disagree",
@@ -2013,7 +1989,7 @@ impl Engine {
         let state = self
             .scheduler
             .iter()
-            .flat_map(|request| request.state_handles.iter().cloned())
+            .flat_map(|request| request.resources.recurrent.handles.iter().cloned())
             .collect::<Vec<_>>();
         let mut retired = Vec::new();
         retired
@@ -2033,12 +2009,12 @@ impl Engine {
 
         retired.extend(self.scheduler.drain());
         for mut request in retired {
-            if let Some(pages) = request.pages.take()
+            if let Some(pages) = request.resources.attention.take()
                 && let Err(failure) = self
-                    .cache_pool
+                    .kv_resources
                     .as_mut()
-                    .expect("request cache pages keep their pool")
-                    .retire_request(pages)
+                    .expect("request KV pages keep their resources")
+                    .retire(pages)
             {
                 let error = cache_pool_error(failure.error);
                 self.poison(
@@ -2047,7 +2023,8 @@ impl Engine {
                 );
                 return Err(error);
             }
-            complete_request_lease(&request.lease, request.generated, true);
+            let generated = std::mem::take(&mut request.inner.generated);
+            complete_request_lease(&request.lease, generated, true);
         }
         Ok(())
     }
@@ -2067,17 +2044,19 @@ impl Engine {
             let request = &mut row.request;
             let scheduled = row.scheduled;
             let context = request.logical_context()?;
-            if scheduled.phase != request.phase() || scheduled.token_start != context {
+            if scheduled.phase != request.phase() || scheduled.token_start() != context {
                 return Err(PyRuntimeError::new_err(format!(
                     "request {} progress changed while its batch was in flight",
                     request.id
                 )));
             }
-            let token_end = scheduled.token_end()?;
+            let token_end = scheduled
+                .token_end()
+                .ok_or_else(|| PyValueError::new_err("scheduled token range overflows u32"))?;
             let expected_sample = match scheduled.phase {
                 Phase::Prefill => token_end == request.prompt_length(),
                 Phase::Decode => {
-                    if scheduled.token_count.get() != 1 {
+                    if scheduled.token_count().get() != 1 {
                         return Err(PyRuntimeError::new_err(
                             "scheduled decode rows must contain exactly one token",
                         ));
@@ -2133,6 +2112,51 @@ impl Engine {
         }
     }
 
+    fn acquire_recurrent_resources(
+        &self,
+        py: Python<'_>,
+        requests: &[Request],
+    ) -> PyResult<RecurrentBatchState> {
+        let handles = requests
+            .iter()
+            .flat_map(|request| request.resources.recurrent.handles.iter().cloned())
+            .collect::<Vec<_>>();
+        let prepared = self.prepare_state_access(py, requests)?;
+        self.pin_state(py, &handles)?;
+        let access = prepared
+            .map(|prepared| {
+                self.state_pool
+                    .as_ref()
+                    .expect("prepared state access keeps its pool")
+                    .bind(py)
+                    .borrow_mut()
+                    .acquire_engine_access(prepared)
+            })
+            .transpose();
+        match access {
+            Ok(access) => Ok(RecurrentBatchState { handles, access }),
+            Err(error) => {
+                self.unpin_after_error(py, &handles);
+                Err(error)
+            }
+        }
+    }
+
+    fn release_kv_access(&mut self, access: Option<WriterAccessLease>) {
+        if let Some(access) = access {
+            self.kv_resources
+                .as_mut()
+                .expect("writer access keeps its KV resources")
+                .release(access);
+        }
+    }
+
+    fn rollback_batch_resources(&mut self, py: Python<'_>, resources: &mut BatchResources) {
+        self.release_kv_access(resources.attention.take());
+        self.release_state_access(py, resources.recurrent.access.take());
+        self.unpin_after_error(py, &resources.recurrent.handles);
+    }
+
     fn prepare_state_access(
         &self,
         py: Python<'_>,
@@ -2141,7 +2165,7 @@ impl Engine {
         let claim_count = requests
             .iter()
             .try_fold(0usize, |count, request| {
-                count.checked_add(request.state_handles.len())
+                count.checked_add(request.resources.recurrent.handles.len())
             })
             .ok_or_else(|| PyRuntimeError::new_err("state access claim count overflow"))?;
         if claim_count == 0 {
@@ -2153,15 +2177,17 @@ impl Engine {
             .map_err(|_| PyMemoryError::new_err("could not prepare state access metadata"))?;
         for (row_index, request) in requests.iter().enumerate() {
             debug_assert_eq!(
-                request.state_handles.len(),
-                request.state_access_modes.len()
+                request.resources.recurrent.handles.len(),
+                request.resources.recurrent.access_modes.len()
             );
             claims.extend(
                 request
-                    .state_handles
+                    .resources
+                    .recurrent
+                    .handles
                     .iter()
                     .cloned()
-                    .zip(request.state_access_modes.iter().copied())
+                    .zip(request.resources.recurrent.access_modes.iter().copied())
                     .map(|(handle, mode)| StateAccessClaim::new(row_index, handle, mode)),
             );
         }
@@ -2171,23 +2197,6 @@ impl Engine {
             .bind(py)
             .borrow()
             .prepare_engine_access(&claims)
-            .map(Some)
-    }
-
-    fn acquire_state_access(
-        &self,
-        py: Python<'_>,
-        prepared: Option<PreparedStateAccessLease>,
-    ) -> PyResult<Option<StateAccessLease>> {
-        let Some(prepared) = prepared else {
-            return Ok(None);
-        };
-        self.state_pool
-            .as_ref()
-            .expect("prepared state access keeps its pool")
-            .bind(py)
-            .borrow_mut()
-            .acquire_engine_access(prepared)
             .map(Some)
     }
 
@@ -2203,7 +2212,7 @@ impl Engine {
             .release_engine_access(access);
     }
 
-    fn pin_state(&self, py: Python<'_>, handles: &[StateHandle]) -> PyResult<()> {
+    fn pin_state(&self, py: Python<'_>, handles: &[CoreStateHandle]) -> PyResult<()> {
         if handles.is_empty() {
             return Ok(());
         }
@@ -2215,7 +2224,7 @@ impl Engine {
             .pin_handles(handles)
     }
 
-    fn unpin_state(&self, py: Python<'_>, handles: &[StateHandle]) -> PyResult<()> {
+    fn unpin_state(&self, py: Python<'_>, handles: &[CoreStateHandle]) -> PyResult<()> {
         if handles.is_empty() {
             return Ok(());
         }
@@ -2227,7 +2236,7 @@ impl Engine {
             .unpin_handles(handles)
     }
 
-    fn release_state(&self, py: Python<'_>, handles: &[StateHandle]) -> PyResult<()> {
+    fn release_state(&self, py: Python<'_>, handles: &[CoreStateHandle]) -> PyResult<()> {
         if handles.is_empty() {
             return Ok(());
         }
@@ -2239,7 +2248,7 @@ impl Engine {
             .release_handles(handles)
     }
 
-    fn unpin_after_error(&self, py: Python<'_>, handles: &[StateHandle]) {
+    fn unpin_after_error(&self, py: Python<'_>, handles: &[CoreStateHandle]) {
         // The original runner error is more actionable. A failure here would
         // indicate a native ownership invariant bug and is covered by tests.
         let _ = self.unpin_state(py, handles);
@@ -2291,23 +2300,29 @@ mod tests {
 
     fn request(id: u64, prompt: &[u32], generated: &[u32], pages: Option<RequestPages>) -> Request {
         Request {
-            id,
-            lease: Arc::new(Mutex::new(RequestLeaseState::default())),
-            priority: 0,
-            batch_key: None,
-            turn_ordinal: 0,
-            prompt: prompt.to_vec(),
-            prefill_cursor: if generated.is_empty() {
-                0
-            } else {
-                prompt.len() as u32
+            inner: RequestData {
+                id,
+                lease: Arc::new(Mutex::new(RequestLeaseState::default())),
+                priority: 0,
+                batch_key: None,
+                turn_ordinal: 0,
+                prompt: prompt.to_vec(),
+                prefill_cursor: if generated.is_empty() {
+                    0
+                } else {
+                    prompt.len() as u32
+                },
+                generated: generated.to_vec(),
+                max_new_tokens: 8,
+                cancel_pending: false,
             },
-            generated: generated.to_vec(),
-            max_new_tokens: 8,
-            state_handles: Vec::new(),
-            state_access_modes: Vec::new(),
-            pages,
-            cancel_pending: false,
+            resources: ResourceSet {
+                attention: pages,
+                recurrent: RecurrentRequestState {
+                    handles: Vec::new(),
+                    access_modes: Vec::new(),
+                },
+            },
         }
     }
 
@@ -2331,12 +2346,11 @@ mod tests {
     }
 
     #[test]
-    fn mixed_phase_plan_is_rejected() {
+    fn heterogeneous_phase_schedule_is_rejected() {
         let prefill = request(1, &[10, 11, 12], &[], None);
         let decode = request(2, &[20, 21], &[99], None);
         let scheduled = [&prefill, &decode];
-        let rows = schedule_ready_prefix(&scheduled, SchedulerConfig::default()).unwrap();
-        let error = build_plan(7, &scheduled, &rows, None, None).unwrap_err();
+        let error = schedule_ready_prefix(&scheduled, SchedulerConfig::default()).unwrap_err();
 
         assert!(
             error
@@ -2348,66 +2362,52 @@ mod tests {
     #[test]
     fn history_plan_is_sparse_and_writer_claims_match_active_pages() {
         let layout = history_layout();
-        let mut pool =
-            CachePool::new(layout.parent_capacity_native().get(), &layout.packings()).unwrap();
-        let pending = pool
-            .reserve_request(
-                SequenceId::new(41),
-                &[
-                    GroupDemand::new(GroupId::new(0), 3),
-                    GroupDemand::new(GroupId::new(1), 5),
-                ],
-            )
-            .unwrap();
-        let pages = pool.promote_request(pending);
+        let mut resources = PagedKvResources::new(layout.inner_native().clone()).unwrap();
+        let pages = resources.attach(core_request_id(41), 10).unwrap();
         let mut managed = request(41, &[1, 2, 3, 4, 5, 6], &[], Some(pages));
         managed.prefill_cursor = 4;
         let scheduled = [&managed];
         let rows = schedule_ready_prefix(&scheduled, SchedulerConfig::default()).unwrap();
-        let plan = build_plan(9, &scheduled, &rows, Some(&layout), Some(&pool)).unwrap();
+        let resource_refs = [RequestResourceRef {
+            request_id: core_request_id(41),
+            state: managed.resources.attention.as_ref().unwrap(),
+        }];
+        let acquired = resources.acquire(&resource_refs, &rows).unwrap();
+        let plan = build_plan(9, &scheduled, &rows, Some(&acquired.view)).unwrap();
 
-        assert_eq!(plan.cache_pool_id, Some(pool.id()));
+        assert_eq!(plan.cache_pool_id, Some(resources.pool().id()));
         assert_eq!(plan.token_ids, vec![5, 6]);
         assert_eq!(plan.positions, vec![4, 5]);
         assert_eq!(plan.cache_groups.len(), 2);
         let full = &plan.cache_groups[0];
-        assert_eq!(full.block_indptr_native(), &[0, 2]);
-        assert_eq!(full.block_ids_native().len(), 2);
-        assert_eq!(full.first_logical_blocks_native(), &[0]);
-        assert_eq!(full.append_block_offsets_native(), &[0, 1]);
+        assert_eq!(full.inner_native().block_indptr, [0, 2]);
+        assert_eq!(full.inner_native().block_ids.len(), 2);
+        assert_eq!(full.inner_native().first_logical_blocks, [0]);
+        assert_eq!(full.inner_native().append_block_offsets, [0, 1]);
         let fine = &plan.cache_groups[1];
-        assert_eq!(fine.block_indptr_native(), &[0, 3]);
-        assert_eq!(fine.block_ids_native().len(), 3);
-        assert_eq!(fine.append_block_offsets_native(), &[0, 1]);
+        assert_eq!(fine.inner_native().block_indptr, [0, 3]);
+        assert_eq!(fine.inner_native().block_ids.len(), 3);
+        assert_eq!(fine.inner_native().append_block_offsets, [0, 1]);
 
-        let claims =
-            scheduled_writer_access_claims(&scheduled, &rows, Some(&layout), Some(&pool)).unwrap();
-        assert_eq!(claims.len(), 5);
-        let prepared = pool.prepare_writer_access(claims).unwrap();
-        let lease = pool.acquire_writer_access(prepared).unwrap();
-        assert_eq!(lease.len(), 5);
-        pool.release_writer_access(lease);
+        assert_eq!(acquired.lease.len(), 5);
+        resources.release(acquired.lease);
 
-        let pages = managed.pages.take().unwrap();
-        pool.validate_request(&pages).unwrap();
-        pool.retire_request(pages).unwrap();
-        assert_eq!(pool.occupied_block_count(), 0);
-        assert_eq!(pool.free_parent_count(), 8);
+        let pages = managed.resources.attention.take().unwrap();
+        resources.pool().validate_request(&pages).unwrap();
+        resources.retire(pages).unwrap();
+        assert_eq!(resources.pool().occupied_block_count(), 0);
+        assert_eq!(resources.pool().free_parent_count(), 8);
     }
 
     #[test]
     fn window_plan_is_chronological_and_reuses_only_an_evicted_block() {
         let layout = window_layout();
-        let mut pool =
-            CachePool::new(layout.parent_capacity_native().get(), &layout.packings()).unwrap();
-        let pending = pool
-            .reserve_request(SequenceId::new(51), &[GroupDemand::new(GroupId::new(0), 2)])
-            .unwrap();
-        let pages = pool.promote_request(pending);
+        let mut resources = PagedKvResources::new(layout.inner_native().clone()).unwrap();
+        let pages = resources.attach(core_request_id(51), 12).unwrap();
         let physical = pages.groups()[0]
             .pages()
             .iter()
-            .map(|page| pool.kernel_page_id(page.handle()).unwrap())
+            .map(|page| resources.pool().kernel_page_id(page.handle()).unwrap())
             .collect::<Vec<_>>();
         let mut managed = request(
             51,
@@ -2420,29 +2420,32 @@ mod tests {
         let rows =
             schedule_ready_prefix_for_layout(&scheduled, SchedulerConfig::default(), Some(&layout))
                 .unwrap();
-        assert_eq!(rows[0].token_start, 8);
-        assert_eq!(rows[0].token_count.get(), 4);
+        assert_eq!(rows[0].token_start(), 8);
+        assert_eq!(rows[0].token_count().get(), 4);
 
-        let plan = build_plan(10, &scheduled, &rows, Some(&layout), Some(&pool)).unwrap();
+        let resource_refs = [RequestResourceRef {
+            request_id: core_request_id(51),
+            state: managed.resources.attention.as_ref().unwrap(),
+        }];
+        let acquired = resources.acquire(&resource_refs, &rows).unwrap();
+        let plan = build_plan(10, &scheduled, &rows, Some(&acquired.view)).unwrap();
         let window = &plan.cache_groups[0];
-        assert_eq!(window.first_logical_blocks_native(), &[1]);
-        assert_eq!(window.block_indptr_native(), &[0, 2]);
-        assert_eq!(window.block_ids_native(), &[physical[1], physical[0]]);
+        assert_eq!(window.inner_native().first_logical_blocks, [1]);
+        assert_eq!(window.inner_native().block_indptr, [0, 2]);
+        assert_eq!(window.inner_native().block_ids, [physical[1], physical[0]]);
         assert_eq!(
-            window.append_block_ids_native(),
-            &[physical[0], physical[0], physical[0], physical[0]]
+            window.inner_native().append_block_ids,
+            [physical[0], physical[0], physical[0], physical[0]]
         );
-        assert_eq!(window.append_block_offsets_native(), &[0, 1, 2, 3]);
+        assert_eq!(window.inner_native().append_block_offsets, [0, 1, 2, 3]);
 
-        let claims =
-            scheduled_writer_access_claims(&scheduled, &rows, Some(&layout), Some(&pool)).unwrap();
-        assert_eq!(claims.len(), 2);
-        let prepared = pool.prepare_writer_access(claims).unwrap();
-        let lease = pool.acquire_writer_access(prepared).unwrap();
-        pool.release_writer_access(lease);
+        assert_eq!(acquired.lease.len(), 2);
+        resources.release(acquired.lease);
 
-        pool.retire_request(managed.pages.take().unwrap()).unwrap();
-        assert_eq!(pool.occupied_block_count(), 0);
+        resources
+            .retire(managed.resources.attention.take().unwrap())
+            .unwrap();
+        assert_eq!(resources.pool().occupied_block_count(), 0);
     }
 
     #[test]
@@ -2455,8 +2458,8 @@ mod tests {
         let rows =
             schedule_ready_prefix_for_layout(&scheduled, SchedulerConfig::default(), Some(&layout))
                 .unwrap();
-        assert_eq!(rows[0].token_count.get(), 1);
-        assert_eq!(rows[1].token_count.get(), 4);
+        assert_eq!(rows[0].token_count().get(), 1);
+        assert_eq!(rows[1].token_count().get(), 4);
     }
 
     #[test]
@@ -2464,7 +2467,7 @@ mod tests {
         let unmanaged = request(1, &[1, 2], &[], None);
         let scheduled = [&unmanaged];
         let rows = schedule_ready_prefix(&scheduled, SchedulerConfig::default()).unwrap();
-        let mut plan = build_plan(1, &scheduled, &rows, None, None).unwrap();
+        let mut plan = build_plan(1, &scheduled, &rows, None).unwrap();
         plan.cache_pool_id = Some(3);
         plan.cache_groups = vec![
             CacheGroupPlan::from_parts(1, vec![0, 1], vec![7], vec![0], vec![7, 7], vec![0, 1])
@@ -2485,8 +2488,8 @@ mod tests {
         };
         let rows = schedule_ready_prefix(&scheduled, config).unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].token_count.get(), 2);
-        assert_eq!(rows[1].token_count.get(), 1);
+        assert_eq!(rows[0].token_count().get(), 2);
+        assert_eq!(rows[1].token_count().get(), 1);
         assert!(!rows[0].sample);
         assert!(!rows[1].sample);
     }

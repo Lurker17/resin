@@ -106,7 +106,12 @@ name = "resin"
 version = "0.1.0"
 dependencies = [
  "pyo3",
+ "resin-core",
 ]
+
+[[package]]
+name = "resin-core"
+version = "0.1.0"
 
 [[package]]
 name = "syn"

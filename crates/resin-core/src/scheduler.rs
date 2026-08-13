@@ -1,14 +1,14 @@
 use std::num::NonZeroUsize;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum QueueMode {
+pub enum QueueMode {
     #[default]
     RoundRobin,
     Fifo,
 }
 
 impl QueueMode {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::RoundRobin => "round_robin",
             Self::Fifo => "fifo",
@@ -17,8 +17,8 @@ impl QueueMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SchedulerPolicy {
-    pub(crate) queue_mode: QueueMode,
+pub struct SchedulerPolicy {
+    pub queue_mode: QueueMode,
 }
 
 impl Default for SchedulerPolicy {
@@ -30,7 +30,7 @@ impl Default for SchedulerPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Phase {
+pub enum Phase {
     Prefill,
     Decode,
 }
@@ -41,7 +41,7 @@ pub(crate) enum Phase {
 /// a practically inexhaustible monotonically increasing age domain: even one
 /// billion new turns per second would take vastly longer than the lifetime of
 /// any process to exhaust it.
-pub(crate) trait Schedulable {
+pub trait Schedulable {
     fn priority(&self) -> i32;
     fn batch_key(&self) -> Option<u64>;
     fn phase(&self) -> Phase;
@@ -61,7 +61,7 @@ struct SelectedIdentity {
 /// them. The epoch and identities make the later removal fail loudly if an
 /// accidental queue mutation or reordering is inserted between those steps.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Selection {
+pub struct Selection {
     epoch: u64,
     selected: Vec<SelectedIdentity>,
 }
@@ -72,7 +72,7 @@ impl Selection {
     /// Token-budget planning happens after the engine has inspected the ready
     /// requests. It may admit fewer rows than the sequence limit, but it must
     /// never skip an older matching row to backfill a later one.
-    pub(crate) fn truncate(&mut self, len: usize) {
+    pub fn truncate(&mut self, len: usize) {
         self.selected.truncate(len);
     }
 }
@@ -84,7 +84,7 @@ impl Selection {
 /// their original age; round-robin survivors receive fresh turns after every
 /// request already waiting.
 #[derive(Debug)]
-pub(crate) struct Scheduler<T> {
+pub struct Scheduler<T> {
     ready: Vec<T>,
     max_running_requests: NonZeroUsize,
     policy: SchedulerPolicy,
@@ -93,7 +93,7 @@ pub(crate) struct Scheduler<T> {
 }
 
 impl<T: Schedulable> Scheduler<T> {
-    pub(crate) fn new(max_running_requests: NonZeroUsize, policy: SchedulerPolicy) -> Self {
+    pub fn new(max_running_requests: NonZeroUsize, policy: SchedulerPolicy) -> Self {
         Self {
             ready: Vec::new(),
             max_running_requests,
@@ -103,30 +103,30 @@ impl<T: Schedulable> Scheduler<T> {
         }
     }
 
-    pub(crate) fn max_running_requests(&self) -> usize {
+    pub fn max_running_requests(&self) -> usize {
         self.max_running_requests.get()
     }
 
-    pub(crate) fn policy(&self) -> SchedulerPolicy {
+    pub fn policy(&self) -> SchedulerPolicy {
         self.policy
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.ready.len()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.ready.is_empty()
     }
 
-    pub(crate) fn enqueue(&mut self, mut item: T) {
+    pub fn enqueue(&mut self, mut item: T) {
         let turn = self.take_fresh_turn();
         item.set_turn_ordinal(turn);
         self.ready.push(item);
         self.bump_epoch();
     }
 
-    pub(crate) fn selected(&self) -> (Vec<&T>, Selection) {
+    pub fn selected(&self) -> (Vec<&T>, Selection) {
         let selected = self.selected_identities();
         let items = selected
             .iter()
@@ -141,7 +141,7 @@ impl<T: Schedulable> Scheduler<T> {
         )
     }
 
-    pub(crate) fn take_selected(&mut self, selection: Selection) -> Vec<T> {
+    pub fn take_selected(&mut self, selection: Selection) -> Vec<T> {
         assert_eq!(
             selection.epoch, self.epoch,
             "ready queue changed after its dispatch cohort was selected"
@@ -177,7 +177,7 @@ impl<T: Schedulable> Scheduler<T> {
         selected
     }
 
-    pub(crate) fn restore_rejected(&mut self, selected: Vec<T>) {
+    pub fn restore_rejected(&mut self, selected: Vec<T>) {
         if selected.is_empty() {
             return;
         }
@@ -186,7 +186,7 @@ impl<T: Schedulable> Scheduler<T> {
         self.bump_epoch();
     }
 
-    pub(crate) fn requeue_survivors(&mut self, mut survivors: Vec<T>) {
+    pub fn requeue_survivors(&mut self, mut survivors: Vec<T>) {
         if survivors.is_empty() {
             return;
         }
@@ -201,26 +201,26 @@ impl<T: Schedulable> Scheduler<T> {
         self.bump_epoch();
     }
 
-    pub(crate) fn position(&self, mut predicate: impl FnMut(&T) -> bool) -> Option<usize> {
+    pub fn position(&self, mut predicate: impl FnMut(&T) -> bool) -> Option<usize> {
         self.ready.iter().position(&mut predicate)
     }
 
-    pub(crate) fn remove(&mut self, index: usize) -> T {
+    pub fn remove(&mut self, index: usize) -> T {
         let item = self.ready.remove(index);
         self.bump_epoch();
         item
     }
 
-    pub(crate) fn restore(&mut self, index: usize, item: T) {
+    pub fn restore(&mut self, index: usize, item: T) {
         self.ready.insert(index, item);
         self.bump_epoch();
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.ready.iter()
     }
 
-    pub(crate) fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
+    pub fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
         self.bump_epoch();
         self.ready.drain(..)
     }

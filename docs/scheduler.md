@@ -117,8 +117,8 @@ On successful completion Resin:
 
 1. validates exactly one output token ID per plan row;
 2. asks the runner to release terminal physical request state, if supported;
-3. commits prefill/decode progress;
-4. releases state and cache writer leases;
+3. releases state and cache writer leases;
+4. commits prefill/decode progress;
 5. retires completed or cancelled requests;
 6. requeues survivors according to queue mode;
 7. emits events for sampled rows.
@@ -142,5 +142,7 @@ allowed while Resin can prove that physical execution did not begin.
 
 Scheduling does not choose CUDA graph buckets, kernel shapes, cache admission,
 or sampling algorithms. Those remain runner concerns. The native scheduler is
-single-Engine and single-in-flight today; `StatePool` leases are the mechanism
-that coordinates state access across Engines.
+single-Engine and deliberately single-in-flight; `StatePool` leases are the
+mechanism that coordinates state access across Engines. Resin does not support
+overlap scheduling: it never plans the next batch ahead, takes future-batch
+locks, or duplicates recurrent-state residency to hide scheduler overhead.

@@ -1,4 +1,4 @@
-//! Fungible physical placement for heterogeneous paged-cache groups.
+//! Fungible physical placement for heterogeneous paged-token resources.
 //!
 //! The pool owns equal-sized physical parents.  An empty parent may serve any
 //! cache group; while occupied, it is bound to one group and subdivided into
@@ -16,14 +16,14 @@ static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 /// Ordered cache-group identity.  The runner declaration and native layout use
 /// the same index; there is no process-global group registry.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct GroupId(u32);
+pub struct GroupId(u32);
 
 impl GroupId {
-    pub(crate) const fn new(index: u32) -> Self {
+    pub const fn new(index: u32) -> Self {
         Self(index)
     }
 
-    pub(crate) const fn index(self) -> u32 {
+    pub const fn index(self) -> u32 {
         self.0
     }
 }
@@ -32,7 +32,7 @@ impl GroupId {
 /// ownership; request ownership stays in `PendingRequestPages`, `RequestPages`,
 /// or an active writer lease.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct PageHandle {
+pub struct PageHandle {
     pool_id: u64,
     group: GroupId,
     parent: u32,
@@ -45,14 +45,14 @@ pub(crate) struct PageHandle {
 /// The Engine may use its already-unique request id. Keeping the type distinct
 /// prevents a page handle or group index from being substituted accidentally.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct SequenceId(u64);
+pub struct SequenceId(u64);
 
 impl SequenceId {
-    pub(crate) const fn new(value: u64) -> Self {
+    pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn get(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 }
@@ -66,29 +66,29 @@ impl PageHandle {
     /// One-based physical parent id.  Parent zero is reserved for the device
     /// null page and is never allocated.
     #[cfg(test)]
-    pub(crate) const fn parent(self) -> u32 {
+    pub const fn parent(self) -> u32 {
         self.parent
     }
 
     #[cfg(test)]
-    pub(crate) const fn slot(self) -> u32 {
+    pub const fn slot(self) -> u32 {
         self.slot
     }
 
     #[cfg(test)]
-    pub(crate) const fn generation(self) -> u64 {
+    pub const fn generation(self) -> u64 {
         self.generation
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct GroupDemand {
+pub struct GroupDemand {
     group: GroupId,
     blocks: usize,
 }
 
 impl GroupDemand {
-    pub(crate) const fn new(group: GroupId, blocks: usize) -> Self {
+    pub const fn new(group: GroupId, blocks: usize) -> Self {
         Self { group, blocks }
     }
 }
@@ -97,17 +97,17 @@ impl GroupDemand {
 /// retain distinct tables even though placement shares partially filled
 /// parents.
 #[derive(Debug)]
-pub(crate) struct GroupTable<R> {
+pub struct GroupTable<R> {
     group: GroupId,
     pages: Vec<R>,
 }
 
 impl<R> GroupTable<R> {
-    pub(crate) const fn group(&self) -> GroupId {
+    pub const fn group(&self) -> GroupId {
         self.group
     }
 
-    pub(crate) fn pages(&self) -> &[R] {
+    pub fn pages(&self) -> &[R] {
         &self.pages
     }
 }
@@ -115,12 +115,12 @@ impl<R> GroupTable<R> {
 /// Move-only ownership of one request page. A raw handle may be copied for
 /// metadata, but only this token accounts for the request reference.
 #[derive(Debug)]
-pub(crate) struct PageRef {
+pub struct PageRef {
     handle: PageHandle,
 }
 
 impl PageRef {
-    pub(crate) const fn handle(&self) -> PageHandle {
+    pub const fn handle(&self) -> PageHandle {
         self.handle
     }
 }
@@ -128,7 +128,7 @@ impl PageRef {
 /// Provisional ownership returned by one all-or-nothing request reservation.
 #[derive(Debug)]
 #[must_use = "pending request pages must be promoted or aborted"]
-pub(crate) struct PendingRequestPages {
+pub struct PendingRequestPages {
     pool_id: u64,
     sequence: SequenceId,
     writer: WriterId,
@@ -137,22 +137,22 @@ pub(crate) struct PendingRequestPages {
 
 impl PendingRequestPages {
     #[cfg(test)]
-    pub(crate) const fn sequence(&self) -> SequenceId {
+    pub const fn sequence(&self) -> SequenceId {
         self.sequence
     }
 
     #[cfg(test)]
-    pub(crate) fn groups(&self) -> &[GroupTable<PageRef>] {
+    pub fn groups(&self) -> &[GroupTable<PageRef>] {
         &self.groups
     }
 
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.groups.iter().map(|group| group.pages.len()).sum()
     }
 
     #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
@@ -160,7 +160,7 @@ impl PendingRequestPages {
 /// Move-only ownership of all physical pages belonging to one live request.
 #[derive(Debug)]
 #[must_use = "request pages must be retired through their issuing pool"]
-pub(crate) struct RequestPages {
+pub struct RequestPages {
     pool_id: u64,
     sequence: SequenceId,
     writer: WriterId,
@@ -168,17 +168,17 @@ pub(crate) struct RequestPages {
 }
 
 impl RequestPages {
-    pub(crate) const fn sequence(&self) -> SequenceId {
+    pub const fn sequence(&self) -> SequenceId {
         self.sequence
     }
 
-    pub(crate) fn groups(&self) -> &[GroupTable<PageRef>] {
+    pub fn groups(&self) -> &[GroupTable<PageRef>] {
         &self.groups
     }
 
     /// Construct an exact-writer claim. Passing a page from another request is
     /// harmless: pool validation rejects the substituted writer atomically.
-    pub(crate) const fn write_claim(&self, page: &PageRef) -> WriterAccessClaim {
+    pub const fn write_claim(&self, page: &PageRef) -> WriterAccessClaim {
         WriterAccessClaim {
             pool_id: self.pool_id,
             writer: self.writer,
@@ -188,7 +188,7 @@ impl RequestPages {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct WriterAccessClaim {
+pub struct WriterAccessClaim {
     pool_id: u64,
     writer: WriterId,
     handle: PageHandle,
@@ -202,27 +202,30 @@ struct PreparedWriterClaim {
 
 #[derive(Debug)]
 #[must_use = "prepared writer access must be acquired or discarded"]
-pub(crate) struct PreparedWriterAccess {
+pub struct PreparedWriterAccess {
     pool_id: u64,
     claims: Vec<PreparedWriterClaim>,
 }
 
 #[derive(Debug)]
 #[must_use = "writer access must be released or retained as quarantine"]
-pub(crate) struct WriterAccessLease {
+pub struct WriterAccessLease {
     pool_id: u64,
     claims: Vec<PreparedWriterClaim>,
 }
 
 impl WriterAccessLease {
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.claims.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.claims.is_empty()
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum CachePoolError {
+pub enum CachePoolError {
     InvalidParentCapacity,
     EmptyGroupLayout,
     TooManyGroups,
@@ -345,9 +348,9 @@ impl std::error::Error for CachePoolError {}
 
 /// A failed retirement returns the exact move-only request token unchanged.
 #[derive(Debug)]
-pub(crate) struct RetireRequestFailure {
-    pub(crate) error: CachePoolError,
-    pub(crate) request: RequestPages,
+pub struct RetireRequestFailure {
+    pub error: CachePoolError,
+    pub request: RequestPages,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -604,7 +607,7 @@ impl PlacementPlan {
 
 /// One flat pool of fungible, equal-sized physical parents.
 #[derive(Debug)]
-pub(crate) struct CachePool {
+pub struct CachePool {
     id: u64,
     /// Last writer identity committed to a successful reservation. It is
     /// monotonic for this pool and never rewound by abort or retirement.
@@ -620,7 +623,7 @@ pub(crate) struct CachePool {
 }
 
 impl CachePool {
-    pub(crate) fn new(
+    pub fn new(
         parent_capacity: u32,
         group_packings: &[NonZeroU32],
     ) -> Result<Self, CachePoolError> {
@@ -683,27 +686,27 @@ impl CachePool {
         })
     }
 
-    pub(crate) const fn id(&self) -> u64 {
+    pub const fn id(&self) -> u64 {
         self.id
     }
 
-    pub(crate) fn blocks_per_parent(&self, group: GroupId) -> Result<NonZeroU32, CachePoolError> {
+    pub fn blocks_per_parent(&self, group: GroupId) -> Result<NonZeroU32, CachePoolError> {
         self.group_packings
             .get(group.index() as usize)
             .copied()
             .ok_or(CachePoolError::UnknownGroup { group })
     }
 
-    pub(crate) fn free_parent_count(&self) -> usize {
+    pub fn free_parent_count(&self) -> usize {
         self.free_parents.len()
     }
 
-    pub(crate) const fn occupied_block_count(&self) -> usize {
+    pub const fn occupied_block_count(&self) -> usize {
         self.occupied_blocks
     }
 
     #[cfg(test)]
-    pub(crate) fn bound_group(&self, parent: u32) -> Option<GroupId> {
+    pub fn bound_group(&self, parent: u32) -> Option<GroupId> {
         self.parents
             .get(parent.checked_sub(1)? as usize)
             .and_then(|parent| parent.binding)
@@ -712,7 +715,7 @@ impl CachePool {
     /// Reserve every ordered group demand for one request atomically. Logical
     /// state is unchanged on every error; output tables preserve input order
     /// and multiplicity.
-    pub(crate) fn reserve_request(
+    pub fn reserve_request(
         &mut self,
         sequence: SequenceId,
         demands: &[GroupDemand],
@@ -773,7 +776,7 @@ impl CachePool {
 
     /// Make a fully reserved request executable. Private token provenance makes
     /// this transition infallible.
-    pub(crate) fn promote_request(&mut self, pending: PendingRequestPages) -> RequestPages {
+    pub fn promote_request(&mut self, pending: PendingRequestPages) -> RequestPages {
         self.assert_pending_request(&pending);
         for page in pending.groups.iter().flat_map(|group| &group.pages) {
             let slot = self.slot_mut(page.handle);
@@ -799,7 +802,7 @@ impl CachePool {
 
     /// Discard a fresh request reservation. Like promotion, this is infallible
     /// after successful reservation.
-    pub(crate) fn abort_request(&mut self, pending: PendingRequestPages) {
+    pub fn abort_request(&mut self, pending: PendingRequestPages) {
         self.assert_pending_request(&pending);
         for group in pending.groups.iter().rev() {
             for page in group.pages.iter().rev() {
@@ -814,10 +817,7 @@ impl CachePool {
     /// Retire one move-only request owner. Validation completes before the first
     /// mutation; failure returns the exact token unchanged. Active leases keep
     /// their pages physically live until runner completion or quarantine.
-    pub(crate) fn retire_request(
-        &mut self,
-        request: RequestPages,
-    ) -> Result<(), RetireRequestFailure> {
+    pub fn retire_request(&mut self, request: RequestPages) -> Result<(), RetireRequestFailure> {
         if let Err(error) = self.validate_request(&request) {
             return Err(RetireRequestFailure { error, request });
         }
@@ -834,7 +834,7 @@ impl CachePool {
 
     /// Authenticate and canonicalize an exact set of mutable request pages
     /// before runner acceptance. No lease state changes here.
-    pub(crate) fn prepare_writer_access(
+    pub fn prepare_writer_access(
         &self,
         mut claims: Vec<WriterAccessClaim>,
     ) -> Result<PreparedWriterAccess, CachePoolError> {
@@ -868,7 +868,7 @@ impl CachePool {
 
     /// Acquire every prepared writer lease atomically. Revalidation catches an
     /// intervening retirement or competing lease without partially acquiring.
-    pub(crate) fn acquire_writer_access(
+    pub fn acquire_writer_access(
         &mut self,
         prepared: PreparedWriterAccess,
     ) -> Result<WriterAccessLease, CachePoolError> {
@@ -897,7 +897,7 @@ impl CachePool {
 
     /// Release a known-live writer lease. This path allocates nothing. A caller
     /// which cannot prove runner completion retains the lease as quarantine.
-    pub(crate) fn release_writer_access(&mut self, lease: WriterAccessLease) {
+    pub fn release_writer_access(&mut self, lease: WriterAccessLease) {
         assert_eq!(
             lease.pool_id, self.id,
             "writer access can only return to its issuing cache pool"
@@ -922,7 +922,7 @@ impl CachePool {
 
     /// Translate a pool handle into the dense page id consumed by one group's
     /// device view.  Page zero remains the null page.
-    pub(crate) fn kernel_page_id(&self, handle: PageHandle) -> Result<u32, CachePoolError> {
+    pub fn kernel_page_id(&self, handle: PageHandle) -> Result<u32, CachePoolError> {
         self.validate_live_handle(handle)?;
         let packing = self.blocks_per_parent(handle.group)?.get();
         let page_id =
@@ -1070,7 +1070,7 @@ impl CachePool {
     }
 
     /// Preflight a request retirement without changing ownership or placement.
-    pub(crate) fn validate_request(&self, request: &RequestPages) -> Result<(), CachePoolError> {
+    pub fn validate_request(&self, request: &RequestPages) -> Result<(), CachePoolError> {
         if request.pool_id != self.id {
             return Err(CachePoolError::ForeignPool);
         }
