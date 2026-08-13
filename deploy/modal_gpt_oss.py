@@ -370,10 +370,6 @@ def _run_prompt(
 
     from resin import Engine, SchedulerConfig
 
-    if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
-        raise ValueError("max_new_tokens must be an integer")
-    if max_new_tokens <= 0:
-        raise ValueError("max_new_tokens must be positive")
     model_path, model_cache = _require_cached_model(model_key)
     tokenizer, renderer = _load_renderer(model_path)
     prompt_ids = _encode_prompt(renderer, prompt)
@@ -552,25 +548,8 @@ def _run_bench(
         raise ValueError("model must be '20b' or '120b'")
     if cache_mode not in {"prewarm", "verify"}:
         raise ValueError("cache_mode must be 'prewarm' or 'verify'")
-    if isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int):
-        raise ValueError("prompt_tokens must be an integer")
-    if prompt_tokens <= 0:
-        raise ValueError("prompt_tokens must be positive")
-    if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
-        raise ValueError("max_new_tokens must be an integer")
-    if max_new_tokens <= 0:
-        raise ValueError("max_new_tokens must be positive")
-    if isinstance(context_length, bool) or not isinstance(context_length, int):
-        raise ValueError("context_length must be an integer")
-    if context_length <= 0:
-        raise ValueError("context_length must be positive")
     if prompt_tokens + max_new_tokens - 1 > context_length:
         raise ValueError("prompt_tokens plus max_new_tokens exceeds context_length")
-    if not batch_sizes or any(
-        isinstance(size, bool) or not isinstance(size, int) or size <= 0
-        for size in batch_sizes
-    ):
-        raise ValueError("batch_sizes must contain positive integers")
     if tuple(sorted(set(batch_sizes))) != batch_sizes:
         raise ValueError("batch_sizes must be sorted and contain no duplicates")
 
