@@ -222,6 +222,7 @@ cargo test --all-targets
 uv run pytest -q
 uv run ruff format --check .
 uv run ruff check .
+uv run python scripts/cloc.py
 ```
 
 GPU validation is model- and machine-specific; local tests use fakes or skip
@@ -239,6 +240,7 @@ unavailable accelerator libraries.
 - `crates/resin-core/src/resources/` — KV, recurrent, allocator, and lease logic
 - `src/resin/backend/` — reusable execution and resource gadgets
 - `src/resin/models/` — concrete model definitions, loaders, and runners
+- `scripts/` — examples, benchmarks, and local maintenance tools
 - `deploy/` — optional remote validation harnesses
 - `tests/` — native and runner-contract coverage
 
