@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from resin import (
+    BatchPhase,
     BatchPlan,
     CacheGroupLayout,
     CacheLayout,
@@ -75,19 +76,15 @@ class EngineTests(unittest.TestCase):
 
         initial = engine.step()
         self.assertEqual([event.token_id for event in initial], [3, 9])
-        self.assertEqual(runner.plans[0].mode, "prefill")
+        self.assertEqual(runner.plans[0].phase, BatchPhase.PREFILL)
         self.assertEqual(runner.plans[0].sequence_indptr, [0, 2, 3])
-        self.assertEqual(runner.plans[0].prefill_sequence_indices, [0, 1])
-        self.assertEqual(runner.plans[0].decode_sequence_indices, [])
         self.assertEqual(runner.plans[0].sample_sequence_indices, [0, 1])
         self.assertEqual(runner.released, [second])
 
         final = engine.step()
         self.assertEqual([event.token_id for event in final], [4])
-        self.assertEqual(runner.plans[1].mode, "decode")
+        self.assertEqual(runner.plans[1].phase, BatchPhase.DECODE)
         self.assertEqual(runner.plans[1].positions, [2])
-        self.assertEqual(runner.plans[1].prefill_sequence_indices, [])
-        self.assertEqual(runner.plans[1].decode_sequence_indices, [0])
         self.assertEqual(runner.plans[1].sample_sequence_indices, [0])
         self.assertFalse(engine.has_work())
         self.assertTrue(first.done)
@@ -117,7 +114,7 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(second.done)
         self.assertEqual(second.take_result(), [11])
 
-    def test_mixed_terminal_and_surviving_rows_rotate_behind_ready_tail(self) -> None:
+    def test_decode_survivor_runs_after_the_ready_prefill_tail(self) -> None:
         runner = RecordingRunner()
         engine = Engine(runner, max_running_requests=2)
         surviving = engine.submit([1], max_new_tokens=3)
@@ -134,12 +131,16 @@ class EngineTests(unittest.TestCase):
         second_events = engine.step()
         self.assertEqual(
             [event.request_id for event in second_events],
-            [untouched, surviving],
+            [untouched],
         )
-        self.assertEqual(runner.plans[1].sequence_ids, [untouched, surviving])
+        self.assertEqual(runner.plans[1].sequence_ids, [untouched])
         self.assertTrue(untouched.done)
         self.assertEqual(untouched.take_result(), [21])
         self.assertFalse(surviving.done)
+
+        third_events = engine.step()
+        self.assertEqual([event.request_id for event in third_events], [surviving])
+        self.assertEqual(runner.plans[2].sequence_ids, [surviving])
 
     def test_public_batch_plan_validates_indptr(self) -> None:
         with self.assertRaisesRegex(ValueError, "end at the token count"):
@@ -149,8 +150,6 @@ class EngineTests(unittest.TestCase):
                 [7],
                 [0, 1],
                 [0],
-                prefill_sequence_indices=[0],
-                decode_sequence_indices=[],
             )
 
     def test_engine_pins_native_state_through_forward_and_release(self) -> None:

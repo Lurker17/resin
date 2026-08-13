@@ -9,6 +9,7 @@ import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+from resin import BatchPhase
 from resin.backends.gpt_oss_cuda import (
     _CUDA_GRAPH_WARMUP_STEPS,
     GptOssCudaRunner,
@@ -46,8 +47,7 @@ def _flat_plan(
     context_lengths,
     query_lengths,
     *,
-    prefill_sequence_indices=None,
-    decode_sequence_indices=None,
+    phase=BatchPhase.PREFILL,
     cache_pool_id=41,
 ):
     sequence_count = len(context_lengths)
@@ -79,11 +79,6 @@ def _flat_plan(
             )
         )
 
-    if prefill_sequence_indices is None and decode_sequence_indices is None:
-        prefill_sequence_indices = list(range(sequence_count))
-        decode_sequence_indices = []
-    assert prefill_sequence_indices is not None
-    assert decode_sequence_indices is not None
     history = _group_plan(
         0,
         history_rows,
@@ -107,8 +102,7 @@ def _flat_plan(
         num_sequences=sequence_count,
         sequence_indptr=sequence_indptr,
         context_lengths=list(context_lengths),
-        prefill_sequence_indices=list(prefill_sequence_indices),
-        decode_sequence_indices=list(decode_sequence_indices),
+        phase=phase,
         sample_sequence_indices=list(range(sequence_count)),
     )
 
@@ -121,17 +115,7 @@ def _decode_plan():
     return _flat_plan(
         [130, 260],
         [1, 1],
-        prefill_sequence_indices=[],
-        decode_sequence_indices=[0, 1],
-    )
-
-
-def _mixed_plan():
-    return _flat_plan(
-        [130, 260],
-        [1, 1],
-        prefill_sequence_indices=[0],
-        decode_sequence_indices=[1],
+        phase=BatchPhase.DECODE,
     )
 
 
@@ -256,7 +240,7 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         self.assertIsNone(decode)
         self.assertEqual(len(batches), 1)
         batch = batches[0]
-        self.assertEqual((batch.phase, batch.round_index), ("prefill", 0))
+        self.assertEqual((batch.phase, batch.round_index), (BatchPhase.PREFILL, 0))
         self.assertEqual(batch.sequence_indices, (0, 1))
         self.assertEqual(batch.q_lengths, (128, 5))
         self.assertEqual(batch.token_indices[:3], (0, 1, 2))
@@ -284,17 +268,6 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         self.assertEqual(batch.full_seqused_k, (261,))
         self.assertEqual(batch.sliding_page_table, (130, 129))
         self.assertEqual(batch.sliding_seqused_k, (133,))
-
-    def test_mixed_rows_keep_explicit_attention_phases(self) -> None:
-        prefill, decode = GptOssCudaRunner._attention_batches(_mixed_plan())
-
-        self.assertEqual(len(prefill), 1)
-        self.assertEqual(prefill[0].sequence_indices, (0,))
-        self.assertEqual(prefill[0].token_indices, (0,))
-        self.assertIsNotNone(decode)
-        assert decode is not None
-        self.assertEqual(decode.sequence_indices, (1,))
-        self.assertEqual(decode.token_indices, (1,))
 
     def test_decode_tables_and_append_slots_come_from_sparse_groups(self) -> None:
         batch = GptOssCudaRunner._decode_batch(_decode_plan())

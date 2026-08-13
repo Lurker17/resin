@@ -79,11 +79,7 @@ class StateMappingConfigTests(unittest.TestCase):
 
 class BatchPlanStateMappingTests(unittest.TestCase):
     def test_manual_plan_identity_contract_is_explicit(self) -> None:
-        phase = {
-            "prefill_sequence_indices": [0],
-            "decode_sequence_indices": [],
-        }
-        stateless = BatchPlan([1], [0], [7], [0, 1], [0], **phase)
+        stateless = BatchPlan([1], [0], [7], [0, 1], [0])
         self.assertIsNone(stateless.engine_id)
         self.assertIsNone(stateless.state_pool_id)
 
@@ -93,7 +89,6 @@ class BatchPlanStateMappingTests(unittest.TestCase):
             [7],
             [0, 1],
             [0],
-            **phase,
             state_pool_id=9,
             state_slots=[3],
             state_generations=[4],
@@ -114,15 +109,14 @@ class BatchPlanStateMappingTests(unittest.TestCase):
                 [7],
                 [0, 1],
                 [0],
-                **phase,
                 state_slots=[3],
                 state_generations=[4],
                 state_indptr=[0, 1],
             )
         with self.assertRaisesRegex(ValueError, "must be None"):
-            BatchPlan([1], [0], [7], [0, 1], [0], state_pool_id=9, **phase)
+            BatchPlan([1], [0], [7], [0, 1], [0], state_pool_id=9)
         with self.assertRaisesRegex(ValueError, "engine_id must be positive"):
-            BatchPlan([1], [0], [7], [0, 1], [0], engine_id=0, **phase)
+            BatchPlan([1], [0], [7], [0, 1], [0], engine_id=0)
 
 
 class EngineStateMappingTests(unittest.TestCase):

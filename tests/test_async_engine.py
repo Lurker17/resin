@@ -485,7 +485,7 @@ class AsyncEngineContractTests(unittest.TestCase):
         failed_plan, retry_plan = runner.dispatch_plans
         self.assertEqual((failed_plan.batch_id, retry_plan.batch_id), (1, 2))
         for field in (
-            "mode",
+            "phase",
             "token_ids",
             "positions",
             "sequence_ids",
@@ -510,7 +510,7 @@ class AsyncEngineContractTests(unittest.TestCase):
         self.assertEqual(runner.dispatch_plans[-1].sequence_ids, [tail])
 
     def test_canceled_terminal_and_surviving_rows_preserve_tail_rotation(self) -> None:
-        runner = ControlledAsyncRunner([[11, 21, 31], [41, 32]])
+        runner = ControlledAsyncRunner([[11, 21, 31], [41], [32]])
         engine = Engine(runner, max_running_requests=3)
         canceled = engine.submit([10], max_new_tokens=2)
         terminal = engine.submit([20], max_new_tokens=1)
@@ -529,11 +529,18 @@ class AsyncEngineContractTests(unittest.TestCase):
         second_events = engine.step()
         self.assertEqual(
             runner.dispatch_plans[-1].sequence_ids,
-            [untouched, surviving],
+            [untouched],
         )
         self.assertEqual(
             [event.request_id for event in second_events],
-            [untouched, surviving],
+            [untouched],
+        )
+
+        third_events = engine.step()
+        self.assertEqual(runner.dispatch_plans[-1].sequence_ids, [surviving])
+        self.assertEqual(
+            [event.request_id for event in third_events],
+            [surviving],
         )
 
     def test_async_step_dispatches_and_polls_exactly_once(self) -> None:

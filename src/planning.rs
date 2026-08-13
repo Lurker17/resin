@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 use crate::cache::{CacheGroupPlan, CacheLayout, CacheRetention};
 use crate::cache_pool::{CachePool, GroupId, RequestPages, WriterAccessClaim};
 use crate::scheduler::{Phase, Schedulable};
-use crate::{BatchPlan, Request, ScheduledRow, SchedulerConfig, cache_pool_error, phase_mode};
+use crate::{BatchPhase, BatchPlan, Request, ScheduledRow, SchedulerConfig, cache_pool_error};
 
 pub(super) trait RequestLike {
     fn as_request(&self) -> &Request;
@@ -283,14 +283,18 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
             "scheduler selected requests with different batch keys",
         ));
     }
+    let phase = scheduled_rows[0].phase;
+    if scheduled_rows.iter().any(|row| row.phase != phase) {
+        return Err(PyRuntimeError::new_err(
+            "scheduler selected requests from different phases",
+        ));
+    }
 
     let mut token_ids = Vec::new();
     let mut positions = Vec::new();
     let mut sequence_ids = Vec::with_capacity(requests.len());
     let mut sequence_indptr = Vec::with_capacity(requests.len() + 1);
     let mut context_lengths = Vec::with_capacity(requests.len());
-    let mut prefill_sequence_indices = Vec::with_capacity(requests.len());
-    let mut decode_sequence_indices = Vec::with_capacity(requests.len());
     let mut sample_sequence_indices = Vec::with_capacity(requests.len());
     let mut state_slots = Vec::new();
     let mut state_generations = Vec::new();
@@ -330,7 +334,6 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
                         "scheduled prefill range exceeds the request prompt",
                     ));
                 }
-                prefill_sequence_indices.push(sequence_index as u32);
                 token_ids.extend_from_slice(
                     &request.prompt[scheduled.token_start as usize..token_end as usize],
                 );
@@ -343,7 +346,6 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
                         "scheduled decode rows must contain exactly one token",
                     ));
                 }
-                decode_sequence_indices.push(sequence_index as u32);
                 token_ids.push(*request.generated.last().ok_or_else(|| {
                     PyRuntimeError::new_err("scheduled decode request has no generated token")
                 })?);
@@ -464,14 +466,15 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
         batch_id,
         batch_key,
         engine_id,
-        mode: phase_mode(&prefill_sequence_indices, &decode_sequence_indices).to_owned(),
+        phase: match phase {
+            Phase::Prefill => BatchPhase::Prefill,
+            Phase::Decode => BatchPhase::Decode,
+        },
         token_ids,
         positions,
         sequence_ids,
         sequence_indptr,
         context_lengths,
-        prefill_sequence_indices,
-        decode_sequence_indices,
         sample_sequence_indices,
         state_slots,
         state_generations,

@@ -73,8 +73,8 @@ today.
 
 The managed runner keeps policy boundaries narrow:
 
-- Resin schedules heterogeneous prefill/decode rows and freezes physical cache
-  destinations.
+- Resin schedules phase-homogeneous prefill or decode batches and freezes
+  physical cache destinations.
 - The runner groups compatible work into derived 128-token execution rounds.
 - Full and sliding attention consume their corresponding group views through
   FlashAttention-4.
@@ -117,7 +117,7 @@ A new GPU proof should establish, on the current tree:
 
 1. cold prefill and multi-step decode correctness against the reference runner;
 2. long prefill across repeated private Window reuse;
-3. heterogeneous mixed batches and request retirement;
+3. separate prefill/decode scheduling and request retirement;
 4. flat-pool exhaustion and complete parent recovery;
 5. post-accept failure quarantine;
 6. graph and eager equivalence for each claimed decode shape;

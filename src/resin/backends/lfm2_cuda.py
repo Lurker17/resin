@@ -12,7 +12,7 @@ from pathlib import Path
 from time import monotonic, sleep
 from typing import TYPE_CHECKING, NamedTuple
 
-from resin import CacheGroupLayout, CacheLayout, StateMappingConfig
+from resin import BatchPhase, CacheGroupLayout, CacheLayout, StateMappingConfig
 
 from .lfm2_torch import (
     DEFAULT_MODEL,
@@ -149,8 +149,14 @@ def _cache_kernel_metadata(plan: BatchPlan, page_size: int) -> _CacheKernelMetad
     sequence_count = len(plan.sequence_ids)
     sequence_indptr = tuple(plan.sequence_indptr)
     context_lengths = tuple(plan.context_lengths)
-    prefill_rows = tuple(plan.prefill_sequence_indices)
-    decode_rows = tuple(plan.decode_sequence_indices)
+    if plan.phase == BatchPhase.PREFILL:
+        prefill_rows = tuple(range(sequence_count))
+        decode_rows: tuple[int, ...] = ()
+    elif plan.phase == BatchPhase.DECODE:
+        prefill_rows = ()
+        decode_rows = tuple(range(sequence_count))
+    else:
+        raise ValueError("plan phase must be BatchPhase.PREFILL or BatchPhase.DECODE")
     positions = tuple(plan.positions)
     token_count = len(plan.token_ids)
     groups = tuple(plan.cache_groups)
@@ -188,19 +194,8 @@ def _cache_kernel_metadata(plan: BatchPlan, page_size: int) -> _CacheKernelMetad
         or len(frozen_append_block_offsets) != token_count
     ):
         raise ValueError("cache append metadata does not cover every query token")
-    if (
-        tuple(sorted(prefill_rows)) != prefill_rows
-        or len(set(prefill_rows)) != len(prefill_rows)
-        or tuple(sorted(decode_rows)) != decode_rows
-        or len(set(decode_rows)) != len(decode_rows)
-    ):
-        raise ValueError("explicit phase row indices must be sorted and unique")
     prefill_row_set = set(prefill_rows)
     decode_row_set = set(decode_rows)
-    if prefill_row_set & decode_row_set or prefill_row_set | decode_row_set != set(
-        range(sequence_count)
-    ):
-        raise ValueError("explicit prefill and decode rows must partition the batch")
 
     dense_tokens: list[int] = []
     dense_cu = [0]
@@ -1100,7 +1095,7 @@ class Lfm2CudaRunner:
 
     def _plan_decode(self, plan: BatchPlan, metadata) -> bool:
         torch = self._torch
-        if not plan.decode_sequence_indices:
+        if plan.phase != BatchPhase.DECODE:
             return False
         self._decode.plan(
             metadata["decode_block_indptr"],

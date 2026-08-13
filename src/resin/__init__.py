@@ -5,6 +5,7 @@ Choose a runner from :mod:`resin.backends` only when constructing an engine.
 """
 
 from ._resin import (
+    BatchPhase,
     BatchPlan,
     CacheGroupLayout,
     CacheGroupPlan,
@@ -22,6 +23,7 @@ from ._resin import (
 from .protocols import AsyncRunner, Runner, SyncRunner
 
 __all__ = [
+    "BatchPhase",
     "BatchPlan",
     "CacheGroupLayout",
     "CacheGroupPlan",

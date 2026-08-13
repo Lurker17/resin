@@ -19,14 +19,12 @@ impl QueueMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SchedulerPolicy {
     pub(crate) queue_mode: QueueMode,
-    pub(crate) allow_mixed: bool,
 }
 
 impl Default for SchedulerPolicy {
     fn default() -> Self {
         Self {
             queue_mode: QueueMode::RoundRobin,
-            allow_mixed: true,
         }
     }
 }
@@ -82,9 +80,9 @@ impl Selection {
 /// Strict-priority homogeneous scheduling with stable native turn ordinals.
 ///
 /// The oldest request at the highest ready priority anchors a batch. Matching
-/// requests share its priority and batch key, and also its phase when mixed
-/// batches are disabled. FIFO survivors retain their original age; round-robin
-/// survivors receive fresh turns after every request already waiting.
+/// requests share its priority, batch key, and phase. FIFO survivors retain
+/// their original age; round-robin survivors receive fresh turns after every
+/// request already waiting.
 #[derive(Debug)]
 pub(crate) struct Scheduler<T> {
     ready: Vec<T>,
@@ -244,7 +242,7 @@ impl<T: Schedulable> Scheduler<T> {
             .filter(|(_, item)| {
                 item.priority() == max_priority
                     && item.batch_key() == anchor_key
-                    && (self.policy.allow_mixed || item.phase() == anchor_phase)
+                    && item.phase() == anchor_phase
             })
             .take(self.max_running_requests.get())
             .map(|(index, item)| SelectedIdentity {
@@ -414,30 +412,24 @@ mod tests {
                     case /= classes.len();
                     items.push(item(id, priority, key, phase));
                 }
-                for allow_mixed in [false, true] {
-                    for limit in 1..=queue_len as usize {
-                        let policy = SchedulerPolicy {
-                            queue_mode: QueueMode::RoundRobin,
-                            allow_mixed,
-                        };
-                        let scheduler = scheduler(limit, policy, items.clone());
-                        let max_priority = items.iter().map(|item| item.priority).max().unwrap();
-                        let anchor = items
-                            .iter()
-                            .find(|item| item.priority == max_priority)
-                            .unwrap();
-                        let expected = items
-                            .iter()
-                            .filter(|candidate| {
-                                candidate.priority == max_priority
-                                    && candidate.key == anchor.key
-                                    && (allow_mixed || candidate.phase == anchor.phase)
-                            })
-                            .take(limit)
-                            .map(|item| item.id)
-                            .collect::<Vec<_>>();
-                        assert_eq!(selected_ids(&scheduler), expected);
-                    }
+                for limit in 1..=queue_len as usize {
+                    let scheduler = scheduler(limit, SchedulerPolicy::default(), items.clone());
+                    let max_priority = items.iter().map(|item| item.priority).max().unwrap();
+                    let anchor = items
+                        .iter()
+                        .find(|item| item.priority == max_priority)
+                        .unwrap();
+                    let expected = items
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.priority == max_priority
+                                && candidate.key == anchor.key
+                                && candidate.phase == anchor.phase
+                        })
+                        .take(limit)
+                        .map(|item| item.id)
+                        .collect::<Vec<_>>();
+                    assert_eq!(selected_ids(&scheduler), expected);
                 }
             }
         }
@@ -459,22 +451,13 @@ mod tests {
     }
 
     #[test]
-    fn none_is_a_real_key_and_mixed_phase_is_configurable() {
+    fn none_is_a_real_key_and_phase_is_always_homogeneous() {
         let items = vec![
             item(0, 0, None, Phase::Prefill),
             item(1, 0, Some(0), Phase::Prefill),
             item(2, 0, None, Phase::Decode),
         ];
-        let mixed = scheduler(3, SchedulerPolicy::default(), items.clone());
-        assert_eq!(selected_ids(&mixed), vec![0, 2]);
-        let phase_homogeneous = scheduler(
-            3,
-            SchedulerPolicy {
-                queue_mode: QueueMode::RoundRobin,
-                allow_mixed: false,
-            },
-            items,
-        );
+        let phase_homogeneous = scheduler(3, SchedulerPolicy::default(), items);
         assert_eq!(selected_ids(&phase_homogeneous), vec![0]);
     }
 
@@ -484,7 +467,6 @@ mod tests {
             2,
             SchedulerPolicy {
                 queue_mode: QueueMode::Fifo,
-                allow_mixed: true,
             },
             (0..3).map(|id| item(id, 0, None, Phase::Prefill)).collect(),
         );
@@ -520,7 +502,7 @@ mod tests {
             vec![
                 item(0, 1, None, Phase::Prefill),
                 item(1, 0, None, Phase::Prefill),
-                item(2, 1, None, Phase::Decode),
+                item(2, 1, None, Phase::Prefill),
                 item(3, 1, Some(4), Phase::Prefill),
                 item(4, 1, None, Phase::Prefill),
             ],
@@ -541,7 +523,7 @@ mod tests {
             vec![
                 item(0, 1, Some(7), Phase::Prefill),
                 item(1, 1, None, Phase::Prefill),
-                item(2, 1, Some(7), Phase::Decode),
+                item(2, 1, Some(7), Phase::Prefill),
                 item(3, 0, Some(7), Phase::Prefill),
                 item(4, 1, Some(7), Phase::Prefill),
             ],

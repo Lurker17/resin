@@ -58,19 +58,19 @@ resources are retired.
 - `token_ids`, `positions`: equally sized flattened input arrays;
 - `sequence_ids`, `sequence_indptr`: nonempty sequence CSR;
 - `context_lengths`: one pre-append logical length per sequence;
-- `prefill_sequence_indices`, `decode_sequence_indices`: a sorted, disjoint,
-  complete row partition agreeing with `mode`;
+- `phase`: one `BatchPhase.PREFILL` or `BatchPhase.DECODE` value applying to
+  every row;
 - `sample_sequence_indices`: sorted rows whose returned IDs commit;
 - `batch_id`, optional `batch_key`, and optional positive `engine_id`.
 
 For sequence row `i`, flattened tokens occupy
 `sequence_indptr[i]:sequence_indptr[i + 1]`. Their positions are absolute logical
-positions. Runners should consume the explicit phase and sample sets rather than
-reconstructing policy from positions or context lengths.
+positions. Runners should consume the explicit batch phase and sample set rather
+than reconstructing policy from positions or context lengths.
 
-The public constructor remains useful for reference runners and focused tests,
-but it requires both phase-index arrays explicitly; it never derives phase from
-`mode` or `context_lengths`. Engine-built managed plans add state and cache
+The public constructor remains useful for reference runners and focused tests.
+It defaults to `BatchPhase.PREFILL`; decode plans must pass
+`phase=BatchPhase.DECODE`. Engine-built managed plans add state and cache
 identities and should be treated as authoritative.
 
 ## Cache metadata

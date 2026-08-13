@@ -11,6 +11,8 @@ from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
+from resin import BatchPhase
+
 
 class _FakeTensor:
     def __init__(
@@ -396,8 +398,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             "engine_id": 71,
             "sequence_indptr": [0, 2, 3],
             "context_lengths": [0, 16],
-            "prefill_sequence_indices": [0],
-            "decode_sequence_indices": [1],
+            "phase": BatchPhase.PREFILL,
             "sample_sequence_indices": [0, 1],
             "token_ids": [1, 2, 3],
             "state_pool_id": 53,
@@ -629,15 +630,17 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             "append_positions": ([0, 1, 16], "int32"),
             "prefill_token_indices": ([0, 1], "long"),
             "prefill_cu_seqlens": ([0, 2], "int32"),
-            "decode_token_indices": ([2], "long"),
+            "continuation_prefill_token_indices": ([2], "long"),
+            "continuation_prefill_cu_seqlens": ([0, 1], "int32"),
+            "decode_token_indices": ([], "long"),
         }
         expected_host = {
-            "decode_block_indptr": ([0, 2], "int32"),
-            "decode_block_ids": ([3, 7], "int32"),
-            "decode_last_block_lengths": ([1], "int32"),
+            "decode_block_indptr": ([0], "int32"),
+            "decode_block_ids": ([], "int32"),
+            "decode_last_block_lengths": ([], "int32"),
         }
         self.assertEqual(metadata["prefill_max_q_len"], 2)
-        self.assertEqual(metadata["continuation_prefill_max_q_len"], 0)
+        self.assertEqual(metadata["continuation_prefill_max_q_len"], 1)
         for name, (values, dtype) in expected_cuda.items():
             self.assertEqual(metadata[name].values, tuple(values))
             self.assertEqual(metadata[name].dtype, dtype)
@@ -651,12 +654,8 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             self.assertTrue(metadata[name].pin_memory)
             self.assertIs(metadata[name], metadata["_pinned"][name])
 
-        self.assertTrue(runner._plan_decode(plan, metadata))
-        (args, kwargs) = runner._decode.calls[0]
-        self.assertIs(args[0], metadata["decode_block_indptr"])
-        self.assertIs(args[1], metadata["decode_block_ids"])
-        self.assertIs(args[2], metadata["decode_last_block_lengths"])
-        self.assertEqual(kwargs["data_type"], "bfloat16")
+        self.assertFalse(runner._plan_decode(plan, metadata))
+        self.assertEqual(runner._decode.calls, [])
 
     def test_frozen_append_destinations_are_validated_before_tensor_staging(
         self,
@@ -686,8 +685,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                 sequence_ids=[10],
                 sequence_indptr=[0, 1],
                 context_lengths=[18],
-                prefill_sequence_indices=[],
-                decode_sequence_indices=[0],
+                phase=BatchPhase.DECODE,
                 sample_sequence_indices=[0],
                 token_ids=[3],
             )
@@ -708,8 +706,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             sequence_ids=[10, 11, 12],
             sequence_indptr=[0, 2, 4, 5],
             context_lengths=[0, 5, 8],
-            prefill_sequence_indices=[0, 1, 2],
-            decode_sequence_indices=[],
+            phase=BatchPhase.PREFILL,
             sample_sequence_indices=[0, 1, 2],
             token_ids=[1, 2, 3, 4, 5],
         )
@@ -747,8 +744,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             sequence_ids=[10, 11, 12],
             sequence_indptr=[0, 2, 4, 5],
             context_lengths=[0, 5, 8],
-            prefill_sequence_indices=[0, 1, 2],
-            decode_sequence_indices=[],
+            phase=BatchPhase.PREFILL,
             sample_sequence_indices=[0, 1, 2],
             token_ids=[1, 2, 3, 4, 5],
         )
@@ -797,8 +793,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             sequence_ids=[10],
             sequence_indptr=[0, 2],
             context_lengths=[15],
-            prefill_sequence_indices=[0],
-            decode_sequence_indices=[],
+            phase=BatchPhase.PREFILL,
             sample_sequence_indices=[0],
             token_ids=[1, 2],
             positions=[15, 16],
@@ -818,8 +813,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             sequence_ids=[10, 11],
             sequence_indptr=[0, 1, 2],
             context_lengths=[8, 8],
-            prefill_sequence_indices=[0],
-            decode_sequence_indices=[1],
+            phase=BatchPhase.PREFILL,
             sample_sequence_indices=[0, 1],
             token_ids=[1, 2],
             positions=[8, 8],
@@ -827,9 +821,9 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
 
         metadata = _prefill_kernel_metadata(plan, 16)
 
-        self.assertEqual(metadata.continuation_token_indices, (0,))
-        self.assertEqual(metadata.continuation_cu_seqlens, (0, 1))
-        self.assertEqual(metadata.continuation_seqused_k, (9,))
+        self.assertEqual(metadata.continuation_token_indices, (0, 1))
+        self.assertEqual(metadata.continuation_cu_seqlens, (0, 1, 2))
+        self.assertEqual(metadata.continuation_seqused_k, (9, 9))
 
     def test_runner_has_no_logical_page_or_length_mirror(self) -> None:
         from resin.backends.lfm2_cuda import Lfm2CudaRunner
@@ -843,11 +837,9 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         from resin.backends.lfm2_cuda import _cache_kernel_metadata
 
         adapter_source = inspect.getsource(_cache_kernel_metadata)
-        self.assertIn("plan.prefill_sequence_indices", adapter_source)
-        self.assertIn("plan.decode_sequence_indices", adapter_source)
+        self.assertIn("plan.phase", adapter_source)
         self.assertIn("group.append_block_ids", adapter_source)
         self.assertIn("group.append_block_offsets", adapter_source)
-        self.assertNotIn("plan.mode", adapter_source)
         self.assertIn(
             "_invoke_paged_fa4_b22(",
             inspect.getsource(Lfm2CudaRunner._attention),
@@ -1372,19 +1364,16 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
     def test_all_list_staging_and_copies_are_pinned_and_nonblocking(self) -> None:
         runner, plan = self._runner_and_plan()
 
-        completion = runner.dispatch(plan)
+        runner.dispatch(plan)
 
         tensor_entries = [entry for entry in runner._torch.log if entry[0] == "tensor"]
         self.assertTrue(tensor_entries)
         self.assertTrue(all(entry[3:] == ("cpu", True) for entry in tensor_entries))
         h2d = [entry for entry in runner._torch.log if entry[0] == "h2d"]
-        self.assertEqual(len(h2d), 11)
+        self.assertEqual(len(h2d), 15)
         self.assertTrue(all(entry[2] is True for entry in h2d))
         self.assertIn(("d2h", "cuda:fake", True), runner._torch.log)
-        self.assertIs(
-            runner._decode.calls[0][0][0],
-            completion._staging["metadata"]["_pinned"]["decode_block_indptr"],
-        )
+        self.assertEqual(runner._decode.calls, [])
         model_index = next(
             index
             for index, entry in enumerate(runner._torch.log)

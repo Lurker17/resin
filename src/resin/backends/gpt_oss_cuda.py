@@ -20,7 +20,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
-from resin import CacheGroupLayout, CacheLayout
+from resin import BatchPhase, CacheGroupLayout, CacheLayout
 
 from .gpt_oss import (
     DEFAULT_MODEL,
@@ -118,7 +118,7 @@ def _append_slots(
 class _HostAttentionBatch:
     """One Rust-frozen decode batch or prefill round before tensorization."""
 
-    phase: str
+    phase: BatchPhase
     round_index: int
     token_indices: tuple[int, ...]
     sequence_indices: tuple[int, ...]
@@ -133,8 +133,8 @@ class _HostAttentionBatch:
     sliding_append_slots: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        if self.phase not in {"prefill", "decode"}:
-            raise ValueError("attention batch phase must be prefill or decode")
+        if self.phase not in {BatchPhase.PREFILL, BatchPhase.DECODE}:
+            raise ValueError("attention batch phase must be a BatchPhase")
         if self.round_index < 0:
             raise ValueError("attention batch round index cannot be negative")
         row_count = len(self.sequence_indices)
@@ -190,7 +190,7 @@ class _HostCacheGroup:
 class _DeviceAttentionBatch:
     """FA4-ready tensors for one native attention batch."""
 
-    phase: str
+    phase: BatchPhase
     round_index: int
     token_indices: Any
     sequence_indices: Any
@@ -615,7 +615,7 @@ class GptOssCudaRunner:
             return torch.empty(tensor_shape, dtype=torch.long, device=self.device)
 
         attention_batch = _DeviceAttentionBatch(
-            phase="decode",
+            phase=BatchPhase.DECODE,
             round_index=0,
             token_indices=empty_indices(batch_size),
             sequence_indices=empty_indices(batch_size),
@@ -1019,12 +1019,16 @@ class GptOssCudaRunner:
         positions = cls._integer_tuple("positions", plan.positions)
         sequence_indptr = cls._integer_tuple("sequence_indptr", plan.sequence_indptr)
         context_lengths = cls._integer_tuple("context_lengths", plan.context_lengths)
-        prefill_rows = cls._integer_tuple(
-            "prefill_sequence_indices", plan.prefill_sequence_indices
-        )
-        decode_rows = cls._integer_tuple(
-            "decode_sequence_indices", plan.decode_sequence_indices
-        )
+        if plan.phase == BatchPhase.PREFILL:
+            prefill_rows = tuple(range(sequence_count))
+            decode_rows: tuple[int, ...] = ()
+        elif plan.phase == BatchPhase.DECODE:
+            prefill_rows = ()
+            decode_rows = tuple(range(sequence_count))
+        else:
+            raise ValueError(
+                "plan phase must be BatchPhase.PREFILL or BatchPhase.DECODE"
+            )
 
         if len(positions) != token_count:
             raise ValueError("positions do not cover every query token")
@@ -1043,19 +1047,6 @@ class GptOssCudaRunner:
             )
         if len(context_lengths) != sequence_count:
             raise ValueError("context_lengths do not cover every sequence")
-        if (
-            tuple(sorted(prefill_rows)) != prefill_rows
-            or len(set(prefill_rows)) != len(prefill_rows)
-            or tuple(sorted(decode_rows)) != decode_rows
-            or len(set(decode_rows)) != len(decode_rows)
-            or set(prefill_rows) & set(decode_rows)
-            or set(prefill_rows) | set(decode_rows) != set(range(sequence_count))
-        ):
-            raise ValueError(
-                "explicit prefill and decode rows must be sorted, unique, and "
-                "partition the batch"
-            )
-
         history, window = cls._cache_group_metadata(
             plan,
             sequence_count=sequence_count,
@@ -1163,7 +1154,7 @@ class GptOssCudaRunner:
             )
             prefill_batches = (
                 _HostAttentionBatch(
-                    phase="prefill",
+                    phase=BatchPhase.PREFILL,
                     round_index=0,
                     token_indices=token_indices,
                     sequence_indices=prefill_rows,
@@ -1201,7 +1192,7 @@ class GptOssCudaRunner:
                 window_rows, minimum_width=_WINDOW_TABLE_WIDTH
             )
             decode_batch = _HostAttentionBatch(
-                phase="decode",
+                phase=BatchPhase.DECODE,
                 round_index=0,
                 token_indices=token_indices,
                 sequence_indices=decode_rows,

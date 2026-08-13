@@ -152,7 +152,7 @@ the Engine binds once during construction.
 The native layer currently provides:
 
 - strict priority with FIFO or round-robin continual batching;
-- explicit mixed prefill/decode rows, token budgets, and prefill chunks;
+- phase-homogeneous prefill or decode batches, token budgets, and prefill chunks;
 - one flat physical cache pool shared by ordered History and Window groups;
 - sparse, chronological `CacheGroupPlan` rows and exact append destinations;
 - generation-checked `StatePool` slots with shared-read/exclusive-write access;
@@ -190,6 +190,7 @@ Runner
 SyncRunner
 AsyncRunner
 BatchPlan
+BatchPhase
 TokenEvent
 RequestLease
 SchedulerConfig

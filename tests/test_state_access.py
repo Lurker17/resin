@@ -63,8 +63,6 @@ class BatchPlanStateAccessTests(unittest.TestCase):
             [7],
             [0, 1],
             [0],
-            prefill_sequence_indices=[0],
-            decode_sequence_indices=[],
             **state_metadata,
         )
 

@@ -300,7 +300,7 @@ class GptOssTorchTests(unittest.TestCase):
         torch.testing.assert_close(actual_decode, expected_decode, rtol=1e-5, atol=1e-6)
 
     def test_runner_consumes_rust_batch_plan_and_releases_caches(self) -> None:
-        from resin import BatchPlan
+        from resin import BatchPhase, BatchPlan
         from resin.backends.gpt_oss import GptOssRunner
 
         runner = GptOssRunner.__new__(GptOssRunner)
@@ -325,8 +325,6 @@ class GptOssTorchTests(unittest.TestCase):
             [17, 23],
             [0, 2, 4],
             [0, 0],
-            prefill_sequence_indices=[0, 1],
-            decode_sequence_indices=[],
         )
         first = runner.forward(prefill)
         self.assertEqual(len(first), 2)
@@ -339,9 +337,7 @@ class GptOssTorchTests(unittest.TestCase):
             [17, 23],
             [0, 1, 2],
             [2, 2],
-            mode="decode",
-            prefill_sequence_indices=[],
-            decode_sequence_indices=[0, 1],
+            phase=BatchPhase.DECODE,
         )
         second = runner.forward(decode)
         self.assertEqual(len(second), 2)
@@ -355,7 +351,7 @@ class GptOssTorchTests(unittest.TestCase):
         handle.remove()
 
     def test_runner_chunked_prefill_matches_single_chunk_and_cache_state(self) -> None:
-        from resin import BatchPlan
+        from resin import BatchPhase, BatchPlan
         from resin.backends.gpt_oss import GptOssRunner
 
         def make_runner(chunk_size):
@@ -376,8 +372,6 @@ class GptOssTorchTests(unittest.TestCase):
             [17, 23],
             [0, 5, 10],
             [0, 0],
-            prefill_sequence_indices=[0, 1],
-            decode_sequence_indices=[],
         )
         single_chunk = make_runner(128)
         chunked = make_runner(2)
@@ -407,9 +401,7 @@ class GptOssTorchTests(unittest.TestCase):
             [17, 23],
             [0, 1, 2],
             [5, 5],
-            mode="decode",
-            prefill_sequence_indices=[],
-            decode_sequence_indices=[0, 1],
+            phase=BatchPhase.DECODE,
         )
         self.assertEqual(chunked.forward(decode), single_chunk.forward(decode))
         single_chunk.release([17, 23])
@@ -418,7 +410,7 @@ class GptOssTorchTests(unittest.TestCase):
         self.assertEqual(len(chunked._cache), 0)
 
     def test_runner_executes_one_model_call_per_plan(self) -> None:
-        from resin import BatchPlan
+        from resin import BatchPhase, BatchPlan
         from resin.backends.gpt_oss import GptOssRunner
 
         runner = GptOssRunner.__new__(GptOssRunner)
@@ -444,8 +436,6 @@ class GptOssTorchTests(unittest.TestCase):
             [17, 23],
             [0, 5, 10],
             [0, 0],
-            prefill_sequence_indices=[0, 1],
-            decode_sequence_indices=[],
         )
         first = runner.forward(prefill)
         self.assertEqual(model_calls, 1)
@@ -459,9 +449,7 @@ class GptOssTorchTests(unittest.TestCase):
             [17, 23],
             [0, 1, 2],
             [5, 5],
-            mode="decode",
-            prefill_sequence_indices=[],
-            decode_sequence_indices=[0, 1],
+            phase=BatchPhase.DECODE,
         )
         runner.forward(decode)
         self.assertEqual(model_calls, 2)
@@ -488,8 +476,6 @@ class GptOssTorchTests(unittest.TestCase):
             [17, 23],
             [0, 2, 3],
             [0, 0],
-            prefill_sequence_indices=[0, 1],
-            decode_sequence_indices=[],
         )
 
         with self.assertRaisesRegex(ValueError, "equal token counts"):

@@ -18,8 +18,6 @@ use cache::{CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention};
 use cache_pool::{
     CachePool, CachePoolError, GroupDemand, GroupId, RequestPages, SequenceId, WriterAccessLease,
 };
-#[cfg(test)]
-use planning::{build_plan, schedule_ready_prefix};
 use planning::{
     build_plan_for_engine, schedule_ready_prefix_for_layout, scheduled_writer_access_claims,
 };
@@ -70,13 +68,11 @@ impl SchedulerConfig {
     #[pyo3(signature = (
         *,
         queue_mode = "round_robin",
-        allow_mixed = true,
         max_batch_tokens = None,
         prefill_chunk_size = 8192
     ))]
     fn new(
         queue_mode: &str,
-        allow_mixed: bool,
         max_batch_tokens: Option<u32>,
         prefill_chunk_size: u32,
     ) -> PyResult<Self> {
@@ -90,10 +86,7 @@ impl SchedulerConfig {
             }
         };
         Ok(Self {
-            policy: SchedulerPolicy {
-                queue_mode,
-                allow_mixed,
-            },
+            policy: SchedulerPolicy { queue_mode },
             max_batch_tokens: max_batch_tokens
                 .map(|value| {
                     NonZeroU32::new(value)
@@ -111,11 +104,6 @@ impl SchedulerConfig {
     }
 
     #[getter]
-    fn allow_mixed(&self) -> bool {
-        self.policy.allow_mixed
-    }
-
-    #[getter]
     fn max_batch_tokens(&self) -> Option<u32> {
         self.max_batch_tokens.map(NonZeroU32::get)
     }
@@ -127,13 +115,35 @@ impl SchedulerConfig {
 
     fn __repr__(&self) -> String {
         format!(
-            "SchedulerConfig(queue_mode='{}', allow_mixed={}, max_batch_tokens={}, prefill_chunk_size={})",
+            "SchedulerConfig(queue_mode='{}', max_batch_tokens={}, prefill_chunk_size={})",
             self.queue_mode(),
-            if self.allow_mixed() { "True" } else { "False" },
             self.max_batch_tokens()
                 .map_or_else(|| "None".to_owned(), |value| value.to_string()),
             self.prefill_chunk_size(),
         )
+    }
+}
+
+#[pyclass(
+    frozen,
+    eq,
+    hash,
+    rename_all = "SCREAMING_SNAKE_CASE",
+    from_py_object,
+    module = "resin._resin"
+)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum BatchPhase {
+    Prefill,
+    Decode,
+}
+
+impl BatchPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "PREFILL",
+            Self::Decode => "DECODE",
+        }
     }
 }
 
@@ -217,14 +227,12 @@ struct BatchPlan {
     batch_id: u64,
     batch_key: Option<u64>,
     engine_id: Option<u64>,
-    mode: String,
+    phase: BatchPhase,
     token_ids: Vec<u32>,
     positions: Vec<u32>,
     sequence_ids: Vec<u64>,
     sequence_indptr: Vec<u32>,
     context_lengths: Vec<u32>,
-    prefill_sequence_indices: Vec<u32>,
-    decode_sequence_indices: Vec<u32>,
     // Rust event/commit mask: runner results remain dense at one token per row,
     // while rows omitted here advance prefill state without sampling a token.
     sample_sequence_indices: Vec<u32>,
@@ -252,18 +260,6 @@ fn validate_sequence_indices(name: &str, indices: &[u32], sequence_count: usize)
         )));
     }
     Ok(())
-}
-
-fn phase_mode(prefill_sequence_indices: &[u32], decode_sequence_indices: &[u32]) -> &'static str {
-    match (
-        prefill_sequence_indices.is_empty(),
-        decode_sequence_indices.is_empty(),
-    ) {
-        (false, true) => "prefill",
-        (true, false) => "decode",
-        (false, false) => "mixed",
-        (true, true) => unreachable!("a valid phase partition contains at least one row"),
-    }
 }
 
 fn parse_state_access_modes(
@@ -294,14 +290,11 @@ impl BatchPlan {
     fn checked(plan: Self) -> PyResult<Self> {
         let Self {
             engine_id,
-            mode,
             token_ids,
             positions,
             sequence_ids,
             sequence_indptr,
             context_lengths,
-            prefill_sequence_indices,
-            decode_sequence_indices,
             sample_sequence_indices,
             state_slots,
             state_generations,
@@ -313,11 +306,6 @@ impl BatchPlan {
         if engine_id == &Some(0) {
             return Err(PyValueError::new_err(
                 "engine_id must be positive when supplied",
-            ));
-        }
-        if !matches!(mode.as_str(), "prefill" | "decode" | "mixed") {
-            return Err(PyValueError::new_err(
-                "mode must be 'prefill', 'decode', or 'mixed'",
             ));
         }
         if token_ids.is_empty() {
@@ -351,44 +339,10 @@ impl BatchPlan {
             ));
         }
         validate_sequence_indices(
-            "prefill_sequence_indices",
-            prefill_sequence_indices,
-            sequence_ids.len(),
-        )?;
-        validate_sequence_indices(
-            "decode_sequence_indices",
-            decode_sequence_indices,
-            sequence_ids.len(),
-        )?;
-        validate_sequence_indices(
             "sample_sequence_indices",
             sample_sequence_indices,
             sequence_ids.len(),
         )?;
-        let mut phase_by_sequence = vec![0_u8; sequence_ids.len()];
-        for sequence_index in prefill_sequence_indices {
-            phase_by_sequence[*sequence_index as usize] = 1;
-        }
-        for sequence_index in decode_sequence_indices {
-            let phase = &mut phase_by_sequence[*sequence_index as usize];
-            if *phase != 0 {
-                return Err(PyValueError::new_err(
-                    "prefill_sequence_indices and decode_sequence_indices must be disjoint",
-                ));
-            }
-            *phase = 2;
-        }
-        if phase_by_sequence.contains(&0) {
-            return Err(PyValueError::new_err(
-                "prefill_sequence_indices and decode_sequence_indices must exactly partition the batch sequences",
-            ));
-        }
-        let expected_mode = phase_mode(prefill_sequence_indices, decode_sequence_indices);
-        if mode != expected_mode {
-            return Err(PyValueError::new_err(format!(
-                "mode must be '{expected_mode}' for the explicit phase partition"
-            )));
-        }
         if state_slots.len() != state_generations.len() {
             return Err(PyValueError::new_err(
                 "state_slots and state_generations must have equal length",
@@ -530,7 +484,7 @@ impl BatchPlan {
         sequence_indptr,
         context_lengths,
         *,
-        mode = "prefill",
+        phase = BatchPhase::Prefill,
         batch_id = 0,
         batch_key = None,
         engine_id = None,
@@ -541,8 +495,6 @@ impl BatchPlan {
         state_access_modes = None,
         cache_pool_id = None,
         cache_groups = None,
-        prefill_sequence_indices,
-        decode_sequence_indices,
         sample_sequence_indices = None
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -553,7 +505,7 @@ impl BatchPlan {
         sequence_ids: Vec<u64>,
         sequence_indptr: Vec<u32>,
         context_lengths: Vec<u32>,
-        mode: &str,
+        phase: BatchPhase,
         batch_id: u64,
         batch_key: Option<u64>,
         engine_id: Option<u64>,
@@ -564,8 +516,6 @@ impl BatchPlan {
         state_access_modes: Option<Vec<String>>,
         cache_pool_id: Option<u64>,
         cache_groups: Option<Vec<Py<CacheGroupPlan>>>,
-        prefill_sequence_indices: Vec<u32>,
-        decode_sequence_indices: Vec<u32>,
         sample_sequence_indices: Option<Vec<u32>>,
     ) -> PyResult<Self> {
         let sequence_count = sequence_ids.len();
@@ -598,14 +548,12 @@ impl BatchPlan {
             batch_id,
             batch_key,
             engine_id,
-            mode: mode.to_owned(),
+            phase,
             token_ids,
             positions,
             sequence_ids,
             sequence_indptr,
             context_lengths,
-            prefill_sequence_indices,
-            decode_sequence_indices,
             sample_sequence_indices,
             state_slots,
             state_generations,
@@ -633,8 +581,8 @@ impl BatchPlan {
     }
 
     #[getter]
-    fn mode(&self) -> &str {
-        &self.mode
+    fn phase(&self) -> BatchPhase {
+        self.phase
     }
 
     #[getter]
@@ -660,16 +608,6 @@ impl BatchPlan {
     #[getter]
     fn context_lengths(&self) -> Vec<u32> {
         self.context_lengths.clone()
-    }
-
-    #[getter]
-    fn prefill_sequence_indices(&self) -> Vec<u32> {
-        self.prefill_sequence_indices.clone()
-    }
-
-    #[getter]
-    fn decode_sequence_indices(&self) -> Vec<u32> {
-        self.decode_sequence_indices.clone()
     }
 
     #[getter]
@@ -738,9 +676,9 @@ impl BatchPlan {
 
     fn __repr__(&self) -> String {
         format!(
-            "BatchPlan(batch_id={}, mode='{}', sequences={}, tokens={}, states={}, cache_groups={})",
+            "BatchPlan(batch_id={}, phase=BatchPhase.{}, sequences={}, tokens={}, states={}, cache_groups={})",
             self.batch_id,
-            self.mode,
+            self.phase.as_str(),
             self.sequence_ids.len(),
             self.token_ids.len(),
             self.state_slots.len(),
@@ -2336,7 +2274,7 @@ fn mint_state_mapping_arena_id() -> PyResult<u64> {
 mod _resin {
     #[pymodule_export]
     use super::{
-        BatchPlan, CacheGroupLayout, CacheGroupPlan, CacheLayout, Engine, RequestLease,
+        BatchPhase, BatchPlan, CacheGroupLayout, CacheGroupPlan, CacheLayout, Engine, RequestLease,
         SchedulerConfig, StateHandle, StateMappingConfig, StatePool, TokenEvent,
         mint_state_mapping_arena_id,
     };
@@ -2349,6 +2287,7 @@ mod _resin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::planning::{build_plan, schedule_ready_prefix};
 
     fn request(id: u64, prompt: &[u32], generated: &[u32], pages: Option<RequestPages>) -> Request {
         Request {
@@ -2392,23 +2331,18 @@ mod tests {
     }
 
     #[test]
-    fn mixed_unmanaged_plan_keeps_base_batch_contract() {
+    fn mixed_phase_plan_is_rejected() {
         let prefill = request(1, &[10, 11, 12], &[], None);
         let decode = request(2, &[20, 21], &[99], None);
         let scheduled = [&prefill, &decode];
         let rows = schedule_ready_prefix(&scheduled, SchedulerConfig::default()).unwrap();
-        let plan = build_plan(7, &scheduled, &rows, None, None).unwrap();
+        let error = build_plan(7, &scheduled, &rows, None, None).unwrap_err();
 
-        assert_eq!(plan.mode, "mixed");
-        assert_eq!(plan.token_ids, vec![10, 11, 12, 99]);
-        assert_eq!(plan.positions, vec![0, 1, 2, 2]);
-        assert_eq!(plan.sequence_ids, vec![1, 2]);
-        assert_eq!(plan.sequence_indptr, vec![0, 3, 4]);
-        assert_eq!(plan.prefill_sequence_indices, vec![0]);
-        assert_eq!(plan.decode_sequence_indices, vec![1]);
-        assert_eq!(plan.sample_sequence_indices, vec![0, 1]);
-        assert_eq!(plan.cache_pool_id, None);
-        assert!(plan.cache_groups.is_empty());
+        assert!(
+            error
+                .to_string()
+                .contains("scheduler selected requests from different phases")
+        );
     }
 
     #[test]

@@ -74,7 +74,7 @@ class Lfm2TorchTests(unittest.TestCase):
                 )
 
     def test_runner_consumes_batch_plan_and_releases_per_request_cache(self) -> None:
-        from resin import BatchPlan
+        from resin import BatchPhase, BatchPlan
         from resin.backends.lfm2_torch import Lfm2TorchRunner
 
         runner = Lfm2TorchRunner.__new__(Lfm2TorchRunner)
@@ -93,8 +93,6 @@ class Lfm2TorchTests(unittest.TestCase):
             [17, 23],
             [0, 2, 3],
             [0, 0],
-            prefill_sequence_indices=[0, 1],
-            decode_sequence_indices=[],
         )
         first = runner.forward(prefill)
         self.assertEqual(len(first), 2)
@@ -106,9 +104,7 @@ class Lfm2TorchTests(unittest.TestCase):
             [17, 23],
             [0, 1, 2],
             [2, 1],
-            mode="decode",
-            prefill_sequence_indices=[],
-            decode_sequence_indices=[0, 1],
+            phase=BatchPhase.DECODE,
         )
         second = runner.forward(decode)
         self.assertEqual(len(second), 2)

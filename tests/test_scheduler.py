@@ -4,6 +4,7 @@ import unittest
 from typing import Any
 
 from resin import (
+    BatchPhase,
     BatchPlan,
     CacheGroupLayout,
     CacheLayout,
@@ -90,15 +91,14 @@ class SchedulerConfigContractTests(unittest.TestCase):
     def test_config_is_frozen_keyword_only_and_validated(self) -> None:
         default = SchedulerConfig()
         self.assertEqual(default.queue_mode, "round_robin")
-        self.assertTrue(default.allow_mixed)
         self.assertEqual(
             repr(default),
-            "SchedulerConfig(queue_mode='round_robin', allow_mixed=True, "
-            "max_batch_tokens=None, prefill_chunk_size=8192)",
+            "SchedulerConfig(queue_mode='round_robin', max_batch_tokens=None, "
+            "prefill_chunk_size=8192)",
         )
 
-        fifo = SchedulerConfig(queue_mode="fifo", allow_mixed=False)
-        self.assertEqual((fifo.queue_mode, fifo.allow_mixed), ("fifo", False))
+        fifo = SchedulerConfig(queue_mode="fifo")
+        self.assertEqual(fifo.queue_mode, "fifo")
         with self.assertRaises(AttributeError):
             fifo.queue_mode = "round_robin"
         with self.assertRaises(TypeError):
@@ -107,9 +107,8 @@ class SchedulerConfigContractTests(unittest.TestCase):
             ValueError, "queue_mode must be 'round_robin' or 'fifo'"
         ):
             SchedulerConfig(queue_mode="priority")
-        for value in (0, 1, None, "yes"):
-            with self.subTest(value=value), self.assertRaises(TypeError):
-                SchedulerConfig(allow_mixed=value)
+        with self.assertRaises(TypeError):
+            SchedulerConfig(allow_mixed=False)
 
         limited = SchedulerConfig(max_batch_tokens=17, prefill_chunk_size=5)
         self.assertEqual(
@@ -118,8 +117,8 @@ class SchedulerConfigContractTests(unittest.TestCase):
         )
         self.assertEqual(
             repr(limited),
-            "SchedulerConfig(queue_mode='round_robin', allow_mixed=True, "
-            "max_batch_tokens=17, prefill_chunk_size=5)",
+            "SchedulerConfig(queue_mode='round_robin', max_batch_tokens=17, "
+            "prefill_chunk_size=5)",
         )
         for field in ("max_batch_tokens", "prefill_chunk_size"):
             with (
@@ -210,28 +209,22 @@ class SchedulerConfigContractTests(unittest.TestCase):
         runner = RecordingRunner()
         engine = Engine(
             runner,
-            scheduler_config=SchedulerConfig(queue_mode="fifo", allow_mixed=False),
+            scheduler_config=SchedulerConfig(queue_mode="fifo"),
         )
         self.assertEqual(engine.scheduler_config.queue_mode, "fifo")
-        self.assertFalse(engine.scheduler_config.allow_mixed)
         with self.assertRaises(TypeError):
             Engine(runner, scheduler_config=object())
 
-        legacy = Engine(RecordingRunner())
-        self.assertEqual(legacy.scheduler_config.queue_mode, "round_robin")
-        self.assertTrue(legacy.scheduler_config.allow_mixed)
+        default = Engine(RecordingRunner())
+        self.assertEqual(default.scheduler_config.queue_mode, "round_robin")
 
     def test_batch_plan_batch_key_defaults_and_range_validation(self) -> None:
-        phase = {
-            "prefill_sequence_indices": [0],
-            "decode_sequence_indices": [],
-        }
-        default = BatchPlan([1], [0], [7], [0, 1], [0], **phase)
-        keyed = BatchPlan([1], [0], [7], [0, 1], [0], batch_key=9, **phase)
+        default = BatchPlan([1], [0], [7], [0, 1], [0])
+        keyed = BatchPlan([1], [0], [7], [0, 1], [0], batch_key=9)
         self.assertIsNone(default.batch_key)
         self.assertEqual(keyed.batch_key, 9)
         with self.assertRaises(OverflowError):
-            BatchPlan([1], [0], [7], [0, 1], [0], batch_key=2**64, **phase)
+            BatchPlan([1], [0], [7], [0, 1], [0], batch_key=2**64)
 
         engine = Engine(RecordingRunner())
         with self.assertRaises(OverflowError):
@@ -239,41 +232,31 @@ class SchedulerConfigContractTests(unittest.TestCase):
         with self.assertRaises(OverflowError):
             engine.submit([1], 1, batch_key=2**64)
 
-    def test_batch_plan_freezes_explicit_phase_and_sampling_rows(self) -> None:
+    def test_batch_plan_freezes_phase_and_sampling_rows(self) -> None:
         plan = BatchPlan(
             [10, 20, 30],
             [0, 4, 0],
             [7, 8, 9],
             [0, 1, 2, 3],
             [0, 4, 0],
-            mode="mixed",
-            prefill_sequence_indices=[0, 2],
-            decode_sequence_indices=[1],
             sample_sequence_indices=[1, 2],
         )
-        self.assertEqual(plan.prefill_sequence_indices, [0, 2])
-        self.assertEqual(plan.decode_sequence_indices, [1])
+        self.assertEqual(plan.phase, BatchPhase.PREFILL)
         self.assertEqual(plan.sample_sequence_indices, [1, 2])
         self.assertEqual(plan.num_sequences, 3)
         self.assertEqual(len(RecordingRunner().forward(plan)), 3)
         with self.assertRaises(AttributeError):
             plan.sample_sequence_indices = [0]
 
-    def test_batch_plan_requires_explicit_phase_rows(self) -> None:
-        with self.assertRaisesRegex(TypeError, "prefill_sequence_indices"):
-            BatchPlan([1, 2], [0, 0], [7, 8], [0, 1, 2], [0, 0])
-
+    def test_batch_plan_phase_is_batch_homogeneous(self) -> None:
         prefill = BatchPlan(
             [1, 2],
             [0, 0],
             [7, 8],
             [0, 1, 2],
             [0, 0],
-            prefill_sequence_indices=[0, 1],
-            decode_sequence_indices=[],
         )
-        self.assertEqual(prefill.prefill_sequence_indices, [0, 1])
-        self.assertEqual(prefill.decode_sequence_indices, [])
+        self.assertEqual(prefill.phase, BatchPhase.PREFILL)
         self.assertEqual(prefill.sample_sequence_indices, [0, 1])
 
         decode = BatchPlan(
@@ -282,73 +265,35 @@ class SchedulerConfigContractTests(unittest.TestCase):
             [7, 8],
             [0, 1, 2],
             [3, 5],
-            mode="decode",
-            prefill_sequence_indices=[],
-            decode_sequence_indices=[0, 1],
+            phase=BatchPhase.DECODE,
         )
-        self.assertEqual(decode.prefill_sequence_indices, [])
-        self.assertEqual(decode.decode_sequence_indices, [0, 1])
+        self.assertEqual(decode.phase, BatchPhase.DECODE)
 
-        mixed = BatchPlan(
-            [1, 2],
-            [0, 5],
-            [7, 8],
-            [0, 1, 2],
-            [0, 5],
-            mode="mixed",
-            prefill_sequence_indices=[0],
-            decode_sequence_indices=[1],
-        )
-        self.assertEqual(mixed.prefill_sequence_indices, [0])
-        self.assertEqual(mixed.decode_sequence_indices, [1])
-
-    def test_batch_plan_rejects_invalid_explicit_row_sets(self) -> None:
-        def make(**metadata: object) -> BatchPlan:
-            return BatchPlan(
-                [10, 20, 30],
-                [0, 4, 0],
-                [7, 8, 9],
-                [0, 1, 2, 3],
-                [0, 4, 0],
-                mode="mixed",
-                **metadata,
-            )
-
-        with self.assertRaisesRegex(TypeError, "decode_sequence_indices"):
-            make(prefill_sequence_indices=[0, 2])
-        for field, value in (
-            ("prefill_sequence_indices", [2, 0]),
-            ("prefill_sequence_indices", [0, 0]),
-            ("decode_sequence_indices", [3]),
-            ("sample_sequence_indices", [2, 1]),
-            ("sample_sequence_indices", [1, 1]),
-            ("sample_sequence_indices", [3]),
-        ):
-            metadata = {
-                "prefill_sequence_indices": [0, 2],
-                "decode_sequence_indices": [1],
-                "sample_sequence_indices": [0, 1, 2],
-            }
-            metadata[field] = value
-            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
-                make(**metadata)
-
-        with self.assertRaisesRegex(ValueError, "must be disjoint"):
-            make(
-                prefill_sequence_indices=[0, 1],
-                decode_sequence_indices=[1, 2],
-            )
-        with self.assertRaisesRegex(ValueError, "exactly partition"):
-            make(prefill_sequence_indices=[0], decode_sequence_indices=[1])
-        with self.assertRaisesRegex(ValueError, "mode must be 'mixed'"):
+        with self.assertRaisesRegex(TypeError, "mode"):
             BatchPlan(
-                [10, 20],
-                [0, 0],
-                [7, 8],
-                [0, 1, 2],
-                [0, 0],
+                [1, 2], [0, 5], [7, 8], [0, 1, 2], [0, 5], mode="mixed"
+            )
+
+    def test_batch_plan_rejects_invalid_sampling_rows(self) -> None:
+        for value in ([2, 1], [1, 1], [3]):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                BatchPlan(
+                    [10, 20, 30],
+                    [0, 4, 0],
+                    [7, 8, 9],
+                    [0, 1, 2, 3],
+                    [0, 4, 0],
+                    sample_sequence_indices=value,
+                )
+
+        with self.assertRaisesRegex(TypeError, "prefill_sequence_indices"):
+            BatchPlan(
+                [1],
+                [0],
+                [7],
+                [0, 1],
+                [0],
                 prefill_sequence_indices=[0],
-                decode_sequence_indices=[1],
             )
 
 
@@ -369,7 +314,7 @@ class NativePolicyIntegrationTests(unittest.TestCase):
             self.assertEqual([first, second, third], [1, 2, 3])
             return [plan.sequence_ids for plan in runner.plans]
 
-        expected = [[1, 2], [3, 1]]
+        expected = [[1, 2], [3]]
         self.assertEqual(trace(None), expected)
         self.assertEqual(trace(SchedulerConfig()), expected)
 
@@ -415,36 +360,18 @@ class NativePolicyIntegrationTests(unittest.TestCase):
         self.assertEqual(runner.plans[-1].sequence_ids, [zero])
         self.assertEqual(runner.plans[-1].batch_key, 0)
 
-    def test_allow_mixed_false_separates_decode_survivor_from_fresh_prefill(
-        self,
-    ) -> None:
-        mixed_runner = RecordingRunner()
-        mixed = Engine(mixed_runner, max_running_requests=2)
-        decode = mixed.submit([10], 2)
-        mixed.step()
-        fresh = mixed.submit([20], 1)
-        mixed.step()
-        self.assertEqual(mixed_runner.plans[-1].sequence_ids, [decode, fresh])
-        self.assertEqual(mixed_runner.plans[-1].mode, "mixed")
-        self.assertEqual(mixed_runner.plans[-1].prefill_sequence_indices, [1])
-        self.assertEqual(mixed_runner.plans[-1].decode_sequence_indices, [0])
-        self.assertEqual(mixed_runner.plans[-1].sample_sequence_indices, [0, 1])
-
-        split_runner = RecordingRunner()
-        split = Engine(
-            split_runner,
-            max_running_requests=2,
-            scheduler_config=SchedulerConfig(allow_mixed=False),
-        )
-        decode = split.submit([10], 2)
-        split.step()
-        fresh = split.submit([20], 1)
-        split.step()
-        self.assertEqual(split_runner.plans[-1].sequence_ids, [decode])
-        self.assertEqual(split_runner.plans[-1].mode, "decode")
-        split.step()
-        self.assertEqual(split_runner.plans[-1].sequence_ids, [fresh])
-        self.assertEqual(split_runner.plans[-1].mode, "prefill")
+    def test_decode_survivor_is_separate_from_fresh_prefill(self) -> None:
+        runner = RecordingRunner()
+        engine = Engine(runner, max_running_requests=2)
+        decode = engine.submit([10], 2)
+        engine.step()
+        fresh = engine.submit([20], 1)
+        engine.step()
+        self.assertEqual(runner.plans[-1].sequence_ids, [decode])
+        self.assertEqual(runner.plans[-1].phase, BatchPhase.DECODE)
+        engine.step()
+        self.assertEqual(runner.plans[-1].sequence_ids, [fresh])
+        self.assertEqual(runner.plans[-1].phase, BatchPhase.PREFILL)
 
     def test_fifo_and_round_robin_diverge_only_in_survivor_turn_refresh(self) -> None:
         def next_batch(queue_mode: str) -> list[int]:
@@ -497,13 +424,11 @@ class NativePolicyIntegrationTests(unittest.TestCase):
         self.assertEqual(retry.sequence_ids, [first, third])
         for field in (
             "batch_key",
-            "mode",
+            "phase",
             "token_ids",
             "positions",
             "sequence_indptr",
             "context_lengths",
-            "prefill_sequence_indices",
-            "decode_sequence_indices",
             "sample_sequence_indices",
         ):
             self.assertEqual(getattr(failed, field), getattr(retry, field), field)
@@ -542,7 +467,7 @@ class NativePolicyIntegrationTests(unittest.TestCase):
         self.assertEqual(async_runner.dispatch_plans[-1].sequence_ids, [other_key])
         async_engine.poll()
 
-    def test_mixed_batch_keeps_dense_outputs_but_only_samples_finished_rows(
+    def test_decode_and_partial_prefill_are_dispatched_separately(
         self,
     ) -> None:
         runner = ContinuationRecordingRunner()
@@ -561,15 +486,22 @@ class NativePolicyIntegrationTests(unittest.TestCase):
 
         events = engine.step()
         plan = runner.plans[-1]
-        self.assertEqual(plan.sequence_ids, [decoding, partial])
-        self.assertEqual(plan.mode, "mixed")
-        self.assertEqual(plan.token_ids, [11, 20, 21])
-        self.assertEqual(plan.context_lengths, [1, 0])
+        self.assertEqual(plan.sequence_ids, [decoding])
+        self.assertEqual(plan.phase, BatchPhase.DECODE)
+        self.assertEqual(plan.token_ids, [11])
+        self.assertEqual(plan.context_lengths, [1])
         self.assertEqual(plan.sample_sequence_indices, [0])
         self.assertEqual([event.request_id for event in events], [decoding])
         self.assertEqual([event.token_id for event in events], [12])
         self.assertFalse(partial.done)
         self.assertEqual(runner.released, [decoding])
+
+        events = engine.step()
+        self.assertEqual(events, [])
+        self.assertEqual(runner.plans[-1].phase, BatchPhase.PREFILL)
+        self.assertEqual(runner.plans[-1].context_lengths, [0])
+        self.assertEqual(runner.plans[-1].sample_sequence_indices, [])
+        self.assertFalse(partial.done)
 
         events = engine.step()
         self.assertEqual(runner.plans[-1].context_lengths, [2])

@@ -12,7 +12,6 @@ engine = Engine(
     context_length=32768,
     scheduler_config=SchedulerConfig(
         queue_mode="round_robin",
-        allow_mixed=True,
         max_batch_tokens=4096,
         prefill_chunk_size=8192,
     ),
@@ -47,16 +46,16 @@ Selection is deterministic:
 1. Find the highest priority in the ready queue.
 2. Use the oldest request at that priority as the anchor.
 3. In age order, take requests with the anchor's exact priority and `batch_key`.
-4. If `allow_mixed=False`, also require the anchor's current prefill/decode phase.
+4. Require the anchor's current prefill/decode phase.
 5. Stop at `max_running_requests`.
 
 The scheduler does not fill spare rows with a lower priority, another key, or an
 incompatible phase. `batch_key=None` is a real cohort and differs from zero.
 Priorities are signed 32-bit integers; larger values run first.
 
-With `allow_mixed=True`, prefill and decode rows may share a plan. Their exact
-membership is explicit in `prefill_sequence_indices` and
-`decode_sequence_indices`; the runner never infers phase from context length.
+Prefill and decode never share a plan. `BatchPlan.phase` is the explicit
+`BatchPhase.PREFILL` or `BatchPhase.DECODE` value for the complete batch. A
+one-token continuation prefill therefore remains unambiguously prefill.
 
 Queue mode determines the age of requests that survive a successful batch:
 
@@ -89,8 +88,8 @@ row consumes its one input token. With controls:
 
 - `prefill_chunk_size` limits each selected prefill row;
 - `max_batch_tokens` is consumed in row order across flattened plan tokens;
-- decode rows always request one token and are omitted if the earlier rows
-  exhaust the batch budget;
+- decode rows always request one token and later rows are omitted when the
+  decode batch exhausts its token budget;
 - the scheduler keeps an oldest prefix of the selected cohort rather than
   skipping a row.
 

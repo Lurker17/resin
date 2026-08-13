@@ -100,8 +100,6 @@ class FlatCacheApiTests(unittest.TestCase):
             [11],
             [0, 2],
             [1],
-            prefill_sequence_indices=[0],
-            decode_sequence_indices=[],
             cache_pool_id=7,
             cache_groups=[group],
         )

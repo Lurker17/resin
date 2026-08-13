@@ -67,7 +67,6 @@ accelerator framework.
 SchedulerConfig(
     *,
     queue_mode="round_robin",      # or "fifo"
-    allow_mixed=True,
     max_batch_tokens=None,
     prefill_chunk_size=8192,
 )
@@ -178,10 +177,11 @@ See the [flat cache-pool contract](cache-pool.md) for allocation and plan detail
 
 ## BatchPlan ABI
 
-`BatchPlan` is frozen. Base arrays describe flattened tokens and positions,
-sequence CSR (`sequence_ids`, `sequence_indptr`), pre-append context lengths,
-explicit prefill/decode row indices, and `sample_sequence_indices`. Optional
-state arrays provide generation-checked slots, access modes, CSR, and a pool ID.
+`BatchPlan` is frozen. `phase` is one `BatchPhase.PREFILL` or
+`BatchPhase.DECODE` value for the complete batch. Base arrays describe flattened
+tokens and positions, sequence CSR (`sequence_ids`, `sequence_indptr`),
+pre-append context lengths, and `sample_sequence_indices`. Optional state arrays
+provide generation-checked slots, access modes, CSR, and a pool ID.
 
 Managed cache metadata is only:
 
