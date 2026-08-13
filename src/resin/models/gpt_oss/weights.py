@@ -1,9 +1,8 @@
 """Streaming weight loading for official GPT-OSS safetensors checkpoints.
 
-This module deliberately has no module-level dependency on PyTorch,
-Transformers, tokenizers, Hugging Face Hub, or safetensors.  It operates on a
-model that an execution backend has already constructed (normally on the meta
-device) and imports the tensor libraries only when a load is requested.
+This module operates on a model that an execution backend has already
+constructed (normally on the meta device). Safetensors are opened only when a
+load is requested.
 
 Ordinary parameters and persistent buffers are assigned directly, one tensor
 at a time.  Packed expert tensors are handed to an :class:`ExpertLayerBuilder`
@@ -23,7 +22,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, Self
 
-from ...backend.loading import resolve_dtype
+import torch
+
+from resin.backend.loading import resolve_dtype
 
 _EXPERT_KEY = re.compile(
     r"^model\.layers\.(?P<layer>[0-9]+)\.mlp\.experts\.(?P<name>.+)$"
@@ -468,11 +469,6 @@ def load_gpt_oss_weights(
     blocks and scales always retain their checkpoint dtype and are moved to the
     requested device before being passed to the builder.
     """
-
-    try:
-        import torch
-    except ImportError as error:
-        raise ImportError("loading GPT-OSS weights requires PyTorch") from error
 
     target = torch.device(device)
     if target.type == "meta":

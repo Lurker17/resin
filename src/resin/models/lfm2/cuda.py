@@ -11,17 +11,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from resin import BatchPhase, CacheGroupLayout, CacheLayout, StateMappingConfig
+import torch
 
-from ...backend.checks import nonempty_plan
-from ...backend.checks import token_ids as check_token_ids
-from ...backend.cuda.execution import CudaCompletion, CudaExecutor
-from ...backend.cuda.mapped_state import MappedStateArena
-from ...backend.cuda.paged_kv import PagedKvArena, PagedKvCsr
-from ...backend.cuda.staging import TensorStager
-from ...backend.sampling import GreedySampler
-from .plan import CacheMetadata, build_cache_metadata
-from .reference import (
+from resin import BatchPhase, CacheGroupLayout, CacheLayout, StateMappingConfig
+from resin.backend.checks import nonempty_plan
+from resin.backend.checks import token_ids as check_token_ids
+from resin.backend.cuda.execution import CudaCompletion, CudaExecutor
+from resin.backend.cuda.mapped_state import MappedStateArena
+from resin.backend.cuda.paged_kv import PagedKvArena, PagedKvCsr
+from resin.backend.cuda.staging import TensorStager
+from resin.backend.sampling import GreedySampler
+from resin.models.lfm2.plan import CacheMetadata, build_cache_metadata
+from resin.models.lfm2.reference import (
     DEFAULT_MODEL,
     DEFAULT_REVISION,
     load_model,
@@ -114,7 +115,6 @@ class Lfm2CudaRunner:
         workspace_bytes: int = 128 * 1024 * 1024,
     ) -> None:
         import flashinfer
-        import torch
         from flash_attn.cute import flash_attn_varlen_func
 
         if not torch.cuda.is_available():

@@ -11,14 +11,6 @@ from typing import Any
 MODEL_FILES = ("config.json", "model*.safetensors", "model.safetensors.index.json")
 
 
-def require_torch(runner_name: str):
-    try:
-        import torch
-    except ImportError as error:
-        raise ImportError(f"{runner_name} requires PyTorch") from error
-    return torch
-
-
 def default_device(torch, *, require_cuda: bool = False) -> str:
     if torch.cuda.is_available():
         return "cuda"

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from time import monotonic, sleep
 
-from .staging import TensorStager
+from resin.backend.cuda.staging import TensorStager
 
 CUDA_COMPLETION_QUARANTINE: list[dict[str, object]] = []
 _ABANDON_QUERY_TIMEOUT_SECONDS = 0.010

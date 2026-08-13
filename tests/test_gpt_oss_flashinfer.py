@@ -228,12 +228,13 @@ class FlashInferMXFP4AdapterTests(unittest.TestCase):
         )
         return kernel, torch, fused_moe
 
-    def test_import_and_factory_are_accelerator_lazy(self) -> None:
+    def test_import_loads_torch_but_not_flashinfer(self) -> None:
         code = """
 import sys
 from resin.models.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
 make_flashinfer_sm90_mxfp4_kernel()
-for name in ('torch', 'flashinfer', 'triton'):
+assert 'torch' in sys.modules
+for name in ('flashinfer', 'triton'):
     assert name not in sys.modules, name
 """
         subprocess.run([sys.executable, "-c", code], check=True)

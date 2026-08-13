@@ -3,7 +3,7 @@
 The model remains ordinary Resin-owned PyTorch code.  This module replaces only
 the expert implementation with the small :mod:`resin.moe_kernels` contract and
 streams official packed tensors through the selected adapter one layer at a
-time.  It imports PyTorch only when a packed model is explicitly loaded.
+time.
 """
 
 from __future__ import annotations
@@ -13,14 +13,15 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import torch
+
+from resin.backend.loading import resolve_dtype
+from resin.models.gpt_oss.weights import load_gpt_oss_weights
 from resin.moe_kernels import (
     MoEExpertWeights,
     MoEKernelConfig,
     MoERouting,
 )
-
-from ...backend.loading import resolve_dtype
-from .weights import load_gpt_oss_weights
 
 _CHECKPOINT_TO_STANDARD = {
     "gate_up_proj_blocks": "gate_up",
@@ -189,13 +190,8 @@ def load_mxfp4_model(
 ):
     """Load an official packed checkpoint without Transformers or tokenizers."""
 
-    try:
-        import torch
-    except ImportError as error:
-        raise ImportError("packed GPT-OSS execution requires PyTorch") from error
-
-    from .config import GptOssConfig
-    from .model import GptOssForCausalLM
+    from resin.models.gpt_oss.config import GptOssConfig
+    from resin.models.gpt_oss.model import GptOssForCausalLM
 
     path = Path(model_path)
     config_path = path / "config.json"

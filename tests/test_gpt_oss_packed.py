@@ -9,11 +9,12 @@ from resin.moe_kernels import MoEKernelConfig
 
 
 class GptOssPackedImportTests(unittest.TestCase):
-    def test_import_is_framework_and_tokenizer_free(self) -> None:
+    def test_import_loads_torch_but_not_serving_stacks(self) -> None:
         script = """
 import sys
 import resin.models.gpt_oss.mxfp4
-for name in ('torch', 'transformers', 'tokenizers', 'flashinfer', 'triton'):
+assert 'torch' in sys.modules
+for name in ('transformers', 'tokenizers', 'flashinfer', 'triton'):
     assert name not in sys.modules, name
 """
         subprocess.run([sys.executable, "-c", script], check=True)

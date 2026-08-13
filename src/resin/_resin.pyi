@@ -1,7 +1,7 @@
 from collections.abc import Sequence
 from typing import Any, Final, final
 
-from .protocols import Runner
+from resin.protocols import Runner
 
 __version__: Final[str]
 

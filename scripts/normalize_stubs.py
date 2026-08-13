@@ -3,7 +3,7 @@
 from pathlib import Path
 
 STUB_PATH = Path(__file__).resolve().parents[1] / "src" / "resin" / "_resin.pyi"
-IMPORT = "from .protocols import Runner"
+IMPORT = "from resin.protocols import Runner"
 GENERATED_ANNOTATION = 'runner: "resin.protocols.Runner"'
 GENERATED_CANCEL = "def cancel(self, /, request: Any) -> bool: ..."
 

@@ -359,11 +359,12 @@ class GptOssWeightLoaderTests(unittest.TestCase):
 
 
 class GptOssWeightLoaderImportTests(unittest.TestCase):
-    def test_import_is_tensor_and_tokenizer_free(self) -> None:
+    def test_import_loads_torch_but_not_checkpoint_stacks(self) -> None:
         script = """
 import sys
 import resin.models.gpt_oss.weights
-for name in ('torch', 'transformers', 'tokenizers', 'huggingface_hub', 'safetensors'):
+assert 'torch' in sys.modules
+for name in ('transformers', 'tokenizers', 'huggingface_hub', 'safetensors'):
     assert name not in sys.modules, name
 """
         subprocess.run([sys.executable, "-c", script], check=True)

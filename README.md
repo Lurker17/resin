@@ -45,8 +45,8 @@ uv run python scripts/normalize_stubs.py
 uv run ruff format src/resin/_resin.pyi
 ```
 
-The control-plane tests do not require a GPU. Accelerator runners import their
-dependencies lazily.
+The control-plane tests do not require a GPU. Importing a concrete model module
+loads PyTorch; importing `resin` or a model package namespace does not.
 
 Install `resin[torch]` for reference models or `resin[cuda]` for the CUDA
 runners. Reusable device-neutral helpers live in `resin.backend`; CUDA helpers

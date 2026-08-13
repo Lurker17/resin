@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..checks import positive_int
+from resin.backend.checks import positive_int
 
 
 @dataclass(frozen=True, slots=True)

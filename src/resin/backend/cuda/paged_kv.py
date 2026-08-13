@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ..resources import CachePoolBinding
+from resin.backend.resources import CachePoolBinding
 
 
 class PagedKvArena:

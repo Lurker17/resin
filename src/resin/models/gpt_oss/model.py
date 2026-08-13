@@ -12,7 +12,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from .config import GptOssConfig
+from resin.models.gpt_oss.config import GptOssConfig
 
 
 class AttentionState:

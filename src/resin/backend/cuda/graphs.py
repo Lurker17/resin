@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
 
-from .staging import StagingError, TensorStager
+from resin.backend.cuda.staging import StagingError, TensorStager
 
 GraphShape = tuple[int, ...]
 

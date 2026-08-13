@@ -6,18 +6,19 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ...backend.loading import (
+import torch
+
+from resin.backend.loading import (
     MODEL_FILES,
     default_device,
     load_safetensor_shards,
     read_config,
-    require_torch,
     resolve_dtype,
     resolve_model,
 )
-from ...backend.plans import plan_rows
-from .config import GptOssConfig
-from .model import GptOssForCausalLM, GptOssState
+from resin.backend.plans import plan_rows
+from resin.models.gpt_oss.config import GptOssConfig
+from resin.models.gpt_oss.model import GptOssForCausalLM, GptOssState
 
 if TYPE_CHECKING:
     from resin import BatchPlan
@@ -89,13 +90,12 @@ def _check_quantization(config: dict[str, Any], *, allow_mxfp4: bool = False) ->
 
 
 def load_model(model_path: Path, *, device, dtype=None, moe_kernel=None):
-    torch = require_torch("GptOssRunner")
     config = read_config(model_path)
     args = GptOssConfig.from_dict(config)
     _check_quantization(config, allow_mxfp4=moe_kernel is not None)
     quantization = config.get("quantization_config") or config.get("quantization")
     if quantization and quantization.get("quant_method") == "mxfp4":
-        from .mxfp4 import load_mxfp4_model
+        from resin.models.gpt_oss.mxfp4 import load_mxfp4_model
 
         return load_mxfp4_model(
             model_path,
@@ -150,7 +150,6 @@ class GptOssRunner:
         dtype=None,
         moe_kernel=None,
     ) -> None:
-        torch = require_torch("GptOssRunner")
         self.prefill_chunk_size = type(self).prefill_chunk_size
         self.device = torch.device(device or default_device(torch, require_cuda=True))
         self.model_path = resolve_model_path(

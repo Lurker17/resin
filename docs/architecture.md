@@ -280,8 +280,9 @@ Reusable runner building blocks live under `resin.backend`. The device-neutral
 package provides plan, binding, and sampling helpers. `resin.backend.cuda`
 provides injected-framework CUDA graphs, asynchronous completion, tensor
 staging, paged KV, and mapped recurrent-state storage. Concrete architectures
-and their runners live separately under `resin.models`. None of these package
-imports loads PyTorch, FlashInfer, or FlashAttention.
+and their runners live separately under `resin.models`. Importing the package
+namespaces does not load PyTorch, FlashInfer, or FlashAttention; importing a
+concrete model implementation loads the framework it uses.
 
 ## Code map
 

@@ -8,7 +8,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from .config import Lfm2Config
+from resin.models.lfm2.config import Lfm2Config
 
 
 class FullAttentionState:

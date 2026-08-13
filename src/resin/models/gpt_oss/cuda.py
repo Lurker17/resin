@@ -18,23 +18,24 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from resin import BatchPhase, CacheGroupLayout, CacheLayout
+import torch
 
-from ...backend.checks import positions as check_positions
-from ...backend.checks import positive_int
-from ...backend.checks import token_ids as check_token_ids
-from ...backend.cuda.graphs import (
+from resin import BatchPhase, CacheGroupLayout, CacheLayout
+from resin.backend.checks import positions as check_positions
+from resin.backend.checks import positive_int
+from resin.backend.checks import token_ids as check_token_ids
+from resin.backend.cuda.graphs import (
     CudaGraphCache,
     CudaGraphStep,
     GraphInputError,
     GraphShape,
     graph_shapes,
 )
-from ...backend.cuda.paged_kv import PagedKvArena, PagedKvTable
-from ...backend.cuda.staging import TensorStager
-from ...backend.loading import default_device
-from ...backend.sampling import GreedySampler
-from .plan import (
+from resin.backend.cuda.paged_kv import PagedKvArena, PagedKvTable
+from resin.backend.cuda.staging import TensorStager
+from resin.backend.loading import default_device
+from resin.backend.sampling import GreedySampler
+from resin.models.gpt_oss.plan import (
     PAGE_SIZE,
     PREFILL_CHUNK_SIZE,
     SLIDING_WINDOW,
@@ -42,7 +43,7 @@ from .plan import (
     AttentionBatch,
     build_attention_batches,
 )
-from .reference import (
+from resin.models.gpt_oss.reference import (
     DEFAULT_MODEL,
     load_model,
     resolve_model_path,
@@ -162,10 +163,6 @@ class GptOssCudaRunner:
                 ),
             ],
         )
-        try:
-            import torch
-        except ImportError as error:
-            raise ImportError("GptOssCudaRunner requires PyTorch") from error
         try:
             installed_fa4 = version("flash-attn-4")
         except PackageNotFoundError as error:

@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, TypeAlias
 
 if TYPE_CHECKING:
-    from ._resin import BatchPlan
+    from resin._resin import BatchPlan
 
 
 class SyncRunner(Protocol):

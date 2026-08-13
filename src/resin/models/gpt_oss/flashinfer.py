@@ -1,9 +1,7 @@
 """FlashInfer's Hopper MXFP4 fused-MoE adapter for GPT-OSS.
 
 The public boundary is :mod:`resin.moe_kernels`; this module contains only the
-FlashInfer-specific cold-path layout conversion and hot-path invocation.  It
-does not import PyTorch or FlashInfer until the adapter is actually prepared or
-executed.
+FlashInfer-specific cold-path layout conversion and hot-path invocation.
 
 FlashInfer's SM90 W4A16 scale layout groups four consecutive MXFP4 groups.
 GPT-OSS uses a width of 2880 (90 groups), so preparation pads the hidden and
@@ -21,6 +19,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+
+import torch
 
 from resin.moe_kernels import (
     MoEExpertWeights,
@@ -204,12 +204,6 @@ class FlashInferSM90MXFP4Kernel:
 
     def _get_torch(self):
         if self._torch is None:
-            try:
-                import torch
-            except ImportError as error:
-                raise ImportError(
-                    f"{KERNEL_ID} requires PyTorch with CUDA support"
-                ) from error
             self._torch = torch
         return self._torch
 

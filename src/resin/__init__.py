@@ -4,7 +4,7 @@ Importing this module intentionally does not import an accelerator framework.
 Choose a runner from :mod:`resin.models` only when constructing an engine.
 """
 
-from ._resin import (
+from resin._resin import (
     BatchPhase,
     BatchPlan,
     CacheGroupLayout,
@@ -20,7 +20,7 @@ from ._resin import (
     __version__,
     mint_state_mapping_arena_id,
 )
-from .protocols import AsyncRunner, Runner, SyncRunner
+from resin.protocols import AsyncRunner, Runner, SyncRunner
 
 __all__ = [
     "BatchPhase",

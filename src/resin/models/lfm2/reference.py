@@ -5,18 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ...backend.loading import (
+import torch
+
+from resin.backend.loading import (
     MODEL_FILES,
     default_device,
     load_safetensor_shards,
     read_config,
-    require_torch,
     resolve_dtype,
     resolve_model,
 )
-from ...backend.plans import plan_rows
-from .config import Lfm2Config
-from .model import Lfm2ForCausalLM, Lfm2State
+from resin.backend.plans import plan_rows
+from resin.models.lfm2.config import Lfm2Config
+from resin.models.lfm2.model import Lfm2ForCausalLM, Lfm2State
 
 if TYPE_CHECKING:
     from resin import BatchPlan
@@ -48,7 +49,6 @@ def resolve_model_path(model: str | Path, revision: str | None) -> Path:
 
 
 def load_model(model_path: Path, *, device, dtype=None):
-    torch = require_torch("Lfm2TorchRunner")
     config = read_config(model_path)
     if config.get("quantization") or config.get("quantization_config"):
         raise ValueError(
@@ -92,7 +92,6 @@ class Lfm2TorchRunner:
         device: str | None = None,
         dtype=None,
     ) -> None:
-        torch = require_torch("Lfm2TorchRunner")
         self.device = torch.device(device or default_device(torch))
         self.model_path = resolve_model_path(model, revision)
         self._torch, self._model, self.config = load_model(
