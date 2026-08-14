@@ -34,6 +34,7 @@ from resin import BatchPhase, CacheGroupLayout, CacheLayout
 from resin.backend.checks import positions as check_positions
 from resin.backend.checks import positive_int
 from resin.backend.checks import token_ids as check_token_ids
+from resin.backend.cuda.attention import paged_fa4
 from resin.backend.cuda.graphs import (
     CudaGraphCache,
     CudaGraphStats,
@@ -198,52 +199,6 @@ class _DeviceAttentionBatch:
     sliding: PagedKvTable
 
 
-def _invoke_fa4(
-    query,
-    key_cache,
-    value_cache,
-    *,
-    cu_seqlens_q,
-    max_seqlen_q: int,
-    page_table,
-    seqused_k,
-    min_seqlen_k: int,
-    max_seqlen_k: int,
-    softmax_scale: float,
-    learnable_sink,
-    sliding: bool,
-):
-    """Call only the pinned FA4 surface required by official GPT-OSS."""
-    from flash_attn.cute import flash_attn_varlen_func
-
-    result = flash_attn_varlen_func(
-        query,
-        key_cache,
-        value_cache,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=None,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        min_seqlen_k=min_seqlen_k,
-        seqused_q=None,
-        seqused_k=seqused_k,
-        page_table=page_table,
-        softmax_scale=softmax_scale,
-        causal=True,
-        window_size=(_SLIDING_WINDOW - 1, 0) if sliding else (None, None),
-        learnable_sink=learnable_sink,
-        softcap=0.0,
-        # FA4's SM90 implementation does not support split-KV. Do not use
-        # its automatic heuristic here because it may choose more than one
-        # split for long decode contexts before rejecting that specialization.
-        num_splits=1,
-        pack_gqa=True,
-        deterministic=False,
-        return_lse=False,
-    )
-    return result[0] if isinstance(result, tuple) else result
-
-
 class GptOssCudaRunner:
     """GPT-OSS BF16 attention on FA4 over one flat native cache pool."""
 
@@ -269,6 +224,8 @@ class GptOssCudaRunner:
         tensor_parallel: TensorParallelContext | None = None,
         fast_allreduce: bool = True,
     ) -> None:
+        from flash_attn.cute import flash_attn_varlen_func
+
         self.tensor_parallel = tensor_parallel or TensorParallelContext()
         self.tensor_parallel_rank = self.tensor_parallel.rank
         self.tensor_parallel_size = self.tensor_parallel.size
@@ -288,6 +245,7 @@ class GptOssCudaRunner:
         )
 
         self._torch = torch
+        self._fa4 = flash_attn_varlen_func
         self._sampler = FlashInferSampler(torch)
         self.device = torch.device(device or default_device(torch, require_cuda=True))
         if self.device.type != "cuda":
@@ -605,7 +563,8 @@ class GptOssCudaRunner:
         value_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
             0, group.append_slots, value
         )
-        output = _invoke_fa4(
+        output = paged_fa4(
+            self._fa4,
             query,
             key_cache,
             value_cache,
@@ -616,8 +575,8 @@ class GptOssCudaRunner:
             min_seqlen_k=group.min_length,
             max_seqlen_k=group.max_length,
             softmax_scale=self.softmax_scale,
+            window_size=(_SLIDING_WINDOW - 1, 0) if sliding else (None, None),
             learnable_sink=attention.sinks,
-            sliding=sliding,
         )
         if output.dtype is not torch.bfloat16:
             raise TypeError("FA4 output tensor must be bfloat16")

@@ -16,6 +16,7 @@ import torch
 from resin import BatchPhase, CacheGroupLayout, CacheLayout, StateMappingConfig
 from resin.backend.checks import nonempty_plan
 from resin.backend.checks import token_ids as check_token_ids
+from resin.backend.cuda.attention import paged_fa4
 from resin.backend.cuda.execution import CudaCompletion, CudaExecutor
 from resin.backend.cuda.mapped_state import MappedStateArena
 from resin.backend.cuda.paged_kv import PagedKvArena, PagedKvCsr
@@ -53,46 +54,6 @@ class _InPlaceRecurrentState:
         if value is None:
             raise ValueError("mapped convolution state cannot be cleared")
         self._state.copy_(value)
-
-
-def _invoke_paged_fa4(
-    kernel,
-    query,
-    key_cache,
-    value_cache,
-    *,
-    cu_seqlens_q,
-    max_seqlen_q: int,
-    page_table,
-    seqused_k,
-    min_seqlen_k: int,
-    max_seqlen_k: int,
-    softmax_scale: float,
-):
-    """Invoke the exact paged-varlen surface pinned by the LFM2 CUDA image."""
-
-    result = kernel(
-        query,
-        key_cache,
-        value_cache,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=None,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        min_seqlen_k=min_seqlen_k,
-        seqused_q=None,
-        seqused_k=seqused_k,
-        page_table=page_table,
-        softmax_scale=softmax_scale,
-        causal=True,
-        window_size=(None, None),
-        softcap=0.0,
-        num_splits=1,
-        pack_gqa=True,
-        deterministic=False,
-        return_lse=False,
-    )
-    return result[0] if isinstance(result, tuple) else result
 
 
 class Lfm2CudaRunner:
@@ -429,7 +390,7 @@ class Lfm2CudaRunner:
 
         if metadata["continuation_prefill_max_q_len"]:
             continuation_token_indices = metadata["continuation_prefill_token_indices"]
-            continuation_output = _invoke_paged_fa4(
+            continuation_output = paged_fa4(
                 self._fa4,
                 queries[continuation_token_indices],
                 k_cache,

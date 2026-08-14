@@ -12,9 +12,8 @@ from resin.backend.cuda.parallel import TensorParallelLayout
 from resin.backend.loading import (
     MODEL_FILES,
     default_device,
-    load_safetensor_shards,
+    materialize_safetensor_model,
     read_config,
-    resolve_dtype,
     resolve_model,
 )
 from resin.backend.plans import plan_rows
@@ -114,29 +113,22 @@ def load_model(
             "tensor parallel loading currently requires packed MXFP4 experts"
         )
 
-    target = torch.device(device)
-    load_target = target if target.type in {"cpu", "cuda"} else torch.device("cpu")
-    with torch.device("meta"):
-        model = GptOssForCausalLM(args)
+    def restore_norm_dtype(model) -> None:
+        # The checkpoint stores BF16 scales, but normalization accumulates and
+        # retains its parameters in FP32.
+        for module in model.modules():
+            if module.__class__.__name__ == "RMSNorm":
+                module.float()
 
-    weights = load_safetensor_shards(model_path, device=load_target, backend="GPT-OSS")
-    model.load_state_dict(weights, strict=True, assign=True)
-    model.materialize_buffers(load_target)
-    if target != load_target:
-        model.to(target)
-
-    resolved_dtype = resolve_dtype(torch, dtype)
-    if resolved_dtype is not None:
-        if not resolved_dtype.is_floating_point:
-            raise ValueError("model dtype must be floating point")
-        model.to(dtype=resolved_dtype)
-    # GPT-OSS keeps normalization scales and arithmetic in float32 even though
-    # the released non-expert checkpoint tensors are BF16.
-    for module in model.modules():
-        if module.__class__.__name__ == "RMSNorm":
-            module.float()
-    model.materialize_buffers(target)
-    model.eval()
+    model = materialize_safetensor_model(
+        torch,
+        model_path,
+        device=device,
+        dtype=dtype,
+        backend="GPT-OSS",
+        build=lambda: GptOssForCausalLM(args),
+        after_cast=restore_norm_dtype,
+    )
     return torch, model, config
 
 

@@ -65,3 +65,39 @@ def load_safetensor_shards(model_path: Path, *, device, backend: str) -> dict[st
             raise ValueError(f"duplicate tensors across weight shards: {duplicates}")
         weights.update(shard)
     return weights
+
+
+def materialize_safetensor_model(
+    torch,
+    model_path: Path,
+    *,
+    device,
+    dtype,
+    backend: str,
+    build: Callable[[], Any],
+    after_cast: Callable[[Any], None] | None = None,
+):
+    """Build a meta model, assign safetensors, and finalize inference buffers."""
+
+    target = torch.device(device)
+    load_target = target if target.type in {"cpu", "cuda"} else torch.device("cpu")
+    with torch.device("meta"):
+        model = build()
+    weights = load_safetensor_shards(model_path, device=load_target, backend=backend)
+    model.load_state_dict(weights, strict=True, assign=True)
+    model.materialize_buffers(load_target)
+    if target != load_target:
+        model.to(target)
+
+    resolved_dtype = resolve_dtype(torch, dtype)
+    if resolved_dtype is not None:
+        if not resolved_dtype.is_floating_point:
+            raise ValueError("model dtype must be floating point")
+        model.to(dtype=resolved_dtype)
+    if after_cast is not None:
+        after_cast(model)
+    # Module.to(dtype=...) casts floating-point buffers too. Each model's
+    # materializer restores computed buffers such as RoPE frequencies.
+    model.materialize_buffers(target)
+    model.eval()
+    return model

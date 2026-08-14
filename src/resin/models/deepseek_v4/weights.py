@@ -2,43 +2,10 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
-from safetensors import safe_open
-
-
-def _indexed_tensor_files(root: Path) -> dict[str, Path]:
-    index_path = root / "model.safetensors.index.json"
-    try:
-        index = json.loads(index_path.read_text())
-    except FileNotFoundError as error:
-        raise FileNotFoundError(f"missing checkpoint index: {index_path}") from error
-    except json.JSONDecodeError as error:
-        raise ValueError(f"invalid checkpoint index: {index_path}") from error
-    weight_map = index.get("weight_map") if isinstance(index, dict) else None
-    if not isinstance(weight_map, dict) or not weight_map:
-        raise ValueError("checkpoint index must contain a non-empty weight_map")
-
-    files: dict[str, Path] = {}
-    for name, filename in weight_map.items():
-        if not isinstance(name, str) or not name:
-            raise ValueError("checkpoint index contains an invalid tensor name")
-        if not isinstance(filename, str):
-            raise ValueError("checkpoint index contains an invalid shard name")
-        relative = Path(filename)
-        if (
-            relative.is_absolute()
-            or len(relative.parts) != 1
-            or relative.suffix != ".safetensors"
-        ):
-            raise ValueError(f"invalid checkpoint shard name: {filename!r}")
-        path = root / relative
-        if not path.is_file():
-            raise FileNotFoundError(f"missing checkpoint shard: {path}")
-        files[name] = path
-    return files
+from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 
 
 def tensor_parallel_axis(name: str) -> int | None:
@@ -111,35 +78,25 @@ def load_deepseek_v4_weights(
     if not 0 <= rank < tensor_parallel_size:
         raise ValueError("rank must be in [0, tensor_parallel_size)")
     root = Path(model_path).expanduser().resolve()
-    tensor_files = _indexed_tensor_files(root)
+    tensor_files = indexed_tensor_files(root, require_index=True)
     targets = dict(model.state_dict())
     if missing := set(targets) - set(tensor_files):
         raise ValueError(f"checkpoint is missing tensors: {sorted(missing)[:8]}")
 
     ordered = sorted(targets, key=lambda name: (tensor_files[name].name, name))
-    current_path: Path | None = None
-    context = None
-    handle = None
     loaded_bytes = 0
     loaded_tensors = 0
-    try:
+    with SafetensorReader() as reader:
         for name in ordered:
             path = tensor_files[name]
-            if path != current_path:
-                if context is not None:
-                    context.__exit__(None, None, None)
-                context = safe_open(str(path), framework="pt", device="cpu")
-                handle = context.__enter__()
-                current_path = path
-
-            tensor = _shard(handle.get_tensor(name), name, rank, tensor_parallel_size)
+            tensor = _shard(reader.read(path, name), name, rank, tensor_parallel_size)
             if name.endswith(".wo_a.weight"):
                 scale_name = name.removesuffix("weight") + "scale"
                 scale_path = tensor_files.get(scale_name)
                 if scale_path != path:
                     raise ValueError("wo_a weight and scale must occupy the same shard")
                 scale = _shard(
-                    handle.get_tensor(scale_name),
+                    reader.read(scale_path, scale_name),
                     scale_name,
                     rank,
                     tensor_parallel_size,
@@ -150,9 +107,6 @@ def load_deepseek_v4_weights(
             loaded_tensors += 1
             with torch.no_grad():
                 targets[name].copy_(tensor.to(device=device))
-    finally:
-        if context is not None:
-            context.__exit__(None, None, None)
 
     return {"tensors": loaded_tensors, "bytes": loaded_bytes}
 

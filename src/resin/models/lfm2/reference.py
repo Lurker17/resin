@@ -10,9 +10,8 @@ import torch
 from resin.backend.loading import (
     MODEL_FILES,
     default_device,
-    load_safetensor_shards,
+    materialize_safetensor_model,
     read_config,
-    resolve_dtype,
     resolve_model,
 )
 from resin.backend.plans import plan_rows
@@ -52,26 +51,14 @@ def load_model(model_path: Path, *, device, dtype=None):
             "quantized safetensors use a different physical format"
         )
     args = Lfm2Config.from_dict(config)
-    target = torch.device(device)
-    load_target = target if target.type in {"cpu", "cuda"} else torch.device("cpu")
-
-    with torch.device("meta"):
-        model = Lfm2ForCausalLM(args)
-
-    weights = load_safetensor_shards(model_path, device=load_target, backend="LFM2")
-    model.load_state_dict(weights, strict=True, assign=True)
-    model.materialize_buffers(load_target)
-    if target != load_target:
-        model.to(target)
-    resolved_dtype = resolve_dtype(torch, dtype)
-    if resolved_dtype is not None:
-        if not resolved_dtype.is_floating_point:
-            raise ValueError("model dtype must be floating point")
-        model.to(dtype=resolved_dtype)
-    # Module.to(dtype=...) casts floating-point buffers too. RoPE frequencies
-    # intentionally remain float32 even when the checkpoint is bfloat16.
-    model.materialize_buffers(target)
-    model.eval()
+    model = materialize_safetensor_model(
+        torch,
+        model_path,
+        device=device,
+        dtype=dtype,
+        backend="LFM2",
+        build=lambda: Lfm2ForCausalLM(args),
+    )
     return torch, model, config
 
 

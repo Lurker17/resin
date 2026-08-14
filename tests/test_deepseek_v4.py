@@ -161,24 +161,23 @@ class TestDeepSeekV4Weights:
             "head.weight": torch.arange(16, 32, dtype=torch.float32).view(8, 2),
         }
 
-        class Handle:
-            def get_tensor(self, name: str) -> torch.Tensor:
-                return tensors[name]
-
-        class Context:
-            def __enter__(self) -> Handle:
-                return Handle()
+        class Reader:
+            def __enter__(self) -> Reader:
+                return self
 
             def __exit__(self, *exc_info: object) -> None:
                 return None
 
+            def read(self, _path: Path, name: str) -> torch.Tensor:
+                return tensors[name]
+
         shard = tmp_path / "model.safetensors"
         monkeypatch.setattr(
             weights,
-            "_indexed_tensor_files",
-            lambda root: {name: shard for name in tensors},
+            "indexed_tensor_files",
+            lambda root, **kwargs: {name: shard for name in tensors},
         )
-        monkeypatch.setattr(weights, "safe_open", lambda *args, **kwargs: Context())
+        monkeypatch.setattr(weights, "SafetensorReader", Reader)
         model = TinyRank()
 
         report = load_deepseek_v4_weights(
