@@ -396,7 +396,7 @@ def _drain_async_engine(engine) -> dict[str, int]:
 
 
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
+    modal.Image.from_registry("nvidia/cuda:13.3.1-devel-ubuntu22.04", add_python="3.12")
     .apt_install("build-essential", "curl")
     .run_commands(
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
@@ -420,6 +420,7 @@ image = (
         "flash-attn-4==4.0.0b22",
         "nvidia-cutlass-dsl==4.6.0.dev0",
         "apache-tvm-ffi==0.1.13.post2",
+        "cuda-tile==1.4.0",
         "quack-kernels==0.5.3",
         "triton==3.7.1",
         "blake3==1.0.9",

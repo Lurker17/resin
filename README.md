@@ -184,14 +184,19 @@ runner placement.
 Implemented runner modules include synchronous LFM2 and GPT-OSS references and
 local CUDA implementations for LFM2 and GPT-OSS. The GPT-OSS CUDA path uses one
 History group and one Window group over the flat pool. Its deployment harness
-has been verified on an H200 with reusable decode CUDA graphs.
+supports intra-container tensor parallel sizes 1, 2, 4, and 8, with matching
+multi-H200 allocations and reusable distributed decode CUDA graphs. Attention
+heads, KV storage, and MXFP4 expert intermediate dimensions are sharded; row
+parallel attention and expert outputs are reduced through one NCCL group.
 
 The LFM2 CUDA runner has one route: atomic cache-plus-state binding followed by
 asynchronous dispatch/poll. Its continuation harness uses native Engine plans;
 there is no parallel manual-plan or synchronous compatibility path.
 
 Current limits include one in-flight batch per Engine, greedy runner-owned
-sampling, no tensor/expert parallel control plane, and no distributed serving.
+sampling, no expert parallel or data-parallel attention, and no multi-node
+serving. Tensor parallelism remains a GPT-OSS CUDA backend concern rather than
+part of the native scheduler.
 
 ## Public surface
 

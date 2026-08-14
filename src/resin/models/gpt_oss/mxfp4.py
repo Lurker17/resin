@@ -9,11 +9,13 @@ time.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from resin.backend.cuda.parallel import TensorParallelLayout, TensorShard
 from resin.backend.loading import resolve_dtype
 from resin.models.gpt_oss.weights import load_gpt_oss_weights
 from resin.moe_kernels import (
@@ -31,6 +33,99 @@ _CHECKPOINT_TO_STANDARD = {
     "down_proj_bias": "down_bias",
 }
 _EXPERT_CHECKPOINT_NAMES = tuple(_CHECKPOINT_TO_STANDARD)
+
+
+def _slice_axis(tensor, axis: int, shard: TensorShard):
+    selection = [slice(None)] * tensor.ndim
+    selection[axis] = shard.as_slice()
+    return tensor[tuple(selection)].contiguous()
+
+
+def _local_args(args, tensor_parallel: TensorParallelLayout):
+    query_heads = tensor_parallel.even_shard(
+        args.num_attention_heads, name="num_attention_heads"
+    )
+    kv_heads = tensor_parallel.even_shard(
+        args.num_key_value_heads, name="num_key_value_heads"
+    )
+    intermediate = tensor_parallel.aligned_shard(
+        args.intermediate_size,
+        alignment=32,
+        name="intermediate_size",
+    )
+    return replace(
+        args,
+        num_attention_heads=query_heads.size,
+        num_key_value_heads=kv_heads.size,
+        intermediate_size=intermediate.size,
+    )
+
+
+def _checkpoint_tensor_for_rank(
+    key: str,
+    tensor,
+    *,
+    args,
+    tensor_parallel: TensorParallelLayout,
+):
+    """Return one rank's canonical contiguous checkpoint shard."""
+
+    if not tensor_parallel.enabled:
+        return tensor
+
+    query_heads = tensor_parallel.even_shard(
+        args.num_attention_heads, name="num_attention_heads"
+    )
+    kv_heads = tensor_parallel.even_shard(
+        args.num_key_value_heads, name="num_key_value_heads"
+    )
+    intermediate = tensor_parallel.aligned_shard(
+        args.intermediate_size,
+        alignment=32,
+        name="intermediate_size",
+    )
+    query_width = TensorShard(
+        query_heads.start * args.head_dim,
+        query_heads.stop * args.head_dim,
+    )
+    kv_width = TensorShard(
+        kv_heads.start * args.head_dim,
+        kv_heads.stop * args.head_dim,
+    )
+
+    if key.endswith(".self_attn.q_proj.weight") or key.endswith(
+        ".self_attn.q_proj.bias"
+    ):
+        return _slice_axis(tensor, 0, query_width)
+    if key.endswith(".self_attn.k_proj.weight") or key.endswith(
+        ".self_attn.k_proj.bias"
+    ):
+        return _slice_axis(tensor, 0, kv_width)
+    if key.endswith(".self_attn.v_proj.weight") or key.endswith(
+        ".self_attn.v_proj.bias"
+    ):
+        return _slice_axis(tensor, 0, kv_width)
+    if key.endswith(".self_attn.o_proj.weight"):
+        return _slice_axis(tensor, 1, query_width)
+    if key.endswith(".self_attn.sinks"):
+        return _slice_axis(tensor, 0, query_heads)
+    if key.endswith(".self_attn.o_proj.bias"):
+        return tensor if tensor_parallel.rank == 0 else torch.zeros_like(tensor)
+
+    expert_name = key.rsplit(".", 1)[-1]
+    if expert_name in {
+        "gate_up_proj_blocks",
+        "gate_up_proj_scales",
+        "gate_up_proj_bias",
+    }:
+        paired = TensorShard(2 * intermediate.start, 2 * intermediate.stop)
+        return _slice_axis(tensor, 1, paired)
+    if expert_name in {"down_proj_blocks", "down_proj_scales"}:
+        grouped = TensorShard(intermediate.start // 32, intermediate.stop // 32)
+        return _slice_axis(tensor, 2, grouped)
+    if expert_name == "down_proj_bias":
+        return tensor if tensor_parallel.rank == 0 else torch.zeros_like(tensor)
+    return tensor
 
 
 def _cuda_architecture(torch, device) -> str:
@@ -144,6 +239,7 @@ def load_mxfp4_model(
     device,
     kernel,
     dtype=None,
+    tensor_parallel: TensorParallelLayout | None = None,
 ):
     """Load an official packed checkpoint without Transformers or tokenizers."""
 
@@ -156,6 +252,7 @@ def load_mxfp4_model(
         raise FileNotFoundError(f"missing model config: {config_path}")
     config = json.loads(config_path.read_text())
     args = GptOssConfig.from_dict(config)
+    tensor_parallel = tensor_parallel or TensorParallelLayout()
     quantization = config.get("quantization_config") or config.get("quantization")
     if not quantization or quantization.get("quant_method") != "mxfp4":
         raise ValueError("load_mxfp4_model requires an MXFP4 GPT-OSS checkpoint")
@@ -165,12 +262,13 @@ def load_mxfp4_model(
     if resolved_dtype not in {None, torch.bfloat16}:
         raise ValueError("the packed SM90 GPT-OSS path requires bfloat16 activations")
     architecture = _cuda_architecture(torch, target)
-    moe_config = _moe_config(args, architecture)
+    local_args = _local_args(args, tensor_parallel)
+    moe_config = _moe_config(local_args, architecture)
     kernel.validate(moe_config)
 
     expert_factory = _make_kernel_expert_factory(torch, kernel, moe_config)
     with torch.device("meta"):
-        model = GptOssForCausalLM(args, expert_factory)
+        model = GptOssForCausalLM(local_args, expert_factory)
 
     load_gpt_oss_weights(
         path,
@@ -179,6 +277,12 @@ def load_mxfp4_model(
         dtype=torch.bfloat16,
         num_hidden_layers=args.num_hidden_layers,
         expert_tensor_names=_EXPERT_CHECKPOINT_NAMES,
+        transform_tensor=lambda key, tensor: _checkpoint_tensor_for_rank(
+            key,
+            tensor,
+            args=args,
+            tensor_parallel=tensor_parallel,
+        ),
         install_expert_layer=lambda layer, tensors: _install_expert_layer(
             model, kernel, moe_config, layer, dict(tensors)
         ),

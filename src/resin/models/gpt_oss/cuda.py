@@ -1,4 +1,4 @@
-"""Concrete FA4 b22 execution for GPT-OSS on one Hopper GPU.
+"""Concrete FA4 b22 execution for GPT-OSS on Hopper GPUs.
 
 This is intentionally a model backend, not a public attention abstraction.
 Rust owns one flat cache pool and supplies two ordered sparse group plans:
@@ -19,6 +19,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
+from flashinfer.comm import (
+    AllReduceFusionPattern,
+    AllReduceFusionWorkspace,
+    allreduce_fusion,
+    create_allreduce_fusion_workspace,
+)
+from flashinfer.comm.mnnvl import TorchDistBackend
+from flashinfer.gemm import tinygemm_bf16
+from quack import rmsnorm
+from quack.rotary import apply_rotary
+from torch import Tensor
 
 from resin import BatchPhase, CacheGroupLayout, CacheLayout
 from resin.backend.checks import positions as check_positions
@@ -33,9 +44,13 @@ from resin.backend.cuda.graphs import (
     graph_shapes,
 )
 from resin.backend.cuda.paged_kv import PagedKvArena, PagedKvTable
+from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.loading import default_device
 from resin.backend.sampling import GreedySampler
+from resin.models.gpt_oss.config import GptOssConfig
+from resin.models.gpt_oss.cutile import top4_softmax
+from resin.models.gpt_oss.model import MLP, TopKRouter
 from resin.models.gpt_oss.plan import (
     PAGE_SIZE,
     PREFILL_CHUNK_SIZE,
@@ -63,6 +78,34 @@ _WINDOW_TABLE_WIDTH = WINDOW_TABLE_WIDTH
 _NUM_KV_HEADS = 8
 _HEAD_DIM = 64
 _BF16_BYTES = 2
+_TINYGEMM_MAX_TOKENS = 128
+
+
+def _router_logits(router: TopKRouter, hidden: Tensor) -> Tensor:
+    """Use Hopper TinyGEMM for skinny decode routers and GEMM otherwise."""
+
+    if hidden.shape[0] <= _TINYGEMM_MAX_TOKENS:
+        output = torch.empty(
+            (hidden.shape[0], router.weight.shape[0]),
+            dtype=hidden.dtype,
+            device=hidden.device,
+        )
+        tinygemm_bf16(
+            hidden,
+            router.weight,
+            output,
+            router.bias,
+            use_pdl=False,
+        )
+        return output
+    return torch.nn.functional.linear(hidden, router.weight, router.bias)
+
+
+def _route(router: TopKRouter, logits: Tensor) -> tuple[Tensor, Tensor]:
+    if router.top_k == 4 and logits.shape[-1] == 128:
+        return top4_softmax(logits)
+    values, indices = torch.topk(logits, router.top_k, dim=-1, sorted=True)
+    return indices, torch.softmax(values, dim=-1)
 
 
 class _PostAcceptCudaError(RuntimeError):
@@ -97,6 +140,7 @@ def plan_gpt_oss_kv_capacity(
     *,
     attention_layers_per_group: int = 18,
     swa_full_tokens_ratio: float = 0.8,
+    tensor_parallel_size: int = 1,
 ) -> GptOssKvCapacityPlan:
     """Calculate GPT-OSS KV capacity without imposing an allocation policy.
 
@@ -106,51 +150,28 @@ def plan_gpt_oss_kv_capacity(
     advisory token-capacity split rather than two physical allocations.
     """
 
-    for name, value in (
-        ("total_memory_bytes", total_memory_bytes),
-        ("model_memory_bytes", model_memory_bytes),
-        ("attention_layers_per_group", attention_layers_per_group),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(f"{name} must be a positive integer")
-    if model_memory_bytes >= total_memory_bytes:
-        raise ValueError("model_memory_bytes must be smaller than total GPU memory")
-    if (
-        isinstance(static_memory_fraction, bool)
-        or not isinstance(static_memory_fraction, (int, float))
-        or not 0.0 < static_memory_fraction < 1.0
-    ):
-        raise ValueError("static_memory_fraction must be between zero and one")
-    if (
-        isinstance(swa_full_tokens_ratio, bool)
-        or not isinstance(swa_full_tokens_ratio, (int, float))
-        or not 0.0 <= swa_full_tokens_ratio <= 1.0
-    ):
-        raise ValueError("swa_full_tokens_ratio must be between zero and one")
+    if _NUM_KV_HEADS % tensor_parallel_size:
+        raise ValueError("tensor_parallel_size must divide GPT-OSS KV heads")
 
     static_memory_bytes = int(total_memory_bytes * static_memory_fraction)
     kv_budget_bytes = static_memory_bytes - model_memory_bytes
-    if kv_budget_bytes <= 0:
-        raise ValueError("the static memory target leaves no room for KV cache")
     bytes_per_parent = (
         2
         * attention_layers_per_group
         * _PAGE_SIZE
-        * _NUM_KV_HEADS
+        * (_NUM_KV_HEADS // tensor_parallel_size)
         * _HEAD_DIM
         * _BF16_BYTES
     )
     # The device slab contains parent zero as a permanent null/graph-capture
     # page in addition to the positive parent IDs owned by the native pool.
     parent_capacity = kv_budget_bytes // bytes_per_parent - 1
-    if parent_capacity <= 0:
-        raise ValueError("the KV budget cannot hold a usable parent plus null page")
     full_parent_target = max(1, int(parent_capacity / (1.0 + swa_full_tokens_ratio)))
     swa_parent_target = parent_capacity - full_parent_target
     return GptOssKvCapacityPlan(
         total_memory_bytes=total_memory_bytes,
         model_memory_bytes=model_memory_bytes,
-        static_memory_fraction=float(static_memory_fraction),
+        static_memory_fraction=static_memory_fraction,
         static_memory_bytes=static_memory_bytes,
         kv_budget_bytes=kv_budget_bytes,
         bytes_per_parent=bytes_per_parent,
@@ -160,7 +181,7 @@ def plan_gpt_oss_kv_capacity(
         swa_parent_target=swa_parent_target,
         full_token_target=full_parent_target * _PAGE_SIZE,
         swa_token_target=swa_parent_target * _PAGE_SIZE,
-        swa_full_tokens_ratio=float(swa_full_tokens_ratio),
+        swa_full_tokens_ratio=swa_full_tokens_ratio,
     )
 
 
@@ -247,7 +268,12 @@ class GptOssCudaRunner:
         dtype=None,
         moe_kernel=None,
         cuda_graph_decode_shapes: object = None,
+        tensor_parallel: TensorParallelContext | None = None,
+        fast_allreduce: bool = True,
     ) -> None:
+        self.tensor_parallel = tensor_parallel or TensorParallelContext()
+        self.tensor_parallel_rank = self.tensor_parallel.rank
+        self.tensor_parallel_size = self.tensor_parallel.size
         self.cache_parent_capacity = positive_int(
             "cache_parent_capacity", cache_parent_capacity
         )
@@ -310,9 +336,16 @@ class GptOssCudaRunner:
             device=self.device,
             dtype=torch.bfloat16,
             moe_kernel=moe_kernel,
+            tensor_parallel=self.tensor_parallel.layout,
         )
         args = self._model.args
-        expected_attention = (64, 8, 64, _SLIDING_WINDOW)
+        checkpoint_args = GptOssConfig.from_dict(self.config)
+        expected_attention = (
+            checkpoint_args.num_attention_heads // self.tensor_parallel_size,
+            checkpoint_args.num_key_value_heads // self.tensor_parallel_size,
+            64,
+            _SLIDING_WINDOW,
+        )
         actual_attention = (
             args.num_attention_heads,
             args.num_key_value_heads,
@@ -332,6 +365,32 @@ class GptOssCudaRunner:
         self.hidden_size = args.hidden_size
         self.vocab_size = args.vocab_size
         self.eos_token_id = self.config.get("eos_token_id")
+
+        self._allreduce_workspace: AllReduceFusionWorkspace | None = None
+        self.allreduce_backend = "local"
+        if self.tensor_parallel.enabled and fast_allreduce:
+            self._allreduce_workspace = create_allreduce_fusion_workspace(
+                backend="auto",
+                world_size=self.tensor_parallel_size,
+                rank=self.tensor_parallel_rank,
+                max_token_num=_PREFILL_CHUNK_SIZE,
+                hidden_dim=self.hidden_size,
+                dtype=torch.bfloat16,
+                comm_backend=TorchDistBackend(group=self.tensor_parallel.process_group),
+                group=self.tensor_parallel.process_group,
+            )
+            self.allreduce_backend = self._allreduce_workspace.backend
+        elif self.tensor_parallel.enabled:
+            self.allreduce_backend = "nccl"
+
+        for layer in self._model.model.layers:
+            layer.self_attn.pack_qkv_projection()
+            # MNNVL's fused RMSNorm reads gamma in the communication tensor's
+            # dtype. The checkpoint values are BF16 even though RMSNorm
+            # parameters are initially materialized as FP32.
+            layer.input_layernorm.to(dtype=torch.bfloat16)
+            layer.post_attention_layernorm.to(dtype=torch.bfloat16)
+        self._model.model.norm.to(dtype=torch.bfloat16)
 
         self._full_layers = tuple(
             index
@@ -490,12 +549,17 @@ class GptOssCudaRunner:
     def _apply_yarn_rotary(self, hidden, cos, sin):
         """Apply the model's already-materialized YaRN cos/sin tensors."""
 
-        first, second = hidden.chunk(2, dim=-1)
-        cos = cos.squeeze(0).unsqueeze(1)
-        sin = sin.squeeze(0).unsqueeze(1)
-        return self._torch.cat(
-            (first * cos - second * sin, second * cos + first * sin), dim=-1
+        # The runner already gathers the YaRN rows for every packed token. A
+        # synthetic batch dimension lets Quack consume those rows directly,
+        # independent of the requests they came from.
+        apply_rotary(
+            hidden.unsqueeze(0),
+            cos.squeeze(0),
+            sin.squeeze(0),
+            interleaved=False,
+            inplace=True,
         )
+        return hidden
 
     def _attention(
         self,
@@ -508,13 +572,17 @@ class GptOssCudaRunner:
         torch = self._torch
         token_count = hidden.shape[1]
         flat = hidden.reshape(token_count, self.hidden_size)
-        query = attention.q_proj(flat).view(
-            token_count, self.num_query_heads, self.head_dim
+        query, key, value = attention.qkv_proj(flat).split(
+            (
+                self.num_query_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim,
+            ),
+            dim=-1,
         )
-        key = attention.k_proj(flat).view(token_count, self.num_kv_heads, self.head_dim)
-        value = attention.v_proj(flat).view(
-            token_count, self.num_kv_heads, self.head_dim
-        )
+        query = query.view(token_count, self.num_query_heads, self.head_dim)
+        key = key.view(token_count, self.num_kv_heads, self.head_dim)
+        value = value.view(token_count, self.num_kv_heads, self.head_dim)
         cos, sin = position_embeddings
         query = self._apply_yarn_rotary(query, cos, sin)
         key = self._apply_yarn_rotary(key, cos, sin)
@@ -561,6 +629,52 @@ class GptOssCudaRunner:
             raise TypeError("FA4 output tensor must be bfloat16")
         return attention.o_proj(output.reshape(1, token_count, -1))
 
+    def _allreduce_residual_rmsnorm(
+        self,
+        partial: Tensor,
+        residual: Tensor,
+        weight: Tensor,
+        eps: float,
+    ) -> tuple[Tensor, Tensor]:
+        workspace = self._allreduce_workspace
+        if workspace is None:
+            reduced = self.tensor_parallel.sum(partial)
+            normalized, combined = rmsnorm(
+                reduced,
+                weight,
+                residual=residual,
+                eps=eps,
+                prenorm=True,
+            )
+            return normalized, combined
+
+        shape = partial.shape
+        flat_partial = partial.reshape(-1, shape[-1])
+        flat_residual = residual.reshape(-1, shape[-1])
+        combined = torch.empty_like(flat_partial)
+        normalized = torch.empty_like(flat_partial)
+        allreduce_fusion(
+            input=flat_partial,
+            workspace=workspace,
+            pattern=AllReduceFusionPattern.kARResidualRMSNorm,
+            launch_with_pdl=False,
+            trigger_completion_at_end=True,
+            residual_in=flat_residual,
+            residual_out=combined,
+            norm_out=normalized,
+            rms_gamma=weight,
+            rms_eps=eps,
+        )
+        return normalized.view(shape), combined.view(shape)
+
+    @staticmethod
+    def _moe(mlp: MLP, hidden: Tensor) -> Tensor:
+        shape = hidden.shape
+        flat = hidden.reshape(-1, shape[-1])
+        logits = _router_logits(mlp.router, flat)
+        indices, weights = _route(mlp.router, logits)
+        return mlp.experts(flat, indices, weights, logits).reshape(shape)
+
     def _forward_batch(self, token_ids, positions, batch: _DeviceAttentionBatch):
         selected_tokens = token_ids.index_select(0, batch.token_indices)
         selected_positions = positions.index_select(0, batch.token_indices)
@@ -568,9 +682,13 @@ class GptOssCudaRunner:
         position_embeddings = self._model.model.rotary_emb(
             selected_positions.unsqueeze(0), hidden.dtype
         )
-        for layer_index, layer in enumerate(self._model.model.layers):
-            residual = hidden
-            normalized = layer.input_layernorm(hidden)
+        layers = self._model.model.layers
+        normalized = rmsnorm(
+            hidden,
+            layers[0].input_layernorm.weight,
+            eps=layers[0].input_layernorm.eps,
+        )
+        for layer_index, layer in enumerate(layers):
             attention_out = self._attention(
                 layer_index,
                 layer.self_attn,
@@ -578,13 +696,26 @@ class GptOssCudaRunner:
                 position_embeddings,
                 batch,
             )
-            hidden = residual + attention_out
-            residual = hidden
-            normalized_mlp_input = layer.post_attention_layernorm(hidden)
-            moe_output = layer.mlp(normalized_mlp_input)
-            hidden = residual + moe_output
-        hidden = self._model.model.norm(hidden).squeeze(0)
-        return hidden.index_select(0, batch.last_token_indices)
+            normalized_mlp_input, hidden = self._allreduce_residual_rmsnorm(
+                attention_out,
+                hidden,
+                layer.post_attention_layernorm.weight,
+                layer.post_attention_layernorm.eps,
+            )
+            moe_output = self._moe(layer.mlp, normalized_mlp_input)
+            next_norm = (
+                layers[layer_index + 1].input_layernorm
+                if layer_index + 1 < len(layers)
+                else self._model.model.norm
+            )
+            normalized, hidden = self._allreduce_residual_rmsnorm(
+                moe_output,
+                hidden,
+                next_norm.weight,
+                next_norm.eps,
+            )
+        final_hidden = normalized.squeeze(0)
+        return final_hidden.index_select(0, batch.last_token_indices)
 
     @staticmethod
     def _pad_page_table(batch: AttentionBatch, width: int) -> tuple[int, ...]:

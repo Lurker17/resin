@@ -265,13 +265,18 @@ exposes only the atomic cache-plus-state binder and asynchronous `dispatch` /
 continuation harness is driven by the native Engine rather than fabricated
 runner-facing plans.
 `GptOssCudaRunner` uses ordered History and Window groups over one parent pool,
-with FA4 attention and fused MoE execution. These CUDA paths and the GPT-OSS
-deployment harness are migrated in the local tree. The harness has not been
-launched, so there is no new remote GPU proof for this cache architecture yet.
+with FA4 attention and fused MoE execution. Its optional tensor-parallel context
+shards attention and KV heads plus the MXFP4 expert intermediate dimension, then
+reduces row-parallel attention and expert outputs through NCCL. The native
+Engine remains topology-blind: each rank executes the same frozen plan and owns
+an identically shaped logical cache pool, while physical KV bytes shrink with
+the local KV-head count. The Modal harness maps TP 1, 2, 4, and 8 to matching
+multi-H200 containers and verifies exact output-token agreement across ranks.
 
 Current limits are one in-flight batch per Engine, private rather than shared
-request cache, greedy runner-owned sampling, no tensor/expert parallel control
-plane, and no distributed serving.
+request cache, greedy runner-owned sampling, no expert parallel or data-parallel
+attention, and no multi-node serving. Tensor parallelism is currently specific
+to the GPT-OSS CUDA backend rather than a native scheduling concept.
 Tokenization, chat formatting, detokenization, and text streaming remain outside
 Resin. A completed token buffer is transferred to the caller's `RequestLease`;
 the Engine does not retain completed outputs indefinitely.

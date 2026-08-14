@@ -1,0 +1,67 @@
+"""Test-only stubs for optional CUDA packages unavailable on macOS."""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from types import ModuleType
+
+if importlib.util.find_spec("quack") is None:
+    quack = ModuleType("quack")
+    rotary = ModuleType("quack.rotary")
+
+    def _unavailable(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("Quack is unavailable in this test environment")
+
+    quack.rmsnorm = _unavailable
+    rotary.apply_rotary = _unavailable
+    sys.modules["quack"] = quack
+    sys.modules["quack.rotary"] = rotary
+
+if importlib.util.find_spec("flashinfer") is None:
+    flashinfer = ModuleType("flashinfer")
+    comm = ModuleType("flashinfer.comm")
+    mnnvl = ModuleType("flashinfer.comm.mnnvl")
+    gemm = ModuleType("flashinfer.gemm")
+
+    def _flashinfer_unavailable(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("FlashInfer is unavailable in this test environment")
+
+    gemm.tinygemm_bf16 = _flashinfer_unavailable
+
+    class _AllReduceFusionPattern:
+        kARResidualRMSNorm = 1
+
+    class _AllReduceFusionWorkspace:
+        backend = "unavailable"
+
+    class _TorchDistBackend:
+        def __init__(self, group: object = None) -> None:
+            self.group = group
+
+    comm.AllReduceFusionPattern = _AllReduceFusionPattern
+    comm.AllReduceFusionWorkspace = _AllReduceFusionWorkspace
+    comm.allreduce_fusion = _flashinfer_unavailable
+    comm.create_allreduce_fusion_workspace = _flashinfer_unavailable
+    mnnvl.TorchDistBackend = _TorchDistBackend
+    sys.modules["flashinfer"] = flashinfer
+    sys.modules["flashinfer.comm"] = comm
+    sys.modules["flashinfer.comm.mnnvl"] = mnnvl
+    sys.modules["flashinfer.gemm"] = gemm
+
+if (
+    importlib.util.find_spec("cuda") is None
+    or importlib.util.find_spec("cuda.tile") is None
+):
+    cuda = ModuleType("cuda")
+    tile = ModuleType("cuda.tile")
+
+    def _kernel(function: object) -> object:
+        return function
+
+    tile.kernel = _kernel
+    cuda.tile = tile
+    sys.modules["cuda"] = cuda
+    sys.modules["cuda.tile"] = tile

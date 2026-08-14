@@ -5,6 +5,7 @@ import inspect
 import math
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from resin import BatchPhase
 from resin.backend.resources import CachePoolBinding
@@ -12,8 +13,11 @@ from resin.backend.sampling import GreedySampler
 from resin.models.gpt_oss.cuda import (
     GptOssCudaRunner,
     _invoke_fa4_b22,
+    _route,
+    _router_logits,
     plan_gpt_oss_kv_capacity,
 )
+from resin.models.gpt_oss.model import Attention
 from resin.models.gpt_oss.plan import (
     PREFILL_CHUNK_SIZE,
     WINDOW_TABLE_WIDTH,
@@ -172,8 +176,18 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         self.assertEqual(plan.full_token_target, plan.full_parent_target * 128)
         self.assertEqual(plan.swa_token_target, plan.swa_parent_target * 128)
 
+        tp4 = plan_gpt_oss_kv_capacity(
+            100 * gib,
+            55 * gib,
+            0.75,
+            tensor_parallel_size=4,
+        )
+        self.assertEqual(tp4.bytes_per_parent, plan.bytes_per_parent // 4)
+        self.assertGreater(tp4.parent_capacity, plan.parent_capacity)
+
     def test_runner_exposes_only_the_flat_grouped_cache_path(self) -> None:
         source = inspect.getsource(GptOssCudaRunner)
+        parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
         self.assertIs(GptOssCudaRunner.supports_continuation_prefill, True)
         self.assertEqual(GptOssCudaRunner.prefill_chunk_size, 8192)
         self.assertEqual(GptOssCudaRunner.max_batch_tokens, 8192)
@@ -181,6 +195,10 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         self.assertIn("CacheGroupLayout(_PAGE_SIZE)", source)
         self.assertIn('retention="window"', source)
         self.assertIn("build_attention_batches", source)
+        self.assertIn("tensor_parallel", parameters)
+        self.assertIn("fast_allreduce", parameters)
+        self.assertEqual(source.count("self.tensor_parallel.sum("), 1)
+        self.assertEqual(source.count("self._allreduce_residual_rmsnorm("), 2)
 
     def test_cache_pool_binding_is_exact_idempotent_and_permanent(self) -> None:
         runner = self._binding_runner()
@@ -339,6 +357,10 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         self.assertNotIn(".float(", source)
         self.assertNotIn("repeat_interleave", source)
         self.assertNotIn("repeat(", source)
+        self.assertEqual(source.count("qkv_proj("), 1)
+        self.assertNotIn("attention.q_proj(", source)
+        self.assertNotIn("attention.k_proj(", source)
+        self.assertNotIn("attention.v_proj(", source)
         self.assertIn("index_copy_", source)
 
     def test_runner_has_no_python_request_cache_or_page_allocator(self) -> None:
@@ -401,6 +423,150 @@ class GptOssCudaFa4CallTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
 class GptOssCudaTinyOracleTests(unittest.TestCase):
+    def test_flashinfer_allreduce_fuses_residual_and_rmsnorm(self) -> None:
+        import torch
+
+        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
+        runner._allreduce_workspace = SimpleNamespace(backend="trtllm")
+        partial = torch.randn(1, 3, 8, dtype=torch.bfloat16)
+        residual = torch.randn(1, 3, 8, dtype=torch.bfloat16)
+        weight = torch.randn(8, dtype=torch.bfloat16)
+        eps = 1e-5
+        calls = []
+
+        def fused(**kwargs):
+            calls.append(kwargs)
+            combined = kwargs["input"] + kwargs["residual_in"]
+            kwargs["residual_out"].copy_(combined)
+            normalized = combined.float()
+            normalized *= torch.rsqrt(
+                normalized.square().mean(-1, keepdim=True) + kwargs["rms_eps"]
+            )
+            kwargs["norm_out"].copy_((normalized * kwargs["rms_gamma"]).bfloat16())
+            return kwargs["norm_out"]
+
+        with patch("resin.models.gpt_oss.cuda.allreduce_fusion", fused):
+            normalized, combined = runner._allreduce_residual_rmsnorm(
+                partial, residual, weight, eps
+            )
+
+        expected_combined = partial + residual
+        expected_normalized = expected_combined.float()
+        expected_normalized *= torch.rsqrt(
+            expected_normalized.square().mean(-1, keepdim=True) + eps
+        )
+        expected_normalized = (expected_normalized * weight).bfloat16()
+        torch.testing.assert_close(combined, expected_combined)
+        torch.testing.assert_close(normalized, expected_normalized)
+        self.assertNotIn("use_oneshot", calls[0])
+        self.assertFalse(calls[0]["launch_with_pdl"])
+        self.assertTrue(calls[0]["trigger_completion_at_end"])
+
+    def test_packed_qkv_matches_three_loaded_projections(self) -> None:
+        import torch
+
+        attention = SimpleNamespace(
+            q_proj=torch.nn.Linear(8, 12, bias=True),
+            k_proj=torch.nn.Linear(8, 4, bias=True),
+            v_proj=torch.nn.Linear(8, 4, bias=True),
+        )
+        hidden = torch.randn(7, 8)
+        expected = torch.cat(
+            (
+                attention.q_proj(hidden),
+                attention.k_proj(hidden),
+                attention.v_proj(hidden),
+            ),
+            dim=-1,
+        )
+
+        Attention.pack_qkv_projection(attention)
+
+        torch.testing.assert_close(attention.qkv_proj(hidden), expected)
+        self.assertFalse(hasattr(attention, "q_proj"))
+        self.assertFalse(hasattr(attention, "k_proj"))
+        self.assertFalse(hasattr(attention, "v_proj"))
+
+    def test_router_uses_tinygemm_through_128_rows_then_linear(self) -> None:
+        import torch
+
+        router = SimpleNamespace(
+            weight=torch.randn(16, 64, dtype=torch.bfloat16),
+            bias=torch.randn(16, dtype=torch.bfloat16),
+        )
+        calls = []
+
+        def tinygemm(input, weight, output, bias, *, use_pdl):
+            calls.append((input.shape[0], use_pdl))
+            output.copy_(torch.nn.functional.linear(input, weight, bias))
+
+        with patch("resin.models.gpt_oss.cuda.tinygemm_bf16", tinygemm):
+            for rows in (1, 2, 4, 8, 16, 32, 64, 128):
+                hidden = torch.randn(rows, 64, dtype=torch.bfloat16)
+                expected = torch.nn.functional.linear(
+                    hidden, router.weight, router.bias
+                )
+                torch.testing.assert_close(
+                    _router_logits(router, hidden), expected, rtol=0, atol=0
+                )
+
+            hidden = torch.randn(129, 64, dtype=torch.bfloat16)
+            expected = torch.nn.functional.linear(hidden, router.weight, router.bias)
+            torch.testing.assert_close(
+                _router_logits(router, hidden), expected, rtol=0, atol=0
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                (1, False),
+                (2, False),
+                (4, False),
+                (8, False),
+                (16, False),
+                (32, False),
+                (64, False),
+                (128, False),
+            ],
+        )
+
+    def test_official_top4_router_uses_cutile_and_other_layouts_fall_back(
+        self,
+    ) -> None:
+        import torch
+
+        official = SimpleNamespace(top_k=4)
+        logits = torch.randn(32, 128, dtype=torch.bfloat16)
+        expected_values, expected_indices = torch.topk(logits, 4, dim=-1, sorted=True)
+        expected_weights = torch.softmax(expected_values, dim=-1)
+        calls = []
+
+        def top4_softmax(actual_logits):
+            calls.append(actual_logits.shape)
+            return expected_indices.to(torch.int32), expected_weights.to(torch.float32)
+
+        with patch("resin.models.gpt_oss.cuda.top4_softmax", top4_softmax):
+            indices, weights = _route(official, logits)
+
+        self.assertEqual(calls, [torch.Size([32, 128])])
+        torch.testing.assert_close(indices, expected_indices.to(torch.int32))
+        torch.testing.assert_close(weights, expected_weights.to(torch.float32))
+
+        generic = SimpleNamespace(top_k=2)
+        indices, weights = _route(generic, logits[:, :16])
+        values, expected_indices = torch.topk(logits[:, :16], 2, dim=-1, sorted=True)
+        torch.testing.assert_close(indices, expected_indices)
+        torch.testing.assert_close(weights, torch.softmax(values, dim=-1))
+
+        large_logits = torch.randn(8192, 128, dtype=torch.bfloat16)
+        large_values, large_indices = torch.topk(large_logits, 4, dim=-1, sorted=True)
+        with patch(
+            "resin.models.gpt_oss.cuda.top4_softmax",
+            return_value=(large_indices.int(), torch.softmax(large_values, dim=-1)),
+        ) as fused:
+            _route(official, large_logits)
+        fused.assert_called_once_with(large_logits)
+
     def test_static_decode_step_restores_rust_sequence_order_before_sampling(
         self,
     ) -> None:
@@ -438,6 +604,24 @@ class GptOssCudaTinyOracleTests(unittest.TestCase):
         )
         cos = torch.tensor([[[1.0, 0.5], [0.25, 1.0]]], dtype=torch.bfloat16)
         sin = torch.tensor([[[0.0, 0.5], [1.0, 0.0]]], dtype=torch.bfloat16)
+
+        def apply_rotary(hidden, cos, sin, *, interleaved, inplace):
+            self.assertFalse(interleaved)
+            self.assertTrue(inplace)
+            first, second = hidden.chunk(2, dim=-1)
+            hidden.copy_(
+                torch.cat(
+                    (
+                        first * cos.unsqueeze(0).unsqueeze(2)
+                        - second * sin.unsqueeze(0).unsqueeze(2),
+                        second * cos.unsqueeze(0).unsqueeze(2)
+                        + first * sin.unsqueeze(0).unsqueeze(2),
+                    ),
+                    dim=-1,
+                )
+            )
+            return hidden
+
         first, second = hidden.chunk(2, dim=-1)
         expected = torch.cat(
             (
@@ -449,7 +633,8 @@ class GptOssCudaTinyOracleTests(unittest.TestCase):
             dim=-1,
         )
 
-        actual = runner._apply_yarn_rotary(hidden, cos, sin)
+        with patch("resin.models.gpt_oss.cuda.apply_rotary", apply_rotary):
+            actual = runner._apply_yarn_rotary(hidden, cos, sin)
 
         self.assertEqual(actual.dtype, torch.bfloat16)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)

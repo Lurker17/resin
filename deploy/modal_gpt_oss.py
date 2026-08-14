@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import tempfile
 import time
 from dataclasses import asdict
+from datetime import timedelta
 from pathlib import Path
 from typing import TypedDict, cast
 
 import modal
 import torch
+import torch.distributed as dist
 from huggingface_hub import snapshot_download
 from renderers import GptOssRendererConfig, Message, Renderer, create_renderer
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -29,8 +33,7 @@ from deploy.jit_cache import (
 )
 from resin import Engine, SchedulerConfig, TokenEvent
 from resin.backend.cuda.graphs import CudaGraphStats
-from resin.models.gpt_oss.cuda import GptOssCudaRunner
-from resin.models.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
+from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.models.gpt_oss.plan import PAGE_SIZE, WINDOW_TABLE_WIDTH
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +41,8 @@ ROOT = Path(__file__).resolve().parents[1]
 MODEL_CACHE_VOLUME_NAME = "resin-gpt-oss-models-v2"
 MODEL_CACHE_VOLUME_VERSION = 2
 MODEL_CACHE_MOUNT = "/models/resin-gpt-oss"
+PROFILE_VOLUME_NAME = "resin-gpt-oss-profiles"
+PROFILE_MOUNT = "/profiles/resin-gpt-oss"
 
 
 class ModelSpec(TypedDict):
@@ -76,10 +81,11 @@ TOKENIZER_FILES = (
 
 PAGE_TOKENS = PAGE_SIZE
 WINDOW_RESIDENT_BLOCKS = WINDOW_TABLE_WIDTH
+SUPPORTED_TP_SIZES = (1, 2, 4, 8)
 
 
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
+    modal.Image.from_registry("nvidia/cuda:13.3.1-devel-ubuntu22.04", add_python="3.12")
     .apt_install("build-essential", "curl")
     .run_commands(
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
@@ -122,6 +128,10 @@ image = (
     .env(KERNEL_CACHE_ENV)
 )
 
+with image.imports():
+    from resin.models.gpt_oss.cuda import GptOssCudaRunner
+    from resin.models.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
+
 kernel_cache_volume = modal.Volume.from_name(
     KERNEL_CACHE_VOLUME_NAME,
     create_if_missing=True,
@@ -132,12 +142,14 @@ model_cache_volume = modal.Volume.from_name(
     create_if_missing=True,
     version=MODEL_CACHE_VOLUME_VERSION,
 )
+profile_volume = modal.Volume.from_name(PROFILE_VOLUME_NAME, create_if_missing=True)
 app = modal.App(
     "resin-gpt-oss-flat",
     image=image,
     volumes={
         KERNEL_CACHE_MOUNT: kernel_cache_volume,
         MODEL_CACHE_MOUNT: model_cache_volume,
+        PROFILE_MOUNT: profile_volume,
     },
 )
 
@@ -274,8 +286,6 @@ def _load_renderer(model_path: Path) -> tuple[PreTrainedTokenizerBase, Renderer]
 
 
 def _encode_prompt(renderer: Renderer, prompt: str) -> list[int]:
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ValueError("prompt must be a non-empty string")
     messages: list[Message] = [{"role": "user", "content": prompt}]
     token_ids = renderer.render_ids(messages, add_generation_prompt=True)
     if not token_ids:
@@ -337,41 +347,66 @@ def _required_history_width(prompt_tokens: int, max_new_tokens: int) -> int:
     return (maximum_input + PAGE_TOKENS - 1) // PAGE_TOKENS
 
 
-def _autotune_path(model_key: str, protocol: str) -> Path:
+def _autotune_path(
+    model_key: str,
+    protocol: str,
+    tensor_parallel_size: int,
+    tensor_parallel_rank: int,
+) -> Path:
     revision = MODEL_SPECS[model_key]["revision"][:12]
+    parallel = (
+        ""
+        if tensor_parallel_size == 1
+        else f"-tp{tensor_parallel_size}-rank{tensor_parallel_rank}"
+    )
     return (
         Path(KERNEL_CACHE_ROOT)
         / "flashinfer-autotune"
-        / (f"{protocol}-{model_key}-{revision}.json")
+        / (f"{protocol}-{model_key}-{revision}{parallel}.json")
     )
 
 
-def _workload_name(model_key: str, protocol: str) -> str:
+def _workload_name(model_key: str, protocol: str, tensor_parallel_size: int) -> str:
     revision = MODEL_SPECS[model_key]["revision"][:12]
-    return f"{protocol}-{model_key}-{revision}"
+    parallel = "" if tensor_parallel_size == 1 else f"-tp{tensor_parallel_size}"
+    return f"{protocol}-{model_key}-{revision}{parallel}"
 
 
 def _new_cuda_runner(
     model_path: Path,
     cache_parent_capacity: int,
+    tensor_parallel: TensorParallelContext,
     cuda_graph_decode_shapes: tuple[tuple[int, int], ...] = (),
 ) -> GptOssCudaRunner:
     moe_kernel = make_flashinfer_sm90_mxfp4_kernel()
-    print(f"[model-load] Loading model from {model_path}...", flush=True)
+    if tensor_parallel.rank == 0:
+        print(
+            f"[model-load] Loading TP={tensor_parallel.size} model from "
+            f"{model_path}...",
+            flush=True,
+        )
     model_load_start = time.perf_counter()
     runner = GptOssCudaRunner(
         model_path,
         cache_parent_capacity=cache_parent_capacity,
-        device="cuda",
+        device=f"cuda:{tensor_parallel.rank}",
         moe_kernel=moe_kernel,
         cuda_graph_decode_shapes=cuda_graph_decode_shapes,
+        tensor_parallel=tensor_parallel,
     )
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(runner.device)
+    tensor_parallel.barrier()
     model_load_elapsed_s = time.perf_counter() - model_load_start
-    print(
-        f"[model-load] Model loaded in {model_load_elapsed_s:.2f} seconds",
-        flush=True,
-    )
+    if tensor_parallel.rank == 0:
+        print(
+            f"[allreduce] backend={runner.allreduce_backend}",
+            flush=True,
+        )
+        print(
+            f"[model-load] TP={tensor_parallel.size} model loaded in "
+            f"{model_load_elapsed_s:.2f} seconds",
+            flush=True,
+        )
     return runner
 
 
@@ -380,35 +415,42 @@ def _capture_cuda_graphs(runner: GptOssCudaRunner) -> CudaGraphStats:
     shapes = stats["configured_shapes"]
     if not shapes:
         return stats
-    print(f"[cuda-graphs] Capturing {len(shapes)} decode shape(s)...", flush=True)
+    if runner.tensor_parallel_rank == 0:
+        print(
+            f"[cuda-graphs] Capturing {len(shapes)} TP={runner.tensor_parallel_size} "
+            "decode shape(s)...",
+            flush=True,
+        )
     capture_start = time.perf_counter()
     stats = runner.capture_cuda_graphs()
+    runner.tensor_parallel.barrier()
     capture_elapsed_s = time.perf_counter() - capture_start
-    print(
-        f"[cuda-graphs] Captured {stats['capture_count']} shape(s) in "
-        f"{capture_elapsed_s:.2f} seconds",
-        flush=True,
-    )
+    if runner.tensor_parallel_rank == 0:
+        print(
+            f"[cuda-graphs] Captured {stats['capture_count']} shape(s) in "
+            f"{capture_elapsed_s:.2f} seconds",
+            flush=True,
+        )
     return stats
 
 
 def _run_prompt(
     model_key: str,
-    prompt: str,
+    model_path: Path,
+    model_cache: dict[str, object],
+    prompt_ids: list[int],
     max_new_tokens: int,
     context_length: int,
     schedule_conservativeness: float,
+    tensor_parallel: TensorParallelContext,
 ) -> dict[str, object]:
-    model_path, model_cache = _require_cached_model(model_key)
-    tokenizer, renderer = _load_renderer(model_path)
-    prompt_ids = _encode_prompt(renderer, prompt)
-    generation_prefix_ids = _generation_prefix_ids(renderer, prompt)
     if len(prompt_ids) + max_new_tokens - 1 > context_length:
         raise ValueError("prompt plus max_new_tokens exceeds context_length")
     cache_parent_capacity = _required_parent_capacity(len(prompt_ids), max_new_tokens)
     runner = _new_cuda_runner(
         model_path,
         cache_parent_capacity,
+        tensor_parallel,
         cuda_graph_decode_shapes=(
             (1, _required_history_width(len(prompt_ids), max_new_tokens)),
         ),
@@ -433,7 +475,8 @@ def _run_prompt(
         while engine.has_work():
             engine.step()
         warmup.take_result()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(runner.device)
+        tensor_parallel.barrier()
 
         start = time.perf_counter()
         request = engine.submit(prompt_ids, max_new_tokens=max_new_tokens)
@@ -442,22 +485,58 @@ def _run_prompt(
             if events and first_token_time is None:
                 first_token_time = time.perf_counter()
             output_events.extend(events)
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(runner.device)
+        tensor_parallel.barrier()
         output_ids = request.take_result()
-        rendered_output_ids = generation_prefix_ids + output_ids
-        parsed = renderer.parse_response(rendered_output_ids)
+        if tensor_parallel.enabled:
+            output_tensor = torch.full(
+                (max_new_tokens,),
+                -1,
+                dtype=torch.int64,
+                device=runner.device,
+            )
+            output_tensor[: len(output_ids)] = torch.tensor(
+                output_ids,
+                dtype=torch.int64,
+                device=runner.device,
+            )
+            gathered_outputs = torch.empty(
+                tensor_parallel.size * max_new_tokens,
+                dtype=torch.int64,
+                device=runner.device,
+            )
+            assert tensor_parallel.process_group is not None
+            dist.all_gather_single(
+                gathered_outputs,
+                output_tensor,
+                group=tensor_parallel.process_group,
+            )
+            output_rows = gathered_outputs.view(
+                tensor_parallel.size,
+                max_new_tokens,
+            )
+            if any(
+                not torch.equal(output_rows[0], output_rows[rank])
+                for rank in range(1, tensor_parallel.size)
+            ):
+                raise RuntimeError("tensor-parallel ranks produced different tokens")
+            if tensor_parallel.rank == 0:
+                print(
+                    f"[tensor-parallel] Verified output agreement across "
+                    f"{tensor_parallel.size} ranks",
+                    flush=True,
+                )
         elapsed_s = time.perf_counter() - start
         return {
             "model": model_key,
             "device": torch.cuda.get_device_name(),
+            "tensor_parallel_size": tensor_parallel.size,
+            "allreduce_backend": runner.allreduce_backend,
             "checkpoint": model_cache,
             "prompt_tokens": len(prompt_ids),
             "max_new_tokens": max_new_tokens,
             "output_tokens": len(output_ids),
-            "text": tokenizer.decode(rendered_output_ids, skip_special_tokens=False),
-            "content": parsed.content,
-            "reasoning_content": parsed.reasoning_content,
-            "tool_calls": [asdict(tool_call) for tool_call in parsed.tool_calls],
+            "_output_ids": output_ids,
             "cuda_graph": runner.cuda_graph_stats,
             "time_to_first_token_ms": (
                 None if first_token_time is None else (first_token_time - start) * 1000
@@ -471,18 +550,45 @@ def _run_prompt(
             engine.close()
 
 
+def _render_prompt_report(
+    report: dict[str, object],
+    tokenizer: PreTrainedTokenizerBase,
+    renderer: Renderer,
+    generation_prefix_ids: list[int],
+) -> dict[str, object]:
+    raw_output_ids = report.pop("_output_ids", None)
+    output_ids = cast(list[int], raw_output_ids)
+    rendered_output_ids = generation_prefix_ids + output_ids
+    parsed = renderer.parse_response(rendered_output_ids)
+    report.update(
+        {
+            "text": tokenizer.decode(
+                rendered_output_ids,
+                skip_special_tokens=False,
+            ),
+            "content": parsed.content,
+            "reasoning_content": parsed.reasoning_content,
+            "tool_calls": [asdict(tool_call) for tool_call in parsed.tool_calls],
+        }
+    )
+    return report
+
+
 def _bench_cuda(
     model_key: str,
     model_path: Path,
     model_cache: dict[str, object],
+    prompt_ids: list[int],
     prompt_tokens: int,
     max_new_tokens: int,
     batch_sizes: tuple[int, ...],
     context_length: int,
     schedule_conservativeness: float,
+    profile_decode_steps: int,
+    tensor_parallel: TensorParallelContext,
 ) -> dict[str, object]:
-    tokenizer, _renderer = _load_renderer(model_path)
-    prompt_ids = _bench_prompt_ids(tokenizer, prompt_tokens)
+    if len(prompt_ids) != prompt_tokens:
+        raise ValueError("benchmark prompt IDs do not match prompt_tokens")
     cache_parent_capacity = _required_parent_capacity(
         prompt_tokens, max_new_tokens
     ) * max(batch_sizes)
@@ -490,6 +596,7 @@ def _bench_cuda(
     runner = _new_cuda_runner(
         model_path,
         cache_parent_capacity,
+        tensor_parallel,
         cuda_graph_decode_shapes=tuple(
             (batch_size, graph_width) for batch_size in batch_sizes
         ),
@@ -513,7 +620,8 @@ def _bench_cuda(
             )
             for _ in range(batch_size)
         ]
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(runner.device)
+        tensor_parallel.barrier()
         start = time.perf_counter()
         first_token_time = None
         event_count = 0
@@ -522,7 +630,8 @@ def _bench_cuda(
             event_count += len(events)
             if events and first_token_time is None:
                 first_token_time = time.perf_counter()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(runner.device)
+        tensor_parallel.barrier()
         end = time.perf_counter()
         for request in requests:
             if len(request.take_result()) != max_new_tokens:
@@ -542,6 +651,88 @@ def _bench_cuda(
             "event_count": event_count,
         }
 
+    def profile_decode(batch_size: int) -> dict[str, object]:
+        profiled_steps = min(profile_decode_steps, max_new_tokens - 1)
+        if profiled_steps <= 0:
+            raise ValueError("profile_decode_steps requires at least two output tokens")
+        requests = [
+            engine.submit(
+                prompt_ids,
+                max_new_tokens=max_new_tokens,
+                batch_key=prompt_tokens,
+            )
+            for _ in range(batch_size)
+        ]
+        # Advance through every prefill chunk and stop immediately after the
+        # first sampled token. Every profiled step after this point is a
+        # fixed-shape CUDA-graph decode replay.
+        while engine.has_work():
+            if engine.step():
+                break
+        torch.cuda.synchronize(runner.device)
+        tensor_parallel.barrier()
+
+        if tensor_parallel.rank == 0:
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CUDA]
+            ) as cuda_profile:
+                for _ in range(profiled_steps):
+                    engine.step()
+                torch.cuda.synchronize(runner.device)
+        else:
+            for _ in range(profiled_steps):
+                engine.step()
+            torch.cuda.synchronize(runner.device)
+            cuda_profile = None
+        tensor_parallel.barrier()
+
+        while engine.has_work():
+            engine.step()
+        for request in requests:
+            if len(request.take_result()) != max_new_tokens:
+                raise RuntimeError("profile request returned the wrong token count")
+        if cuda_profile is None:
+            return {}
+
+        trace_name = (
+            f"gpt-oss-{model_key}-tp{tensor_parallel.size}-batch{batch_size}-"
+            f"decode-{time.time_ns()}.perfetto-trace.json.gz"
+        )
+        trace_path = Path(PROFILE_MOUNT) / trace_name
+        cuda_profile.export_chrome_trace(str(trace_path))
+
+        events = sorted(
+            (
+                event
+                for event in cuda_profile.key_averages()
+                if event.self_device_time_total > 0
+            ),
+            key=lambda event: event.self_device_time_total,
+            reverse=True,
+        )
+        total_cuda_time_us = sum(event.self_device_time_total for event in events)
+        return {
+            "batch_size": batch_size,
+            "profiled_decode_steps": profiled_steps,
+            "perfetto_trace": trace_name,
+            "total_cuda_time_us": total_cuda_time_us,
+            "cuda_time_per_step_us": total_cuda_time_us / profiled_steps,
+            "top_cuda_kernels": [
+                {
+                    "name": event.key,
+                    "count": event.count,
+                    "self_cuda_time_us": event.self_device_time_total,
+                    "cuda_time_per_call_us": (
+                        event.self_device_time_total / event.count
+                    ),
+                    "cuda_time_percent": (
+                        100.0 * event.self_device_time_total / total_cuda_time_us
+                    ),
+                }
+                for event in events[:50]
+            ],
+        }
+
     try:
         _capture_cuda_graphs(runner)
         # Warm each batch shape once so the reported rows represent steady
@@ -549,19 +740,278 @@ def _bench_cuda(
         for batch_size in batch_sizes:
             execute_batch(batch_size)
         rows = [execute_batch(batch_size) for batch_size in batch_sizes]
-        return {
+        report: dict[str, object] = {
             "protocol": "gpt-oss-throughput-v1",
             "model": model_key,
             "device": torch.cuda.get_device_name(),
             "device_capability": list(torch.cuda.get_device_capability()),
+            "tensor_parallel_size": tensor_parallel.size,
+            "allreduce_backend": runner.allreduce_backend,
             "checkpoint": model_cache,
             "cache_parent_capacity": cache_parent_capacity,
             "rows": rows,
             "peak_memory_mib": torch.cuda.max_memory_allocated() / (1024 * 1024),
         }
+        if profile_decode_steps > 0:
+            report["decode_profile"] = profile_decode(batch_sizes[0])
+        return report
     finally:
         if not engine.closed:
             engine.close()
+
+
+def _validate_tensor_parallel_size(tensor_parallel_size: int) -> None:
+    if tensor_parallel_size not in SUPPORTED_TP_SIZES:
+        allowed = ", ".join(str(size) for size in SUPPORTED_TP_SIZES)
+        raise ValueError(f"tp must be one of: {allowed}")
+
+
+def _free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _initialize_tensor_parallel(
+    rank: int, tensor_parallel_size: int, master_port: int
+) -> TensorParallelContext:
+    if torch.cuda.device_count() < tensor_parallel_size:
+        raise RuntimeError(
+            f"TP={tensor_parallel_size} requires {tensor_parallel_size} visible GPUs, "
+            f"found {torch.cuda.device_count()}"
+        )
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://127.0.0.1:{master_port}",
+        rank=rank,
+        world_size=tensor_parallel_size,
+        timeout=timedelta(minutes=30),
+        device_id=device,
+    )
+    process_group = dist.group.WORLD
+    if process_group is None:
+        raise RuntimeError("PyTorch did not create the tensor-parallel process group")
+    return TensorParallelContext(
+        TensorParallelLayout(rank=rank, size=tensor_parallel_size),
+        process_group,
+    )
+
+
+def _run_prompt_rank(
+    rank: int,
+    tensor_parallel_size: int,
+    master_port: int,
+    report_path: Path,
+    model_key: str,
+    model_path: Path,
+    model_cache: dict[str, object],
+    prompt_ids: list[int],
+    max_new_tokens: int,
+    context_length: int,
+    schedule_conservativeness: float,
+) -> None:
+    tensor_parallel = _initialize_tensor_parallel(
+        rank, tensor_parallel_size, master_port
+    )
+    install_flashinfer_hash_cache()
+    report = _run_prompt(
+        model_key,
+        model_path,
+        model_cache,
+        prompt_ids,
+        max_new_tokens,
+        context_length,
+        schedule_conservativeness,
+        tensor_parallel,
+    )
+    tensor_parallel.barrier()
+    if rank == 0:
+        report_path.write_text(json.dumps(report))
+    # Decode graphs own NCCL work. These are dedicated single-use workers, so
+    # process exit is the communicator lifetime boundary; explicit group
+    # destruction can wait forever on graph-owned communicators.
+    os._exit(0)
+
+
+def _launch_tensor_parallel_prompt(
+    tensor_parallel_size: int,
+    model_key: str,
+    model_path: Path,
+    model_cache: dict[str, object],
+    prompt_ids: list[int],
+    max_new_tokens: int,
+    context_length: int,
+    schedule_conservativeness: float,
+) -> dict[str, object]:
+    master_port = _free_local_port()
+    with tempfile.TemporaryDirectory(prefix="resin-tp-") as directory:
+        report_path = Path(directory) / "report.json"
+        torch.multiprocessing.spawn(
+            _run_prompt_rank,
+            args=(
+                tensor_parallel_size,
+                master_port,
+                report_path,
+                model_key,
+                model_path,
+                model_cache,
+                prompt_ids,
+                max_new_tokens,
+                context_length,
+                schedule_conservativeness,
+            ),
+            nprocs=tensor_parallel_size,
+            join=True,
+        )
+        return json.loads(report_path.read_text())
+
+
+def _bench_rank_workload(
+    model_key: str,
+    model_path: Path,
+    model_cache: dict[str, object],
+    prompt_ids: list[int],
+    cache_mode: str,
+    prompt_tokens: int,
+    max_new_tokens: int,
+    batch_sizes: tuple[int, ...],
+    context_length: int,
+    schedule_conservativeness: float,
+    profile_decode_steps: int,
+    tensor_parallel: TensorParallelContext,
+) -> dict[str, object]:
+    install_flashinfer_hash_cache()
+    protocol = "gpt-oss-throughput-v1"
+    path = _autotune_path(
+        model_key,
+        protocol,
+        tensor_parallel.size,
+        tensor_parallel.rank,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tune_missing = cache_mode == "prewarm"
+    tuning_buckets = tuple(sorted({1, *batch_sizes, 128}))
+    with flashinfer_autotune_context(
+        path,
+        tune_missing=tune_missing,
+        tuning_buckets=tuning_buckets,
+    ) as cache_loaded:
+        report = _bench_cuda(
+            model_key,
+            model_path,
+            model_cache,
+            prompt_ids,
+            prompt_tokens,
+            max_new_tokens,
+            batch_sizes,
+            context_length,
+            schedule_conservativeness,
+            profile_decode_steps,
+            tensor_parallel,
+        )
+    if not path.is_file():
+        raise RuntimeError("FlashInfer did not publish its benchmark tactic file")
+    report["flashinfer_autotune"] = {
+        "mode": "tune_missing" if tune_missing else "immutable_reuse",
+        "cache_loaded": cache_loaded,
+        "path": str(path),
+        "rank_paths": [
+            str(
+                _autotune_path(
+                    model_key,
+                    protocol,
+                    tensor_parallel.size,
+                    rank,
+                )
+            )
+            for rank in range(tensor_parallel.size)
+        ],
+        "buckets": list(tuning_buckets),
+    }
+    return report
+
+
+def _run_bench_rank(
+    rank: int,
+    tensor_parallel_size: int,
+    master_port: int,
+    report_path: Path,
+    model_key: str,
+    model_path: Path,
+    model_cache: dict[str, object],
+    prompt_ids: list[int],
+    cache_mode: str,
+    prompt_tokens: int,
+    max_new_tokens: int,
+    batch_sizes: tuple[int, ...],
+    context_length: int,
+    schedule_conservativeness: float,
+    profile_decode_steps: int,
+) -> None:
+    tensor_parallel = _initialize_tensor_parallel(
+        rank, tensor_parallel_size, master_port
+    )
+    report = _bench_rank_workload(
+        model_key,
+        model_path,
+        model_cache,
+        prompt_ids,
+        cache_mode,
+        prompt_tokens,
+        max_new_tokens,
+        batch_sizes,
+        context_length,
+        schedule_conservativeness,
+        profile_decode_steps,
+        tensor_parallel,
+    )
+    tensor_parallel.barrier()
+    if rank == 0:
+        report_path.write_text(json.dumps(report))
+    os._exit(0)
+
+
+def _launch_tensor_parallel_bench(
+    tensor_parallel_size: int,
+    model_key: str,
+    model_path: Path,
+    model_cache: dict[str, object],
+    prompt_ids: list[int],
+    cache_mode: str,
+    prompt_tokens: int,
+    max_new_tokens: int,
+    batch_sizes: tuple[int, ...],
+    context_length: int,
+    schedule_conservativeness: float,
+    profile_decode_steps: int,
+) -> dict[str, object]:
+    master_port = _free_local_port()
+    with tempfile.TemporaryDirectory(prefix="resin-tp-") as directory:
+        report_path = Path(directory) / "report.json"
+        torch.multiprocessing.spawn(
+            _run_bench_rank,
+            args=(
+                tensor_parallel_size,
+                master_port,
+                report_path,
+                model_key,
+                model_path,
+                model_cache,
+                prompt_ids,
+                cache_mode,
+                prompt_tokens,
+                max_new_tokens,
+                batch_sizes,
+                context_length,
+                schedule_conservativeness,
+                profile_decode_steps,
+            ),
+            nprocs=tensor_parallel_size,
+            join=True,
+        )
+        return json.loads(report_path.read_text())
 
 
 def _run_bench(
@@ -572,7 +1022,10 @@ def _run_bench(
     batch_sizes: tuple[int, ...],
     context_length: int,
     schedule_conservativeness: float,
+    tensor_parallel_size: int,
+    profile_decode_steps: int,
 ) -> dict[str, object]:
+    _validate_tensor_parallel_size(tensor_parallel_size)
     if model_key not in MODEL_SPECS:
         raise ValueError("model must be '20b' or '120b'")
     if cache_mode not in {"prewarm", "verify"}:
@@ -581,62 +1034,124 @@ def _run_bench(
         raise ValueError("prompt_tokens plus max_new_tokens exceeds context_length")
     if tuple(sorted(set(batch_sizes))) != batch_sizes:
         raise ValueError("batch_sizes must be sorted and contain no duplicates")
+    if profile_decode_steps < 0:
+        raise ValueError("profile_decode_steps cannot be negative")
 
     model_path, model_cache = _require_cached_model(model_key)
+    tokenizer, _renderer = _load_renderer(model_path)
+    prompt_ids = _bench_prompt_ids(tokenizer, prompt_tokens)
     protocol = "gpt-oss-throughput-v1"
 
     def workload() -> dict[str, object]:
-        install_flashinfer_hash_cache()
-
-        path = _autotune_path(model_key, protocol)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tune_missing = cache_mode == "prewarm"
-        tuning_buckets = tuple(sorted({1, *batch_sizes, 128}))
-        with flashinfer_autotune_context(
-            path,
-            tune_missing=tune_missing,
-            tuning_buckets=tuning_buckets,
-        ) as cache_loaded:
-            report = _bench_cuda(
+        if tensor_parallel_size == 1:
+            return _bench_rank_workload(
                 model_key,
                 model_path,
                 model_cache,
+                prompt_ids,
+                cache_mode,
                 prompt_tokens,
                 max_new_tokens,
                 batch_sizes,
                 context_length,
                 schedule_conservativeness,
+                profile_decode_steps,
+                TensorParallelContext(),
             )
-        if not path.is_file():
-            raise RuntimeError("FlashInfer did not publish its benchmark tactic file")
-        report["flashinfer_autotune"] = {
-            "mode": "tune_missing" if tune_missing else "immutable_reuse",
-            "cache_loaded": cache_loaded,
-            "path": str(path),
-            "buckets": list(tuning_buckets),
-        }
-        return report
+        return _launch_tensor_parallel_bench(
+            tensor_parallel_size,
+            model_key,
+            model_path,
+            model_cache,
+            prompt_ids,
+            cache_mode,
+            prompt_tokens,
+            max_new_tokens,
+            batch_sizes,
+            context_length,
+            schedule_conservativeness,
+            profile_decode_steps,
+        )
 
     if cache_mode == "prewarm":
-        return run_cache_prewarm(
-            kernel_cache_volume, _workload_name(model_key, protocol), workload
+        report = run_cache_prewarm(
+            kernel_cache_volume,
+            _workload_name(model_key, protocol, tensor_parallel_size),
+            workload,
         )
-    report = run_cache_reuse_probe(
-        kernel_cache_volume, _workload_name(model_key, protocol), workload
-    )
-    cache = cast(KernelCacheVerification, report["kernel_cache"])
-    if (
-        cache["cache_hit"] is not True
-        or cache["stable_artifact_changes"]
-        or cache["flashinfer_hash_cache_misses"] != 0
-    ):
-        raise AssertionError("fresh-container benchmark reuse was not immutable")
+    else:
+        report = run_cache_reuse_probe(
+            kernel_cache_volume,
+            _workload_name(model_key, protocol, tensor_parallel_size),
+            workload,
+        )
+        cache = cast(KernelCacheVerification, report["kernel_cache"])
+        if (
+            cache["cache_hit"] is not True
+            or cache["stable_artifact_changes"]
+            or cache["flashinfer_hash_cache_misses"] != 0
+        ):
+            raise AssertionError("fresh-container benchmark reuse was not immutable")
+    if profile_decode_steps > 0:
+        profile_volume.commit()
     return report
 
 
 @app.function(timeout=4 * 60 * 60, cpu=4, memory=8 * 1024)
 def cache_checkpoint(model_key: str) -> dict[str, object]:
     return _download_model(model_key)
+
+
+def _run_model(
+    tensor_parallel_size: int,
+    model_key: str,
+    prompt: str,
+    max_new_tokens: int = 256,
+    context_length: int = 32768,
+    schedule_conservativeness: float = 1.0,
+) -> dict[str, object]:
+    _validate_tensor_parallel_size(tensor_parallel_size)
+
+    def workload() -> dict[str, object]:
+        # Volume v2 does not preserve the nanosecond mtimes Ninja uses to
+        # validate FlashInfer JIT outputs. Install Resin's content-addressed
+        # loader before importing GPU packages so a fresh single-use container
+        # can load the cached shared library directly instead of rebuilding it.
+        model_path, model_cache = _require_cached_model(model_key)
+        tokenizer, renderer = _load_renderer(model_path)
+        prompt_ids = _encode_prompt(renderer, prompt)
+        generation_prefix_ids = _generation_prefix_ids(renderer, prompt)
+        if tensor_parallel_size == 1:
+            install_flashinfer_hash_cache()
+            report = _run_prompt(
+                model_key,
+                model_path,
+                model_cache,
+                prompt_ids,
+                max_new_tokens,
+                context_length,
+                schedule_conservativeness,
+                TensorParallelContext(),
+            )
+        else:
+            report = _launch_tensor_parallel_prompt(
+                tensor_parallel_size,
+                model_key,
+                model_path,
+                model_cache,
+                prompt_ids,
+                max_new_tokens,
+                context_length,
+                schedule_conservativeness,
+            )
+        return _render_prompt_report(
+            report,
+            tokenizer,
+            renderer,
+            generation_prefix_ids,
+        )
+
+    return run_cached_workload(kernel_cache_volume, workload)
 
 
 @app.function(
@@ -653,21 +1168,86 @@ def run_model(
     context_length: int = 32768,
     schedule_conservativeness: float = 1.0,
 ) -> dict[str, object]:
-    def workload() -> dict[str, object]:
-        # Volume v2 does not preserve the nanosecond mtimes Ninja uses to
-        # validate FlashInfer JIT outputs. Install Resin's content-addressed
-        # loader before importing GPU packages so a fresh single-use container
-        # can load the cached shared library directly instead of rebuilding it.
-        install_flashinfer_hash_cache()
-        return _run_prompt(
-            model_key,
-            prompt,
-            max_new_tokens,
-            context_length,
-            schedule_conservativeness,
-        )
+    return _run_model(
+        1,
+        model_key,
+        prompt,
+        max_new_tokens,
+        context_length,
+        schedule_conservativeness,
+    )
 
-    return run_cached_workload(kernel_cache_volume, workload)
+
+@app.function(
+    gpu="H200:2",
+    cpu=16,
+    memory=256 * 1024,
+    timeout=4 * 60 * 60,
+    single_use_containers=True,
+)
+def run_model_tp2(
+    model_key: str,
+    prompt: str,
+    max_new_tokens: int = 256,
+    context_length: int = 32768,
+    schedule_conservativeness: float = 1.0,
+) -> dict[str, object]:
+    return _run_model(
+        2,
+        model_key,
+        prompt,
+        max_new_tokens,
+        context_length,
+        schedule_conservativeness,
+    )
+
+
+@app.function(
+    gpu="H200:4",
+    cpu=16,
+    memory=256 * 1024,
+    timeout=4 * 60 * 60,
+    single_use_containers=True,
+)
+def run_model_tp4(
+    model_key: str,
+    prompt: str,
+    max_new_tokens: int = 256,
+    context_length: int = 32768,
+    schedule_conservativeness: float = 1.0,
+) -> dict[str, object]:
+    return _run_model(
+        4,
+        model_key,
+        prompt,
+        max_new_tokens,
+        context_length,
+        schedule_conservativeness,
+    )
+
+
+@app.function(
+    gpu="H200:8",
+    cpu=16,
+    memory=256 * 1024,
+    timeout=4 * 60 * 60,
+    single_use_containers=True,
+)
+def run_model_tp8(
+    model_key: str,
+    prompt: str,
+    max_new_tokens: int = 256,
+    context_length: int = 32768,
+    schedule_conservativeness: float = 1.0,
+) -> dict[str, object]:
+    return _run_model(
+        8,
+        model_key,
+        prompt,
+        max_new_tokens,
+        context_length,
+        schedule_conservativeness,
+    )
 
 
 @app.function(
@@ -685,6 +1265,7 @@ def bench_model(
     batch_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
     context_length: int = 32768,
     schedule_conservativeness: float = 1.0,
+    profile_decode_steps: int = 0,
 ) -> dict[str, object]:
     return _run_bench(
         model_key,
@@ -694,6 +1275,98 @@ def bench_model(
         batch_sizes,
         context_length,
         schedule_conservativeness,
+        1,
+        profile_decode_steps,
+    )
+
+
+@app.function(
+    gpu="H200:2",
+    cpu=16,
+    memory=256 * 1024,
+    timeout=12 * 60 * 60,
+    single_use_containers=True,
+)
+def bench_model_tp2(
+    model_key: str,
+    cache_mode: str = "prewarm",
+    prompt_tokens: int = 8192,
+    max_new_tokens: int = 256,
+    batch_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
+    context_length: int = 32768,
+    schedule_conservativeness: float = 1.0,
+    profile_decode_steps: int = 0,
+) -> dict[str, object]:
+    return _run_bench(
+        model_key,
+        cache_mode,
+        prompt_tokens,
+        max_new_tokens,
+        batch_sizes,
+        context_length,
+        schedule_conservativeness,
+        2,
+        profile_decode_steps,
+    )
+
+
+@app.function(
+    gpu="H200:4",
+    cpu=16,
+    memory=256 * 1024,
+    timeout=12 * 60 * 60,
+    single_use_containers=True,
+)
+def bench_model_tp4(
+    model_key: str,
+    cache_mode: str = "prewarm",
+    prompt_tokens: int = 8192,
+    max_new_tokens: int = 256,
+    batch_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
+    context_length: int = 32768,
+    schedule_conservativeness: float = 1.0,
+    profile_decode_steps: int = 0,
+) -> dict[str, object]:
+    return _run_bench(
+        model_key,
+        cache_mode,
+        prompt_tokens,
+        max_new_tokens,
+        batch_sizes,
+        context_length,
+        schedule_conservativeness,
+        4,
+        profile_decode_steps,
+    )
+
+
+@app.function(
+    gpu="H200:8",
+    cpu=16,
+    memory=256 * 1024,
+    timeout=12 * 60 * 60,
+    single_use_containers=True,
+)
+def bench_model_tp8(
+    model_key: str,
+    cache_mode: str = "prewarm",
+    prompt_tokens: int = 8192,
+    max_new_tokens: int = 256,
+    batch_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
+    context_length: int = 32768,
+    schedule_conservativeness: float = 1.0,
+    profile_decode_steps: int = 0,
+) -> dict[str, object]:
+    return _run_bench(
+        model_key,
+        cache_mode,
+        prompt_tokens,
+        max_new_tokens,
+        batch_sizes,
+        context_length,
+        schedule_conservativeness,
+        8,
+        profile_decode_steps,
     )
 
 
@@ -708,13 +1381,24 @@ def main(
     batch_sizes: str = "1,2,8,16,32",
     context_length: int = 32768,
     schedule_conservativeness: float = 1.0,
+    tp: int = 1,
+    profile_decode_steps: int = 0,
 ) -> None:
     """Download a checkpoint, run one prompt, or benchmark throughput."""
 
     if mode == "download":
         report = cache_checkpoint.remote(model)
     elif mode == "run":
-        report = run_model.remote(
+        _validate_tensor_parallel_size(tp)
+        if tp == 1:
+            remote_run = run_model
+        elif tp == 2:
+            remote_run = run_model_tp2
+        elif tp == 4:
+            remote_run = run_model_tp4
+        else:
+            remote_run = run_model_tp8
+        report = remote_run.remote(
             model,
             prompt,
             max_new_tokens,
@@ -722,13 +1406,22 @@ def main(
             schedule_conservativeness,
         )
     elif mode == "bench":
+        _validate_tensor_parallel_size(tp)
         try:
             parsed_batch_sizes = tuple(int(value) for value in batch_sizes.split(","))
         except ValueError as error:
             raise ValueError(
                 "batch_sizes must be a comma-separated integer list"
             ) from error
-        report = bench_model.remote(
+        if tp == 1:
+            remote_bench = bench_model
+        elif tp == 2:
+            remote_bench = bench_model_tp2
+        elif tp == 4:
+            remote_bench = bench_model_tp4
+        else:
+            remote_bench = bench_model_tp8
+        report = remote_bench.remote(
             model,
             cache_mode,
             prompt_tokens,
@@ -736,6 +1429,7 @@ def main(
             parsed_batch_sizes,
             context_length,
             schedule_conservativeness,
+            profile_decode_steps,
         )
     else:
         raise ValueError("mode must be 'download', 'run', or 'bench'")

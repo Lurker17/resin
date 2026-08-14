@@ -10,3 +10,4 @@ target/
 *.egg-info/
 *.dSYM/
 *.so
+artifacts/

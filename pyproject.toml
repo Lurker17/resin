@@ -38,6 +38,7 @@ cuda = [
   "nvidia-cutlass-dsl==4.6.0.dev0",
   "nvidia-cutlass-dsl-libs-base==4.6.0.dev0",
   "apache-tvm-ffi==0.1.13.post2",
+  "cuda-tile==1.4.0",
   "quack-kernels==0.5.3",
 ]
 demo = [

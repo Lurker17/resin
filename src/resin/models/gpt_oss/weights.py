@@ -128,6 +128,10 @@ def _assign_tensor(model: Any, key: str, tensor: Any, *, device, dtype) -> None:
         module._buffers[name] = moved
 
 
+def _identity_tensor(_key: str, tensor: Any) -> Any:
+    return tensor
+
+
 def load_gpt_oss_weights(
     model_path: str | Path,
     model: Any,
@@ -136,6 +140,7 @@ def load_gpt_oss_weights(
     num_hidden_layers: int,
     expert_tensor_names: Collection[str],
     install_expert_layer: Callable[[int, Mapping[str, Any]], None],
+    transform_tensor: Callable[[str, Any], Any] | None = None,
     dtype: Any = None,
 ) -> None:
     """Load ordinary tensors and install one packed expert layer at a time."""
@@ -151,6 +156,7 @@ def load_gpt_oss_weights(
         raise ValueError("model dtype must be floating point")
 
     tensor_files = _indexed_tensor_files(root)
+    transform_tensor = transform_tensor or _identity_tensor
     ordinary_keys = tuple(
         key for key in model.state_dict() if _EXPERT_KEY.fullmatch(key) is None
     )
@@ -170,6 +176,7 @@ def load_gpt_oss_weights(
     with _TensorReader() as reader:
         for key in ordinary_keys:
             tensor = reader.read(tensor_files[key], key)
+            tensor = transform_tensor(key, tensor)
             _assign_tensor(
                 model,
                 key,
@@ -183,6 +190,7 @@ def load_gpt_oss_weights(
             for name in expert_names:
                 key = f"model.layers.{layer}.mlp.experts.{name}"
                 tensor = reader.read(tensor_files[key], key)
+                tensor = transform_tensor(key, tensor)
                 tensors[name] = tensor.to(device=target)
             install_expert_layer(layer, tensors)
 

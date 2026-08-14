@@ -195,6 +195,8 @@ def apply_rotary(hidden: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class Attention(nn.Module):
+    qkv_proj: nn.Linear
+
     def __init__(self, config: GptOssConfig, layer_index: int) -> None:
         super().__init__()
         self.layer_type = config.layer_types[layer_index]
@@ -220,6 +222,38 @@ class Attention(nn.Module):
             self.num_heads * self.head_dim, width, bias=config.attention_bias
         )
         self.sinks = nn.Parameter(torch.empty(self.num_heads))
+
+    def pack_qkv_projection(self) -> None:
+        """Replace the loaded local Q/K/V shards with one packed projection."""
+
+        projections = (self.q_proj, self.k_proj, self.v_proj)
+        weight = torch.cat(tuple(projection.weight for projection in projections))
+        packed = nn.Linear(
+            weight.shape[1],
+            weight.shape[0],
+            bias=self.q_proj.bias is not None,
+            device="meta",
+            dtype=weight.dtype,
+        )
+        packed.weight = nn.Parameter(
+            weight,
+            requires_grad=self.q_proj.weight.requires_grad,
+        )
+        if self.q_proj.bias is not None:
+            packed.bias = nn.Parameter(
+                torch.cat(
+                    tuple(
+                        projection.bias
+                        for projection in projections
+                        if projection.bias is not None
+                    )
+                ),
+                requires_grad=self.q_proj.bias.requires_grad,
+            )
+        self.qkv_proj = packed
+        del self.q_proj
+        del self.k_proj
+        del self.v_proj
 
     def forward(
         self,

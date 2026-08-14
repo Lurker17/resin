@@ -75,7 +75,7 @@ class KernelCacheContractTests(unittest.TestCase):
         self.assertEqual(
             Path(KERNEL_CACHE_ROOT), Path(KERNEL_CACHE_MOUNT) / KERNEL_CACHE_ABI
         )
-        self.assertTrue(KERNEL_CACHE_ABI.startswith("v6-blake3-"))
+        self.assertTrue(KERNEL_CACHE_ABI.startswith("v10-blake3-"))
         self.assertEqual(KERNEL_CACHE_MARKER_SCHEMA, 2)
 
     def test_artifact_fingerprints_ignore_mtime_changes(self) -> None:

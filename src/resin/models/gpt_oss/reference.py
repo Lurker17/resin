@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from resin.backend.cuda.parallel import TensorParallelLayout
 from resin.backend.loading import (
     MODEL_FILES,
     default_device,
@@ -89,7 +90,14 @@ def _check_quantization(config: dict[str, Any], *, allow_mxfp4: bool = False) ->
     raise ValueError(f"unsupported GPT-OSS quantization method: {method!r}")
 
 
-def load_model(model_path: Path, *, device, dtype=None, moe_kernel=None):
+def load_model(
+    model_path: Path,
+    *,
+    device,
+    dtype=None,
+    moe_kernel=None,
+    tensor_parallel: TensorParallelLayout | None = None,
+):
     config = read_config(model_path)
     args = GptOssConfig.from_dict(config)
     _check_quantization(config, allow_mxfp4=moe_kernel is not None)
@@ -102,6 +110,13 @@ def load_model(model_path: Path, *, device, dtype=None, moe_kernel=None):
             device=device,
             kernel=moe_kernel,
             dtype=dtype,
+            tensor_parallel=tensor_parallel,
+        )
+
+    tensor_parallel = tensor_parallel or TensorParallelLayout()
+    if tensor_parallel.enabled:
+        raise NotImplementedError(
+            "tensor parallel loading currently requires packed MXFP4 experts"
         )
 
     target = torch.device(device)
