@@ -6,7 +6,6 @@ import math
 import weakref
 from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
@@ -427,12 +426,7 @@ class TestLfm2CudaCachePoolBoundary:
         runner = self._runner()
         with pytest.raises(ValueError, match="frozen layout object"):
             runner.bind_cache_and_recurrent_state(
-                41,
-                object(),
-                53,
-                4,
-                "lfm2.conv_state.v1",
-                None,
+                41, object(), 53, 4, "lfm2.conv_state.v1", None
             )
         assert runner._kv.binding.pool_id is None
         assert runner._state.binding is None
@@ -451,59 +445,42 @@ class TestLfm2CudaCachePoolBoundary:
 
         with pytest.raises(ValueError, match="different cache pool"):
             runner.bind_cache_and_recurrent_state(
-                42,
-                runner.cache_layout,
-                53,
-                7,
-                "lfm2.conv_state.v1",
-                None,
+                42, runner.cache_layout, 53, 7, "lfm2.conv_state.v1", None
             )
         with pytest.raises(ValueError, match="different mapped-state"):
             runner.bind_cache_and_recurrent_state(
-                41,
-                runner.cache_layout,
-                54,
-                7,
-                "lfm2.conv_state.v1",
-                None,
+                41, runner.cache_layout, 54, 7, "lfm2.conv_state.v1", None
             )
 
-    def test_combined_binding_reuses_the_exact_registered_arena_object(self) -> None:
+    def test_combined_binding_reuses_the_exact_registered_arena_object(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from resin.backend.cuda.mapped_state import _MAPPED_STATE_ARENAS
 
         _MAPPED_STATE_ARENAS.clear()
         try:
             first = self._runner()
-            with patch(
+            monkeypatch.setattr(
                 "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
-                return_value=1234,
-                create=True,
-            ):
-                first_ack = first.bind_cache_and_recurrent_state(
-                    41,
-                    first.cache_layout,
-                    53,
-                    7,
-                    "lfm2.conv_state.v1",
-                    None,
-                )
+                lambda: 1234,
+            )
+            first_ack = first.bind_cache_and_recurrent_state(
+                41, first.cache_layout, 53, 7, "lfm2.conv_state.v1", None
+            )
 
             second = self._runner()
-            with patch(
-                "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
-                side_effect=AssertionError("a required arena must not be reminted"),
-                create=True,
-            ) as mint:
-                second_ack = second.bind_cache_and_recurrent_state(
-                    42,
-                    second.cache_layout,
-                    53,
-                    7,
-                    "lfm2.conv_state.v1",
-                    1234,
-                )
 
-            mint.assert_not_called()
+            def unexpected_mint():
+                raise AssertionError("a required arena must not be reminted")
+
+            monkeypatch.setattr(
+                "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
+                unexpected_mint,
+            )
+            second_ack = second.bind_cache_and_recurrent_state(
+                42, second.cache_layout, 53, 7, "lfm2.conv_state.v1", 1234
+            )
+
             assert first_ack[-1] == 1234
             assert second_ack[-1] == 1234
             assert second._state.slab is first._state.slab
@@ -521,12 +498,7 @@ class TestLfm2CudaCachePoolBoundary:
             )
             with pytest.raises(ValueError, match="incompatible"):
                 incompatible.bind_cache_and_recurrent_state(
-                    43,
-                    incompatible.cache_layout,
-                    53,
-                    7,
-                    "lfm2.conv_state.v1",
-                    1234,
+                    43, incompatible.cache_layout, 53, 7, "lfm2.conv_state.v1", 1234
                 )
             assert incompatible._kv.binding.pool_id is None
             assert incompatible._state.binding is None
@@ -534,7 +506,7 @@ class TestLfm2CudaCachePoolBoundary:
             _MAPPED_STATE_ARENAS.clear()
 
     def test_combined_binding_allocation_failure_publishes_neither_identity(
-        self,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         runner = self._runner()
 
@@ -543,20 +515,14 @@ class TestLfm2CudaCachePoolBoundary:
             raise RuntimeError("synthetic recurrent slab allocation failure")
 
         runner._torch.zeros = fail_allocation
-        with patch(
+        monkeypatch.setattr(
             "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
-            return_value=1234,
-            create=True,
-        ):
-            with pytest.raises(RuntimeError, match="synthetic recurrent slab"):
-                runner.bind_cache_and_recurrent_state(
-                    41,
-                    runner.cache_layout,
-                    53,
-                    7,
-                    "lfm2.conv_state.v1",
-                    None,
-                )
+            lambda: 1234,
+        )
+        with pytest.raises(RuntimeError, match="synthetic recurrent slab"):
+            runner.bind_cache_and_recurrent_state(
+                41, runner.cache_layout, 53, 7, "lfm2.conv_state.v1", None
+            )
 
         assert runner._kv.binding.pool_id is None
         assert runner._state.binding is None
@@ -566,7 +532,7 @@ class TestLfm2CudaCachePoolBoundary:
         assert runner._state.owners is None
 
     def test_engine_combined_binding_rejects_unregistered_prebound_native_arena(
-        self,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from resin import (
             CacheGroupLayout,
@@ -599,15 +565,17 @@ class TestLfm2CudaCachePoolBoundary:
         runner = self._runner()
         runner.cache_layout = CacheLayout(8, [CacheGroupLayout(16)])
         runner._kv.binding.layout = runner.cache_layout
-        with patch(
-            "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
-            side_effect=AssertionError("prebound native arena must not be reminted"),
-            create=True,
-        ) as mint:
-            with pytest.raises(ValueError, match="not registered in this process"):
-                Engine(runner, state_pool=pool)
 
-        mint.assert_not_called()
+        def unexpected_mint():
+            raise AssertionError("prebound native arena must not be reminted")
+
+        monkeypatch.setattr(
+            "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
+            unexpected_mint,
+        )
+        with pytest.raises(ValueError, match="not registered in this process"):
+            Engine(runner, state_pool=pool)
+
         assert runner._kv.binding.pool_id is None
         assert runner._state.arena_id is None
         assert pool.physical_mapping == ("lfm2.conv_state.v1", arena_id)
@@ -851,25 +819,15 @@ class TestLfm2CudaRecurrentState:
 
         with pytest.raises(ValueError, match="different mapped-state"):
             runner.bind_cache_and_recurrent_state(
-                41,
-                runner.cache_layout,
-                54,
-                7,
-                "lfm2.conv_state.v1",
-                None,
+                41, runner.cache_layout, 54, 7, "lfm2.conv_state.v1", None
             )
         with pytest.raises(ValueError, match="different mapped-state"):
             runner.bind_cache_and_recurrent_state(
-                41,
-                runner.cache_layout,
-                53,
-                8,
-                "lfm2.conv_state.v1",
-                None,
+                41, runner.cache_layout, 53, 8, "lfm2.conv_state.v1", None
             )
 
     def test_binding_rejects_invalid_identity_capacity_and_protocol_before_mint(
-        self,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         cases = (
             ((0, 4, "lfm2.conv_state.v1"), "pool id"),
@@ -878,21 +836,20 @@ class TestLfm2CudaRecurrentState:
             ((53, True, "lfm2.conv_state.v1"), "capacity"),
             ((53, 4, "lfm2.conv_state.v2"), "protocol"),
         )
+
+        def unexpected_mint():
+            raise AssertionError("invalid bindings must fail before minting an arena")
+
+        monkeypatch.setattr(
+            "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
+            unexpected_mint,
+        )
         for arguments, message in cases:
             runner = TestLfm2CudaCachePoolBoundary._runner()
-            with patch(
-                "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
-                return_value=1234,
-                create=True,
-            ) as mint:
-                with pytest.raises(ValueError, match=message):
-                    runner.bind_cache_and_recurrent_state(
-                        41,
-                        runner.cache_layout,
-                        *arguments,
-                        None,
-                    )
-            mint.assert_not_called()
+            with pytest.raises(ValueError, match=message):
+                runner.bind_cache_and_recurrent_state(
+                    41, runner.cache_layout, *arguments, None
+                )
             assert runner._state.slab is None
 
     def test_preflight_guards_reject_before_start_event_acceptance(self) -> None:

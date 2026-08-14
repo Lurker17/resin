@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import os
-import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -43,18 +41,14 @@ class TestKernelCacheContract:
             "triton": {"files": 1, "bytes": 30},
         }
 
-    def test_environment_override_cannot_escape_mount(self) -> None:
+    def test_environment_override_cannot_escape_mount(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         # Import locally so the test never needs Modal or a mounted volume.
         from deploy.jit_cache import ensure_kernel_cache_dirs
 
-        with (
-            tempfile.TemporaryDirectory() as temporary,
-            patch.dict(
-                os.environ,
-                {"CUDA_CACHE_PATH": str(Path(temporary) / "outside")},
-            ),
-            pytest.raises(RuntimeError, match="escaped"),
-        ):
+        monkeypatch.setenv("CUDA_CACHE_PATH", str(tmp_path / "outside"))
+        with pytest.raises(RuntimeError, match="escaped"):
             ensure_kernel_cache_dirs()
 
     def test_deployment_uses_one_abi_scoped_namespace(self) -> None:
@@ -68,47 +62,45 @@ class TestKernelCacheContract:
         assert KERNEL_CACHE_ABI.startswith("v10-blake3-")
         assert KERNEL_CACHE_MARKER_SCHEMA == 2
 
-    def test_artifact_fingerprints_ignore_mtime_changes(self) -> None:
+    def test_artifact_fingerprints_ignore_mtime_changes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         from deploy.jit_cache import kernel_artifact_fingerprints
 
-        with (
-            tempfile.TemporaryDirectory() as temporary,
-            patch("deploy.jit_cache.KERNEL_CACHE_ROOT", temporary),
-        ):
-            artifact = Path(temporary) / "flash-attention-4" / "fwd" / "kernel.o"
-            artifact.parent.mkdir(parents=True)
-            artifact.write_bytes(b"compiled")
-            before = kernel_artifact_fingerprints()
-            assert (
-                before["flash-attention-4/fwd/kernel.o"]
-                == "8:0a1c9344b835c6d495d9c0373e619936990f97b18cb8ba615b5344adf724a5e5"
-            )
-            stat = artifact.stat()
-            os.utime(
-                artifact,
-                ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
-            )
-            assert kernel_artifact_fingerprints() == before
+        monkeypatch.setattr("deploy.jit_cache.KERNEL_CACHE_ROOT", tmp_path)
+        artifact = tmp_path / "flash-attention-4" / "fwd" / "kernel.o"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"compiled")
+        before = kernel_artifact_fingerprints()
+        assert (
+            before["flash-attention-4/fwd/kernel.o"]
+            == "8:0a1c9344b835c6d495d9c0373e619936990f97b18cb8ba615b5344adf724a5e5"
+        )
+        stat = artifact.stat()
+        os.utime(
+            artifact,
+            ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+        )
+        assert kernel_artifact_fingerprints() == before
 
-    def test_autotune_json_is_content_fingerprinted_without_mtimes(self) -> None:
+    def test_autotune_json_is_content_fingerprinted_without_mtimes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         from deploy.jit_cache import kernel_artifact_fingerprints
 
-        with (
-            tempfile.TemporaryDirectory() as temporary,
-            patch("deploy.jit_cache.KERNEL_CACHE_ROOT", temporary),
-        ):
-            artifact = Path(temporary) / "flashinfer-autotune" / "gpt-oss.json"
-            artifact.parent.mkdir(parents=True)
-            artifact.write_bytes(b'{"tactic":1}')
-            before = kernel_artifact_fingerprints()
-            assert "flashinfer-autotune/gpt-oss.json" in before
+        monkeypatch.setattr("deploy.jit_cache.KERNEL_CACHE_ROOT", tmp_path)
+        artifact = tmp_path / "flashinfer-autotune" / "gpt-oss.json"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b'{"tactic":1}')
+        before = kernel_artifact_fingerprints()
+        assert "flashinfer-autotune/gpt-oss.json" in before
 
-            stat = artifact.stat()
-            os.utime(
-                artifact,
-                ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
-            )
-            assert kernel_artifact_fingerprints() == before
+        stat = artifact.stat()
+        os.utime(
+            artifact,
+            ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+        )
+        assert kernel_artifact_fingerprints() == before
 
-            artifact.write_bytes(b'{"tactic":2}')
-            assert kernel_artifact_fingerprints() != before
+        artifact.write_bytes(b'{"tactic":2}')
+        assert kernel_artifact_fingerprints() != before

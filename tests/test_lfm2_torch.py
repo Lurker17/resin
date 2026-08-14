@@ -5,7 +5,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -127,7 +126,9 @@ class TestLfm2Torch:
         not importlib.util.find_spec("safetensors"),
         reason="safetensors is not installed",
     )
-    def test_direct_safetensors_loading_without_transformers(self) -> None:
+    def test_direct_safetensors_loading_without_transformers(
+        self, tmp_path: Path
+    ) -> None:
         from safetensors.torch import save_file
 
         from resin.models.lfm2.reference import load_model
@@ -157,15 +158,14 @@ class TestLfm2Torch:
         with self.torch.inference_mode():
             expected = self.model(tokens, self.model.make_cache())
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            (path / "config.json").write_text(json.dumps(config))
-            save_file(self.model.state_dict(), path / "model.safetensors")
-            torch, loaded, loaded_config = load_model(path, device="cpu")
-            assert "transformers" not in sys.modules
-            assert "tokenizers" not in sys.modules
-            with torch.inference_mode():
-                actual = loaded(tokens, loaded.make_cache())
+        path = tmp_path
+        (path / "config.json").write_text(json.dumps(config))
+        save_file(self.model.state_dict(), path / "model.safetensors")
+        torch, loaded, loaded_config = load_model(path, device="cpu")
+        assert "transformers" not in sys.modules
+        assert "tokenizers" not in sys.modules
+        with torch.inference_mode():
+            actual = loaded(tokens, loaded.make_cache())
         assert loaded_config["model_type"] == "lfm2"
         torch.testing.assert_close(expected, actual, rtol=0, atol=0)
 

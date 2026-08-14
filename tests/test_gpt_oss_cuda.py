@@ -4,7 +4,6 @@ import importlib.util
 import inspect
 import math
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
@@ -423,7 +422,9 @@ class TestGptOssCudaFa4Call:
     not importlib.util.find_spec("torch"), reason="PyTorch is not installed"
 )
 class TestGptOssCudaTinyOracle:
-    def test_flashinfer_allreduce_fuses_residual_and_rmsnorm(self) -> None:
+    def test_flashinfer_allreduce_fuses_residual_and_rmsnorm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         import torch
 
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
@@ -445,10 +446,10 @@ class TestGptOssCudaTinyOracle:
             kwargs["norm_out"].copy_((normalized * kwargs["rms_gamma"]).bfloat16())
             return kwargs["norm_out"]
 
-        with patch("resin.models.gpt_oss.cuda.allreduce_fusion", fused):
-            normalized, combined = runner._allreduce_residual_rmsnorm(
-                partial, residual, weight, eps
-            )
+        monkeypatch.setattr("resin.models.gpt_oss.cuda.allreduce_fusion", fused)
+        normalized, combined = runner._allreduce_residual_rmsnorm(
+            partial, residual, weight, eps
+        )
 
         expected_combined = partial + residual
         expected_normalized = expected_combined.float()
@@ -487,7 +488,9 @@ class TestGptOssCudaTinyOracle:
         assert not hasattr(attention, "k_proj")
         assert not hasattr(attention, "v_proj")
 
-    def test_router_uses_tinygemm_through_128_rows_then_linear(self) -> None:
+    def test_router_uses_tinygemm_through_128_rows_then_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         import torch
 
         router = SimpleNamespace(
@@ -500,21 +503,19 @@ class TestGptOssCudaTinyOracle:
             calls.append((input.shape[0], use_pdl))
             output.copy_(torch.nn.functional.linear(input, weight, bias))
 
-        with patch("resin.models.gpt_oss.cuda.tinygemm_bf16", tinygemm):
-            for rows in (1, 2, 4, 8, 16, 32, 64, 128):
-                hidden = torch.randn(rows, 64, dtype=torch.bfloat16)
-                expected = torch.nn.functional.linear(
-                    hidden, router.weight, router.bias
-                )
-                torch.testing.assert_close(
-                    _router_logits(router, hidden), expected, rtol=0, atol=0
-                )
-
-            hidden = torch.randn(129, 64, dtype=torch.bfloat16)
+        monkeypatch.setattr("resin.models.gpt_oss.cuda.tinygemm_bf16", tinygemm)
+        for rows in (1, 2, 4, 8, 16, 32, 64, 128):
+            hidden = torch.randn(rows, 64, dtype=torch.bfloat16)
             expected = torch.nn.functional.linear(hidden, router.weight, router.bias)
             torch.testing.assert_close(
                 _router_logits(router, hidden), expected, rtol=0, atol=0
             )
+
+        hidden = torch.randn(129, 64, dtype=torch.bfloat16)
+        expected = torch.nn.functional.linear(hidden, router.weight, router.bias)
+        torch.testing.assert_close(
+            _router_logits(router, hidden), expected, rtol=0, atol=0
+        )
 
         assert calls == [
             (1, False),
@@ -528,7 +529,7 @@ class TestGptOssCudaTinyOracle:
         ]
 
     def test_official_top4_router_uses_cutile_and_other_layouts_fall_back(
-        self,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import torch
 
@@ -542,7 +543,8 @@ class TestGptOssCudaTinyOracle:
             calls.append(actual_logits.shape)
             return expected_indices.to(torch.int32), expected_weights.to(torch.float32)
 
-        with patch("resin.models.gpt_oss.cuda.top4_softmax", top4_softmax):
+        with monkeypatch.context() as context:
+            context.setattr("resin.models.gpt_oss.cuda.top4_softmax", top4_softmax)
             indices, weights = _route(official, logits)
 
         assert calls == [torch.Size([32, 128])]
@@ -557,12 +559,17 @@ class TestGptOssCudaTinyOracle:
 
         large_logits = torch.randn(8192, 128, dtype=torch.bfloat16)
         large_values, large_indices = torch.topk(large_logits, 4, dim=-1, sorted=True)
-        with patch(
-            "resin.models.gpt_oss.cuda.top4_softmax",
-            return_value=(large_indices.int(), torch.softmax(large_values, dim=-1)),
-        ) as fused:
+        fused_calls = []
+
+        def fused(actual_logits):
+            fused_calls.append(actual_logits)
+            return large_indices.int(), torch.softmax(large_values, dim=-1)
+
+        with monkeypatch.context() as context:
+            context.setattr("resin.models.gpt_oss.cuda.top4_softmax", fused)
             _route(official, large_logits)
-        fused.assert_called_once_with(large_logits)
+        assert len(fused_calls) == 1
+        assert fused_calls[0] is large_logits
 
     def test_static_decode_step_restores_rust_sequence_order_before_sampling(
         self,
@@ -586,7 +593,7 @@ class TestGptOssCudaTinyOracle:
         assert step.output.tolist() == [0, 1]
 
     def test_rotary_path_matches_reference_formula_without_dtype_promotion(
-        self,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import torch
 
@@ -630,8 +637,8 @@ class TestGptOssCudaTinyOracle:
             dim=-1,
         )
 
-        with patch("resin.models.gpt_oss.cuda.apply_rotary", apply_rotary):
-            actual = runner._apply_yarn_rotary(hidden, cos, sin)
+        monkeypatch.setattr("resin.models.gpt_oss.cuda.apply_rotary", apply_rotary)
+        actual = runner._apply_yarn_rotary(hidden, cos, sin)
 
         assert actual.dtype == torch.bfloat16
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)

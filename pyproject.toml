@@ -61,6 +61,7 @@ dev = [
 [tool.maturin]
 module-name = "resin._resin"
 python-source = "src"
+python-packages = ["resin"]
 features = ["pyo3/extension-module"]
 
 [tool.ruff]

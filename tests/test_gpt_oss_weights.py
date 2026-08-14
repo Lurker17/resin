@@ -4,7 +4,6 @@ import importlib.util
 import json
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -75,19 +74,20 @@ class TestGptOssWeightLoader:
             install_expert_layer=install,
         )
 
-    def test_streams_ordinary_tensors_and_one_expert_layer_at_a_time(self) -> None:
+    def test_streams_ordinary_tensors_and_one_expert_layer_at_a_time(
+        self, tmp_path: Path
+    ) -> None:
         model = self._model()
         tensors = self._tensors()
         installed = []
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            self._write_single(root, tensors)
-            self._load(
-                root,
-                model,
-                lambda layer, values: installed.append((layer, dict(values))),
-                dtype="float64",
-            )
+        root = tmp_path
+        self._write_single(root, tensors)
+        self._load(
+            root,
+            model,
+            lambda layer, values: installed.append((layer, dict(values))),
+            dtype="float64",
+        )
 
         assert model.model.embed_tokens.weight.dtype == self.torch.float64
         assert not model.model.embed_tokens.weight.is_meta
@@ -101,64 +101,61 @@ class TestGptOssWeightLoader:
             {"blocks", "scales"},
         ]
 
-    def test_sharded_checkpoint_uses_index(self) -> None:
+    def test_sharded_checkpoint_uses_index(self, tmp_path: Path) -> None:
         from safetensors.torch import save_file
 
         tensors = self._tensors(layers=1)
         ordinary = {"model.embed_tokens.weight", "lm_head.weight"}
         installed = []
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            first = root / "model-00001-of-00002.safetensors"
-            second = root / "model-00002-of-00002.safetensors"
-            save_file({key: tensors[key] for key in ordinary}, first)
-            save_file(
-                {key: value for key, value in tensors.items() if key not in ordinary},
-                second,
-            )
-            (root / "model.safetensors.index.json").write_text(
-                json.dumps(
-                    {
-                        "weight_map": {
-                            key: first.name if key in ordinary else second.name
-                            for key in tensors
-                        }
+        root = tmp_path
+        first = root / "model-00001-of-00002.safetensors"
+        second = root / "model-00002-of-00002.safetensors"
+        save_file({key: tensors[key] for key in ordinary}, first)
+        save_file(
+            {key: value for key, value in tensors.items() if key not in ordinary},
+            second,
+        )
+        (root / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        key: first.name if key in ordinary else second.name
+                        for key in tensors
                     }
-                )
+                }
             )
-            self._load(
-                root,
-                self._model(),
-                lambda layer, values: installed.append((layer, dict(values))),
-                layers=1,
-            )
+        )
+        self._load(
+            root,
+            self._model(),
+            lambda layer, values: installed.append((layer, dict(values))),
+            layers=1,
+        )
 
         assert len(installed) == 1
 
-    def test_missing_tensor_is_rejected_before_assignment(self) -> None:
+    def test_missing_tensor_is_rejected_before_assignment(self, tmp_path: Path) -> None:
         tensors = self._tensors(layers=1)
         del tensors["lm_head.weight"]
         model = self._model()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            self._write_single(root, tensors)
-            with pytest.raises(ValueError, match="missing tensors"):
-                self._load(root, model, lambda _layer, _values: None, layers=1)
+        root = tmp_path
+        self._write_single(root, tensors)
+        with pytest.raises(ValueError, match="missing tensors"):
+            self._load(root, model, lambda _layer, _values: None, layers=1)
         assert model.model.embed_tokens.weight.is_meta
 
-    def test_shape_mismatch_is_rejected(self) -> None:
+    def test_shape_mismatch_is_rejected(self, tmp_path: Path) -> None:
         tensors = self._tensors(layers=1)
         tensors["model.embed_tokens.weight"] = self.torch.ones(1, 1)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            self._write_single(root, tensors)
-            with pytest.raises(ValueError, match="shape mismatch"):
-                self._load(
-                    root,
-                    self._model(),
-                    lambda _layer, _values: None,
-                    layers=1,
-                )
+        root = tmp_path
+        self._write_single(root, tensors)
+        with pytest.raises(ValueError, match="shape mismatch"):
+            self._load(
+                root,
+                self._model(),
+                lambda _layer, _values: None,
+                layers=1,
+            )
 
 
 class TestGptOssWeightLoaderImport:

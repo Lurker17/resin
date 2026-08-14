@@ -4,7 +4,6 @@ import importlib.util
 import json
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -484,25 +483,28 @@ class TestGptOssTorch:
             runner.forward(plan)
         assert len(runner._cache) == 0
 
-    def test_mxfp4_checkpoint_has_precise_kernel_boundary_error(self) -> None:
+    def test_mxfp4_checkpoint_has_precise_kernel_boundary_error(
+        self, tmp_path: Path
+    ) -> None:
         from resin.models.gpt_oss.reference import load_model
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            (path / "config.json").write_text(
-                json.dumps(_config(self.args, quantization={"quant_method": "mxfp4"}))
-            )
-            with pytest.raises(
-                NotImplementedError,
-                match="MXFP4 expert weights.*H100 MXFP4 expert kernel",
-            ):
-                load_model(path, device="cpu")
+        path = tmp_path
+        (path / "config.json").write_text(
+            json.dumps(_config(self.args, quantization={"quant_method": "mxfp4"}))
+        )
+        with pytest.raises(
+            NotImplementedError,
+            match="MXFP4 expert weights.*H100 MXFP4 expert kernel",
+        ):
+            load_model(path, device="cpu")
 
     @pytest.mark.skipif(
         not importlib.util.find_spec("safetensors"),
         reason="safetensors is not installed",
     )
-    def test_direct_dense_safetensors_loading_without_transformers(self) -> None:
+    def test_direct_dense_safetensors_loading_without_transformers(
+        self, tmp_path: Path
+    ) -> None:
         from safetensors.torch import save_file
 
         from resin.models.gpt_oss.reference import load_model
@@ -511,14 +513,13 @@ class TestGptOssTorch:
         with self.torch.inference_mode():
             expected = self.model(tokens, self.model.make_cache())
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            (path / "config.json").write_text(json.dumps(_config(self.args)))
-            save_file(self.model.state_dict(), path / "model.safetensors")
-            torch, loaded, loaded_config = load_model(path, device="cpu")
-            assert "transformers" not in sys.modules
-            assert "tokenizers" not in sys.modules
-            with torch.inference_mode():
-                actual = loaded(tokens, loaded.make_cache())
+        path = tmp_path
+        (path / "config.json").write_text(json.dumps(_config(self.args)))
+        save_file(self.model.state_dict(), path / "model.safetensors")
+        torch, loaded, loaded_config = load_model(path, device="cpu")
+        assert "transformers" not in sys.modules
+        assert "tokenizers" not in sys.modules
+        with torch.inference_mode():
+            actual = loaded(tokens, loaded.make_cache())
         assert loaded_config["model_type"] == "gpt_oss"
         torch.testing.assert_close(expected, actual, rtol=0, atol=0)
