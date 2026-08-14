@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import unittest
+import pytest
 
 from resin import (
     BatchPhase,
@@ -30,14 +30,14 @@ class RecordingRunner:
         self.released.extend(request_ids)
 
 
-class EngineTests(unittest.TestCase):
+class TestEngine:
     def test_engine_context_length_and_request_limit_are_top_level(self) -> None:
         engine = Engine(RecordingRunner(), max_running_requests=3, context_length=4)
-        self.assertEqual(engine.max_running_requests, 3)
-        self.assertEqual(engine.context_length, 4)
-        with self.assertRaisesRegex(ValueError, "exceeds Engine context_length 4"):
+        assert engine.max_running_requests == 3
+        assert engine.context_length == 4
+        with pytest.raises(ValueError, match="exceeds Engine context_length 4"):
             engine.submit([1, 2, 3], max_new_tokens=3)
-        with self.assertRaisesRegex(ValueError, "context_length must be positive"):
+        with pytest.raises(ValueError, match="context_length must be positive"):
             Engine(RecordingRunner(), context_length=0)
 
     def test_missing_generation_limit_uses_remaining_model_context(self) -> None:
@@ -45,25 +45,25 @@ class EngineTests(unittest.TestCase):
         request = engine.submit([1, 2])
         while engine.has_work():
             engine.step()
-        self.assertEqual(request.take_result(), [3, 4])
+        assert request.take_result() == [3, 4]
 
     def test_request_lease_owns_result_without_engine_retention(self) -> None:
         engine = Engine(RecordingRunner())
         request = engine.submit([1], max_new_tokens=1)
 
-        self.assertIsInstance(request, RequestLease)
-        self.assertEqual(request.id, request.request_id)
-        self.assertFalse(request.done)
-        with self.assertRaisesRegex(RuntimeError, "not completed"):
+        assert isinstance(request, RequestLease)
+        assert request.id == request.request_id
+        assert not request.done
+        with pytest.raises(RuntimeError, match="not completed"):
             request.take_result()
 
         engine.step()
 
-        self.assertTrue(request.done)
-        self.assertFalse(request.cancelled)
-        self.assertFalse(hasattr(engine, "output"))
-        self.assertEqual(request.take_result(), [2])
-        with self.assertRaisesRegex(RuntimeError, "already been consumed"):
+        assert request.done
+        assert not request.cancelled
+        assert not hasattr(engine, "output")
+        assert request.take_result() == [2]
+        with pytest.raises(RuntimeError, match="already been consumed"):
             request.take_result()
 
     def test_request_lease_is_bound_to_its_engine(self) -> None:
@@ -71,10 +71,10 @@ class EngineTests(unittest.TestCase):
         second = Engine(RecordingRunner())
         request = first.submit([1], max_new_tokens=1)
 
-        with self.assertRaisesRegex(ValueError, "different Engine"):
+        with pytest.raises(ValueError, match="different Engine"):
             second.cancel(request)
-        self.assertEqual(first.ready_request_count, 1)
-        self.assertEqual(second.ready_request_count, 0)
+        assert first.ready_request_count == 1
+        assert second.ready_request_count == 0
 
     def test_rust_owns_prefill_decode_and_completion_transitions(self) -> None:
         runner = RecordingRunner()
@@ -83,22 +83,22 @@ class EngineTests(unittest.TestCase):
         second = engine.submit([8], max_new_tokens=1)
 
         initial = engine.step()
-        self.assertEqual([event.token_id for event in initial], [3, 9])
-        self.assertEqual(runner.plans[0].phase, BatchPhase.PREFILL)
-        self.assertEqual(runner.plans[0].sequence_indptr, [0, 2, 3])
-        self.assertEqual(runner.plans[0].sample_sequence_indices, [0, 1])
-        self.assertEqual(runner.released, [second])
+        assert [event.token_id for event in initial] == [3, 9]
+        assert runner.plans[0].phase == BatchPhase.PREFILL
+        assert runner.plans[0].sequence_indptr == [0, 2, 3]
+        assert runner.plans[0].sample_sequence_indices == [0, 1]
+        assert runner.released == [second]
 
         final = engine.step()
-        self.assertEqual([event.token_id for event in final], [4])
-        self.assertEqual(runner.plans[1].phase, BatchPhase.DECODE)
-        self.assertEqual(runner.plans[1].positions, [2])
-        self.assertEqual(runner.plans[1].sample_sequence_indices, [0])
-        self.assertFalse(engine.has_work())
-        self.assertTrue(first.done)
-        self.assertEqual(first.take_result(), [3, 4])
-        self.assertTrue(second.done)
-        self.assertEqual(second.take_result(), [9])
+        assert [event.token_id for event in final] == [4]
+        assert runner.plans[1].phase == BatchPhase.DECODE
+        assert runner.plans[1].positions == [2]
+        assert runner.plans[1].sample_sequence_indices == [0]
+        assert not engine.has_work()
+        assert first.done
+        assert first.take_result() == [3, 4]
+        assert second.done
+        assert second.take_result() == [9]
 
     def test_runner_must_return_one_token_per_sequence(self) -> None:
         class BadRunner:
@@ -107,7 +107,7 @@ class EngineTests(unittest.TestCase):
 
         engine = Engine(BadRunner())
         engine.submit([1], max_new_tokens=1)
-        with self.assertRaisesRegex(RuntimeError, "1 sequences"):
+        with pytest.raises(RuntimeError, match="1 sequences"):
             engine.step()
 
     def test_batch_limit_keeps_running_request_ahead_of_waiter(self) -> None:
@@ -117,14 +117,14 @@ class EngineTests(unittest.TestCase):
         second = engine.submit([10], max_new_tokens=1)
         engine.step()
         event = engine.step()[0]
-        self.assertEqual(event.request_id, first)
-        self.assertFalse(first.done)
-        self.assertFalse(second.done)
+        assert event.request_id == first
+        assert not first.done
+        assert not second.done
         engine.step()
         event = engine.step()[0]
-        self.assertEqual(event.request_id, second)
-        self.assertTrue(second.done)
-        self.assertEqual(second.take_result(), [11])
+        assert event.request_id == second
+        assert second.done
+        assert second.take_result() == [11]
 
     def test_ready_prefill_fills_a_vacancy_before_decode_resumes(self) -> None:
         runner = RecordingRunner()
@@ -134,32 +134,26 @@ class EngineTests(unittest.TestCase):
         untouched = engine.submit([20], max_new_tokens=1)
 
         first_events = engine.step()
-        self.assertEqual(
-            [event.request_id for event in first_events],
-            [surviving, terminal],
-        )
-        self.assertEqual(runner.plans[0].sequence_ids, [surviving, terminal])
+        assert [event.request_id for event in first_events] == [surviving, terminal]
+        assert runner.plans[0].sequence_ids == [surviving, terminal]
 
         second_events = engine.step()
-        self.assertEqual(
-            [event.request_id for event in second_events],
-            [untouched],
-        )
-        self.assertEqual(runner.plans[1].sequence_ids, [untouched])
-        self.assertTrue(untouched.done)
-        self.assertFalse(surviving.done)
+        assert [event.request_id for event in second_events] == [untouched]
+        assert runner.plans[1].sequence_ids == [untouched]
+        assert untouched.done
+        assert not surviving.done
 
         third_events = engine.step()
-        self.assertEqual([event.request_id for event in third_events], [surviving])
-        self.assertEqual(runner.plans[2].sequence_ids, [surviving])
+        assert [event.request_id for event in third_events] == [surviving]
+        assert runner.plans[2].sequence_ids == [surviving]
 
         fourth_events = engine.step()
-        self.assertEqual([event.request_id for event in fourth_events], [surviving])
-        self.assertEqual(runner.plans[3].sequence_ids, [surviving])
-        self.assertEqual(untouched.take_result(), [21])
+        assert [event.request_id for event in fourth_events] == [surviving]
+        assert runner.plans[3].sequence_ids == [surviving]
+        assert untouched.take_result() == [21]
 
     def test_public_batch_plan_validates_indptr(self) -> None:
-        with self.assertRaisesRegex(ValueError, "end at the token count"):
+        with pytest.raises(ValueError, match="end at the token count"):
             BatchPlan(
                 [1, 2],
                 [0, 1],
@@ -191,18 +185,18 @@ class EngineTests(unittest.TestCase):
         runner = StateAwareRunner()
         engine = Engine(runner, eos_token_id=7, state_pool=pool)
         request = engine.submit([11], max_new_tokens=2, state_handles=[handle])
-        self.assertEqual(pool.counts(handle), (2, 0))
+        assert pool.counts(handle) == (2, 0)
         pool.release([handle])  # Transfer the caller's reference to the engine.
 
         event = engine.step()[0]
-        self.assertTrue(event.finished)
-        self.assertTrue(request.done)
-        self.assertEqual(request.take_result(), [7])
-        self.assertEqual(runner.plan.state_slots, [handle.slot])
-        self.assertEqual(runner.plan.state_generations, [handle.generation])
-        self.assertEqual(runner.plan.state_indptr, [0, 1])
-        self.assertFalse(pool.contains(handle))
-        self.assertEqual(pool.free_count, 2)
+        assert event.finished
+        assert request.done
+        assert request.take_result() == [7]
+        assert runner.plan.state_slots == [handle.slot]
+        assert runner.plan.state_generations == [handle.generation]
+        assert runner.plan.state_indptr == [0, 1]
+        assert not pool.contains(handle)
+        assert pool.free_count == 2
 
     def test_rust_owns_flat_cache_allocation_and_sparse_group_metadata(self) -> None:
         layout = CacheLayout(3, [CacheGroupLayout(2)])
@@ -222,37 +216,35 @@ class EngineTests(unittest.TestCase):
         engine = Engine(runner)
         request = engine.submit([4, 5, 6], max_new_tokens=2)
 
-        self.assertEqual(runner.binding, (engine.cache_pool_id, layout))
-        self.assertIs(runner.binding[1], layout)
-        self.assertEqual(engine.cache_occupied_block_count, 0)
-        self.assertEqual(engine.cache_free_parent_count, 3)
+        assert runner.binding == (engine.cache_pool_id, layout)
+        assert runner.binding[1] is layout
+        assert engine.cache_occupied_block_count == 0
+        assert engine.cache_free_parent_count == 3
 
         engine.step()
-        self.assertEqual(engine.cache_occupied_block_count, 2)
-        self.assertEqual(engine.cache_free_parent_count, 1)
+        assert engine.cache_occupied_block_count == 2
+        assert engine.cache_free_parent_count == 1
         prefill = runner.plans[0]
-        self.assertEqual(prefill.cache_pool_id, engine.cache_pool_id)
-        self.assertEqual(len(prefill.cache_groups), 1)
+        assert prefill.cache_pool_id == engine.cache_pool_id
+        assert len(prefill.cache_groups) == 1
         group = prefill.cache_groups[0]
-        self.assertEqual(group.group_index, 0)
-        self.assertEqual(group.block_indptr, [0, 2])
-        self.assertEqual(group.first_logical_blocks, [0])
-        self.assertEqual(
-            group.append_block_ids, [group.block_ids[0]] * 2 + [group.block_ids[1]]
-        )
-        self.assertEqual(group.append_block_offsets, [0, 1, 0])
+        assert group.group_index == 0
+        assert group.block_indptr == [0, 2]
+        assert group.first_logical_blocks == [0]
+        assert group.append_block_ids == [group.block_ids[0]] * 2 + [group.block_ids[1]]
+        assert group.append_block_offsets == [0, 1, 0]
 
         engine.step()
         decode = runner.plans[1]
-        self.assertEqual(decode.positions, [3])
+        assert decode.positions == [3]
         decode_group = decode.cache_groups[0]
-        self.assertEqual(decode_group.block_ids, group.block_ids)
-        self.assertEqual(decode_group.append_block_ids, [group.block_ids[1]])
-        self.assertEqual(decode_group.append_block_offsets, [1])
+        assert decode_group.block_ids == group.block_ids
+        assert decode_group.append_block_ids == [group.block_ids[1]]
+        assert decode_group.append_block_offsets == [1]
 
-        self.assertEqual(runner.released, [request])
-        self.assertEqual(engine.cache_occupied_block_count, 0)
-        self.assertEqual(engine.cache_free_parent_count, 3)
+        assert runner.released == [request]
+        assert engine.cache_occupied_block_count == 0
+        assert engine.cache_free_parent_count == 3
 
     def test_kv_grows_on_demand_and_retracts_for_replay(self) -> None:
         layout = CacheLayout(3, [CacheGroupLayout(1)])
@@ -276,22 +268,22 @@ class EngineTests(unittest.TestCase):
         second = engine.submit([10], max_new_tokens=3)
 
         engine.step()
-        self.assertEqual(engine.cache_occupied_block_count, 2)
-        self.assertEqual(runner.plans[-1].sequence_ids, [first, second])
+        assert engine.cache_occupied_block_count == 2
+        assert runner.plans[-1].sequence_ids == [first, second]
 
         while engine.has_work():
             engine.step()
 
-        self.assertEqual(second.take_result(), [11, 12, 13])
-        self.assertEqual(first.take_result(), [2, 3, 4])
-        self.assertEqual(runner.released, [first, second, first])
+        assert second.take_result() == [11, 12, 13]
+        assert first.take_result() == [2, 3, 4]
+        assert runner.released == [first, second, first]
         first_replay = next(
             plan
             for plan in runner.plans[1:]
             if plan.sequence_ids == [first] and plan.phase == BatchPhase.PREFILL
         )
-        self.assertEqual(first_replay.sample_sequence_indices, [])
-        self.assertEqual(engine.cache_occupied_block_count, 0)
+        assert first_replay.sample_sequence_indices == []
+        assert engine.cache_occupied_block_count == 0
 
     def test_conservativeness_limits_initial_kv_admission(self) -> None:
         layout = CacheLayout(3, [CacheGroupLayout(1)])
@@ -307,10 +299,6 @@ class EngineTests(unittest.TestCase):
         first = engine.submit([1], max_new_tokens=3)
         second = engine.submit([10], max_new_tokens=3)
         engine.step()
-        self.assertEqual(runner.plans[-1].sequence_ids, [first])
-        self.assertFalse(second.done)
+        assert runner.plans[-1].sequence_ids == [first]
+        assert not second.done
         engine.close()
-
-
-if __name__ == "__main__":
-    unittest.main()

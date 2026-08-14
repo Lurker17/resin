@@ -5,19 +5,20 @@ import json
 import subprocess
 import sys
 import tempfile
-import unittest
 from pathlib import Path
+
+import pytest
 
 SAFETENSORS_AVAILABLE = importlib.util.find_spec("safetensors") is not None
 TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 
 
-@unittest.skipUnless(
-    SAFETENSORS_AVAILABLE and TORCH_AVAILABLE,
-    "torch and safetensors are required",
+@pytest.mark.skipif(
+    not SAFETENSORS_AVAILABLE and TORCH_AVAILABLE,
+    reason="torch and safetensors are required",
 )
-class GptOssWeightLoaderTests(unittest.TestCase):
-    def setUp(self) -> None:
+class TestGptOssWeightLoader:
+    def setup_method(self) -> None:
         import torch
 
         self.torch = torch
@@ -88,20 +89,17 @@ class GptOssWeightLoaderTests(unittest.TestCase):
                 dtype="float64",
             )
 
-        self.assertEqual(model.model.embed_tokens.weight.dtype, self.torch.float64)
-        self.assertFalse(model.model.embed_tokens.weight.is_meta)
+        assert model.model.embed_tokens.weight.dtype == self.torch.float64
+        assert not model.model.embed_tokens.weight.is_meta
         self.torch.testing.assert_close(
             model.model.embed_tokens.weight,
             tensors["model.embed_tokens.weight"].double(),
         )
-        self.assertEqual([layer for layer, _ in installed], [0, 1])
-        self.assertEqual(
-            [set(values) for _, values in installed],
-            [
-                {"blocks", "scales"},
-                {"blocks", "scales"},
-            ],
-        )
+        assert [layer for layer, _ in installed] == [0, 1]
+        assert [set(values) for _, values in installed] == [
+            {"blocks", "scales"},
+            {"blocks", "scales"},
+        ]
 
     def test_sharded_checkpoint_uses_index(self) -> None:
         from safetensors.torch import save_file
@@ -135,7 +133,7 @@ class GptOssWeightLoaderTests(unittest.TestCase):
                 layers=1,
             )
 
-        self.assertEqual(len(installed), 1)
+        assert len(installed) == 1
 
     def test_missing_tensor_is_rejected_before_assignment(self) -> None:
         tensors = self._tensors(layers=1)
@@ -144,9 +142,9 @@ class GptOssWeightLoaderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self._write_single(root, tensors)
-            with self.assertRaisesRegex(ValueError, "missing tensors"):
+            with pytest.raises(ValueError, match="missing tensors"):
                 self._load(root, model, lambda _layer, _values: None, layers=1)
-        self.assertTrue(model.model.embed_tokens.weight.is_meta)
+        assert model.model.embed_tokens.weight.is_meta
 
     def test_shape_mismatch_is_rejected(self) -> None:
         tensors = self._tensors(layers=1)
@@ -154,7 +152,7 @@ class GptOssWeightLoaderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self._write_single(root, tensors)
-            with self.assertRaisesRegex(ValueError, "shape mismatch"):
+            with pytest.raises(ValueError, match="shape mismatch"):
                 self._load(
                     root,
                     self._model(),
@@ -163,7 +161,7 @@ class GptOssWeightLoaderTests(unittest.TestCase):
                 )
 
 
-class GptOssWeightLoaderImportTests(unittest.TestCase):
+class TestGptOssWeightLoaderImport:
     def test_import_loads_torch_but_not_checkpoint_stacks(self) -> None:
         script = """
 import sys
@@ -173,7 +171,3 @@ for name in ('transformers', 'tokenizers', 'huggingface_hub', 'safetensors'):
     assert name not in sys.modules, name
 """
         subprocess.run([sys.executable, "-c", script], check=True)
-
-
-if __name__ == "__main__":
-    unittest.main()

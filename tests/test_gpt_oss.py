@@ -5,8 +5,9 @@ import json
 import subprocess
 import sys
 import tempfile
-import unittest
 from pathlib import Path
+
+import pytest
 
 
 def _tiny_args():
@@ -71,7 +72,7 @@ def _config(args, *, quantization=None):
     return config
 
 
-class GptOssImportTests(unittest.TestCase):
+class TestGptOssImport:
     def test_import_is_framework_and_tokenizer_free(self) -> None:
         script = """
 import sys
@@ -119,21 +120,23 @@ for name in ('torch', 'transformers', 'tokenizers', 'huggingface_hub', 'safetens
                 ],
             )
             args = GptOssConfig.from_dict(config)
-            self.assertEqual(args.num_hidden_layers, layers)
-            self.assertEqual(args.num_local_experts, experts)
-            self.assertEqual(args.num_experts_per_tok, 4)
-            self.assertEqual(args.head_dim, 64)
+            assert args.num_hidden_layers == layers
+            assert args.num_local_experts == experts
+            assert args.num_experts_per_tok == 4
+            assert args.head_dim == 64
 
     def test_args_reject_non_gpt_oss_checkpoint(self) -> None:
         from resin.models.gpt_oss.config import GptOssConfig
 
-        with self.assertRaisesRegex(ValueError, "expected a GPT-OSS"):
+        with pytest.raises(ValueError, match="expected a GPT-OSS"):
             GptOssConfig.from_dict({"model_type": "llama"})
 
 
-@unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
-class GptOssTorchTests(unittest.TestCase):
-    def setUp(self) -> None:
+@pytest.mark.skipif(
+    not importlib.util.find_spec("torch"), reason="PyTorch is not installed"
+)
+class TestGptOssTorch:
+    def setup_method(self) -> None:
         import torch
 
         from resin.models.gpt_oss.model import GptOssForCausalLM
@@ -170,8 +173,8 @@ class GptOssTorchTests(unittest.TestCase):
             first = attention(original, positions, rope, first_cache)
             second = attention(changed, positions, rope, second_cache)
         torch.testing.assert_close(first[:, -1], second[:, -1], rtol=0, atol=0)
-        self.assertEqual(first_cache.stored, self.args.sliding_window - 1)
-        self.assertEqual(second_cache.stored, self.args.sliding_window - 1)
+        assert first_cache.stored == self.args.sliding_window - 1
+        assert second_cache.stored == self.args.sliding_window - 1
 
     def test_topk_moe_routes_and_weights_selected_experts(self) -> None:
         torch = self.torch
@@ -188,7 +191,7 @@ class GptOssTorchTests(unittest.TestCase):
 
         hidden = torch.randn(1, 1, self.args.hidden_size)
         _, weights, indices = mlp.router(hidden.reshape(1, -1))
-        self.assertEqual(indices.tolist(), [[0, 1]])
+        assert indices.tolist() == [[0, 1]]
         expected_value = 2.0 * weights[0, 0] + 4.0 * weights[0, 1]
         with torch.inference_mode():
             actual = mlp(hidden)
@@ -215,10 +218,10 @@ class GptOssTorchTests(unittest.TestCase):
         ).eval()
         with torch.inference_mode():
             output = model(torch.tensor([[1, 2, 3]]), model.make_cache())
-        self.assertEqual(output.shape, (1, 3, self.args.vocab_size))
-        self.assertEqual(
-            calls,
-            [
+        assert output.shape == (1, 3, self.args.vocab_size)
+        assert (
+            calls
+            == [
                 (
                     torch.Size([3, self.args.hidden_size]),
                     torch.Size([3, self.args.num_experts_per_tok]),
@@ -226,7 +229,7 @@ class GptOssTorchTests(unittest.TestCase):
                     torch.Size([3, self.args.num_local_experts]),
                 )
             ]
-            * self.args.num_hidden_layers,
+            * self.args.num_hidden_layers
         )
 
     def test_equal_length_requests_share_one_model_forward_and_keep_own_caches(
@@ -251,7 +254,7 @@ class GptOssTorchTests(unittest.TestCase):
                 positions,
             )
         handle.remove()
-        self.assertEqual(model_calls, 1)
+        assert model_calls == 1
 
         with torch.inference_mode():
             expected = torch.cat(
@@ -266,16 +269,19 @@ class GptOssTorchTests(unittest.TestCase):
                 dim=0,
             )
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-        self.assertEqual([cache.length for cache in batched_caches], [3, 3])
-        self.assertIsNot(batched_caches[0], batched_caches[1])
+        assert [cache.length for cache in batched_caches] == [3, 3]
+        assert batched_caches[0] is not batched_caches[1]
         for layer_index in range(self.args.num_hidden_layers):
-            self.assertIsNot(
-                batched_caches[0].layers[layer_index],
-                batched_caches[1].layers[layer_index],
+            assert (
+                batched_caches[0].layers[layer_index]
+                is not batched_caches[1].layers[layer_index]
             )
-            self.assertNotEqual(
-                batched_caches[0].layers[layer_index].keys.untyped_storage().data_ptr(),
-                batched_caches[1].layers[layer_index].keys.untyped_storage().data_ptr(),
+            assert (
+                batched_caches[0].layers[layer_index].keys.untyped_storage().data_ptr()
+                != batched_caches[1]
+                .layers[layer_index]
+                .keys.untyped_storage()
+                .data_ptr()
             )
 
         decode_tokens = torch.tensor([[4], [11]])
@@ -327,9 +333,9 @@ class GptOssTorchTests(unittest.TestCase):
             [0, 0],
         )
         first = runner.forward(prefill)
-        self.assertEqual(len(first), 2)
-        self.assertEqual(len(runner._cache), 2)
-        self.assertEqual(model_calls, 1)
+        assert len(first) == 2
+        assert len(runner._cache) == 2
+        assert model_calls == 1
 
         decode = BatchPlan(
             first,
@@ -340,14 +346,14 @@ class GptOssTorchTests(unittest.TestCase):
             phase=BatchPhase.DECODE,
         )
         second = runner.forward(decode)
-        self.assertEqual(len(second), 2)
-        self.assertTrue(all(0 <= token < self.args.vocab_size for token in second))
-        self.assertEqual(model_calls, 2)
+        assert len(second) == 2
+        assert all(0 <= token < self.args.vocab_size for token in second)
+        assert model_calls == 2
         runner.release([17])
-        self.assertEqual(len(runner._cache), 1)
-        self.assertIn(23, runner._cache)
+        assert len(runner._cache) == 1
+        assert 23 in runner._cache
         runner.release([23])
-        self.assertEqual(len(runner._cache), 0)
+        assert len(runner._cache) == 0
         handle.remove()
 
     def test_runner_chunked_prefill_matches_single_chunk_and_cache_state(self) -> None:
@@ -378,13 +384,13 @@ class GptOssTorchTests(unittest.TestCase):
 
         expected = single_chunk.forward(plan)
         actual = chunked.forward(plan)
-        self.assertEqual(actual, expected)
-        self.assertEqual(len(single_chunk._cache), 2)
-        self.assertEqual(len(chunked._cache), 2)
+        assert actual == expected
+        assert len(single_chunk._cache) == 2
+        assert len(chunked._cache) == 2
         for request_id in plan.sequence_ids:
             expected_cache = single_chunk._cache[request_id]
             actual_cache = chunked._cache[request_id]
-            self.assertEqual(actual_cache.length, expected_cache.length)
+            assert actual_cache.length == expected_cache.length
             for expected_layer, actual_layer in zip(
                 expected_cache.layers, actual_cache.layers, strict=True
             ):
@@ -403,11 +409,11 @@ class GptOssTorchTests(unittest.TestCase):
             [5, 5],
             phase=BatchPhase.DECODE,
         )
-        self.assertEqual(chunked.forward(decode), single_chunk.forward(decode))
+        assert chunked.forward(decode) == single_chunk.forward(decode)
         single_chunk.release([17, 23])
         chunked.release([17, 23])
-        self.assertEqual(len(single_chunk._cache), 0)
-        self.assertEqual(len(chunked._cache), 0)
+        assert len(single_chunk._cache) == 0
+        assert len(chunked._cache) == 0
 
     def test_runner_executes_one_model_call_per_plan(self) -> None:
         from resin import BatchPhase, BatchPlan
@@ -438,10 +444,8 @@ class GptOssTorchTests(unittest.TestCase):
             [0, 0],
         )
         first = runner.forward(prefill)
-        self.assertEqual(model_calls, 1)
-        self.assertEqual(
-            [runner._cache[request_id].length for request_id in (17, 23)], [5, 5]
-        )
+        assert model_calls == 1
+        assert [runner._cache[request_id].length for request_id in (17, 23)] == [5, 5]
 
         decode = BatchPlan(
             first,
@@ -452,10 +456,8 @@ class GptOssTorchTests(unittest.TestCase):
             phase=BatchPhase.DECODE,
         )
         runner.forward(decode)
-        self.assertEqual(model_calls, 2)
-        self.assertEqual(
-            [runner._cache[request_id].length for request_id in (17, 23)], [6, 6]
-        )
+        assert model_calls == 2
+        assert [runner._cache[request_id].length for request_id in (17, 23)] == [6, 6]
         handle.remove()
 
     def test_runner_rejects_heterogeneous_plan_instead_of_serializing(self) -> None:
@@ -478,9 +480,9 @@ class GptOssTorchTests(unittest.TestCase):
             [0, 0],
         )
 
-        with self.assertRaisesRegex(ValueError, "equal token counts"):
+        with pytest.raises(ValueError, match="equal token counts"):
             runner.forward(plan)
-        self.assertEqual(len(runner._cache), 0)
+        assert len(runner._cache) == 0
 
     def test_mxfp4_checkpoint_has_precise_kernel_boundary_error(self) -> None:
         from resin.models.gpt_oss.reference import load_model
@@ -490,13 +492,15 @@ class GptOssTorchTests(unittest.TestCase):
             (path / "config.json").write_text(
                 json.dumps(_config(self.args, quantization={"quant_method": "mxfp4"}))
             )
-            with self.assertRaisesRegex(
-                NotImplementedError, "MXFP4 expert weights.*H100 MXFP4 expert kernel"
+            with pytest.raises(
+                NotImplementedError,
+                match="MXFP4 expert weights.*H100 MXFP4 expert kernel",
             ):
                 load_model(path, device="cpu")
 
-    @unittest.skipUnless(
-        importlib.util.find_spec("safetensors"), "safetensors is not installed"
+    @pytest.mark.skipif(
+        not importlib.util.find_spec("safetensors"),
+        reason="safetensors is not installed",
     )
     def test_direct_dense_safetensors_loading_without_transformers(self) -> None:
         from safetensors.torch import save_file
@@ -512,13 +516,9 @@ class GptOssTorchTests(unittest.TestCase):
             (path / "config.json").write_text(json.dumps(_config(self.args)))
             save_file(self.model.state_dict(), path / "model.safetensors")
             torch, loaded, loaded_config = load_model(path, device="cpu")
-            self.assertNotIn("transformers", sys.modules)
-            self.assertNotIn("tokenizers", sys.modules)
+            assert "transformers" not in sys.modules
+            assert "tokenizers" not in sys.modules
             with torch.inference_mode():
                 actual = loaded(tokens, loaded.make_cache())
-        self.assertEqual(loaded_config["model_type"], "gpt_oss")
+        assert loaded_config["model_type"] == "gpt_oss"
         torch.testing.assert_close(expected, actual, rtol=0, atol=0)
-
-
-if __name__ == "__main__":
-    unittest.main()

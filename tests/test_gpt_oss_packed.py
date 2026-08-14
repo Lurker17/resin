@@ -3,12 +3,13 @@ from __future__ import annotations
 import importlib.util
 import subprocess
 import sys
-import unittest
+
+import pytest
 
 from resin.moe_kernels import MoEKernelConfig
 
 
-class GptOssPackedImportTests(unittest.TestCase):
+class TestGptOssPackedImport:
     def test_import_loads_torch_but_not_serving_stacks(self) -> None:
         script = """
 import sys
@@ -20,8 +21,10 @@ for name in ('transformers', 'tokenizers', 'flashinfer', 'triton'):
         subprocess.run([sys.executable, "-c", script], check=True)
 
 
-@unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
-class GptOssPackedBridgeTests(unittest.TestCase):
+@pytest.mark.skipif(
+    not importlib.util.find_spec("torch"), reason="PyTorch is not installed"
+)
+class TestGptOssPackedBridge:
     def test_official_block_layout_is_flattened_and_installed(self) -> None:
         import torch
 
@@ -96,13 +99,9 @@ class GptOssPackedBridgeTests(unittest.TestCase):
         }
         _install_expert_layer(model, kernel, config, 0, tensors)
 
-        self.assertEqual(len(kernel.prepared), 1)
+        assert len(kernel.prepared) == 1
         weights, actual_config = kernel.prepared[0]
-        self.assertIs(actual_config, config)
-        self.assertEqual(weights.gate_up.shape, (4, 64, 16))
-        self.assertEqual(weights.down.shape, (4, 32, 16))
-        self.assertTrue(model.model.layers[0].mlp.experts.is_prepared)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert actual_config is config
+        assert weights.gate_up.shape == (4, 64, 16)
+        assert weights.down.shape == (4, 32, 16)
+        assert model.model.layers[0].mlp.experts.is_prepared

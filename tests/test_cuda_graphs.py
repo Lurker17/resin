@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import unittest
+import pytest
 
 from resin.backend.cuda.graphs import (
     CudaGraphCache,
@@ -120,18 +120,17 @@ def _cache(torch, shapes, build, synchronize_failure=lambda: None):
     )
 
 
-class CudaGraphTests(unittest.TestCase):
+class TestCudaGraph:
     def test_shapes_are_frozen_sorted_and_validated(self) -> None:
-        self.assertEqual(graph_shapes(None, dimensions=2), ())
-        self.assertEqual(graph_shapes({2: 8, 1: 4}, dimensions=2), ((1, 4), (2, 8)))
-        self.assertEqual(graph_shapes(((2, 8), (1, 8)), dimensions=2), ((1, 8), (2, 8)))
+        assert graph_shapes(None, dimensions=2) == ()
+        assert graph_shapes({2: 8, 1: 4}, dimensions=2) == ((1, 4), (2, 8))
+        assert graph_shapes(((2, 8), (1, 8)), dimensions=2) == ((1, 8), (2, 8))
         for invalid in ("1x4", ((0, 4),), ((True, 4),), ((1,),)):
             with (
-                self.subTest(invalid=invalid),
-                self.assertRaises((TypeError, ValueError)),
+                pytest.raises((TypeError, ValueError)),
             ):
                 graph_shapes(invalid, dimensions=2)
-        with self.assertRaisesRegex(ValueError, "duplicate"):
+        with pytest.raises(ValueError, match="duplicate"):
             graph_shapes(((1, 4), (1, 4)), dimensions=2)
 
     def test_matches_the_first_compatible_physical_shape(self) -> None:
@@ -140,13 +139,9 @@ class CudaGraphTests(unittest.TestCase):
             ((2, 8), (1, 4), (2, 4)),
             lambda _shape: CudaGraphStep({}, _Tensor([0]), lambda: None),
         )
-        self.assertEqual(
-            graphs.match(lambda shape: shape[0] == 2 and shape[1] >= 3), (2, 4)
-        )
-        self.assertEqual(
-            graphs.match(lambda shape: shape[0] == 2 and shape[1] >= 5), (2, 8)
-        )
-        self.assertIsNone(graphs.match(lambda shape: shape[0] == 1 and shape[1] >= 5))
+        assert graphs.match(lambda shape: shape[0] == 2 and shape[1] >= 3) == (2, 4)
+        assert graphs.match(lambda shape: shape[0] == 2 and shape[1] >= 5) == (2, 8)
+        assert graphs.match(lambda shape: shape[0] == 1 and shape[1] >= 5) is None
 
     def test_explicit_capture_precedes_replay_of_the_same_static_step(self) -> None:
         torch = _Torch()
@@ -160,13 +155,13 @@ class CudaGraphTests(unittest.TestCase):
 
         graphs = _cache(torch, ((1, 4),), build)
 
-        self.assertEqual(graphs.capture((1, 4), {"value": staged}), [7])
+        assert graphs.capture((1, 4), {"value": staged}) == [7]
         staged[:] = [8]
-        self.assertEqual(graphs.run((1, 4), {"value": staged}), [8])
-        self.assertEqual(len(allocations), 1)
-        self.assertEqual(graphs.stats["capture_count"], 1)
-        self.assertEqual(graphs.stats["replay_count"], 1)
-        self.assertEqual(graphs.stats["captured_shapes"], ((1, 4),))
+        assert graphs.run((1, 4), {"value": staged}) == [8]
+        assert len(allocations) == 1
+        assert graphs.stats["capture_count"] == 1
+        assert graphs.stats["replay_count"] == 1
+        assert graphs.stats["captured_shapes"] == ((1, 4),)
 
     def test_run_never_captures_dynamically(self) -> None:
         graphs = _cache(
@@ -174,9 +169,9 @@ class CudaGraphTests(unittest.TestCase):
             ((1, 4),),
             lambda _shape: CudaGraphStep({}, _Tensor([0]), lambda: None),
         )
-        with self.assertRaisesRegex(RuntimeError, "has not been captured"):
+        with pytest.raises(RuntimeError, match="has not been captured"):
             graphs.run((1, 4), {})
-        self.assertEqual(graphs.stats["capture_count"], 0)
+        assert graphs.stats["capture_count"] == 0
 
     def test_host_shape_error_is_retryable_and_drops_fresh_step(self) -> None:
         builds = []
@@ -187,11 +182,11 @@ class CudaGraphTests(unittest.TestCase):
             return CudaGraphStep({"value": state}, state, lambda: None)
 
         graphs = _cache(_Torch(), ((1, 4),), build)
-        with self.assertRaises(GraphInputError):
+        with pytest.raises(GraphInputError):
             graphs.capture((1, 4), {})
-        self.assertFalse(graphs.stats["poisoned"])
-        self.assertEqual(graphs.capture((1, 4), {"value": [1]}), [1])
-        self.assertEqual(len(builds), 2)
+        assert not graphs.stats["poisoned"]
+        assert graphs.capture((1, 4), {"value": [1]}) == [1]
+        assert len(builds) == 2
 
     def test_capture_mismatch_poisons_before_future_work(self) -> None:
         synchronized = []
@@ -205,11 +200,11 @@ class CudaGraphTests(unittest.TestCase):
             return CudaGraphStep({"value": state}, state, launch)
 
         graphs = _cache(_Torch(), ((1, 4),), build, lambda: synchronized.append(True))
-        with self.assertRaisesRegex(RuntimeError, "differs"):
+        with pytest.raises(RuntimeError, match="differs"):
             graphs.capture((1, 4), {"value": [0]})
-        self.assertEqual(synchronized, [True])
-        self.assertTrue(graphs.stats["poisoned"])
-        with self.assertRaisesRegex(RuntimeError, "poisoned"):
+        assert synchronized == [True]
+        assert graphs.stats["poisoned"]
+        with pytest.raises(RuntimeError, match="poisoned"):
             graphs.check()
 
     def test_device_copy_failure_poisons_before_capture(self) -> None:
@@ -221,10 +216,10 @@ class CudaGraphTests(unittest.TestCase):
             lambda _shape: CudaGraphStep({"value": state}, state, lambda: None),
         )
 
-        with self.assertRaisesRegex(RuntimeError, "copy failed"):
+        with pytest.raises(RuntimeError, match="copy failed"):
             graphs.capture((1, 4), {"value": [1]})
-        self.assertEqual(graphs.stats["capture_count"], 0)
-        self.assertIn("graph input copy", graphs.stats["poison_error"])
+        assert graphs.stats["capture_count"] == 0
+        assert "graph input copy" in graphs.stats["poison_error"]
 
     def test_replay_failure_poisons_without_counting_replay(self) -> None:
         torch = _Torch()
@@ -236,11 +231,7 @@ class CudaGraphTests(unittest.TestCase):
         graphs = _cache(torch, ((1, 4),), build)
         graphs.capture((1, 4), {"value": [1]})
         torch.cuda.graphs[0].error = RuntimeError("illegal replay")
-        with self.assertRaisesRegex(RuntimeError, "illegal replay"):
+        with pytest.raises(RuntimeError, match="illegal replay"):
             graphs.run((1, 4), {"value": [1]})
-        self.assertEqual(graphs.stats["replay_count"], 0)
-        self.assertIn("graph replay", graphs.stats["poison_error"])
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert graphs.stats["replay_count"] == 0
+        assert "graph replay" in graphs.stats["poison_error"]

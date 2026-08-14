@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import unittest
+import pytest
 
 from resin import BatchPlan, Engine, StatePool
 
@@ -52,7 +52,7 @@ class ControlledAsyncRunner:
         self.released.extend(request_ids)
 
 
-class BatchPlanStateAccessTests(unittest.TestCase):
+class TestBatchPlanStateAccess:
     @staticmethod
     def plan(**state_metadata) -> BatchPlan:
         if state_metadata.get("state_slots"):
@@ -72,7 +72,7 @@ class BatchPlanStateAccessTests(unittest.TestCase):
             state_generations=[9],
             state_indptr=[0, 1],
         )
-        self.assertEqual(default.state_access_modes, ["write"])
+        assert default.state_access_modes == ["write"]
 
         explicit = self.plan(
             state_slots=[3, 4],
@@ -82,8 +82,8 @@ class BatchPlanStateAccessTests(unittest.TestCase):
         )
         returned = explicit.state_access_modes
         returned[0] = "write"
-        self.assertEqual(explicit.state_access_modes, ["read", "write"])
-        with self.assertRaises(AttributeError):
+        assert explicit.state_access_modes == ["read", "write"]
+        with pytest.raises(AttributeError):
             explicit.state_access_modes = ["write", "write"]
 
     def test_explicit_modes_validate_exact_length_and_vocabulary(self) -> None:
@@ -92,9 +92,9 @@ class BatchPlanStateAccessTests(unittest.TestCase):
             "state_generations": [9],
             "state_indptr": [0, 1],
         }
-        with self.assertRaisesRegex(ValueError, "one item per state handle"):
+        with pytest.raises(ValueError, match="one item per state handle"):
             self.plan(**metadata, state_access_modes=[])
-        with self.assertRaisesRegex(ValueError, "must be 'read' or 'write'"):
+        with pytest.raises(ValueError, match="must be 'read' or 'write'"):
             self.plan(**metadata, state_access_modes=["Read"])
 
     def test_submit_validation_is_atomic_before_state_retain(self) -> None:
@@ -102,14 +102,14 @@ class BatchPlanStateAccessTests(unittest.TestCase):
         state = pool.allocate()[0]
         engine = Engine(RecordingSyncRunner(), state_pool=pool)
 
-        with self.assertRaisesRegex(ValueError, "one item per state handle"):
+        with pytest.raises(ValueError, match="one item per state handle"):
             engine.submit(
                 [1],
                 max_new_tokens=1,
                 state_handles=[state],
                 state_access_modes=[],
             )
-        with self.assertRaisesRegex(ValueError, "must be 'read' or 'write'"):
+        with pytest.raises(ValueError, match="must be 'read' or 'write'"):
             engine.submit(
                 [1],
                 max_new_tokens=1,
@@ -117,27 +117,27 @@ class BatchPlanStateAccessTests(unittest.TestCase):
                 state_access_modes=["shared"],
             )
 
-        self.assertEqual(pool.counts(state), (1, 0))
-        self.assertEqual(pool.access_counts(state), (0, False))
-        self.assertEqual(engine.ready_request_count, 0)
+        assert pool.counts(state) == (1, 0)
+        assert pool.access_counts(state) == (0, False)
+        assert engine.ready_request_count == 0
 
 
-class EngineStateAccessTests(unittest.TestCase):
+class TestEngineStateAccess:
     def test_submit_omission_defaults_to_exclusive_write(self) -> None:
         pool = StatePool(1)
         state = pool.allocate()[0]
         observed: list[tuple[int, bool]] = []
 
         def inspect(plan: BatchPlan) -> None:
-            self.assertEqual(plan.state_access_modes, ["write"])
+            assert plan.state_access_modes == ["write"]
             observed.append(pool.access_counts(state))
 
         engine = Engine(RecordingSyncRunner(inspect), state_pool=pool)
         engine.submit([1], max_new_tokens=1, state_handles=[state])
         engine.step()
 
-        self.assertEqual(observed, [(0, True)])
-        self.assertEqual(pool.access_counts(state), (0, False))
+        assert observed == [(0, True)]
+        assert pool.access_counts(state) == (0, False)
 
     def test_readers_of_same_state_co_batch_under_one_shared_lease(self) -> None:
         pool = StatePool(1)
@@ -145,7 +145,7 @@ class EngineStateAccessTests(unittest.TestCase):
         observed: list[tuple[tuple[int, int], tuple[int, bool]]] = []
 
         def inspect(plan: BatchPlan) -> None:
-            self.assertEqual(plan.state_access_modes, ["read", "read"])
+            assert plan.state_access_modes == ["read", "read"]
             observed.append((pool.counts(state), pool.access_counts(state)))
 
         runner = RecordingSyncRunner(inspect)
@@ -165,12 +165,12 @@ class EngineStateAccessTests(unittest.TestCase):
 
         events = engine.step()
 
-        self.assertEqual([event.request_id for event in events], [first, second])
-        self.assertEqual(runner.plans[0].sequence_ids, [first, second])
-        self.assertEqual(runner.plans[0].state_indptr, [0, 1, 2])
-        self.assertEqual(observed, [((3, 2), (1, False))])
-        self.assertEqual(pool.counts(state), (1, 0))
-        self.assertEqual(pool.access_counts(state), (0, False))
+        assert [event.request_id for event in events] == [first, second]
+        assert runner.plans[0].sequence_ids == [first, second]
+        assert runner.plans[0].state_indptr == [0, 1, 2]
+        assert observed == [((3, 2), (1, False))]
+        assert pool.counts(state) == (1, 0)
+        assert pool.access_counts(state) == (0, False)
 
     def test_writer_reader_conflict_truncates_then_later_progresses(self) -> None:
         pool = StatePool(2)
@@ -204,20 +204,18 @@ class EngineStateAccessTests(unittest.TestCase):
         first_events = engine.step()
         second_events = engine.step()
 
-        self.assertEqual([event.request_id for event in first_events], [writer])
-        self.assertEqual(
-            [event.request_id for event in second_events], [reader, disjoint]
-        )
-        self.assertEqual(
-            [plan.sequence_ids for plan in runner.plans],
-            [[writer], [reader, disjoint]],
-        )
-        self.assertEqual(
-            [plan.state_access_modes for plan in runner.plans],
-            [["write"], ["read", "write"]],
-        )
-        self.assertEqual(observed, [(0, True), (1, False)])
-        self.assertEqual(pool.access_counts(state), (0, False))
+        assert [event.request_id for event in first_events] == [writer]
+        assert [event.request_id for event in second_events] == [reader, disjoint]
+        assert [plan.sequence_ids for plan in runner.plans] == [
+            [writer],
+            [reader, disjoint],
+        ]
+        assert [plan.state_access_modes for plan in runner.plans] == [
+            ["write"],
+            ["read", "write"],
+        ]
+        assert observed == [(0, True), (1, False)]
+        assert pool.access_counts(state) == (0, False)
 
     def test_duplicate_occurrences_preserve_modes_but_write_dominates(self) -> None:
         pool = StatePool(1)
@@ -225,7 +223,7 @@ class EngineStateAccessTests(unittest.TestCase):
         observed: list[tuple[tuple[int, int], tuple[int, bool]]] = []
 
         def inspect(plan: BatchPlan) -> None:
-            self.assertEqual(plan.state_access_modes, ["read", "write"])
+            assert plan.state_access_modes == ["read", "write"]
             observed.append((pool.counts(state), pool.access_counts(state)))
 
         runner = RecordingSyncRunner(inspect)
@@ -239,11 +237,11 @@ class EngineStateAccessTests(unittest.TestCase):
 
         events = engine.step()
 
-        self.assertEqual([event.request_id for event in events], [request])
-        self.assertEqual(runner.plans[0].state_indptr, [0, 2])
-        self.assertEqual(observed, [((3, 2), (0, True))])
-        self.assertEqual(pool.counts(state), (1, 0))
-        self.assertEqual(pool.access_counts(state), (0, False))
+        assert [event.request_id for event in events] == [request]
+        assert runner.plans[0].state_indptr == [0, 2]
+        assert observed == [((3, 2), (0, True))]
+        assert pool.counts(state) == (1, 0)
+        assert pool.access_counts(state) == (0, False)
 
     def test_sync_rejection_releases_access_and_retry_reacquires_it(self) -> None:
         pool = StatePool(1)
@@ -270,22 +268,22 @@ class EngineStateAccessTests(unittest.TestCase):
             state_access_modes=["write"],
         )
 
-        with self.assertRaisesRegex(RuntimeError, "before acceptance"):
+        with pytest.raises(RuntimeError, match="before acceptance"):
             engine.step()
-        self.assertFalse(engine.poisoned)
-        self.assertEqual(engine.ready_request_count, 1)
-        self.assertEqual(pool.counts(state), (2, 0))
-        self.assertEqual(pool.access_counts(state), (0, False))
+        assert not engine.poisoned
+        assert engine.ready_request_count == 1
+        assert pool.counts(state) == (2, 0)
+        assert pool.access_counts(state) == (0, False)
 
         events = engine.step()
 
-        self.assertEqual([event.request_id for event in events], [request])
-        self.assertEqual(runner.access_during_forward, [(0, True), (0, True)])
-        self.assertEqual(
-            [plan.state_access_modes for plan in runner.plans],
-            [["write"], ["write"]],
-        )
-        self.assertEqual(pool.access_counts(state), (0, False))
+        assert [event.request_id for event in events] == [request]
+        assert runner.access_during_forward == [(0, True), (0, True)]
+        assert [plan.state_access_modes for plan in runner.plans] == [
+            ["write"],
+            ["write"],
+        ]
+        assert pool.access_counts(state) == (0, False)
 
     def test_async_pending_cancel_holds_then_releases_shared_access(self) -> None:
         pool = StatePool(1)
@@ -299,16 +297,16 @@ class EngineStateAccessTests(unittest.TestCase):
             state_access_modes=["read"],
         )
 
-        self.assertEqual(engine.dispatch(), 1)
-        self.assertEqual(pool.access_counts(state), (1, False))
-        self.assertTrue(engine.cancel(request))
-        self.assertEqual(engine.poll(), [])
-        self.assertEqual(pool.access_counts(state), (1, False))
+        assert engine.dispatch() == 1
+        assert pool.access_counts(state) == (1, False)
+        assert engine.cancel(request)
+        assert engine.poll() == []
+        assert pool.access_counts(state) == (1, False)
 
-        self.assertEqual(engine.poll(), [])
-        self.assertEqual(runner.released, [request])
-        self.assertEqual(pool.counts(state), (1, 0))
-        self.assertEqual(pool.access_counts(state), (0, False))
+        assert engine.poll() == []
+        assert runner.released == [request]
+        assert pool.counts(state) == (1, 0)
+        assert pool.access_counts(state) == (0, False)
 
     def test_shared_read_survivor_reacquires_after_peer_retires(self) -> None:
         pool = StatePool(1)
@@ -330,15 +328,15 @@ class EngineStateAccessTests(unittest.TestCase):
 
         first = engine.step()
 
-        self.assertEqual([event.request_id for event in first], [finished, survivor])
-        self.assertEqual(pool.counts(state), (2, 0))
-        self.assertEqual(pool.access_counts(state), (0, False))
+        assert [event.request_id for event in first] == [finished, survivor]
+        assert pool.counts(state) == (2, 0)
+        assert pool.access_counts(state) == (0, False)
 
         second = engine.step()
 
-        self.assertEqual([event.request_id for event in second], [survivor])
-        self.assertEqual(pool.counts(state), (1, 0))
-        self.assertEqual(pool.access_counts(state), (0, False))
+        assert [event.request_id for event in second] == [survivor]
+        assert pool.counts(state) == (1, 0)
+        assert pool.access_counts(state) == (0, False)
 
     def test_access_arbitrates_across_engines_sharing_one_pool(self) -> None:
         pool = StatePool(1)
@@ -352,7 +350,7 @@ class EngineStateAccessTests(unittest.TestCase):
             state_access_modes=["read"],
         )
         pending.dispatch()
-        self.assertEqual(pool.access_counts(state), (1, False))
+        assert pool.access_counts(state) == (1, False)
 
         peer_observed: list[tuple[int, bool]] = []
         peer = Engine(
@@ -368,8 +366,8 @@ class EngineStateAccessTests(unittest.TestCase):
             state_access_modes=["read"],
         )
         peer.step()
-        self.assertEqual(peer_observed, [(2, False)])
-        self.assertEqual(pool.access_counts(state), (1, False))
+        assert peer_observed == [(2, False)]
+        assert pool.access_counts(state) == (1, False)
 
         writer_runner = RecordingSyncRunner()
         writer = Engine(writer_runner, state_pool=pool)
@@ -379,20 +377,18 @@ class EngineStateAccessTests(unittest.TestCase):
             state_handles=[state],
             state_access_modes=["write"],
         )
-        with self.assertRaisesRegex(ValueError, "active lease"):
+        with pytest.raises(ValueError, match="active lease"):
             writer.dispatch()
-        self.assertEqual(writer.ready_request_count, 1)
-        self.assertEqual(pool.access_counts(state), (1, False))
+        assert writer.ready_request_count == 1
+        assert pool.access_counts(state) == (1, False)
 
-        self.assertEqual(pending.poll(), [])
-        self.assertEqual(len(pending.poll()), 1)
-        self.assertEqual(pool.access_counts(state), (0, False))
-        self.assertEqual(
-            [event.request_id for event in writer.step()], [writer_request]
-        )
-        self.assertEqual(writer.in_flight_batch_id, None)
-        self.assertEqual(writer_runner.plans[0].batch_id, 2)
-        self.assertEqual(pool.access_counts(state), (0, False))
+        assert pending.poll() == []
+        assert len(pending.poll()) == 1
+        assert pool.access_counts(state) == (0, False)
+        assert [event.request_id for event in writer.step()] == [writer_request]
+        assert writer.in_flight_batch_id is None
+        assert writer_runner.plans[0].batch_id == 2
+        assert pool.access_counts(state) == (0, False)
 
     def test_close_drains_pending_write_and_releases_transferred_state(self) -> None:
         pool = StatePool(1)
@@ -402,13 +398,13 @@ class EngineStateAccessTests(unittest.TestCase):
         engine.submit([1], max_new_tokens=1, state_handles=[state])
         pool.release([state])
         engine.dispatch()
-        self.assertEqual(pool.access_counts(state), (0, True))
+        assert pool.access_counts(state) == (0, True)
 
         engine.close()
 
-        self.assertTrue(engine.closed)
-        self.assertEqual(pool.free_count, 1)
-        with self.assertRaisesRegex(ValueError, "stale"):
+        assert engine.closed
+        assert pool.free_count == 1
+        with pytest.raises(ValueError, match="stale"):
             pool.access_counts(state)
 
     def test_protocol_and_release_failures_quarantine_exclusive_access(self) -> None:
@@ -431,27 +427,22 @@ class EngineStateAccessTests(unittest.TestCase):
             ),
         )
         for name, runner, error_type, message, poison_stage in cases:
-            with self.subTest(name=name):
-                pool = StatePool(1)
-                state = pool.allocate()[0]
-                engine = Engine(runner, state_pool=pool)
-                request = engine.submit(
-                    [1],
-                    max_new_tokens=1,
-                    state_handles=[state],
-                    state_access_modes=["write"],
-                )
-                engine.dispatch()
+            pool = StatePool(1)
+            state = pool.allocate()[0]
+            engine = Engine(runner, state_pool=pool)
+            request = engine.submit(
+                [1],
+                max_new_tokens=1,
+                state_handles=[state],
+                state_access_modes=["write"],
+            )
+            engine.dispatch()
 
-                with self.assertRaisesRegex(error_type, message):
-                    engine.poll()
+            with pytest.raises(error_type, match=message):
+                engine.poll()
 
-                self.assertTrue(engine.poisoned)
-                self.assertIn(poison_stage, engine.poison_error)
-                self.assertFalse(request.done)
-                self.assertEqual(pool.counts(state), (2, 1))
-                self.assertEqual(pool.access_counts(state), (0, True))
-
-
-if __name__ == "__main__":
-    unittest.main()
+            assert engine.poisoned
+            assert poison_stage in engine.poison_error
+            assert not request.done
+            assert pool.counts(state) == (2, 1)
+            assert pool.access_counts(state) == (0, True)

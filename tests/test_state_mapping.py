@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import unittest
+import pytest
 
 from resin import (
     BatchPlan,
@@ -53,35 +53,34 @@ class SyntheticSsmRunner(MappedRunner):
     )
 
 
-class StateMappingConfigTests(unittest.TestCase):
+class TestStateMappingConfig:
     def test_descriptor_is_frozen_owned_and_derives_handle_count(self) -> None:
         source_modes = ["read", "write"]
         config = StateMappingConfig(SYNTHETIC_SSM_PROTOCOL, source_modes)
         source_modes[:] = ["write"]
 
-        self.assertEqual(config.protocol, SYNTHETIC_SSM_PROTOCOL)
-        self.assertEqual(config.access_modes, ["read", "write"])
-        self.assertEqual(config.handles_per_sequence, 2)
-        self.assertIn("synthetic.ssm_state.v7", repr(config))
-        with self.assertRaises(AttributeError):
+        assert config.protocol == SYNTHETIC_SSM_PROTOCOL
+        assert config.access_modes == ["read", "write"]
+        assert config.handles_per_sequence == 2
+        assert "synthetic.ssm_state.v7" in repr(config)
+        with pytest.raises(AttributeError):
             config.protocol = "changed"
 
     def test_descriptor_rejects_empty_or_malformed_fields(self) -> None:
         for protocol in ("", "   "):
-            with self.subTest(protocol=protocol):
-                with self.assertRaisesRegex(ValueError, "protocol must be nonempty"):
-                    StateMappingConfig(protocol, ["write"])
-        with self.assertRaisesRegex(ValueError, "at least one"):
+            with pytest.raises(ValueError, match="protocol must be nonempty"):
+                StateMappingConfig(protocol, ["write"])
+        with pytest.raises(ValueError, match="at least one"):
             StateMappingConfig("synthetic.empty.v1", [])
-        with self.assertRaisesRegex(ValueError, "'read' or 'write'"):
+        with pytest.raises(ValueError, match="'read' or 'write'"):
             StateMappingConfig("synthetic.bad_mode.v1", ["borrow"])
 
 
-class BatchPlanStateMappingTests(unittest.TestCase):
+class TestBatchPlanStateMapping:
     def test_manual_plan_identity_contract_is_explicit(self) -> None:
         stateless = BatchPlan([1], [0], [7], [0, 1], [0])
-        self.assertIsNone(stateless.engine_id)
-        self.assertIsNone(stateless.state_pool_id)
+        assert stateless.engine_id is None
+        assert stateless.state_pool_id is None
 
         stateful = BatchPlan(
             [1],
@@ -95,14 +94,14 @@ class BatchPlanStateMappingTests(unittest.TestCase):
             state_access_modes=["write"],
             state_indptr=[0, 1],
         )
-        self.assertIsNone(stateful.engine_id)
-        self.assertEqual(stateful.state_pool_id, 9)
-        self.assertEqual(stateful.state_slots, [3])
-        self.assertEqual(stateful.state_generations, [4])
-        self.assertEqual(stateful.state_access_modes, ["write"])
-        self.assertEqual(stateful.state_indptr, [0, 1])
+        assert stateful.engine_id is None
+        assert stateful.state_pool_id == 9
+        assert stateful.state_slots == [3]
+        assert stateful.state_generations == [4]
+        assert stateful.state_access_modes == ["write"]
+        assert stateful.state_indptr == [0, 1]
 
-        with self.assertRaisesRegex(ValueError, "state_pool_id is required"):
+        with pytest.raises(ValueError, match="state_pool_id is required"):
             BatchPlan(
                 [1],
                 [0],
@@ -113,18 +112,18 @@ class BatchPlanStateMappingTests(unittest.TestCase):
                 state_generations=[4],
                 state_indptr=[0, 1],
             )
-        with self.assertRaisesRegex(ValueError, "must be None"):
+        with pytest.raises(ValueError, match="must be None"):
             BatchPlan([1], [0], [7], [0, 1], [0], state_pool_id=9)
-        with self.assertRaisesRegex(ValueError, "engine_id must be positive"):
+        with pytest.raises(ValueError, match="engine_id must be positive"):
             BatchPlan([1], [0], [7], [0, 1], [0], engine_id=0)
 
 
-class EngineStateMappingTests(unittest.TestCase):
+class TestEngineStateMapping:
     def test_native_arena_mint_is_positive_and_process_unique(self) -> None:
         ids = [mint_state_mapping_arena_id() for _ in range(3)]
-        self.assertTrue(all(arena_id > 0 for arena_id in ids))
-        self.assertEqual(len(set(ids)), len(ids))
-        self.assertEqual(ids, sorted(ids))
+        assert all(arena_id > 0 for arena_id in ids)
+        assert len(set(ids)) == len(ids)
+        assert ids == sorted(ids)
 
     def test_exact_binding_is_idempotent_and_pool_operations_are_unchanged(
         self,
@@ -135,22 +134,22 @@ class EngineStateMappingTests(unittest.TestCase):
         second = Engine(runner, state_pool=pool)
 
         expected = (PROTOCOL, runner.arena_id)
-        self.assertEqual(pool.physical_mapping, expected)
-        self.assertEqual(
-            runner.bindings,
-            [(pool.pool_id, 2, PROTOCOL), (pool.pool_id, 2, PROTOCOL)],
-        )
+        assert pool.physical_mapping == expected
+        assert runner.bindings == [
+            (pool.pool_id, 2, PROTOCOL),
+            (pool.pool_id, 2, PROTOCOL),
+        ]
 
         state = pool.allocate()[0]
         pool.retain([state])
-        self.assertEqual(pool.counts(state), (2, 0))
+        assert pool.counts(state) == (2, 0)
         pool.release([state])
-        self.assertEqual(pool.counts(state), (1, 0))
-        self.assertEqual(pool.physical_mapping, expected)
+        assert pool.counts(state) == (1, 0)
+        assert pool.physical_mapping == expected
 
         first.close()
         second.close()
-        self.assertEqual(pool.physical_mapping, expected)
+        assert pool.physical_mapping == expected
 
     def test_divergent_arena_binding_is_rejected_without_changing_claim(self) -> None:
         pool = StatePool(1)
@@ -200,20 +199,20 @@ class EngineStateMappingTests(unittest.TestCase):
                 )
 
         second_runner = CachedMappedRunner()
-        self.assertNotEqual(first_runner.arena_id, second_runner.arena_id)
-        with self.assertRaisesRegex(ValueError, "acknowledged combined resources"):
+        assert first_runner.arena_id != second_runner.arena_id
+        with pytest.raises(ValueError, match="acknowledged combined resources"):
             Engine(second_runner, state_pool=pool)
 
-        self.assertEqual(len(second_runner.combined_bindings), 1)
-        self.assertIs(second_runner.combined_bindings[0][1], TEST_CACHE_LAYOUT)
-        self.assertEqual(second_runner.bindings, [])
-        self.assertEqual(pool.physical_mapping, original)
+        assert len(second_runner.combined_bindings) == 1
+        assert second_runner.combined_bindings[0][1] is TEST_CACHE_LAYOUT
+        assert second_runner.bindings == []
+        assert pool.physical_mapping == original
         first.close()
 
     def test_binding_capability_requires_pool_descriptor_callable_and_exact_ack(
         self,
     ) -> None:
-        with self.assertRaisesRegex(ValueError, "requires an Engine state_pool"):
+        with pytest.raises(ValueError, match="requires an Engine state_pool"):
             Engine(MappedRunner())
 
         class CachedMappedRunner(MappedRunner):
@@ -228,16 +227,16 @@ class EngineStateMappingTests(unittest.TestCase):
                 return pool_id
 
         cached_runner = CachedMappedRunner()
-        with self.assertRaisesRegex(ValueError, "requires an Engine state_pool"):
+        with pytest.raises(ValueError, match="requires an Engine state_pool"):
             Engine(cached_runner)
-        self.assertEqual(cached_runner.cache_bindings, [])
+        assert cached_runner.cache_bindings == []
 
         pool = StatePool(1)
 
         class MissingDescriptor(PlainRunner):
             supports_recurrent_state_mapping = True
 
-        with self.assertRaisesRegex(TypeError, "recurrent_state_mapping is missing"):
+        with pytest.raises(TypeError, match="recurrent_state_mapping is missing"):
             Engine(MissingDescriptor(), state_pool=pool)
 
         class MalformedDescriptor(PlainRunner):
@@ -247,9 +246,9 @@ class EngineStateMappingTests(unittest.TestCase):
                 "access_modes": ["write"],
             }
 
-        with self.assertRaisesRegex(TypeError, "exactly a StateMappingConfig"):
+        with pytest.raises(TypeError, match="exactly a StateMappingConfig"):
             Engine(MalformedDescriptor(), state_pool=pool)
-        self.assertIsNone(pool.physical_mapping)
+        assert pool.physical_mapping is None
 
         class MissingBinder:
             supports_recurrent_state_mapping = True
@@ -259,33 +258,32 @@ class EngineStateMappingTests(unittest.TestCase):
             def forward(plan: BatchPlan) -> list[int]:
                 return [0] * plan.num_sequences
 
-        with self.assertRaisesRegex(TypeError, "bind_recurrent_state_mapping"):
+        with pytest.raises(TypeError, match="bind_recurrent_state_mapping"):
             Engine(MissingBinder(), state_pool=pool)
-        self.assertIsNone(pool.physical_mapping)
+        assert pool.physical_mapping is None
 
         for drift in ("pool", "capacity", "protocol", "arena"):
-            with self.subTest(drift=drift):
-                candidate = StatePool(1)
-                values: list[int | str] = [candidate.pool_id, 1, PROTOCOL, 41]
-                if drift == "pool":
-                    values[0] = candidate.pool_id + 1
-                elif drift == "capacity":
-                    values[1] = 2
-                elif drift == "protocol":
-                    values[2] = "lfm2.conv_state.v2"
-                else:
-                    values[3] = 0
-                acknowledgement = tuple(values)
+            candidate = StatePool(1)
+            values: list[int | str] = [candidate.pool_id, 1, PROTOCOL, 41]
+            if drift == "pool":
+                values[0] = candidate.pool_id + 1
+            elif drift == "capacity":
+                values[1] = 2
+            elif drift == "protocol":
+                values[2] = "lfm2.conv_state.v2"
+            else:
+                values[3] = 0
+            acknowledgement = tuple(values)
 
-                class BadAck(MappedRunner):
-                    def bind_recurrent_state_mapping(
-                        self, pool_id: int, capacity: int, protocol: str
-                    ) -> tuple[int, int, str, int]:
-                        return acknowledgement
+            class BadAck(MappedRunner):
+                def bind_recurrent_state_mapping(
+                    self, pool_id: int, capacity: int, protocol: str
+                ) -> tuple[int, int, str, int]:
+                    return acknowledgement
 
-                with self.assertRaisesRegex(ValueError, "acknowledged"):
-                    Engine(BadAck(), state_pool=candidate)
-                self.assertIsNone(candidate.physical_mapping)
+            with pytest.raises(ValueError, match="acknowledged"):
+                Engine(BadAck(), state_pool=candidate)
+            assert candidate.physical_mapping is None
 
         class BooleanArenaAck(MappedRunner):
             def bind_recurrent_state_mapping(
@@ -294,9 +292,9 @@ class EngineStateMappingTests(unittest.TestCase):
                 return pool_id, capacity, protocol, True
 
         candidate = StatePool(1)
-        with self.assertRaisesRegex(TypeError, "exactly"):
+        with pytest.raises(TypeError, match="exactly"):
             Engine(BooleanArenaAck(), state_pool=candidate)
-        self.assertIsNone(candidate.physical_mapping)
+        assert candidate.physical_mapping is None
 
     def test_dual_resources_use_one_exact_combined_binding(self) -> None:
         class DualRunner(PlainRunner):
@@ -350,17 +348,15 @@ class EngineStateMappingTests(unittest.TestCase):
         runner = DualRunner()
         engine = Engine(runner, state_pool=pool)
 
-        self.assertEqual(runner.individual_calls, [])
-        self.assertEqual(len(runner.combined_calls), 1)
+        assert runner.individual_calls == []
+        assert len(runner.combined_calls) == 1
         cache_pool_id, layout, state_pool_id, capacity, protocol = (
             runner.combined_calls[0]
         )
-        self.assertEqual(cache_pool_id, engine.cache_pool_id)
-        self.assertIs(layout, TEST_CACHE_LAYOUT)
-        self.assertEqual(
-            (state_pool_id, capacity, protocol), (pool.pool_id, 3, PROTOCOL)
-        )
-        self.assertEqual(pool.physical_mapping, (PROTOCOL, runner.arena_id))
+        assert cache_pool_id == engine.cache_pool_id
+        assert layout is TEST_CACHE_LAYOUT
+        assert (state_pool_id, capacity, protocol) == (pool.pool_id, 3, PROTOCOL)
+        assert pool.physical_mapping == (PROTOCOL, runner.arena_id)
         engine.close()
 
     def test_dual_binding_failure_never_calls_individual_binders_or_mutates_pool(
@@ -389,10 +385,10 @@ class EngineStateMappingTests(unittest.TestCase):
 
         pool = StatePool(2)
         missing = MissingCombined()
-        with self.assertRaisesRegex(TypeError, "bind_cache_and_recurrent_state"):
+        with pytest.raises(TypeError, match="bind_cache_and_recurrent_state"):
             Engine(missing, state_pool=pool)
-        self.assertEqual(missing.individual_calls, [])
-        self.assertIsNone(pool.physical_mapping)
+        assert missing.individual_calls == []
+        assert pool.physical_mapping is None
 
         class RaisingCombined(MissingCombined):
             def __init__(self) -> None:
@@ -405,11 +401,11 @@ class EngineStateMappingTests(unittest.TestCase):
                 raise RuntimeError("synthetic combined bind failure")
 
         raising = RaisingCombined()
-        with self.assertRaisesRegex(RuntimeError, "synthetic combined bind failure"):
+        with pytest.raises(RuntimeError, match="synthetic combined bind failure"):
             Engine(raising, state_pool=pool)
-        self.assertEqual(raising.combined_calls, 1)
-        self.assertEqual(raising.individual_calls, [])
-        self.assertIsNone(pool.physical_mapping)
+        assert raising.combined_calls == 1
+        assert raising.individual_calls == []
+        assert pool.physical_mapping is None
 
     def test_dual_binding_rejects_malformed_or_drifted_ack_before_pool_commit(
         self,
@@ -462,11 +458,10 @@ class EngineStateMappingTests(unittest.TestCase):
             ("boolean_arena", TypeError, "exactly"),
             ("cache_drift", ValueError, "acknowledged combined resources"),
         ):
-            with self.subTest(mode=mode):
-                candidate = StatePool(2)
-                with self.assertRaisesRegex(error_type, message):
-                    Engine(BadCombinedAck(mode), state_pool=candidate)
-                self.assertIsNone(candidate.physical_mapping)
+            candidate = StatePool(2)
+            with pytest.raises(error_type, match=message):
+                Engine(BadCombinedAck(mode), state_pool=candidate)
+            assert candidate.physical_mapping is None
 
     def test_descriptor_validation_fails_before_cache_binding_callback(self) -> None:
         class MalformedCachedRunner(PlainRunner):
@@ -483,9 +478,9 @@ class EngineStateMappingTests(unittest.TestCase):
                 return pool_id
 
         runner = MalformedCachedRunner()
-        with self.assertRaisesRegex(TypeError, "exactly a StateMappingConfig"):
+        with pytest.raises(TypeError, match="exactly a StateMappingConfig"):
             Engine(runner, state_pool=StatePool(1))
-        self.assertEqual(runner.cache_bindings, [])
+        assert runner.cache_bindings == []
 
     def test_native_core_uses_descriptor_and_ignores_legacy_protocol_alias(
         self,
@@ -496,7 +491,7 @@ class EngineStateMappingTests(unittest.TestCase):
         pool = StatePool(1)
         runner = AliasDriftRunner()
         engine = Engine(runner, state_pool=pool)
-        self.assertEqual(pool.physical_mapping, (PROTOCOL, runner.arena_id))
+        assert pool.physical_mapping == (PROTOCOL, runner.arena_id)
         engine.close()
 
     def test_permanent_pool_binding_rejects_protocol_drift(self) -> None:
@@ -517,17 +512,17 @@ class EngineStateMappingTests(unittest.TestCase):
                 return pool_id
 
         second_runner = CachedSyntheticSsmRunner()
-        with self.assertRaisesRegex(ValueError, "already bound"):
+        with pytest.raises(ValueError, match="already bound"):
             Engine(second_runner, state_pool=pool)
-        self.assertEqual(second_runner.cache_bindings, [])
-        self.assertEqual(second_runner.bindings, [])
-        self.assertEqual(pool.physical_mapping, original)
+        assert second_runner.cache_bindings == []
+        assert second_runner.bindings == []
+        assert pool.physical_mapping == original
         first.close()
 
     def test_non_opted_in_runners_do_not_bind_a_pool(self) -> None:
         pool = StatePool(1)
         Engine(PlainRunner(), state_pool=pool).close()
-        self.assertIsNone(pool.physical_mapping)
+        assert pool.physical_mapping is None
 
         class TruthyButNotTrue(PlainRunner):
             supports_recurrent_state_mapping = 1
@@ -537,7 +532,7 @@ class EngineStateMappingTests(unittest.TestCase):
                 raise AssertionError("must not be called")
 
         Engine(TruthyButNotTrue(), state_pool=pool).close()
-        self.assertIsNone(pool.physical_mapping)
+        assert pool.physical_mapping is None
 
     def test_single_write_descriptor_preserves_lfm_admission_defaults(self) -> None:
         pool = StatePool(2)
@@ -553,18 +548,17 @@ class EngineStateMappingTests(unittest.TestCase):
             },
         ]
         for metadata in invalid:
-            with self.subTest(metadata=metadata):
-                with self.assertRaisesRegex(ValueError, "exactly one state handle"):
-                    engine.submit([1], max_new_tokens=1, **metadata)
+            with pytest.raises(ValueError, match="exactly one state handle"):
+                engine.submit([1], max_new_tokens=1, **metadata)
 
-        self.assertEqual(engine.ready_request_count, 0)
-        self.assertEqual(pool.counts(first_state), (1, 0))
-        self.assertEqual(pool.counts(second_state), (1, 0))
+        assert engine.ready_request_count == 0
+        assert pool.counts(first_state) == (1, 0)
+        assert pool.counts(second_state) == (1, 0)
 
         request = engine.submit([1], max_new_tokens=1, state_handles=[first_state])
         event = engine.step()[0]
-        self.assertEqual(event.request_id, request)
-        self.assertEqual(pool.counts(first_state), (1, 0))
+        assert event.request_id == request
+        assert pool.counts(first_state) == (1, 0)
 
     def test_arbitrary_ssm_descriptor_enforces_two_handle_mixed_mode_pattern(
         self,
@@ -588,16 +582,13 @@ class EngineStateMappingTests(unittest.TestCase):
             },
         ]
         for metadata in invalid:
-            with self.subTest(metadata=metadata):
-                with self.assertRaisesRegex(ValueError, "exactly 2 state handles"):
-                    engine.submit([1], max_new_tokens=1, **metadata)
+            with pytest.raises(ValueError, match="exactly 2 state handles"):
+                engine.submit([1], max_new_tokens=1, **metadata)
 
-        self.assertEqual(engine.ready_request_count, 0)
-        self.assertEqual(
-            pool.physical_mapping, (SYNTHETIC_SSM_PROTOCOL, runner.arena_id)
-        )
-        self.assertEqual(pool.counts(read_state), (1, 0))
-        self.assertEqual(pool.counts(write_state), (1, 0))
+        assert engine.ready_request_count == 0
+        assert pool.physical_mapping == (SYNTHETIC_SSM_PROTOCOL, runner.arena_id)
+        assert pool.counts(read_state) == (1, 0)
+        assert pool.counts(write_state) == (1, 0)
 
         request = engine.submit(
             [1],
@@ -606,16 +597,13 @@ class EngineStateMappingTests(unittest.TestCase):
             state_access_modes=["read", "write"],
         )
         event = engine.step()[0]
-        self.assertEqual(event.request_id, request)
+        assert event.request_id == request
         plan = runner.plans[-1]
-        self.assertEqual(plan.state_indptr, [0, 2])
-        self.assertEqual(plan.state_access_modes, ["read", "write"])
-        self.assertEqual(
-            plan.state_slots,
-            [read_state.slot, write_state.slot],
-        )
-        self.assertEqual(pool.counts(read_state), (1, 0))
-        self.assertEqual(pool.counts(write_state), (1, 0))
+        assert plan.state_indptr == [0, 2]
+        assert plan.state_access_modes == ["read", "write"]
+        assert plan.state_slots == [read_state.slot, write_state.slot]
+        assert pool.counts(read_state) == (1, 0)
+        assert pool.counts(write_state) == (1, 0)
 
     def test_engine_owns_descriptor_snapshot_after_construction(self) -> None:
         pool = StatePool(2)
@@ -627,7 +615,7 @@ class EngineStateMappingTests(unittest.TestCase):
             ["write"],
         )
 
-        with self.assertRaisesRegex(ValueError, "exactly 2 state handles"):
+        with pytest.raises(ValueError, match="exactly 2 state handles"):
             engine.submit([1], 1, state_handles=[write_state])
         request = engine.submit(
             [1],
@@ -635,7 +623,7 @@ class EngineStateMappingTests(unittest.TestCase):
             state_handles=[read_state, write_state],
             state_access_modes=["read", "write"],
         )
-        self.assertEqual(engine.step()[0].request_id, request)
+        assert engine.step()[0].request_id == request
 
     def test_cross_engine_local_request_collision_has_distinct_plan_identity(
         self,
@@ -651,22 +639,18 @@ class EngineStateMappingTests(unittest.TestCase):
         second_request = second.submit([2], 1, state_handles=[state])
         second.step()
 
-        self.assertEqual((first_request, second_request), (1, 1))
+        assert (first_request, second_request) == (1, 1)
         first_plan, second_plan = runner.plans
-        self.assertEqual(first_plan.sequence_ids, [1])
-        self.assertEqual(second_plan.sequence_ids, [1])
-        self.assertIsNotNone(first_plan.engine_id)
-        self.assertIsNotNone(second_plan.engine_id)
-        self.assertNotEqual(first_plan.engine_id, second_plan.engine_id)
-        self.assertEqual(first_plan.state_pool_id, pool.pool_id)
-        self.assertEqual(second_plan.state_pool_id, pool.pool_id)
-        self.assertEqual(first_plan.state_slots, [state.slot])
-        self.assertEqual(second_plan.state_slots, [state.slot])
-        self.assertEqual(first_plan.state_generations, [state.generation])
-        self.assertEqual(second_plan.state_generations, [state.generation])
-        self.assertEqual(first_plan.state_access_modes, ["write"])
-        self.assertEqual(second_plan.state_access_modes, ["write"])
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert first_plan.sequence_ids == [1]
+        assert second_plan.sequence_ids == [1]
+        assert first_plan.engine_id is not None
+        assert second_plan.engine_id is not None
+        assert first_plan.engine_id != second_plan.engine_id
+        assert first_plan.state_pool_id == pool.pool_id
+        assert second_plan.state_pool_id == pool.pool_id
+        assert first_plan.state_slots == [state.slot]
+        assert second_plan.state_slots == [state.slot]
+        assert first_plan.state_generations == [state.generation]
+        assert second_plan.state_generations == [state.generation]
+        assert first_plan.state_access_modes == ["write"]
+        assert second_plan.state_access_modes == ["write"]

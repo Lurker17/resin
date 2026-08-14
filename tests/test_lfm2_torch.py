@@ -6,8 +6,9 @@ import os
 import subprocess
 import sys
 import tempfile
-import unittest
 from pathlib import Path
+
+import pytest
 
 
 def _tiny_args():
@@ -31,7 +32,7 @@ def _tiny_args():
     )
 
 
-class Lfm2TorchImportTests(unittest.TestCase):
+class TestLfm2TorchImport:
     def test_import_does_not_import_torch(self) -> None:
         script = """
 import sys
@@ -44,13 +45,15 @@ for name in ('torch', 'transformers', 'tokenizers', 'huggingface_hub', 'safetens
     def test_args_reject_non_lfm_checkpoint(self) -> None:
         from resin.models.lfm2.config import Lfm2Config
 
-        with self.assertRaisesRegex(ValueError, "expected an LFM2"):
+        with pytest.raises(ValueError, match="expected an LFM2"):
             Lfm2Config.from_dict({"model_type": "llama"})
 
 
-@unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
-class Lfm2TorchTests(unittest.TestCase):
-    def setUp(self) -> None:
+@pytest.mark.skipif(
+    not importlib.util.find_spec("torch"), reason="PyTorch is not installed"
+)
+class TestLfm2Torch:
+    def setup_method(self) -> None:
         import torch
 
         from resin.models.lfm2.model import Lfm2ForCausalLM
@@ -75,11 +78,11 @@ class Lfm2TorchTests(unittest.TestCase):
 
     def test_checkpoint_parameter_paths_match_the_released_layout(self) -> None:
         keys = set(self.model.state_dict())
-        self.assertIn("model.layers.0.conv.in_proj.weight", keys)
-        self.assertIn("model.layers.1.self_attn.q_layernorm.weight", keys)
-        self.assertIn("model.layers.1.feed_forward.w1.weight", keys)
-        self.assertIn("model.embedding_norm.weight", keys)
-        self.assertFalse(any(".operator." in key for key in keys))
+        assert "model.layers.0.conv.in_proj.weight" in keys
+        assert "model.layers.1.self_attn.q_layernorm.weight" in keys
+        assert "model.layers.1.feed_forward.w1.weight" in keys
+        assert "model.embedding_norm.weight" in keys
+        assert not any(".operator." in key for key in keys)
 
     def test_runner_consumes_batch_plan_and_releases_per_request_cache(self) -> None:
         from resin import BatchPhase, BatchPlan
@@ -103,8 +106,8 @@ class Lfm2TorchTests(unittest.TestCase):
             [0, 0],
         )
         first = runner.forward(prefill)
-        self.assertEqual(len(first), 2)
-        self.assertEqual(runner.live_cache_count, 2)
+        assert len(first) == 2
+        assert runner.live_cache_count == 2
 
         decode = BatchPlan(
             first,
@@ -115,13 +118,14 @@ class Lfm2TorchTests(unittest.TestCase):
             phase=BatchPhase.DECODE,
         )
         second = runner.forward(decode)
-        self.assertEqual(len(second), 2)
-        self.assertTrue(all(0 <= token < self.args.vocab_size for token in second))
+        assert len(second) == 2
+        assert all(0 <= token < self.args.vocab_size for token in second)
         runner.release([17, 23])
-        self.assertEqual(runner.live_cache_count, 0)
+        assert runner.live_cache_count == 0
 
-    @unittest.skipUnless(
-        importlib.util.find_spec("safetensors"), "safetensors is not installed"
+    @pytest.mark.skipif(
+        not importlib.util.find_spec("safetensors"),
+        reason="safetensors is not installed",
     )
     def test_direct_safetensors_loading_without_transformers(self) -> None:
         from safetensors.torch import save_file
@@ -158,16 +162,16 @@ class Lfm2TorchTests(unittest.TestCase):
             (path / "config.json").write_text(json.dumps(config))
             save_file(self.model.state_dict(), path / "model.safetensors")
             torch, loaded, loaded_config = load_model(path, device="cpu")
-            self.assertNotIn("transformers", sys.modules)
-            self.assertNotIn("tokenizers", sys.modules)
+            assert "transformers" not in sys.modules
+            assert "tokenizers" not in sys.modules
             with torch.inference_mode():
                 actual = loaded(tokens, loaded.make_cache())
-        self.assertEqual(loaded_config["model_type"], "lfm2")
+        assert loaded_config["model_type"] == "lfm2"
         torch.testing.assert_close(expected, actual, rtol=0, atol=0)
 
-    @unittest.skipUnless(
-        os.environ.get("RESIN_LFM2_TORCH_MODEL"),
-        "set RESIN_LFM2_TORCH_MODEL to run the pretrained-model integration test",
+    @pytest.mark.skipif(
+        not os.environ.get("RESIN_LFM2_TORCH_MODEL"),
+        reason="set RESIN_LFM2_TORCH_MODEL to run the pretrained-model integration test",
     )
     def test_pretrained_runner_generates_expected_tokens(self) -> None:
         from resin import Engine
@@ -213,12 +217,6 @@ class Lfm2TorchTests(unittest.TestCase):
         request = engine.submit(prompt, max_new_tokens=8)
         while engine.has_work():
             engine.step()
-        self.assertTrue(request.done)
-        self.assertEqual(
-            request.take_result(), [1098, 5706, 803, 4481, 856, 5242, 523, 7]
-        )
-        self.assertEqual(runner.live_cache_count, 0)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert request.done
+        assert request.take_result() == [1098, 5706, 803, 4481, 856, 5242, 523, 7]
+        assert runner.live_cache_count == 0

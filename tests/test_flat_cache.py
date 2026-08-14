@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import unittest
+import pytest
 
 import resin
 from resin import (
@@ -45,11 +45,11 @@ class RecordingCachedRunner:
         self.released.extend(request_ids)
 
 
-class FlatCacheApiTests(unittest.TestCase):
+class TestFlatCacheApi:
     def test_flat_cache_descriptors_are_exported(self) -> None:
         for name in ("CacheGroupLayout", "CacheLayout", "CacheGroupPlan"):
-            self.assertIn(name, resin.__all__)
-            self.assertTrue(hasattr(resin, name))
+            assert name in resin.__all__
+            assert hasattr(resin, name)
 
     def test_layout_is_frozen_ordered_and_derives_kernel_geometry(self) -> None:
         coarse = CacheGroupLayout(4)
@@ -58,31 +58,30 @@ class FlatCacheApiTests(unittest.TestCase):
         layout = CacheLayout(3, source)
         source.reverse()
 
-        self.assertEqual(
-            [(group.block_tokens, group.blocks_per_parent) for group in layout.groups],
-            [(4, 1), (2, 2)],
-        )
-        self.assertEqual(layout.group_count, 2)
-        self.assertEqual(layout.group_kernel_page_capacity(0), 3)
-        self.assertEqual(layout.group_kernel_page_count(0), 4)
-        self.assertEqual(layout.group_kernel_page_capacity(1), 6)
-        self.assertEqual(layout.group_kernel_page_count(1), 7)
-        with self.assertRaises(AttributeError):
+        assert [
+            (group.block_tokens, group.blocks_per_parent) for group in layout.groups
+        ] == [(4, 1), (2, 2)]
+        assert layout.group_count == 2
+        assert layout.group_kernel_page_capacity(0) == 3
+        assert layout.group_kernel_page_count(0) == 4
+        assert layout.group_kernel_page_capacity(1) == 6
+        assert layout.group_kernel_page_count(1) == 7
+        with pytest.raises(AttributeError):
             layout.parent_capacity = 4
 
     def test_cache_retention_is_only_history_or_window(self) -> None:
         history = CacheGroupLayout(4)
         window = CacheGroupLayout(4, retention="window", window_tokens=4)
 
-        self.assertEqual(history.retention, "history")
-        self.assertIsNone(history.window_tokens)
-        self.assertEqual(window.retention, "window")
-        self.assertEqual(window.window_tokens, 4)
-        with self.assertRaises(AttributeError):
+        assert history.retention == "history"
+        assert history.window_tokens is None
+        assert window.retention == "window"
+        assert window.window_tokens == 4
+        with pytest.raises(AttributeError):
             _ = history.resident_blocks
-        with self.assertRaisesRegex(TypeError, "resident_blocks"):
+        with pytest.raises(TypeError, match="resident_blocks"):
             CacheGroupLayout(4, resident_blocks=1)
-        with self.assertRaisesRegex(ValueError, "'history' or 'window'"):
+        with pytest.raises(ValueError, match="'history' or 'window'"):
             CacheGroupLayout(4, retention="state")
 
     def test_manual_sparse_group_plan_is_the_only_batch_cache_metadata(self) -> None:
@@ -104,15 +103,15 @@ class FlatCacheApiTests(unittest.TestCase):
             cache_groups=[group],
         )
 
-        self.assertEqual(plan.cache_pool_id, 7)
-        self.assertEqual(len(plan.cache_groups), 1)
+        assert plan.cache_pool_id == 7
+        assert len(plan.cache_groups) == 1
         frozen = plan.cache_groups[0]
-        self.assertEqual(frozen.group_index, group.group_index)
-        self.assertEqual(frozen.block_indptr, [0, 2])
-        self.assertEqual(frozen.block_ids, [3, 4])
-        self.assertEqual(frozen.first_logical_blocks, [0])
-        self.assertEqual(frozen.append_block_ids, [3, 4])
-        self.assertEqual(frozen.append_block_offsets, [1, 0])
+        assert frozen.group_index == group.group_index
+        assert frozen.block_indptr == [0, 2]
+        assert frozen.block_ids == [3, 4]
+        assert frozen.first_logical_blocks == [0]
+        assert frozen.append_block_ids == [3, 4]
+        assert frozen.append_block_offsets == [1, 0]
 
     def test_binding_requires_an_exact_layout_callable_and_pool_ack(self) -> None:
         layout = CacheLayout(2, [CacheGroupLayout(2)])
@@ -124,7 +123,7 @@ class FlatCacheApiTests(unittest.TestCase):
             def forward(plan: BatchPlan) -> list[int]:
                 return [0] * plan.num_sequences
 
-        with self.assertRaisesRegex(TypeError, "bind_cache_pool"):
+        with pytest.raises(TypeError, match="bind_cache_pool"):
             Engine(MissingBinder())
 
         class BadLayout(MissingBinder):
@@ -135,7 +134,7 @@ class FlatCacheApiTests(unittest.TestCase):
                 del bound_layout
                 return pool_id
 
-        with self.assertRaisesRegex(TypeError, "exactly a CacheLayout"):
+        with pytest.raises(TypeError, match="exactly a CacheLayout"):
             Engine(BadLayout())
 
         class BadAck(MissingBinder):
@@ -146,16 +145,16 @@ class FlatCacheApiTests(unittest.TestCase):
                 del pool_id, bound_layout
                 return self.acknowledgement
 
-        with self.assertRaisesRegex(TypeError, "exactly an int"):
+        with pytest.raises(TypeError, match="exactly an int"):
             Engine(BadAck(True))
-        with self.assertRaisesRegex(ValueError, "acknowledged cache pool"):
+        with pytest.raises(ValueError, match="acknowledged cache pool"):
             Engine(BadAck(999_999))
 
         runner = RecordingCachedRunner(layout)
         engine = Engine(runner)
-        self.assertGreater(engine.cache_pool_id, 0)
-        self.assertEqual(runner.bindings, [(engine.cache_pool_id, layout)])
-        self.assertIs(runner.bindings[0][1], layout)
+        assert engine.cache_pool_id > 0
+        assert runner.bindings == [(engine.cache_pool_id, layout)]
+        assert runner.bindings[0][1] is layout
 
     def test_explicit_none_layout_is_unmanaged_and_ignores_stray_binder(self) -> None:
         class UnmanagedRunner:
@@ -175,48 +174,49 @@ class FlatCacheApiTests(unittest.TestCase):
 
         runner = UnmanagedRunner()
         engine = Engine(runner)
-        self.assertIsNone(engine.cache_pool_id)
-        self.assertEqual(runner.bind_calls, 0)
+        assert engine.cache_pool_id is None
+        assert runner.bind_calls == 0
         engine.close()
 
 
-class FlatCacheEngineTests(unittest.TestCase):
+class TestFlatCacheEngine:
     def test_one_history_group_uses_positive_sparse_block_ids(self) -> None:
         layout = CacheLayout(3, [CacheGroupLayout(2)])
         runner = RecordingCachedRunner(layout)
         engine = Engine(runner)
         request = engine.submit([4, 5, 6], max_new_tokens=2)
 
-        self.assertEqual(engine.cache_free_parent_count, 3)
-        self.assertEqual(engine.cache_occupied_block_count, 0)
+        assert engine.cache_free_parent_count == 3
+        assert engine.cache_occupied_block_count == 0
         first_event = engine.step()[0]
-        self.assertEqual(engine.cache_free_parent_count, 1)
-        self.assertEqual(engine.cache_occupied_block_count, 2)
-        self.assertFalse(first_event.finished)
+        assert engine.cache_free_parent_count == 1
+        assert engine.cache_occupied_block_count == 2
+        assert not first_event.finished
         prefill = runner.plans[0]
-        self.assertEqual(prefill.cache_pool_id, engine.cache_pool_id)
-        self.assertEqual(len(prefill.cache_groups), 1)
+        assert prefill.cache_pool_id == engine.cache_pool_id
+        assert len(prefill.cache_groups) == 1
         group = prefill.cache_groups[0]
-        self.assertEqual(group.group_index, 0)
-        self.assertEqual(group.block_indptr, [0, 2])
-        self.assertEqual(group.first_logical_blocks, [0])
-        self.assertEqual(len(group.block_ids), 2)
-        self.assertTrue(all(block_id > 0 for block_id in group.block_ids))
-        self.assertEqual(
-            group.append_block_ids,
-            [group.block_ids[0], group.block_ids[0], group.block_ids[1]],
-        )
-        self.assertEqual(group.append_block_offsets, [0, 1, 0])
+        assert group.group_index == 0
+        assert group.block_indptr == [0, 2]
+        assert group.first_logical_blocks == [0]
+        assert len(group.block_ids) == 2
+        assert all(block_id > 0 for block_id in group.block_ids)
+        assert group.append_block_ids == [
+            group.block_ids[0],
+            group.block_ids[0],
+            group.block_ids[1],
+        ]
+        assert group.append_block_offsets == [0, 1, 0]
 
         final_event = engine.step()[0]
-        self.assertTrue(final_event.finished)
+        assert final_event.finished
         decode_group = runner.plans[1].cache_groups[0]
-        self.assertEqual(decode_group.block_ids, group.block_ids)
-        self.assertEqual(decode_group.append_block_ids, [group.block_ids[1]])
-        self.assertEqual(decode_group.append_block_offsets, [1])
-        self.assertEqual(runner.released, [request])
-        self.assertEqual(engine.cache_free_parent_count, 3)
-        self.assertEqual(engine.cache_occupied_block_count, 0)
+        assert decode_group.block_ids == group.block_ids
+        assert decode_group.append_block_ids == [group.block_ids[1]]
+        assert decode_group.append_block_offsets == [1]
+        assert runner.released == [request]
+        assert engine.cache_free_parent_count == 3
+        assert engine.cache_occupied_block_count == 0
 
     def test_ordered_groups_share_one_parent_pool_with_group_specific_ids(self) -> None:
         layout = CacheLayout(
@@ -230,29 +230,30 @@ class FlatCacheEngineTests(unittest.TestCase):
         engine = Engine(runner)
         engine.submit([1, 2, 3], max_new_tokens=2)
 
-        self.assertEqual(engine.cache_free_parent_count, 3)
-        self.assertEqual(engine.cache_occupied_block_count, 0)
+        assert engine.cache_free_parent_count == 3
+        assert engine.cache_occupied_block_count == 0
         engine.step()
         plan = runner.plans[0]
-        self.assertEqual([group.group_index for group in plan.cache_groups], [0, 1])
+        assert [group.group_index for group in plan.cache_groups] == [0, 1]
 
         coarse, fine = plan.cache_groups
-        self.assertEqual(coarse.block_indptr, [0, 1])
-        self.assertEqual(coarse.first_logical_blocks, [0])
-        self.assertEqual(coarse.append_block_offsets, [0, 1, 2])
-        self.assertEqual(coarse.append_block_ids, [coarse.block_ids[0]] * 3)
+        assert coarse.block_indptr == [0, 1]
+        assert coarse.first_logical_blocks == [0]
+        assert coarse.append_block_offsets == [0, 1, 2]
+        assert coarse.append_block_ids == [coarse.block_ids[0]] * 3
 
-        self.assertEqual(fine.block_indptr, [0, 2])
-        self.assertEqual(fine.first_logical_blocks, [0])
-        self.assertEqual(fine.append_block_offsets, [0, 1, 0])
-        self.assertEqual(
-            fine.append_block_ids,
-            [fine.block_ids[0], fine.block_ids[0], fine.block_ids[1]],
-        )
+        assert fine.block_indptr == [0, 2]
+        assert fine.first_logical_blocks == [0]
+        assert fine.append_block_offsets == [0, 1, 0]
+        assert fine.append_block_ids == [
+            fine.block_ids[0],
+            fine.block_ids[0],
+            fine.block_ids[1],
+        ]
 
         engine.step()
-        self.assertEqual(engine.cache_free_parent_count, 3)
-        self.assertEqual(engine.cache_occupied_block_count, 0)
+        assert engine.cache_free_parent_count == 3
+        assert engine.cache_occupied_block_count == 0
 
     def test_preaccept_rejection_keeps_pages_owned_and_retry_uses_same_ids(
         self,
@@ -262,23 +263,23 @@ class FlatCacheEngineTests(unittest.TestCase):
         engine = Engine(runner)
         request = engine.submit([1], max_new_tokens=1)
 
-        with self.assertRaisesRegex(RuntimeError, "rejected the batch"):
+        with pytest.raises(RuntimeError, match="rejected the batch"):
             engine.dispatch()
-        self.assertFalse(engine.poisoned)
-        self.assertEqual(engine.ready_request_count, 1)
-        self.assertEqual(engine.in_flight_request_count, 0)
-        self.assertEqual(engine.cache_free_parent_count, 0)
-        self.assertEqual(engine.cache_occupied_block_count, 1)
+        assert not engine.poisoned
+        assert engine.ready_request_count == 1
+        assert engine.in_flight_request_count == 0
+        assert engine.cache_free_parent_count == 0
+        assert engine.cache_occupied_block_count == 1
 
-        self.assertEqual(engine.dispatch(), 2)
+        assert engine.dispatch() == 2
         events = engine.poll()
-        self.assertEqual([event.request_id for event in events], [request])
-        self.assertEqual(
-            runner.plans[0].cache_groups[0].block_ids,
-            runner.plans[1].cache_groups[0].block_ids,
+        assert [event.request_id for event in events] == [request]
+        assert (
+            runner.plans[0].cache_groups[0].block_ids
+            == runner.plans[1].cache_groups[0].block_ids
         )
-        self.assertEqual(engine.cache_free_parent_count, 1)
-        self.assertEqual(engine.cache_occupied_block_count, 0)
+        assert engine.cache_free_parent_count == 1
+        assert engine.cache_occupied_block_count == 0
 
     def test_window_group_exposes_a_chronological_suffix_without_copy_metadata(
         self,
@@ -292,17 +293,12 @@ class FlatCacheEngineTests(unittest.TestCase):
         engine.submit(list(range(12)), max_new_tokens=1)
 
         events = engine.step()
-        self.assertEqual(len(events), 1)
+        assert len(events) == 1
         prefill = runner.plans[-1].cache_groups[0]
-        self.assertEqual(prefill.first_logical_blocks, [0])
-        self.assertEqual(len(prefill.block_ids), 3)
-        self.assertEqual(
-            prefill.append_block_ids,
-            [page for page in prefill.block_ids for _ in range(4)],
-        )
-        self.assertEqual(engine.cache_occupied_block_count, 0)
-        self.assertEqual(engine.cache_free_parent_count, 4)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert prefill.first_logical_blocks == [0]
+        assert len(prefill.block_ids) == 3
+        assert prefill.append_block_ids == [
+            page for page in prefill.block_ids for _ in range(4)
+        ]
+        assert engine.cache_occupied_block_count == 0
+        assert engine.cache_free_parent_count == 4

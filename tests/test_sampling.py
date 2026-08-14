@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import unittest
-
+import pytest
 import torch
 
 import resin
@@ -19,10 +18,10 @@ class RecordingRunner:
         return [0] * plan.num_sequences
 
 
-class SamplingContractTests(unittest.TestCase):
+class TestSamplingContract:
     def test_state_mapping_arena_mint_is_public_backend_api(self) -> None:
-        self.assertTrue(callable(resin.mint_state_mapping_arena_id))
-        self.assertIn("mint_state_mapping_arena_id", resin.__all__)
+        assert callable(resin.mint_state_mapping_arena_id)
+        assert "mint_state_mapping_arena_id" in resin.__all__
 
     def test_sampling_params_validate_defaults_and_preserve_extra_identity(
         self,
@@ -30,11 +29,11 @@ class SamplingContractTests(unittest.TestCase):
         marker = object()
         params = SamplingParams(extra=marker)
 
-        self.assertEqual(params.temperature, 1.0)
-        self.assertEqual(params.top_p, 1.0)
-        self.assertIsNone(params.top_k)
-        self.assertIsNone(params.seed)
-        self.assertIs(params.extra, marker)
+        assert params.temperature == 1.0
+        assert params.top_p == 1.0
+        assert params.top_k is None
+        assert params.seed is None
+        assert params.extra is marker
 
         for kwargs in (
             {"temperature": -1.0},
@@ -44,7 +43,7 @@ class SamplingContractTests(unittest.TestCase):
             {"top_k": 0},
             {"seed": -1},
         ):
-            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+            with pytest.raises(ValueError):
                 SamplingParams(**kwargs)
 
     def test_engine_freezes_mixed_row_annotations_and_advances_offsets(self) -> None:
@@ -75,29 +74,23 @@ class SamplingContractTests(unittest.TestCase):
 
         engine.step()
         initial = runner.plans[0]
-        self.assertEqual(
-            [params.temperature for params in initial.sampling_params], [0.7, 0.0]
-        )
-        self.assertEqual(
-            [params.top_p for params in initial.sampling_params], [0.9, 1.0]
-        )
-        self.assertEqual(
-            [params.top_k for params in initial.sampling_params], [32, None]
-        )
-        self.assertIs(initial.sampling_params[0].extra, first_extra)
-        self.assertIs(initial.sampling_params[1].extra, second_extra)
-        self.assertEqual([params.seed for params in initial.sampling_params], [11, 22])
-        self.assertEqual(initial.sampling_offsets, [0, 0])
+        assert [params.temperature for params in initial.sampling_params] == [0.7, 0.0]
+        assert [params.top_p for params in initial.sampling_params] == [0.9, 1.0]
+        assert [params.top_k for params in initial.sampling_params] == [32, None]
+        assert initial.sampling_params[0].extra is first_extra
+        assert initial.sampling_params[1].extra is second_extra
+        assert [params.seed for params in initial.sampling_params] == [11, 22]
+        assert initial.sampling_offsets == [0, 0]
 
         engine.step()
         decode = runner.plans[1]
-        self.assertEqual(decode.sampling_offsets, [32, 0])
-        self.assertEqual(first.take_result(), [0, 0])
-        self.assertEqual(second.take_result(), [0, 0])
+        assert decode.sampling_offsets == [32, 0]
+        assert first.take_result() == [0, 0]
+        assert second.take_result() == [0, 0]
 
     def test_batch_plan_requires_row_aligned_sampling_annotations(self) -> None:
         params = SamplingParams()
-        with self.assertRaisesRegex(ValueError, "one item per sequence"):
+        with pytest.raises(ValueError, match="one item per sequence"):
             BatchPlan(
                 [1, 2],
                 [0, 0],
@@ -106,7 +99,7 @@ class SamplingContractTests(unittest.TestCase):
                 [0, 0],
                 sampling_params=[params],
             )
-        with self.assertRaisesRegex(ValueError, "sampling_offsets"):
+        with pytest.raises(ValueError, match="sampling_offsets"):
             BatchPlan(
                 [1, 2],
                 [0, 0],
@@ -117,7 +110,7 @@ class SamplingContractTests(unittest.TestCase):
             )
 
 
-class SharedSamplerTests(unittest.TestCase):
+class TestSharedSampler:
     @staticmethod
     def _plan(params, *, sample_sequence_indices=None):
         rows = len(params)
@@ -144,7 +137,7 @@ class SharedSamplerTests(unittest.TestCase):
             sample_sequence_indices=[0, 1],
         )
 
-        self.assertEqual(sampler(logits, plan).tolist(), [1, 1, 1])
+        assert sampler(logits, plan).tolist() == [1, 1, 1]
 
     def test_flashinfer_sampler_receives_per_row_filter_and_rng_tensors(self) -> None:
         calls = {}
@@ -178,13 +171,9 @@ class SharedSamplerTests(unittest.TestCase):
         )
         logits = torch.tensor([[0.0, 1.0, 2.0], [0.0, 3.0, 1.0]])
 
-        self.assertEqual(sampler(logits, plan).tolist(), [2, 1])
+        assert sampler(logits, plan).tolist() == [2, 1]
         torch.testing.assert_close(calls["temperatures"], torch.tensor([0.5, 1.0]))
-        self.assertEqual(calls["top_k"].tolist(), [2, 3])
+        assert calls["top_k"].tolist() == [2, 3]
         torch.testing.assert_close(calls["top_p"], torch.tensor([0.8, 1.0]))
-        self.assertEqual(calls["seed"].tolist(), [31, 32])
-        self.assertEqual(calls["offset"].tolist(), [64, 96])
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert calls["seed"].tolist() == [31, 32]
+        assert calls["offset"].tolist() == [64, 96]

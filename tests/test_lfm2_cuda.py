@@ -3,11 +3,12 @@ from __future__ import annotations
 import gc
 import inspect
 import math
-import unittest
 import weakref
 from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from resin import BatchPhase
 from resin.backend.cuda.execution import CudaExecutor
@@ -288,44 +289,35 @@ class _RecordingDecode:
         self.calls.append((args, kwargs))
 
 
-class Lfm2CudaImportTests(unittest.TestCase):
+class TestLfm2CudaImport:
     def test_physical_cache_slab_reserves_zero_as_the_null_page(self) -> None:
         source = inspect.getsource(PagedKvArena.__init__)
 
-        self.assertIn("self.capacity + 1", source)
-        self.assertIn("self.keys = self.storage[0]", source)
-        self.assertIn("self.values = self.storage[1]", source)
+        assert "self.capacity + 1" in source
+        assert "self.keys = self.storage[0]" in source
+        assert "self.values = self.storage[1]" in source
 
     def test_physical_cache_slab_zeroes_null_page_and_unwritten_tails(self) -> None:
         from resin.models.lfm2.cuda import Lfm2CudaRunner
 
         constructor = inspect.getsource(Lfm2CudaRunner.__init__)
-        self.assertIn("self._kv = PagedKvArena(", constructor)
-        self.assertIn("self.cache_layout = CacheLayout(", constructor)
-        self.assertIs(Lfm2CudaRunner.supports_continuation_prefill, True)
-        self.assertIs(Lfm2CudaRunner.supports_recurrent_state_mapping, True)
-        self.assertEqual(
-            Lfm2CudaRunner.recurrent_state_mapping.protocol,
-            "lfm2.conv_state.v1",
-        )
-        self.assertEqual(
-            Lfm2CudaRunner.recurrent_state_mapping.access_modes,
-            ["write"],
-        )
-        self.assertEqual(
-            Lfm2CudaRunner.recurrent_state_mapping.handles_per_sequence,
-            1,
-        )
-        self.assertTrue(callable(Lfm2CudaRunner.bind_cache_and_recurrent_state))
-        self.assertTrue(callable(Lfm2CudaRunner.dispatch))
-        self.assertTrue(callable(Lfm2CudaRunner.poll))
-        self.assertFalse(hasattr(Lfm2CudaRunner, "recurrent_state_mapping_protocol"))
-        self.assertFalse(hasattr(Lfm2CudaRunner, "bind_cache_pool"))
-        self.assertFalse(hasattr(Lfm2CudaRunner, "bind_recurrent_state_mapping"))
-        self.assertFalse(hasattr(Lfm2CudaRunner, "forward"))
+        assert "self._kv = PagedKvArena(" in constructor
+        assert "self.cache_layout = CacheLayout(" in constructor
+        assert Lfm2CudaRunner.supports_continuation_prefill is True
+        assert Lfm2CudaRunner.supports_recurrent_state_mapping is True
+        assert Lfm2CudaRunner.recurrent_state_mapping.protocol == "lfm2.conv_state.v1"
+        assert Lfm2CudaRunner.recurrent_state_mapping.access_modes == ["write"]
+        assert Lfm2CudaRunner.recurrent_state_mapping.handles_per_sequence == 1
+        assert callable(Lfm2CudaRunner.bind_cache_and_recurrent_state)
+        assert callable(Lfm2CudaRunner.dispatch)
+        assert callable(Lfm2CudaRunner.poll)
+        assert not hasattr(Lfm2CudaRunner, "recurrent_state_mapping_protocol")
+        assert not hasattr(Lfm2CudaRunner, "bind_cache_pool")
+        assert not hasattr(Lfm2CudaRunner, "bind_recurrent_state_mapping")
+        assert not hasattr(Lfm2CudaRunner, "forward")
 
 
-class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
+class TestLfm2CudaCachePoolBoundary:
     @staticmethod
     def _runner():
         from resin.models.lfm2.cuda import Lfm2CudaRunner
@@ -433,7 +425,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
 
     def test_combined_binding_requires_the_exact_layout(self) -> None:
         runner = self._runner()
-        with self.assertRaisesRegex(ValueError, "frozen layout object"):
+        with pytest.raises(ValueError, match="frozen layout object"):
             runner.bind_cache_and_recurrent_state(
                 41,
                 object(),
@@ -442,22 +434,22 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                 "lfm2.conv_state.v1",
                 None,
             )
-        self.assertIsNone(runner._kv.binding.pool_id)
-        self.assertIsNone(runner._state.binding)
+        assert runner._kv.binding.pool_id is None
+        assert runner._state.binding is None
 
     def test_combined_binding_is_atomic_exact_and_idempotent(self) -> None:
         runner = self._runner()
         first = self._bind(runner, capacity=7)
         second = self._bind(runner, capacity=7)
 
-        self.assertEqual(first[:4], (41, 53, 7, "lfm2.conv_state.v1"))
-        self.assertGreater(first[-1], 0)
-        self.assertEqual(second, first)
-        self.assertEqual(runner._kv.binding.pool_id, 41)
-        self.assertEqual(runner._state.binding, (53, 7, "lfm2.conv_state.v1"))
-        self.assertEqual(runner._state.slab.shape, (4, 7, 8, 2))
+        assert first[:4] == (41, 53, 7, "lfm2.conv_state.v1")
+        assert first[-1] > 0
+        assert second == first
+        assert runner._kv.binding.pool_id == 41
+        assert runner._state.binding == (53, 7, "lfm2.conv_state.v1")
+        assert runner._state.slab.shape == (4, 7, 8, 2)
 
-        with self.assertRaisesRegex(ValueError, "different cache pool"):
+        with pytest.raises(ValueError, match="different cache pool"):
             runner.bind_cache_and_recurrent_state(
                 42,
                 runner.cache_layout,
@@ -466,7 +458,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                 "lfm2.conv_state.v1",
                 None,
             )
-        with self.assertRaisesRegex(ValueError, "different mapped-state"):
+        with pytest.raises(ValueError, match="different mapped-state"):
             runner.bind_cache_and_recurrent_state(
                 41,
                 runner.cache_layout,
@@ -512,17 +504,13 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                 )
 
             mint.assert_not_called()
-            self.assertEqual(first_ack[-1], 1234)
-            self.assertEqual(second_ack[-1], 1234)
-            self.assertIs(second._state.slab, first._state.slab)
-            self.assertIs(
-                second._state.generations,
-                first._state.generations,
-            )
-            self.assertIs(second._state.owners, first._state.owners)
-            self.assertFalse(
-                any(entry[0] == "zeros" for entry in second._torch.log),
-                "reusing an arena must not allocate replacement bytes",
+            assert first_ack[-1] == 1234
+            assert second_ack[-1] == 1234
+            assert second._state.slab is first._state.slab
+            assert second._state.generations is first._state.generations
+            assert second._state.owners is first._state.owners
+            assert not any(entry[0] == "zeros" for entry in second._torch.log), (
+                "reusing an arena must not allocate replacement bytes"
             )
 
             incompatible = self._runner()
@@ -531,7 +519,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                 incompatible.hidden_size,
                 incompatible.conv_cache_length - 1,
             )
-            with self.assertRaisesRegex(ValueError, "incompatible"):
+            with pytest.raises(ValueError, match="incompatible"):
                 incompatible.bind_cache_and_recurrent_state(
                     43,
                     incompatible.cache_layout,
@@ -540,8 +528,8 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                     "lfm2.conv_state.v1",
                     1234,
                 )
-            self.assertIsNone(incompatible._kv.binding.pool_id)
-            self.assertIsNone(incompatible._state.binding)
+            assert incompatible._kv.binding.pool_id is None
+            assert incompatible._state.binding is None
         finally:
             _MAPPED_STATE_ARENAS.clear()
 
@@ -560,7 +548,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             return_value=1234,
             create=True,
         ):
-            with self.assertRaisesRegex(RuntimeError, "synthetic recurrent slab"):
+            with pytest.raises(RuntimeError, match="synthetic recurrent slab"):
                 runner.bind_cache_and_recurrent_state(
                     41,
                     runner.cache_layout,
@@ -570,12 +558,12 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                     None,
                 )
 
-        self.assertIsNone(runner._kv.binding.pool_id)
-        self.assertIsNone(runner._state.binding)
-        self.assertIsNone(runner._state.arena_id)
-        self.assertIsNone(runner._state.slab)
-        self.assertIsNone(runner._state.generations)
-        self.assertIsNone(runner._state.owners)
+        assert runner._kv.binding.pool_id is None
+        assert runner._state.binding is None
+        assert runner._state.arena_id is None
+        assert runner._state.slab is None
+        assert runner._state.generations is None
+        assert runner._state.owners is None
 
     def test_engine_combined_binding_rejects_unregistered_prebound_native_arena(
         self,
@@ -606,7 +594,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                 return [0] * plan.num_sequences
 
         Engine(SeedRunner(), state_pool=pool).close()
-        self.assertEqual(pool.physical_mapping, ("lfm2.conv_state.v1", arena_id))
+        assert pool.physical_mapping == ("lfm2.conv_state.v1", arena_id)
 
         runner = self._runner()
         runner.cache_layout = CacheLayout(8, [CacheGroupLayout(16)])
@@ -616,13 +604,13 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             side_effect=AssertionError("prebound native arena must not be reminted"),
             create=True,
         ) as mint:
-            with self.assertRaisesRegex(ValueError, "not registered in this process"):
+            with pytest.raises(ValueError, match="not registered in this process"):
                 Engine(runner, state_pool=pool)
 
         mint.assert_not_called()
-        self.assertIsNone(runner._kv.binding.pool_id)
-        self.assertIsNone(runner._state.arena_id)
-        self.assertEqual(pool.physical_mapping, ("lfm2.conv_state.v1", arena_id))
+        assert runner._kv.binding.pool_id is None
+        assert runner._state.arena_id is None
+        assert pool.physical_mapping == ("lfm2.conv_state.v1", arena_id)
 
     def test_runner_only_tensorizes_frozen_rust_kernel_metadata(self) -> None:
         runner = self._runner()
@@ -648,23 +636,23 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             "decode_block_ids": ([], "int32"),
             "decode_last_block_lengths": ([], "int32"),
         }
-        self.assertEqual(metadata["prefill_max_q_len"], 2)
-        self.assertEqual(metadata["continuation_prefill_max_q_len"], 1)
+        assert metadata["prefill_max_q_len"] == 2
+        assert metadata["continuation_prefill_max_q_len"] == 1
         for name, (values, dtype) in expected_cuda.items():
-            self.assertEqual(metadata[name].values, tuple(values))
-            self.assertEqual(metadata[name].dtype, dtype)
-            self.assertEqual(metadata[name].device, "cuda:fake")
-            self.assertEqual(metadata["_pinned"][name].device, "cpu")
-            self.assertTrue(metadata["_pinned"][name].pin_memory)
+            assert metadata[name].values == tuple(values)
+            assert metadata[name].dtype == dtype
+            assert metadata[name].device == "cuda:fake"
+            assert metadata["_pinned"][name].device == "cpu"
+            assert metadata["_pinned"][name].pin_memory
         for name, (values, dtype) in expected_host.items():
-            self.assertEqual(metadata[name].values, tuple(values))
-            self.assertEqual(metadata[name].dtype, dtype)
-            self.assertEqual(metadata[name].device, "cpu")
-            self.assertTrue(metadata[name].pin_memory)
-            self.assertIs(metadata[name], metadata["_pinned"][name])
+            assert metadata[name].values == tuple(values)
+            assert metadata[name].dtype == dtype
+            assert metadata[name].device == "cpu"
+            assert metadata[name].pin_memory
+            assert metadata[name] is metadata["_pinned"][name]
 
-        self.assertFalse(runner._plan_decode(plan, metadata))
-        self.assertEqual(runner._decode.calls, [])
+        assert not runner._plan_decode(plan, metadata)
+        assert runner._decode.calls == []
 
     def test_frozen_append_destinations_are_validated_before_tensor_staging(
         self,
@@ -673,11 +661,11 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         self._bind(runner)
         plan = self._plan(append_block_ids=[5, 3, 7])
 
-        with self.assertRaisesRegex(ValueError, "append destinations"):
+        with pytest.raises(ValueError, match="append destinations"):
             runner.dispatch(plan)
 
-        self.assertFalse(runner._torch.cuda.events)
-        self.assertFalse(any(entry[0] == "tensor" for entry in runner._torch.log))
+        assert not runner._torch.cuda.events
+        assert not any(entry[0] == "tensor" for entry in runner._torch.log)
 
     def test_decode_metadata_needs_no_python_request_history(self) -> None:
         runner = self._runner()
@@ -699,8 +687,8 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
                 token_ids=[3],
             )
         )
-        self.assertEqual(metadata["block_ids"].values, (6, 2))
-        self.assertEqual(metadata["append_positions"].values, (18,))
+        assert metadata["block_ids"].values == (6, 2)
+        assert metadata["append_positions"].values == (18,)
 
     def test_explicit_continuation_rows_use_only_rust_post_append_pages(self) -> None:
         from resin.models.lfm2.plan import build_cache_metadata
@@ -722,20 +710,17 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
 
         metadata = build_cache_metadata(plan, 4).prefill
 
-        self.assertEqual(metadata.dense_token_indices, (0, 1))
-        self.assertEqual(metadata.dense_cu_seqlens, (0, 2))
-        self.assertEqual(metadata.continuation_token_indices, (2, 3, 4))
-        self.assertEqual(metadata.continuation_cu_seqlens, (0, 2, 3))
+        assert metadata.dense_token_indices == (0, 1)
+        assert metadata.dense_cu_seqlens == (0, 2)
+        assert metadata.continuation_token_indices == (2, 3, 4)
+        assert metadata.continuation_cu_seqlens == (0, 2, 3)
         # Row 2 has one query token but remains explicit prefill. It therefore
         # shares the continuation page table rather than entering decode.
-        self.assertEqual(metadata.continuation_seqused_k, (7, 9))
-        self.assertEqual(metadata.continuation_page_table_width, 3)
-        self.assertEqual(
-            metadata.continuation_page_table,
-            (2, 7, 2, 4, 6, 1),
-        )
-        self.assertEqual(metadata.continuation_min_seqlen_k, 7)
-        self.assertEqual(metadata.continuation_max_seqlen_k, 9)
+        assert metadata.continuation_seqused_k == (7, 9)
+        assert metadata.continuation_page_table_width == 3
+        assert metadata.continuation_page_table == (2, 7, 2, 4, 6, 1)
+        assert metadata.continuation_min_seqlen_k == 7
+        assert metadata.continuation_max_seqlen_k == 9
 
     def test_continuation_kernel_views_are_pinned_nonblocking_tensorizations(
         self,
@@ -760,35 +745,20 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
 
         metadata = runner._metadata(plan)
 
-        self.assertEqual(metadata["prefill_token_indices"].values, (0, 1))
-        self.assertEqual(
-            metadata["continuation_prefill_token_indices"].values,
-            (2, 3, 4),
-        )
-        self.assertEqual(
-            metadata["continuation_prefill_cu_seqlens"].values,
-            (0, 2, 3),
-        )
-        self.assertEqual(
-            metadata["continuation_prefill_page_table"].values,
-            (2, 7, 2, 4, 6, 1),
-        )
-        self.assertEqual(
-            metadata["continuation_prefill_page_table"].shape,
-            (2, 3),
-        )
-        self.assertEqual(
-            metadata["continuation_prefill_seqused_k"].values,
-            (7, 9),
-        )
+        assert metadata["prefill_token_indices"].values == (0, 1)
+        assert metadata["continuation_prefill_token_indices"].values == (2, 3, 4)
+        assert metadata["continuation_prefill_cu_seqlens"].values == (0, 2, 3)
+        assert metadata["continuation_prefill_page_table"].values == (2, 7, 2, 4, 6, 1)
+        assert metadata["continuation_prefill_page_table"].shape == (2, 3)
+        assert metadata["continuation_prefill_seqused_k"].values == (7, 9)
         for name in (
             "continuation_prefill_token_indices",
             "continuation_prefill_cu_seqlens",
             "continuation_prefill_page_table",
             "continuation_prefill_seqused_k",
         ):
-            self.assertTrue(metadata["_pinned"][name].pin_memory)
-            self.assertEqual(metadata["_pinned"][name].device, "cpu")
+            assert metadata["_pinned"][name].pin_memory
+            assert metadata["_pinned"][name].device == "cpu"
 
     def test_continuation_rejects_stale_preappend_block_table(self) -> None:
         from resin.models.lfm2.plan import build_cache_metadata
@@ -807,7 +777,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             token_ids=[1, 2],
             positions=[15, 16],
         )
-        with self.assertRaisesRegex(ValueError, "post-append"):
+        with pytest.raises(ValueError, match="post-append"):
             build_cache_metadata(plan, 16)
 
     def test_one_token_prefill_is_not_inferred_to_be_decode(self) -> None:
@@ -830,59 +800,56 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
 
         metadata = build_cache_metadata(plan, 16).prefill
 
-        self.assertEqual(metadata.continuation_token_indices, (0, 1))
-        self.assertEqual(metadata.continuation_cu_seqlens, (0, 1, 2))
-        self.assertEqual(metadata.continuation_seqused_k, (9, 9))
+        assert metadata.continuation_token_indices == (0, 1)
+        assert metadata.continuation_cu_seqlens == (0, 1, 2)
+        assert metadata.continuation_seqused_k == (9, 9)
 
     def test_runner_has_no_logical_page_or_length_mirror(self) -> None:
         from resin.models.lfm2.cuda import Lfm2CudaRunner
 
         source = inspect.getsource(Lfm2CudaRunner)
-        self.assertNotIn("_request_pages", source)
-        self.assertNotIn("_request_lengths", source)
-        self.assertNotIn("_free_pages", source)
+        assert "_request_pages" not in source
+        assert "_request_lengths" not in source
+        assert "_free_pages" not in source
         metadata_source = inspect.getsource(Lfm2CudaRunner._metadata)
-        self.assertIn("_preflight_cache", metadata_source)
+        assert "_preflight_cache" in metadata_source
         from resin.models.lfm2.plan import build_cache_metadata
 
         adapter_source = inspect.getsource(build_cache_metadata)
-        self.assertIn("plan.phase", adapter_source)
-        self.assertIn("group.append_block_ids", adapter_source)
-        self.assertIn("group.append_block_offsets", adapter_source)
-        self.assertIn(
-            "_invoke_paged_fa4_b22(",
-            inspect.getsource(Lfm2CudaRunner._attention),
-        )
+        assert "plan.phase" in adapter_source
+        assert "group.append_block_ids" in adapter_source
+        assert "group.append_block_offsets" in adapter_source
+        assert "_invoke_paged_fa4_b22(" in inspect.getsource(Lfm2CudaRunner._attention)
 
 
-class Lfm2CudaRecurrentStateTests(unittest.TestCase):
+class TestLfm2CudaRecurrentState:
     @staticmethod
     def _bound_runner():
-        runner = Lfm2CudaCachePoolBoundaryTests._runner()
-        Lfm2CudaCachePoolBoundaryTests._bind(runner)
+        runner = TestLfm2CudaCachePoolBoundary._runner()
+        TestLfm2CudaCachePoolBoundary._bind(runner)
         return runner
 
     def test_binding_allocates_exact_bf16_geometry_once_on_private_stream(self) -> None:
-        runner = Lfm2CudaCachePoolBoundaryTests._runner()
-        first = Lfm2CudaCachePoolBoundaryTests._bind(runner, capacity=7)
-        second = Lfm2CudaCachePoolBoundaryTests._bind(runner, capacity=7)
+        runner = TestLfm2CudaCachePoolBoundary._runner()
+        first = TestLfm2CudaCachePoolBoundary._bind(runner, capacity=7)
+        second = TestLfm2CudaCachePoolBoundary._bind(runner, capacity=7)
 
-        self.assertEqual(first[:4], (41, 53, 7, "lfm2.conv_state.v1"))
-        self.assertGreater(first[-1], 0)
-        self.assertEqual(second, first)
-        self.assertEqual(runner._state.slab.shape, (4, 7, 8, 2))
-        self.assertEqual(runner._state.slab.dtype, "bfloat16")
-        self.assertEqual(runner._state.generations, [None] * 7)
-        self.assertEqual(runner._state.owners, [None] * 7)
+        assert first[:4] == (41, 53, 7, "lfm2.conv_state.v1")
+        assert first[-1] > 0
+        assert second == first
+        assert runner._state.slab.shape == (4, 7, 8, 2)
+        assert runner._state.slab.dtype == "bfloat16"
+        assert runner._state.generations == [None] * 7
+        assert runner._state.owners == [None] * 7
         enter = runner._torch.log.index(("stream.enter", runner._stream))
         allocation = runner._torch.log.index(
             ("zeros", (4, 7, 8, 2), "bfloat16", "cuda:fake")
         )
         exit_index = runner._torch.log.index(("stream.exit", runner._stream))
-        self.assertLess(enter, allocation)
-        self.assertLess(allocation, exit_index)
+        assert enter < allocation
+        assert allocation < exit_index
 
-        with self.assertRaisesRegex(ValueError, "different mapped-state"):
+        with pytest.raises(ValueError, match="different mapped-state"):
             runner.bind_cache_and_recurrent_state(
                 41,
                 runner.cache_layout,
@@ -891,7 +858,7 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
                 "lfm2.conv_state.v1",
                 None,
             )
-        with self.assertRaisesRegex(ValueError, "different mapped-state"):
+        with pytest.raises(ValueError, match="different mapped-state"):
             runner.bind_cache_and_recurrent_state(
                 41,
                 runner.cache_layout,
@@ -912,22 +879,21 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
             ((53, 4, "lfm2.conv_state.v2"), "protocol"),
         )
         for arguments, message in cases:
-            with self.subTest(arguments=arguments):
-                runner = Lfm2CudaCachePoolBoundaryTests._runner()
-                with patch(
-                    "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
-                    return_value=1234,
-                    create=True,
-                ) as mint:
-                    with self.assertRaisesRegex(ValueError, message):
-                        runner.bind_cache_and_recurrent_state(
-                            41,
-                            runner.cache_layout,
-                            *arguments,
-                            None,
-                        )
-                mint.assert_not_called()
-                self.assertIsNone(runner._state.slab)
+            runner = TestLfm2CudaCachePoolBoundary._runner()
+            with patch(
+                "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
+                return_value=1234,
+                create=True,
+            ) as mint:
+                with pytest.raises(ValueError, match=message):
+                    runner.bind_cache_and_recurrent_state(
+                        41,
+                        runner.cache_layout,
+                        *arguments,
+                        None,
+                    )
+            mint.assert_not_called()
+            assert runner._state.slab is None
 
     def test_preflight_guards_reject_before_start_event_acceptance(self) -> None:
         cases = (
@@ -947,64 +913,58 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
             ),
         )
         for overrides, message in cases:
-            with self.subTest(overrides=overrides):
-                runner = self._bound_runner()
-                plan = Lfm2CudaCachePoolBoundaryTests._plan(**overrides)
-                with self.assertRaisesRegex(ValueError, message):
-                    runner.dispatch(plan)
-                self.assertIsNone(runner._executor.inflight)
-                self.assertEqual(runner._executor.dispatch_count, 0)
-                self.assertFalse(runner._torch.cuda.events)
-                self.assertFalse(
-                    any(entry[0] == "slab.zero" for entry in runner._torch.log)
-                )
+            runner = self._bound_runner()
+            plan = TestLfm2CudaCachePoolBoundary._plan(**overrides)
+            with pytest.raises(ValueError, match=message):
+                runner.dispatch(plan)
+            assert runner._executor.inflight is None
+            assert runner._executor.dispatch_count == 0
+            assert not runner._torch.cuda.events
+            assert not any(entry[0] == "slab.zero" for entry in runner._torch.log)
 
     def test_generation_zeroing_reuse_and_exact_engine_request_tombstone(self) -> None:
         runner = self._bound_runner()
-        initial = Lfm2CudaCachePoolBoundaryTests._plan()
+        initial = TestLfm2CudaCachePoolBoundary._plan()
 
         rows = runner._state.rows(initial)
         with runner._torch.cuda.stream(runner._stream):
             runner._state.prepare_rows(rows)
-        self.assertEqual(
-            runner._state.slab.zeroed, [(slice(None), 0), (slice(None), 1)]
-        )
-        self.assertEqual(runner._state.generations[:2], [1, 1])
-        self.assertEqual(runner._state.owners[:2], [(71, 10), (71, 11)])
+        assert runner._state.slab.zeroed == [(slice(None), 0), (slice(None), 1)]
+        assert runner._state.generations[:2] == [1, 1]
+        assert runner._state.owners[:2] == [(71, 10), (71, 11)]
 
-        same_owner_continuation = Lfm2CudaCachePoolBoundaryTests._plan(
+        same_owner_continuation = TestLfm2CudaCachePoolBoundary._plan(
             context_lengths=[2, 17],
             positions=[2, 3, 17],
         )
         same_rows = runner._state.rows(same_owner_continuation)
         with runner._torch.cuda.stream(runner._stream):
             runner._state.prepare_rows(same_rows)
-        self.assertEqual(len(runner._state.slab.zeroed), 2)
+        assert len(runner._state.slab.zeroed) == 2
 
-        next_generation = Lfm2CudaCachePoolBoundaryTests._plan(state_generations=[2, 1])
+        next_generation = TestLfm2CudaCachePoolBoundary._plan(state_generations=[2, 1])
         with runner._torch.cuda.stream(runner._stream):
             runner._state.prepare_rows(runner._state.rows(next_generation))
-        self.assertEqual(len(runner._state.slab.zeroed), 3)
-        self.assertEqual(runner._state.generations[0], 2)
-        self.assertEqual(runner._state.owners[0], (71, 10))
+        assert len(runner._state.slab.zeroed) == 3
+        assert runner._state.generations[0] == 2
+        assert runner._state.owners[0] == (71, 10)
 
-        stale = Lfm2CudaCachePoolBoundaryTests._plan(state_generations=[1, 1])
-        with self.assertRaisesRegex(ValueError, "stale"):
+        stale = TestLfm2CudaCachePoolBoundary._plan(state_generations=[1, 1])
+        with pytest.raises(ValueError, match="stale"):
             runner.dispatch(stale)
-        self.assertFalse(runner._torch.cuda.events)
-        self.assertEqual(len(runner._state.slab.zeroed), 3)
+        assert not runner._torch.cuda.events
+        assert len(runner._state.slab.zeroed) == 3
 
         substitutions = (
             ({"sequence_ids": [99, 11], "state_generations": [2, 1]}, "request"),
             ({"engine_id": 72, "state_generations": [2, 1]}, "Engine"),
         )
         for overrides, message in substitutions:
-            with self.subTest(overrides=overrides):
-                plan = Lfm2CudaCachePoolBoundaryTests._plan(**overrides)
-                with self.assertRaisesRegex(ValueError, message):
-                    runner.dispatch(plan)
-                self.assertFalse(runner._torch.cuda.events)
-                self.assertEqual(len(runner._state.slab.zeroed), 3)
+            plan = TestLfm2CudaCachePoolBoundary._plan(**overrides)
+            with pytest.raises(ValueError, match=message):
+                runner.dispatch(plan)
+            assert not runner._torch.cuda.events
+            assert len(runner._state.slab.zeroed) == 3
 
     def test_short_conv_assignment_updates_fixed_layer_slot_view_in_place(self) -> None:
         runner = self._bound_runner()
@@ -1032,24 +992,21 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
             ephemeral,
         )
 
-        self.assertEqual(output.values, (4, 5))
-        self.assertIs(observations[0][0], observations[0][1])
-        self.assertEqual(
-            runner._state.slab.copies,
-            [((1, 3), replacement)],
-        )
-        self.assertIn(observations[0][0], ephemeral)
-        self.assertNotIn(replacement, ephemeral)
+        assert output.values == (4, 5)
+        assert observations[0][0] is observations[0][1]
+        assert runner._state.slab.copies == [((1, 3), replacement)]
+        assert observations[0][0] in ephemeral
+        assert replacement not in ephemeral
 
     def test_source_has_no_request_keyed_convolution_cache(self) -> None:
         from resin.models.lfm2.cuda import Lfm2CudaRunner
 
         source = inspect.getsource(Lfm2CudaRunner)
-        self.assertNotIn("_conv_cache", source)
-        self.assertIn("_InPlaceRecurrentState", source)
+        assert "_conv_cache" not in source
+        assert "_InPlaceRecurrentState" in source
 
 
-class Lfm2CudaFa4ContinuationTests(unittest.TestCase):
+class TestLfm2CudaFa4Continuation:
     def test_exact_b22_paged_surface(self) -> None:
         from resin.models.lfm2.cuda import _invoke_paged_fa4_b22
 
@@ -1078,23 +1035,23 @@ class Lfm2CudaFa4ContinuationTests(unittest.TestCase):
             softmax_scale=0.125,
         )
 
-        self.assertEqual(output, "output")
-        self.assertEqual(calls[0][0], ("q", "k_cache", "v_cache"))
+        assert output == "output"
+        assert calls[0][0] == ("q", "k_cache", "v_cache")
         kwargs = calls[0][1]
-        self.assertIs(kwargs["cu_seqlens_q"], values["cu_seqlens_q"])
-        self.assertIsNone(kwargs["cu_seqlens_k"])
-        self.assertIsNone(kwargs["seqused_q"])
-        self.assertIs(kwargs["seqused_k"], values["seqused_k"])
-        self.assertIs(kwargs["page_table"], values["page_table"])
-        self.assertEqual(kwargs["max_seqlen_q"], 7)
-        self.assertEqual(kwargs["min_seqlen_k"], 33)
-        self.assertEqual(kwargs["max_seqlen_k"], 65)
-        self.assertTrue(kwargs["causal"])
-        self.assertEqual(kwargs["window_size"], (None, None))
-        self.assertEqual(kwargs["num_splits"], 1)
-        self.assertTrue(kwargs["pack_gqa"])
-        self.assertFalse(kwargs["deterministic"])
-        self.assertFalse(kwargs["return_lse"])
+        assert kwargs["cu_seqlens_q"] is values["cu_seqlens_q"]
+        assert kwargs["cu_seqlens_k"] is None
+        assert kwargs["seqused_q"] is None
+        assert kwargs["seqused_k"] is values["seqused_k"]
+        assert kwargs["page_table"] is values["page_table"]
+        assert kwargs["max_seqlen_q"] == 7
+        assert kwargs["min_seqlen_k"] == 33
+        assert kwargs["max_seqlen_k"] == 65
+        assert kwargs["causal"]
+        assert kwargs["window_size"] == (None, None)
+        assert kwargs["num_splits"] == 1
+        assert kwargs["pack_gqa"]
+        assert not kwargs["deterministic"]
+        assert not kwargs["return_lse"]
 
     def test_bottom_right_causal_paged_call_matches_dense_suffix_oracle(self) -> None:
         from resin.models.lfm2.cuda import _invoke_paged_fa4_b22
@@ -1163,7 +1120,7 @@ class Lfm2CudaFa4ContinuationTests(unittest.TestCase):
             cu = kwargs["cu_seqlens_q"]
             lengths = kwargs["seqused_k"]
             table = kwargs["page_table"]
-            self.assertTrue(kwargs["causal"])
+            assert kwargs["causal"]
             for row in range(len(lengths)):
                 q_start, q_end = cu[row : row + 2]
                 length = lengths[row]
@@ -1193,16 +1150,16 @@ class Lfm2CudaFa4ContinuationTests(unittest.TestCase):
             for actual_value, expected_value in zip(
                 actual_row, expected_row, strict=True
             ):
-                self.assertAlmostEqual(actual_value, expected_value, places=12)
+                assert actual_value == pytest.approx(expected_value, abs=1e-12)
 
 
-class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
+class TestLfm2CudaAsyncLifecycle:
     @staticmethod
     def _runner_and_plan():
-        runner = Lfm2CudaCachePoolBoundaryTests._runner()
-        Lfm2CudaCachePoolBoundaryTests._bind(runner)
+        runner = TestLfm2CudaCachePoolBoundary._runner()
+        TestLfm2CudaCachePoolBoundary._bind(runner)
         runner._decode = _RecordingDecode(runner._torch.cuda)
-        plan = Lfm2CudaCachePoolBoundaryTests._plan()
+        plan = TestLfm2CudaCachePoolBoundary._plan()
 
         def run_model(
             self,
@@ -1234,59 +1191,55 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
 
         completion = runner.dispatch(plan)
 
-        self.assertIs(runner._executor.inflight, completion)
-        self.assertIs(completion._plan, plan)
-        self.assertIsNotNone(completion.staging)
-        self.assertTrue(completion.ephemeral)
+        assert runner._executor.inflight is completion
+        assert completion._plan is plan
+        assert completion.staging is not None
+        assert completion.ephemeral
         for resource in (
             runner._state.slab,
             runner._state.generations,
             runner._state.owners,
         ):
-            self.assertTrue(
-                any(candidate is resource for candidate in completion._resources)
-            )
-        self.assertIs(completion._start_event.recorded_stream, runner._stream)
-        self.assertIs(completion._done_event.recorded_stream, runner._stream)
-        self.assertIsNone(runner.poll(completion))
-        self.assertIs(runner._executor.inflight, completion)
-        self.assertNotIn(("tolist",), runner._torch.log)
+            assert any(candidate is resource for candidate in completion._resources)
+        assert completion._start_event.recorded_stream is runner._stream
+        assert completion._done_event.recorded_stream is runner._stream
+        assert runner.poll(completion) is None
+        assert runner._executor.inflight is completion
+        assert ("tolist",) not in runner._torch.log
 
         completion._done_event.ready = True
-        self.assertEqual(runner.poll(completion), [17, 23])
-        self.assertIsNone(runner._executor.inflight)
-        self.assertTrue(completion._retired)
-        self.assertIsNone(completion._plan)
-        self.assertIsNone(completion._resources)
-        self.assertIsNone(completion.staging)
-        self.assertIsNone(completion.ephemeral)
-        self.assertNotIn(("event.synchronize",), runner._torch.log)
-        self.assertNotIn(("stream.synchronize",), runner._torch.log)
-        with self.assertRaisesRegex(ValueError, "stale"):
+        assert runner.poll(completion) == [17, 23]
+        assert runner._executor.inflight is None
+        assert completion._retired
+        assert completion._plan is None
+        assert completion._resources is None
+        assert completion.staging is None
+        assert completion.ephemeral is None
+        assert ("event.synchronize",) not in runner._torch.log
+        assert ("stream.synchronize",) not in runner._torch.log
+        with pytest.raises(ValueError, match="stale"):
             runner.poll(completion)
 
         event_syncs = runner._torch.log.count(("event.synchronize",))
         del completion
         gc.collect()
-        self.assertEqual(runner._torch.log.count(("event.synchronize",)), event_syncs)
+        assert runner._torch.log.count(("event.synchronize",)) == event_syncs
 
     def test_exact_one_inflight_and_foreign_handle_guards(self) -> None:
         runner, plan = self._runner_and_plan()
         completion = runner.dispatch(plan)
         tensor_calls = sum(entry[0] == "tensor" for entry in runner._torch.log)
 
-        with self.assertRaisesRegex(RuntimeError, "in-flight"):
+        with pytest.raises(RuntimeError, match="in-flight"):
             runner.dispatch(plan)
-        self.assertEqual(
-            sum(entry[0] == "tensor" for entry in runner._torch.log), tensor_calls
-        )
-        with self.assertRaisesRegex(TypeError, "dispatch"):
+        assert sum(entry[0] == "tensor" for entry in runner._torch.log) == tensor_calls
+        with pytest.raises(TypeError, match="dispatch"):
             runner.poll(object())
 
         other, _ = self._runner_and_plan()
-        with self.assertRaisesRegex(ValueError, "different"):
+        with pytest.raises(ValueError, match="different"):
             other.poll(completion)
-        self.assertIs(runner._executor.inflight, completion)
+        assert runner._executor.inflight is completion
 
     def test_poll_extraction_failure_preserves_all_lifetimes_for_retry(self) -> None:
         runner, plan = self._runner_and_plan()
@@ -1296,35 +1249,35 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         completion._done_event.ready = True
         completion._output_host.tolist_error = RuntimeError("host extraction failed")
 
-        with self.assertRaisesRegex(RuntimeError, "host extraction failed"):
+        with pytest.raises(RuntimeError, match="host extraction failed"):
             runner.poll(completion)
-        self.assertIs(runner._executor.inflight, completion)
-        self.assertIs(completion.staging, staging)
-        self.assertIs(completion.ephemeral, ephemeral)
-        self.assertFalse(completion._terminal)
+        assert runner._executor.inflight is completion
+        assert completion.staging is staging
+        assert completion.ephemeral is ephemeral
+        assert not completion._terminal
 
-        self.assertEqual(runner.poll(completion), [17, 23])
-        self.assertIsNone(runner._executor.inflight)
+        assert runner.poll(completion) == [17, 23]
+        assert runner._executor.inflight is None
 
     def test_start_event_failure_is_preacceptance_but_done_failure_is_not(self) -> None:
         runner, plan = self._runner_and_plan()
         runner._torch.cuda.event_record_errors = [RuntimeError("start rejected")]
 
-        with self.assertRaisesRegex(RuntimeError, "start rejected"):
+        with pytest.raises(RuntimeError, match="start rejected"):
             runner.dispatch(plan)
-        self.assertIsNone(runner._executor.inflight)
-        self.assertEqual(runner._executor.dispatch_count, 0)
+        assert runner._executor.inflight is None
+        assert runner._executor.dispatch_count == 0
 
         runner._torch.cuda.event_record_errors = [
             None,
             RuntimeError("done record failed after acceptance"),
         ]
         completion = runner.dispatch(plan)
-        self.assertFalse(completion._done_recorded)
-        with self.assertRaisesRegex(RuntimeError, "after acceptance"):
+        assert not completion._done_recorded
+        with pytest.raises(RuntimeError, match="after acceptance"):
             runner.poll(completion)
-        self.assertIs(runner._executor.inflight, completion)
-        self.assertIsNotNone(completion.staging)
+        assert runner._executor.inflight is completion
+        assert completion.staging is not None
 
     def test_post_acceptance_launch_error_is_deferred_to_poll_and_quarantined(
         self,
@@ -1338,17 +1291,17 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         completion = runner.dispatch(plan)
         staging = completion.staging
         ephemeral = completion.ephemeral
-        self.assertIs(runner._executor.inflight, completion)
-        self.assertTrue(completion._done_recorded)
-        self.assertIsNone(runner.poll(completion))
+        assert runner._executor.inflight is completion
+        assert completion._done_recorded
+        assert runner.poll(completion) is None
 
         completion._done_event.ready = True
-        with self.assertRaisesRegex(RuntimeError, "after acceptance"):
+        with pytest.raises(RuntimeError, match="after acceptance"):
             runner.poll(completion)
-        self.assertIs(runner._executor.inflight, completion)
-        self.assertIs(completion.staging, staging)
-        self.assertIs(completion.ephemeral, ephemeral)
-        self.assertFalse(completion._terminal)
+        assert runner._executor.inflight is completion
+        assert completion.staging is staging
+        assert completion.ephemeral is ephemeral
+        assert not completion._terminal
 
     def test_all_list_staging_and_copies_are_pinned_and_nonblocking(self) -> None:
         runner, plan = self._runner_and_plan()
@@ -1356,13 +1309,13 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         runner.dispatch(plan)
 
         tensor_entries = [entry for entry in runner._torch.log if entry[0] == "tensor"]
-        self.assertTrue(tensor_entries)
-        self.assertTrue(all(entry[3:] == ("cpu", True) for entry in tensor_entries))
+        assert tensor_entries
+        assert all(entry[3:] == ("cpu", True) for entry in tensor_entries)
         h2d = [entry for entry in runner._torch.log if entry[0] == "h2d"]
-        self.assertEqual(len(h2d), 15)
-        self.assertTrue(all(entry[2] is True for entry in h2d))
-        self.assertIn(("d2h", "cuda:fake", True), runner._torch.log)
-        self.assertEqual(runner._decode.calls, [])
+        assert len(h2d) == 15
+        assert all(entry[2] is True for entry in h2d)
+        assert ("d2h", "cuda:fake", True) in runner._torch.log
+        assert runner._decode.calls == []
         model_index = next(
             index
             for index, entry in enumerate(runner._torch.log)
@@ -1383,29 +1336,29 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
             for index, entry in enumerate(runner._torch.log)
             if entry[0] == "slab.zero"
         ]
-        self.assertTrue(zero_indices)
-        self.assertTrue(all(enter < index < model_index for index in zero_indices))
+        assert zero_indices
+        assert all(enter < index < model_index for index in zero_indices)
         for index, entry in enumerate(runner._torch.log):
             if entry[0] in {"h2d", "d2h", "decode.plan", "model", "event.record"}:
-                self.assertLess(enter, index)
-                self.assertLess(index, exit)
+                assert enter < index
+                assert index < exit
 
     def test_preflight_validation_does_not_consume_inflight_slot(self) -> None:
         runner, plan = self._runner_and_plan()
         plan.cache_pool_id = 99
 
-        with self.assertRaisesRegex(ValueError, "does not match"):
+        with pytest.raises(ValueError, match="does not match"):
             runner.dispatch(plan)
-        self.assertIsNone(runner._executor.inflight)
-        self.assertEqual(runner._executor.dispatch_count, 0)
+        assert runner._executor.inflight is None
+        assert runner._executor.dispatch_count == 0
 
     def test_completion_cannot_be_retired_while_pending(self) -> None:
         runner, plan = self._runner_and_plan()
         completion = runner.dispatch(plan)
 
-        with self.assertRaisesRegex(RuntimeError, "pending"):
+        with pytest.raises(RuntimeError, match="pending"):
             completion._retire()
-        self.assertIs(runner._executor.inflight, completion)
+        assert runner._executor.inflight is completion
 
     def test_abandoned_ready_completion_outlives_runner_and_queries_before_release(
         self,
@@ -1427,15 +1380,15 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         completion = runner.dispatch(plan)
         completion._done_event.ready = True
         captured = completion._resources
-        self.assertTrue(all(reference() in captured for reference in tracked.values()))
-        self.assertIsNotNone(tracked["state_slab"]())
+        assert all(reference() in captured for reference in tracked.values())
+        assert tracked["state_slab"]() is not None
 
         del captured
         del runner
         gc.collect()
-        self.assertIsNone(runner_ref())
-        self.assertTrue(all(reference() is not None for reference in tracked.values()))
-        self.assertNotIn(("event.query", True), log)
+        assert runner_ref() is None
+        assert all(reference() is not None for reference in tracked.values())
+        assert ("event.query", True) not in log
 
         del completion
         gc.collect()
@@ -1443,19 +1396,17 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         deletion_indices = [
             index for index, entry in enumerate(log) if entry[0] == "resource.del"
         ]
-        self.assertTrue(deletion_indices)
-        self.assertTrue(all(query_index < index for index in deletion_indices))
-        self.assertTrue(
-            all(
-                reference() is None
-                for name, reference in tracked.items()
-                if name != "state_slab"
-            )
+        assert deletion_indices
+        assert all(query_index < index for index in deletion_indices)
+        assert all(
+            reference() is None
+            for name, reference in tracked.items()
+            if name != "state_slab"
         )
         # The native arena registry intentionally outlives runner/completion
         # objects so its physical identity and owner tombstones remain reusable.
-        self.assertIsNotNone(tracked["state_slab"]())
-        self.assertNotIn(("event.synchronize",), log)
+        assert tracked["state_slab"]() is not None
+        assert ("event.synchronize",) not in log
 
     def test_abandonment_queries_ready_stream_when_terminal_event_was_not_recorded(
         self,
@@ -1469,14 +1420,14 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         runner._stream.ready = True
 
         completion = runner.dispatch(plan)
-        self.assertFalse(completion._done_recorded)
+        assert not completion._done_recorded
         del runner
         gc.collect()
         del completion
         gc.collect()
 
-        self.assertIn(("stream.query", True), log)
-        self.assertNotIn(("event.synchronize",), log)
+        assert ("stream.query", True) in log
+        assert ("event.synchronize",) not in log
 
     def test_abandonment_timeout_quarantines_every_lifetime(self) -> None:
         from resin.backend.cuda.execution import CUDA_COMPLETION_QUARANTINE
@@ -1495,24 +1446,24 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         del completion
         gc.collect()
 
-        self.assertGreaterEqual(log.count(("event.query", False)), 2)
-        self.assertNotIn(("event.synchronize",), log)
-        self.assertEqual(len(CUDA_COMPLETION_QUARANTINE), baseline + 1)
-        self.assertIsNotNone(resource_ref())
-        self.assertNotIn(("resource.del", "model"), log)
+        assert log.count(("event.query", False)) >= 2
+        assert ("event.synchronize",) not in log
+        assert len(CUDA_COMPLETION_QUARANTINE) == baseline + 1
+        assert resource_ref() is not None
+        assert ("resource.del", "model") not in log
         payload = CUDA_COMPLETION_QUARANTINE[-1]
-        self.assertIs(payload["_done_event"], done_event)
-        self.assertIn(resource_ref(), payload["_resources"])
-        self.assertIsInstance(payload["wait_error"], TimeoutError)
+        assert payload["_done_event"] is done_event
+        assert resource_ref() in payload["_resources"]
+        assert isinstance(payload["wait_error"], TimeoutError)
 
         # Test-only cleanup after the fake event can prove completion.
         done_event.ready = True
-        self.assertTrue(done_event.query())
+        assert done_event.query()
         del CUDA_COMPLETION_QUARANTINE[baseline:]
         del payload
         del done_event
         gc.collect()
-        self.assertIsNone(resource_ref())
+        assert resource_ref() is None
 
     def test_abandonment_query_error_quarantines_without_retrying(self) -> None:
         from resin.backend.cuda.execution import CUDA_COMPLETION_QUARANTINE
@@ -1530,51 +1481,49 @@ class Lfm2CudaAsyncLifecycleTests(unittest.TestCase):
         del completion
         gc.collect()
 
-        self.assertEqual(log.count(("event.query", False)), 1)
-        self.assertNotIn(("event.synchronize",), log)
-        self.assertEqual(len(CUDA_COMPLETION_QUARANTINE), baseline + 1)
+        assert log.count(("event.query", False)) == 1
+        assert ("event.synchronize",) not in log
+        assert len(CUDA_COMPLETION_QUARANTINE) == baseline + 1
         payload = CUDA_COMPLETION_QUARANTINE[-1]
-        self.assertIsInstance(payload["wait_error"], RuntimeError)
-        self.assertIsNotNone(resource_ref())
+        assert isinstance(payload["wait_error"], RuntimeError)
+        assert resource_ref() is not None
 
         done_event.ready = True
-        self.assertTrue(done_event.query())
+        assert done_event.query()
         del CUDA_COMPLETION_QUARANTINE[baseline:]
         del payload
         del done_event
         gc.collect()
-        self.assertIsNone(resource_ref())
+        assert resource_ref() is None
 
 
-class Lfm2CudaAsyncStaticBoundaryTests(unittest.TestCase):
+class TestLfm2CudaAsyncStaticBoundary:
     def test_abandonment_is_bounded_and_query_only(self) -> None:
         from resin.backend.cuda.execution import CudaCompletion
 
         source = inspect.getsource(CudaCompletion._abandon)
-        self.assertIn("fence.query()", source)
-        self.assertIn("deadline", source)
-        self.assertIn("_quarantine_lifetimes", source)
-        self.assertNotIn(".synchronize(", source)
+        assert "fence.query()" in source
+        assert "deadline" in source
+        assert "_quarantine_lifetimes" in source
+        assert ".synchronize(" not in source
 
     def test_poll_queries_without_synchronizing(self) -> None:
         from resin.backend.cuda.execution import CudaExecutor
 
         source = inspect.getsource(CudaExecutor.poll)
-        self.assertIn(".query()", source)
-        self.assertNotIn("synchronize", source)
+        assert ".query()" in source
+        assert "synchronize" not in source
 
     def test_dispatch_uses_private_stream_and_nonblocking_copies(self) -> None:
         from resin.backend.cuda.execution import CudaExecutor
         from resin.models.lfm2.cuda import Lfm2CudaRunner
 
         source = inspect.getsource(CudaExecutor.dispatch)
-        self.assertIn("torch.cuda.stream(self.stream)", source)
-        self.assertIn("completion._done_event.record(self.stream)", source)
-        self.assertIn(
-            "self._executor.dispatch", inspect.getsource(Lfm2CudaRunner.dispatch)
-        )
-        self.assertNotIn("torch.cuda.synchronize", inspect.getsource(Lfm2CudaRunner))
-        self.assertNotIn("current_stream", inspect.getsource(Lfm2CudaRunner))
+        assert "torch.cuda.stream(self.stream)" in source
+        assert "completion._done_event.record(self.stream)" in source
+        assert "self._executor.dispatch" in inspect.getsource(Lfm2CudaRunner.dispatch)
+        assert "torch.cuda.synchronize" not in inspect.getsource(Lfm2CudaRunner)
+        assert "current_stream" not in inspect.getsource(Lfm2CudaRunner)
 
     def test_metadata_stages_decode_plan_on_pinned_cpu(self) -> None:
         from resin.backend.cuda.execution import CudaExecutor
@@ -1585,13 +1534,9 @@ class Lfm2CudaAsyncStaticBoundaryTests(unittest.TestCase):
         staging_source = inspect.getsource(TensorStager)
         poll_source = inspect.getsource(CudaExecutor.poll)
         dispatch_source = inspect.getsource(Lfm2CudaRunner.dispatch)
-        self.assertIn("TensorStager", metadata_source)
-        self.assertIn('device="cpu"', staging_source)
-        self.assertIn("pin_memory=True", staging_source)
-        self.assertIn("non_blocking=True", staging_source)
-        self.assertNotIn(".tolist()", dispatch_source)
-        self.assertIn(".tolist()", poll_source)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert "TensorStager" in metadata_source
+        assert 'device="cpu"' in staging_source
+        assert "pin_memory=True" in staging_source
+        assert "non_blocking=True" in staging_source
+        assert ".tolist()" not in dispatch_source
+        assert ".tolist()" in poll_source

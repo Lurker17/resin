@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import unittest
 from dataclasses import replace
+
+import pytest
 
 from resin.moe_kernels import (
     MoEExpertWeights,
@@ -216,7 +217,7 @@ def _weights(torch, config=None):
     )
 
 
-class FlashInferMXFP4AdapterTests(unittest.TestCase):
+class TestFlashInferMXFP4Adapter:
     def _kernel(self, *, capability=(9, 0)):
         from resin.models.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
 
@@ -241,12 +242,12 @@ for name in ('flashinfer', 'triton'):
 
     def test_capabilities_implement_the_standard_contract(self) -> None:
         kernel, _, _ = self._kernel()
-        self.assertIsInstance(kernel, MoEKernel)
-        self.assertTrue(kernel.supports(_config(), num_tokens=16))
-        self.assertFalse(kernel.supports(replace(_config(), architecture="sm100")))
-        self.assertFalse(kernel.supports(replace(_config(), activation_limit=None)))
-        with self.assertRaisesRegex(
-            UnsupportedMoEConfiguration, "requires activation_limit"
+        assert isinstance(kernel, MoEKernel)
+        assert kernel.supports(_config(), num_tokens=16)
+        assert not kernel.supports(replace(_config(), architecture="sm100"))
+        assert not kernel.supports(replace(_config(), activation_limit=None))
+        with pytest.raises(
+            UnsupportedMoEConfiguration, match="requires activation_limit"
         ):
             kernel.validate(replace(_config(), activation_limit=None))
 
@@ -254,59 +255,53 @@ for name in ('flashinfer', 'triton'):
         kernel, torch, fused_moe = self._kernel()
         prepared = kernel.prepare_weights(_weights(torch), _config())
 
-        self.assertEqual(
-            [(call[0].shape, call[1]) for call in fused_moe.weight_calls],
-            [
-                ((128, 5888, 1472), "fp4"),
-                ((128, 2944, 1472), "fp4"),
-            ],
-        )
+        assert [(call[0].shape, call[1]) for call in fused_moe.weight_calls] == [
+            ((128, 5888, 1472), "fp4"),
+            ((128, 2944, 1472), "fp4"),
+        ]
         fc1_before_interleave = fused_moe.weight_calls[0][0]
-        self.assertEqual(len(fc1_before_interleave.copies), 2)
-        self.assertEqual(
-            [copy[0][1] for copy in fc1_before_interleave.copies],
-            [slice(0, 2880), slice(2944, 5824)],
-        )
-        self.assertEqual(
-            [copy[1].key[1] for copy in fc1_before_interleave.copies],
-            [slice(1, None, 2), slice(0, None, 2)],
-        )
-        self.assertEqual(
-            [(call[0].shape, call[1]) for call in fused_moe.scale_calls],
-            [
-                ((128, 5888, 92), 32),
-                ((128, 2944, 92), 32),
-            ],
-        )
+        assert len(fc1_before_interleave.copies) == 2
+        assert [copy[0][1] for copy in fc1_before_interleave.copies] == [
+            slice(0, 2880),
+            slice(2944, 5824),
+        ]
+        assert [copy[1].key[1] for copy in fc1_before_interleave.copies] == [
+            slice(1, None, 2),
+            slice(0, None, 2),
+        ]
+        assert [(call[0].shape, call[1]) for call in fused_moe.scale_calls] == [
+            ((128, 5888, 92), 32),
+            ((128, 2944, 92), 32),
+        ]
         fc1_scales_before_interleave = fused_moe.scale_calls[0][0]
-        self.assertEqual(
-            [copy[1].key[1] for copy in fc1_scales_before_interleave.copies],
-            [slice(1, None, 2), slice(0, None, 2)],
-        )
+        assert [copy[1].key[1] for copy in fc1_scales_before_interleave.copies] == [
+            slice(1, None, 2),
+            slice(0, None, 2),
+        ]
         scale_padding = [
             tensor
             for tensor in torch.full_calls
             if tensor.fill_value == 127 and len(tensor.shape) == 3
         ]
-        self.assertEqual(
-            [tensor.shape for tensor in scale_padding],
-            [(128, 5888, 92), (128, 2944, 92)],
-        )
-        self.assertEqual(prepared.fc1_bias.shape, (128, 5888))
-        self.assertEqual(prepared.fc2_bias.shape, (128, 2944))
-        self.assertEqual(
-            [copy[1].key[1] for copy in prepared.fc1_bias.copies],
-            [slice(1, None, 2), slice(0, None, 2)],
-        )
-        self.assertIs(prepared.fc1_bias.dtype, torch.bfloat16)
-        self.assertIs(prepared.fc2_bias.dtype, torch.bfloat16)
-        self.assertEqual(prepared.swiglu_alpha.shape, (128,))
-        self.assertEqual(prepared.swiglu_alpha.fill_value, 1.702)
-        self.assertEqual(prepared.swiglu_beta.fill_value, 1.0)
-        self.assertEqual(prepared.swiglu_limit.fill_value, 7.0)
-        self.assertIs(prepared.swiglu_alpha.dtype, torch.float32)
-        self.assertEqual(prepared.padded_hidden_size, 2944)
-        self.assertEqual(prepared.padded_intermediate_size, 2944)
+        assert [tensor.shape for tensor in scale_padding] == [
+            (128, 5888, 92),
+            (128, 2944, 92),
+        ]
+        assert prepared.fc1_bias.shape == (128, 5888)
+        assert prepared.fc2_bias.shape == (128, 2944)
+        assert [copy[1].key[1] for copy in prepared.fc1_bias.copies] == [
+            slice(1, None, 2),
+            slice(0, None, 2),
+        ]
+        assert prepared.fc1_bias.dtype is torch.bfloat16
+        assert prepared.fc2_bias.dtype is torch.bfloat16
+        assert prepared.swiglu_alpha.shape == (128,)
+        assert prepared.swiglu_alpha.fill_value == 1.702
+        assert prepared.swiglu_beta.fill_value == 1.0
+        assert prepared.swiglu_limit.fill_value == 7.0
+        assert prepared.swiglu_alpha.dtype is torch.float32
+        assert prepared.padded_hidden_size == 2944
+        assert prepared.padded_intermediate_size == 2944
 
     def test_forward_uses_exact_low_level_api_types_and_scale_order(self) -> None:
         kernel, torch, fused_moe = self._kernel()
@@ -320,31 +315,28 @@ for name in ('flashinfer', 'triton'):
         )
 
         output = kernel.forward(hidden, routing, prepared, config)
-        self.assertEqual(output.shape, (16, 2880))
-        self.assertIs(output.dtype, torch.bfloat16)
-        self.assertEqual(len(fused_moe.forward_calls), 1)
+        assert output.shape == (16, 2880)
+        assert output.dtype is torch.bfloat16
+        assert len(fused_moe.forward_calls) == 1
         call = fused_moe.forward_calls[0]
-        self.assertEqual(call["input"].shape, (16, 2944))
-        self.assertIs(call["token_selected_experts"].dtype, torch.int32)
-        self.assertIs(call["token_final_scales"].dtype, torch.float32)
-        self.assertEqual(
-            call["quant_scales"],
-            [prepared.fc1_scales, prepared.fc2_scales],
-        )
-        self.assertIs(prepared.fc1_scales.dtype, torch.int32)
-        self.assertIs(prepared.fc2_scales.dtype, torch.int32)
-        self.assertIs(call["output_dtype"], torch.bfloat16)
-        self.assertEqual(call["output"].shape, (16, 2944))
-        self.assertIs(call["output"].dtype, torch.bfloat16)
-        self.assertIs(call["fc1_expert_biases"].dtype, torch.bfloat16)
-        self.assertIs(call["fc2_expert_biases"].dtype, torch.bfloat16)
-        self.assertEqual(call["swiglu_alpha"].shape, (128,))
-        self.assertEqual(call["swiglu_beta"].shape, (128,))
-        self.assertEqual(call["swiglu_limit"].shape, (128,))
-        self.assertTrue(call["use_w4_group_scaling"])
-        self.assertFalse(call["use_packed_weights"])
-        self.assertEqual(call["tune_max_num_tokens"], 8192)
-        self.assertEqual(call["activation_type"], _ActivationType.Swiglu)
+        assert call["input"].shape == (16, 2944)
+        assert call["token_selected_experts"].dtype is torch.int32
+        assert call["token_final_scales"].dtype is torch.float32
+        assert call["quant_scales"] == [prepared.fc1_scales, prepared.fc2_scales]
+        assert prepared.fc1_scales.dtype is torch.int32
+        assert prepared.fc2_scales.dtype is torch.int32
+        assert call["output_dtype"] is torch.bfloat16
+        assert call["output"].shape == (16, 2944)
+        assert call["output"].dtype is torch.bfloat16
+        assert call["fc1_expert_biases"].dtype is torch.bfloat16
+        assert call["fc2_expert_biases"].dtype is torch.bfloat16
+        assert call["swiglu_alpha"].shape == (128,)
+        assert call["swiglu_beta"].shape == (128,)
+        assert call["swiglu_limit"].shape == (128,)
+        assert call["use_w4_group_scaling"]
+        assert not call["use_packed_weights"]
+        assert call["tune_max_num_tokens"] == 8192
+        assert call["activation_type"] == _ActivationType.Swiglu
 
     def test_shape_architecture_and_incremental_builder_fail_early(self) -> None:
         kernel, torch, _ = self._kernel()
@@ -354,19 +346,19 @@ for name in ('flashinfer', 'triton'):
             invalid,
             gate_up=_tensor(torch, (128, 5760, 1439)),
         )
-        with self.assertRaisesRegex(ValueError, "gate_up must have shape"):
+        with pytest.raises(ValueError, match="gate_up must have shape"):
             kernel.prepare_weights(invalid, config)
 
         wrong_arch_kernel, wrong_arch_torch, _ = self._kernel(capability=(10, 0))
-        with self.assertRaisesRegex(UnsupportedMoEConfiguration, "requires SM90"):
+        with pytest.raises(UnsupportedMoEConfiguration, match="requires SM90"):
             wrong_arch_kernel.prepare_weights(_weights(wrong_arch_torch), config)
 
         builder = kernel.builder(config)
         weights = _weights(torch)
         builder.add("gate_up", weights.gate_up)
-        with self.assertRaisesRegex(ValueError, "duplicate"):
+        with pytest.raises(ValueError, match="duplicate"):
             builder.add("gate_up", weights.gate_up)
-        with self.assertRaisesRegex(ValueError, "missing MXFP4"):
+        with pytest.raises(ValueError, match="missing MXFP4"):
             builder.finish()
 
         complete = kernel.builder(config)
@@ -380,11 +372,7 @@ for name in ('flashinfer', 'triton'):
         ):
             complete.add(field, getattr(weights, field))
         prepared = complete.finish()
-        self.assertEqual(prepared.padded_hidden_size, 2944)
-        self.assertFalse(complete._tensors)
-        with self.assertRaisesRegex(RuntimeError, "already finished"):
+        assert prepared.padded_hidden_size == 2944
+        assert not complete._tensors
+        with pytest.raises(RuntimeError, match="already finished"):
             complete.finish()
-
-
-if __name__ == "__main__":
-    unittest.main()
