@@ -205,6 +205,7 @@ class TestDeepSeekV4Weights:
             "hc_post_mix",
             "qk_norm_rope_store",
             "sparse_attn",
+            "top6_sqrt_softplus",
         ):
             setattr(cutile, name, None)
         flashinfer = ModuleType("flashinfer")

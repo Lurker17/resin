@@ -23,6 +23,7 @@ from resin.models.deepseek_v4.cutile import (
     hc_post_mix,
     qk_norm_rope_store,
     sparse_attn,
+    top6_sqrt_softplus,
 )
 from resin.models.deepseek_v4.gemm import (
     fp4_fused_moe,
@@ -1026,6 +1027,15 @@ class Gate(nn.Module):
         self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         scores = linear(x.float(), self.weight.float())
+        if (
+            scores.is_cuda
+            and scores.shape[0] == 1
+            and (scores.shape[1] & (scores.shape[1] - 1)) == 0
+            and self.topk == 6
+            and self.score_func == "sqrtsoftplus"
+            and self.bias is not None
+        ):
+            return top6_sqrt_softplus(scores, self.bias, self.route_scale)
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
         elif self.score_func == "sigmoid":

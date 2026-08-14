@@ -16,6 +16,106 @@ _NEGATIVE = -3.402823466e38
 
 
 @ct.kernel
+def _top6_sqrt_softplus_kernel(
+    logits,
+    bias,
+    expert_indices,
+    expert_weights,
+    route_scale,
+    num_experts: _ConstantInt,
+):
+    row = ct.bid(0)
+    logits_tile = ct.load(logits, (row, 0), shape=(1, num_experts)).astype(
+        ct.float32
+    )
+    bias_tile = ct.load(bias, (0,), shape=(num_experts,)).reshape((1, num_experts))
+    stable_softplus = ct.maximum(logits_tile, 0.0) + ct.log(
+        1.0 + ct.exp(-ct.abs(logits_tile))
+    )
+    softplus = ct.where(logits_tile > 20.0, logits_tile, stable_softplus)
+    original = ct.sqrt(softplus)
+    scores = original + bias_tile
+    expert_ids = ct.arange(num_experts, dtype=ct.int32).reshape((1, num_experts))
+
+    index0 = ct.argmax(scores, 1, keepdims=True)
+    remaining = ct.where(expert_ids == index0, _NEGATIVE, scores)
+    index1 = ct.argmax(remaining, 1, keepdims=True)
+    remaining = ct.where(expert_ids == index1, _NEGATIVE, remaining)
+    index2 = ct.argmax(remaining, 1, keepdims=True)
+    remaining = ct.where(expert_ids == index2, _NEGATIVE, remaining)
+    index3 = ct.argmax(remaining, 1, keepdims=True)
+    remaining = ct.where(expert_ids == index3, _NEGATIVE, remaining)
+    index4 = ct.argmax(remaining, 1, keepdims=True)
+    remaining = ct.where(expert_ids == index4, _NEGATIVE, remaining)
+    index5 = ct.argmax(remaining, 1, keepdims=True)
+
+    indices01 = ct.cat((index0, index1), 1)
+    indices23 = ct.cat((index2, index3), 1)
+    indices45 = ct.cat((index4, index5), 1)
+
+    weight0 = ct.sum(
+        ct.where(expert_ids == index0, original, 0.0), axis=1, keepdims=True
+    )
+    weight1 = ct.sum(
+        ct.where(expert_ids == index1, original, 0.0), axis=1, keepdims=True
+    )
+    weight2 = ct.sum(
+        ct.where(expert_ids == index2, original, 0.0), axis=1, keepdims=True
+    )
+    weight3 = ct.sum(
+        ct.where(expert_ids == index3, original, 0.0), axis=1, keepdims=True
+    )
+    weight4 = ct.sum(
+        ct.where(expert_ids == index4, original, 0.0), axis=1, keepdims=True
+    )
+    weight5 = ct.sum(
+        ct.where(expert_ids == index5, original, 0.0), axis=1, keepdims=True
+    )
+    weights01 = ct.cat((weight0, weight1), 1)
+    weights23 = ct.cat((weight2, weight3), 1)
+    weights45 = ct.cat((weight4, weight5), 1)
+    normalization = route_scale / (
+        weight0 + weight1 + weight2 + weight3 + weight4 + weight5
+    )
+
+    ct.store(expert_indices, (row, 0), indices01)
+    ct.store(expert_indices, (row, 1), indices23)
+    ct.store(expert_indices, (row, 2), indices45)
+    ct.store(expert_weights, (row, 0), weights01 * normalization)
+    ct.store(expert_weights, (row, 1), weights23 * normalization)
+    ct.store(expert_weights, (row, 2), weights45 * normalization)
+
+
+def top6_sqrt_softplus(
+    logits: Tensor,
+    bias: Tensor,
+    route_scale: float,
+) -> tuple[Tensor, Tensor]:
+    """Apply the exact score transform for fixed-capacity single-row decode."""
+
+    if logits.ndim != 2 or logits.shape[0] != 1:
+        raise ValueError("the optimized router requires one fixed decode row")
+    rows, num_experts = logits.shape
+    if num_experts & (num_experts - 1):
+        raise ValueError("the optimized routing expert count must be a power of two")
+    if bias.shape != (num_experts,):
+        raise ValueError("DeepSeek-V4 routing bias must match the expert count")
+    expert_indices = torch.empty(
+        (rows, 6), dtype=torch.int32, device=logits.device
+    )
+    expert_weights = torch.empty(
+        (rows, 6), dtype=torch.float32, device=logits.device
+    )
+    ct.launch(
+        torch.cuda.current_stream(logits.device),
+        (rows,),
+        _top6_sqrt_softplus_kernel,
+        (logits, bias, expert_indices, expert_weights, route_scale, num_experts),
+    )
+    return expert_weights, expert_indices
+
+
+@ct.kernel
 def _fp8_quantize_kernel(source, output, scales, width: _ConstantInt):
     row = ct.bid(0)
     group = ct.bid(1)
@@ -683,4 +783,5 @@ __all__ = [
     "hc_post_mix",
     "qk_norm_rope_store",
     "sparse_attn",
+    "top6_sqrt_softplus",
 ]
