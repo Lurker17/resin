@@ -6,11 +6,34 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any
+from typing import Any, TypedDict
 
 from resin.backend.cuda.staging import StagingError, TensorStager
 
 GraphShape = tuple[int, ...]
+
+
+class CudaGraphShapeStats(TypedDict):
+    shape: GraphShape
+    captured: bool
+    capture_count: int
+    replay_count: int
+    warmup_count: int
+    capture_ms: float | None
+    capture_memory_bytes: int | None
+
+
+class CudaGraphStats(TypedDict):
+    enabled: bool
+    configured_shapes: tuple[GraphShape, ...]
+    captured_shapes: tuple[GraphShape, ...]
+    capture_count: int
+    replay_count: int
+    eager_fallback_count: int
+    fallback_counts: dict[str, int]
+    shape_stats: tuple[CudaGraphShapeStats, ...]
+    poisoned: bool
+    poison_error: str | None
 
 
 class GraphInputError(ValueError):
@@ -71,9 +94,9 @@ class CudaGraphCache:
     """Capture and replay reusable static CUDA steps.
 
     The backend describes each physical shape once with :class:`CudaGraphStep`.
-    This cache owns input staging, warmup, capture, parity validation, replay,
-    failure poisoning, and metrics. It only executes the batch passed to
-    :meth:`run`; it never plans future work or implements overlap scheduling.
+    This cache owns input staging, explicit warmup/capture, parity validation,
+    replay, failure poisoning, and metrics. It only executes the batch passed
+    to :meth:`run`; it never plans future work or implements overlap scheduling.
     """
 
     def __init__(
@@ -114,35 +137,57 @@ class CudaGraphCache:
         if self._poison is None:
             self._poison = f"{stage}: {type(error).__name__}: {error}"
 
-    def run(self, shape: GraphShape, inputs: Mapping[str, object]) -> list[int]:
-        """Stage and execute one current batch, capturing on first use."""
+    def capture(self, shape: GraphShape, inputs: Mapping[str, object]) -> list[int]:
+        """Build and capture one configured shape before request execution."""
 
         self.check()
-        entry = self._entries[shape]
-        fresh = entry.step is None
-        if fresh:
-            before = self.torch.cuda.memory_allocated(self.device)
-            entry.step = self._build(shape)
+        try:
+            entry = self._entries[shape]
+        except KeyError as error:
+            raise ValueError(f"unconfigured CUDA graph shape: {shape}") from error
+        if entry.graph is not None:
+            raise RuntimeError(f"CUDA graph shape is already captured: {shape}")
+        before = self.torch.cuda.memory_allocated(self.device)
+        entry.step = self._build(shape)
         assert entry.step is not None
         try:
             entry.staging = TensorStager(self.torch, self.device)
             entry.staging.copy_into(entry.step.inputs, inputs)
         except StagingError as error:
-            if fresh:
-                entry.step = None
+            entry.step = None
             raise GraphInputError(str(error)) from error
         except BaseException as error:
             self._fail("graph input copy", error)
             raise
+        try:
+            self._capture(entry, before)
+        except BaseException as error:
+            self._fail("graph capture", error)
+            self._synchronize_failure()
+            raise
+        return entry.step.output.tolist()
 
-        if entry.graph is None:
-            try:
-                self._capture(entry, before)
-            except BaseException as error:
-                self._fail("graph capture", error)
-                self._synchronize_failure()
-                raise
-            return entry.step.output.tolist()
+    def run(self, shape: GraphShape, inputs: Mapping[str, object]) -> list[int]:
+        """Stage and replay one current batch using a pre-captured graph."""
+
+        self.check()
+        try:
+            entry = self._entries[shape]
+        except KeyError as error:
+            raise ValueError(f"unconfigured CUDA graph shape: {shape}") from error
+        if entry.graph is None or entry.step is None:
+            raise RuntimeError(
+                f"CUDA graph shape {shape} has not been captured; "
+                "capture configured graphs during runner initialization"
+            )
+        try:
+            entry.staging = TensorStager(self.torch, self.device)
+            entry.staging.copy_into(entry.step.inputs, inputs)
+        except StagingError as error:
+            raise GraphInputError(str(error)) from error
+        except BaseException as error:
+            self._fail("graph input copy", error)
+            raise
 
         try:
             with self.torch.cuda.device(self.device):
@@ -186,8 +231,8 @@ class CudaGraphCache:
         )
 
     @property
-    def stats(self) -> dict[str, object]:
-        rows = tuple(
+    def stats(self) -> CudaGraphStats:
+        rows: tuple[CudaGraphShapeStats, ...] = tuple(
             {
                 "shape": entry.shape,
                 "captured": entry.graph is not None,

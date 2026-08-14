@@ -26,6 +26,7 @@ from resin.backend.checks import positive_int
 from resin.backend.checks import token_ids as check_token_ids
 from resin.backend.cuda.graphs import (
     CudaGraphCache,
+    CudaGraphStats,
     CudaGraphStep,
     GraphInputError,
     GraphShape,
@@ -39,6 +40,7 @@ from resin.models.gpt_oss.plan import (
     PAGE_SIZE,
     PREFILL_CHUNK_SIZE,
     SLIDING_WINDOW,
+    WINDOW_RETENTION_TOKENS,
     WINDOW_TABLE_WIDTH,
     AttentionBatch,
     build_attention_batches,
@@ -58,12 +60,108 @@ _PAGE_SIZE = PAGE_SIZE
 _SLIDING_WINDOW = SLIDING_WINDOW
 _PREFILL_CHUNK_SIZE = PREFILL_CHUNK_SIZE
 _WINDOW_TABLE_WIDTH = WINDOW_TABLE_WIDTH
+_NUM_KV_HEADS = 8
+_HEAD_DIM = 64
+_BF16_BYTES = 2
 
 
 class _PostAcceptCudaError(RuntimeError):
     """Tell the native Engine that accepted CUDA work is not safely retryable."""
 
     _resin_post_accept = True
+
+
+@dataclass(frozen=True, slots=True)
+class GptOssKvCapacityPlan:
+    """Advisory shared-pool sizing from an SGLang-style static fraction."""
+
+    total_memory_bytes: int
+    model_memory_bytes: int
+    static_memory_fraction: float
+    static_memory_bytes: int
+    kv_budget_bytes: int
+    bytes_per_parent: int
+    parent_capacity: int
+    allocation_bytes: int
+    full_parent_target: int
+    swa_parent_target: int
+    full_token_target: int
+    swa_token_target: int
+    swa_full_tokens_ratio: float
+
+
+def plan_gpt_oss_kv_capacity(
+    total_memory_bytes: int,
+    model_memory_bytes: int,
+    static_memory_fraction: float,
+    *,
+    attention_layers_per_group: int = 18,
+    swa_full_tokens_ratio: float = 0.8,
+) -> GptOssKvCapacityPlan:
+    """Calculate GPT-OSS KV capacity without imposing an allocation policy.
+
+    ``static_memory_fraction`` follows SGLang's definition: model weights plus
+    KV cache divided by total GPU memory. Resin uses one fungible parent pool
+    for full and sliding-window attention, so the SWA ratio is returned as an
+    advisory token-capacity split rather than two physical allocations.
+    """
+
+    for name, value in (
+        ("total_memory_bytes", total_memory_bytes),
+        ("model_memory_bytes", model_memory_bytes),
+        ("attention_layers_per_group", attention_layers_per_group),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if model_memory_bytes >= total_memory_bytes:
+        raise ValueError("model_memory_bytes must be smaller than total GPU memory")
+    if (
+        isinstance(static_memory_fraction, bool)
+        or not isinstance(static_memory_fraction, (int, float))
+        or not 0.0 < static_memory_fraction < 1.0
+    ):
+        raise ValueError("static_memory_fraction must be between zero and one")
+    if (
+        isinstance(swa_full_tokens_ratio, bool)
+        or not isinstance(swa_full_tokens_ratio, (int, float))
+        or not 0.0 <= swa_full_tokens_ratio <= 1.0
+    ):
+        raise ValueError("swa_full_tokens_ratio must be between zero and one")
+
+    static_memory_bytes = int(total_memory_bytes * static_memory_fraction)
+    kv_budget_bytes = static_memory_bytes - model_memory_bytes
+    if kv_budget_bytes <= 0:
+        raise ValueError("the static memory target leaves no room for KV cache")
+    bytes_per_parent = (
+        2
+        * attention_layers_per_group
+        * _PAGE_SIZE
+        * _NUM_KV_HEADS
+        * _HEAD_DIM
+        * _BF16_BYTES
+    )
+    # The device slab contains parent zero as a permanent null/graph-capture
+    # page in addition to the positive parent IDs owned by the native pool.
+    parent_capacity = kv_budget_bytes // bytes_per_parent - 1
+    if parent_capacity <= 0:
+        raise ValueError("the KV budget cannot hold a usable parent plus null page")
+    full_parent_target = max(1, int(parent_capacity / (1.0 + swa_full_tokens_ratio)))
+    swa_parent_target = parent_capacity - full_parent_target
+    return GptOssKvCapacityPlan(
+        total_memory_bytes=total_memory_bytes,
+        model_memory_bytes=model_memory_bytes,
+        static_memory_fraction=float(static_memory_fraction),
+        static_memory_bytes=static_memory_bytes,
+        kv_budget_bytes=kv_budget_bytes,
+        bytes_per_parent=bytes_per_parent,
+        parent_capacity=parent_capacity,
+        allocation_bytes=(parent_capacity + 1) * bytes_per_parent,
+        full_parent_target=full_parent_target,
+        swa_parent_target=swa_parent_target,
+        full_token_target=full_parent_target * _PAGE_SIZE,
+        swa_token_target=swa_parent_target * _PAGE_SIZE,
+        swa_full_tokens_ratio=float(swa_full_tokens_ratio),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +232,7 @@ class GptOssCudaRunner:
     # token. Sparse History/Window rows are chronological; dense FA4 tables and
     # page-aligned execution rounds are derived locally without any cache state.
     supports_continuation_prefill = True
+    max_batch_tokens = _PREFILL_CHUNK_SIZE
     page_size = _PAGE_SIZE
     sliding_window = _SLIDING_WINDOW
     prefill_chunk_size = _PREFILL_CHUNK_SIZE
@@ -159,7 +258,7 @@ class GptOssCudaRunner:
                 CacheGroupLayout(
                     _PAGE_SIZE,
                     retention="window",
-                    window_tokens=_SLIDING_WINDOW,
+                    window_tokens=WINDOW_RETENTION_TOKENS,
                 ),
             ],
         )
@@ -274,7 +373,42 @@ class GptOssCudaRunner:
                 raise TypeError("FA4 learnable sink tensors must be bfloat16")
 
     @property
-    def cuda_graph_stats(self) -> dict[str, object]:
+    def cuda_graph_stats(self) -> CudaGraphStats:
+        return self._graphs.stats
+
+    @staticmethod
+    def _graph_capture_inputs(shape: GraphShape) -> dict[str, tuple[int, ...]]:
+        """Return valid synthetic decode inputs backed only by null page zero."""
+
+        batch_size, full_width = shape
+        rows = tuple(range(batch_size))
+        zeros = (0,) * batch_size
+        return {
+            "token_ids": zeros,
+            "positions": zeros,
+            "token_indices": rows,
+            "sequence_indices": rows,
+            "full_page_table": (0,) * (batch_size * full_width),
+            "full_seqused_k": (1,) * batch_size,
+            "sliding_page_table": (0,) * (batch_size * _WINDOW_TABLE_WIDTH),
+            "sliding_seqused_k": (1,) * batch_size,
+            "full_append_slots": zeros,
+            "sliding_append_slots": zeros,
+        }
+
+    def capture_cuda_graphs(self) -> CudaGraphStats:
+        """Capture every configured decode graph before accepting requests."""
+
+        already_captured = set(self._graphs.stats["captured_shapes"])
+        for shape in self._graphs.shapes:
+            if shape not in already_captured:
+                self._graphs.capture(shape, self._graph_capture_inputs(shape))
+        if self._graphs.shapes:
+            # Capture writes synthetic K/V to parent zero, which the native
+            # allocator permanently reserves. Restore its null-page contract
+            # before a request can reach the runner.
+            self._kv.storage[:, :, 0].zero_()
+            self._torch.cuda.synchronize(self.device)
         return self._graphs.stats
 
     def bind_cache_pool(self, pool_id: int, layout: CacheLayout) -> int:

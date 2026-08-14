@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import os
 import time
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import TypedDict, cast
 
 import modal
+import torch
+from huggingface_hub import snapshot_download
+from renderers import GptOssRendererConfig, Message, Renderer, create_renderer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from deploy.jit_cache import (
     KERNEL_CACHE_ENV,
@@ -17,18 +21,37 @@ from deploy.jit_cache import (
     KERNEL_CACHE_ROOT,
     KERNEL_CACHE_VOLUME_NAME,
     KERNEL_CACHE_VOLUME_VERSION,
+    flashinfer_autotune_context,
     install_flashinfer_hash_cache,
     run_cache_prewarm,
     run_cache_reuse_probe,
     run_cached_workload,
 )
+from resin import Engine, SchedulerConfig, TokenEvent
+from resin.backend.cuda.graphs import CudaGraphStats
+from resin.models.gpt_oss.cuda import GptOssCudaRunner
+from resin.models.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
+from resin.models.gpt_oss.plan import PAGE_SIZE, WINDOW_TABLE_WIDTH
 
 ROOT = Path(__file__).resolve().parents[1]
 
 MODEL_CACHE_VOLUME_NAME = "resin-gpt-oss-models-v2"
 MODEL_CACHE_VOLUME_VERSION = 2
 MODEL_CACHE_MOUNT = "/models/resin-gpt-oss"
-MODEL_SPECS = {
+
+
+class ModelSpec(TypedDict):
+    repo_id: str
+    revision: str
+
+
+class KernelCacheVerification(TypedDict):
+    cache_hit: bool
+    stable_artifact_changes: list[str]
+    flashinfer_hash_cache_misses: int
+
+
+MODEL_SPECS: dict[str, ModelSpec] = {
     "20b": {
         "repo_id": "openai/gpt-oss-20b",
         "revision": "6cee5e81ee83917806bbde320786a8fb61efebee",
@@ -51,8 +74,8 @@ TOKENIZER_FILES = (
     "vocab.json",
 )
 
-PAGE_TOKENS = 128
-WINDOW_RESIDENT_BLOCKS = 2
+PAGE_TOKENS = PAGE_SIZE
+WINDOW_RESIDENT_BLOCKS = WINDOW_TABLE_WIDTH
 
 
 image = (
@@ -69,23 +92,12 @@ image = (
             "CMAKE_BUILD_PARALLEL_LEVEL": "12",
         }
     )
-    .uv_pip_install(
-        "maturin>=1.9,<2",
-        "torch==2.13.0",
-        "numpy==2.5.1",
-        "huggingface-hub==1.27.0",
-        "hf-xet==1.6.0",
-        "safetensors==0.8.0",
-        "kernels==0.15.2",
-        "triton==3.7.1",
-        "flashinfer-python==0.6.15.post1",
-        "flash-attn-4==4.0.0b22",
-        "nvidia-cutlass-dsl==4.6.0.dev0",
-        "apache-tvm-ffi==0.1.13.post2",
-        "quack-kernels==0.5.3",
-        "blake3==1.0.9",
-        "renderers==0.1.9",
+    .pip_install_from_pyproject(
+        str(ROOT / "pyproject.toml"), optional_dependencies=["cuda", "demo"]
     )
+    # These accelerator-specific supplement wheels live outside PyPI, so the
+    # project extras own all ordinary dependencies while the image only owns
+    # their index locations.
     .uv_pip_install(
         "flashinfer-cubin==0.6.15.post1",
         extra_index_url="https://flashinfer.ai/whl",
@@ -94,6 +106,8 @@ image = (
         "flashinfer-jit-cache==0.6.15.post1+cu130",
         extra_index_url="https://flashinfer.ai/whl/cu130",
     )
+    # Keep the heavyweight dependency layers independent of local source so a
+    # normal code edit only rebuilds Resin itself.
     .add_local_file(ROOT / "deploy/__init__.py", "/root/deploy/__init__.py", copy=True)
     .add_local_file(
         ROOT / "deploy/jit_cache.py", "/root/deploy/jit_cache.py", copy=True
@@ -104,7 +118,7 @@ image = (
     .add_local_file(ROOT / "README.md", "/opt/resin/README.md", copy=True)
     .add_local_dir(ROOT / "crates", "/opt/resin/crates", copy=True)
     .add_local_dir(ROOT / "src", "/opt/resin/src", copy=True)
-    .run_commands("python -m pip install --no-deps /opt/resin")
+    .uv_pip_install("/opt/resin", extra_options="--no-deps")
     .env(KERNEL_CACHE_ENV)
 )
 
@@ -117,11 +131,6 @@ model_cache_volume = modal.Volume.from_name(
     MODEL_CACHE_VOLUME_NAME,
     create_if_missing=True,
     version=MODEL_CACHE_VOLUME_VERSION,
-)
-single_use_options = (
-    {"single_use_containers": True}
-    if "single_use_containers" in inspect.signature(modal.App.function).parameters
-    else {"max_inputs": 1}
 )
 app = modal.App(
     "resin-gpt-oss-flat",
@@ -190,8 +199,6 @@ def _download_model(model_key: str) -> dict[str, object]:
     cache_hit = _model_is_complete(model_key) and _tokenizer_is_complete(model_key)
     start = time.perf_counter()
     if not cache_hit:
-        from huggingface_hub import snapshot_download
-
         spec = MODEL_SPECS[model_key]
         target = _model_path(model_key)
         target.mkdir(parents=True, exist_ok=True)
@@ -247,17 +254,17 @@ def _require_cached_model(model_key: str) -> tuple[Path, dict[str, object]]:
     }
 
 
-def _load_renderer(model_path: Path):
-    from renderers import GptOssRendererConfig, create_renderer
-    from transformers import AutoTokenizer
-
+def _load_renderer(model_path: Path) -> tuple[PreTrainedTokenizerBase, Renderer]:
     tokenizer_path = model_path / "tokenizer.json"
     if not tokenizer_path.is_file():
         raise RuntimeError(
             "tokenizer.json is absent; run mode=download to populate the tokenizer"
         )
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(model_path), local_files_only=True, trust_remote_code=False
+    tokenizer = cast(
+        PreTrainedTokenizerBase,
+        AutoTokenizer.from_pretrained(
+            str(model_path), local_files_only=True, trust_remote_code=False
+        ),
     )
     renderer = create_renderer(
         tokenizer,
@@ -266,18 +273,17 @@ def _load_renderer(model_path: Path):
     return tokenizer, renderer
 
 
-def _encode_prompt(renderer: Any, prompt: str) -> list[int]:
+def _encode_prompt(renderer: Renderer, prompt: str) -> list[int]:
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("prompt must be a non-empty string")
-    token_ids = renderer.render_ids(
-        [{"role": "user", "content": prompt}], add_generation_prompt=True
-    )
+    messages: list[Message] = [{"role": "user", "content": prompt}]
+    token_ids = renderer.render_ids(messages, add_generation_prompt=True)
     if not token_ids:
         raise ValueError("prompt produced no tokens")
     return [int(token_id) for token_id in token_ids]
 
 
-def _generation_prefix_ids(renderer: Any, prompt: str) -> list[int]:
+def _generation_prefix_ids(renderer: Renderer, prompt: str) -> list[int]:
     """Return the harmony scaffolding the model continues from.
 
     The Engine returns sampled completion IDs only.  GPT-OSS starts its
@@ -288,7 +294,7 @@ def _generation_prefix_ids(renderer: Any, prompt: str) -> list[int]:
     generated tokens.
     """
 
-    messages = [{"role": "user", "content": prompt}]
+    messages: list[Message] = [{"role": "user", "content": prompt}]
     conversation_ids = [
         int(token_id)
         for token_id in renderer.render_ids(messages, add_generation_prompt=False)
@@ -302,13 +308,15 @@ def _generation_prefix_ids(renderer: Any, prompt: str) -> list[int]:
     return prompt_ids[len(conversation_ids) :]
 
 
-def _bench_prompt_ids(tokenizer: Any, prompt_tokens: int) -> list[int]:
+def _bench_prompt_ids(
+    tokenizer: PreTrainedTokenizerBase, prompt_tokens: int
+) -> list[int]:
     seed = (
         "Resin benchmark paragraph. Measure useful language-model work with "
         "stable token IDs, deterministic scheduling, and no tokenizer work in "
         "the timed GPU interval. "
     )
-    token_ids = tokenizer.encode(seed, add_special_tokens=False).ids
+    token_ids = tokenizer.encode(seed, add_special_tokens=False)
     if not token_ids:
         raise RuntimeError("benchmark seed produced no tokenizer IDs")
     repeats = (prompt_tokens + len(token_ids) - 1) // len(token_ids)
@@ -347,12 +355,7 @@ def _new_cuda_runner(
     model_path: Path,
     cache_parent_capacity: int,
     cuda_graph_decode_shapes: tuple[tuple[int, int], ...] = (),
-):
-    import torch
-
-    from resin.models.gpt_oss.cuda import GptOssCudaRunner
-    from resin.models.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
-
+) -> GptOssCudaRunner:
     moe_kernel = make_flashinfer_sm90_mxfp4_kernel()
     print(f"[model-load] Loading model from {model_path}...", flush=True)
     model_load_start = time.perf_counter()
@@ -372,6 +375,23 @@ def _new_cuda_runner(
     return runner
 
 
+def _capture_cuda_graphs(runner: GptOssCudaRunner) -> CudaGraphStats:
+    stats = runner.cuda_graph_stats
+    shapes = stats["configured_shapes"]
+    if not shapes:
+        return stats
+    print(f"[cuda-graphs] Capturing {len(shapes)} decode shape(s)...", flush=True)
+    capture_start = time.perf_counter()
+    stats = runner.capture_cuda_graphs()
+    capture_elapsed_s = time.perf_counter() - capture_start
+    print(
+        f"[cuda-graphs] Captured {stats['capture_count']} shape(s) in "
+        f"{capture_elapsed_s:.2f} seconds",
+        flush=True,
+    )
+    return stats
+
+
 def _run_prompt(
     model_key: str,
     prompt: str,
@@ -379,10 +399,6 @@ def _run_prompt(
     context_length: int,
     schedule_conservativeness: float,
 ) -> dict[str, object]:
-    import torch
-
-    from resin import Engine, SchedulerConfig
-
     model_path, model_cache = _require_cached_model(model_key)
     tokenizer, renderer = _load_renderer(model_path)
     prompt_ids = _encode_prompt(renderer, prompt)
@@ -406,10 +422,13 @@ def _run_prompt(
         ),
         eos_token_id=runner.eos_token_id,
     )
-    output_events = []
-    first_token_time = None
+    output_events: list[TokenEvent] = []
+    first_token_time: float | None = None
     try:
-        # Warm kernels and capture the configured B=1 decode graph before timing.
+        # Graph capture is an explicit initialization phase and never consumes
+        # the first request batch.
+        _capture_cuda_graphs(runner)
+        # Warm the real prefill path before timing request execution.
         warmup = engine.submit(prompt_ids, max_new_tokens=2)
         while engine.has_work():
             engine.step()
@@ -438,7 +457,7 @@ def _run_prompt(
             "text": tokenizer.decode(rendered_output_ids, skip_special_tokens=False),
             "content": parsed.content,
             "reasoning_content": parsed.reasoning_content,
-            "tool_calls": [tool_call.__dict__ for tool_call in parsed.tool_calls],
+            "tool_calls": [asdict(tool_call) for tool_call in parsed.tool_calls],
             "cuda_graph": runner.cuda_graph_stats,
             "time_to_first_token_ms": (
                 None if first_token_time is None else (first_token_time - start) * 1000
@@ -462,10 +481,6 @@ def _bench_cuda(
     context_length: int,
     schedule_conservativeness: float,
 ) -> dict[str, object]:
-    import torch
-
-    from resin import Engine, SchedulerConfig
-
     tokenizer, _renderer = _load_renderer(model_path)
     prompt_ids = _bench_prompt_ids(tokenizer, prompt_tokens)
     cache_parent_capacity = _required_parent_capacity(
@@ -528,6 +543,7 @@ def _bench_cuda(
         }
 
     try:
+        _capture_cuda_graphs(runner)
         # Warm each batch shape once so the reported rows represent steady
         # execution rather than first-use allocation and kernel setup.
         for batch_size in batch_sizes:
@@ -572,26 +588,15 @@ def _run_bench(
     def workload() -> dict[str, object]:
         install_flashinfer_hash_cache()
 
-        import flashinfer
-        from flashinfer.autotuner import AutoTuner
-
         path = _autotune_path(model_key, protocol)
         path.parent.mkdir(parents=True, exist_ok=True)
-        cache_loaded = None
-        if path.exists():
-            cache_loaded = AutoTuner.get().load_configs(str(path))
-            if not cache_loaded:
-                raise RuntimeError(f"FlashInfer rejected its saved tactics: {path}")
-        elif cache_mode == "verify":
-            raise RuntimeError("saved FlashInfer tactics are absent; prewarm first")
         tune_missing = cache_mode == "prewarm"
         tuning_buckets = tuple(sorted({1, *batch_sizes, 128}))
-        with flashinfer.autotune(
-            tune_missing,
-            cache=str(path) if tune_missing else None,
+        with flashinfer_autotune_context(
+            path,
+            tune_missing=tune_missing,
             tuning_buckets=tuning_buckets,
-            round_up=True,
-        ):
+        ) as cache_loaded:
             report = _bench_cuda(
                 model_key,
                 model_path,
@@ -619,7 +624,7 @@ def _run_bench(
     report = run_cache_reuse_probe(
         kernel_cache_volume, _workload_name(model_key, protocol), workload
     )
-    cache = report["kernel_cache"]
+    cache = cast(KernelCacheVerification, report["kernel_cache"])
     if (
         cache["cache_hit"] is not True
         or cache["stable_artifact_changes"]
@@ -639,7 +644,7 @@ def cache_checkpoint(model_key: str) -> dict[str, object]:
     cpu=16,
     memory=256 * 1024,
     timeout=4 * 60 * 60,
-    **single_use_options,
+    single_use_containers=True,
 )
 def run_model(
     model_key: str,
@@ -670,14 +675,14 @@ def run_model(
     cpu=16,
     memory=256 * 1024,
     timeout=12 * 60 * 60,
-    **single_use_options,
+    single_use_containers=True,
 )
 def bench_model(
     model_key: str,
     cache_mode: str = "prewarm",
     prompt_tokens: int = 8192,
     max_new_tokens: int = 256,
-    batch_sizes: tuple[int, ...] = (1, 2, 8, 16, 32),
+    batch_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
     context_length: int = 32768,
     schedule_conservativeness: float = 1.0,
 ) -> dict[str, object]:

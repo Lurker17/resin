@@ -14,7 +14,7 @@ mod runner;
 mod state_pool;
 
 use cache::{CacheGroupLayout, CacheGroupPlan, CacheLayout};
-use planning::{build_plan_for_engine, schedule_ready_prefix_for_layout};
+use planning::{build_plan_for_engine, schedule_ready_prefix};
 use resin_core::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
 use resin_core::resources::paged_kv::{PagedKvError, PagedKvResources};
 use resin_core::resources::slots::SlotHandle as CoreStateHandle;
@@ -22,8 +22,8 @@ use resin_core::resources::{RequestResourceRef, ResourceSet, WithResources};
 use resin_core::{Phase, RequestId, Schedulable, Scheduler, SequenceStep};
 use runner::{
     RunnerExecution, bind_runner_resources, resolve_runner_contract,
-    resolve_runner_prefill_chunk_size, resolve_runner_resources, runner_error_is_post_accept,
-    runner_supports_continuation_prefill,
+    resolve_runner_max_batch_tokens, resolve_runner_prefill_chunk_size, resolve_runner_resources,
+    runner_error_is_post_accept, runner_supports_continuation_prefill,
 };
 use state_pool::{
     PreparedStateAccessLease, StateAccessClaim, StateAccessLease, StateAccessMode, StateHandle,
@@ -146,12 +146,21 @@ impl BatchPhase {
 }
 
 impl SchedulerConfig {
-    fn with_runner_prefill_limit(self, runner_limit: Option<NonZeroU32>) -> Self {
-        let Some(runner_limit) = runner_limit else {
-            return self;
+    fn with_runner_limits(
+        self,
+        runner_prefill_limit: Option<NonZeroU32>,
+        runner_batch_limit: Option<NonZeroU32>,
+    ) -> Self {
+        let prefill_chunk_size = runner_prefill_limit.map_or(self.prefill_chunk_size, |limit| {
+            self.prefill_chunk_size.min(limit)
+        });
+        let max_batch_tokens = match (self.max_batch_tokens, runner_batch_limit) {
+            (Some(configured), Some(limit)) => Some(configured.min(limit)),
+            (configured, limit) => configured.or(limit),
         };
         Self {
-            prefill_chunk_size: self.prefill_chunk_size.min(runner_limit),
+            max_batch_tokens,
+            prefill_chunk_size,
             ..self
         }
     }
@@ -1010,6 +1019,7 @@ struct Engine {
     runner_execution: RunnerExecution,
     runner_release: Option<Py<PyAny>>,
     runner_prefill_chunk_size: Option<NonZeroU32>,
+    runner_max_batch_tokens: Option<NonZeroU32>,
     scheduler: Scheduler<Request>,
     scheduler_config: SchedulerConfig,
     new_token_ratio: f64,
@@ -1089,6 +1099,7 @@ impl Engine {
             (new_token_ratio - minimum_new_token_ratio) / NEW_TOKEN_RATIO_DECAY_STEPS;
         let (runner_execution, runner_release) = resolve_runner_contract(py, runner.bind(py))?;
         let runner_prefill_chunk_size = resolve_runner_prefill_chunk_size(py, runner.bind(py))?;
+        let runner_max_batch_tokens = resolve_runner_max_batch_tokens(py, runner.bind(py))?;
 
         let runner_resources = resolve_runner_resources(py, runner.bind(py), state_pool.as_ref())?;
         let kv_resources = runner_resources
@@ -1115,6 +1126,7 @@ impl Engine {
             runner_execution,
             runner_release,
             runner_prefill_chunk_size,
+            runner_max_batch_tokens,
             scheduler: Scheduler::new(
                 NonZeroUsize::new(max_running_requests).expect("validated positive batch limit"),
             ),
@@ -1316,11 +1328,12 @@ impl Engine {
             debug_assert_ne!(compatible, 0);
             selected_requests.truncate(compatible);
             selection.truncate(compatible);
-            let scheduled_rows = schedule_ready_prefix_for_layout(
+            let scheduled_rows = schedule_ready_prefix(
                 &selected_requests,
-                self.scheduler_config
-                    .with_runner_prefill_limit(self.runner_prefill_chunk_size),
-                self.cache_layout.as_ref(),
+                self.scheduler_config.with_runner_limits(
+                    self.runner_prefill_chunk_size,
+                    self.runner_max_batch_tokens,
+                ),
             )?;
             if scheduled_rows.is_empty() {
                 return Err(PyRuntimeError::new_err(
@@ -2632,9 +2645,7 @@ mod tests {
         );
         managed.resident_tokens = 8;
         let scheduled = [&managed];
-        let rows =
-            schedule_ready_prefix_for_layout(&scheduled, SchedulerConfig::default(), Some(&layout))
-                .unwrap();
+        let rows = schedule_ready_prefix(&scheduled, SchedulerConfig::default()).unwrap();
         assert_eq!(rows[0].token_start(), 8);
         assert_eq!(rows[0].token_count().get(), 4);
 
@@ -2664,17 +2675,14 @@ mod tests {
     }
 
     #[test]
-    fn window_prefill_never_crosses_a_logical_block_boundary() {
-        let layout = window_layout();
+    fn window_prefill_can_cross_logical_block_boundaries() {
         let mut first = request(1, &[1, 2, 3, 4, 5, 6], &[], None);
         first.resident_tokens = 3;
         let second = request(2, &[7, 8, 9, 10, 11, 12], &[], None);
         let scheduled = [&first, &second];
-        let rows =
-            schedule_ready_prefix_for_layout(&scheduled, SchedulerConfig::default(), Some(&layout))
-                .unwrap();
-        assert_eq!(rows[0].token_count().get(), 1);
-        assert_eq!(rows[1].token_count().get(), 4);
+        let rows = schedule_ready_prefix(&scheduled, SchedulerConfig::default()).unwrap();
+        assert_eq!(rows[0].token_count().get(), 3);
+        assert_eq!(rows[1].token_count().get(), 6);
     }
 
     #[test]

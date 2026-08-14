@@ -88,6 +88,50 @@ class SchedulerConfigContractTests(unittest.TestCase):
         self.assertFalse(request.done)
         engine.close()
 
+    def test_runner_batch_limit_is_consumed_in_request_order(self) -> None:
+        class LimitedRunner(ContinuationRecordingRunner):
+            prefill_chunk_size = 8192
+            max_batch_tokens = 4
+
+        runner = LimitedRunner()
+        engine = Engine(runner, max_running_requests=2)
+        first = engine.submit([1, 2, 3, 4], 1)
+        second = engine.submit([5, 6, 7, 8], 1)
+
+        engine.step()
+
+        self.assertEqual(runner.plans[0].sequence_ids, [first])
+        self.assertEqual(runner.plans[0].sequence_indptr, [0, 4])
+        self.assertTrue(first.done)
+        self.assertFalse(second.done)
+        engine.close()
+
+    def test_window_prefill_spans_multiple_pages_by_default(self) -> None:
+        layout = CacheLayout(
+            8,
+            [CacheGroupLayout(2, retention="window", window_tokens=8)],
+        )
+
+        class MultiPageRunner(ContinuationRecordingRunner):
+            prefill_chunk_size = 8
+            max_batch_tokens = 8
+            cache_layout = layout
+
+            def bind_cache_pool(self, pool_id, bound_layout):
+                self.bound_layout = bound_layout
+                return pool_id
+
+        runner = MultiPageRunner()
+        engine = Engine(runner)
+        request = engine.submit([1, 2, 3, 4, 5, 6], 1)
+
+        events = engine.step()
+
+        self.assertEqual(runner.plans[0].token_ids, [1, 2, 3, 4, 5, 6])
+        self.assertEqual([event.request_id for event in events], [request])
+        self.assertTrue(request.done)
+        engine.close()
+
     def test_config_is_frozen_keyword_only_and_validated(self) -> None:
         default = SchedulerConfig()
         self.assertEqual(
@@ -113,8 +157,12 @@ class SchedulerConfigContractTests(unittest.TestCase):
             ):
                 SchedulerConfig(**{field: 0})
         for value in (-0.1, float("inf"), float("nan")):
-            with self.subTest(value=value), self.assertRaisesRegex(
-                ValueError, "schedule_conservativeness must be finite and non-negative"
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "schedule_conservativeness must be finite and non-negative",
+                ),
             ):
                 SchedulerConfig(schedule_conservativeness=value)
         aggressive = SchedulerConfig(schedule_conservativeness=0.0)
@@ -203,6 +251,7 @@ class SchedulerConfigContractTests(unittest.TestCase):
         from resin.models.lfm2.reference import Lfm2TorchRunner
 
         self.assertIs(GptOssCudaRunner.supports_continuation_prefill, True)
+        self.assertEqual(GptOssCudaRunner.max_batch_tokens, 8192)
         self.assertIs(Lfm2CudaRunner.supports_continuation_prefill, True)
         self.assertIs(Lfm2TorchRunner.supports_continuation_prefill, True)
         self.assertIs(GptOssRunner.supports_continuation_prefill, True)

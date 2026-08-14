@@ -12,8 +12,9 @@ import os
 import socket
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from blake3 import blake3
 
@@ -273,8 +274,8 @@ def _cache_report(
 
 
 def _reload_and_prepare(volume) -> None:
-    # Cache paths are read at import time by the GPU packages. Callers invoke
-    # these helpers before importing torch, FlashInfer, FA4, or Triton.
+    # The image installs cache environment variables before importing GPU
+    # packages; this prepares the mounted directories before any runtime JIT.
     global _CACHE_PREPARED
     if not _CACHE_PREPARED:
         volume.reload()
@@ -312,6 +313,36 @@ def install_flashinfer_hash_cache() -> None:
         _KERNEL_ARTIFACT_CACHE,
         durable_artifact_resolver=_flashinfer_durable_artifact,
     )
+
+
+@contextmanager
+def flashinfer_autotune_context(
+    path: Path,
+    *,
+    tune_missing: bool,
+    tuning_buckets: tuple[int, ...],
+) -> Iterator[bool | None]:
+    """Load saved tactics and scope FlashInfer autotuning after cache setup."""
+
+    # This import must remain after ``install_flashinfer_hash_cache`` so a
+    # runtime JIT cannot observe FlashInfer's unwrapped build entrypoint.
+    import flashinfer
+    from flashinfer.autotuner import AutoTuner
+
+    cache_loaded = None
+    if path.exists():
+        cache_loaded = bool(AutoTuner.get().load_configs(str(path)))
+        if not cache_loaded:
+            raise RuntimeError(f"FlashInfer rejected its saved tactics: {path}")
+    elif not tune_missing:
+        raise RuntimeError("saved FlashInfer tactics are absent; prewarm first")
+    with flashinfer.autotune(
+        tune_missing,
+        cache=str(path) if tune_missing else None,
+        tuning_buckets=tuning_buckets,
+        round_up=True,
+    ):
+        yield cache_loaded
 
 
 def _flashinfer_durable_artifact(spec) -> Path:

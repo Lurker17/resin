@@ -42,13 +42,9 @@ impl std::error::Error for PlanningError {}
 
 /// Choose the token range for each request in the current dispatch.
 ///
-/// Sliding-window block widths are supplied separately because a prefill step
-/// cannot cross a physical reuse boundary. Full-history and recurrent state do
-/// not impose a token boundary here.
 pub fn schedule_ready_prefix(
     requests: &[RequestProgress],
     config: PlanningConfig,
-    sliding_window_block_tokens: &[NonZeroU32],
 ) -> Result<Vec<SequenceStep>, PlanningError> {
     let Some(first) = requests.first() else {
         return Ok(Vec::new());
@@ -63,7 +59,7 @@ pub fn schedule_ready_prefix(
         if remaining_batch_tokens == Some(0) {
             break;
         }
-        let mut desired = match request.phase {
+        let desired = match request.phase {
             Phase::Prefill => request
                 .prefill_length
                 .checked_sub(request.logical_context)
@@ -72,13 +68,6 @@ pub fn schedule_ready_prefix(
                 .min(config.prefill_chunk_size.get()),
             Phase::Decode => 1,
         };
-        if request.phase == Phase::Prefill {
-            for block_tokens in sliding_window_block_tokens {
-                let until_boundary =
-                    block_tokens.get() - request.logical_context % block_tokens.get();
-                desired = desired.min(until_boundary);
-            }
-        }
         let count = remaining_batch_tokens.map_or(desired, |budget| desired.min(budget));
         let count = NonZeroU32::new(count).expect("positive request work and budget");
         let end = request
@@ -124,7 +113,6 @@ mod tests {
                 max_batch_tokens: NonZeroU32::new(3),
                 prefill_chunk_size: NonZeroU32::new(2).unwrap(),
             },
-            &[],
         )
         .unwrap();
         assert_eq!(steps.len(), 2);
@@ -135,17 +123,31 @@ mod tests {
     }
 
     #[test]
-    fn sliding_prefill_stops_at_each_reuse_boundary() {
+    fn token_budget_is_consumed_in_request_order() {
+        let steps = schedule_ready_prefix(
+            &[prefill(4, 0), prefill(4, 0)],
+            PlanningConfig {
+                max_batch_tokens: NonZeroU32::new(4),
+                prefill_chunk_size: NonZeroU32::new(8).unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].tokens.count.get(), 4);
+        assert!(steps[0].sample);
+    }
+
+    #[test]
+    fn prefills_are_not_limited_by_cache_page_boundaries() {
         let steps = schedule_ready_prefix(
             &[prefill(100, 30)],
             PlanningConfig {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(50).unwrap(),
             },
-            &[NonZeroU32::new(16).unwrap(), NonZeroU32::new(12).unwrap()],
         )
         .unwrap();
-        assert_eq!(steps[0].tokens.count.get(), 2);
+        assert_eq!(steps[0].tokens.count.get(), 50);
     }
 
     #[test]
@@ -161,7 +163,6 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(8).unwrap(),
             },
-            &[],
         )
         .unwrap();
         assert_eq!(steps[0].token_end(), Some(6));
@@ -183,7 +184,6 @@ mod tests {
                     max_batch_tokens: None,
                     prefill_chunk_size: NonZeroU32::new(4).unwrap(),
                 },
-                &[],
             ),
             Err(PlanningError::MixedPhases)
         );

@@ -105,26 +105,43 @@ pub(super) fn runner_supports_continuation_prefill(
     }
 }
 
-pub(super) fn resolve_runner_prefill_chunk_size(
+fn resolve_runner_positive_u32(
     py: Python<'_>,
     runner: &Bound<'_, PyAny>,
+    name: &str,
 ) -> PyResult<Option<std::num::NonZeroU32>> {
-    let declared = match runner.getattr("prefill_chunk_size") {
+    let declared = match runner.getattr(name) {
         Ok(value) => value,
         Err(error) if error.is_instance_of::<PyAttributeError>(py) => return Ok(None),
         Err(error) => return Err(error),
     };
     if !declared.is_exact_instance_of::<PyInt>() {
-        return Err(PyTypeError::new_err(
-            "runner.prefill_chunk_size must be exactly a positive int",
-        ));
+        return Err(PyTypeError::new_err(format!(
+            "runner.{name} must be exactly a positive int"
+        )));
     }
     let value = declared.extract::<u32>().map_err(|_| {
-        PyValueError::new_err("runner.prefill_chunk_size must fit in unsigned 32-bit metadata")
+        PyValueError::new_err(format!(
+            "runner.{name} must fit in unsigned 32-bit metadata"
+        ))
     })?;
     std::num::NonZeroU32::new(value)
-        .ok_or_else(|| PyValueError::new_err("runner.prefill_chunk_size must be positive"))
+        .ok_or_else(|| PyValueError::new_err(format!("runner.{name} must be positive")))
         .map(Some)
+}
+
+pub(super) fn resolve_runner_prefill_chunk_size(
+    py: Python<'_>,
+    runner: &Bound<'_, PyAny>,
+) -> PyResult<Option<std::num::NonZeroU32>> {
+    resolve_runner_positive_u32(py, runner, "prefill_chunk_size")
+}
+
+pub(super) fn resolve_runner_max_batch_tokens(
+    py: Python<'_>,
+    runner: &Bound<'_, PyAny>,
+) -> PyResult<Option<std::num::NonZeroU32>> {
+    resolve_runner_positive_u32(py, runner, "max_batch_tokens")
 }
 
 fn resolve_runner_cache_layout(

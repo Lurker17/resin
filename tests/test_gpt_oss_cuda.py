@@ -12,8 +12,13 @@ from resin.backend.sampling import GreedySampler
 from resin.models.gpt_oss.cuda import (
     GptOssCudaRunner,
     _invoke_fa4_b22,
+    plan_gpt_oss_kv_capacity,
 )
-from resin.models.gpt_oss.plan import build_attention_batches
+from resin.models.gpt_oss.plan import (
+    PREFILL_CHUNK_SIZE,
+    WINDOW_TABLE_WIDTH,
+    build_attention_batches,
+)
 
 
 def _group_plan(group_index, rows, first_logical_blocks, positions, indptr):
@@ -63,14 +68,14 @@ def _flat_plan(
         last_block = (post_length - 1) // 128
         history_rows.append(
             tuple(
-                1 + sequence_index * 16 + logical for logical in range(last_block + 1)
+                1 + sequence_index * 128 + logical for logical in range(last_block + 1)
             )
         )
-        first = max(0, last_block - 1)
+        first = max(0, last_block + 1 - WINDOW_TABLE_WIDTH)
         window_first.append(first)
         window_rows.append(
             tuple(
-                129 + sequence_index * 16 + logical % 2
+                1025 + sequence_index * 128 + logical % WINDOW_TABLE_WIDTH
                 for logical in range(first, last_block + 1)
             )
         )
@@ -132,13 +137,46 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         source = inspect.getsource(GptOssCudaRunner)
         self.assertIn("cuda_graph_decode_shapes", parameters)
         self.assertTrue(hasattr(GptOssCudaRunner, "cuda_graph_stats"))
+        self.assertTrue(hasattr(GptOssCudaRunner, "capture_cuda_graphs"))
         self.assertIn("CudaGraphCache(", source)
         self.assertNotIn("CUDAGraph", source)
         self.assertNotIn(".replay()", source)
 
+    def test_graph_capture_inputs_use_only_the_reserved_null_page(self) -> None:
+        inputs = GptOssCudaRunner._graph_capture_inputs((2, 4))
+
+        self.assertEqual(inputs["token_indices"], (0, 1))
+        self.assertEqual(inputs["sequence_indices"], (0, 1))
+        self.assertEqual(inputs["full_page_table"], (0,) * 8)
+        self.assertEqual(inputs["sliding_page_table"], (0,) * (2 * WINDOW_TABLE_WIDTH))
+        self.assertEqual(inputs["full_append_slots"], (0, 0))
+        self.assertEqual(inputs["sliding_append_slots"], (0, 0))
+
+    def test_kv_capacity_plan_uses_static_fraction_and_swa_ratio(self) -> None:
+        gib = 1024**3
+        plan = plan_gpt_oss_kv_capacity(
+            100 * gib,
+            55 * gib,
+            0.75,
+            swa_full_tokens_ratio=0.8,
+        )
+
+        self.assertEqual(plan.static_memory_bytes, 75 * gib)
+        self.assertEqual(plan.kv_budget_bytes, 20 * gib)
+        self.assertEqual(plan.bytes_per_parent, 4_718_592)
+        self.assertEqual(plan.parent_capacity, 4_550)
+        self.assertEqual(
+            plan.full_parent_target + plan.swa_parent_target,
+            plan.parent_capacity,
+        )
+        self.assertEqual(plan.full_token_target, plan.full_parent_target * 128)
+        self.assertEqual(plan.swa_token_target, plan.swa_parent_target * 128)
+
     def test_runner_exposes_only_the_flat_grouped_cache_path(self) -> None:
         source = inspect.getsource(GptOssCudaRunner)
         self.assertIs(GptOssCudaRunner.supports_continuation_prefill, True)
+        self.assertEqual(GptOssCudaRunner.prefill_chunk_size, 8192)
+        self.assertEqual(GptOssCudaRunner.max_batch_tokens, 8192)
         self.assertIn("bind_cache_pool", source)
         self.assertIn("CacheGroupLayout(_PAGE_SIZE)", source)
         self.assertIn('retention="window"', source)
@@ -180,14 +218,21 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         self.assertEqual(batch.token_indices[:3], (0, 1, 2))
         self.assertEqual(batch.token_indices[-3:], (130, 131, 132))
         self.assertEqual(batch.full_width, 2)
-        self.assertEqual(batch.full_table, (1, 1, 17, 18))
+        self.assertEqual(batch.full_table, (1, 1, 129, 130))
         self.assertEqual(batch.full_lengths, (128, 135))
-        self.assertEqual(batch.sliding_width, 2)
-        self.assertEqual(batch.sliding_table, (129, 129, 145, 146))
+        self.assertEqual(batch.sliding_width, WINDOW_TABLE_WIDTH)
+        self.assertEqual(
+            batch.sliding_table[:WINDOW_TABLE_WIDTH],
+            (1025,) * WINDOW_TABLE_WIDTH,
+        )
+        self.assertEqual(
+            batch.sliding_table[WINDOW_TABLE_WIDTH : WINDOW_TABLE_WIDTH + 2],
+            (1153, 1154),
+        )
         self.assertEqual(batch.sliding_lengths, (128, 135))
         self.assertEqual(batch.full_append_slots[0], 128)
-        self.assertEqual(batch.full_append_slots[-1], 18 * 128 + 6)
-        self.assertEqual(batch.sliding_append_slots[-1], 146 * 128 + 6)
+        self.assertEqual(batch.full_append_slots[-1], 130 * 128 + 6)
+        self.assertEqual(batch.sliding_append_slots[-1], 1154 * 128 + 6)
 
     def test_one_token_continuation_remains_explicit_prefill(self) -> None:
         plan = _flat_plan([260], [1])
@@ -200,15 +245,15 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         self.assertEqual(batch.token_indices, (0,))
         self.assertEqual(batch.full_table, (1, 2, 3))
         self.assertEqual(batch.full_lengths, (261,))
-        self.assertEqual(batch.sliding_table, (130, 129))
-        self.assertEqual(batch.sliding_lengths, (133,))
+        self.assertEqual(batch.sliding_table[:3], (1025, 1026, 1027))
+        self.assertEqual(batch.sliding_lengths, (261,))
 
     def test_graph_padding_repeats_only_pages_owned_by_each_row(self) -> None:
         _, batch = build_attention_batches(_decode_plan())
         assert batch is not None
         self.assertEqual(
             GptOssCudaRunner._pad_page_table(batch, 4),
-            (1, 2, 1, 1, 17, 18, 19, 17),
+            (1, 2, 1, 1, 129, 130, 131, 129),
         )
 
     def test_decode_tables_and_append_slots_come_from_sparse_groups(self) -> None:
@@ -219,15 +264,19 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         self.assertEqual(batch.sequence_indices, (0, 1))
         self.assertEqual(batch.query_lengths, (1, 1))
         self.assertEqual(batch.full_width, 3)
-        self.assertEqual(batch.full_table, (1, 2, 1, 17, 18, 19))
+        self.assertEqual(batch.full_table, (1, 2, 1, 129, 130, 131))
         self.assertEqual(batch.full_lengths, (131, 261))
-        self.assertEqual(batch.sliding_table, (129, 130, 146, 145))
-        self.assertEqual(batch.sliding_lengths, (131, 133))
-        self.assertEqual(batch.full_append_slots, (2 * 128 + 2, 19 * 128 + 4))
+        self.assertEqual(batch.sliding_table[:3], (1025, 1026, 1025))
+        self.assertEqual(
+            batch.sliding_table[WINDOW_TABLE_WIDTH : WINDOW_TABLE_WIDTH + 3],
+            (1153, 1154, 1155),
+        )
+        self.assertEqual(batch.sliding_lengths, (131, 261))
         self.assertEqual(
             batch.sliding_append_slots,
-            (130 * 128 + 2, 145 * 128 + 4),
+            (1026 * 128 + 2, 1155 * 128 + 4),
         )
+        self.assertEqual(batch.full_append_slots, (2 * 128 + 2, 131 * 128 + 4))
 
     def test_frozen_append_destinations_are_a_validation_oracle(self) -> None:
         plan = _prefill_plan()
@@ -241,7 +290,7 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ordered"):
             build_attention_batches(plan)
 
-        plan = _flat_plan([260], [1])
+        plan = _flat_plan([9000], [1])
         plan.cache_groups[1].first_logical_blocks[0] = 0
         with self.assertRaisesRegex(ValueError, "active suffix"):
             build_attention_batches(plan)
@@ -256,10 +305,17 @@ class GptOssCudaNativePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside"):
             build_attention_batches(plan, parent_capacity=64)
 
-    def test_window_prefill_boundary_is_validated_before_device_work(self) -> None:
-        plan = _flat_plan([127], [2])
-        with self.assertRaisesRegex(ValueError, "within one logical"):
-            build_attention_batches(plan)
+    def test_multi_page_prefill_is_validated_before_device_work(self) -> None:
+        prefill, decode = build_attention_batches(_flat_plan([0], [PREFILL_CHUNK_SIZE]))
+
+        self.assertIsNone(decode)
+        self.assertEqual(prefill[0].query_lengths, (PREFILL_CHUNK_SIZE,))
+        self.assertEqual(prefill[0].full_width, PREFILL_CHUNK_SIZE // 128)
+        self.assertEqual(prefill[0].sliding_width, WINDOW_TABLE_WIDTH)
+        self.assertEqual(len(set(prefill[0].sliding_append_slots)), PREFILL_CHUNK_SIZE)
+
+        with self.assertRaisesRegex(ValueError, "exceeds 8192"):
+            build_attention_batches(_flat_plan([0], [PREFILL_CHUNK_SIZE + 1]))
 
     def test_failed_eager_work_must_quiesce_or_be_post_accept(self) -> None:
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)

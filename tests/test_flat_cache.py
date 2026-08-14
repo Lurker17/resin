@@ -284,34 +284,24 @@ class FlatCacheEngineTests(unittest.TestCase):
         self,
     ) -> None:
         layout = CacheLayout(
-            2,
-            [CacheGroupLayout(4, retention="window", window_tokens=4)],
+            4,
+            [CacheGroupLayout(4, retention="window", window_tokens=12)],
         )
         runner = RecordingCachedRunner(layout)
         engine = Engine(runner)
         engine.submit(list(range(12)), max_new_tokens=1)
 
-        self.assertEqual(engine.step(), [])
-        first = runner.plans[-1].cache_groups[0]
-        self.assertEqual(first.first_logical_blocks, [0])
-        self.assertEqual(len(first.block_ids), 1)
-        self.assertEqual(first.append_block_ids, [first.block_ids[0]] * 4)
-
-        self.assertEqual(engine.step(), [])
-        second = runner.plans[-1].cache_groups[0]
-        self.assertEqual(second.first_logical_blocks, [0])
-        self.assertEqual(len(second.block_ids), 2)
-        self.assertEqual(second.block_ids[0], first.block_ids[0])
-        self.assertEqual(second.append_block_ids, [second.block_ids[1]] * 4)
-
         events = engine.step()
         self.assertEqual(len(events), 1)
-        third = runner.plans[-1].cache_groups[0]
-        self.assertEqual(third.first_logical_blocks, [1])
-        self.assertEqual(third.block_ids, [second.block_ids[1], second.block_ids[0]])
-        self.assertEqual(third.append_block_ids, [second.block_ids[0]] * 4)
+        prefill = runner.plans[-1].cache_groups[0]
+        self.assertEqual(prefill.first_logical_blocks, [0])
+        self.assertEqual(len(prefill.block_ids), 3)
+        self.assertEqual(
+            prefill.append_block_ids,
+            [page for page in prefill.block_ids for _ in range(4)],
+        )
         self.assertEqual(engine.cache_occupied_block_count, 0)
-        self.assertEqual(engine.cache_free_parent_count, 2)
+        self.assertEqual(engine.cache_free_parent_count, 4)
 
 
 if __name__ == "__main__":

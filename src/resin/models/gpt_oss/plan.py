@@ -8,8 +8,12 @@ from resin import BatchPhase
 
 PAGE_SIZE = 128
 SLIDING_WINDOW = 128
-PREFILL_CHUNK_SIZE = 128
-WINDOW_TABLE_WIDTH = 2
+PREFILL_CHUNK_SIZE = 8192
+# Paged prefill must keep the whole query plus the preceding attention window
+# resident until the forward finishes. Decode still attends to only
+# ``SLIDING_WINDOW`` tokens; this wider physical suffix permits one 8K prefill.
+WINDOW_RETENTION_TOKENS = PREFILL_CHUNK_SIZE + SLIDING_WINDOW - 1
+WINDOW_TABLE_WIDTH = 1 + (WINDOW_RETENTION_TOKENS - 1 + PAGE_SIZE - 1) // PAGE_SIZE
 
 
 def _integers(name: str, values, *, positive: bool = False) -> tuple[int, ...]:
@@ -204,8 +208,10 @@ def build_attention_batches(
                 ):
                     raise ValueError("cache append destinations do not match the row")
         if plan.phase == BatchPhase.PREFILL:
-            if query_length > PREFILL_CHUNK_SIZE or context // PAGE_SIZE != last_block:
-                raise ValueError("Window prefill must remain within one logical page")
+            if query_length > PREFILL_CHUNK_SIZE:
+                raise ValueError(
+                    f"prefill query length exceeds {PREFILL_CHUNK_SIZE} tokens"
+                )
         elif query_length != 1:
             raise ValueError("decode rows must contain one token")
 

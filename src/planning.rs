@@ -1,7 +1,7 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::cache::{CacheGroupPlan, CacheLayout, CacheRetention};
+use crate::cache::CacheGroupPlan;
 use crate::{BatchPhase, BatchPlan, Request, ScheduledRow, SchedulerConfig};
 use resin_core::resources::paged_kv::PagedKvBatchView;
 use resin_core::{
@@ -25,18 +25,9 @@ impl RequestLike for &Request {
     }
 }
 
-#[cfg(test)]
 pub(super) fn schedule_ready_prefix<R: RequestLike>(
     scheduled: &[R],
     config: SchedulerConfig,
-) -> PyResult<Vec<ScheduledRow>> {
-    schedule_ready_prefix_for_layout(scheduled, config, None)
-}
-
-pub(super) fn schedule_ready_prefix_for_layout<R: RequestLike>(
-    scheduled: &[R],
-    config: SchedulerConfig,
-    layout: Option<&CacheLayout>,
 ) -> PyResult<Vec<ScheduledRow>> {
     let requests = scheduled
         .iter()
@@ -50,21 +41,12 @@ pub(super) fn schedule_ready_prefix_for_layout<R: RequestLike>(
             })
         })
         .collect::<PyResult<Vec<_>>>()?;
-    let sliding_window_block_tokens = layout
-        .into_iter()
-        .flat_map(CacheLayout::groups_native)
-        .filter_map(|group| {
-            matches!(group.retention(), CacheRetention::SlidingWindow { .. })
-                .then_some(group.block_tokens())
-        })
-        .collect::<Vec<_>>();
     schedule_core_ready_prefix(
         &requests,
         PlanningConfig {
             max_batch_tokens: config.max_batch_tokens,
             prefill_chunk_size: config.prefill_chunk_size,
         },
-        &sliding_window_block_tokens,
     )
     .map_err(|error| match error {
         PlanningError::TokenRangeOverflow => PyValueError::new_err(error.to_string()),

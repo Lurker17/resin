@@ -9,8 +9,6 @@ use resin_core::resources::kv::{
     KvGroupLayout, KvGroupPlan, KvLayout, KvLayoutError, KvPlanError, KvRetention,
 };
 
-pub(crate) use resin_core::resources::kv::KvRetention as CacheRetention;
-
 fn layout_error(error: KvLayoutError) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
@@ -170,6 +168,7 @@ impl CacheLayout {
         &self.inner
     }
 
+    #[cfg(test)]
     pub(crate) fn groups_native(&self) -> &[KvGroupLayout] {
         self.inner.groups()
     }
