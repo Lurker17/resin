@@ -895,8 +895,7 @@ class Attention(nn.Module):
         # o
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        # NOTE: wo_a is FP8 in checkpoint; could do FP8 einsum here for better perf,
-        # but using BF16 for simplicity.
+        # BF16 einsum is faster than the available tiny-M grouped FP8 paths.
         o = grouped_bf16_linear(o, wo_a)
         x = self.wo_b(o.flatten(2))
         return x
