@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import TypeAlias
+from typing import Annotated, TypeAlias
 
 import cuda.tile as ct
 import torch
@@ -12,22 +12,28 @@ from torch.nn import functional as F
 
 _ConstantInt: TypeAlias = ct.Constant[int]
 _ConstantBool: TypeAlias = ct.Constant[bool]
+_StaticLastDim: TypeAlias = Annotated[
+    ct.Array,
+    ct.ArrayAnnotation(static_shape_dims=(-1,)),
+]
+_StaticLastTwoDims: TypeAlias = Annotated[
+    ct.Array,
+    ct.ArrayAnnotation(static_shape_dims=(-2, -1)),
+]
 _NEGATIVE = -3.402823466e38
 
 
 @ct.kernel
 def _top6_sqrt_softplus_kernel(
-    logits,
-    bias,
-    expert_indices,
-    expert_weights,
+    logits: _StaticLastDim,
+    bias: _StaticLastDim,
+    expert_indices: _StaticLastDim,
+    expert_weights: _StaticLastDim,
     route_scale,
     num_experts: _ConstantInt,
 ):
     row = ct.bid(0)
-    logits_tile = ct.load(logits, (row, 0), shape=(1, num_experts)).astype(
-        ct.float32
-    )
+    logits_tile = ct.load(logits, (row, 0), shape=(1, num_experts)).astype(ct.float32)
     bias_tile = ct.load(bias, (0,), shape=(num_experts,)).reshape((1, num_experts))
     stable_softplus = ct.maximum(logits_tile, 0.0) + ct.log(
         1.0 + ct.exp(-ct.abs(logits_tile))
@@ -100,12 +106,8 @@ def top6_sqrt_softplus(
         raise ValueError("the optimized routing expert count must be a power of two")
     if bias.shape != (num_experts,):
         raise ValueError("DeepSeek-V4 routing bias must match the expert count")
-    expert_indices = torch.empty(
-        (rows, 6), dtype=torch.int32, device=logits.device
-    )
-    expert_weights = torch.empty(
-        (rows, 6), dtype=torch.float32, device=logits.device
-    )
+    expert_indices = torch.empty((rows, 6), dtype=torch.int32, device=logits.device)
+    expert_weights = torch.empty((rows, 6), dtype=torch.float32, device=logits.device)
     ct.launch(
         torch.cuda.current_stream(logits.device),
         (rows,),
@@ -116,7 +118,12 @@ def top6_sqrt_softplus(
 
 
 @ct.kernel
-def _fp8_quantize_kernel(source, output, scales, width: _ConstantInt):
+def _fp8_quantize_kernel(
+    source: _StaticLastDim,
+    output: _StaticLastDim,
+    scales: _StaticLastDim,
+    width: _ConstantInt,
+):
     row = ct.bid(0)
     group = ct.bid(1)
     values = ct.load(source, (row, group), shape=(1, 128)).astype(ct.float32)
@@ -134,7 +141,7 @@ def _fp8_quantize_kernel(source, output, scales, width: _ConstantInt):
 
 
 @ct.kernel
-def _fp8_simulate_kernel(values, width: _ConstantInt):
+def _fp8_simulate_kernel(values: _StaticLastDim, width: _ConstantInt):
     row = ct.bid(0)
     group = ct.bid(1)
     tile = ct.load(values, (row, group), shape=(1, 64)).astype(ct.float32)
@@ -151,7 +158,7 @@ def _fp8_simulate_kernel(values, width: _ConstantInt):
 
 
 @ct.kernel
-def _fp4_simulate_kernel(values, width: _ConstantInt):
+def _fp4_simulate_kernel(values: _StaticLastDim, width: _ConstantInt):
     row = ct.bid(0)
     group = ct.bid(1)
     tile = ct.load(values, (row, group), shape=(1, 32)).astype(ct.float32)
@@ -231,11 +238,11 @@ def fp4_act_quant(values: Tensor, block_size: int = 32, inplace: bool = False):
 
 @ct.kernel
 def _qk_norm_rope_store_kernel(
-    query,
-    key_value,
-    norm_weight,
-    frequencies,
-    cache,
+    query: _StaticLastTwoDims,
+    key_value: _StaticLastDim,
+    norm_weight: _StaticLastDim,
+    frequencies: _StaticLastTwoDims,
+    cache: _StaticLastTwoDims,
     position,
     heads: _ConstantInt,
     dimension: _ConstantInt,
@@ -364,11 +371,11 @@ def qk_norm_rope_store(
 
 @ct.kernel
 def _compress_state_pool_kernel(
-    values,
-    gates,
-    ape,
-    value_state,
-    score_state,
+    values: _StaticLastDim,
+    gates: _StaticLastDim,
+    ape: _StaticLastDim,
+    value_state: _StaticLastDim,
+    score_state: _StaticLastDim,
     position,
     ratio: _ConstantInt,
     dimension: _ConstantInt,
@@ -452,10 +459,10 @@ def _compress_state_pool_kernel(
 
 @ct.kernel
 def _compress_finalize_kernel(
-    values,
-    norm_weight,
-    frequencies,
-    cache,
+    values: _StaticLastDim,
+    norm_weight: _StaticLastDim,
+    frequencies: _StaticLastTwoDims,
+    cache: _StaticLastDim,
     position,
     ratio: _ConstantInt,
     dimension: _ConstantInt,
@@ -604,11 +611,11 @@ def compress_decode(
 
 @ct.kernel(occupancy=2)
 def _sparse_attention_kernel(
-    query,
-    key_value,
-    sinks,
+    query: _StaticLastTwoDims,
+    key_value: _StaticLastDim,
+    sinks: _StaticLastDim,
     indices,
-    output,
+    output: _StaticLastTwoDims,
     heads: _ConstantInt,
     dimension: _ConstantInt,
     index_width: _ConstantInt,
@@ -691,7 +698,13 @@ def sparse_attn(
 
 
 @ct.kernel
-def _hc_post_mix_kernel(values, residual, post, combination, output):
+def _hc_post_mix_kernel(
+    values: _StaticLastDim,
+    residual: _StaticLastDim,
+    post: _StaticLastDim,
+    combination: _StaticLastDim,
+    output: _StaticLastDim,
+):
     row = ct.bid(0)
     branch = ct.bid(1)
     block = ct.bid(2)
@@ -735,8 +748,8 @@ def hc_post_mix(
 
 @ct.kernel
 def _hadamard_kernel(
-    source,
-    output,
+    source: _StaticLastDim,
+    output: _StaticLastDim,
     dimension: _ConstantInt,
     stages: _ConstantInt,
 ):
