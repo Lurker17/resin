@@ -810,6 +810,7 @@ class Attention(nn.Module):
             persistent=False,
         )
         self.attention_workspace: torch.Tensor = None
+        self.decode_overlap_stream: torch.cuda.Stream | None = None
         if self.compress_ratio:
             original_seq_len, rope_theta = (
                 args.original_seq_len,
@@ -921,6 +922,34 @@ class Attention(nn.Module):
         else:
             q_input, kv = self.wq_a(x), self.wkv(x)
         qr = q = self.q_norm(q_input)
+
+        compressed_width = 0
+        compress_topk_idxs = None
+        main_stream = None
+        if ratio:
+            compressed_width = min(
+                self.kv_cache.shape[1] - win,
+                math.ceil(graph_seq_len / ratio / 4) * 4,
+            )
+            assert self.decode_overlap_stream is not None
+            # Compression/indexing depends on normalized Q but is otherwise
+            # independent of the dense Q projection and window-cache update.
+            main_stream = torch.cuda.current_stream(x.device)
+            self.decode_overlap_stream.wait_stream(main_stream)
+            with torch.cuda.stream(self.decode_overlap_stream):
+                if self.indexer is not None:
+                    compress_topk_idxs = self.indexer.forward_decode(
+                        x, qr, position, 0, compressed_width * ratio
+                    )
+                else:
+                    self.compressor.forward_decode(x, position)
+                    compress_topk_idxs = get_decode_compress_topk_idxs(
+                        ratio,
+                        position,
+                        compressed_width,
+                        0,
+                    )
+
         q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
         qk_norm_rope_store(
             q,
@@ -933,29 +962,14 @@ class Attention(nn.Module):
         )
         topk_idxs = get_decode_window_topk_idxs(win, position)
 
-        compressed_width = 0
         compressed_complete = torch.zeros_like(position)
         if ratio:
-            compressed_width = min(
-                self.kv_cache.shape[1] - win,
-                math.ceil(graph_seq_len / ratio / 4) * 4,
-            )
             compressed_complete = torch.minimum(
                 (position + 1).div(ratio, rounding_mode="floor"),
                 torch.full_like(position, compressed_width),
             )
-            if self.indexer is not None:
-                compress_topk_idxs = self.indexer.forward_decode(
-                    x, qr, position, 0, compressed_width * ratio
-                )
-            else:
-                self.compressor.forward_decode(x, position)
-                compress_topk_idxs = get_decode_compress_topk_idxs(
-                    ratio,
-                    position,
-                    compressed_width,
-                    0,
-                )
+            assert main_stream is not None and compress_topk_idxs is not None
+            main_stream.wait_stream(self.decode_overlap_stream)
             topk_idxs = torch.cat((topk_idxs, compress_topk_idxs), dim=-1)
 
         assert self.attention_workspace is not None
@@ -1472,8 +1486,10 @@ class Transformer(nn.Module):
             torch.empty(128 * 1024 * 1024, dtype=torch.uint8),
             persistent=False,
         )
+        self._decode_overlap_stream = torch.cuda.Stream()
         for layer in self.layers:
             layer.attn.attention_workspace = self._attention_workspace
+            layer.attn.decode_overlap_stream = self._decode_overlap_stream
         self.norm = RMSNorm(args.dim, args.norm_eps)
         self.head = ParallelHead(args.vocab_size, args.dim)
         self.hc_mult = hc_mult = args.hc_mult
