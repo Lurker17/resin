@@ -1,4 +1,4 @@
-"""Run DeepSeek-V4-Flash-0731 on one Modal 4xB300 node with TP=4."""
+"""Run and benchmark DeepSeek-V4-Flash-0731 on Modal B300 nodes."""
 
 from __future__ import annotations
 
@@ -30,7 +30,8 @@ MODEL_CACHE_VOLUME_NAME = "resin-deepseek-v4-models-v1"
 KERNEL_CACHE_MOUNT = "/root/.cache"
 KERNEL_CACHE_VOLUME_NAME = "resin-deepseek-v4-kernels-v1"
 MODEL_KEY = "flash-0731"
-TP_SIZE = 4
+DEFAULT_TP_SIZE = 4
+BENCHMARK_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
 CHECKPOINT_PATTERNS = (
     "config.json",
     "generation_config.json",
@@ -241,19 +242,21 @@ def _free_local_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _initialize_tensor_parallel(rank: int, master_port: int) -> TensorParallelContext:
+def _initialize_tensor_parallel(
+    rank: int, master_port: int, tensor_parallel_size: int
+) -> TensorParallelContext:
     torch.cuda.set_device(rank)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(master_port)
     dist.init_process_group(
         "nccl",
         rank=rank,
-        world_size=TP_SIZE,
+        world_size=tensor_parallel_size,
         timeout=timedelta(minutes=30),
         device_id=torch.device(f"cuda:{rank}"),
     )
     return TensorParallelContext(
-        TensorParallelLayout(rank=rank, size=TP_SIZE),
+        TensorParallelLayout(rank=rank, size=tensor_parallel_size),
         dist.group.WORLD,
     )
 
@@ -272,7 +275,10 @@ def _run_rank_workload(
     from resin.models.deepseek_v4.cuda import DeepSeekV4FlashCudaRunner
 
     if rank == 0:
-        print("[deepseek-v4] loading TP=4 checkpoint", flush=True)
+        print(
+            f"[deepseek-v4] loading TP={tensor_parallel.size} checkpoint",
+            flush=True,
+        )
     load_start = time.perf_counter()
     batch_size = len(prompt_rows)
     graph_capacity = max(len(row) for row in prompt_rows) + max_new_tokens
@@ -318,6 +324,7 @@ def _run_rank_workload(
         eos_token_id=runner.eos_token_id,
     )
     first_token_time: float | None = None
+    generated_steps = 0
     try:
         profile_tables: dict[str, str] = {}
         if profile:
@@ -390,6 +397,14 @@ def _run_rank_workload(
             events = engine.step()
             if events and first_token_time is None:
                 first_token_time = time.perf_counter()
+            if events:
+                generated_steps += 1
+                if tensor_parallel.rank == 0 and generated_steps % 256 == 0:
+                    print(
+                        f"[deepseek-v4] batch={batch_size}: "
+                        f"generated {generated_steps}/{max_new_tokens}",
+                        flush=True,
+                    )
         torch.cuda.synchronize(runner.device)
         tensor_parallel.barrier()
         elapsed = time.perf_counter() - start
@@ -409,15 +424,17 @@ def _run_rank_workload(
                 output_ids, dtype=torch.int64, device=runner.device
             )
         gathered = torch.empty(
-            TP_SIZE * batch_size * max_new_tokens,
+            tensor_parallel.size * batch_size * max_new_tokens,
             dtype=torch.int64,
             device=runner.device,
         )
-        dist.all_gather_single(gathered, output_tensor.flatten(), group=dist.group.WORLD)
-        rank_outputs = gathered.view(TP_SIZE, batch_size, max_new_tokens)
+        dist.all_gather_single(
+            gathered, output_tensor.flatten(), group=dist.group.WORLD
+        )
+        rank_outputs = gathered.view(tensor_parallel.size, batch_size, max_new_tokens)
         if any(
             not torch.equal(rank_outputs[0], rank_outputs[index])
-            for index in range(1, TP_SIZE)
+            for index in range(1, tensor_parallel.size)
         ):
             raise RuntimeError("tensor-parallel ranks sampled different tokens")
 
@@ -427,7 +444,7 @@ def _run_rank_workload(
             "model": DEFAULT_MODEL,
             "revision": DEFAULT_REVISION,
             "device": torch.cuda.get_device_name(runner.device),
-            "tensor_parallel_size": TP_SIZE,
+            "tensor_parallel_size": tensor_parallel.size,
             "allreduce_backend": runner.allreduce_backend,
             "checkpoint": checkpoint,
             "weight_load": runner.weight_load,
@@ -452,7 +469,9 @@ def _run_rank_workload(
             "output_tokens_per_second": output_count / elapsed,
             "decode_tokens_per_second": (
                 None
-                if decode_elapsed is None or decode_elapsed <= 0 or output_count <= batch_size
+                if decode_elapsed is None
+                or decode_elapsed <= 0
+                or output_count <= batch_size
                 else (output_count - batch_size) / decode_elapsed
             ),
         }
@@ -464,6 +483,7 @@ def _run_rank_workload(
 def _run_rank(
     rank: int,
     master_port: int,
+    tensor_parallel_size: int,
     report_path: Path,
     model_path: Path,
     checkpoint: dict[str, object],
@@ -476,7 +496,9 @@ def _run_rank(
     seed: int | None,
     profile: bool,
 ) -> None:
-    tensor_parallel = _initialize_tensor_parallel(rank, master_port)
+    tensor_parallel = _initialize_tensor_parallel(
+        rank, master_port, tensor_parallel_size
+    )
     sampling_params = SamplingParams(
         temperature=temperature,
         top_p=top_p,
@@ -500,7 +522,8 @@ def _run_rank(
     os._exit(0)
 
 
-def _launch_tp4(
+def _launch_tensor_parallel(
+    tensor_parallel_size: int,
     model_path: Path,
     checkpoint: dict[str, object],
     prompt_rows: list[list[int]],
@@ -513,12 +536,15 @@ def _launch_tp4(
     profile: bool,
 ) -> dict[str, object]:
     master_port = _free_local_port()
-    with tempfile.TemporaryDirectory(prefix="resin-dsv4-tp4-") as directory:
+    with tempfile.TemporaryDirectory(
+        prefix=f"resin-dsv4-tp{tensor_parallel_size}-"
+    ) as directory:
         report_path = Path(directory) / "report.json"
         torch.multiprocessing.spawn(
             _run_rank,
             args=(
                 master_port,
+                tensor_parallel_size,
                 report_path,
                 model_path,
                 checkpoint,
@@ -531,15 +557,293 @@ def _launch_tp4(
                 seed,
                 profile,
             ),
-            nprocs=TP_SIZE,
+            nprocs=tensor_parallel_size,
             join=True,
         )
         return cast(dict[str, object], json.loads(report_path.read_text()))
 
 
+def _benchmark_point(
+    runner,
+    tensor_parallel: TensorParallelContext,
+    prompt_ids: list[int],
+    batch_size: int,
+    max_new_tokens: int,
+    context_length: int,
+    sampling_params: SamplingParams,
+) -> dict[str, object]:
+    """Measure one synchronized batch after model and graph initialization."""
+
+    engine = Engine(
+        runner,
+        max_running_requests=batch_size,
+        context_length=context_length,
+        scheduler_config=SchedulerConfig(
+            max_batch_tokens=batch_size * len(prompt_ids),
+            prefill_chunk_size=len(prompt_ids),
+        ),
+        # Force exactly max_new_tokens so every point has the same denominator.
+        eos_token_id=None,
+    )
+    first_token_time: float | None = None
+    try:
+        tensor_parallel.barrier()
+        start = time.perf_counter()
+        requests = [
+            engine.submit(
+                prompt_ids,
+                max_new_tokens=max_new_tokens,
+                sampling_params=sampling_params,
+            )
+            for _ in range(batch_size)
+        ]
+        events = engine.step()
+        if not events:
+            raise RuntimeError("benchmark prefill produced no token event")
+        first_token_time = time.perf_counter()
+
+        while engine.has_work():
+            engine.step()
+        torch.cuda.synchronize(runner.device)
+        tensor_parallel.barrier()
+        end = time.perf_counter()
+        output_rows = [request.take_result() for request in requests]
+        output_lengths = [len(row) for row in output_rows]
+        if any(length != max_new_tokens for length in output_lengths):
+            raise RuntimeError(
+                f"benchmark generated {output_lengths}, expected {max_new_tokens} each"
+            )
+        if first_token_time is None:
+            raise RuntimeError("benchmark produced no first-token event")
+
+        output_count = sum(output_lengths)
+        decode_token_count = output_count - batch_size
+        decode_elapsed = end - first_token_time
+        decode_throughput = decode_token_count / decode_elapsed
+        return {
+            "batch_size": batch_size,
+            "input_tokens_per_request": len(prompt_ids),
+            "output_tokens_per_request": max_new_tokens,
+            "time_to_first_token_ms": (first_token_time - start) * 1000,
+            "elapsed_ms": (end - start) * 1000,
+            "decode_elapsed_ms": decode_elapsed * 1000,
+            "decode_throughput_tokens_per_second": decode_throughput,
+            "interactivity_tokens_per_second": decode_throughput / batch_size,
+        }
+    finally:
+        if not engine.closed:
+            engine.close()
+
+
+def _run_rank_benchmark(
+    rank: int,
+    master_port: int,
+    tensor_parallel_size: int,
+    report_path: Path,
+    model_path: Path,
+    checkpoint: dict[str, object],
+    prompt_ids: list[int],
+    max_new_tokens: int,
+    batch_sizes: tuple[int, ...],
+    use_cuda_graphs: bool,
+) -> None:
+    from resin.models.deepseek_v4.cuda import DeepSeekV4FlashCudaRunner
+
+    tensor_parallel = _initialize_tensor_parallel(
+        rank, master_port, tensor_parallel_size
+    )
+    context_length = len(prompt_ids) + max_new_tokens
+    max_batch_size = max(batch_sizes)
+    if rank == 0:
+        print(
+            f"[deepseek-v4] loading TP={tensor_parallel_size} benchmark runner "
+            f"for batches {batch_sizes}",
+            flush=True,
+        )
+    load_start = time.perf_counter()
+    runner = DeepSeekV4FlashCudaRunner(
+        model_path,
+        max_seq_len=context_length,
+        max_batch_size=max_batch_size,
+        tensor_parallel=tensor_parallel,
+        device=f"cuda:{rank}",
+        cuda_graph_decode_shapes=(
+            tuple((batch_size, context_length) for batch_size in batch_sizes)
+            if use_cuda_graphs
+            else ()
+        ),
+    )
+    torch.cuda.synchronize(runner.device)
+    tensor_parallel.barrier()
+    load_elapsed = time.perf_counter() - load_start
+
+    capture_elapsed = 0.0
+    sampling_params = SamplingParams(
+        temperature=1.0,
+        top_p=0.95,
+        top_k=None,
+        seed=0,
+    )
+
+    points = []
+    for batch_size in batch_sizes:
+        if rank == 0:
+            print(
+                f"[deepseek-v4] TP={tensor_parallel_size} batch={batch_size} "
+                f"{len(prompt_ids)}/{max_new_tokens}",
+                flush=True,
+            )
+        if use_cuda_graphs:
+            capture_start = time.perf_counter()
+            shape = (batch_size, context_length)
+            runner._graphs.capture(  # noqa: SLF001 - benchmark shape isolation
+                shape, runner._graph_capture_inputs(shape, runner.vocab_size)
+            )
+            runner._reset_model_state()  # noqa: SLF001 - reset capture mutations
+            torch.cuda.synchronize(runner.device)
+            tensor_parallel.barrier()
+            capture_elapsed += time.perf_counter() - capture_start
+        point = _benchmark_point(
+            runner,
+            tensor_parallel,
+            prompt_ids,
+            batch_size,
+            max_new_tokens,
+            context_length,
+            sampling_params,
+        )
+        points.append(point)
+        if rank == 0:
+            print(
+                f"[deepseek-v4] batch={batch_size}: "
+                f"interactivity={point['interactivity_tokens_per_second']:.2f} "
+                f"tok/s, throughput="
+                f"{point['decode_throughput_tokens_per_second']:.2f} tok/s",
+                flush=True,
+            )
+
+    tensor_parallel.barrier()
+    if rank == 0:
+        report = {
+            "model": DEFAULT_MODEL,
+            "revision": DEFAULT_REVISION,
+            "device": torch.cuda.get_device_name(runner.device),
+            "tensor_parallel_size": tensor_parallel_size,
+            "allreduce_backend": runner.allreduce_backend,
+            "checkpoint": checkpoint,
+            "input_tokens_per_request": len(prompt_ids),
+            "output_tokens_per_request": max_new_tokens,
+            "sampling": {
+                "temperature": sampling_params.temperature,
+                "top_p": sampling_params.top_p,
+                "top_k": sampling_params.top_k,
+                "seed": sampling_params.seed,
+            },
+            "model_load_ms": load_elapsed * 1000,
+            "cuda_graph_capture_ms": capture_elapsed * 1000,
+            "use_cuda_graphs": use_cuda_graphs,
+            "cuda_graph": runner.cuda_graph_stats,
+            "points": points,
+        }
+        report_path.write_text(json.dumps(report))
+    os._exit(0)
+
+
+def _launch_batch_benchmark(
+    tensor_parallel_size: int,
+    model_path: Path,
+    checkpoint: dict[str, object],
+    prompt_ids: list[int],
+    max_new_tokens: int,
+    batch_sizes: tuple[int, ...],
+    use_cuda_graphs: bool,
+) -> dict[str, object]:
+    master_port = _free_local_port()
+    with tempfile.TemporaryDirectory(
+        prefix=f"resin-dsv4-benchmark-tp{tensor_parallel_size}-"
+    ) as directory:
+        report_path = Path(directory) / "report.json"
+        torch.multiprocessing.spawn(
+            _run_rank_benchmark,
+            args=(
+                master_port,
+                tensor_parallel_size,
+                report_path,
+                model_path,
+                checkpoint,
+                prompt_ids,
+                max_new_tokens,
+                batch_sizes,
+                use_cuda_graphs,
+            ),
+            nprocs=tensor_parallel_size,
+            join=True,
+        )
+        return cast(dict[str, object], json.loads(report_path.read_text()))
+
+
+def _benchmark_remote(
+    tensor_parallel_size: int,
+    input_tokens: int = 8192,
+    max_new_tokens: int = 1024,
+    batch_sizes: tuple[int, ...] = BENCHMARK_BATCH_SIZES,
+    use_cuda_graphs: bool = True,
+) -> dict[str, object]:
+    if input_tokens <= 0 or max_new_tokens <= 1:
+        raise ValueError("benchmark token counts must be positive")
+    model_path, checkpoint = _require_checkpoint()
+    tokenizer = cast(
+        PreTrainedTokenizerBase,
+        AutoTokenizer.from_pretrained(
+            str(model_path), local_files_only=True, trust_remote_code=False
+        ),
+    )
+    encoding = _load_encoding(model_path)
+    seed_prompt = _encode_prompt(
+        tokenizer,
+        encoding,
+        "Measure inference throughput with a stable synthetic prompt.",
+        "chat",
+        "low",
+    )
+    repeats = (input_tokens + len(seed_prompt) - 1) // len(seed_prompt)
+    prompt_ids = (seed_prompt * repeats)[:input_tokens]
+    return _launch_batch_benchmark(
+        tensor_parallel_size,
+        model_path,
+        checkpoint,
+        prompt_ids,
+        max_new_tokens,
+        batch_sizes,
+        use_cuda_graphs,
+    )
+
+
 @app.function(timeout=24 * 60 * 60, cpu=16, memory=32 * 1024)
 def cache_checkpoint() -> dict[str, object]:
     return _download_checkpoint()
+
+
+@app.function(
+    gpu="B300:2",
+    cpu=32,
+    memory=256 * 1024,
+    timeout=8 * 60 * 60,
+    single_use_containers=True,
+)
+def benchmark_tp2() -> dict[str, object]:
+    return _benchmark_remote(2)
+
+
+@app.function(
+    gpu="B300:4",
+    cpu=32,
+    memory=256 * 1024,
+    timeout=8 * 60 * 60,
+    single_use_containers=True,
+)
+def benchmark_tp4() -> dict[str, object]:
+    return _benchmark_remote(4)
 
 
 @app.function(
@@ -587,7 +891,8 @@ def run_model_tp4(
     if max(map(len, prompt_rows)) + max_new_tokens - 1 > context_length:
         raise ValueError("prompt plus max_new_tokens exceeds context_length")
 
-    report = _launch_tp4(
+    report = _launch_tensor_parallel(
+        DEFAULT_TP_SIZE,
         model_path,
         checkpoint,
         prompt_rows,
@@ -634,6 +939,10 @@ def main(
 ) -> None:
     if mode == "download":
         report = cache_checkpoint.remote()
+    elif mode == "bench-tp2":
+        report = benchmark_tp2.remote()
+    elif mode == "bench-tp4":
+        report = benchmark_tp4.remote()
     elif mode == "run":
         report = run_model_tp4.remote(
             prompt,
@@ -649,5 +958,8 @@ def main(
             batch_size,
         )
     else:
-        raise ValueError("mode must be 'download' or 'run'")
+        raise ValueError(
+            "mode must be 'download', 'bench-tp2', 'bench-tp4', "
+            "or 'run'"
+        )
     print(json.dumps(report, indent=2, sort_keys=True))

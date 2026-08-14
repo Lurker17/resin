@@ -10,17 +10,19 @@ from typing import Callable, Literal, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from flashinfer.mhc import mhc_pre_big_fuse_with_prenorm
+from flashinfer.mhc import mhc_post, mhc_pre_big_fuse_with_prenorm
 from quack import rmsnorm as quack_rmsnorm
 from torch import nn
 
-from resin.models.deepseek_v4.attention import sparse_decode_attention
+from resin.models.deepseek_v4.attention import (
+    sparse_decode_attention,
+    sparse_topk_lengths,
+)
 from resin.models.deepseek_v4.cutile import (
     act_quant,
     compress_decode,
     fp4_act_quant,
     hadamard_transform,
-    hc_post_mix,
     qk_norm_rope_store,
     sparse_attn,
     top6_sqrt_softplus,
@@ -719,7 +721,9 @@ class Indexer(torch.nn.Module):
         index_score = torch.einsum("bshd,btd->bsht", q, cache)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         complete = (position + 1).div(ratio, rounding_mode="floor")
-        valid = torch.arange(width, device=x.device).unsqueeze(0) < complete.unsqueeze(1)
+        valid = torch.arange(width, device=x.device).unsqueeze(0) < complete.unsqueeze(
+            1
+        )
         index_score = index_score.masked_fill(~valid.unsqueeze(1), float("-inf"))
         if world_size > 1:
             index_score = self.allreduce(index_score)
@@ -993,6 +997,7 @@ class Attention(nn.Module):
             topk_idxs += cache_rows * win
 
         compressed_complete = torch.zeros_like(position)
+        compressed_index_width = 0
         if ratio:
             compressed_complete = torch.minimum(
                 (position + 1).div(ratio, rounding_mode="floor"),
@@ -1003,24 +1008,22 @@ class Attention(nn.Module):
             if cache_rows is not None:
                 compress_topk_idxs = torch.where(
                     compress_topk_idxs >= 0,
-                    compress_topk_idxs
-                    + cache_rows * self.compressed_kv_cache.shape[1],
+                    compress_topk_idxs + cache_rows * self.compressed_kv_cache.shape[1],
                     -1,
                 )
+            compressed_index_width = compress_topk_idxs.shape[-1]
             topk_idxs = torch.cat((topk_idxs, compress_topk_idxs), dim=-1)
 
         assert self.attention_workspace is not None
         window_cache = self.kv_cache[:bsz, :win]
-        compressed_cache = (
-            self.compressed_kv_cache[:bsz] if ratio else window_cache
-        )
+        compressed_cache = self.compressed_kv_cache[:bsz] if ratio else window_cache
         o = sparse_decode_attention(
             q,
             window_cache,
             compressed_cache,
             self.attn_sink,
             topk_idxs,
-            (compressed_complete + win).to(torch.int32),
+            sparse_topk_lengths(compressed_complete, compressed_index_width, win),
             (position + 1).to(torch.int32),
             self.attention_workspace,
             self.softmax_scale,
@@ -1361,9 +1364,7 @@ class MoE(nn.Module):
             with torch.cuda.stream(self.decode_overlap_stream):
                 shared = self.shared_experts(x)
 
-        weights, indices = self.gate(
-            x, input_ids.flatten(), optimized=shape[1] == 1
-        )
+        weights, indices = self.gate(x, input_ids.flatten(), optimized=shape[1] == 1)
         if self._fused_fp4:
             y = self._fused_experts(x, weights, indices)
         else:
@@ -1445,7 +1446,7 @@ class Block(nn.Module):
         comb: torch.Tensor,
     ):
         # x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc], y: [b,s,hc,d]
-        return hc_post_mix(x, residual, post, comb)
+        return mhc_post(x, residual, post, comb)
 
     def forward(
         self,

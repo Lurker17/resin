@@ -21,6 +21,15 @@ _StaticLastTwoDims: TypeAlias = Annotated[
     ct.ArrayAnnotation(static_shape_dims=(-2, -1)),
 ]
 _NEGATIVE = -3.402823466e38
+_MIN_WIDE_TILE_PROGRAMS = 64
+
+
+def _quant_groups_per_program(rows: int, group_count: int) -> int:
+    """Use wider tiles only when the resulting grid retains enough parallel work."""
+
+    if group_count % 4 == 0 and rows * (group_count // 4) >= _MIN_WIDE_TILE_PROGRAMS:
+        return 4
+    return 1
 
 
 @ct.kernel
@@ -122,7 +131,6 @@ def _fp8_quantize_kernel(
     source: _StaticLastDim,
     output: _StaticLastDim,
     scales: _StaticLastDim,
-    width: _ConstantInt,
 ):
     row = ct.bid(0)
     group = ct.bid(1)
@@ -141,7 +149,27 @@ def _fp8_quantize_kernel(
 
 
 @ct.kernel
-def _fp8_simulate_kernel(values: _StaticLastDim, width: _ConstantInt):
+def _fp8_quantize_four_groups_kernel(
+    source: _StaticLastDim,
+    output: _StaticLastDim,
+    scales: _StaticLastDim,
+):
+    row = ct.bid(0)
+    tile = ct.bid(1)
+    values = ct.load(source, (row, tile), shape=(1, 512)).reshape((4, 128))
+    values = values.astype(ct.float32)
+    maximum = ct.maximum(ct.max(ct.abs(values), axis=1, keepdims=True), 1e-4)
+    exponent = ct.ceil(ct.log2(maximum / 448.0))
+    scale = ct.exp2(exponent)
+    quantized = ct.maximum(ct.minimum(values / scale, 448.0), -448.0).astype(
+        ct.float8_e4m3fn
+    )
+    ct.store(output, (row, tile), quantized.reshape((1, 512)))
+    ct.store(scales, (row, tile), (exponent + 127).astype(ct.uint8).reshape((1, 4)))
+
+
+@ct.kernel
+def _fp8_simulate_kernel(values: _StaticLastDim):
     row = ct.bid(0)
     group = ct.bid(1)
     tile = ct.load(values, (row, group), shape=(1, 64)).astype(ct.float32)
@@ -158,7 +186,7 @@ def _fp8_simulate_kernel(values: _StaticLastDim, width: _ConstantInt):
 
 
 @ct.kernel
-def _fp4_simulate_kernel(values: _StaticLastDim, width: _ConstantInt):
+def _fp4_simulate_kernel(values: _StaticLastDim):
     row = ct.bid(0)
     group = ct.bid(1)
     tile = ct.load(values, (row, group), shape=(1, 32)).astype(ct.float32)
@@ -169,6 +197,26 @@ def _fp4_simulate_kernel(values: _StaticLastDim, width: _ConstantInt):
         values,
         (row, group),
         (simulated.astype(ct.float32) * scale).astype(values.dtype),
+    )
+
+
+@ct.kernel
+def _fp4_simulate_four_groups_kernel(values: _StaticLastDim):
+    row = ct.bid(0)
+    tile = ct.bid(1)
+    groups = ct.load(values, (row, tile), shape=(1, 128)).reshape((4, 32))
+    groups = groups.astype(ct.float32)
+    maximum = ct.maximum(
+        ct.max(ct.abs(groups), axis=1, keepdims=True), 6.0 * (2.0**-126)
+    )
+    scale = ct.exp2(ct.ceil(ct.log2(maximum / 6.0)))
+    simulated = ct.maximum(ct.minimum(groups / scale, 6.0), -6.0).astype(
+        ct.float4_e2m1fn
+    )
+    ct.store(
+        values,
+        (row, tile),
+        (simulated.astype(ct.float32) * scale).reshape((1, 128)).astype(values.dtype),
     )
 
 
@@ -191,7 +239,7 @@ def act_quant(
             torch.cuda.current_stream(values.device),
             (rows, width // block_size),
             _fp8_simulate_kernel,
-            (values.view(rows, width), width),
+            (values.view(rows, width),),
         )
         destination.copy_(values)
         return destination
@@ -207,15 +255,21 @@ def act_quant(
         device=values.device,
     )
     scales = scale_storage.view(scale_dtype)
+    group_count = width // block_size
+    groups_per_program = _quant_groups_per_program(rows, group_count)
+    kernel = (
+        _fp8_quantize_four_groups_kernel
+        if groups_per_program == 4
+        else _fp8_quantize_kernel
+    )
     ct.launch(
         torch.cuda.current_stream(values.device),
-        (rows, width // block_size),
-        _fp8_quantize_kernel,
+        (rows, group_count // groups_per_program),
+        kernel,
         (
             values.view(rows, width),
             output.view(rows, width),
             scale_storage.view(rows, -1),
-            width,
         ),
     )
     return output, scales
@@ -227,11 +281,18 @@ def fp4_act_quant(values: Tensor, block_size: int = 32, inplace: bool = False):
     if block_size != 32 or not inplace:
         raise ValueError("Resin only uses the in-place 32-value FP4 simulation")
     rows, width = values.numel() // values.shape[-1], values.shape[-1]
+    group_count = width // block_size
+    groups_per_program = _quant_groups_per_program(rows, group_count)
+    kernel = (
+        _fp4_simulate_four_groups_kernel
+        if groups_per_program == 4
+        else _fp4_simulate_kernel
+    )
     ct.launch(
         torch.cuda.current_stream(values.device),
-        (rows, width // block_size),
-        _fp4_simulate_kernel,
-        (values.view(rows, width), width),
+        (rows, group_count // groups_per_program),
+        kernel,
+        (values.view(rows, width),),
     )
     return values
 
@@ -726,55 +787,6 @@ def sparse_attn(
 
 
 @ct.kernel
-def _hc_post_mix_kernel(
-    values: _StaticLastDim,
-    residual: _StaticLastDim,
-    post: _StaticLastDim,
-    combination: _StaticLastDim,
-    output: _StaticLastDim,
-):
-    row = ct.bid(0)
-    branch = ct.bid(1)
-    block = ct.bid(2)
-    value = ct.load(values, (row, block), shape=(1, 128)).astype(ct.float32)
-    post_scale = ct.load(post, (row, branch), shape=(1, 1)).item()
-    branches = ct.load(residual, (row, 0, block), shape=(1, 4, 128)).astype(ct.float32)
-    weights = ct.load(combination, (row, 0, branch), shape=(1, 4, 1))
-    mixed = value * post_scale + ct.sum(branches * weights, axis=1)
-    ct.store(
-        output,
-        (row, branch, block),
-        mixed.reshape((1, 1, 128)).astype(output.dtype),
-    )
-
-
-def hc_post_mix(
-    values: Tensor,
-    residual: Tensor,
-    post: Tensor,
-    combination: Tensor,
-) -> Tensor:
-    """Apply the four mHC output branches and residual mixing in one kernel."""
-
-    dimension = residual.shape[-1]
-    rows = residual.numel() // (4 * dimension)
-    output = torch.empty_like(residual)
-    ct.launch(
-        torch.cuda.current_stream(values.device),
-        (rows, 4, dimension // 128),
-        _hc_post_mix_kernel,
-        (
-            values.view(rows, dimension),
-            residual.view(rows, 4, dimension),
-            post.view(rows, 4),
-            combination.view(rows, 4, 4),
-            output.view(rows, 4, dimension),
-        ),
-    )
-    return output
-
-
-@ct.kernel
 def _hadamard_kernel(
     source: _StaticLastDim,
     output: _StaticLastDim,
@@ -821,7 +833,6 @@ __all__ = [
     "compress_decode",
     "fp4_act_quant",
     "hadamard_transform",
-    "hc_post_mix",
     "qk_norm_rope_store",
     "sparse_attn",
     "top6_sqrt_softplus",

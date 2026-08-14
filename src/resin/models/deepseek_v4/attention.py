@@ -2,8 +2,22 @@
 
 from __future__ import annotations
 
+import torch
 from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 from torch import Tensor
+from torch.nn import functional as F
+
+
+def sparse_topk_lengths(
+    compressed_complete: Tensor, compressed_index_width: int, window_size: int
+) -> Tensor:
+    """Bound FlashInfer's active length by the physical sparse-index row."""
+
+    if compressed_index_width < 0 or window_size <= 0:
+        raise ValueError("sparse attention widths must be nonnegative")
+    return (compressed_complete.clamp_max(compressed_index_width) + window_size).to(
+        torch.int32
+    )
 
 
 def sparse_decode_attention(
@@ -37,6 +51,10 @@ def sparse_decode_attention(
     if sinks.shape != (query.shape[2],):
         raise ValueError("learnable sinks must contain one value per query head")
 
+    padding = -indices.shape[-1] % 4
+    if padding:
+        indices = F.pad(indices, (0, padding), value=-1)
+
     return trtllm_batch_decode_sparse_mla_dsv4(
         query,
         window_cache,
@@ -52,4 +70,4 @@ def sparse_decode_attention(
     )
 
 
-__all__ = ["sparse_decode_attention"]
+__all__ = ["sparse_decode_attention", "sparse_topk_lengths"]

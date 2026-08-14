@@ -201,7 +201,6 @@ class TestDeepSeekV4Weights:
             "compress_decode",
             "fp4_act_quant",
             "hadamard_transform",
-            "hc_post_mix",
             "qk_norm_rope_store",
             "sparse_attn",
             "top6_sqrt_softplus",
@@ -209,6 +208,7 @@ class TestDeepSeekV4Weights:
             setattr(cutile, name, None)
         flashinfer = ModuleType("flashinfer")
         flashinfer_mhc = ModuleType("flashinfer.mhc")
+        flashinfer_mhc.mhc_post = None
         flashinfer_mhc.mhc_pre_big_fuse_with_prenorm = None
         gemm = ModuleType("resin.models.deepseek_v4.gemm")
         for name in (
@@ -220,6 +220,7 @@ class TestDeepSeekV4Weights:
             setattr(gemm, name, None)
         attention = ModuleType("resin.models.deepseek_v4.attention")
         attention.sparse_decode_attention = None
+        attention.sparse_topk_lengths = None
         quack = ModuleType("quack")
         quack.rmsnorm = None
         monkeypatch.setitem(sys.modules, cutile.__name__, cutile)
@@ -537,9 +538,7 @@ class TestDeepSeekV4Attention:
         query = torch.zeros(2, 1, 2, 4)
         window = torch.arange(24, dtype=torch.float32).view(2, 3, 4)
         compressed = torch.arange(16, dtype=torch.float32).view(2, 2, 4)
-        indices = torch.tensor(
-            [[[2, 1, 0, 1]], [[1, 0, -1, -1]]], dtype=torch.int32
-        )
+        indices = torch.tensor([[[2, 1, 0, 1]], [[1, 0, -1, -1]]], dtype=torch.int32)
         sinks = torch.tensor([1.0, 1.0])
         sparse_lengths = torch.tensor([4, 2], dtype=torch.int32)
         sequence_lengths = torch.tensor([3, 2], dtype=torch.int32)
@@ -571,6 +570,30 @@ class TestDeepSeekV4Attention:
         assert kwargs["enable_pdl"] is True
         assert output.shape == query.shape
 
+        unaligned_indices = torch.zeros(2, 1, 5, dtype=torch.int32)
+        attention.sparse_decode_attention(
+            query,
+            window,
+            compressed,
+            sinks,
+            unaligned_indices,
+            sparse_lengths,
+            sequence_lengths,
+            workspace,
+            0.5,
+        )
+        padded_indices = calls[1][0][3]
+        assert padded_indices.shape == (2, 8)
+        assert torch.equal(padded_indices[:, :5], unaligned_indices.view(2, 5))
+        assert torch.equal(padded_indices[:, 5:], torch.full((2, 3), -1))
+
+        complete = torch.tensor([0, 32, 2048])
+        assert attention.sparse_topk_lengths(complete, 512, 128).tolist() == [
+            128,
+            160,
+            640,
+        ]
+
         with pytest.raises(ValueError, match="physical KV pools must be contiguous"):
             attention.sparse_decode_attention(
                 query,
@@ -599,9 +622,7 @@ class TestDeepSeekV4BatchPlan:
                 super().__init__()
                 self.register_buffer("kv_cache", torch.zeros(3, 2))
                 self.register_buffer("kv_state", torch.zeros(3, 2))
-                self.register_buffer(
-                    "score_state", torch.full((3, 2), float("-inf"))
-                )
+                self.register_buffer("score_state", torch.full((3, 2), float("-inf")))
 
             def forward(self, input_ids: torch.Tensor, _start_pos: int) -> torch.Tensor:
                 markers = input_ids[:, :1].to(torch.float32)
@@ -609,9 +630,9 @@ class TestDeepSeekV4BatchPlan:
                 self.kv_cache[:rows].copy_(markers.expand(rows, 2))
                 self.kv_state[:rows].copy_((markers + 10).expand(rows, 2))
                 self.score_state[:rows].copy_((markers + 20).expand(rows, 2))
-                return torch.nn.functional.one_hot(
-                    input_ids[:, -1], num_classes=32
-                ).to(torch.float32)
+                return torch.nn.functional.one_hot(input_ids[:, -1], num_classes=32).to(
+                    torch.float32
+                )
 
         runner._model = StateModel()
         runner.device = torch.device("cpu")
@@ -697,7 +718,9 @@ class TestDeepSeekV4BatchPlan:
         runner.release([8])
 
         assert runner._active_sequence_ids == [7, 9]
-        assert torch.equal(runner._model.kv_cache, torch.tensor([[7, 7], [9, 9], [0, 0]]))
+        assert torch.equal(
+            runner._model.kv_cache, torch.tensor([[7, 7], [9, 9], [0, 0]])
+        )
         assert torch.equal(
             runner._model.kv_state, torch.tensor([[17, 17], [19, 19], [0, 0]])
         )
