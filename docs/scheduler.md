@@ -4,7 +4,7 @@ Resin keeps ready-queue ordering and request progress in Rust. The scheduler
 selects work; the runner executes the already-frozen token ranges.
 
 ```python
-from resin import Engine, SchedulerConfig
+from resin import Engine, SamplingParams, SchedulerConfig
 
 engine = Engine(
     runner,
@@ -22,6 +22,12 @@ request = engine.submit(
     max_new_tokens=64,  # optional hard stop, not a KV reservation
     priority=5,
     batch_key=7,
+    sampling_params=SamplingParams(
+        temperature=1.0,
+        top_p=0.95,
+        top_k=40,
+        seed=7,
+    ),
 )
 ```
 
@@ -140,6 +146,14 @@ sampled; decode rows are always sampled. `sample_sequence_indices` makes this
 event/commit mask explicit. The runner still returns one token ID per row,
 including an unsampled continuation or replay row.
 
+`SamplingParams` is per request and defaults to temperature `1.0`, top-p `1.0`,
+and no top-k limit. Temperature `0` requests deterministic argmax. The frozen
+plan carries one policy, effective seed, and random offset per row so mixed
+requests can share a batch without sharing a random stream. The optional
+`extra` value is an opaque Python object for custom runner code; Resin preserves
+it but does not inspect it. Shared Torch and FlashInfer backend samplers consume
+the standard fields.
+
 ## Dispatch and completion
 
 One Engine currently accepts at most one in-flight batch. `dispatch()` returns
@@ -176,7 +190,8 @@ allowed while Resin can prove that physical execution did not begin.
 ## Current limits
 
 Scheduling does not choose CUDA graph buckets, kernel shapes, cache admission,
-or sampling algorithms. Those remain runner concerns. The native scheduler is
+or sampling kernels. Those remain runner concerns; the Engine only transports
+per-request policy and advances random offsets transactionally. The native scheduler is
 single-Engine and deliberately single-in-flight; `StatePool` leases are the
 mechanism that coordinates state access across Engines. Resin does not support
 overlap scheduling: it never plans the next batch ahead, takes future-batch

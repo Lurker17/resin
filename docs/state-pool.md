@@ -116,6 +116,10 @@ with the native pool, and acknowledges the exact descriptor. The pool records
 different protocol or arena is rejected. This permanent claim prevents a later
 Engine from changing the physical interpretation of surviving slot generations.
 
+A backend calls `resin.mint_state_mapping_arena_id()` when it creates a new
+physical slab. Despite the long name, the function only returns a process-unique
+positive integer; it does not allocate state or device memory itself.
+
 ## Atomic cache-plus-state binding
 
 A runner that declares both `cache_layout` and recurrent-state mapping uses one

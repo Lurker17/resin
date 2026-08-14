@@ -103,7 +103,8 @@ uv run modal run deploy/modal_gpt_oss.py --mode download --model 20b
 # Run one prompt on H200. Quote the prompt so Modal receives it as one argument.
 uv run modal run deploy/modal_gpt_oss.py \
   --mode run --model 120b \
-  --prompt "Explain why batching improves language-model throughput."
+  --prompt "Explain why batching improves language-model throughput." \
+  --temperature 1.0 --top-p 0.95 --top-k 40 --seed 7
 
 # Sweep 8k prompt / 256 output at batch sizes 1,2,8,16,32.
 uv run modal run deploy/modal_gpt_oss.py \
@@ -116,7 +117,9 @@ uv run modal run deploy/modal_gpt_oss.py \
 
 Both GPU modes also accept `--schedule-conservativeness`; larger values leave
 more estimated KV headroom, while smaller values admit more work and may cause
-retraction/replay.
+retraction/replay. Run mode accepts per-request `--temperature`, `--top-p`,
+`--top-k`, and `--seed`. Temperature defaults to `1.0`; pass `--temperature 0`
+for deterministic argmax generation.
 
 Use `--model 120b` for the larger checkpoint. These commands submit the
 repository's local source into the Modal image; they do not require a locally
@@ -126,7 +129,7 @@ FlashInfer/FA4 packages are still required remotely.
 ## Minimal use
 
 ```python
-from resin import Engine
+from resin import Engine, SamplingParams
 from resin.models.lfm2.reference import Lfm2TorchRunner
 
 runner = Lfm2TorchRunner()
@@ -136,7 +139,11 @@ with Engine(
     context_length=32768,
     eos_token_id=runner.eos_token_id,
 ) as engine:
-    request = engine.submit([1, 6, 24131], max_new_tokens=8)
+    request = engine.submit(
+        [1, 6, 24131],
+        max_new_tokens=8,
+        sampling_params=SamplingParams(temperature=1.0, top_p=0.95),
+    )
     while engine.has_work():
         for event in engine.step():
             print(event)
@@ -193,10 +200,9 @@ The LFM2 CUDA runner has one route: atomic cache-plus-state binding followed by
 asynchronous dispatch/poll. Its continuation harness uses native Engine plans;
 there is no parallel manual-plan or synchronous compatibility path.
 
-Current limits include one in-flight batch per Engine, greedy runner-owned
-sampling, no expert parallel or data-parallel attention, and no multi-node
-serving. Tensor parallelism remains a GPT-OSS CUDA backend concern rather than
-part of the native scheduler.
+Current limits include one in-flight batch per Engine, no expert parallel or
+data-parallel attention, and no multi-node serving. Tensor parallelism remains
+a GPT-OSS CUDA backend concern rather than part of the native scheduler.
 
 ## Public surface
 
@@ -211,6 +217,7 @@ BatchPlan
 BatchPhase
 TokenEvent
 RequestLease
+SamplingParams
 SchedulerConfig
 CacheGroupLayout
 CacheLayout

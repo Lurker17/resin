@@ -16,6 +16,7 @@ from resin.backend.loading import (
     resolve_model,
 )
 from resin.backend.plans import plan_rows
+from resin.backend.sampling import TorchSampler
 from resin.models.lfm2.config import Lfm2Config
 from resin.models.lfm2.model import Lfm2ForCausalLM, Lfm2State
 
@@ -80,7 +81,7 @@ def load_model(model_path: Path, *, device, dtype=None):
 
 
 class Lfm2TorchRunner:
-    """Greedy LFM2 runner consuming Rust-built integer-token batches."""
+    """LFM2 runner consuming Rust-built integer-token batches."""
 
     supports_continuation_prefill = True
 
@@ -99,12 +100,13 @@ class Lfm2TorchRunner:
         )
         self.eos_token_id = self.config.get("eos_token_id")
         self.vocab_size = self.config["vocab_size"]
+        self._sampler = TorchSampler(torch)
         self._cache: dict[int, Lfm2State] = {}
         self.forward_calls = 0
 
     def forward(self, plan: BatchPlan) -> list[int]:
         torch = self._torch
-        output: list[int] = []
+        logits_rows = []
         self.forward_calls += 1
         rows = plan_rows(plan, self._cache, self.vocab_size)
 
@@ -121,8 +123,11 @@ class Lfm2TorchRunner:
                     [row.positions], dtype=torch.long, device=self.device
                 )
                 logits = self._model(inputs, cache, position_tensor, logits_to_keep=1)
-                output.append(int(logits[:, -1, :].argmax(dim=-1).item()))
-        return output
+                logits_rows.append(logits[:, -1, :])
+        sampler = getattr(self, "_sampler", None)
+        if sampler is None:
+            sampler = self._sampler = TorchSampler(torch)
+        return sampler(torch.cat(logits_rows), plan).tolist()
 
     def release(self, request_ids: list[int]) -> None:
         for request_id in request_ids:

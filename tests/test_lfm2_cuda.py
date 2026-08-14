@@ -14,7 +14,7 @@ from resin.backend.cuda.execution import CudaExecutor
 from resin.backend.cuda.mapped_state import MappedStateArena
 from resin.backend.cuda.paged_kv import PagedKvArena
 from resin.backend.resources import CachePoolBinding
-from resin.backend.sampling import GreedySampler
+from resin.backend.sampling import TorchSampler
 
 
 class _FakeTensor:
@@ -371,7 +371,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
             dtype=runner._torch.bfloat16,
             label="LFM2 recurrent state",
         )
-        runner._sampler = GreedySampler(runner._torch)
+        runner._sampler = TorchSampler(runner._torch)
         runner._executor = CudaExecutor(
             runner._torch,
             runner.device,
@@ -483,7 +483,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         try:
             first = self._runner()
             with patch(
-                "resin.mint_state_mapping_arena_id",
+                "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
                 return_value=1234,
                 create=True,
             ):
@@ -498,7 +498,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
 
             second = self._runner()
             with patch(
-                "resin.mint_state_mapping_arena_id",
+                "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
                 side_effect=AssertionError("a required arena must not be reminted"),
                 create=True,
             ) as mint:
@@ -556,7 +556,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
 
         runner._torch.zeros = fail_allocation
         with patch(
-            "resin.mint_state_mapping_arena_id",
+            "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
             return_value=1234,
             create=True,
         ):
@@ -612,7 +612,7 @@ class Lfm2CudaCachePoolBoundaryTests(unittest.TestCase):
         runner.cache_layout = CacheLayout(8, [CacheGroupLayout(16)])
         runner._kv.binding.layout = runner.cache_layout
         with patch(
-            "resin.mint_state_mapping_arena_id",
+            "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
             side_effect=AssertionError("prebound native arena must not be reminted"),
             create=True,
         ) as mint:
@@ -915,7 +915,7 @@ class Lfm2CudaRecurrentStateTests(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 runner = Lfm2CudaCachePoolBoundaryTests._runner()
                 with patch(
-                    "resin.mint_state_mapping_arena_id",
+                    "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
                     return_value=1234,
                     create=True,
                 ) as mint:

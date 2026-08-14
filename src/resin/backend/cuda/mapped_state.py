@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from resin import mint_state_mapping_arena_id
 from resin.backend.checks import positive_int
 
 
@@ -121,8 +122,6 @@ class MappedStateArena:
                 )
             self._validate_record(record, binding)
             return binding, record, record.arena_id
-
-        from resin import mint_state_mapping_arena_id
 
         arena_id = positive_int(
             "native mapped-state arena id", mint_state_mapping_arena_id()

@@ -61,6 +61,8 @@ resources are retired.
 - `phase`: one `BatchPhase.PREFILL` or `BatchPhase.DECODE` value applying to
   every row;
 - `sample_sequence_indices`: sorted rows whose returned IDs commit;
+- `sampling_params`, `sampling_offsets`: one per sequence row; each plan
+  parameter contains its effective seed;
 - `batch_id`, optional `batch_key`, and optional positive `engine_id`.
 
 For sequence row `i`, flattened tokens occupy
@@ -166,8 +168,10 @@ decode-graph replay; broader performance claims still require dedicated runs.
 ## What is not in the boundary
 
 Resin does not standardize a tensor library, attention backend, model checkpoint
-format, tokenizer, or sampling policy. `resin.backend.cuda` offers optional
-reusable graph, staging, and completion machinery, but graph shapes and use
-remain runner policy. These choices can evolve independently as long as the
-runner honors the frozen plan, binding acknowledgements, dense output contract,
-and completion lifetime.
+format, or tokenizer. It does standardize the request-level temperature, top-p,
+top-k, seed, and opaque `extra` annotations carried by a plan. Shared reference
+and FlashInfer samplers are available under `resin.backend`, but selecting and
+executing a sampling kernel remains runner policy. `resin.backend.cuda` also
+offers optional reusable graph, staging, and completion machinery. These choices
+can evolve independently as long as the runner honors the frozen plan, binding
+acknowledgements, dense output contract, and completion lifetime.

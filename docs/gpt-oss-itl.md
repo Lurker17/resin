@@ -11,8 +11,8 @@ per-request model cache in Python and implements synchronous `forward(plan)`.
 Equal-length rows execute as a physical batch; unsupported heterogeneous shapes
 fail rather than silently running serially under a batched label.
 
-The reference runner is useful for model loading, greedy-output comparison, and
-small correctness work. It does not exercise Resin's managed cache pool.
+The reference runner is useful for model loading, sampling-output comparison,
+and small correctness work. It does not exercise Resin's managed cache pool.
 
 ## CUDA runner
 
@@ -80,7 +80,8 @@ The managed runner keeps policy boundaries narrow:
   FlashAttention-4.
 - The model's MXFP4 expert path may use the configured FlashInfer fused-MoE
   adapter.
-- Greedy sampling remains runner-owned.
+- Shared FlashInfer logits processing applies each row's temperature, top-k,
+  top-p, seed, and offset. Temperature zero selects argmax.
 - Configured decode shapes use Resin's reusable CUDA graph cache: the backend
   declares stable tensors and one device launch, then the shared cache stages,
   warms, captures, validates, and replays it automatically.

@@ -38,6 +38,8 @@ class BatchPlan:
         cache_pool_id: int | None = None,
         cache_groups: Sequence[CacheGroupPlan] | None = None,
         sample_sequence_indices: Sequence[int] | None = None,
+        sampling_params: Sequence[SamplingParams] | None = None,
+        sampling_offsets: Sequence[int] | None = None,
     ) -> BatchPlan: ...
     def __repr__(self, /) -> str: ...
     @property
@@ -60,6 +62,10 @@ class BatchPlan:
     def positions(self, /) -> list[int]: ...
     @property
     def sample_sequence_indices(self, /) -> list[int]: ...
+    @property
+    def sampling_offsets(self, /) -> list[int]: ...
+    @property
+    def sampling_params(self, /) -> tuple[SamplingParams, ...]: ...
     @property
     def sequence_ids(self, /) -> list[int]: ...
     @property
@@ -210,6 +216,7 @@ class Engine:
         state_access_modes: Sequence[str] | None = None,
         priority: int = 0,
         batch_key: int | None = None,
+        sampling_params: SamplingParams | None = None,
     ) -> RequestLease: ...
 
 @final
@@ -238,6 +245,36 @@ class RequestLease:
         """
         Consume the completed token buffer exactly once.
         """
+
+@final
+class SamplingParams:
+    """
+    Per-request output-token sampling policy.
+
+    A zero temperature selects the maximum-logit token. Positive temperatures
+    enable stochastic sampling after optional top-k and top-p filtering.
+    """
+    def __new__(
+        cls,
+        /,
+        *,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int | None = None,
+        seed: int | None = None,
+        extra: Any | None = None,
+    ) -> SamplingParams: ...
+    def __repr__(self, /) -> str: ...
+    @property
+    def extra(self, /) -> Any | None: ...
+    @property
+    def seed(self, /) -> int | None: ...
+    @property
+    def temperature(self, /) -> float: ...
+    @property
+    def top_k(self, /) -> int | None: ...
+    @property
+    def top_p(self, /) -> float: ...
 
 @final
 class SchedulerConfig:
@@ -323,4 +360,7 @@ class TokenEvent:
     @property
     def token_id(self, /) -> int: ...
 
-def mint_state_mapping_arena_id() -> int: ...
+def mint_state_mapping_arena_id() -> int:
+    """
+    Return a new process-unique identity for a backend mapped-state arena.
+    """

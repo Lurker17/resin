@@ -31,7 +31,7 @@ from deploy.jit_cache import (
     run_cache_reuse_probe,
     run_cached_workload,
 )
-from resin import Engine, SchedulerConfig, TokenEvent
+from resin import Engine, SamplingParams, SchedulerConfig, TokenEvent
 from resin.backend.cuda.graphs import CudaGraphStats
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.models.gpt_oss.plan import PAGE_SIZE, WINDOW_TABLE_WIDTH
@@ -442,6 +442,7 @@ def _run_prompt(
     max_new_tokens: int,
     context_length: int,
     schedule_conservativeness: float,
+    sampling_params: SamplingParams,
     tensor_parallel: TensorParallelContext,
 ) -> dict[str, object]:
     if len(prompt_ids) + max_new_tokens - 1 > context_length:
@@ -471,7 +472,11 @@ def _run_prompt(
         # the first request batch.
         _capture_cuda_graphs(runner)
         # Warm the real prefill path before timing request execution.
-        warmup = engine.submit(prompt_ids, max_new_tokens=2)
+        warmup = engine.submit(
+            prompt_ids,
+            max_new_tokens=2,
+            sampling_params=sampling_params,
+        )
         while engine.has_work():
             engine.step()
         warmup.take_result()
@@ -479,7 +484,11 @@ def _run_prompt(
         tensor_parallel.barrier()
 
         start = time.perf_counter()
-        request = engine.submit(prompt_ids, max_new_tokens=max_new_tokens)
+        request = engine.submit(
+            prompt_ids,
+            max_new_tokens=max_new_tokens,
+            sampling_params=sampling_params,
+        )
         while engine.has_work():
             events = engine.step()
             if events and first_token_time is None:
@@ -535,6 +544,12 @@ def _run_prompt(
             "checkpoint": model_cache,
             "prompt_tokens": len(prompt_ids),
             "max_new_tokens": max_new_tokens,
+            "sampling": {
+                "temperature": sampling_params.temperature,
+                "top_p": sampling_params.top_p,
+                "top_k": sampling_params.top_k,
+                "seed": sampling_params.seed,
+            },
             "output_tokens": len(output_ids),
             "_output_ids": output_ids,
             "cuda_graph": runner.cuda_graph_stats,
@@ -811,6 +826,10 @@ def _run_prompt_rank(
     max_new_tokens: int,
     context_length: int,
     schedule_conservativeness: float,
+    temperature: float,
+    top_p: float,
+    top_k: int | None,
+    seed: int | None,
 ) -> None:
     tensor_parallel = _initialize_tensor_parallel(
         rank, tensor_parallel_size, master_port
@@ -824,6 +843,12 @@ def _run_prompt_rank(
         max_new_tokens,
         context_length,
         schedule_conservativeness,
+        SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+        ),
         tensor_parallel,
     )
     tensor_parallel.barrier()
@@ -844,6 +869,10 @@ def _launch_tensor_parallel_prompt(
     max_new_tokens: int,
     context_length: int,
     schedule_conservativeness: float,
+    temperature: float,
+    top_p: float,
+    top_k: int | None,
+    seed: int | None,
 ) -> dict[str, object]:
     master_port = _free_local_port()
     with tempfile.TemporaryDirectory(prefix="resin-tp-") as directory:
@@ -861,6 +890,10 @@ def _launch_tensor_parallel_prompt(
                 max_new_tokens,
                 context_length,
                 schedule_conservativeness,
+                temperature,
+                top_p,
+                top_k,
+                seed,
             ),
             nprocs=tensor_parallel_size,
             join=True,
@@ -1109,8 +1142,18 @@ def _run_model(
     max_new_tokens: int = 256,
     context_length: int = 32768,
     schedule_conservativeness: float = 1.0,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int | None = None,
+    seed: int | None = None,
 ) -> dict[str, object]:
     _validate_tensor_parallel_size(tensor_parallel_size)
+    sampling_params = SamplingParams(
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        seed=seed,
+    )
 
     def workload() -> dict[str, object]:
         # Volume v2 does not preserve the nanosecond mtimes Ninja uses to
@@ -1131,6 +1174,7 @@ def _run_model(
                 max_new_tokens,
                 context_length,
                 schedule_conservativeness,
+                sampling_params,
                 TensorParallelContext(),
             )
         else:
@@ -1143,6 +1187,10 @@ def _run_model(
                 max_new_tokens,
                 context_length,
                 schedule_conservativeness,
+                temperature,
+                top_p,
+                top_k,
+                seed,
             )
         return _render_prompt_report(
             report,
@@ -1167,6 +1215,10 @@ def run_model(
     max_new_tokens: int = 256,
     context_length: int = 32768,
     schedule_conservativeness: float = 1.0,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int | None = None,
+    seed: int | None = None,
 ) -> dict[str, object]:
     return _run_model(
         1,
@@ -1175,6 +1227,10 @@ def run_model(
         max_new_tokens,
         context_length,
         schedule_conservativeness,
+        temperature,
+        top_p,
+        top_k,
+        seed,
     )
 
 
@@ -1191,6 +1247,10 @@ def run_model_tp2(
     max_new_tokens: int = 256,
     context_length: int = 32768,
     schedule_conservativeness: float = 1.0,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int | None = None,
+    seed: int | None = None,
 ) -> dict[str, object]:
     return _run_model(
         2,
@@ -1199,6 +1259,10 @@ def run_model_tp2(
         max_new_tokens,
         context_length,
         schedule_conservativeness,
+        temperature,
+        top_p,
+        top_k,
+        seed,
     )
 
 
@@ -1215,6 +1279,10 @@ def run_model_tp4(
     max_new_tokens: int = 256,
     context_length: int = 32768,
     schedule_conservativeness: float = 1.0,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int | None = None,
+    seed: int | None = None,
 ) -> dict[str, object]:
     return _run_model(
         4,
@@ -1223,6 +1291,10 @@ def run_model_tp4(
         max_new_tokens,
         context_length,
         schedule_conservativeness,
+        temperature,
+        top_p,
+        top_k,
+        seed,
     )
 
 
@@ -1239,6 +1311,10 @@ def run_model_tp8(
     max_new_tokens: int = 256,
     context_length: int = 32768,
     schedule_conservativeness: float = 1.0,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int | None = None,
+    seed: int | None = None,
 ) -> dict[str, object]:
     return _run_model(
         8,
@@ -1247,6 +1323,10 @@ def run_model_tp8(
         max_new_tokens,
         context_length,
         schedule_conservativeness,
+        temperature,
+        top_p,
+        top_k,
+        seed,
     )
 
 
@@ -1381,6 +1461,10 @@ def main(
     batch_sizes: str = "1,2,8,16,32",
     context_length: int = 32768,
     schedule_conservativeness: float = 1.0,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int | None = None,
+    seed: int | None = None,
     tp: int = 1,
     profile_decode_steps: int = 0,
 ) -> None:
@@ -1404,6 +1488,10 @@ def main(
             max_new_tokens,
             context_length,
             schedule_conservativeness,
+            temperature,
+            top_p,
+            top_k,
+            seed,
         )
     elif mode == "bench":
         _validate_tensor_parallel_size(tp)

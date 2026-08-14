@@ -45,9 +45,9 @@ from resin.backend.cuda.graphs import (
 )
 from resin.backend.cuda.paged_kv import PagedKvArena, PagedKvTable
 from resin.backend.cuda.parallel import TensorParallelContext
+from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.loading import default_device
-from resin.backend.sampling import GreedySampler
 from resin.models.gpt_oss.config import GptOssConfig
 from resin.models.gpt_oss.cutile import top4_softmax
 from resin.models.gpt_oss.model import MLP, TopKRouter
@@ -302,7 +302,7 @@ class GptOssCudaRunner:
         from flash_attn.cute import flash_attn_varlen_func
 
         self._torch = torch
-        self._sampler = GreedySampler(torch)
+        self._sampler = FlashInferSampler(torch)
         self._fa4 = flash_attn_varlen_func
         self.device = torch.device(device or default_device(torch, require_cuda=True))
         if self.device.type != "cuda":
@@ -436,7 +436,9 @@ class GptOssCudaRunner:
         return self._graphs.stats
 
     @staticmethod
-    def _graph_capture_inputs(shape: GraphShape) -> dict[str, tuple[int, ...]]:
+    def _graph_capture_inputs(
+        shape: GraphShape, vocab_size: int = 201_088
+    ) -> dict[str, tuple]:
         """Return valid synthetic decode inputs backed only by null page zero."""
 
         batch_size, full_width = shape
@@ -453,6 +455,12 @@ class GptOssCudaRunner:
             "sliding_seqused_k": (1,) * batch_size,
             "full_append_slots": zeros,
             "sliding_append_slots": zeros,
+            "sampling_temperatures": (1.0,) * batch_size,
+            "sampling_top_ps": (1.0,) * batch_size,
+            "sampling_top_ks": (vocab_size,) * batch_size,
+            "sampling_seeds": zeros,
+            "sampling_offsets": zeros,
+            "sampling_stochastic_mask": (True,) * batch_size,
         }
 
     def capture_cuda_graphs(self) -> CudaGraphStats:
@@ -461,7 +469,9 @@ class GptOssCudaRunner:
         already_captured = set(self._graphs.stats["captured_shapes"])
         for shape in self._graphs.shapes:
             if shape not in already_captured:
-                self._graphs.capture(shape, self._graph_capture_inputs(shape))
+                self._graphs.capture(
+                    shape, self._graph_capture_inputs(shape, self.vocab_size)
+                )
         if self._graphs.shapes:
             # Capture writes synthetic K/V to parent zero, which the native
             # allocator permanently reserves. Restore its null-page contract
@@ -771,26 +781,37 @@ class GptOssCudaRunner:
         positions = empty(torch.long, batch_size)
         final_hidden = empty(torch.bfloat16, batch_size, self.hidden_size)
         output_ids = empty(torch.long, batch_size)
+        sampling = (
+            self._sampler.empty(batch_size, self.device)
+            if hasattr(self._sampler, "empty")
+            else None
+        )
 
         def launch() -> None:
             hidden = self._forward_batch(token_ids, positions, batch)
             final_hidden.index_copy_(0, batch.sequence_indices, hidden)
             logits = self._model.lm_head(final_hidden)
-            self._sampler(logits, out=output_ids)
+            if sampling is None:
+                self._sampler(logits, out=output_ids)
+            else:
+                self._sampler.sample_tensors(logits, sampling, out=output_ids)
 
+        inputs = {
+            "token_ids": token_ids,
+            "positions": positions,
+            "token_indices": batch.token_indices,
+            "sequence_indices": batch.sequence_indices,
+            "full_page_table": batch.full.page_table,
+            "full_seqused_k": batch.full.lengths,
+            "sliding_page_table": batch.sliding.page_table,
+            "sliding_seqused_k": batch.sliding.lengths,
+            "full_append_slots": batch.full.append_slots,
+            "sliding_append_slots": batch.sliding.append_slots,
+        }
+        if sampling is not None:
+            inputs.update(self._sampler.graph_inputs(sampling))
         return CudaGraphStep(
-            inputs={
-                "token_ids": token_ids,
-                "positions": positions,
-                "token_indices": batch.token_indices,
-                "sequence_indices": batch.sequence_indices,
-                "full_page_table": batch.full.page_table,
-                "full_seqused_k": batch.full.lengths,
-                "sliding_page_table": batch.sliding.page_table,
-                "sliding_seqused_k": batch.sliding.lengths,
-                "full_append_slots": batch.full.append_slots,
-                "sliding_append_slots": batch.sliding.append_slots,
-            },
+            inputs=inputs,
             output=output_ids,
             launch=launch,
         )
@@ -811,21 +832,21 @@ class GptOssCudaRunner:
         if shape is None:
             self._graphs.fallback("shape")
             return None
-        return self._graphs.run(
-            shape,
-            {
-                "token_ids": plan.token_ids,
-                "positions": plan.positions,
-                "token_indices": host.token_indices,
-                "sequence_indices": host.sequence_indices,
-                "full_page_table": self._pad_page_table(host, shape[1]),
-                "full_seqused_k": host.full_lengths,
-                "sliding_page_table": host.sliding_table,
-                "sliding_seqused_k": host.sliding_lengths,
-                "full_append_slots": host.full_append_slots,
-                "sliding_append_slots": host.sliding_append_slots,
-            },
-        )
+        inputs = {
+            "token_ids": plan.token_ids,
+            "positions": plan.positions,
+            "token_indices": host.token_indices,
+            "sequence_indices": host.sequence_indices,
+            "full_page_table": self._pad_page_table(host, shape[1]),
+            "full_seqused_k": host.full_lengths,
+            "sliding_page_table": host.sliding_table,
+            "sliding_seqused_k": host.sliding_lengths,
+            "full_append_slots": host.full_append_slots,
+            "sliding_append_slots": host.sliding_append_slots,
+        }
+        if hasattr(self._sampler, "host_inputs"):
+            inputs.update(self._sampler.host_inputs(plan, self.vocab_size))
+        return self._graphs.run(shape, inputs)
 
     def forward(self, plan: BatchPlan) -> list[int]:
         self._graphs.check()
@@ -874,7 +895,7 @@ class GptOssCudaRunner:
                     final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
                 logits = self._model.lm_head(final_hidden)
 
-            return self._sampler(logits).tolist()
+            return self._sampler(logits, plan).tolist()
         except BaseException:
             self._synchronize_failed_eager_forward()
             raise

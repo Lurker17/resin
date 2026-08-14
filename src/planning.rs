@@ -114,6 +114,8 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
     let mut sequence_ids = Vec::with_capacity(requests.len());
     let mut sequence_indptr = Vec::with_capacity(requests.len() + 1);
     let mut context_lengths = Vec::with_capacity(requests.len());
+    let mut sampling_params = Vec::with_capacity(requests.len());
+    let mut sampling_offsets = Vec::with_capacity(requests.len());
     let mut sample_sequence_indices = Vec::with_capacity(requests.len());
     let mut state_slots = Vec::new();
     let mut state_generations = Vec::new();
@@ -124,6 +126,8 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
 
     for (sequence_index, (request, scheduled)) in requests.iter().zip(scheduled_rows).enumerate() {
         sequence_ids.push(request.id);
+        sampling_params.push(request.sampling_params.clone());
+        sampling_offsets.push(request.sampling_offset);
         state_slots.extend(
             request
                 .resources
@@ -241,6 +245,8 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
         sequence_ids,
         sequence_indptr,
         context_lengths,
+        sampling_params,
+        sampling_offsets,
         sample_sequence_indices,
         state_slots,
         state_generations,

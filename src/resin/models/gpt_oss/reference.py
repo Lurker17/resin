@@ -18,6 +18,7 @@ from resin.backend.loading import (
     resolve_model,
 )
 from resin.backend.plans import plan_rows
+from resin.backend.sampling import TorchSampler
 from resin.models.gpt_oss.config import GptOssConfig
 from resin.models.gpt_oss.model import GptOssForCausalLM, GptOssState
 
@@ -146,7 +147,7 @@ def load_model(
 
 
 class GptOssRunner:
-    """Greedy GPT-OSS runner consuming Rust-built integer-token batches.
+    """GPT-OSS runner consuming Rust-built integer-token batches.
 
     Equal-length sequences with equally sized KV caches execute in one physical
     batch. Heterogeneous chunks are rejected instead of being mislabeled as a
@@ -180,6 +181,7 @@ class GptOssRunner:
         )
         self.eos_token_id = self.config.get("eos_token_id")
         self.vocab_size = self.config["vocab_size"]
+        self._sampler = TorchSampler(torch)
         self._cache: dict[int, GptOssState] = {}
 
     def forward(self, plan: BatchPlan) -> list[int]:
@@ -218,7 +220,10 @@ class GptOssRunner:
                 position_tensor,
                 logits_to_keep=1,
             )
-        output = logits[:, -1, :].argmax(dim=-1).tolist()
+        sampler = getattr(self, "_sampler", None)
+        if sampler is None:
+            sampler = self._sampler = TorchSampler(torch)
+        output = sampler(logits[:, -1, :], plan).tolist()
 
         for row, cache in zip(rows, request_caches, strict=True):
             if row.cache is None:

@@ -206,8 +206,10 @@ See the [flat cache-pool contract](cache-pool.md) for allocation and plan detail
 `BatchPlan` is frozen. `phase` is one `BatchPhase.PREFILL` or
 `BatchPhase.DECODE` value for the complete batch. Base arrays describe flattened
 tokens and positions, sequence CSR (`sequence_ids`, `sequence_indptr`),
-pre-append context lengths, and `sample_sequence_indices`. Optional state arrays
-provide generation-checked slots, access modes, CSR, and a pool ID.
+pre-append context lengths, and `sample_sequence_indices`. Each sequence row also
+has its request's `SamplingParams`, with an effective seed resolved into it, plus
+the current random offset. Optional state arrays provide generation-checked
+slots, access modes, CSR, and a pool ID.
 
 Managed cache metadata is only:
 
@@ -274,9 +276,9 @@ the local KV-head count. The Modal harness maps TP 1, 2, 4, and 8 to matching
 multi-H200 containers and verifies exact output-token agreement across ranks.
 
 Current limits are one in-flight batch per Engine, private rather than shared
-request cache, greedy runner-owned sampling, no expert parallel or data-parallel
-attention, and no multi-node serving. Tensor parallelism is currently specific
-to the GPT-OSS CUDA backend rather than a native scheduling concept.
+request cache, no expert parallel or data-parallel attention, and no multi-node
+serving. Tensor parallelism is currently specific to the GPT-OSS CUDA backend
+rather than a native scheduling concept.
 Tokenization, chat formatting, detokenization, and text streaming remain outside
 Resin. A completed token buffer is transferred to the caller's `RequestLease`;
 the Engine does not retain completed outputs indefinitely.

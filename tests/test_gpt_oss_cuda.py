@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from resin import BatchPhase
 from resin.backend.resources import CachePoolBinding
-from resin.backend.sampling import GreedySampler
+from resin.backend.sampling import TorchSampler
 from resin.models.gpt_oss.cuda import (
     GptOssCudaRunner,
     _invoke_fa4_b22,
@@ -574,7 +574,7 @@ class GptOssCudaTinyOracleTests(unittest.TestCase):
 
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
         runner._torch = torch
-        runner._sampler = GreedySampler(torch)
+        runner._sampler = TorchSampler(torch)
         runner.device = "cpu"
         runner.hidden_size = 3
         runner._model = SimpleNamespace(lm_head=lambda hidden: hidden)

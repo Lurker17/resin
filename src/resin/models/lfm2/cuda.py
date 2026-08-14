@@ -19,8 +19,8 @@ from resin.backend.checks import token_ids as check_token_ids
 from resin.backend.cuda.execution import CudaCompletion, CudaExecutor
 from resin.backend.cuda.mapped_state import MappedStateArena
 from resin.backend.cuda.paged_kv import PagedKvArena, PagedKvCsr
+from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
-from resin.backend.sampling import GreedySampler
 from resin.models.lfm2.plan import CacheMetadata, build_cache_metadata
 from resin.models.lfm2.reference import (
     DEFAULT_MODEL,
@@ -96,7 +96,7 @@ def _invoke_paged_fa4_b22(
 
 
 class Lfm2CudaRunner:
-    """Greedy BF16 LFM2 runner with FA4 prefill and FlashInfer paged decode."""
+    """BF16 LFM2 runner with FA4 prefill and FlashInfer paged decode."""
 
     supports_continuation_prefill = True
     supports_recurrent_state_mapping = True
@@ -127,7 +127,7 @@ class Lfm2CudaRunner:
         self._torch = torch
         self._flashinfer = flashinfer
         self._fa4 = flash_attn_varlen_func
-        self._sampler = GreedySampler(torch)
+        self._sampler = FlashInferSampler(torch)
         self.device = torch.device("cuda")
         self._stream = torch.cuda.Stream(device=self.device)
         self.page_size = page_size
@@ -507,7 +507,7 @@ class Lfm2CudaRunner:
         logits = torch.nn.functional.linear(
             hidden[final_indices], self._model.model.embed_tokens.weight
         )
-        output = self._sampler(logits)
+        output = self._sampler(logits, plan)
         # Keep the terminal activation chain and device result explicitly alive.
         # PyTorch's stream-aware allocator safely recycles earlier layer-local
         # temporaries in order on this same stream.

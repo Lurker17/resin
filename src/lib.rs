@@ -31,6 +31,16 @@ use state_pool::{
 };
 
 static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
+const SAMPLING_OFFSET_STRIDE: i64 = 32;
+
+fn default_sampling_seed(engine_id: u64, request_id: u64) -> i64 {
+    // SplitMix64 gives stable, well-distributed row seeds without adding a
+    // control-plane RNG or making batch composition part of randomness.
+    let mut value = engine_id ^ request_id.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    ((value ^ (value >> 31)) & i64::MAX as u64) as i64
+}
 
 fn mint_engine_id() -> PyResult<u64> {
     NEXT_ENGINE_ID
@@ -145,6 +155,115 @@ impl BatchPhase {
     }
 }
 
+/// Per-request output-token sampling policy.
+///
+/// A zero temperature selects the maximum-logit token. Positive temperatures
+/// enable stochastic sampling after optional top-k and top-p filtering.
+#[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
+#[derive(Clone, Debug)]
+struct SamplingParams {
+    temperature: f64,
+    top_p: f64,
+    top_k: Option<u32>,
+    seed: Option<i64>,
+    extra: Option<Arc<Py<PyAny>>>,
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            extra: None,
+        }
+    }
+}
+
+#[pymethods]
+impl SamplingParams {
+    #[new]
+    #[pyo3(signature = (*, temperature = 1.0, top_p = 1.0, top_k = None, seed = None, extra = None))]
+    fn new(
+        temperature: f64,
+        top_p: f64,
+        top_k: Option<u32>,
+        seed: Option<i64>,
+        extra: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        if !temperature.is_finite() || temperature < 0.0 {
+            return Err(PyValueError::new_err(
+                "temperature must be finite and non-negative",
+            ));
+        }
+        if !top_p.is_finite() || !(0.0 < top_p && top_p <= 1.0) {
+            return Err(PyValueError::new_err(
+                "top_p must be finite and in the interval (0, 1]",
+            ));
+        }
+        if top_k == Some(0) {
+            return Err(PyValueError::new_err(
+                "top_k must be positive when supplied",
+            ));
+        }
+        if seed.is_some_and(|seed| seed < 0) {
+            return Err(PyValueError::new_err(
+                "seed must be non-negative when supplied",
+            ));
+        }
+        Ok(Self {
+            temperature,
+            top_p,
+            top_k,
+            seed,
+            extra: extra.map(Arc::new),
+        })
+    }
+
+    #[getter]
+    fn temperature(&self) -> f64 {
+        self.temperature
+    }
+
+    #[getter]
+    fn top_p(&self) -> f64 {
+        self.top_p
+    }
+
+    #[getter]
+    fn top_k(&self) -> Option<u32> {
+        self.top_k
+    }
+
+    #[getter]
+    fn seed(&self) -> Option<i64> {
+        self.seed
+    }
+
+    #[getter]
+    fn extra(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.extra
+            .as_ref()
+            .map(|extra| extra.as_ref().clone_ref(py))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SamplingParams(temperature={:?}, top_p={:?}, top_k={:?}, seed={:?}, extra={})",
+            self.temperature,
+            self.top_p,
+            self.top_k,
+            self.seed,
+            if self.extra.is_some() {
+                "<object>"
+            } else {
+                "None"
+            }
+        )
+    }
+}
+
 impl SchedulerConfig {
     fn with_runner_limits(
         self,
@@ -244,6 +363,8 @@ struct BatchPlan {
     sequence_ids: Vec<u64>,
     sequence_indptr: Vec<u32>,
     context_lengths: Vec<u32>,
+    sampling_params: Vec<SamplingParams>,
+    sampling_offsets: Vec<i64>,
     // Rust event/commit mask: runner results remain dense at one token per row,
     // while rows omitted here advance prefill state without sampling a token.
     sample_sequence_indices: Vec<u32>,
@@ -306,6 +427,8 @@ impl BatchPlan {
             sequence_ids,
             sequence_indptr,
             context_lengths,
+            sampling_params,
+            sampling_offsets,
             sample_sequence_indices,
             state_slots,
             state_generations,
@@ -347,6 +470,26 @@ impl BatchPlan {
         if context_lengths.len() != sequence_ids.len() {
             return Err(PyValueError::new_err(
                 "context_lengths must contain one item per sequence",
+            ));
+        }
+        if sampling_params.len() != sequence_ids.len() {
+            return Err(PyValueError::new_err(
+                "sampling_params must contain one item per sequence",
+            ));
+        }
+        if sampling_offsets.len() != sequence_ids.len() {
+            return Err(PyValueError::new_err(
+                "sampling_offsets must contain one item per sequence",
+            ));
+        }
+        if sampling_params.iter().any(|params| params.seed.is_none()) {
+            return Err(PyValueError::new_err(
+                "sampling_params must contain an effective seed for every sequence",
+            ));
+        }
+        if sampling_offsets.iter().any(|offset| *offset < 0) {
+            return Err(PyValueError::new_err(
+                "sampling_offsets must be non-negative",
             ));
         }
         validate_sequence_indices(
@@ -507,7 +650,9 @@ impl BatchPlan {
         state_access_modes = None,
         cache_pool_id = None,
         cache_groups = None,
-        sample_sequence_indices = None
+        sample_sequence_indices = None,
+        sampling_params = None,
+        sampling_offsets = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -529,6 +674,8 @@ impl BatchPlan {
         cache_pool_id: Option<u64>,
         cache_groups: Option<Vec<Py<CacheGroupPlan>>>,
         sample_sequence_indices: Option<Vec<u32>>,
+        sampling_params: Option<Vec<Py<SamplingParams>>>,
+        sampling_offsets: Option<Vec<i64>>,
     ) -> PyResult<Self> {
         let sequence_count = sequence_ids.len();
         let (state_slots, state_generations, state_indptr) = match (
@@ -556,6 +703,21 @@ impl BatchPlan {
             .collect();
         let sample_sequence_indices = sample_sequence_indices
             .unwrap_or_else(|| (0..sequence_count as u32).collect::<Vec<_>>());
+        let mut sampling_params = sampling_params
+            .map(|params| {
+                params
+                    .into_iter()
+                    .map(|params| params.borrow(py).clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![SamplingParams::default(); sequence_count]);
+        let seed_engine_id = engine_id.unwrap_or(0);
+        for (params, sequence_id) in sampling_params.iter_mut().zip(&sequence_ids) {
+            params
+                .seed
+                .get_or_insert_with(|| default_sampling_seed(seed_engine_id, *sequence_id));
+        }
+        let sampling_offsets = sampling_offsets.unwrap_or_else(|| vec![0; sequence_count]);
         Self::checked(Self {
             batch_id,
             batch_key,
@@ -566,6 +728,8 @@ impl BatchPlan {
             sequence_ids,
             sequence_indptr,
             context_lengths,
+            sampling_params,
+            sampling_offsets,
             sample_sequence_indices,
             state_slots,
             state_generations,
@@ -620,6 +784,22 @@ impl BatchPlan {
     #[getter]
     fn context_lengths(&self) -> Vec<u32> {
         self.context_lengths.clone()
+    }
+
+    #[getter]
+    fn sampling_params(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        let params = self
+            .sampling_params
+            .iter()
+            .cloned()
+            .map(|params| Py::new(py, params))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(PyTuple::new(py, params)?.unbind())
+    }
+
+    #[getter]
+    fn sampling_offsets(&self) -> Vec<i64> {
+        self.sampling_offsets.clone()
     }
 
     #[getter]
@@ -851,6 +1031,8 @@ struct RequestData {
     resident_tokens: u32,
     generated: Vec<u32>,
     max_new_tokens: usize,
+    sampling_params: SamplingParams,
+    sampling_offset: i64,
     cancel_pending: bool,
 }
 
@@ -993,6 +1175,7 @@ struct PreparedProgress {
     apply: bool,
     resident_tokens: u32,
     sampled_token: Option<u32>,
+    sampling_offset: Option<i64>,
 }
 
 struct InFlightData {
@@ -1155,7 +1338,8 @@ impl Engine {
         state_handles = None,
         state_access_modes = None,
         priority = 0,
-        batch_key = None
+        batch_key = None,
+        sampling_params = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn submit(
@@ -1167,6 +1351,7 @@ impl Engine {
         state_access_modes: Option<Vec<String>>,
         priority: i32,
         batch_key: Option<u64>,
+        sampling_params: Option<Py<SamplingParams>>,
     ) -> PyResult<Py<RequestLease>> {
         self.raise_if_open()?;
         if token_ids.is_empty() {
@@ -1202,6 +1387,12 @@ impl Engine {
             .map(|handle| handle.borrow(py).inner())
             .collect::<Vec<_>>();
         let state_access_modes = parse_state_access_modes(state_access_modes, state_handles.len())?;
+        let mut sampling_params = sampling_params
+            .map(|params| params.borrow(py).clone())
+            .unwrap_or_default();
+        sampling_params
+            .seed
+            .get_or_insert_with(|| default_sampling_seed(self.engine_id, request_id));
         if let Some(mapping) = &self.recurrent_state_mapping
             && (state_handles.len() != mapping.access_modes.len()
                 || state_access_modes != mapping.access_modes)
@@ -1293,6 +1484,8 @@ impl Engine {
                 resident_tokens: 0,
                 generated: Vec::new(),
                 max_new_tokens,
+                sampling_params,
+                sampling_offset: 0,
                 cancel_pending: false,
             },
             resources: ResourceSet {
@@ -2309,6 +2502,7 @@ impl Engine {
                     apply: false,
                     resident_tokens: request.resident_tokens,
                     sampled_token: None,
+                    sampling_offset: None,
                 });
                 continue;
             }
@@ -2317,10 +2511,19 @@ impl Engine {
                     PyMemoryError::new_err("could not reserve generated-token storage")
                 })?;
             }
+            let sampling_offset = (scheduled.sample && request.sampling_params.temperature > 0.0)
+                .then(|| {
+                    request
+                        .sampling_offset
+                        .checked_add(SAMPLING_OFFSET_STRIDE)
+                        .ok_or_else(|| PyValueError::new_err("sampling offset space is exhausted"))
+                })
+                .transpose()?;
             prepared.push(PreparedProgress {
                 apply: true,
                 resident_tokens: token_end,
                 sampled_token: scheduled.sample.then_some(token_id),
+                sampling_offset,
             });
         }
         Ok(prepared)
@@ -2335,6 +2538,9 @@ impl Engine {
             row.request.resident_tokens = progress.resident_tokens;
             if let Some(token_id) = progress.sampled_token {
                 row.request.generated.push(token_id);
+            }
+            if let Some(sampling_offset) = progress.sampling_offset {
+                row.request.sampling_offset = sampling_offset;
             }
         }
     }
@@ -2501,6 +2707,7 @@ impl Drop for Engine {
     }
 }
 
+/// Return a new process-unique identity for a backend mapped-state arena.
 #[pyfunction]
 fn mint_state_mapping_arena_id() -> PyResult<u64> {
     state_pool::mint_state_mapping_arena_id()
@@ -2511,7 +2718,7 @@ mod _resin {
     #[pymodule_export]
     use super::{
         BatchPhase, BatchPlan, CacheGroupLayout, CacheGroupPlan, CacheLayout, Engine, RequestLease,
-        SchedulerConfig, StateHandle, StateMappingConfig, StatePool, TokenEvent,
+        SamplingParams, SchedulerConfig, StateHandle, StateMappingConfig, StatePool, TokenEvent,
         mint_state_mapping_arena_id,
     };
 
@@ -2542,6 +2749,11 @@ mod tests {
                 },
                 generated: generated.to_vec(),
                 max_new_tokens: 8,
+                sampling_params: SamplingParams {
+                    seed: Some(default_sampling_seed(0, id)),
+                    ..SamplingParams::default()
+                },
+                sampling_offset: 0,
                 cancel_pending: false,
             },
             resources: ResourceSet {
