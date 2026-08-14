@@ -1162,6 +1162,7 @@ class MoE(nn.Module):
         self.n_activated_experts = args.n_activated_experts
         self.swiglu_limit = args.swiglu_limit
         self.allreduce: Callable[[torch.Tensor], torch.Tensor] = _distributed_sum
+        self.decode_overlap_stream: torch.cuda.Stream | None = None
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(layer_id, args)
@@ -1300,6 +1301,16 @@ class MoE(nn.Module):
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
+        main_stream = None
+        shared = None
+        if x.shape[0] == 1 and self.decode_overlap_stream is not None:
+            # The shared expert does not depend on routing, so decode can hide
+            # it behind the routed experts and their tensor-parallel reduction.
+            main_stream = torch.cuda.current_stream(x.device)
+            self.decode_overlap_stream.wait_stream(main_stream)
+            with torch.cuda.stream(self.decode_overlap_stream):
+                shared = self.shared_experts(x)
+
         weights, indices = self.gate(x, input_ids.flatten())
         if self._fused_fp4:
             y = self._fused_experts(x, weights, indices)
@@ -1316,7 +1327,12 @@ class MoE(nn.Module):
                 y[idx] += expert(x[idx], weights[idx, top, None])
         if world_size > 1:
             y = self.allreduce(y)
-        y += self.shared_experts(x)
+        if main_stream is None:
+            shared = self.shared_experts(x)
+        else:
+            main_stream.wait_stream(self.decode_overlap_stream)
+        assert shared is not None
+        y += shared
         return y.type_as(x).view(shape)
 
 
@@ -1490,6 +1506,7 @@ class Transformer(nn.Module):
         for layer in self.layers:
             layer.attn.attention_workspace = self._attention_workspace
             layer.attn.decode_overlap_stream = self._decode_overlap_stream
+            layer.ffn.decode_overlap_stream = self._decode_overlap_stream
         self.norm = RMSNorm(args.dim, args.norm_eps)
         self.head = ParallelHead(args.vocab_size, args.dim)
         self.hc_mult = hc_mult = args.hc_mult
