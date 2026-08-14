@@ -340,10 +340,15 @@ def apply_rotary_emb(
     x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     if inverse:
         freqs_cis = freqs_cis.conj()
+    row_aligned = x.size(1) == 1 and freqs_cis.size(0) == x.size(0)
     if x.ndim == 3:
-        freqs_cis = freqs_cis.view(1, x.size(1), x.size(-1))
+        freqs_cis = freqs_cis.view(
+            x.size(0) if row_aligned else 1, x.size(1), x.size(-1)
+        )
     else:
-        freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+        freqs_cis = freqs_cis.view(
+            x.size(0) if row_aligned else 1, x.size(1), 1, x.size(-1)
+        )
     x = torch.view_as_real(x * freqs_cis).flatten(-2)
     y.copy_(x)
     return y
@@ -394,14 +399,16 @@ def get_decode_window_topk_idxs(
 ) -> torch.Tensor:
     """Build one fixed-width ring-cache row from a staged device position."""
 
-    logical = torch.arange(window_size, dtype=torch.long, device=position.device)
+    logical = torch.arange(
+        window_size, dtype=torch.long, device=position.device
+    ).unsqueeze(0)
     start = torch.where(
         position >= window_size - 1,
         (position + 1).remainder(window_size),
         torch.zeros_like(position),
-    )
+    ).unsqueeze(1)
     physical = (logical + start).remainder(window_size)
-    return physical.to(torch.int32).view(1, 1, -1)
+    return physical.to(torch.int32).unsqueeze(1)
 
 
 def get_decode_compress_topk_idxs(
@@ -412,12 +419,12 @@ def get_decode_compress_topk_idxs(
 ) -> torch.Tensor:
     """Build a graph-static compressed-cache row and mask unfinished groups."""
 
-    logical = torch.arange(width, dtype=torch.long, device=position.device)
-    complete = (position + 1).div(ratio, rounding_mode="floor")
+    logical = torch.arange(width, dtype=torch.long, device=position.device).unsqueeze(0)
+    complete = (position + 1).div(ratio, rounding_mode="floor").unsqueeze(1)
     return (
         torch.where(logical < complete, logical + offset, -1)
         .to(torch.int32)
-        .view(1, 1, -1)
+        .unsqueeze(1)
     )
 
 
@@ -599,11 +606,11 @@ class Compressor(nn.Module):
             kv,
             score,
             self.ape,
-            self.kv_state[:1],
-            self.score_state[:1],
+            self.kv_state[: x.shape[0]],
+            self.score_state[: x.shape[0]],
             self.norm.weight,
             torch.view_as_real(self.freqs_cis),
-            self.kv_cache[:1],
+            self.kv_cache[: x.shape[0]],
             position,
             self.compress_ratio,
             self.rotate,
@@ -712,14 +719,14 @@ class Indexer(torch.nn.Module):
         index_score = torch.einsum("bshd,btd->bsht", q, cache)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         complete = (position + 1).div(ratio, rounding_mode="floor")
-        valid = torch.arange(width, device=x.device) < complete
-        index_score = index_score.masked_fill(~valid.view(1, 1, width), float("-inf"))
+        valid = torch.arange(width, device=x.device).unsqueeze(0) < complete.unsqueeze(1)
+        index_score = index_score.masked_fill(~valid.unsqueeze(1), float("-inf"))
         if world_size > 1:
             index_score = self.allreduce(index_score)
         topk_width = min(self.index_topk, width)
         topk_idxs = index_score.topk(topk_width, dim=-1)[1]
         return torch.where(
-            topk_idxs < complete.view(1, 1, 1),
+            topk_idxs < complete.view(bsz, 1, 1),
             topk_idxs + offset,
             -1,
         ).to(torch.int32)
@@ -802,14 +809,23 @@ class Attention(nn.Module):
             else:
                 self.indexer = None
 
-        kv_cache_size = args.window_size + (
-            args.max_seq_len // self.compress_ratio if self.compress_ratio else 0
-        )
         self.register_buffer(
             "kv_cache",
-            torch.zeros(args.max_batch_size, kv_cache_size, self.head_dim),
+            torch.zeros(args.max_batch_size, args.window_size, self.head_dim),
             persistent=False,
         )
+        if self.compress_ratio:
+            self.register_buffer(
+                "compressed_kv_cache",
+                torch.zeros(
+                    args.max_batch_size,
+                    args.max_seq_len // self.compress_ratio,
+                    self.head_dim,
+                ),
+                persistent=False,
+            )
+        else:
+            self.compressed_kv_cache = None
         self.attention_workspace: torch.Tensor = None
         self.decode_overlap_stream: torch.cuda.Stream | None = None
         if self.compress_ratio:
@@ -838,7 +854,7 @@ class Attention(nn.Module):
         ratio = self.compress_ratio
         rd = self.rope_head_dim
         if self.compress_ratio and self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.kv_cache[:, win:]
+            self.compressor.kv_cache = self.compressed_kv_cache
             self.compressor.freqs_cis = self.freqs_cis
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
@@ -887,8 +903,13 @@ class Attention(nn.Module):
             self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
             if self.compress_ratio:
                 self.compressor(x, start_pos)
+                attention_cache = torch.cat(
+                    (self.kv_cache[:bsz], self.compressed_kv_cache[:bsz]), dim=1
+                )
+            else:
+                attention_cache = self.kv_cache[:bsz]
             o = sparse_attn(
-                q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale
+                q, attention_cache, self.attn_sink, topk_idxs, self.softmax_scale
             )
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
 
@@ -911,7 +932,7 @@ class Attention(nn.Module):
         bsz, _, _ = x.size()
         win, ratio, rd = self.window_size, self.compress_ratio, self.rope_head_dim
         if ratio and self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.kv_cache[:, win:]
+            self.compressor.kv_cache = self.compressed_kv_cache
             self.compressor.freqs_cis = self.freqs_cis
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
@@ -927,8 +948,9 @@ class Attention(nn.Module):
         compress_topk_idxs = None
         main_stream = None
         if ratio:
+            assert self.compressed_kv_cache is not None
             compressed_width = min(
-                self.kv_cache.shape[1] - win,
+                self.compressed_kv_cache.shape[1],
                 math.ceil(graph_seq_len / ratio / 4) * 4,
             )
             assert self.decode_overlap_stream is not None
@@ -961,6 +983,14 @@ class Attention(nn.Module):
             self.eps,
         )
         topk_idxs = get_decode_window_topk_idxs(win, position)
+        cache_rows = None
+        if bsz > 1:
+            cache_rows = torch.arange(bsz, dtype=torch.int32, device=x.device).view(
+                bsz, 1, 1
+            )
+            # FlashInfer sees each dense sequence row as one page in a shared pool,
+            # so sparse indices are physical pool offsets rather than row-local IDs.
+            topk_idxs += cache_rows * win
 
         compressed_complete = torch.zeros_like(position)
         if ratio:
@@ -970,12 +1000,19 @@ class Attention(nn.Module):
             )
             assert main_stream is not None and compress_topk_idxs is not None
             main_stream.wait_stream(self.decode_overlap_stream)
+            if cache_rows is not None:
+                compress_topk_idxs = torch.where(
+                    compress_topk_idxs >= 0,
+                    compress_topk_idxs
+                    + cache_rows * self.compressed_kv_cache.shape[1],
+                    -1,
+                )
             topk_idxs = torch.cat((topk_idxs, compress_topk_idxs), dim=-1)
 
         assert self.attention_workspace is not None
         window_cache = self.kv_cache[:bsz, :win]
         compressed_cache = (
-            self.kv_cache[:bsz, win : win + compressed_width] if ratio else window_cache
+            self.compressed_kv_cache[:bsz] if ratio else window_cache
         )
         o = sparse_decode_attention(
             q,
@@ -1023,13 +1060,17 @@ class Gate(nn.Module):
             )
 
     def forward(
-        self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+        *,
+        optimized: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         scores = linear(x.float(), self.weight.float())
         if (
-            scores.is_cuda
-            and scores.shape[0] == 1
-            and (scores.shape[1] & (scores.shape[1] - 1)) == 0
+            optimized
+            and scores.is_cuda
+            and (scores.shape[-1] & (scores.shape[-1] - 1)) == 0
             and self.topk == 6
             and self.score_func == "sqrtsoftplus"
             and self.bias is not None
@@ -1312,7 +1353,7 @@ class MoE(nn.Module):
         x = x.view(-1, self.dim)
         main_stream = None
         shared = None
-        if x.shape[0] == 1 and self.decode_overlap_stream is not None:
+        if shape[1] == 1 and self.decode_overlap_stream is not None:
             # The shared expert does not depend on routing, so decode can hide
             # it behind the routed experts and their tensor-parallel reduction.
             main_stream = torch.cuda.current_stream(x.device)
@@ -1320,7 +1361,9 @@ class MoE(nn.Module):
             with torch.cuda.stream(self.decode_overlap_stream):
                 shared = self.shared_experts(x)
 
-        weights, indices = self.gate(x, input_ids.flatten())
+        weights, indices = self.gate(
+            x, input_ids.flatten(), optimized=shape[1] == 1
+        )
         if self._fused_fp4:
             y = self._fused_experts(x, weights, indices)
         else:

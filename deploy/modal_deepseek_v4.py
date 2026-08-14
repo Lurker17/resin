@@ -262,7 +262,7 @@ def _run_rank_workload(
     rank: int,
     model_path: Path,
     checkpoint: dict[str, object],
-    prompt_ids: list[int],
+    prompt_rows: list[list[int]],
     max_new_tokens: int,
     context_length: int,
     sampling_params: SamplingParams,
@@ -274,13 +274,16 @@ def _run_rank_workload(
     if rank == 0:
         print("[deepseek-v4] loading TP=4 checkpoint", flush=True)
     load_start = time.perf_counter()
+    batch_size = len(prompt_rows)
+    graph_capacity = max(len(row) for row in prompt_rows) + max_new_tokens
     runner = DeepSeekV4FlashCudaRunner(
         model_path,
         max_seq_len=context_length,
+        max_batch_size=batch_size,
         tensor_parallel=tensor_parallel,
         device=f"cuda:{rank}",
-        cuda_graph_decode_shapes=(
-            (max(2, len(prompt_ids) + max_new_tokens),),
+        cuda_graph_decode_shapes=tuple(
+            (rows, max(2, graph_capacity)) for rows in range(1, batch_size + 1)
         ),
     )
     torch.cuda.synchronize(runner.device)
@@ -306,10 +309,10 @@ def _run_rank_workload(
 
     engine = Engine(
         runner,
-        max_running_requests=1,
+        max_running_requests=batch_size,
         context_length=context_length,
         scheduler_config=SchedulerConfig(
-            max_batch_tokens=context_length,
+            max_batch_tokens=batch_size * context_length,
             prefill_chunk_size=context_length,
         ),
         eos_token_id=runner.eos_token_id,
@@ -320,11 +323,14 @@ def _run_rank_workload(
         if profile:
             if rank == 0:
                 print("[deepseek-v4] profiling warm prefill/decode", flush=True)
-            profile_request = engine.submit(
-                prompt_ids,
-                max_new_tokens=min(max_new_tokens, 8),
-                sampling_params=sampling_params,
-            )
+            profile_requests = [
+                engine.submit(
+                    row,
+                    max_new_tokens=min(max_new_tokens, 8),
+                    sampling_params=sampling_params,
+                )
+                for row in prompt_rows
+            ]
             if rank == 0:
                 with torch.profiler.profile(
                     activities=(
@@ -362,7 +368,8 @@ def _run_rank_workload(
                         sort_by="self_cuda_time_total",
                         row_limit=30,
                     )
-            profile_request.take_result()
+            for request in profile_requests:
+                request.take_result()
             tensor_parallel.barrier()
             if rank == 0:
                 print("[deepseek-v4] profiling complete", flush=True)
@@ -371,11 +378,14 @@ def _run_rank_workload(
         if rank == 0:
             print("[deepseek-v4] starting clean timed request", flush=True)
         start = time.perf_counter()
-        request = engine.submit(
-            prompt_ids,
-            max_new_tokens=max_new_tokens,
-            sampling_params=sampling_params,
-        )
+        requests = [
+            engine.submit(
+                row,
+                max_new_tokens=max_new_tokens,
+                sampling_params=sampling_params,
+            )
+            for row in prompt_rows
+        ]
         while engine.has_work():
             events = engine.step()
             if events and first_token_time is None:
@@ -386,21 +396,32 @@ def _run_rank_workload(
         decode_elapsed = (
             None if first_token_time is None else time.perf_counter() - first_token_time
         )
-        output_ids = request.take_result()
+        output_rows = [request.take_result() for request in requests]
 
         output_tensor = torch.full(
-            (max_new_tokens,), -1, dtype=torch.int64, device=runner.device
+            (batch_size, max_new_tokens),
+            -1,
+            dtype=torch.int64,
+            device=runner.device,
         )
-        output_tensor[: len(output_ids)] = torch.tensor(
-            output_ids, dtype=torch.int64, device=runner.device
-        )
+        for row, output_ids in enumerate(output_rows):
+            output_tensor[row, : len(output_ids)] = torch.tensor(
+                output_ids, dtype=torch.int64, device=runner.device
+            )
         gathered = torch.empty(
-            TP_SIZE * max_new_tokens, dtype=torch.int64, device=runner.device
+            TP_SIZE * batch_size * max_new_tokens,
+            dtype=torch.int64,
+            device=runner.device,
         )
-        dist.all_gather_single(gathered, output_tensor, group=dist.group.WORLD)
-        rows = gathered.view(TP_SIZE, max_new_tokens)
-        if any(not torch.equal(rows[0], rows[index]) for index in range(1, TP_SIZE)):
+        dist.all_gather_single(gathered, output_tensor.flatten(), group=dist.group.WORLD)
+        rank_outputs = gathered.view(TP_SIZE, batch_size, max_new_tokens)
+        if any(
+            not torch.equal(rank_outputs[0], rank_outputs[index])
+            for index in range(1, TP_SIZE)
+        ):
             raise RuntimeError("tensor-parallel ranks sampled different tokens")
+
+        output_count = sum(map(len, output_rows))
 
         return {
             "model": DEFAULT_MODEL,
@@ -414,9 +435,10 @@ def _run_rank_workload(
             "cuda_graph_capture_ms": capture_elapsed * 1000,
             "cuda_graph": runner.cuda_graph_stats,
             "torch_profile": profile_tables,
-            "prompt_tokens": len(prompt_ids),
-            "output_tokens": len(output_ids),
-            "_output_ids": output_ids,
+            "batch_size": batch_size,
+            "prompt_tokens": [len(row) for row in prompt_rows],
+            "output_tokens": [len(row) for row in output_rows],
+            "_output_ids": output_rows,
             "sampling": {
                 "temperature": sampling_params.temperature,
                 "top_p": sampling_params.top_p,
@@ -427,11 +449,11 @@ def _run_rank_workload(
                 None if first_token_time is None else (first_token_time - start) * 1000
             ),
             "elapsed_ms": elapsed * 1000,
-            "output_tokens_per_second": len(output_ids) / elapsed,
+            "output_tokens_per_second": output_count / elapsed,
             "decode_tokens_per_second": (
                 None
-                if decode_elapsed is None or decode_elapsed <= 0 or len(output_ids) <= 1
-                else (len(output_ids) - 1) / decode_elapsed
+                if decode_elapsed is None or decode_elapsed <= 0 or output_count <= batch_size
+                else (output_count - batch_size) / decode_elapsed
             ),
         }
     finally:
@@ -445,7 +467,7 @@ def _run_rank(
     report_path: Path,
     model_path: Path,
     checkpoint: dict[str, object],
-    prompt_ids: list[int],
+    prompt_rows: list[list[int]],
     max_new_tokens: int,
     context_length: int,
     temperature: float,
@@ -465,7 +487,7 @@ def _run_rank(
         rank,
         model_path,
         checkpoint,
-        prompt_ids,
+        prompt_rows,
         max_new_tokens,
         context_length,
         sampling_params,
@@ -481,7 +503,7 @@ def _run_rank(
 def _launch_tp4(
     model_path: Path,
     checkpoint: dict[str, object],
-    prompt_ids: list[int],
+    prompt_rows: list[list[int]],
     max_new_tokens: int,
     context_length: int,
     temperature: float,
@@ -500,7 +522,7 @@ def _launch_tp4(
                 report_path,
                 model_path,
                 checkpoint,
-                prompt_ids,
+                prompt_rows,
                 max_new_tokens,
                 context_length,
                 temperature,
@@ -538,11 +560,14 @@ def run_model_tp4(
     top_k: int | None = None,
     seed: int | None = 0,
     profile: bool = False,
+    batch_size: int = 1,
 ) -> dict[str, object]:
     if thinking_mode not in {"chat", "thinking"}:
         raise ValueError("thinking_mode must be 'chat' or 'thinking'")
     if reasoning_effort not in {"low", "high", "max"}:
         raise ValueError("reasoning_effort must be 'low', 'high', or 'max'")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     model_path, checkpoint = _require_checkpoint()
     tokenizer = cast(
         PreTrainedTokenizerBase,
@@ -558,13 +583,14 @@ def run_model_tp4(
         thinking_mode,
         reasoning_effort,
     )
-    if len(prompt_ids) + max_new_tokens - 1 > context_length:
+    prompt_rows = [prompt_ids.copy() for _ in range(batch_size)]
+    if max(map(len, prompt_rows)) + max_new_tokens - 1 > context_length:
         raise ValueError("prompt plus max_new_tokens exceeds context_length")
 
     report = _launch_tp4(
         model_path,
         checkpoint,
-        prompt_ids,
+        prompt_rows,
         max_new_tokens,
         context_length,
         temperature,
@@ -573,16 +599,20 @@ def run_model_tp4(
         seed,
         profile,
     )
-    output_ids = cast(list[int], report.pop("_output_ids"))
-    completion = tokenizer.decode(output_ids, skip_special_tokens=False)
-    report["text"] = completion
+    output_rows = cast(list[list[int]], report.pop("_output_ids"))
+    completions = [
+        tokenizer.decode(output_ids, skip_special_tokens=False)
+        for output_ids in output_rows
+    ]
+    report["text"] = completions[0] if batch_size == 1 else completions
     report["thinking_mode"] = thinking_mode
-    try:
-        report["message"] = encoding.parse_message_from_completion_text(
-            completion, thinking_mode=thinking_mode
-        )
-    except (AssertionError, ValueError) as error:
-        report["parse_error"] = str(error)
+    if batch_size == 1:
+        try:
+            report["message"] = encoding.parse_message_from_completion_text(
+                completions[0], thinking_mode=thinking_mode
+            )
+        except (AssertionError, ValueError) as error:
+            report["parse_error"] = str(error)
     kernel_cache_volume.commit()
     return report
 
@@ -600,6 +630,7 @@ def main(
     top_k: int | None = None,
     seed: int | None = 0,
     profile: bool = False,
+    batch_size: int = 1,
 ) -> None:
     if mode == "download":
         report = cache_checkpoint.remote()
@@ -615,6 +646,7 @@ def main(
             top_k,
             seed,
             profile,
+            batch_size,
         )
     else:
         raise ValueError("mode must be 'download' or 'run'")

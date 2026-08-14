@@ -97,10 +97,10 @@ def top6_sqrt_softplus(
     bias: Tensor,
     route_scale: float,
 ) -> tuple[Tensor, Tensor]:
-    """Apply the exact score transform for fixed-capacity single-row decode."""
+    """Apply the exact top-six routing transform to dynamic token rows."""
 
-    if logits.ndim != 2 or logits.shape[0] != 1:
-        raise ValueError("the optimized router requires one fixed decode row")
+    if logits.ndim != 2 or logits.shape[0] == 0:
+        raise ValueError("the optimized router requires nonempty two-dimensional logits")
     rows, num_experts = logits.shape
     if num_experts & (num_experts - 1):
         raise ValueError("the optimized routing expert count must be a power of two")
@@ -251,17 +251,18 @@ def _qk_norm_rope_store_kernel(
     epsilon: float,
 ):
     block = ct.bid(0)
-    token = ct.load(position, (0,), shape=(1,)).item()
+    batch = ct.bid(1)
+    token = ct.load(position, (batch,), shape=(1,)).item()
     if block < heads:
-        value = ct.load(query, (0, 0, block, 0), shape=(1, 1, 1, dimension)).reshape(
-            (dimension,)
-        )
+        value = ct.load(
+            query, (batch, 0, block, 0), shape=(1, 1, 1, dimension)
+        ).reshape((dimension,))
         value = value.astype(ct.float32)
         value *= ct.rsqrt(ct.sum(value * value) / dimension + epsilon)
     else:
-        value = ct.load(key_value, (0, 0, 0), shape=(1, 1, dimension)).reshape(
-            (dimension,)
-        )
+        value = ct.load(
+            key_value, (batch, 0, 0), shape=(1, 1, dimension)
+        ).reshape((dimension,))
         weight = ct.load(norm_weight, (0,), shape=(dimension,)).astype(ct.float32)
         value = value.astype(ct.float32)
         value *= ct.rsqrt(ct.sum(value * value) / dimension + epsilon) * weight
@@ -302,7 +303,7 @@ def _qk_norm_rope_store_kernel(
     if block < heads:
         ct.store(
             query,
-            (0, 0, block, 0),
+            (batch, 0, block, 0),
             value.reshape((1, 1, 1, dimension)).astype(query.dtype),
         )
     else:
@@ -325,7 +326,7 @@ def _qk_norm_rope_store_kernel(
         )
         ct.store(
             cache,
-            (0, token % window, 0),
+            (batch, token % window, 0),
             value.reshape((1, 1, dimension)).astype(cache.dtype),
         )
 
@@ -341,8 +342,14 @@ def qk_norm_rope_store(
 ) -> None:
     """Normalize Q/K, apply RoPE, quantize K, and update the decode cache."""
 
-    if query.shape[:2] != (1, 1) or key_value.shape != (1, 1, query.shape[-1]):
-        raise ValueError("fused Q/K decode requires one token with matching dimensions")
+    batch_size = query.shape[0]
+    if (
+        query.shape[1] != 1
+        or key_value.shape != (batch_size, 1, query.shape[-1])
+        or position.shape != (batch_size,)
+        or cache.shape[0] != batch_size
+    ):
+        raise ValueError("fused Q/K decode requires one token per matching batch row")
     dimension = query.shape[-1]
     rope_dimension = frequencies.shape[-2] * 2
     if dimension != 512 or rope_dimension != 64:
@@ -351,7 +358,7 @@ def qk_norm_rope_store(
         )
     ct.launch(
         torch.cuda.current_stream(query.device),
-        (query.shape[2] + 1,),
+        (query.shape[2] + 1, batch_size),
         _qk_norm_rope_store_kernel,
         (
             query,
@@ -382,33 +389,40 @@ def _compress_state_pool_kernel(
     overlap: _ConstantBool,
 ):
     block = ct.bid(0)
-    token = ct.load(position, (0,), shape=(1,)).item()
+    batch = ct.bid(1)
+    token = ct.load(position, (batch,), shape=(1,)).item()
     slot = token % ratio
     state_slot = slot + ratio if overlap else slot
-    current = ct.load(values, (0, 0, block), shape=(1, 1, 128)).astype(ct.float32)
-    score = ct.load(gates, (0, 0, block), shape=(1, 1, 128)).astype(ct.float32)
+    current = ct.load(values, (batch, 0, block), shape=(1, 1, 128)).astype(
+        ct.float32
+    )
+    score = ct.load(gates, (batch, 0, block), shape=(1, 1, 128)).astype(ct.float32)
     score += ct.load(ape, (slot, block), shape=(1, 128)).reshape((1, 1, 128))
-    ct.store(value_state, (0, state_slot, block), current)
-    ct.store(score_state, (0, state_slot, block), score)
+    ct.store(value_state, (batch, state_slot, block), current)
+    ct.store(score_state, (batch, state_slot, block), score)
 
     if (token + 1) % ratio == 0:
         if block < dimension // 128:
             rows = ct.arange(ratio, dtype=ct.int32).reshape((1, ratio, 1))
             if overlap:
-                old_values = ct.load(value_state, (0, 0, block), shape=(1, ratio, 128))
-                old_scores = ct.load(score_state, (0, 0, block), shape=(1, ratio, 128))
+                old_values = ct.load(
+                    value_state, (batch, 0, block), shape=(1, ratio, 128)
+                )
+                old_scores = ct.load(
+                    score_state, (batch, 0, block), shape=(1, ratio, 128)
+                )
                 second_block = block + dimension // 128
                 new_values = ct.load(
-                    value_state, (0, 1, second_block), shape=(1, ratio, 128)
+                    value_state, (batch, 1, second_block), shape=(1, ratio, 128)
                 )
                 new_scores = ct.load(
-                    score_state, (0, 1, second_block), shape=(1, ratio, 128)
+                    score_state, (batch, 1, second_block), shape=(1, ratio, 128)
                 )
                 direct = ct.load(
-                    values, (0, 0, second_block), shape=(1, 1, 128)
+                    values, (batch, 0, second_block), shape=(1, 1, 128)
                 ).astype(ct.float32)
                 direct_score = ct.load(
-                    gates, (0, 0, second_block), shape=(1, 1, 128)
+                    gates, (batch, 0, second_block), shape=(1, 1, 128)
                 ).astype(ct.float32)
                 direct_score += ct.load(
                     ape, (slot, second_block), shape=(1, 128)
@@ -424,10 +438,10 @@ def _compress_state_pool_kernel(
                 pooled_scores = ct.cat((old_scores, new_scores), axis=1)
             else:
                 pooled_values = ct.load(
-                    value_state, (0, 0, block), shape=(1, ratio, 128)
+                    value_state, (batch, 0, block), shape=(1, ratio, 128)
                 )
                 pooled_scores = ct.load(
-                    score_state, (0, 0, block), shape=(1, ratio, 128)
+                    score_state, (batch, 0, block), shape=(1, ratio, 128)
                 )
                 last = rows == slot
                 pooled_values = ct.where(
@@ -440,11 +454,15 @@ def _compress_state_pool_kernel(
             weights = ct.exp(pooled_scores - maximum)
             pooled = ct.sum(pooled_values * weights, axis=1, keepdims=True)
             pooled /= ct.sum(weights, axis=1, keepdims=True)
-            ct.store(values, (0, 0, block), pooled)
+            ct.store(values, (batch, 0, block), pooled)
 
         if overlap:
-            window_values = ct.load(value_state, (0, 1, block), shape=(1, ratio, 128))
-            window_scores = ct.load(score_state, (0, 1, block), shape=(1, ratio, 128))
+            window_values = ct.load(
+                value_state, (batch, 1, block), shape=(1, ratio, 128)
+            )
+            window_scores = ct.load(
+                score_state, (batch, 1, block), shape=(1, ratio, 128)
+            )
             rows = ct.arange(ratio, dtype=ct.int32).reshape((1, ratio, 1))
             last = rows == slot
             window_values = ct.where(
@@ -453,8 +471,8 @@ def _compress_state_pool_kernel(
             window_scores = ct.where(
                 last, ct.broadcast_to(score, window_scores.shape), window_scores
             )
-            ct.store(value_state, (0, 0, block), window_values)
-            ct.store(score_state, (0, 0, block), window_scores)
+            ct.store(value_state, (batch, 0, block), window_values)
+            ct.store(score_state, (batch, 0, block), window_scores)
 
 
 @ct.kernel
@@ -470,9 +488,10 @@ def _compress_finalize_kernel(
     rotate: _ConstantBool,
     epsilon: float,
 ):
-    token = ct.load(position, (0,), shape=(1,)).item()
+    batch = ct.bid(1)
+    token = ct.load(position, (batch,), shape=(1,)).item()
     if (token + 1) % ratio == 0:
-        value = ct.load(values, (0, 0, 0), shape=(1, 1, dimension))
+        value = ct.load(values, (batch, 0, 0), shape=(1, 1, dimension))
         # The released model rounds the pooled FP32 value to BF16 before RMSNorm.
         value = value.astype(ct.bfloat16).astype(ct.float32).reshape((dimension,))
         weight = ct.load(norm_weight, (0,), shape=(dimension,)).astype(ct.float32)
@@ -548,7 +567,7 @@ def _compress_finalize_kernel(
             ).reshape((dimension,))
         ct.store(
             cache,
-            (0, token // ratio, 0),
+            (batch, token // ratio, 0),
             value.reshape((1, 1, dimension)).astype(cache.dtype),
         )
 
@@ -571,12 +590,21 @@ def compress_decode(
 
     dimension = cache.shape[-1]
     width = values.shape[-1]
-    if values.shape[:2] != (1, 1) or width != dimension * (2 if ratio == 4 else 1):
-        raise ValueError("decode compression requires a single correctly sized token")
+    batch_size = values.shape[0]
+    if (
+        values.shape[1] != 1
+        or gates.shape != values.shape
+        or position.shape != (batch_size,)
+        or value_state.shape[0] != batch_size
+        or score_state.shape[0] != batch_size
+        or cache.shape[0] != batch_size
+        or width != dimension * (2 if ratio == 4 else 1)
+    ):
+        raise ValueError("decode compression requires one correctly sized token per row")
     stream = torch.cuda.current_stream(values.device)
     ct.launch(
         stream,
-        (width // 128,),
+        (width // 128, batch_size),
         _compress_state_pool_kernel,
         (
             values,
@@ -592,7 +620,7 @@ def compress_decode(
     )
     ct.launch(
         stream,
-        (1,),
+        (1, batch_size),
         _compress_finalize_kernel,
         (
             values,

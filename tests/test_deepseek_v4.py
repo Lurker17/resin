@@ -10,7 +10,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from resin import BatchPlan
+from resin import BatchPhase, BatchPlan
 from resin.backend.cuda.parallel import FlashInferAllReduce
 from resin.models.deepseek_v4.checkpoint import resolve_model_path
 from resin.models.deepseek_v4.config import DeepSeekV4Config
@@ -525,7 +525,7 @@ class TestDeepSeekV4Attention:
 
         def flashinfer(*args: object, **kwargs: object) -> torch.Tensor:
             calls.append((args, kwargs))
-            return torch.ones(1, 1, 2, 4)
+            return torch.ones(2, 1, 2, 4)
 
         flashinfer_package = ModuleType("flashinfer")
         flashinfer_mla = ModuleType("flashinfer.mla")
@@ -535,13 +535,15 @@ class TestDeepSeekV4Attention:
         module_name = "resin.models.deepseek_v4.attention"
         monkeypatch.delitem(sys.modules, module_name, raising=False)
         attention = importlib.import_module(module_name)
-        query = torch.zeros(1, 1, 2, 4)
-        window = torch.arange(12, dtype=torch.float32).view(1, 3, 4)
-        compressed = torch.arange(8, dtype=torch.float32).view(1, 2, 4)
-        indices = torch.tensor([[[2, 1, 0, 1]]], dtype=torch.int32)
+        query = torch.zeros(2, 1, 2, 4)
+        window = torch.arange(24, dtype=torch.float32).view(2, 3, 4)
+        compressed = torch.arange(16, dtype=torch.float32).view(2, 2, 4)
+        indices = torch.tensor(
+            [[[2, 1, 0, 1]], [[1, 0, -1, -1]]], dtype=torch.int32
+        )
         sinks = torch.tensor([1.0, 1.0])
-        sparse_lengths = torch.tensor([4], dtype=torch.int32)
-        sequence_lengths = torch.tensor([3], dtype=torch.int32)
+        sparse_lengths = torch.tensor([4, 2], dtype=torch.int32)
+        sequence_lengths = torch.tensor([3, 2], dtype=torch.int32)
         workspace = torch.empty(8, dtype=torch.uint8)
 
         output = attention.sparse_decode_attention(
@@ -560,7 +562,7 @@ class TestDeepSeekV4Attention:
         assert args[0] is query
         assert args[1] is window
         assert args[2] is workspace
-        assert torch.equal(args[3], indices.view(1, -1))
+        assert torch.equal(args[3], indices.view(2, -1))
         assert kwargs["compressed_kv_cache"] is compressed
         assert kwargs["sparse_topk_lens"] is sparse_lengths
         assert kwargs["seq_lens"] is sequence_lengths
@@ -570,15 +572,50 @@ class TestDeepSeekV4Attention:
         assert kwargs["enable_pdl"] is True
         assert output.shape == query.shape
 
+        with pytest.raises(ValueError, match="physical KV pools must be contiguous"):
+            attention.sparse_decode_attention(
+                query,
+                torch.zeros(2, 4, 4)[:, :3],
+                compressed,
+                sinks,
+                indices,
+                sparse_lengths,
+                sequence_lengths,
+                workspace,
+                0.5,
+            )
 
-class TestDeepSeekV4StaticPlan:
+
+class TestDeepSeekV4BatchPlan:
     @staticmethod
     def _runner() -> DeepSeekV4FlashCudaRunner:
         runner = DeepSeekV4FlashCudaRunner.__new__(DeepSeekV4FlashCudaRunner)
         runner.vocab_size = 32
         runner.max_seq_len = 16
-        runner._active_sequence_id = None
-        runner._model = torch.nn.Module()
+        runner.max_batch_size = 3
+        runner._active_sequence_ids = []
+
+        class StateModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.register_buffer("kv_cache", torch.zeros(3, 2))
+                self.register_buffer("kv_state", torch.zeros(3, 2))
+                self.register_buffer(
+                    "score_state", torch.full((3, 2), float("-inf"))
+                )
+
+            def forward(self, input_ids: torch.Tensor, _start_pos: int) -> torch.Tensor:
+                markers = input_ids[:, :1].to(torch.float32)
+                rows = input_ids.shape[0]
+                self.kv_cache[:rows].copy_(markers.expand(rows, 2))
+                self.kv_state[:rows].copy_((markers + 10).expand(rows, 2))
+                self.score_state[:rows].copy_((markers + 20).expand(rows, 2))
+                return torch.nn.functional.one_hot(
+                    input_ids[:, -1], num_classes=32
+                ).to(torch.float32)
+
+        runner._model = StateModel()
+        runner.device = torch.device("cpu")
         return runner
 
     def test_cuda_graphs_use_shared_static_lifecycle(self) -> None:
@@ -593,31 +630,98 @@ class TestDeepSeekV4StaticPlan:
         assert ".replay()" not in source
 
     def test_graph_capture_inputs_stage_position_and_sampling(self) -> None:
-        inputs = DeepSeekV4FlashCudaRunner._graph_capture_inputs((128,), 256)
+        inputs = DeepSeekV4FlashCudaRunner._graph_capture_inputs((3, 128), 256)
 
-        assert inputs["token_ids"] == (0,)
-        assert inputs["positions"] == (1,)
-        assert inputs["sampling_top_ks"] == (256,)
-        assert inputs["sampling_stochastic_mask"] == (False,)
+        assert inputs["token_ids"] == (0, 0, 0)
+        assert inputs["positions"] == (1, 1, 1)
+        assert inputs["sampling_top_ks"] == (256, 256, 256)
+        assert inputs["sampling_stochastic_mask"] == (False, False, False)
 
-    def test_prefill_then_decode_owns_one_sequence(self) -> None:
+    def test_ragged_prefill_then_decode_owns_compact_rows(self) -> None:
         runner = self._runner()
-        prefill = BatchPlan([2, 3], [0, 1], [7], [0, 2], [0])
-        decode = BatchPlan([4], [2], [7], [0, 1], [0])
+        prefill = BatchPlan(
+            [2, 3, 4, 5, 6],
+            [0, 1, 0, 1, 2],
+            [7, 8],
+            [0, 2, 5],
+            [0, 0],
+            phase=BatchPhase.PREFILL,
+        )
+        decode = BatchPlan(
+            [9, 10],
+            [2, 3],
+            [7, 8],
+            [0, 1, 2],
+            [2, 3],
+            phase=BatchPhase.DECODE,
+        )
 
-        assert runner._validate_plan(prefill) == 0
-        assert runner._validate_plan(decode) == 2
+        assert runner._validate_plan(prefill) == ((0, 2), (2, 5))
+        runner._active_sequence_ids = [7, 8]
+        assert runner._validate_plan(decode) == ((0, 1), (1, 2))
 
         runner.release([7])
-        assert runner._active_sequence_id is None
+        assert runner._active_sequence_ids == [8]
 
     def test_rejects_continuation_prefill_and_foreign_decode(self) -> None:
         runner = self._runner()
-        runner._active_sequence_id = 7
-        continuation = BatchPlan([4, 5], [2, 3], [7], [0, 2], [0])
-        foreign = BatchPlan([4], [2], [8], [0, 1], [0])
+        continuation = BatchPlan(
+            [4, 5],
+            [2, 3],
+            [7],
+            [0, 2],
+            [2],
+            phase=BatchPhase.PREFILL,
+        )
 
         with pytest.raises(ValueError, match="continuation prefill"):
             runner._validate_plan(continuation)
-        with pytest.raises(ValueError, match="does not own"):
+        runner._active_sequence_ids = [7]
+        foreign = BatchPlan(
+            [4],
+            [2],
+            [8],
+            [0, 1],
+            [2],
+            phase=BatchPhase.DECODE,
+        )
+        with pytest.raises(ValueError, match="do not own"):
             runner._validate_plan(foreign)
+
+    def test_release_compacts_every_sequence_state_buffer(self) -> None:
+        runner = self._runner()
+        runner._active_sequence_ids = [7, 8, 9]
+        runner._model.kv_cache.copy_(torch.tensor([[7, 7], [8, 8], [9, 9]]))
+        runner._model.kv_state.copy_(torch.tensor([[17, 17], [18, 18], [19, 19]]))
+        runner._model.score_state.copy_(torch.tensor([[27, 27], [28, 28], [29, 29]]))
+
+        runner.release([8])
+
+        assert runner._active_sequence_ids == [7, 9]
+        assert torch.equal(runner._model.kv_cache, torch.tensor([[7, 7], [9, 9], [0, 0]]))
+        assert torch.equal(
+            runner._model.kv_state, torch.tensor([[17, 17], [19, 19], [0, 0]])
+        )
+        assert torch.equal(
+            runner._model.score_state[:2], torch.tensor([[27, 27], [29, 29]])
+        )
+        assert torch.isneginf(runner._model.score_state[2]).all()
+
+    def test_ragged_prefill_places_each_sequence_in_its_compact_row(self) -> None:
+        runner = self._runner()
+        plan = BatchPlan(
+            [2, 3, 8, 9, 10],
+            [0, 1, 0, 1, 2],
+            [7, 8],
+            [0, 2, 5],
+            [0, 0],
+            phase=BatchPhase.PREFILL,
+        )
+
+        logits = runner._prefill(plan, ((0, 2), (2, 5)))
+
+        assert logits.argmax(dim=-1).tolist() == [3, 10]
+        assert torch.equal(runner._model.kv_cache[:2], torch.tensor([[2, 2], [8, 8]]))
+        assert torch.equal(
+            runner._model.kv_state[:2], torch.tensor([[12, 12], [18, 18]])
+        )
