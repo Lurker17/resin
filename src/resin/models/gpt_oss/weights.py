@@ -17,23 +17,15 @@ _EXPERT_KEY = re.compile(
 )
 
 
-def _safe_open():
-    try:
-        from safetensors import safe_open
-    except ImportError as error:
-        raise ImportError(
-            "loading GPT-OSS weights requires safetensors; install safetensors"
-        ) from error
-    return safe_open
-
-
 def _indexed_tensor_files(root: Path) -> dict[str, Path]:
+    from safetensors import safe_open
+
     index_path = root / "model.safetensors.index.json"
     if not index_path.is_file():
         model_file = root / "model.safetensors"
         if not model_file.is_file():
             raise FileNotFoundError(f"missing checkpoint weights: {model_file}")
-        with _safe_open()(str(model_file), framework="pt", device="cpu") as handle:
+        with safe_open(str(model_file), framework="pt", device="cpu") as handle:
             return {key: model_file for key in handle.keys()}
 
     try:
@@ -87,9 +79,11 @@ class _TensorReader:
         self._handle = None
 
     def read(self, path: Path, key: str):
+        from safetensors import safe_open
+
         if path != self._path:
             self.close()
-            self._context = _safe_open()(str(path), framework="pt", device="cpu")
+            self._context = safe_open(str(path), framework="pt", device="cpu")
             self._handle = self._context.__enter__()
             self._path = path
         return self._handle.get_tensor(key)

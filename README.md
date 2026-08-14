@@ -49,7 +49,9 @@ The control-plane tests do not require a GPU. Importing a concrete model module
 loads PyTorch; importing `resin` or a model package namespace does not.
 
 Install `resin[torch]` for reference models or `resin[cuda]` for the CUDA
-runners. Reusable device-neutral helpers live in `resin.backend`; CUDA helpers
+runners. The uv lock intentionally overrides FlashAttention-4's stale CUTLASS
+DSL metadata pin so FA4 and Quack use one tested toolchain.
+Reusable device-neutral helpers live in `resin.backend`; CUDA helpers
 are explicit imports from `resin.backend.cuda`.
 
 ## Developing

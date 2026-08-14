@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
-import math
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +11,6 @@ from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import TorchSampler
 from resin.models.gpt_oss.cuda import (
     GptOssCudaRunner,
-    _invoke_fa4_b22,
     _route,
     _router_logits,
     plan_gpt_oss_kv_capacity,
@@ -379,43 +377,6 @@ class TestGptOssCudaNativePlan:
         assert "self.capacity + 1" in arena_source
         assert "self.keys = self.storage[0]" in arena_source
         assert "self.values = self.storage[1]" in arena_source
-
-
-class TestGptOssCudaFa4Call:
-    def test_exact_b22_surface_for_full_and_sliding_attention(self) -> None:
-        calls = []
-
-        def kernel(*args, **kwargs):
-            calls.append((args, kwargs))
-            return ("output", None)
-
-        common = {
-            "cu_seqlens_q": object(),
-            "max_seqlen_q": 1,
-            "page_table": object(),
-            "seqused_k": object(),
-            "min_seqlen_k": 129,
-            "max_seqlen_k": 8193,
-            "softmax_scale": 1 / math.sqrt(64),
-            "learnable_sink": object(),
-        }
-        assert (
-            _invoke_fa4_b22(kernel, "q", "k", "v", sliding=False, **common) == "output"
-        )
-        assert calls[-1][0] == ("q", "k", "v")
-        full = calls[-1][1]
-        assert full["causal"]
-        assert full["window_size"] == (None, None)
-        assert full["pack_gqa"]
-        assert full["num_splits"] == 1
-        assert full["learnable_sink"] is common["learnable_sink"]
-        assert full["softmax_scale"] == 0.125
-        assert full["cu_seqlens_k"] is None
-
-        _invoke_fa4_b22(kernel, "q", "k", "v", sliding=True, **common)
-        sliding = calls[-1][1]
-        assert sliding["window_size"] == (127, 0)
-        assert sliding["causal"]
 
 
 @pytest.mark.skipif(

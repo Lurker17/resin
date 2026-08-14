@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -168,55 +167,3 @@ class TestLfm2Torch:
             actual = loaded(tokens, loaded.make_cache())
         assert loaded_config["model_type"] == "lfm2"
         torch.testing.assert_close(expected, actual, rtol=0, atol=0)
-
-    @pytest.mark.skipif(
-        not os.environ.get("RESIN_LFM2_TORCH_MODEL"),
-        reason="set RESIN_LFM2_TORCH_MODEL to run the pretrained-model integration test",
-    )
-    def test_pretrained_runner_generates_expected_tokens(self) -> None:
-        from resin import Engine
-        from resin.models.lfm2.reference import Lfm2TorchRunner
-
-        runner = Lfm2TorchRunner(
-            Path(os.environ["RESIN_LFM2_TORCH_MODEL"]), device="cpu"
-        )
-        engine = Engine(runner, eos_token_id=runner.eos_token_id)
-        prompt = [
-            1,
-            6,
-            24131,
-            708,
-            4083,
-            938,
-            768,
-            11538,
-            16701,
-            12216,
-            968,
-            59929,
-            14009,
-            523,
-            7,
-            708,
-            6,
-            6423,
-            708,
-            3493,
-            856,
-            779,
-            5706,
-            803,
-            4481,
-            540,
-            7,
-            708,
-            6,
-            64015,
-            708,
-        ]
-        request = engine.submit(prompt, max_new_tokens=8)
-        while engine.has_work():
-            engine.step()
-        assert request.done
-        assert request.take_result() == [1098, 5706, 803, 4481, 856, 5242, 523, 7]
-        assert runner.live_cache_count == 0

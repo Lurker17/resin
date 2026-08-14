@@ -38,13 +38,7 @@ MODEL_REVISIONS = {
 def _download_model(
     repo_id: str, revision: str | None, *, allow_mxfp4: bool = False
 ) -> Path:
-    try:
-        from huggingface_hub import hf_hub_download, snapshot_download
-    except ImportError as error:
-        raise ImportError(
-            "loading GPT-OSS by repository id requires huggingface-hub; "
-            "install it or pass a local model directory"
-        ) from error
+    from huggingface_hub import hf_hub_download, snapshot_download
 
     # Inspect the tiny config before asking the Hub for tens of gigabytes of
     # packed weights. Without an explicit kernel, fail before shard download.

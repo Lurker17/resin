@@ -98,8 +98,10 @@ image = (
             "CMAKE_BUILD_PARALLEL_LEVEL": "12",
         }
     )
-    .pip_install_from_pyproject(
-        str(ROOT / "pyproject.toml"), optional_dependencies=["cuda", "demo"]
+    .uv_sync(
+        str(ROOT),
+        extras=["cuda", "demo"],
+        extra_options="--no-default-groups",
     )
     # These accelerator-specific supplement wheels live outside PyPI, so the
     # project extras own all ordinary dependencies while the image only owns

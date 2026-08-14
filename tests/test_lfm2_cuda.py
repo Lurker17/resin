@@ -787,7 +787,7 @@ class TestLfm2CudaCachePoolBoundary:
         assert "plan.phase" in adapter_source
         assert "group.append_block_ids" in adapter_source
         assert "group.append_block_offsets" in adapter_source
-        assert "_invoke_paged_fa4_b22(" in inspect.getsource(Lfm2CudaRunner._attention)
+        assert "_invoke_paged_fa4(" in inspect.getsource(Lfm2CudaRunner._attention)
 
 
 class TestLfm2CudaRecurrentState:
@@ -964,8 +964,8 @@ class TestLfm2CudaRecurrentState:
 
 
 class TestLfm2CudaFa4Continuation:
-    def test_exact_b22_paged_surface(self) -> None:
-        from resin.models.lfm2.cuda import _invoke_paged_fa4_b22
+    def test_exact_fa4_paged_surface(self) -> None:
+        from resin.models.lfm2.cuda import _invoke_paged_fa4
 
         calls = []
 
@@ -978,7 +978,7 @@ class TestLfm2CudaFa4Continuation:
             "page_table": object(),
             "seqused_k": object(),
         }
-        output = _invoke_paged_fa4_b22(
+        output = _invoke_paged_fa4(
             kernel,
             "q",
             "k_cache",
@@ -1011,7 +1011,7 @@ class TestLfm2CudaFa4Continuation:
         assert not kwargs["return_lse"]
 
     def test_bottom_right_causal_paged_call_matches_dense_suffix_oracle(self) -> None:
-        from resin.models.lfm2.cuda import _invoke_paged_fa4_b22
+        from resin.models.lfm2.cuda import _invoke_paged_fa4
 
         query = [[0.5, -0.25], [0.1, 0.8], [-0.4, 0.3]]
         key_cache = [
@@ -1090,7 +1090,7 @@ class TestLfm2CudaFa4Continuation:
                 rows.extend(suffix_attention(q[q_start:q_end], k_row, v_row))
             return rows
 
-        actual = _invoke_paged_fa4_b22(
+        actual = _invoke_paged_fa4(
             paged_oracle,
             query,
             key_cache,

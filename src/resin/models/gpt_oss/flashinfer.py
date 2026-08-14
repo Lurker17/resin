@@ -209,12 +209,8 @@ class FlashInferSM90MXFP4Kernel:
 
     def _get_fused_moe(self):
         if self._fused_moe is None:
-            try:
-                from flashinfer import fused_moe
-            except ImportError as error:
-                raise ImportError(
-                    f"{KERNEL_ID} requires flashinfer-python with SM90 support"
-                ) from error
+            from flashinfer import fused_moe
+
             self._fused_moe = fused_moe
 
         required = (

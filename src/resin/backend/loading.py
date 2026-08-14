@@ -52,12 +52,7 @@ def read_config(model_path: Path) -> dict[str, Any]:
 
 
 def load_safetensor_shards(model_path: Path, *, device, backend: str) -> dict[str, Any]:
-    try:
-        from safetensors.torch import load_file
-    except ImportError as error:
-        raise ImportError(
-            f"loading {backend} weights requires safetensors; install safetensors"
-        ) from error
+    from safetensors.torch import load_file
 
     weight_files = sorted(glob.glob(str(model_path / "model*.safetensors")))
     if not weight_files:

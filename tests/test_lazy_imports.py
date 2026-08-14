@@ -26,5 +26,6 @@ class TestImport:
         cuda = project["optional-dependencies"]["cuda"]
         assert any(item.startswith("torch") for item in cuda)
         assert any(item.startswith("flashinfer-python") for item in cuda)
-        assert any(item.startswith("flash-attn-4") for item in cuda)
+        assert any(item.startswith("quack-kernels==0.6.4") for item in cuda)
         assert any(item.startswith("nvidia-cutlass-dsl") for item in cuda)
+        assert any(item.startswith("flash-attn-4") for item in cuda)

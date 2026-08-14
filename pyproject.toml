@@ -34,12 +34,12 @@ cuda = [
   "kernels==0.15.2",
   "triton==3.7.1",
   "flashinfer-python==0.6.15.post1",
-  "flash-attn-4==4.0.0b22",
-  "nvidia-cutlass-dsl==4.6.0.dev0",
-  "nvidia-cutlass-dsl-libs-base==4.6.0.dev0",
+  "flash-attn-4==4.0.0b26",
+  "nvidia-cutlass-dsl==4.6.2",
+  "nvidia-cutlass-dsl-libs-base==4.6.2",
   "apache-tvm-ffi==0.1.13.post2",
   "cuda-tile==1.4.0",
-  "quack-kernels==0.5.3",
+  "quack-kernels==0.6.4",
 ]
 demo = [
   "torch==2.13.0",
@@ -77,4 +77,7 @@ ban-relative-imports = "all"
 pythonpath = ["."]
 
 [tool.uv]
-constraint-dependencies = ["nvidia-cutlass-dsl-libs-base==4.6.0.dev0"]
+override-dependencies = [
+  "nvidia-cutlass-dsl==4.6.2",
+  "nvidia-cutlass-dsl-libs-base==4.6.2",
+]

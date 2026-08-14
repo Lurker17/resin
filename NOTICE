@@ -22,5 +22,13 @@ Hugging Face Transformers:
 OpenAI gpt-oss and Hugging Face Transformers are licensed under the Apache
 License, Version 2.0.
 
+The DeepSeek-V4 model hierarchy and cuTile kernels in
+src/resin/models/deepseek_v4 contain portions adapted from DeepSeek-V4:
+
+  Copyright (c) 2023 DeepSeek
+  https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731
+
+DeepSeek-V4 is licensed under the MIT License.
+
 Model weights are not distributed with Resin. Users who download Liquid AI or
 OpenAI checkpoints are responsible for the checkpoints' separate license terms.

@@ -32,6 +32,7 @@ if importlib.util.find_spec("flashinfer") is None:
     gemm.tinygemm_bf16 = _flashinfer_unavailable
 
     class _AllReduceFusionPattern:
+        kAllReduce = 0
         kARResidualRMSNorm = 1
 
     class _AllReduceFusionWorkspace:

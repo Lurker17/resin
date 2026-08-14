@@ -1,4 +1,4 @@
-"""Concrete FA4 b22 execution for GPT-OSS on Hopper GPUs.
+"""Concrete FA4 execution for GPT-OSS on Hopper GPUs.
 
 This is intentionally a model backend, not a public attention abstraction.
 Rust owns one flat cache pool and supplies two ordered sparse group plans:
@@ -14,7 +14,6 @@ cache map and no Python page allocator.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -70,7 +69,6 @@ if TYPE_CHECKING:
     from resin import BatchPlan
 
 
-_FA4_VERSION = "4.0.0b22"
 _PAGE_SIZE = PAGE_SIZE
 _SLIDING_WINDOW = SLIDING_WINDOW
 _PREFILL_CHUNK_SIZE = PREFILL_CHUNK_SIZE
@@ -200,8 +198,7 @@ class _DeviceAttentionBatch:
     sliding: PagedKvTable
 
 
-def _invoke_fa4_b22(
-    kernel,
+def _invoke_fa4(
     query,
     key_cache,
     value_cache,
@@ -217,8 +214,9 @@ def _invoke_fa4_b22(
     sliding: bool,
 ):
     """Call only the pinned FA4 surface required by official GPT-OSS."""
+    from flash_attn.cute import flash_attn_varlen_func
 
-    result = kernel(
+    result = flash_attn_varlen_func(
         query,
         key_cache,
         value_cache,
@@ -235,7 +233,7 @@ def _invoke_fa4_b22(
         window_size=(_SLIDING_WINDOW - 1, 0) if sliding else (None, None),
         learnable_sink=learnable_sink,
         softcap=0.0,
-        # FA4 b22's SM90 implementation does not support split-KV.  Do not use
+        # FA4's SM90 implementation does not support split-KV. Do not use
         # its automatic heuristic here because it may choose more than one
         # split for long decode contexts before rejecting that specialization.
         num_splits=1,
@@ -247,7 +245,7 @@ def _invoke_fa4_b22(
 
 
 class GptOssCudaRunner:
-    """GPT-OSS BF16 attention on FA4 b22 over one flat native cache pool."""
+    """GPT-OSS BF16 attention on FA4 over one flat native cache pool."""
 
     # A continuation remains an explicit prefill row even when it contains one
     # token. Sparse History/Window rows are chronological; dense FA4 tables and
@@ -288,22 +286,9 @@ class GptOssCudaRunner:
                 ),
             ],
         )
-        try:
-            installed_fa4 = version("flash-attn-4")
-        except PackageNotFoundError as error:
-            raise ImportError(
-                f"GptOssCudaRunner requires flash-attn-4=={_FA4_VERSION}"
-            ) from error
-        if installed_fa4 != _FA4_VERSION:
-            raise RuntimeError(
-                f"GptOssCudaRunner requires flash-attn-4=={_FA4_VERSION}, "
-                f"got {installed_fa4}"
-            )
-        from flash_attn.cute import flash_attn_varlen_func
 
         self._torch = torch
         self._sampler = FlashInferSampler(torch)
-        self._fa4 = flash_attn_varlen_func
         self.device = torch.device(device or default_device(torch, require_cuda=True))
         if self.device.type != "cuda":
             raise RuntimeError("GptOssCudaRunner requires CUDA")
@@ -620,8 +605,7 @@ class GptOssCudaRunner:
         value_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
             0, group.append_slots, value
         )
-        output = _invoke_fa4_b22(
-            self._fa4,
+        output = _invoke_fa4(
             query,
             key_cache,
             value_cache,

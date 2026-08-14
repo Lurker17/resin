@@ -410,20 +410,10 @@ image = (
             )
         }
     )
-    .uv_pip_install(
-        "maturin>=1.9,<2",
-        "torch==2.13.0",
-        "numpy==2.5.1",
-        "huggingface-hub==1.27.0",
-        "safetensors==0.8.0",
-        "flashinfer-python==0.6.15.post1",
-        "flash-attn-4==4.0.0b22",
-        "nvidia-cutlass-dsl==4.6.0.dev0",
-        "apache-tvm-ffi==0.1.13.post2",
-        "cuda-tile==1.4.0",
-        "quack-kernels==0.5.3",
-        "triton==3.7.1",
-        "blake3==1.0.9",
+    .uv_sync(
+        str(ROOT),
+        extras=["cuda"],
+        extra_options="--no-default-groups",
     )
     .uv_pip_install(
         "flashinfer-cubin==0.6.15.post1",

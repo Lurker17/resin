@@ -29,13 +29,8 @@ DEFAULT_REVISION = "13a53837c4906b4f7405932532ba85d182bb013b"
 
 
 def _download_model(repo_id: str, revision: str | None) -> Path:
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError as error:
-        raise ImportError(
-            "loading an LFM2 model by repository id requires huggingface-hub; "
-            "install it or pass a local model directory"
-        ) from error
+    from huggingface_hub import snapshot_download
+
     return Path(
         snapshot_download(
             repo_id=repo_id,

@@ -55,7 +55,7 @@ class _InPlaceRecurrentState:
         self._state.copy_(value)
 
 
-def _invoke_paged_fa4_b22(
+def _invoke_paged_fa4(
     kernel,
     query,
     key_cache,
@@ -170,7 +170,7 @@ class Lfm2CudaRunner:
             self.hidden_size = args.hidden_size
             self.conv_cache_length = args.conv_cache_length
 
-            # FA4 b22's SM90 paged path may issue TMA loads for the full final
+            # FA4's SM90 paged path may issue TMA loads for the full final
             # physical page and mask scores afterwards. Zero the unwritten tail
             # so a masked lane can never feed NaN/garbage into the PV reduction.
             self._kv = PagedKvArena(
@@ -429,7 +429,7 @@ class Lfm2CudaRunner:
 
         if metadata["continuation_prefill_max_q_len"]:
             continuation_token_indices = metadata["continuation_prefill_token_indices"]
-            continuation_output = _invoke_paged_fa4_b22(
+            continuation_output = _invoke_paged_fa4(
                 self._fa4,
                 queries[continuation_token_indices],
                 k_cache,

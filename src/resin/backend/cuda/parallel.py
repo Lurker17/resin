@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch.distributed as dist
 from torch import Tensor
@@ -126,7 +127,76 @@ class TensorParallelContext:
             dist.barrier(group=self.process_group)
 
 
+class FlashInferAllReduce:
+    """Use FlashInfer's low-latency all-reduce for one small tensor geometry.
+
+    Tensors outside the configured dtype, hidden width, or token limit fall
+    back to the process group's ordinary collective. This lets decode use the
+    custom kernel without reserving a context-sized communication workspace
+    for prefill.
+    """
+
+    def __init__(
+        self,
+        context: TensorParallelContext,
+        *,
+        max_token_num: int,
+        hidden_dim: int,
+        dtype: Any,
+        enabled: bool = True,
+    ) -> None:
+        if max_token_num <= 0 or hidden_dim <= 0:
+            raise ValueError("FlashInfer all-reduce geometry must be positive")
+        self.context = context
+        self.max_token_num = max_token_num
+        self.hidden_dim = hidden_dim
+        self.dtype = dtype
+        self.workspace: Any | None = None
+        self.backend = "local" if not context.enabled else "nccl"
+        if context.enabled and enabled:
+            from flashinfer.comm import create_allreduce_fusion_workspace
+            from flashinfer.comm.mnnvl import TorchDistBackend
+
+            self.workspace = create_allreduce_fusion_workspace(
+                backend="auto",
+                world_size=context.size,
+                rank=context.rank,
+                max_token_num=max_token_num,
+                hidden_dim=hidden_dim,
+                dtype=dtype,
+                comm_backend=TorchDistBackend(group=context.process_group),
+                group=context.process_group,
+            )
+            self.backend = self.workspace.backend
+
+    def sum(self, tensor: Tensor) -> Tensor:
+        """Sum a matching tensor out of place, otherwise use NCCL in place."""
+
+        workspace = self.workspace
+        if (
+            workspace is None
+            or tensor.dtype != self.dtype
+            or tensor.shape[-1] != self.hidden_dim
+            or tensor.numel() // self.hidden_dim > self.max_token_num
+            or not tensor.is_contiguous()
+        ):
+            return self.context.sum(tensor)
+
+        from flashinfer.comm import AllReduceFusionPattern, allreduce_fusion
+
+        shape = tensor.shape
+        output = allreduce_fusion(
+            input=tensor.reshape(-1, self.hidden_dim),
+            workspace=workspace,
+            pattern=AllReduceFusionPattern.kAllReduce,
+            launch_with_pdl=False,
+            trigger_completion_at_end=True,
+        )
+        return output.view(shape)
+
+
 __all__ = [
+    "FlashInferAllReduce",
     "TensorParallelContext",
     "TensorParallelLayout",
     "TensorShard",
