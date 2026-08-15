@@ -80,6 +80,8 @@ def sparse_verify_attention(
     sequence_lengths: Tensor,
     workspace: Tensor,
     softmax_scale: float,
+    *,
+    enable_pdl: bool = True,
 ) -> Tensor:
     """Verify a short query block with one sparse-MLA kernel invocation."""
 
@@ -116,7 +118,7 @@ def sparse_verify_attention(
         bmm1_scale=softmax_scale,
         sinks=sinks,
         kv_layout="HND",
-        enable_pdl=True,
+        enable_pdl=enable_pdl,
     )
     return output.view(batch_size, block_length, heads, dimension)
 

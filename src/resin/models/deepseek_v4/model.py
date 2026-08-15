@@ -26,6 +26,7 @@ from resin.models.deepseek_v4.cutile import (
     clear_rejected_compress_state,
     compress_decode,
     compress_verify,
+    dspark_attention_metadata,
     finish_index_topk,
     fp4_act_quant,
     hadamard_transform,
@@ -1929,26 +1930,25 @@ class DSparkAttention(Attention):
             True,
         )
 
-        history = get_decode_window_topk_idxs(
+        indices, sparse_lengths, sequence_lengths = dspark_attention_metadata(
+            position,
+            draft_length,
             self.window_size,
-            position - 1,
             self.window_capacity,
-        ).expand(-1, draft_length, -1)
-        draft = (
-            (
-                self.window_capacity
-                + torch.arange(draft_length, dtype=torch.int32, device=x.device)
-            )
-            .view(1, 1, -1)
-            .expand(batch_size, draft_length, -1)
         )
-        indices = torch.cat((history, draft), dim=-1).contiguous()
-        o = sparse_attn(
+        if self.attention_workspace is None:
+            raise RuntimeError("DSpark attention workspace is not initialized")
+        o = sparse_verify_attention(
             q,
-            torch.cat((self.kv_cache[:batch_size], kv), dim=1),
+            self.kv_cache[:batch_size],
+            kv.contiguous(),
             self.attn_sink,
             indices,
+            sparse_lengths,
+            sequence_lengths,
+            self.attention_workspace,
             self.softmax_scale,
+            enable_pdl=False,
         )
         apply_rotary_emb(o[..., -self.rope_head_dim :], frequencies, True)
         o = o.view(batch_size, draft_length, self.n_local_groups, -1)
@@ -2055,7 +2055,7 @@ class Transformer(nn.Module):
         )
         self.register_buffer(
             "_attention_workspace",
-            torch.empty(128 * 1024 * 1024, dtype=torch.uint8),
+            torch.zeros(128 * 1024 * 1024, dtype=torch.uint8),
             persistent=False,
         )
         self._decode_overlap_stream = torch.cuda.Stream()

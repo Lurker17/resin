@@ -219,6 +219,7 @@ class TestDeepSeekV4Weights:
             "clear_rejected_compress_state",
             "compress_decode",
             "compress_verify",
+            "dspark_attention_metadata",
             "fp4_act_quant",
             "finish_index_topk",
             "hadamard_transform",
@@ -726,7 +727,22 @@ class TestDeepSeekV4Attention:
         assert kwargs["compressed_kv_cache"] is compressed
         assert torch.equal(kwargs["sparse_topk_lens"], sparse_lengths.flatten())
         assert torch.equal(kwargs["seq_lens"], sequence_lengths.flatten())
+        assert kwargs["enable_pdl"] is True
         assert output.shape == query.shape
+
+        attention.sparse_verify_attention(
+            query,
+            window,
+            compressed,
+            sinks,
+            indices,
+            sparse_lengths,
+            sequence_lengths,
+            workspace,
+            0.5,
+            enable_pdl=False,
+        )
+        assert calls[1][1]["enable_pdl"] is False
 
 
 class TestDeepSeekV4BatchPlan:

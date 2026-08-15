@@ -1158,6 +1158,106 @@ def verify_attention_metadata(
 
 
 @ct.kernel
+def _dspark_attention_metadata_kernel(
+    position,
+    indices: _StaticLastDim,
+    sparse_lengths,
+    sequence_lengths,
+    window_size: _ConstantInt,
+    window_capacity: _ConstantInt,
+    block_length: _ConstantInt,
+    index_width: _ConstantInt,
+):
+    """Build compact history-plus-draft indices for FlashInfer sparse MLA."""
+
+    query = ct.bid(0)
+    batch = ct.bid(1)
+    anchor = ct.load(position, (batch,), shape=(1,)).item()
+    history_count = ct.minimum(anchor, window_size)
+    history_start = anchor - history_count
+    for tile in ct.static_iter(range(index_width // 64)):
+        columns = tile * 64 + ct.arange(64, dtype=ct.int32)
+        history = (history_start + columns) % window_capacity
+        history += batch * window_capacity
+        history = ct.where(columns < history_count, history, -1)
+        # FlashInfer reserves the first ``window_size`` columns for the SWA
+        # pool even when a short sequence has fewer valid history tokens.
+        draft_column = columns - window_size
+        draft = draft_column + batch * block_length
+        output = ct.where(
+            columns < window_size,
+            history,
+            ct.where(
+                (draft_column >= 0) & (draft_column < block_length),
+                draft,
+                -1,
+            ),
+        )
+        ct.store(
+            indices,
+            (batch, query, tile),
+            output.reshape((1, 1, 64)).astype(ct.int32),
+        )
+    ct.store(
+        sparse_lengths,
+        (batch, query),
+        ct.full((1, 1), window_size + block_length, dtype=ct.int32),
+    )
+    # FlashInfer uses the logical sequence length to identify how many leading
+    # sparse indices address the dense-window pool. Draft-block indices follow
+    # that prefix and address the separate block-local KV pool.
+    ct.store(
+        sequence_lengths,
+        (batch, query),
+        ct.full((1, 1), anchor, dtype=ct.int32),
+    )
+
+
+def dspark_attention_metadata(
+    position: Tensor,
+    block_length: int,
+    window_size: int,
+    window_capacity: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Build graph-safe sparse-MLA metadata for a parallel DSpark block."""
+
+    if (
+        position.ndim != 1
+        or block_length <= 0
+        or window_size <= 0
+        or window_capacity < window_size
+    ):
+        raise ValueError("DSpark attention metadata requires valid geometry")
+    batch_size = position.shape[0]
+    index_width = math.ceil((window_size + block_length) / 64) * 64
+    indices = torch.empty(
+        (batch_size, block_length, index_width),
+        dtype=torch.int32,
+        device=position.device,
+    )
+    sparse_lengths = torch.empty(
+        (batch_size, block_length), dtype=torch.int32, device=position.device
+    )
+    sequence_lengths = torch.empty_like(sparse_lengths)
+    ct.launch(
+        torch.cuda.current_stream(position.device),
+        (block_length, batch_size),
+        _dspark_attention_metadata_kernel,
+        (
+            position,
+            indices,
+            sparse_lengths,
+            sequence_lengths,
+            window_size,
+            window_capacity,
+            block_length,
+            index_width,
+        ),
+    )
+    return indices, sparse_lengths, sequence_lengths
+
+
+@ct.kernel
 def _compress_ring_kernel(
     values: _StaticLastDim,
     gates: _StaticLastDim,
@@ -1704,6 +1804,7 @@ __all__ = [
     "clear_rejected_compress_state",
     "compress_decode",
     "compress_verify",
+    "dspark_attention_metadata",
     "fp4_act_quant",
     "finish_index_topk",
     "hadamard_transform",
