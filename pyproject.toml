@@ -33,13 +33,15 @@ cuda = [
   "safetensors==0.8.0",
   "kernels==0.15.2",
   "triton==3.7.1",
+  "tilelang==0.1.11; sys_platform == 'linux'",
   "flashinfer-python==0.6.15.post1",
   "flash-attn-4==4.0.0b26",
   "nvidia-cutlass-dsl==4.6.2",
   "nvidia-cutlass-dsl-libs-base==4.6.2",
-  "apache-tvm-ffi==0.1.13.post2",
+  "apache-tvm-ffi==0.1.11",
   "cuda-tile==1.5.0",
   "quack-kernels==0.6.4",
+  "sgl-deep-gemm==0.1.5.post2; sys_platform == 'linux'",
 ]
 demo = [
   "torch==2.13.0",
@@ -78,6 +80,7 @@ pythonpath = ["."]
 
 [tool.uv]
 override-dependencies = [
+  "apache-tvm-ffi==0.1.11",
   "nvidia-cutlass-dsl==4.6.2",
   "nvidia-cutlass-dsl-libs-base==4.6.2",
 ]

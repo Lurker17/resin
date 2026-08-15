@@ -7,6 +7,7 @@ import resin
 from resin import BatchPlan, Engine, SamplingParams
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.sampling import TorchSampler
+from resin.backend.speculative import accept_speculative_tokens
 
 
 class RecordingRunner:
@@ -19,6 +20,16 @@ class RecordingRunner:
 
 
 class TestSamplingContract:
+    def test_speculative_acceptance_returns_prefix_plus_one_bonus(self) -> None:
+        acceptance = accept_speculative_tokens(
+            [[10, 11, 12], [20, 21, 22]],
+            [[10, 11, 13, 14], [31, 30, 29, 28]],
+        )
+
+        assert acceptance.token_rows == [[10, 11, 13], [31]]
+        assert acceptance.accepted_counts == [2, 0]
+        assert acceptance.processed_counts == [3, 1]
+
     def test_state_mapping_arena_mint_is_public_backend_api(self) -> None:
         assert callable(resin.mint_state_mapping_arena_id)
         assert "mint_state_mapping_arena_id" in resin.__all__

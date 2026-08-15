@@ -5,15 +5,13 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import torch
+from deep_gemm import fp8_fp4_gemm_nt, transform_sf_into_required_layout
 from flashinfer.fused_moe import (
     reorder_rows_for_gated_act_gemm,
     trtllm_fp4_block_scale_routed_moe,
 )
-from flashinfer.gemm import gemm_fp8_nt_groupwise
 from flashinfer.quantization import block_scale_interleave, shuffle_matrix_a
 from flashinfer.tllm_enums import ActivationType
-from quack.blockscaled import BlockScaledOperand, pack_scale_2d_to_blocked_contig
-from quack.gemm_interface import gemm as quack_gemm
 from torch import Tensor
 
 
@@ -39,7 +37,7 @@ def fp8_gemm(
     right_scales: Tensor,
     scale_dtype: torch.dtype = torch.float32,
 ) -> Tensor:
-    """Run the checkpoint's W8A8 GEMM with FlashInfer's CUTLASS kernel."""
+    """Run the checkpoint's K128-block W8A8 GEMM with DeepGEMM."""
 
     if scale_dtype != torch.float8_e8m0fnu:
         raise ValueError("DeepSeek-V4 FP8 scales must use float8_e8m0fnu")
@@ -51,8 +49,15 @@ def fp8_gemm(
     columns = right.shape[0]
     if right.shape != (columns, depth):
         raise ValueError("the FP8 weight must have logical shape (out, in)")
-    if left_scales.numel() != rows * (depth // 128):
-        raise ValueError("activation scales must contain one value per 128 inputs")
+    expected_activation_scales = (rows, (depth // 128 + 3) // 4)
+    if (
+        left_scales.dtype != torch.int32
+        or left_scales.shape != expected_activation_scales
+    ):
+        raise ValueError(
+            "activation scales must be packed UE8M0 with logical shape "
+            f"{expected_activation_scales}, got {tuple(left_scales.shape)}"
+        )
     expected_weight_scales = (columns // 128, depth // 128)
     if right_scales.shape != expected_weight_scales:
         raise ValueError(
@@ -60,25 +65,31 @@ def fp8_gemm(
             f"got {tuple(right_scales.shape)}"
         )
 
-    # FlashInfer's (1, 128, 128) CUTLASS path consumes ordinary fp32 scale
-    # values. Conversion from UE8M0 is exact because every value is a power of
-    # two. Weight scales are immutable and converted once per loaded parameter.
-    activation_scales = left_scales.view(rows, -1).float()
+    # Expand the checkpoint's N128 blocks and pack them once. The runtime A
+    # quantizer already emits the equivalent K128 packed layout directly.
     weight_scales = _cached_transform(
         right_scales,
-        "_resin_flashinfer_fp32_scales",
-        right_scales.float,
+        "_resin_deep_gemm_packed_scales",
+        lambda: transform_sf_into_required_layout(
+            right_scales.float(),
+            mn=columns,
+            k=depth,
+            recipe=(1, 128, 128),
+            is_sfa=False,
+        ),
     )
-    output = gemm_fp8_nt_groupwise(
-        left.view(rows, depth),
-        right,
-        activation_scales,
-        weight_scales,
-        scale_major_mode="K",
-        mma_sm=2 if rows >= 256 else 1,
-        scale_granularity_mnk=(1, 128, 128),
-        out_dtype=torch.get_default_dtype(),
-        backend="cutlass",
+    output = torch.empty(
+        (rows, columns),
+        dtype=torch.get_default_dtype(),
+        device=left.device,
+    )
+    fp8_fp4_gemm_nt(
+        (left.view(rows, depth), left_scales),
+        (right, weight_scales),
+        output,
+        recipe_a=(1, 128),
+        recipe_b=(1, 128),
+        disable_ue8m0_cast=True,
     )
     return output.view(*left.shape[:-1], columns)
 
@@ -90,7 +101,7 @@ def fp4_gemm(
     right_scales: Tensor,
     scale_dtype: torch.dtype = torch.float32,
 ) -> Tensor:
-    """Run the checkpoint's W4A8 GEMM with Quack's block-scaled kernel."""
+    """Run the checkpoint's K128-activation/K32-weight W4A8 GEMM."""
 
     if scale_dtype != torch.float8_e8m0fnu:
         raise ValueError("DeepSeek-V4 FP4 scales must use float8_e8m0fnu")
@@ -104,8 +115,15 @@ def fp4_gemm(
     columns = right.shape[0]
     if right.shape != (columns, depth // 2):
         raise ValueError("the packed FP4 weight must have logical shape (out, in)")
-    if left_scales.numel() != rows * (depth // 128):
-        raise ValueError("activation scales must contain one value per 128 inputs")
+    expected_activation_scales = (rows, (depth // 128 + 3) // 4)
+    if (
+        left_scales.dtype != torch.int32
+        or left_scales.shape != expected_activation_scales
+    ):
+        raise ValueError(
+            "activation scales must be packed UE8M0 with logical shape "
+            f"{expected_activation_scales}, got {tuple(left_scales.shape)}"
+        )
     expected_weight_scales = (columns, depth // 32)
     if right_scales.shape != expected_weight_scales:
         raise ValueError(
@@ -113,34 +131,31 @@ def fp4_gemm(
             f"got {tuple(right_scales.shape)}"
         )
 
-    # Quack's MXFP8 MMA uses a 32-value scale vector. DeepSeek quantizes each
-    # activation group once per 128 values, so repeating that exact UE8M0 byte
-    # four times changes only the descriptor layout, not the represented value.
-    activation_scales = left_scales.view(rows, -1).repeat_interleave(4, dim=-1)
-    activation_scales = pack_scale_2d_to_blocked_contig(activation_scales)
+    # Activations are quantized directly into DeepGEMM's packed, MN-major TMA
+    # scale layout. Immutable checkpoint scales are converted to the same
+    # layout once, rather than expanded/repacked on every projection.
     weight_scales = _cached_transform(
         right_scales,
-        "_resin_quack_blocked_scales",
-        lambda: pack_scale_2d_to_blocked_contig(right_scales),
+        "_resin_deep_gemm_packed_scales",
+        lambda: transform_sf_into_required_layout(
+            right_scales.float(),
+            mn=columns,
+            k=depth,
+            recipe=(1, 32),
+        ),
     )
-
-    activation = BlockScaledOperand.from_parts(
-        left.view(rows, depth),
-        activation_scales,
-        "mxfp8_e4m3",
-        orig_dtype=torch.get_default_dtype(),
+    output = torch.empty(
+        (rows, columns),
+        dtype=torch.get_default_dtype(),
+        device=left.device,
     )
-    weight = BlockScaledOperand.from_parts(
-        right,
-        weight_scales,
-        "mxfp4",
-        orig_dtype=torch.get_default_dtype(),
-    )
-    output = quack_gemm(
-        activation,
-        weight.mT,
-        out_dtype=torch.get_default_dtype(),
-        tuned=True,
+    fp8_fp4_gemm_nt(
+        (left.view(rows, depth), left_scales),
+        (right.view(torch.int8), weight_scales),
+        output,
+        recipe_a=(1, 128),
+        recipe_b=(1, 32),
+        disable_ue8m0_cast=True,
     )
     return output.view(*left.shape[:-1], columns)
 
@@ -179,8 +194,14 @@ def fp4_fused_moe(
     intermediate = doubled_intermediate // 2
     if doubled_intermediate % 2 or w2.shape[2] != intermediate // 2:
         raise ValueError("fused MoE weights have incompatible intermediate dimensions")
-    if left_scales.numel() != rows * (depth // 128):
-        raise ValueError("activation scales must contain one value per 128 inputs")
+    if left_scales.dtype != torch.float8_e4m3fn or left_scales.shape != (
+        rows,
+        depth // 32,
+    ):
+        raise ValueError(
+            "FlashInfer activation scales must contain one repeated UE8M0 byte "
+            "per 32 inputs"
+        )
     if topk_ids.shape != topk_weights.shape or topk_ids.shape[0] != rows:
         raise ValueError("top-k expert ids and weights must have shape (tokens, top_k)")
     if topk_ids.dtype != torch.int32 or topk_weights.dtype != torch.bfloat16:
@@ -194,20 +215,11 @@ def fp4_fused_moe(
     ):
         raise ValueError("fused MoE scalar parameters must have one value per expert")
 
-    # The checkpoint uses one power-of-two activation scale per 128 values.
-    # FlashInfer's MXFP8 tensor-core descriptor consumes one per 32 values;
-    # repeating the same UE8M0 byte preserves the checkpoint's exact value.
-    activation_scales = (
-        left_scales.view(rows, -1)
-        .repeat_interleave(4, dim=-1)
-        .contiguous()
-        .view(torch.float8_e4m3fn)
-    )
     result = trtllm_fp4_block_scale_routed_moe(
         topk_ids=(topk_ids, topk_weights),
         routing_bias=None,
         hidden_states=left.view(rows, depth),
-        hidden_states_scale=activation_scales,
+        hidden_states_scale=left_scales,
         gemm1_weights=w13.view(torch.uint8),
         gemm1_weights_scale=w13_scales.view(torch.float8_e4m3fn),
         gemm1_bias=None,

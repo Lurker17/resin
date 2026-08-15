@@ -30,5 +30,14 @@ src/resin/models/deepseek_v4 contain portions adapted from DeepSeek-V4:
 
 DeepSeek-V4 is licensed under the MIT License.
 
+The TileLang MHC kernel in
+src/resin/models/deepseek_v4/tilelang_kernels.py contains portions adapted
+from SGLang:
+
+  Copyright 2023-2026 SGLang Team
+  https://github.com/sgl-project/sglang
+
+SGLang is licensed under the Apache License, Version 2.0.
+
 Model weights are not distributed with Resin. Users who download Liquid AI or
 OpenAI checkpoints are responsible for the checkpoints' separate license terms.

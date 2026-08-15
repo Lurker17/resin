@@ -216,18 +216,32 @@ class TestDeepSeekV4Weights:
         cutile = ModuleType("resin.models.deepseek_v4.cutile")
         for name in (
             "act_quant",
+            "clear_rejected_compress_state",
             "compress_decode",
+            "compress_verify",
             "fp4_act_quant",
+            "finish_index_topk",
             "hadamard_transform",
+            "hash_sqrt_softplus",
+            "index_scores",
+            "moe_act_quant",
+            "qk_norm_rope_block",
             "qk_norm_rope_store",
+            "rope_last_block_inplace",
             "sparse_attn",
+            "swiglu",
             "top6_sqrt_softplus",
+            "verify_attention_metadata",
         ):
             setattr(cutile, name, None)
         flashinfer = ModuleType("flashinfer")
         flashinfer_mhc = ModuleType("flashinfer.mhc")
         flashinfer_mhc.mhc_post = None
         flashinfer_mhc.mhc_pre_big_fuse_with_prenorm = None
+        flashinfer_topk = ModuleType("flashinfer.topk")
+        flashinfer_topk.top_k = None
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.tf32_hc_prenorm_gemm = None
         gemm = ModuleType("resin.models.deepseek_v4.gemm")
         for name in (
             "fp4_fused_moe",
@@ -239,6 +253,7 @@ class TestDeepSeekV4Weights:
         attention = ModuleType("resin.models.deepseek_v4.attention")
         attention.sparse_decode_attention = None
         attention.sparse_topk_lengths = None
+        attention.sparse_verify_attention = None
         quack = ModuleType("quack")
         quack.rmsnorm = None
         monkeypatch.setitem(sys.modules, cutile.__name__, cutile)
@@ -246,6 +261,8 @@ class TestDeepSeekV4Weights:
         monkeypatch.setitem(sys.modules, attention.__name__, attention)
         monkeypatch.setitem(sys.modules, flashinfer.__name__, flashinfer)
         monkeypatch.setitem(sys.modules, flashinfer_mhc.__name__, flashinfer_mhc)
+        monkeypatch.setitem(sys.modules, flashinfer_topk.__name__, flashinfer_topk)
+        monkeypatch.setitem(sys.modules, deep_gemm.__name__, deep_gemm)
         monkeypatch.setitem(sys.modules, quack.__name__, quack)
 
         module_path = (
@@ -279,6 +296,33 @@ class TestDeepSeekV4Weights:
             [[0, 1, -1, -1]],
             [[2, 3, 0, 1]],
         ]
+        guarded_indices = native_model.get_decode_window_topk_idxs(
+            4, torch.tensor([5, 6]), 6
+        )
+        assert guarded_indices.tolist() == [
+            [[2, 3, 4, 5]],
+            [[3, 4, 5, 0]],
+        ]
+        guard_args = native_model.ModelArgs(
+            max_batch_size=1,
+            max_seq_len=32,
+            vocab_size=256,
+            dim=64,
+            moe_inter_dim=64,
+            n_layers=1,
+            n_heads=2,
+            q_lora_rank=64,
+            head_dim=64,
+            rope_head_dim=64,
+            o_groups=2,
+            o_lora_rank=64,
+            window_size=4,
+            compress_ratios=(0,),
+            dspark_block_size=5,
+        )
+        attention = native_model.DSparkAttention(0, guard_args)
+        assert attention.window_capacity == 10
+        assert attention.kv_cache.shape == (1, 10, 64)
         native_model.world_size = 2
         native_model.rank = 1
         args = native_model.ModelArgs(
@@ -334,6 +378,9 @@ class TestDeepSeekV4Gemms:
                 value = 3
 
         flashinfer_enums.ActivationType = ActivationType
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.fp8_fp4_gemm_nt = None
+        deep_gemm.transform_sf_into_required_layout = None
         quack = ModuleType("quack")
         quack_blockscaled = ModuleType("quack.blockscaled")
         quack_blockscaled.BlockScaledOperand = None
@@ -346,6 +393,7 @@ class TestDeepSeekV4Gemms:
             "flashinfer.fused_moe": flashinfer_moe,
             "flashinfer.quantization": flashinfer_quantization,
             "flashinfer.tllm_enums": flashinfer_enums,
+            "deep_gemm": deep_gemm,
             "quack": quack,
             "quack.blockscaled": quack_blockscaled,
             "quack.gemm_interface": quack_gemm,
@@ -355,20 +403,27 @@ class TestDeepSeekV4Gemms:
         monkeypatch.delitem(sys.modules, module_name, raising=False)
         return importlib.import_module(module_name)
 
-    def test_fp8_uses_flashinfer_groupwise_layout(
+    def test_fp8_uses_deep_gemm_packed_k128_layout(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         deepseek_gemm = self._module(monkeypatch)
 
-        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        transform_calls: list[tuple[torch.Tensor, dict[str, object]]] = []
+        gemm_calls: list[tuple[object, ...]] = []
 
-        def flashinfer(*args: object, **kwargs: object) -> torch.Tensor:
-            calls.append((args, kwargs))
-            return torch.zeros(2, 128, dtype=torch.bfloat16)
+        def transform(scales: torch.Tensor, **kwargs: object) -> torch.Tensor:
+            transform_calls.append((scales, kwargs))
+            return torch.ones(128, 1, dtype=torch.int32)
 
-        monkeypatch.setattr(deepseek_gemm, "gemm_fp8_nt_groupwise", flashinfer)
+        def deep_gemm(*args: object, **kwargs: object) -> None:
+            gemm_calls.append((*args, kwargs))
+
+        monkeypatch.setattr(
+            deepseek_gemm, "transform_sf_into_required_layout", transform
+        )
+        monkeypatch.setattr(deepseek_gemm, "fp8_fp4_gemm_nt", deep_gemm)
         left = torch.zeros(2, 128, dtype=torch.float8_e4m3fn)
-        left_scales = torch.ones(2, 1, dtype=torch.float8_e8m0fnu)
+        left_scales = torch.ones(2, 1, dtype=torch.int32)
         right = torch.zeros(128, 128, dtype=torch.float8_e4m3fn)
         right_scales = torch.ones(1, 1, dtype=torch.float8_e8m0fnu)
 
@@ -380,58 +435,41 @@ class TestDeepSeekV4Gemms:
             torch.float8_e8m0fnu,
         )
 
-        args, kwargs = calls[0]
         assert output.shape == (2, 128)
-        assert args[2].dtype == torch.float32
-        assert args[3].dtype == torch.float32
-        assert kwargs["scale_major_mode"] == "K"
-        assert kwargs["scale_granularity_mnk"] == (1, 128, 128)
-        assert kwargs["backend"] == "cutlass"
+        assert transform_calls[0][1] == {
+            "mn": 128,
+            "k": 128,
+            "recipe": (1, 128, 128),
+            "is_sfa": False,
+        }
+        assert gemm_calls[0][0][1] is left_scales
+        assert gemm_calls[0][-1] == {
+            "recipe_a": (1, 128),
+            "recipe_b": (1, 128),
+            "disable_ue8m0_cast": True,
+        }
 
-    def test_fp4_uses_quack_and_repeats_activation_scale_descriptors(
+    def test_fp4_uses_deep_gemm_with_native_asymmetric_scale_recipes(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         deepseek_gemm = self._module(monkeypatch)
 
-        packed_inputs: list[torch.Tensor] = []
-        gemm_calls: list[tuple[object, object, dict[str, object]]] = []
+        transform_calls: list[tuple[torch.Tensor, dict[str, object]]] = []
+        gemm_calls: list[tuple[object, ...]] = []
 
-        class Operand:
-            def __init__(self, data: torch.Tensor, scale: torch.Tensor) -> None:
-                self.data = data
-                self.scale = scale
+        def transform(scales: torch.Tensor, **kwargs: object) -> torch.Tensor:
+            transform_calls.append((scales, kwargs))
+            return torch.ones(128, 1, dtype=torch.int32)
 
-            @classmethod
-            def from_parts(
-                cls,
-                data: torch.Tensor,
-                scale: torch.Tensor,
-                _format: str,
-                **_kwargs: object,
-            ) -> "Operand":
-                return cls(data, scale)
+        def deep_gemm(*args: object, **kwargs: object) -> None:
+            gemm_calls.append((*args, kwargs))
 
-            @property
-            def mT(self) -> "Operand":
-                return self
-
-        def pack_scales(scales: torch.Tensor) -> torch.Tensor:
-            packed_inputs.append(scales.clone())
-            return scales
-
-        def quack_gemm(
-            activation: object, weight: object, **kwargs: object
-        ) -> torch.Tensor:
-            gemm_calls.append((activation, weight, kwargs))
-            return torch.zeros(2, 128, dtype=torch.bfloat16)
-
-        monkeypatch.setattr(deepseek_gemm, "BlockScaledOperand", Operand)
-        monkeypatch.setattr(deepseek_gemm, "quack_gemm", quack_gemm)
         monkeypatch.setattr(
-            deepseek_gemm, "pack_scale_2d_to_blocked_contig", pack_scales
+            deepseek_gemm, "transform_sf_into_required_layout", transform
         )
+        monkeypatch.setattr(deepseek_gemm, "fp8_fp4_gemm_nt", deep_gemm)
         left = torch.zeros(2, 128, dtype=torch.float8_e4m3fn)
-        left_scales = torch.ones(2, 1, dtype=torch.float8_e8m0fnu)
+        left_scales = torch.ones(2, 1, dtype=torch.int32)
         right = torch.empty(128, 64, dtype=torch.float4_e2m1fn_x2)
         right_scales = torch.ones(128, 4, dtype=torch.float8_e8m0fnu)
 
@@ -444,13 +482,12 @@ class TestDeepSeekV4Gemms:
         )
 
         assert output.shape == (2, 128)
-        assert packed_inputs[0].shape == (2, 4)
-        assert torch.equal(packed_inputs[0], left_scales.repeat_interleave(4, dim=-1))
-        assert packed_inputs[1] is not right_scales
-        assert packed_inputs[1].shape == (128, 4)
-        assert gemm_calls[0][2] == {
-            "out_dtype": torch.get_default_dtype(),
-            "tuned": True,
+        assert transform_calls[0][1] == {"mn": 128, "k": 128, "recipe": (1, 32)}
+        assert gemm_calls[0][0][1] is left_scales
+        assert gemm_calls[0][-1] == {
+            "recipe_a": (1, 128),
+            "recipe_b": (1, 32),
+            "disable_ue8m0_cast": True,
         }
 
     def test_fp4_fused_moe_uses_flashinfer_exact_mixed_format_path(
@@ -468,9 +505,9 @@ class TestDeepSeekV4Gemms:
             deepseek_gemm, "trtllm_fp4_block_scale_routed_moe", fused_moe
         )
         left = torch.zeros(3, 128, dtype=torch.float8_e4m3fn)
-        left_scales = torch.arange(1, 4, dtype=torch.float32).to(torch.float8_e8m0fnu)[
-            :, None
-        ]
+        left_scales = (
+            torch.arange(12, dtype=torch.uint8).view(3, 4).view(torch.float8_e4m3fn)
+        )
         topk_ids = torch.tensor([[0, 2], [1, 3], [0, 1]], dtype=torch.int32)
         topk_weights = torch.full((3, 2), 0.5, dtype=torch.bfloat16)
         w13 = torch.empty(2, 256, 64, dtype=torch.float4_e2m1fn_x2)
@@ -500,11 +537,7 @@ class TestDeepSeekV4Gemms:
         ids, weights = kwargs["topk_ids"]  # type: ignore[misc]
         assert ids is topk_ids
         assert weights is topk_weights
-        expected_scales = left_scales.repeat_interleave(4, dim=-1)
-        assert torch.equal(
-            kwargs["hidden_states_scale"].view(torch.uint8),  # type: ignore[union-attr]
-            expected_scales.view(torch.uint8),
-        )
+        assert kwargs["hidden_states_scale"] is left_scales
         assert kwargs["gemm1_weights"].data_ptr() == w13.data_ptr()  # type: ignore[union-attr]
         assert kwargs["gemm2_weights"].data_ptr() == w2.data_ptr()  # type: ignore[union-attr]
         assert kwargs["gemm1_clamp_limit"] is clamp_limits
@@ -646,6 +679,55 @@ class TestDeepSeekV4Attention:
                 0.5,
             )
 
+    def test_flashinfer_verify_flattens_a_small_query_block(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def flashinfer(*args: object, **kwargs: object) -> torch.Tensor:
+            calls.append((args, kwargs))
+            return torch.ones(6, 1, 2, 4)
+
+        flashinfer_package = ModuleType("flashinfer")
+        flashinfer_mla = ModuleType("flashinfer.mla")
+        flashinfer_mla.trtllm_batch_decode_sparse_mla_dsv4 = flashinfer
+        monkeypatch.setitem(sys.modules, "flashinfer", flashinfer_package)
+        monkeypatch.setitem(sys.modules, "flashinfer.mla", flashinfer_mla)
+        module_name = "resin.models.deepseek_v4.attention"
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+        attention = importlib.import_module(module_name)
+
+        query = torch.zeros(2, 3, 2, 4)
+        window = torch.zeros(2, 7, 4)
+        compressed = torch.zeros(2, 5, 4)
+        indices = torch.zeros(2, 3, 5, dtype=torch.int32)
+        sparse_lengths = torch.full((2, 3), 5, dtype=torch.int32)
+        sequence_lengths = torch.arange(1, 7, dtype=torch.int32).view(2, 3)
+        sinks = torch.ones(2)
+        workspace = torch.empty(8, dtype=torch.uint8)
+
+        output = attention.sparse_verify_attention(
+            query,
+            window,
+            compressed,
+            sinks,
+            indices,
+            sparse_lengths,
+            sequence_lengths,
+            workspace,
+            0.5,
+        )
+
+        args, kwargs = calls[0]
+        assert args[0].shape == (6, 1, 2, 4)
+        assert args[1] is window
+        assert args[2] is workspace
+        assert args[3].shape == (6, 8)
+        assert kwargs["compressed_kv_cache"] is compressed
+        assert torch.equal(kwargs["sparse_topk_lens"], sparse_lengths.flatten())
+        assert torch.equal(kwargs["seq_lens"], sequence_lengths.flatten())
+        assert output.shape == query.shape
+
 
 class TestDeepSeekV4BatchPlan:
     @staticmethod
@@ -731,28 +813,26 @@ class TestDeepSeekV4BatchPlan:
                 self.register_buffer("kv_state", torch.zeros(2, 1))
                 self.commits: list[list[int]] = []
 
-            def forward_decode_target(self, input_ids, positions, graph_seq_len):
-                del graph_seq_len
-                self.kv_state.add_(1)
-                hidden = input_ids.to(torch.float32).unsqueeze(-1)
-                return torch.zeros(2, 32), hidden
-
             @staticmethod
-            def draft(anchors, main_hidden, positions):
-                del anchors, main_hidden, positions
+            def draft(anchors, positions):
+                assert anchors.tolist() == [[1], [2]]
+                assert positions.tolist() == [4, 7]
                 return torch.tensor([[10, 11, 12], [20, 21, 22]])
 
             def forward_verify(self, input_ids, positions, graph_seq_len):
                 del positions, graph_seq_len
-                states = [self.kv_state.clone()]
                 for _ in range(input_ids.shape[1]):
                     self.kv_state.add_(1)
-                    states.append(self.kv_state.clone())
                 return (
                     torch.zeros(2, input_ids.shape[1], 32),
                     input_ids.to(torch.float32).unsqueeze(-1),
-                    [(self.kv_state, torch.stack(states))],
                 )
+
+            def clear_rejected_speculative_state(
+                self, positions, processed_counts, block_length
+            ):
+                del positions, block_length
+                self.kv_state.copy_(processed_counts[:, None])
 
             def commit_dspark_main_block(self, hidden, positions):
                 del hidden
@@ -766,11 +846,10 @@ class TestDeepSeekV4BatchPlan:
                 del logits, plan
                 self.offsets.append(offset_delta)
                 return {
-                    0: torch.tensor([9, 19]),
-                    32: torch.tensor([10, 31]),
-                    64: torch.tensor([11, 30]),
-                    96: torch.tensor([13, 29]),
-                    128: torch.tensor([14, 28]),
+                    0: torch.tensor([10, 31]),
+                    32: torch.tensor([11, 30]),
+                    64: torch.tensor([13, 29]),
+                    96: torch.tensor([14, 28]),
                 }[offset_delta]
 
         runner = DeepSeekV4FlashCudaRunner.__new__(DeepSeekV4FlashCudaRunner)
@@ -794,15 +873,15 @@ class TestDeepSeekV4BatchPlan:
 
         output = runner._speculative_decode(plan)
 
-        assert output == [[9, 10, 11, 13], [19, 31]]
-        assert runner._sampler.offsets == [0, 32, 64, 96, 128]
-        assert runner._model.commits == [[5, 8]]
-        assert runner._model.kv_state.flatten().tolist() == [4.0, 2.0]
+        assert output == [[10, 11, 13], [31]]
+        assert runner._sampler.offsets == [0, 32, 64, 96]
+        assert runner._model.commits == [[4, 7]]
+        assert runner._model.kv_state.flatten().tolist() == [3.0, 1.0]
         assert runner.speculative_stats == {
             "blocks": 2,
             "drafts": 6,
             "accepted": 2,
-            "emitted": 6,
+            "emitted": 4,
             "acceptance_rate": pytest.approx(1 / 3),
         }
 

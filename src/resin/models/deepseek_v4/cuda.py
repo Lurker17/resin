@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from resin import BatchPhase
 from resin.backend.checks import positions as check_positions
@@ -32,6 +33,7 @@ from resin.backend.cuda.sampling import (
     FlashInferSampler,
     SamplingTensors,
 )
+from resin.backend.speculative import accept_speculative_tokens
 from resin.models.deepseek_v4.checkpoint import (
     load_config,
     resolve_model_path,
@@ -68,6 +70,7 @@ class DeepSeekV4FlashCudaRunner:
         cuda_graph_decode_shapes: object = None,
         fast_allreduce: bool = True,
         speculative_tokens: int = 0,
+        profile_graph_phases: bool = False,
     ) -> None:
         if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, int):
             raise ValueError("max_seq_len must be a positive integer")
@@ -122,6 +125,9 @@ class DeepSeekV4FlashCudaRunner:
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.speculative_tokens = speculative_tokens
+        self.profile_graph_phases = profile_graph_phases
+        self._dspark_phase_events: dict[GraphShape, tuple[torch.cuda.Event, ...]] = {}
+        self._last_dspark_phase_ms: dict[str, float] | None = None
         self.max_batch_tokens = max_batch_size * max_seq_len
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = 1
@@ -146,10 +152,6 @@ class DeepSeekV4FlashCudaRunner:
             build=self._new_decode_graph_step,
             synchronize_failure=lambda: torch.cuda.synchronize(self.device),
         )
-        self._dspark_graph_checkpoints: dict[
-            GraphShape, list[tuple[torch.Tensor, torch.Tensor]]
-        ] = {}
-
         # Import only after CUDA validation: importing this module initializes
         # cuTile and is intentionally not part of Resin's CPU package path.
         from resin.models.deepseek_v4 import model as native_model
@@ -188,11 +190,44 @@ class DeepSeekV4FlashCudaRunner:
             self.tensor_parallel,
             max_token_num=max_batch_size * max(1, speculative_tokens + 1),
             hidden_dim=self.config.hidden_size,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             enabled=fast_allreduce,
         )
+        index_widths = sorted(
+            {
+                min(
+                    ((args.max_seq_len + 255) // 256) * 64,
+                    ((shape[1] + 255) // 256) * 64,
+                )
+                for shape in decode_graph_shapes
+            }
+        )
+        self._index_allreduces = {
+            width: FlashInferAllReduce(
+                self.tensor_parallel,
+                max_token_num=max_batch_size * max(1, speculative_tokens + 1),
+                hidden_dim=(width + 7) // 8 * 8,
+                dtype=torch.bfloat16,
+                enabled=fast_allreduce,
+            )
+            for width in index_widths
+        }
+
+        def reduce_index_scores(tensor: torch.Tensor) -> torch.Tensor:
+            reducer = self._index_allreduces.get(tensor.shape[-1])
+            if reducer is None:
+                return self.tensor_parallel.sum(tensor)
+            padding = reducer.hidden_dim - tensor.shape[-1]
+            if padding == 0:
+                return reducer.sum(tensor)
+            padded = F.pad(tensor, (0, padding))
+            return reducer.sum(padded)[..., : tensor.shape[-1]].contiguous()
+
         self.allreduce_backend = self._allreduce.backend
-        self._model.set_allreduce(self._allreduce.sum)
+        self._model.set_allreduce(
+            self._allreduce.sum,
+            indexer_reducer=reduce_index_scores,
+        )
         self.weight_load = load_deepseek_v4_weights(
             self.model_path,
             self._model,
@@ -222,6 +257,14 @@ class DeepSeekV4FlashCudaRunner:
             "emitted": self._speculative_emitted,
             "acceptance_rate": acceptance,
         }
+
+    @property
+    def last_dspark_phase_ms(self) -> dict[str, float] | None:
+        """Return device timings from the most recent profiled graph replay."""
+
+        if self._last_dspark_phase_ms is None:
+            return None
+        return dict(self._last_dspark_phase_ms)
 
     @staticmethod
     def _graph_capture_inputs(
@@ -332,12 +375,17 @@ class DeepSeekV4FlashCudaRunner:
         token_ids = torch.empty((batch_size, 1), dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
         output_ids = torch.empty(
-            (batch_size, 2 * block_size + 2),
+            (batch_size, 2 * block_size + 1),
             dtype=torch.long,
             device=self.device,
         )
         sampling = self._sampler.empty(batch_size, self.device)
-        checkpoint_holder: list[tuple[torch.Tensor, torch.Tensor]] = []
+        phase_events: tuple[torch.cuda.Event, ...] | None = None
+        if self.profile_graph_phases:
+            phase_events = tuple(
+                torch.cuda.Event(enable_timing=True, external=True) for _ in range(4)
+            )
+            self._dspark_phase_events[shape] = phase_events
 
         def sample(logits: torch.Tensor, step: int) -> torch.Tensor:
             step_sampling = SamplingTensors(
@@ -354,39 +402,32 @@ class DeepSeekV4FlashCudaRunner:
 
         def launch() -> None:
             with _default_dtype(torch.bfloat16), torch.device(self.device):
-                target_logits, main_hidden = self._model.forward_decode_target(
-                    token_ids, positions, graph_seq_len
+                if phase_events is not None:
+                    phase_events[0].record()
+                drafts = self._broadcast_tokens(self._model.draft(token_ids, positions))
+                if phase_events is not None:
+                    phase_events[1].record()
+                verify_ids = torch.cat((token_ids, drafts), dim=1)
+                verify_logits, verify_hidden = self._model.forward_verify(
+                    verify_ids, positions, graph_seq_len
                 )
-                if main_hidden is None:
-                    raise RuntimeError("target did not produce DSpark hidden states")
-                first_target = sample(target_logits, 0)
-                drafts = self._broadcast_tokens(
-                    self._model.draft(
-                        first_target.view(batch_size, 1), main_hidden, positions
-                    )
-                )
-                verify_ids = torch.cat(
-                    (first_target.view(batch_size, 1), drafts), dim=1
-                )
-                verify_logits, verify_hidden, checkpoints = self._model.forward_verify(
-                    verify_ids, positions + 1, graph_seq_len
-                )
+                if phase_events is not None:
+                    phase_events[2].record()
                 if verify_hidden is None:
                     raise RuntimeError(
                         "target did not produce DSpark verification states"
                     )
-                self._model.commit_dspark_main_block(verify_hidden, positions + 1)
+                self._model.commit_dspark_main_block(verify_hidden, positions)
                 output_ids[:, :block_size].copy_(drafts)
-                output_ids[:, block_size].copy_(first_target)
                 for index in range(block_size + 1):
-                    output_ids[:, block_size + index + 1].copy_(
-                        sample(verify_logits[:, index], index + 1)
+                    output_ids[:, block_size + index].copy_(
+                        sample(verify_logits[:, index], index)
                     )
-                checkpoint_holder[:] = checkpoints
+                if phase_events is not None:
+                    phase_events[3].record()
 
         inputs = {"token_ids": token_ids, "positions": positions}
         inputs.update(self._sampler.graph_inputs(sampling))
-        self._dspark_graph_checkpoints[shape] = checkpoint_holder
         return CudaGraphStep(
             inputs=inputs,
             output=output_ids,
@@ -413,6 +454,15 @@ class DeepSeekV4FlashCudaRunner:
         }
         inputs.update(self._sampler.host_inputs(plan, self.vocab_size))
         output = self._graphs.run(shape, inputs)
+        phase_events = self._dspark_phase_events.get(shape)
+        if phase_events is not None:
+            start, draft_end, verify_end, step_end = phase_events
+            self._last_dspark_phase_ms = {
+                "draft": start.elapsed_time(draft_end),
+                "target_verify": draft_end.elapsed_time(verify_end),
+                "commit_and_sampling": verify_end.elapsed_time(step_end),
+                "device_total": start.elapsed_time(step_end),
+            }
         if not self.speculative_tokens:
             return output
         block_size = self.speculative_tokens
@@ -421,7 +471,7 @@ class DeepSeekV4FlashCudaRunner:
         return self._accept_speculative(
             drafts,
             targets,
-            self._dspark_graph_checkpoints[shape],
+            torch.tensor(plan.positions, dtype=torch.long, device=self.device),
         )
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
@@ -515,41 +565,25 @@ class DeepSeekV4FlashCudaRunner:
         self,
         draft_rows: list[list[int]],
         target_rows: list[list[int]],
-        checkpoints: list[tuple[torch.Tensor, torch.Tensor]],
+        positions: torch.Tensor,
     ) -> list[list[int]]:
         batch_size = len(draft_rows)
-        outputs = []
-        accepted = []
-        for row in range(batch_size):
-            accepted_count = 0
-            while (
-                accepted_count < self.speculative_tokens
-                and target_rows[row][accepted_count + 1]
-                == draft_rows[row][accepted_count]
-            ):
-                accepted_count += 1
-            outputs.append(
-                [
-                    target_rows[row][0],
-                    *draft_rows[row][:accepted_count],
-                    target_rows[row][accepted_count + 1],
-                ]
-            )
-            accepted.append(accepted_count)
-
-        checkpoint_rows = torch.tensor(
-            [count + 1 for count in accepted],
-            dtype=torch.long,
+        acceptance = accept_speculative_tokens(draft_rows, target_rows)
+        processed_counts = torch.tensor(
+            acceptance.processed_counts,
+            dtype=torch.int32,
             device=self.device,
         )
-        batch_rows = torch.arange(batch_size, device=self.device)
-        for buffer, states in checkpoints:
-            buffer[:batch_size].copy_(states[checkpoint_rows, batch_rows])
+        self._model.clear_rejected_speculative_state(
+            positions,
+            processed_counts,
+            self.speculative_tokens + 1,
+        )
         self._speculative_blocks += batch_size
         self._speculative_drafts += batch_size * self.speculative_tokens
-        self._speculative_accepted += sum(accepted)
-        self._speculative_emitted += sum(map(len, outputs))
-        return outputs
+        self._speculative_accepted += sum(acceptance.accepted_counts)
+        self._speculative_emitted += sum(map(len, acceptance.token_rows))
+        return acceptance.token_rows
 
     def _speculative_decode(self, plan: BatchPlan) -> list[list[int]]:
         """Draft greedily and verify a fixed block against target samples."""
@@ -559,35 +593,26 @@ class DeepSeekV4FlashCudaRunner:
             plan.token_ids, dtype=torch.long, device=self.device
         ).view(batch_size, 1)
         positions = torch.tensor(plan.positions, dtype=torch.long, device=self.device)
-        graph_seq_len = max(plan.positions) + self.speculative_tokens + 2
-        target_logits, main_hidden = self._model.forward_decode_target(
-            anchors, positions, graph_seq_len
-        )
-        if main_hidden is None:
-            raise RuntimeError("target did not produce DSpark hidden states")
-        first_target = self._sample_target(target_logits, plan, 0)
-        drafts = self._broadcast_tokens(
-            self._model.draft(first_target.view(batch_size, 1), main_hidden, positions)
-        )
-        verify_ids = torch.cat((first_target.view(batch_size, 1), drafts), dim=1)
-        verify_logits, verify_hidden, checkpoints = self._model.forward_verify(
+        graph_seq_len = max(plan.positions) + self.speculative_tokens + 1
+        drafts = self._broadcast_tokens(self._model.draft(anchors, positions))
+        verify_ids = torch.cat((anchors, drafts), dim=1)
+        verify_logits, verify_hidden = self._model.forward_verify(
             verify_ids,
-            positions + 1,
+            positions,
             graph_seq_len,
         )
         if verify_hidden is None:
             raise RuntimeError("target did not produce DSpark verification states")
-        self._model.commit_dspark_main_block(verify_hidden, positions + 1)
+        self._model.commit_dspark_main_block(verify_hidden, positions)
 
-        target_columns = [first_target]
-        target_columns.extend(
-            self._sample_target(verify_logits[:, index], plan, index + 1)
+        target_columns = [
+            self._sample_target(verify_logits[:, index], plan, index)
             for index in range(self.speculative_tokens + 1)
-        )
+        ]
         return self._accept_speculative(
             drafts.tolist(),
             torch.stack(target_columns, dim=1).tolist(),
-            checkpoints,
+            positions,
         )
 
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
