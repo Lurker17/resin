@@ -342,7 +342,7 @@ def _diagnose_verify_parity(
     try:
         with torch.inference_mode(), torch.device(device):
             prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device)[None]
-            prefill_logits, main_hidden = model.forward_target(prompt, 0)
+            prefill_logits, main_hidden = model.forward_target(prompt)
             if main_hidden is None:
                 raise RuntimeError("target did not produce DSpark prefill states")
             model.prefill_dspark(main_hidden)

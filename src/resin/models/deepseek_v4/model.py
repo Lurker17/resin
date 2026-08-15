@@ -5,7 +5,7 @@ import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Literal, Optional, Tuple
+from typing import Callable, Literal
 
 import torch
 import torch.distributed as dist
@@ -110,7 +110,7 @@ class ModelArgs:
     o_groups: int = 8
     o_lora_rank: int = 1024
     window_size: int = 128
-    compress_ratios: Tuple[int] = (0, 0, 4, 128, 4, 128, 4, 0)
+    compress_ratios: tuple[int] = (0, 0, 4, 128, 4, 128, 4, 0)
     # yarn
     compress_rope_theta: float = 40000.0
     original_seq_len: int = 0
@@ -129,7 +129,7 @@ class ModelArgs:
     # dspark
     dspark_block_size: int = 0
     dspark_noise_token_id: int = 0
-    dspark_target_layer_ids: Tuple[int, ...] = ()
+    dspark_target_layer_ids: tuple[int, ...] = ()
     dspark_markov_rank: int = 256
 
 
@@ -162,7 +162,7 @@ class ParallelEmbedding(nn.Module):
 
 
 def linear(
-    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
     """Dispatches to fp4_gemm / fp8_gemm / F.linear based on weight dtype.
     For quantized weights, x is first quantized to FP8 via act_quant."""
@@ -197,16 +197,14 @@ def grouped_bf16_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 def bf16_linear_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Multiply BF16 compressor operands while accumulating into FP32."""
+    """Multiply CUDA BF16 operands while accumulating into FP32."""
 
     output_shape = (*x.shape[:-1], weight.shape[0])
-    if x.device.type == "cuda":
-        return torch.mm(
-            x.reshape(-1, x.shape[-1]),
-            weight.t(),
-            out_dtype=torch.float32,
-        ).view(output_shape)
-    return F.linear(x.float(), weight.float()).view(output_shape)
+    return torch.mm(
+        x.reshape(-1, x.shape[-1]),
+        weight.t(),
+        out_dtype=torch.float32,
+    ).view(output_shape)
 
 
 class Linear(nn.Module):
@@ -219,8 +217,8 @@ class Linear(nn.Module):
         bias: bool = False,
         dtype=None,
         *,
-        weight_storage: Optional[torch.Tensor] = None,
-        scale_storage: Optional[torch.Tensor] = None,
+        weight_storage: torch.Tensor | None = None,
+        scale_storage: torch.Tensor | None = None,
     ):
         super().__init__()
         self.in_features = in_features
@@ -329,13 +327,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim, dtype=torch.bfloat16))
 
     def forward(self, x: torch.Tensor):
-        if x.is_cuda:
-            return quack_rmsnorm(x, self.weight, eps=self.eps)
-        dtype = x.dtype
-        x = x.float()
-        var = x.square().mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        return (self.weight * x).to(dtype)
+        return quack_rmsnorm(x, self.weight, eps=self.eps)
 
 
 @lru_cache(2)
@@ -411,40 +403,20 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 
 @lru_cache(4)
-def get_window_topk_idxs(
-    window_size: int,
-    bsz: int,
-    seqlen: int,
-    start_pos: int,
-    capacity: int | None = None,
-):
-    capacity = capacity or window_size
-    if start_pos >= window_size - 1:
-        matrix = torch.arange(start_pos - window_size + 1, start_pos + 1)
-        matrix = matrix.remainder(capacity)
-    elif start_pos > 0:
-        matrix = F.pad(
-            torch.arange(start_pos + 1), (0, window_size - start_pos - 1), value=-1
-        )
-    else:
-        base = torch.arange(seqlen).unsqueeze(1)
-        matrix = (base - window_size + 1).clamp(0) + torch.arange(
-            min(seqlen, window_size)
-        )
-        matrix = torch.where(matrix > base, -1, matrix)
+def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int):
+    base = torch.arange(seqlen).unsqueeze(1)
+    matrix = (base - window_size + 1).clamp(0) + torch.arange(
+        min(seqlen, window_size)
+    )
+    matrix = torch.where(matrix > base, -1, matrix)
     return matrix.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
 
 
 @lru_cache(2)
-def get_compress_topk_idxs(
-    ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int
-):
-    if start_pos > 0:
-        matrix = torch.arange(0, (start_pos + 1) // ratio) + offset
-    else:
-        matrix = torch.arange(seqlen // ratio).repeat(seqlen, 1)
-        mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-        matrix = torch.where(mask, -1, matrix + offset)
+def get_compress_topk_idxs(ratio: int, bsz: int, seqlen: int, offset: int):
+    matrix = torch.arange(seqlen // ratio).repeat(seqlen, 1)
+    mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+    matrix = torch.where(mask, -1, matrix + offset)
     return matrix.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
 
 
@@ -571,7 +543,7 @@ class Compressor(nn.Module):
         new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
         return new_tensor
 
-    def forward(self, x: torch.Tensor, start_pos: int):
+    def forward(self, x: torch.Tensor):
         assert self.kv_cache is not None
         bsz, seqlen, _ = x.size()
         ratio, overlap, rd = (
@@ -580,15 +552,6 @@ class Compressor(nn.Module):
             self.rope_head_dim,
         )
         dtype = x.dtype
-        if start_pos:
-            if seqlen != 1:
-                raise ValueError("continuation compression requires one token")
-            kv = self.forward_decode(
-                x,
-                torch.full((bsz,), start_pos, dtype=torch.long, device=x.device),
-            )
-            return kv if (start_pos + 1) % ratio == 0 else None
-
         projected = bf16_linear_fp32(x, self._fused_projection_weight)
         raw_kv, raw_score = projected.chunk(2, dim=-1)
         cutoff = seqlen - seqlen % ratio
@@ -714,12 +677,10 @@ class Indexer(torch.nn.Module):
         )
         self.freqs_cis = None
 
-    def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int):
+    def forward(self, x: torch.Tensor, qr: torch.Tensor, offset: int):
         bsz, seqlen, _ = x.size()
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        freqs_cis = self.freqs_cis[:seqlen]
         ratio, rd = self.compress_ratio, self.rope_head_dim
-        rd = self.rope_head_dim
-        end_pos = start_pos + seqlen
         if self.compressor.kv_cache is None:
             self.compressor.kv_cache = self.kv_cache
             self.compressor.freqs_cis = self.freqs_cis
@@ -729,28 +690,22 @@ class Indexer(torch.nn.Module):
         q = rotate_activation(q)
         # use fp4 simulation for q and kv in indexer
         fp4_act_quant(q, fp4_block_size, True)
-        self.compressor(x, start_pos)
+        self.compressor(x)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
         # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
         index_score = torch.einsum(
-            "bshd,btd->bsht", q, self.kv_cache[:bsz, : end_pos // ratio]
+            "bshd,btd->bsht", q, self.kv_cache[:bsz, : seqlen // ratio]
         )
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         if world_size > 1:
             index_score = self.allreduce(index_score)
-        if start_pos == 0:
-            mask = (
-                torch.arange(seqlen // ratio).repeat(seqlen, 1)
-                >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-            )
-            index_score += torch.where(mask, float("-inf"), 0)
-        topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
-        if start_pos == 0:
-            mask = topk_idxs >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-            topk_idxs = torch.where(mask, -1, topk_idxs + offset)
-        else:
-            topk_idxs += offset
-        return topk_idxs
+        complete = torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+        mask = torch.arange(seqlen // ratio).repeat(seqlen, 1) >= complete
+        index_score += torch.where(mask, float("-inf"), 0)
+        topk_idxs = index_score.topk(
+            min(self.index_topk, seqlen // ratio), dim=-1
+        )[1]
+        return torch.where(topk_idxs >= complete, -1, topk_idxs + offset)
 
     def forward_decode(
         self,
@@ -964,9 +919,9 @@ class Attention(nn.Module):
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
-    def forward(self, x: torch.Tensor, start_pos: int):
+    def forward(self, x: torch.Tensor):
         bsz, seqlen, _ = x.size()
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        freqs_cis = self.freqs_cis[:seqlen]
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
@@ -991,46 +946,31 @@ class Attention(nn.Module):
         apply_rotary_emb(kv[..., -rd:], freqs_cis)
         # FP8-simulate non-rope dims to match QAT; rope dims stay bf16 for positional precision
         act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
-        topk_idxs = get_window_topk_idxs(
-            win, bsz, seqlen, start_pos, self.window_capacity
-        )
+        topk_idxs = get_window_topk_idxs(win, bsz, seqlen)
         if self.compress_ratio:
-            offset = kv.size(1) if start_pos == 0 else self.window_capacity
+            offset = kv.size(1)
             if self.indexer is not None:
-                compress_topk_idxs = self.indexer(x, qr, start_pos, offset).int()
+                compress_topk_idxs = self.indexer(x, qr, offset).int()
             else:
                 compress_topk_idxs = get_compress_topk_idxs(
-                    ratio, bsz, seqlen, start_pos, offset
+                    ratio, bsz, seqlen, offset
                 )
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
 
         # compress kv & attn
-        if start_pos == 0:
-            if seqlen <= win:
-                self.kv_cache[:bsz, :seqlen] = kv
-            else:
-                positions = torch.arange(
-                    seqlen - win, seqlen, device=kv.device
-                ).remainder(self.window_capacity)
-                rows = torch.arange(bsz, device=kv.device).unsqueeze(1)
-                self.kv_cache[rows, positions.unsqueeze(0)] = kv[:, -win:]
-            if self.compress_ratio:
-                if (kv_compress := self.compressor(x, start_pos)) is not None:
-                    kv = torch.cat([kv, kv_compress], dim=1)
-            # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
-            o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        if seqlen <= win:
+            self.kv_cache[:bsz, :seqlen] = kv
         else:
-            self.kv_cache[:bsz, start_pos % self.window_capacity] = kv.squeeze(1)
-            if self.compress_ratio:
-                self.compressor(x, start_pos)
-                attention_cache = torch.cat(
-                    (self.kv_cache[:bsz], self.compressed_kv_cache[:bsz]), dim=1
-                )
-            else:
-                attention_cache = self.kv_cache[:bsz]
-            o = sparse_attn(
-                q, attention_cache, self.attn_sink, topk_idxs, self.softmax_scale
-            )
+            positions = torch.arange(
+                seqlen - win, seqlen, device=kv.device
+            ).remainder(self.window_capacity)
+            rows = torch.arange(bsz, device=kv.device).unsqueeze(1)
+            self.kv_cache[rows, positions.unsqueeze(0)] = kv[:, -win:]
+        if self.compress_ratio:
+            if (kv_compress := self.compressor(x)) is not None:
+                kv = torch.cat([kv, kv_compress], dim=1)
+        # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
+        o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
 
         # o
@@ -1293,17 +1233,13 @@ class Gate(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        input_ids: Optional[torch.Tensor] = None,
-        *,
-        optimized: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        input_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         scores = bf16_linear_fp32(x, self.weight)
         if (
-            optimized
-            and self.hash
+            self.hash
             and self.score_func == "sqrtsoftplus"
             and self.topk == 6
-            and input_ids is not None
         ):
             return hash_sqrt_softplus(
                 scores,
@@ -1312,9 +1248,7 @@ class Gate(nn.Module):
                 self.route_scale,
             )
         if (
-            optimized
-            and scores.is_cuda
-            and (scores.shape[-1] & (scores.shape[-1] - 1)) == 0
+            (scores.shape[-1] & (scores.shape[-1] - 1)) == 0
             and self.topk == 6
             and self.score_func == "sqrtsoftplus"
             and self.bias is not None
@@ -1350,13 +1284,12 @@ class Expert(nn.Module):
         inter_dim: int,
         dtype=None,
         swiglu_limit=0,
-        storage: Optional[
-            tuple[
-                tuple[torch.Tensor, torch.Tensor],
-                tuple[torch.Tensor, torch.Tensor],
-                tuple[torch.Tensor, torch.Tensor],
-            ]
-        ] = None,
+        storage: tuple[
+            tuple[torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor],
+        ]
+        | None = None,
     ):
         super().__init__()
         if storage is None:
@@ -1422,7 +1355,7 @@ class Expert(nn.Module):
         self.swiglu_limit = swiglu_limit
 
     def forward(
-        self, x: torch.Tensor, weights: Optional[torch.Tensor] = None
+        self, x: torch.Tensor, weights: torch.Tensor | None = None
     ) -> torch.Tensor:
         dtype = x.dtype
         if self._fused_w13:
@@ -1601,7 +1534,7 @@ class MoE(nn.Module):
             with torch.cuda.stream(self.decode_overlap_stream):
                 shared = self.shared_experts(x)
 
-        weights, indices = self.gate(x, input_ids.flatten(), optimized=x.is_cuda)
+        weights, indices = self.gate(x, input_ids.flatten())
         if self._fused_fp4:
             y = self._fused_experts(x, weights, indices)
         else:
@@ -1661,53 +1594,8 @@ class Block(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-        *,
-        optimized: bool = False,
-        norm_weight: torch.Tensor | None = None,
     ):
         # x: [b,s,hc,d], hc_fn: [mix_hc,hc*d], hc_scale: [3], hc_base: [mix_hc], y: [b,s,hc,d]
-        if optimized and x.is_cuda:
-            if norm_weight is None:
-                raise ValueError("optimized HC pre-processing requires norm weights")
-            outer_shape = x.shape[:-2]
-            num_tokens = math.prod(outer_shape)
-            hc_hidden_size = x.shape[-2] * x.shape[-1]
-            residual = x.reshape(num_tokens, x.shape[-2], x.shape[-1]).contiguous()
-            flat = residual.reshape(num_tokens, hc_hidden_size)
-            num_splits = _MHC_PRE_NUM_SPLITS
-            dot_mix = torch.empty(
-                (num_splits, num_tokens, hc_fn.shape[0]),
-                dtype=torch.float32,
-                device=x.device,
-            )
-            sqrsum = torch.empty(
-                (num_splits, num_tokens), dtype=torch.float32, device=x.device
-            )
-            tf32_hc_prenorm_gemm(
-                flat,
-                hc_fn,
-                dot_mix,
-                sqrsum,
-                num_splits=num_splits,
-            )
-            post, comb, layer_input = mhc_pre_norm(
-                dot_mix,
-                sqrsum,
-                residual,
-                hc_scale,
-                hc_base,
-                norm_weight,
-                rms_epsilon=self.norm_eps,
-                norm_epsilon=self.norm_eps,
-                pre_epsilon=self.hc_eps,
-                sinkhorn_epsilon=self.hc_eps,
-                sinkhorn_iterations=self.hc_sinkhorn_iters,
-            )
-            return (
-                layer_input.reshape(*outer_shape, x.shape[-1]),
-                post.reshape(*outer_shape, x.shape[-2]),
-                comb.reshape(*outer_shape, x.shape[-2], x.shape[-2]),
-            )
         mixes = F.linear(x.flatten(2).float(), hc_fn)
         post, comb, layer_input = mhc_pre_big_fuse_with_prenorm(
             mixes,
@@ -1722,6 +1610,57 @@ class Block(nn.Module):
         )
         return layer_input, post.squeeze(-1), comb
 
+    def hc_pre_graph(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: torch.Tensor,
+    ):
+        """Run the small-token HC projection and fused pre-normalization."""
+
+        outer_shape = x.shape[:-2]
+        num_tokens = math.prod(outer_shape)
+        hc_hidden_size = x.shape[-2] * x.shape[-1]
+        residual = x.reshape(num_tokens, x.shape[-2], x.shape[-1]).contiguous()
+        flat = residual.reshape(num_tokens, hc_hidden_size)
+        dot_mix = torch.empty(
+            (_MHC_PRE_NUM_SPLITS, num_tokens, hc_fn.shape[0]),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        sqrsum = torch.empty(
+            (_MHC_PRE_NUM_SPLITS, num_tokens),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        tf32_hc_prenorm_gemm(
+            flat,
+            hc_fn,
+            dot_mix,
+            sqrsum,
+            num_splits=_MHC_PRE_NUM_SPLITS,
+        )
+        post, comb, layer_input = mhc_pre_norm(
+            dot_mix,
+            sqrsum,
+            residual,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            rms_epsilon=self.norm_eps,
+            norm_epsilon=self.norm_eps,
+            pre_epsilon=self.hc_eps,
+            sinkhorn_epsilon=self.hc_eps,
+            sinkhorn_iterations=self.hc_sinkhorn_iters,
+        )
+        return (
+            layer_input.reshape(*outer_shape, x.shape[-1]),
+            post.reshape(*outer_shape, x.shape[-2]),
+            comb.reshape(*outer_shape, x.shape[-2], x.shape[-2]),
+        )
+
     def hc_post(
         self,
         x: torch.Tensor,
@@ -1735,16 +1674,14 @@ class Block(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
-        input_ids: Optional[torch.Tensor],
-        *attn_args,
+        input_ids: torch.Tensor,
     ) -> torch.Tensor:
         residual = x
         x, post, comb = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attn_norm(x)
-        x = self.attn(x, start_pos, *attn_args)
+        x = self.attn(x)
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
@@ -1765,29 +1702,13 @@ class Block(nn.Module):
     ) -> torch.Tensor:
         """Run a target block without host-side position specialization."""
 
-        residual = x
-        x, post, comb = self.hc_pre(
+        return self._forward_graph(
             x,
-            self.hc_attn_fn,
-            self.hc_attn_scale,
-            self.hc_attn_base,
-            optimized=True,
-            norm_weight=self.attn_norm.weight,
+            input_ids,
+            lambda layer_input: self.attn.forward_decode(
+                layer_input, position, graph_seq_len
+            ),
         )
-        x = self.attn.forward_decode(x, position, graph_seq_len)
-        x = self.hc_post(x, residual, post, comb)
-
-        residual = x
-        x, post, comb = self.hc_pre(
-            x,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            optimized=True,
-            norm_weight=self.ffn_norm.weight,
-        )
-        x = self.ffn(x, input_ids)
-        return self.hc_post(x, residual, post, comb)
 
     def forward_verify(
         self,
@@ -1798,26 +1719,40 @@ class Block(nn.Module):
     ) -> torch.Tensor:
         """Run one target layer over a short causal verification block."""
 
+        return self._forward_graph(
+            x,
+            input_ids,
+            lambda layer_input: self.attn.forward_verify(
+                layer_input, token_positions, graph_seq_len
+            ),
+        )
+
+    def _forward_graph(
+        self,
+        x: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the shared small-token HC/attention/FFN block skeleton."""
+
         residual = x
-        x, post, comb = self.hc_pre(
+        x, post, comb = self.hc_pre_graph(
             x,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
-            optimized=True,
-            norm_weight=self.attn_norm.weight,
+            self.attn_norm.weight,
         )
-        x = self.attn.forward_verify(x, token_positions, graph_seq_len)
+        x = attention(x)
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
-        x, post, comb = self.hc_pre(
+        x, post, comb = self.hc_pre_graph(
             x,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            optimized=True,
-            norm_weight=self.ffn_norm.weight,
+            self.ffn_norm.weight,
         )
         x = self.ffn(x, input_ids)
         return self.hc_post(x, residual, post, comb)
@@ -2001,29 +1936,11 @@ class DSparkBlock(Block):
         position: torch.Tensor,
         input_ids: torch.Tensor,
     ) -> torch.Tensor:
-        residual = x
-        x, post, comb = self.hc_pre(
+        return self._forward_graph(
             x,
-            self.hc_attn_fn,
-            self.hc_attn_scale,
-            self.hc_attn_base,
-            optimized=True,
-            norm_weight=self.attn_norm.weight,
+            input_ids,
+            lambda layer_input: self.attn(layer_input, position),
         )
-        x = self.attn(x, position)
-        x = self.hc_post(x, residual, post, comb)
-
-        residual = x
-        x, post, comb = self.hc_pre(
-            x,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            optimized=True,
-            norm_weight=self.ffn_norm.weight,
-        )
-        x = self.ffn(x, input_ids)
-        return self.hc_post(x, residual, post, comb)
 
 
 class Transformer(nn.Module):
@@ -2090,27 +2007,48 @@ class Transformer(nn.Module):
                 )
 
     @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
-        logits, _ = self.forward_target(input_ids, start_pos)
+    def forward(self, input_ids: torch.Tensor):
+        logits, _ = self.forward_target(input_ids)
         return logits
 
-    @torch.inference_mode()
-    def forward_target(self, input_ids: torch.Tensor, start_pos: int = 0):
-        """Run target prefill and return the hidden states consumed by DSpark."""
+    def _forward_layers(
+        self,
+        input_ids: torch.Tensor,
+        forward_layer: Callable[[Block, torch.Tensor], torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the shared embedding/layer/hidden-state collection skeleton."""
 
         h = self.embed(input_ids)
-        # Expand to hc_mult copies for Hyper-Connections
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         main_hiddens = []
         for layer_id, layer in enumerate(self.layers):
-            h = layer(h, start_pos, input_ids)
+            h = forward_layer(layer, h)
             if layer_id in self.target_layer_ids:
                 main_hiddens.append(h.mean(dim=2))
         h = self.layers[-1].hc_head(
             h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
         main_hidden = torch.cat(main_hiddens, dim=-1) if main_hiddens else None
-        return self.head(self.norm(h)), main_hidden
+        return h, main_hidden
+
+    def _target_output(
+        self,
+        hidden: torch.Tensor,
+        main_hidden: torch.Tensor | None,
+        *,
+        full_logits: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self.head(self.norm(hidden), full_logits=full_logits), main_hidden
+
+    @torch.inference_mode()
+    def forward_target(self, input_ids: torch.Tensor):
+        """Run target prefill and return the hidden states consumed by DSpark."""
+
+        h, main_hidden = self._forward_layers(
+            input_ids,
+            lambda layer, hidden: layer(hidden, input_ids),
+        )
+        return self._target_output(h, main_hidden)
 
     @torch.inference_mode()
     def forward_decode(
@@ -2133,18 +2071,13 @@ class Transformer(nn.Module):
     ):
         """Decode target tokens and expose DSpark's selected hidden states."""
 
-        h = self.embed(input_ids)
-        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
-        main_hiddens = []
-        for layer_id, layer in enumerate(self.layers):
-            h = layer.forward_decode(h, position, input_ids, graph_seq_len)
-            if layer_id in self.target_layer_ids:
-                main_hiddens.append(h.mean(dim=2))
-        h = self.layers[-1].hc_head(
-            h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
+        h, main_hidden = self._forward_layers(
+            input_ids,
+            lambda layer, hidden: layer.forward_decode(
+                hidden, position, input_ids, graph_seq_len
+            ),
         )
-        main_hidden = torch.cat(main_hiddens, dim=-1) if main_hiddens else None
-        return self.head(self.norm(h)), main_hidden
+        return self._target_output(h, main_hidden)
 
     @torch.inference_mode()
     def forward_verify(
@@ -2155,21 +2088,16 @@ class Transformer(nn.Module):
     ):
         """Run one fixed target verification block."""
 
-        h = self.embed(input_ids)
-        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         token_positions = position[:, None] + torch.arange(
             input_ids.shape[1], device=input_ids.device
         )
-        main_hiddens = []
-        for layer_id, layer in enumerate(self.layers):
-            h = layer.forward_verify(h, token_positions, input_ids, graph_seq_len)
-            if layer_id in self.target_layer_ids:
-                main_hiddens.append(h.mean(dim=2))
-        h = self.layers[-1].hc_head(
-            h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
+        h, main_hidden = self._forward_layers(
+            input_ids,
+            lambda layer, hidden: layer.forward_verify(
+                hidden, token_positions, input_ids, graph_seq_len
+            ),
         )
-        main_hidden = torch.cat(main_hiddens, dim=-1) if main_hiddens else None
-        return self.head(self.norm(h), full_logits=True), main_hidden
+        return self._target_output(h, main_hidden, full_logits=True)
 
     @torch.inference_mode()
     def clear_rejected_speculative_state(

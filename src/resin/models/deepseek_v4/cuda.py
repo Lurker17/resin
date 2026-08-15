@@ -531,7 +531,7 @@ class DeepSeekV4FlashCudaRunner:
                 plan.token_ids[start:end], dtype=torch.long, device=self.device
             ).unsqueeze(0)
             if getattr(self, "speculative_tokens", 0):
-                row_logits, main_hidden = self._model.forward_target(input_ids, 0)
+                row_logits, main_hidden = self._model.forward_target(input_ids)
                 if main_hidden is None:
                     raise RuntimeError("target did not produce DSpark hidden states")
                 self._model.prefill_dspark(main_hidden)
