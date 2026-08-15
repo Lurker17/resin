@@ -412,7 +412,7 @@ image = (
     )
     .uv_sync(
         str(ROOT),
-        extras=["cuda"],
+        extras=["gpu"],
         extra_options="--no-default-groups",
     )
     .uv_pip_install(
@@ -429,8 +429,23 @@ image = (
     .add_local_file(ROOT / "pyproject.toml", "/opt/resin/pyproject.toml", copy=True)
     .add_local_file(ROOT / "README.md", "/opt/resin/README.md", copy=True)
     .add_local_file(ROOT / "NOTICE", "/opt/resin/NOTICE", copy=True)
-    .add_local_dir(ROOT / "src", "/opt/resin/src", copy=True)
-    .run_commands("python -m pip install --no-deps /opt/resin")
+    .add_local_dir(ROOT / "crates", "/opt/resin/crates", copy=True)
+    .add_local_dir(ROOT / "resin", "/opt/resin/resin", copy=True)
+    .add_local_dir(
+        ROOT / "models/cuda",
+        "/opt/resin/models/cuda",
+        copy=True,
+    )
+    .add_local_dir(
+        ROOT / "models/torch",
+        "/opt/resin/models/torch",
+        copy=True,
+    )
+    .run_commands(
+        "python -m pip install --no-deps /opt/resin",
+        "python -m pip install --no-deps /opt/resin/models/torch",
+        "python -m pip install --no-deps /opt/resin/models/cuda",
+    )
     .env(KERNEL_CACHE_ENV)
 )
 
@@ -457,9 +472,9 @@ def _benchmark_report() -> dict[str, object]:
     from statistics import median
 
     import torch
+    from resin_models_torch.lfm2 import Lfm2TorchRunner
 
     from resin import Engine
-    from resin.models.lfm2.reference import Lfm2TorchRunner
 
     torch.cuda.reset_peak_memory_stats()
     load_start = time.perf_counter()
@@ -507,8 +522,9 @@ def _kernel_benchmark_report() -> dict[str, object]:
     import torch
 
     install_flashinfer_hash_cache()
+    from resin_models_cuda.lfm2 import Lfm2CudaRunner
+
     from resin import Engine, StatePool
-    from resin.models.lfm2.cuda import Lfm2CudaRunner
 
     page_size = 16
     max_pages = 64
@@ -591,8 +607,9 @@ def _async_completion_report() -> dict[str, object]:
     from blake3 import blake3
 
     install_flashinfer_hash_cache()
+    from resin_models_cuda.lfm2 import Lfm2CudaRunner
+
     from resin import Engine, StatePool
-    from resin.models.lfm2.cuda import Lfm2CudaRunner
 
     device_name, capability = _validated_h100(torch)
     torch.cuda.reset_peak_memory_stats()
@@ -827,8 +844,9 @@ def _native_continuation_scheduler_report() -> dict[str, object]:
     import torch
 
     install_flashinfer_hash_cache()
+    from resin_models_cuda.lfm2 import Lfm2CudaRunner
+
     from resin import Engine, SchedulerConfig, StatePool
-    from resin.models.lfm2.cuda import Lfm2CudaRunner
 
     class RecordingRunner:
         supports_continuation_prefill = True

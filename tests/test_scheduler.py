@@ -240,16 +240,14 @@ class TestSchedulerConfigContract:
         cached_engine.close()
 
     def test_builtin_runner_continuation_capabilities_are_explicit(self) -> None:
-        from resin.models.gpt_oss.cuda import GptOssCudaRunner
-        from resin.models.gpt_oss.reference import GptOssRunner
-        from resin.models.lfm2.cuda import Lfm2CudaRunner
-        from resin.models.lfm2.reference import Lfm2TorchRunner
+        from resin_models_cuda.gpt_oss import GptOssCudaRunner
+        from resin_models_cuda.lfm2 import Lfm2CudaRunner
+        from resin_models_torch.lfm2 import Lfm2TorchRunner
 
         assert GptOssCudaRunner.supports_continuation_prefill is True
         assert GptOssCudaRunner.max_batch_tokens == 8192
         assert Lfm2CudaRunner.supports_continuation_prefill is True
         assert Lfm2TorchRunner.supports_continuation_prefill is True
-        assert GptOssRunner.supports_continuation_prefill is True
 
     def test_engine_freezes_a_copy_of_the_effective_config(self) -> None:
         runner = RecordingRunner()

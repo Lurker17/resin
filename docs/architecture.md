@@ -260,7 +260,7 @@ in [state ownership](state-pool.md).
 
 ## Implemented paths and limits
 
-`Lfm2TorchRunner` and `GptOssRunner` are synchronous references.
+`Lfm2TorchRunner` is the synchronous reference implementation.
 `Lfm2CudaRunner` uses one History group plus a mapped convolution-state slab. It
 exposes only the atomic cache-plus-state binder and asynchronous `dispatch` /
 `poll`; there are no separate binding or synchronous execution paths. Its H100
@@ -287,9 +287,11 @@ Reusable runner building blocks live under `resin.backend`. The device-neutral
 package provides plan, binding, and sampling helpers. `resin.backend.cuda`
 provides injected-framework CUDA graphs, asynchronous completion, tensor
 staging, paged KV, and mapped recurrent-state storage. Concrete architectures
-and their runners live separately under `resin.models`. Importing the package
-namespaces does not load PyTorch, FlashInfer, or FlashAttention; importing a
-concrete model implementation loads the framework it uses.
+and their runners live in the separate `resin_models_cuda` and
+`resin_models_torch` distributions under `models/`. Importing those package
+namespaces does not load PyTorch,
+FlashInfer, or FlashAttention; importing a concrete implementation loads the
+framework it uses.
 
 ## Code map
 
@@ -298,5 +300,5 @@ concrete model implementation loads the framework it uses.
 - `crates/resin-py/src/runner.rs` — runner discovery and resource binding
 - `crates/resin-py/src/cache.rs` — layout and plan descriptors
 - `crates/resin-py/src/state_pool.rs` — state ownership, access, and physical mappings
-- `src/resin/backend/` — reusable execution and resource gadgets
-- `src/resin/models/` — concrete model definitions, loaders, and runners
+- `resin/backend/` — reusable execution and resource gadgets
+- `models/` — separately installable model definitions, loaders, and runners

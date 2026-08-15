@@ -10,8 +10,8 @@ class TestImport:
     def test_import_resin_does_not_import_accelerator_stacks(self) -> None:
         code = (
             "import sys; import resin; import resin.backend; "
-            "import resin.backend.cuda; import resin.models; "
-            "import resin.models.gpt_oss; import resin.models.lfm2; "
+            "import resin.backend.cuda; import resin_models_cuda; "
+            "import resin_models_torch; "
             "print(*(int(name in sys.modules) for name in "
             "('torch', 'flashinfer', 'flash_attn')))"
         )
@@ -23,9 +23,19 @@ class TestImport:
     def test_accelerator_dependencies_are_optional(self) -> None:
         project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
         assert project["dependencies"] == ["blake3>=1.0,<2"]
-        cuda = project["optional-dependencies"]["cuda"]
-        assert any(item.startswith("torch") for item in cuda)
-        assert any(item.startswith("flashinfer-python") for item in cuda)
-        assert any(item.startswith("quack-kernels==0.6.4") for item in cuda)
-        assert any(item.startswith("nvidia-cutlass-dsl") for item in cuda)
-        assert any(item.startswith("flash-attn-4") for item in cuda)
+        gpu = project["optional-dependencies"]["gpu"]
+        assert any(item.startswith("torch") for item in gpu)
+        assert any(item.startswith("flashinfer-python") for item in gpu)
+        assert any(item.startswith("quack-kernels==0.6.4") for item in gpu)
+        assert any(item.startswith("nvidia-cutlass-dsl") for item in gpu)
+        assert any(item.startswith("flash-attn-4") for item in gpu)
+
+        cuda_models = tomllib.loads(Path("models/cuda/pyproject.toml").read_text())[
+            "project"
+        ]
+        assert "resin[gpu]==0.1.0" in cuda_models["dependencies"]
+
+        torch_models = tomllib.loads(Path("models/torch/pyproject.toml").read_text())[
+            "project"
+        ]
+        assert torch_models["dependencies"] == ["resin[torch]==0.1.0"]

@@ -42,14 +42,15 @@ Resin requires Python 3.11+ and Rust.
 uv sync --extra dev
 uv run maturin develop --generate-stubs
 uv run python scripts/normalize_stubs.py
-uv run ruff format src/resin/_resin.pyi
+uv run ruff format resin/_resin.pyi
 ```
 
 The control-plane tests do not require a GPU. Importing a concrete model module
 loads PyTorch; importing `resin` or a model package namespace does not.
 
-Install `resin[torch]` for reference models or `resin[cuda]` for the CUDA
-runners. The uv lock intentionally overrides FlashAttention-4's stale CUTLASS
+Install `resin-models-cuda`; it pulls in `resin[gpu]` for the shared
+accelerator runtime. The uv lock intentionally
+overrides FlashAttention-4's stale CUTLASS
 DSL metadata pin so FA4 and Quack use one tested toolchain.
 Reusable device-neutral helpers live in `resin.backend`; CUDA helpers
 are explicit imports from `resin.backend.cuda`.
@@ -64,7 +65,7 @@ new machine:
 uv sync --extra dev
 uv run maturin develop --generate-stubs
 uv run python scripts/normalize_stubs.py
-uv run ruff format src/resin/_resin.pyi
+uv run ruff format resin/_resin.pyi
 uv run modal setup
 ```
 
@@ -132,7 +133,7 @@ FlashInfer/FA4 packages are still required remotely.
 
 ```python
 from resin import Engine, SamplingParams
-from resin.models.lfm2.reference import Lfm2TorchRunner
+from resin_models_torch.lfm2 import Lfm2TorchRunner
 
 runner = Lfm2TorchRunner()
 
@@ -190,8 +191,8 @@ Resin has no content index or cross-request cache sharing today, so it performs
 no prefix reuse. The current cache surface only describes live allocation and
 runner placement.
 
-Implemented runner modules include synchronous LFM2 and GPT-OSS references and
-local CUDA implementations for LFM2 and GPT-OSS. The GPT-OSS CUDA path uses one
+Implemented runner modules include a synchronous LFM2 reference and local CUDA
+implementations for LFM2 and GPT-OSS. The GPT-OSS CUDA path uses one
 History group and one Window group over the flat pool. Its deployment harness
 supports intra-container tensor parallel sizes 1, 2, 4, and 8, with matching
 multi-H200 allocations and reusable distributed decode CUDA graphs. Attention
@@ -230,7 +231,9 @@ StateMappingConfig
 mint_state_mapping_arena_id
 ```
 
-Concrete runners are explicit imports from `resin.models` modules.
+Concrete runners are explicit imports from architecture submodules such as
+`resin_models_cuda.deepseek_v4`, `resin_models_cuda.gpt_oss`, and
+`resin_models_torch.lfm2`.
 
 ## Checks
 
@@ -255,8 +258,8 @@ unavailable accelerator libraries.
 - `crates/resin-core/src/scheduler.rs` — cohort selection and queue-age policy
 - `crates/resin-core/src/planning.rs` — typed token-range planning
 - `crates/resin-core/src/resources/` — KV, recurrent, allocator, and lease logic
-- `src/resin/backend/` — reusable execution and resource gadgets
-- `src/resin/models/` — concrete model definitions, loaders, and runners
+- `resin/backend/` — reusable execution and resource gadgets
+- `models/` — separately installable model definitions, loaders, and runners
 - `scripts/` — examples, benchmarks, and local maintenance tools
 - `deploy/` — optional remote validation harnesses
 - `tests/` — native and runner-contract coverage

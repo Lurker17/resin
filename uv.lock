@@ -13,6 +13,11 @@ resolution-markers = [
 ]
 
 [manifest]
+members = [
+    "resin",
+    "resin-models-cuda",
+    "resin-models-torch",
+]
 overrides = [
     { name = "apache-tvm-ffi", specifier = "==0.1.11" },
     { name = "nvidia-cutlass-dsl", specifier = "==4.6.2" },
@@ -2436,7 +2441,23 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-cuda = [
+demo = [
+    { name = "huggingface-hub" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "renderers" },
+    { name = "safetensors" },
+    { name = "tokenizers" },
+    { name = "torch" },
+    { name = "transformers" },
+]
+dev = [
+    { name = "maturin" },
+    { name = "modal" },
+    { name = "pytest" },
+    { name = "ruff" },
+]
+gpu = [
     { name = "apache-tvm-ffi" },
     { name = "cuda-tile" },
     { name = "flash-attn-4" },
@@ -2455,22 +2476,6 @@ cuda = [
     { name = "torch" },
     { name = "triton" },
 ]
-demo = [
-    { name = "huggingface-hub" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "renderers" },
-    { name = "safetensors" },
-    { name = "tokenizers" },
-    { name = "torch" },
-    { name = "transformers" },
-]
-dev = [
-    { name = "maturin" },
-    { name = "modal" },
-    { name = "pytest" },
-    { name = "ruff" },
-]
 torch = [
     { name = "huggingface-hub" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -2481,42 +2486,68 @@ torch = [
 
 [package.metadata]
 requires-dist = [
-    { name = "apache-tvm-ffi", marker = "extra == 'cuda'", specifier = "==0.1.11" },
+    { name = "apache-tvm-ffi", marker = "extra == 'gpu'", specifier = "==0.1.11" },
     { name = "blake3", specifier = ">=1.0,<2" },
-    { name = "cuda-tile", marker = "extra == 'cuda'", specifier = "==1.5.0" },
-    { name = "flash-attn-4", marker = "extra == 'cuda'", specifier = "==4.0.0b26" },
-    { name = "flashinfer-python", marker = "extra == 'cuda'", specifier = "==0.6.15.post1" },
-    { name = "hf-xet", marker = "extra == 'cuda'", specifier = "==1.6.0" },
-    { name = "huggingface-hub", marker = "extra == 'cuda'", specifier = "==1.27.0" },
+    { name = "cuda-tile", marker = "extra == 'gpu'", specifier = "==1.5.0" },
+    { name = "flash-attn-4", marker = "extra == 'gpu'", specifier = "==4.0.0b26" },
+    { name = "flashinfer-python", marker = "extra == 'gpu'", specifier = "==0.6.15.post1" },
+    { name = "hf-xet", marker = "extra == 'gpu'", specifier = "==1.6.0" },
     { name = "huggingface-hub", marker = "extra == 'demo'", specifier = "==1.27.0" },
+    { name = "huggingface-hub", marker = "extra == 'gpu'", specifier = "==1.27.0" },
     { name = "huggingface-hub", marker = "extra == 'torch'", specifier = ">=0.35" },
-    { name = "kernels", marker = "extra == 'cuda'", specifier = "==0.15.2" },
+    { name = "kernels", marker = "extra == 'gpu'", specifier = "==0.15.2" },
     { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.9,<2" },
     { name = "modal", marker = "extra == 'dev'", specifier = ">=1.5.3" },
-    { name = "numpy", marker = "python_full_version >= '3.12' and extra == 'cuda'", specifier = "==2.5.1" },
     { name = "numpy", marker = "python_full_version >= '3.12' and extra == 'demo'", specifier = "==2.5.1" },
-    { name = "numpy", marker = "python_full_version < '3.12' and extra == 'cuda'", specifier = "==2.4.6" },
+    { name = "numpy", marker = "python_full_version >= '3.12' and extra == 'gpu'", specifier = "==2.5.1" },
     { name = "numpy", marker = "python_full_version < '3.12' and extra == 'demo'", specifier = "==2.4.6" },
+    { name = "numpy", marker = "python_full_version < '3.12' and extra == 'gpu'", specifier = "==2.4.6" },
     { name = "numpy", marker = "extra == 'torch'", specifier = ">=1.26" },
-    { name = "nvidia-cutlass-dsl", marker = "extra == 'cuda'", specifier = "==4.6.2" },
-    { name = "nvidia-cutlass-dsl-libs-base", marker = "extra == 'cuda'", specifier = "==4.6.2" },
+    { name = "nvidia-cutlass-dsl", marker = "extra == 'gpu'", specifier = "==4.6.2" },
+    { name = "nvidia-cutlass-dsl-libs-base", marker = "extra == 'gpu'", specifier = "==4.6.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<9" },
-    { name = "quack-kernels", marker = "extra == 'cuda'", specifier = "==0.6.4" },
+    { name = "quack-kernels", marker = "extra == 'gpu'", specifier = "==0.6.4" },
     { name = "renderers", marker = "extra == 'demo'", specifier = "==0.1.9" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.16,<0.17" },
-    { name = "safetensors", marker = "extra == 'cuda'", specifier = "==0.8.0" },
     { name = "safetensors", marker = "extra == 'demo'", specifier = "==0.8.0" },
+    { name = "safetensors", marker = "extra == 'gpu'", specifier = "==0.8.0" },
     { name = "safetensors", marker = "extra == 'torch'", specifier = ">=0.5" },
-    { name = "sgl-deep-gemm", marker = "sys_platform == 'linux' and extra == 'cuda'", specifier = "==0.1.5.post2" },
-    { name = "tilelang", marker = "sys_platform == 'linux' and extra == 'cuda'", specifier = "==0.1.11" },
+    { name = "sgl-deep-gemm", marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = "==0.1.5.post2" },
+    { name = "tilelang", marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = "==0.1.11" },
     { name = "tokenizers", marker = "extra == 'demo'", specifier = "==0.22.2" },
-    { name = "torch", marker = "extra == 'cuda'", specifier = "==2.13.0" },
     { name = "torch", marker = "extra == 'demo'", specifier = "==2.13.0" },
+    { name = "torch", marker = "extra == 'gpu'", specifier = "==2.13.0" },
     { name = "torch", marker = "extra == 'torch'", specifier = ">=2.7" },
     { name = "transformers", marker = "extra == 'demo'", specifier = "==5.14.1" },
-    { name = "triton", marker = "extra == 'cuda'", specifier = "==3.7.1" },
+    { name = "triton", marker = "extra == 'gpu'", specifier = "==3.7.1" },
 ]
-provides-extras = ["torch", "cuda", "demo", "dev"]
+provides-extras = ["torch", "gpu", "demo", "dev"]
+
+[[package]]
+name = "resin-models-cuda"
+version = "0.1.0"
+source = { editable = "models/cuda" }
+dependencies = [
+    { name = "resin", extra = ["gpu"] },
+    { name = "resin-models-torch" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "resin", extras = ["gpu"], editable = "." },
+    { name = "resin-models-torch", editable = "models/torch" },
+]
+
+[[package]]
+name = "resin-models-torch"
+version = "0.1.0"
+source = { editable = "models/torch" }
+dependencies = [
+    { name = "resin", extra = ["torch"] },
+]
+
+[package.metadata]
+requires-dist = [{ name = "resin", extras = ["torch"], editable = "." }]
 
 [[package]]
 name = "rich"

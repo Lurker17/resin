@@ -2589,10 +2589,11 @@ impl Engine {
             prepared.push(PreparedProgress {
                 apply: true,
                 resident_tokens,
-                sampled_tokens: scheduled
-                    .sample
-                    .then(|| token_ids.clone())
-                    .unwrap_or_default(),
+                sampled_tokens: if scheduled.sample {
+                    token_ids.clone()
+                } else {
+                    Default::default()
+                },
                 sampling_offset,
             });
         }

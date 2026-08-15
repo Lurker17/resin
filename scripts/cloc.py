@@ -124,9 +124,10 @@ def report() -> dict[str, dict[str, dict[str, int]]]:
             "resin-py": source_files(ROOT / "crates/resin-py/src", "*.rs"),
         },
         "python": {
-            "top-level": source_files(ROOT / "src/resin", "*.py", recursive=False),
-            "backend": source_files(ROOT / "src/resin/backend", "*.py"),
-            "models": source_files(ROOT / "src/resin/models", "*.py"),
+            "top-level": source_files(ROOT / "resin", "*.py", recursive=False),
+            "backend": source_files(ROOT / "resin/backend", "*.py"),
+            "models-cuda": source_files(ROOT / "models/cuda", "*.py"),
+            "models-torch": source_files(ROOT / "models/torch", "*.py"),
         },
     }
     output = {}

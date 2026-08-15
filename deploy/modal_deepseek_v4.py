@@ -22,7 +22,6 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from resin import Engine, SamplingParams, SchedulerConfig
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
-from resin.models.deepseek_v4.checkpoint import DEFAULT_MODEL, DEFAULT_REVISION
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_CACHE_MOUNT = "/models/resin-deepseek-v4"
@@ -71,7 +70,7 @@ image = (
     )
     .uv_sync(
         str(ROOT),
-        extras=["cuda", "demo"],
+        extras=["gpu", "demo"],
         extra_options="--no-default-groups",
     )
     .uv_pip_install(
@@ -94,9 +93,21 @@ image = (
     .add_local_file(ROOT / "README.md", "/opt/resin/README.md", copy=True)
     .add_local_dir(ROOT / "docs", "/opt/resin/docs", copy=True)
     .add_local_dir(ROOT / "crates", "/opt/resin/crates", copy=True)
-    .add_local_dir(ROOT / "src", "/opt/resin/src", copy=True)
+    .add_local_dir(ROOT / "resin", "/opt/resin/resin", copy=True)
+    .add_local_dir(
+        ROOT / "models/cuda",
+        "/opt/resin/models/cuda",
+        copy=True,
+    )
     .uv_pip_install("/opt/resin", extra_options="--no-deps")
+    .uv_pip_install(
+        "/opt/resin/models/cuda",
+        extra_options="--no-deps",
+    )
 )
+
+with image.imports():
+    from resin_models_cuda.deepseek_v4.checkpoint import DEFAULT_MODEL, DEFAULT_REVISION
 
 model_cache_volume = modal.Volume.from_name(
     MODEL_CACHE_VOLUME_NAME, create_if_missing=True, version=1
@@ -616,7 +627,7 @@ def _run_rank_workload(
     speculative_tokens: int,
     diagnose_verify: bool,
 ) -> dict[str, object]:
-    from resin.models.deepseek_v4.cuda import DeepSeekV4FlashCudaRunner
+    from resin_models_cuda.deepseek_v4 import DeepSeekV4FlashCudaRunner
 
     if rank == 0:
         print(
@@ -1053,7 +1064,7 @@ def _run_rank_benchmark(
     batch_sizes: tuple[int, ...],
     use_cuda_graphs: bool,
 ) -> None:
-    from resin.models.deepseek_v4.cuda import DeepSeekV4FlashCudaRunner
+    from resin_models_cuda.deepseek_v4 import DeepSeekV4FlashCudaRunner
 
     tensor_parallel = _initialize_tensor_parallel(
         rank, master_port, tensor_parallel_size

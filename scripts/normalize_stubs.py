@@ -2,10 +2,11 @@
 
 from pathlib import Path
 
-STUB_PATH = Path(__file__).resolve().parents[1] / "src" / "resin" / "_resin.pyi"
+STUB_PATH = Path(__file__).resolve().parents[1] / "resin" / "_resin.pyi"
 IMPORT = "from resin.protocols import Runner"
 GENERATED_ANNOTATION = 'runner: "resin.protocols.Runner"'
 GENERATED_CANCEL = "def cancel(self, /, request: Any) -> bool: ..."
+GENERATED_SAMPLING_PARAMS = "def sampling_params(self, /) -> tuple: ..."
 
 
 def main() -> None:
@@ -20,6 +21,10 @@ def main() -> None:
     text = text.replace(
         GENERATED_CANCEL,
         "def cancel(self, /, request: RequestLease) -> bool: ...",
+    )
+    text = text.replace(
+        GENERATED_SAMPLING_PARAMS,
+        "def sampling_params(self, /) -> tuple[SamplingParams, ...]: ...",
     )
     STUB_PATH.write_text(text)
 

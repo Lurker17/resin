@@ -18,9 +18,9 @@ def measure(statement: str) -> float:
 print(f"import resin: {measure('import resin'):.2f} ms")
 print(
     "import PyTorch backend module: "
-    f"{measure('import resin.models.lfm2.reference'):.2f} ms"
+    f"{measure('import resin_models_torch.lfm2.reference'):.2f} ms"
 )
 print(
     "import managed CUDA model backend: "
-    f"{measure('import resin.models.lfm2.cuda'):.2f} ms"
+    f"{measure('import resin_models_cuda.lfm2.cuda'):.2f} ms"
 )

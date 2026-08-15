@@ -34,7 +34,6 @@ from deploy.jit_cache import (
 from resin import Engine, SamplingParams, SchedulerConfig, TokenEvent
 from resin.backend.cuda.graphs import CudaGraphStats
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
-from resin.models.gpt_oss.plan import PAGE_SIZE, WINDOW_TABLE_WIDTH
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -79,8 +78,6 @@ TOKENIZER_FILES = (
     "vocab.json",
 )
 
-PAGE_TOKENS = PAGE_SIZE
-WINDOW_RESIDENT_BLOCKS = WINDOW_TABLE_WIDTH
 SUPPORTED_TP_SIZES = (1, 2, 4, 8)
 
 
@@ -100,7 +97,7 @@ image = (
     )
     .uv_sync(
         str(ROOT),
-        extras=["cuda", "demo"],
+        extras=["gpu", "demo"],
         extra_options="--no-default-groups",
     )
     # These accelerator-specific supplement wheels live outside PyPI, so the
@@ -125,14 +122,27 @@ image = (
     .add_local_file(ROOT / "pyproject.toml", "/opt/resin/pyproject.toml", copy=True)
     .add_local_file(ROOT / "README.md", "/opt/resin/README.md", copy=True)
     .add_local_dir(ROOT / "crates", "/opt/resin/crates", copy=True)
-    .add_local_dir(ROOT / "src", "/opt/resin/src", copy=True)
+    .add_local_dir(ROOT / "resin", "/opt/resin/resin", copy=True)
+    .add_local_dir(
+        ROOT / "models/cuda",
+        "/opt/resin/models/cuda",
+        copy=True,
+    )
     .uv_pip_install("/opt/resin", extra_options="--no-deps")
+    .uv_pip_install(
+        "/opt/resin/models/cuda",
+        extra_options="--no-deps",
+    )
     .env(KERNEL_CACHE_ENV)
 )
 
 with image.imports():
-    from resin.models.gpt_oss.cuda import GptOssCudaRunner
-    from resin.models.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
+    from resin_models_cuda.gpt_oss import GptOssCudaRunner
+    from resin_models_cuda.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
+    from resin_models_cuda.gpt_oss.plan import PAGE_SIZE, WINDOW_TABLE_WIDTH
+
+PAGE_TOKENS = PAGE_SIZE
+WINDOW_RESIDENT_BLOCKS = WINDOW_TABLE_WIDTH
 
 kernel_cache_volume = modal.Volume.from_name(
     KERNEL_CACHE_VOLUME_NAME,

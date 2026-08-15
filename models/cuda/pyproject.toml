@@ -1,0 +1,21 @@
+[build-system]
+requires = ["uv_build>=0.9.2,<0.10"]
+build-backend = "uv_build"
+
+[project]
+name = "resin-models-cuda"
+version = "0.1.0"
+description = "Optimized LLM implementations for Resin, in CUDA"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+  "resin[gpu]==0.1.0",
+  "resin-models-torch==0.1.0",
+]
+
+[tool.uv.sources]
+resin = { workspace = true }
+resin-models-torch = { workspace = true }
+
+[tool.uv.build-backend]
+module-root = ""

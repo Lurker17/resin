@@ -4,10 +4,10 @@
 basic example of using Resin with a Torch-based forward pass.
 """
 
+from resin_models_torch.lfm2.reference import DEFAULT_MODEL, Lfm2TorchRunner
 from tokenizers import Tokenizer
 
 from resin import Engine
-from resin.models.lfm2.reference import DEFAULT_MODEL, Lfm2TorchRunner
 
 
 def main() -> None:

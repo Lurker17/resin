@@ -1,22 +1,12 @@
 # GPT-OSS runner status
 
-Resin contains a synchronous GPT-OSS reference runner and a Hopper-specific CUDA
-runner for released GPT-OSS 20B and 120B checkpoints. This document describes
-the current code path, not historical benchmark results.
-
-## Reference runner
-
-`resin.models.gpt_oss.reference.GptOssRunner` is the readable PyTorch path. It owns
-per-request model cache in Python and implements synchronous `forward(plan)`.
-Equal-length rows execute as a physical batch; unsupported heterogeneous shapes
-fail rather than silently running serially under a batched label.
-
-The reference runner is useful for model loading, sampling-output comparison,
-and small correctness work. It does not exercise Resin's managed cache pool.
+Resin contains a Hopper-specific CUDA runner for released GPT-OSS 20B and 120B
+checkpoints. This document describes the current code path, not historical
+benchmark results.
 
 ## CUDA runner
 
-`resin.models.gpt_oss.cuda.GptOssCudaRunner` is the managed path. Its relevant
+`resin_models_cuda.gpt_oss.GptOssCudaRunner` is the managed path. Its relevant
 constructor surface is:
 
 ```python
@@ -121,7 +111,7 @@ cache protocol and are intentionally not carried forward as evidence.
 
 A new GPU proof should establish, on the current tree:
 
-1. cold prefill and multi-step decode correctness against the reference runner;
+1. cold prefill and multi-step decode correctness against known outputs;
 2. long prefill across repeated private Window reuse;
 3. separate prefill/decode scheduling and request retirement;
 4. flat-pool exhaustion and complete parent recovery;
