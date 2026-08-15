@@ -7,7 +7,7 @@ import pytest
 
 from resin import BatchPlan, CacheGroupLayout, CacheLayout, Engine, StatePool
 
-PollResult = list[int] | tuple[int, ...] | BaseException | None
+PollResult = list[int] | list[list[int]] | tuple[int, ...] | BaseException | None
 
 
 def history_layout(

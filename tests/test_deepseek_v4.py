@@ -67,6 +67,24 @@ class TestDeepSeekV4Config:
         with pytest.raises(ValueError, match="TP=3"):
             config.validate_tensor_parallel(3)
 
+    def test_dspark_geometry_is_checkpoint_data(self) -> None:
+        values = _release_config()
+        values.update(
+            {
+                "dspark_block_size": 5,
+                "dspark_noise_token_id": 128799,
+                "dspark_target_layer_ids": [40, 41, 42],
+                "dspark_markov_rank": 256,
+            }
+        )
+
+        config = DeepSeekV4Config.from_hugging_face(values)
+
+        assert config.dspark_block_size == 5
+        assert config.dspark_noise_token_id == 128799
+        assert config.dspark_target_layer_ids == (40, 41, 42)
+        assert config.dspark_markov_rank == 256
+
 
 class TestDeepSeekV4Collectives:
     def test_flashinfer_allreduce_uses_plain_sum_pattern(
@@ -240,6 +258,27 @@ class TestDeepSeekV4Weights:
         native_model = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, spec.name, native_model)
         spec.loader.exec_module(native_model)
+        frequencies = torch.polar(torch.ones(1, 5, 32), torch.randn(1, 5, 32))
+        rank_three = torch.randn(1, 5, 64)
+        rank_four = torch.randn(1, 5, 2, 64)
+        assert native_model.apply_rotary_emb(rank_three, frequencies).shape == (
+            1,
+            5,
+            64,
+        )
+        assert native_model.apply_rotary_emb(rank_four, frequencies).shape == (
+            1,
+            5,
+            2,
+            64,
+        )
+        window_indices = native_model.get_decode_window_topk_idxs(
+            4, torch.tensor([1, 5])
+        )
+        assert window_indices.tolist() == [
+            [[0, 1, -1, -1]],
+            [[2, 3, 0, 1]],
+        ]
         native_model.world_size = 2
         native_model.rank = 1
         args = native_model.ModelArgs(
@@ -682,6 +721,90 @@ class TestDeepSeekV4BatchPlan:
 
         runner.release([7])
         assert runner._active_sequence_ids == [8]
+
+    def test_fixed_verification_restores_rows_after_their_first_rejection(
+        self,
+    ) -> None:
+        class SpecModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.register_buffer("kv_state", torch.zeros(2, 1))
+                self.commits: list[list[int]] = []
+
+            def forward_decode_target(self, input_ids, positions, graph_seq_len):
+                del graph_seq_len
+                self.kv_state.add_(1)
+                hidden = input_ids.to(torch.float32).unsqueeze(-1)
+                return torch.zeros(2, 32), hidden
+
+            @staticmethod
+            def draft(anchors, main_hidden, positions):
+                del anchors, main_hidden, positions
+                return torch.tensor([[10, 11, 12], [20, 21, 22]])
+
+            def forward_verify(self, input_ids, positions, graph_seq_len):
+                del positions, graph_seq_len
+                states = [self.kv_state.clone()]
+                for _ in range(input_ids.shape[1]):
+                    self.kv_state.add_(1)
+                    states.append(self.kv_state.clone())
+                return (
+                    torch.zeros(2, input_ids.shape[1], 32),
+                    input_ids.to(torch.float32).unsqueeze(-1),
+                    [(self.kv_state, torch.stack(states))],
+                )
+
+            def commit_dspark_main_block(self, hidden, positions):
+                del hidden
+                self.commits.append(positions.tolist())
+
+        class Sampler:
+            def __init__(self) -> None:
+                self.offsets: list[int] = []
+
+            def __call__(self, logits, plan, *, offset_delta):
+                del logits, plan
+                self.offsets.append(offset_delta)
+                return {
+                    0: torch.tensor([9, 19]),
+                    32: torch.tensor([10, 31]),
+                    64: torch.tensor([11, 30]),
+                    96: torch.tensor([13, 29]),
+                    128: torch.tensor([14, 28]),
+                }[offset_delta]
+
+        runner = DeepSeekV4FlashCudaRunner.__new__(DeepSeekV4FlashCudaRunner)
+        runner.device = torch.device("cpu")
+        runner.speculative_tokens = 3
+        runner.tensor_parallel = SimpleNamespace(enabled=False)
+        runner._model = SpecModel()
+        runner._sampler = Sampler()
+        runner._speculative_blocks = 0
+        runner._speculative_drafts = 0
+        runner._speculative_accepted = 0
+        runner._speculative_emitted = 0
+        plan = BatchPlan(
+            [1, 2],
+            [4, 7],
+            [100, 101],
+            [0, 1, 2],
+            [4, 7],
+            phase=BatchPhase.DECODE,
+        )
+
+        output = runner._speculative_decode(plan)
+
+        assert output == [[9, 10, 11, 13], [19, 31]]
+        assert runner._sampler.offsets == [0, 32, 64, 96, 128]
+        assert runner._model.commits == [[5, 8]]
+        assert runner._model.kv_state.flatten().tolist() == [4.0, 2.0]
+        assert runner.speculative_stats == {
+            "blocks": 2,
+            "drafts": 6,
+            "accepted": 2,
+            "emitted": 6,
+            "acceptance_rate": pytest.approx(1 / 3),
+        }
 
     def test_rejects_continuation_prefill_and_foreign_decode(self) -> None:
         runner = self._runner()

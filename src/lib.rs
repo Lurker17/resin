@@ -1153,7 +1153,7 @@ fn state_compatible_prefix_len(requests: &[&Request]) -> usize {
 }
 
 enum InFlightExecution {
-    SyncComplete(Vec<u32>),
+    SyncComplete(Vec<Vec<u32>>),
     FailedAfterAcceptance,
     AsyncHandle(Py<PyAny>),
 }
@@ -1174,8 +1174,43 @@ struct InFlightRow {
 struct PreparedProgress {
     apply: bool,
     resident_tokens: u32,
-    sampled_token: Option<u32>,
+    sampled_tokens: Vec<u32>,
     sampling_offset: Option<i64>,
+}
+
+fn extract_runner_token_rows(
+    output: &Bound<'_, PyAny>,
+    expected_rows: usize,
+) -> PyResult<Vec<Vec<u32>>> {
+    let flat_error = match output.extract::<Vec<u32>>() {
+        Ok(token_ids) => {
+            if token_ids.len() != expected_rows {
+                return Err(PyRuntimeError::new_err(format!(
+                    "runner returned {} token ids for {expected_rows} sequences",
+                    token_ids.len()
+                )));
+            }
+            return Ok(token_ids
+                .into_iter()
+                .map(|token_id| vec![token_id])
+                .collect());
+        }
+        Err(error) => error,
+    };
+
+    let token_rows = output.extract::<Vec<Vec<u32>>>().map_err(|_| flat_error)?;
+    if token_rows.len() != expected_rows {
+        return Err(PyRuntimeError::new_err(format!(
+            "runner returned {} token rows for {expected_rows} sequences",
+            token_rows.len()
+        )));
+    }
+    if let Some(row_index) = token_rows.iter().position(Vec::is_empty) {
+        return Err(PyRuntimeError::new_err(format!(
+            "runner returned an empty token row for sequence {row_index}"
+        )));
+    }
+    Ok(token_rows)
 }
 
 struct InFlightData {
@@ -1662,20 +1697,11 @@ impl Engine {
                         }
                     }
                     Err(error) => RunnerCallOutcome::Rejected(error),
-                    Ok(output) => match output.extract::<Vec<u32>>() {
+                    Ok(output) => match extract_runner_token_rows(&output, selected) {
                         Err(error) => RunnerCallOutcome::FailedAfterAcceptance {
                             stage: "runner forward protocol failure after accepting work",
                             error,
                         },
-                        Ok(output) if output.len() != selected => {
-                            RunnerCallOutcome::FailedAfterAcceptance {
-                                stage: "runner forward protocol failure after accepting work",
-                                error: PyRuntimeError::new_err(format!(
-                                    "runner returned {} token ids for {selected} sequences",
-                                    output.len()
-                                )),
-                            }
-                        }
                         Ok(output) => {
                             RunnerCallOutcome::Accepted(InFlightExecution::SyncComplete(output))
                         }
@@ -1771,7 +1797,7 @@ impl Engine {
                     );
                     return self.quarantine(batch, "runner poll protocol failure", error);
                 }
-                match result.extract::<Vec<u32>>() {
+                match extract_runner_token_rows(&result, batch.rows.len()) {
                     Ok(output) => output,
                     Err(error) => {
                         return self.quarantine(batch, "runner poll protocol failure", error);
@@ -1779,14 +1805,6 @@ impl Engine {
                 }
             }
         };
-        if output_token_ids.len() != batch.rows.len() {
-            let error = PyRuntimeError::new_err(format!(
-                "runner returned {} token ids for {} sequences",
-                output_token_ids.len(),
-                batch.rows.len()
-            ));
-            return self.quarantine(batch, "runner poll protocol failure", error);
-        }
         let decoded_batch = batch
             .rows
             .first()
@@ -1794,43 +1812,59 @@ impl Engine {
 
         let mut retired = Vec::with_capacity(batch.rows.len());
         let mut retired_ids = Vec::new();
-        let mut events = Vec::with_capacity(batch.rows.len());
-        for (row, token_id) in batch.rows.iter().zip(output_token_ids.iter().copied()) {
+        let event_capacity = output_token_ids.iter().map(Vec::len).sum();
+        let mut events = Vec::with_capacity(event_capacity);
+        let mut committed_token_ids = Vec::with_capacity(batch.rows.len());
+        for (row, token_ids) in batch.rows.iter().zip(&output_token_ids) {
             let request = &row.request;
             if request.cancel_pending {
                 retired.push(true);
                 retired_ids.push(request.id);
+                committed_token_ids.push(token_ids.clone());
                 continue;
             }
             if !row.scheduled.sample {
                 retired.push(false);
+                committed_token_ids.push(token_ids.clone());
                 continue;
             }
-            let finished = request.generated.len() + 1 >= request.max_new_tokens
-                || self.eos_token_id == Some(token_id);
-            let event = match Py::new(
-                py,
-                TokenEvent {
-                    request_id: request.id,
-                    token_id,
-                    index: request.generated.len(),
-                    finished,
-                },
-            ) {
-                Ok(event) => event,
-                Err(error) => {
-                    return self.quarantine(batch, "token event construction failed", error);
+            let remaining = request
+                .max_new_tokens
+                .saturating_sub(request.generated.len());
+            let mut committed = Vec::with_capacity(token_ids.len().min(remaining));
+            let mut finished = false;
+            for &token_id in token_ids.iter().take(remaining) {
+                finished = request.generated.len() + committed.len() + 1 >= request.max_new_tokens
+                    || self.eos_token_id == Some(token_id);
+                let event = match Py::new(
+                    py,
+                    TokenEvent {
+                        request_id: request.id,
+                        token_id,
+                        index: request.generated.len() + committed.len(),
+                        finished,
+                    },
+                ) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        return self.quarantine(batch, "token event construction failed", error);
+                    }
+                };
+                events.push(event);
+                committed.push(token_id);
+                if finished {
+                    break;
                 }
-            };
-            events.push(event);
+            }
             retired.push(finished);
             if finished {
                 retired_ids.push(request.id);
             }
+            committed_token_ids.push(committed);
         }
 
         let prepared_progress =
-            match self.prepare_scheduled_progress(&mut batch.rows, &output_token_ids) {
+            match self.prepare_scheduled_progress(&mut batch.rows, &committed_token_ids) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     return self.quarantine(batch, "native progress commit failed", error);
@@ -2453,7 +2487,7 @@ impl Engine {
     fn prepare_scheduled_progress(
         &self,
         rows: &mut [InFlightRow],
-        output_token_ids: &[u32],
+        output_token_ids: &[Vec<u32>],
     ) -> PyResult<Vec<PreparedProgress>> {
         if rows.len() != output_token_ids.len() {
             return Err(PyRuntimeError::new_err(
@@ -2461,7 +2495,7 @@ impl Engine {
             ));
         }
         let mut prepared = Vec::with_capacity(rows.len());
-        for (row, token_id) in rows.iter_mut().zip(output_token_ids.iter().copied()) {
+        for (row, token_ids) in rows.iter_mut().zip(output_token_ids) {
             let request = &mut row.request;
             let scheduled = row.scheduled;
             let context = request.logical_context()?;
@@ -2497,32 +2531,68 @@ impl Engine {
                     "scheduled prefill commit exceeds the request replay input",
                 ));
             }
+            if token_ids.is_empty() {
+                return Err(PyRuntimeError::new_err(
+                    "sampled runner output rows must contain at least one token",
+                ));
+            }
+            if scheduled.phase == Phase::Prefill && token_ids.len() != 1 {
+                return Err(PyRuntimeError::new_err(
+                    "speculative token rows are only supported during decode",
+                ));
+            }
+            if token_ids.len() > 1 && request.resources.attention.is_some() {
+                return Err(PyRuntimeError::new_err(
+                    "speculative token rows require runner-managed attention state",
+                ));
+            }
             if request.cancel_pending {
                 prepared.push(PreparedProgress {
                     apply: false,
                     resident_tokens: request.resident_tokens,
-                    sampled_token: None,
+                    sampled_tokens: Vec::new(),
                     sampling_offset: None,
                 });
                 continue;
             }
             if scheduled.sample {
-                request.generated.try_reserve(1).map_err(|_| {
-                    PyMemoryError::new_err("could not reserve generated-token storage")
-                })?;
+                request
+                    .generated
+                    .try_reserve(token_ids.len())
+                    .map_err(|_| {
+                        PyMemoryError::new_err("could not reserve generated-token storage")
+                    })?;
             }
             let sampling_offset = (scheduled.sample && request.sampling_params.temperature > 0.0)
                 .then(|| {
+                    let advance = i64::try_from(token_ids.len())
+                        .ok()
+                        .and_then(|count| count.checked_mul(SAMPLING_OFFSET_STRIDE))
+                        .ok_or_else(|| {
+                            PyValueError::new_err("sampling offset space is exhausted")
+                        })?;
                     request
                         .sampling_offset
-                        .checked_add(SAMPLING_OFFSET_STRIDE)
+                        .checked_add(advance)
                         .ok_or_else(|| PyValueError::new_err("sampling offset space is exhausted"))
                 })
                 .transpose()?;
+            let resident_tokens = if scheduled.phase == Phase::Decode {
+                let additional = u32::try_from(token_ids.len() - 1)
+                    .map_err(|_| PyValueError::new_err("speculative token row is too long"))?;
+                token_end.checked_add(additional).ok_or_else(|| {
+                    PyValueError::new_err("request token position space is exhausted")
+                })?
+            } else {
+                token_end
+            };
             prepared.push(PreparedProgress {
                 apply: true,
-                resident_tokens: token_end,
-                sampled_token: scheduled.sample.then_some(token_id),
+                resident_tokens,
+                sampled_tokens: scheduled
+                    .sample
+                    .then(|| token_ids.clone())
+                    .unwrap_or_default(),
                 sampling_offset,
             });
         }
@@ -2536,9 +2606,7 @@ impl Engine {
                 continue;
             }
             row.request.resident_tokens = progress.resident_tokens;
-            if let Some(token_id) = progress.sampled_token {
-                row.request.generated.push(token_id);
-            }
+            row.request.generated.extend(progress.sampled_tokens);
             if let Some(sampling_offset) = progress.sampling_offset {
                 row.request.sampling_offset = sampling_offset;
             }

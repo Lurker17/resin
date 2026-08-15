@@ -110,6 +110,67 @@ class TestEngine:
         with pytest.raises(RuntimeError, match="1 sequences"):
             engine.step()
 
+    def test_decode_runner_can_commit_a_verified_token_block(self) -> None:
+        class BlockRunner:
+            def __init__(self) -> None:
+                self.plans: list[BatchPlan] = []
+
+            def forward(self, plan: BatchPlan):
+                self.plans.append(plan)
+                if plan.phase == BatchPhase.PREFILL:
+                    return [2]
+                if len(self.plans) == 2:
+                    return [[3, 4, 5]]
+                return [[6, 7]]
+
+        runner = BlockRunner()
+        engine = Engine(runner)
+        request = engine.submit([1], max_new_tokens=6)
+
+        assert [event.token_id for event in engine.step()] == [2]
+        block = engine.step()
+        assert [event.token_id for event in block] == [3, 4, 5]
+        assert [event.index for event in block] == [1, 2, 3]
+        assert not any(event.finished for event in block)
+
+        final = engine.step()
+        assert [event.token_id for event in final] == [6, 7]
+        assert [event.index for event in final] == [4, 5]
+        assert [event.finished for event in final] == [False, True]
+        assert runner.plans[2].token_ids == [5]
+        assert runner.plans[2].positions == [4]
+        assert request.take_result() == [2, 3, 4, 5, 6, 7]
+
+    def test_verified_block_stops_at_eos_and_discards_its_suffix(self) -> None:
+        class BlockRunner:
+            @staticmethod
+            def forward(plan: BatchPlan):
+                if plan.phase == BatchPhase.PREFILL:
+                    return [2]
+                return [[3, 7, 8]]
+
+        engine = Engine(BlockRunner(), eos_token_id=7)
+        request = engine.submit([1], max_new_tokens=8)
+        engine.step()
+
+        events = engine.step()
+
+        assert [event.token_id for event in events] == [3, 7]
+        assert [event.finished for event in events] == [False, True]
+        assert request.take_result() == [2, 3, 7]
+
+    def test_speculative_rows_are_rejected_during_prefill(self) -> None:
+        class BadRunner:
+            @staticmethod
+            def forward(plan: BatchPlan):
+                return [[2, 3] for _ in range(plan.num_sequences)]
+
+        engine = Engine(BadRunner())
+        engine.submit([1], max_new_tokens=2)
+
+        with pytest.raises(RuntimeError, match="only supported during decode"):
+            engine.step()
+
     def test_batch_limit_keeps_running_request_ahead_of_waiter(self) -> None:
         runner = RecordingRunner()
         engine = Engine(runner, max_running_requests=1)

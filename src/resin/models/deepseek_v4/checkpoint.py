@@ -9,6 +9,8 @@ from resin.models.deepseek_v4.config import DeepSeekV4Config
 
 DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
 DEFAULT_REVISION = "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
+DSPARK_MODEL = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+DSPARK_REVISION = "62af8fffb2f7030cac4de2f0169f5b8d1101b646"
 
 
 def resolve_model_path(model: str | Path) -> Path:
@@ -40,4 +42,11 @@ def load_config(model_path: str | Path) -> DeepSeekV4Config:
     return DeepSeekV4Config.from_hugging_face(values)
 
 
-__all__ = ["DEFAULT_MODEL", "DEFAULT_REVISION", "load_config", "resolve_model_path"]
+__all__ = [
+    "DEFAULT_MODEL",
+    "DEFAULT_REVISION",
+    "DSPARK_MODEL",
+    "DSPARK_REVISION",
+    "load_config",
+    "resolve_model_path",
+]

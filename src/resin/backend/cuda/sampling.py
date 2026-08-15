@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 from resin.backend.sampling import batch_sampling_inputs
 
+SAMPLING_OFFSET_STRIDE = 32
+
 
 @dataclass(frozen=True, slots=True)
 class SamplingTensors:
@@ -34,7 +36,11 @@ class FlashInferSampler:
         self._sample = top_k_top_p_sampling_from_probs
 
     @staticmethod
-    def host_inputs(plan, vocab_size: int) -> dict[str, tuple]:
+    def host_inputs(
+        plan, vocab_size: int, *, offset_delta: int = 0
+    ) -> dict[str, tuple]:
+        if offset_delta < 0:
+            raise ValueError("sampling offset delta cannot be negative")
         values = batch_sampling_inputs(plan, vocab_size)
         return {
             "sampling_temperatures": tuple(
@@ -44,7 +50,9 @@ class FlashInferSampler:
             "sampling_top_ps": values["top_ps"],
             "sampling_top_ks": values["top_ks"],
             "sampling_seeds": values["seeds"],
-            "sampling_offsets": values["offsets"],
+            "sampling_offsets": tuple(
+                offset + offset_delta for offset in values["offsets"]
+            ),
             "sampling_stochastic_mask": tuple(
                 should_sample and temperature > 0.0
                 for temperature, should_sample in zip(
@@ -93,7 +101,7 @@ class FlashInferSampler:
         out.copy_(result)
         return out
 
-    def __call__(self, logits, plan=None, *, out=None):
+    def __call__(self, logits, plan=None, *, out=None, offset_delta: int = 0):
         if plan is None:
             result = logits.argmax(dim=-1)
             if out is None:
@@ -116,7 +124,7 @@ class FlashInferSampler:
             result = greedy
         else:
             device = logits.device
-            host = self.host_inputs(plan, logits.shape[-1])
+            host = self.host_inputs(plan, logits.shape[-1], offset_delta=offset_delta)
             tensors = SamplingTensors(
                 temperatures=self.torch.tensor(
                     host["sampling_temperatures"],
@@ -149,4 +157,4 @@ class FlashInferSampler:
         return out
 
 
-__all__ = ["FlashInferSampler", "SamplingTensors"]
+__all__ = ["FlashInferSampler", "SAMPLING_OFFSET_STRIDE", "SamplingTensors"]

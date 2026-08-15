@@ -1,4 +1,4 @@
-"""Run and benchmark DeepSeek-V4-Flash-0731 on Modal B300 nodes."""
+"""Run and benchmark DeepSeek-V4-Flash-DSpark on Modal B300 nodes."""
 
 from __future__ import annotations
 
@@ -22,15 +22,18 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from resin import Engine, SamplingParams, SchedulerConfig
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
-from resin.models.deepseek_v4.checkpoint import DEFAULT_MODEL, DEFAULT_REVISION
+from resin.models.deepseek_v4.checkpoint import DSPARK_MODEL, DSPARK_REVISION
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MODEL = DSPARK_MODEL
+DEFAULT_REVISION = DSPARK_REVISION
 MODEL_CACHE_MOUNT = "/models/resin-deepseek-v4"
 MODEL_CACHE_VOLUME_NAME = "resin-deepseek-v4-models-v1"
 KERNEL_CACHE_MOUNT = "/root/.cache"
 KERNEL_CACHE_VOLUME_NAME = "resin-deepseek-v4-kernels-v1"
-MODEL_KEY = "flash-0731"
+MODEL_KEY = "flash-dspark"
 DEFAULT_TP_SIZE = 4
+DSPARK_TOKENS = 5
 BENCHMARK_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
 CHECKPOINT_PATTERNS = (
     "config.json",
@@ -98,7 +101,7 @@ kernel_cache_volume = modal.Volume.from_name(
     KERNEL_CACHE_VOLUME_NAME, create_if_missing=True, version=1
 )
 app = modal.App(
-    "resin-deepseek-v4-flash-0731",
+    "resin-deepseek-v4-flash-dspark",
     image=image,
     volumes={
         MODEL_CACHE_MOUNT: model_cache_volume,
@@ -281,7 +284,9 @@ def _run_rank_workload(
         )
     load_start = time.perf_counter()
     batch_size = len(prompt_rows)
-    graph_capacity = max(len(row) for row in prompt_rows) + max_new_tokens
+    graph_capacity = (
+        max(len(row) for row in prompt_rows) + max_new_tokens + DSPARK_TOKENS + 1
+    )
     runner = DeepSeekV4FlashCudaRunner(
         model_path,
         max_seq_len=context_length,
@@ -291,6 +296,7 @@ def _run_rank_workload(
         cuda_graph_decode_shapes=tuple(
             (rows, max(2, graph_capacity)) for rows in range(1, batch_size + 1)
         ),
+        speculative_tokens=DSPARK_TOKENS,
     )
     torch.cuda.synchronize(runner.device)
     tensor_parallel.barrier()
@@ -451,6 +457,7 @@ def _run_rank_workload(
             "model_load_ms": load_elapsed * 1000,
             "cuda_graph_capture_ms": capture_elapsed * 1000,
             "cuda_graph": runner.cuda_graph_stats,
+            "speculative": runner.speculative_stats,
             "torch_profile": profile_tables,
             "batch_size": batch_size,
             "prompt_tokens": [len(row) for row in prompt_rows],
@@ -668,10 +675,14 @@ def _run_rank_benchmark(
         tensor_parallel=tensor_parallel,
         device=f"cuda:{rank}",
         cuda_graph_decode_shapes=(
-            tuple((batch_size, context_length) for batch_size in batch_sizes)
+            tuple(
+                (batch_size, context_length + DSPARK_TOKENS + 1)
+                for batch_size in batch_sizes
+            )
             if use_cuda_graphs
             else ()
         ),
+        speculative_tokens=DSPARK_TOKENS,
     )
     torch.cuda.synchronize(runner.device)
     tensor_parallel.barrier()
@@ -695,7 +706,7 @@ def _run_rank_benchmark(
             )
         if use_cuda_graphs:
             capture_start = time.perf_counter()
-            shape = (batch_size, context_length)
+            shape = (batch_size, context_length + DSPARK_TOKENS + 1)
             runner._graphs.capture(  # noqa: SLF001 - benchmark shape isolation
                 shape, runner._graph_capture_inputs(shape, runner.vocab_size)
             )
@@ -804,7 +815,7 @@ def _benchmark_remote(
         encoding,
         "Measure inference throughput with a stable synthetic prompt.",
         "chat",
-        "low",
+        "high",
     )
     repeats = (input_tokens + len(seed_prompt) - 1) // len(seed_prompt)
     prompt_ids = (seed_prompt * repeats)[:input_tokens]
@@ -858,7 +869,7 @@ def run_model_tp4(
     max_new_tokens: int = 256,
     context_length: int = 32768,
     thinking_mode: str = "chat",
-    reasoning_effort: str = "low",
+    reasoning_effort: str = "high",
     temperature: float = 1.0,
     top_p: float = 0.95,
     top_k: int | None = None,
@@ -868,8 +879,8 @@ def run_model_tp4(
 ) -> dict[str, object]:
     if thinking_mode not in {"chat", "thinking"}:
         raise ValueError("thinking_mode must be 'chat' or 'thinking'")
-    if reasoning_effort not in {"low", "high", "max"}:
-        raise ValueError("reasoning_effort must be 'low', 'high', or 'max'")
+    if reasoning_effort not in {"high", "max"}:
+        raise ValueError("reasoning_effort must be 'high' or 'max'")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     model_path, checkpoint = _require_checkpoint()
@@ -929,7 +940,7 @@ def main(
     max_new_tokens: int = 256,
     context_length: int = 32768,
     thinking_mode: str = "chat",
-    reasoning_effort: str = "low",
+    reasoning_effort: str = "high",
     temperature: float = 1.0,
     top_p: float = 0.95,
     top_k: int | None = None,
@@ -958,8 +969,5 @@ def main(
             batch_size,
         )
     else:
-        raise ValueError(
-            "mode must be 'download', 'bench-tp2', 'bench-tp4', "
-            "or 'run'"
-        )
+        raise ValueError("mode must be 'download', 'bench-tp2', 'bench-tp4', or 'run'")
     print(json.dumps(report, indent=2, sort_keys=True))

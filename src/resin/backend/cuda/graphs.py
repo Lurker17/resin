@@ -75,6 +75,7 @@ class CudaGraphStep:
     inputs: Mapping[str, Any]
     output: Any
     launch: Callable[[], None]
+    prepare: Callable[[], None] | None = None
 
 
 @dataclass(slots=True)
@@ -137,7 +138,7 @@ class CudaGraphCache:
         if self._poison is None:
             self._poison = f"{stage}: {type(error).__name__}: {error}"
 
-    def capture(self, shape: GraphShape, inputs: Mapping[str, object]) -> list[int]:
+    def capture(self, shape: GraphShape, inputs: Mapping[str, object]) -> Any:
         """Build and capture one configured shape before request execution."""
 
         self.check()
@@ -167,7 +168,7 @@ class CudaGraphCache:
             raise
         return entry.step.output.tolist()
 
-    def run(self, shape: GraphShape, inputs: Mapping[str, object]) -> list[int]:
+    def run(self, shape: GraphShape, inputs: Mapping[str, object]) -> Any:
         """Stage and replay one current batch using a pre-captured graph."""
 
         self.check()
@@ -208,6 +209,8 @@ class CudaGraphCache:
         warmup.wait_stream(current)
         with torch.cuda.stream(warmup), torch.inference_mode():
             for _ in range(3):
+                if step.prepare is not None:
+                    step.prepare()
                 step.launch()
             expected = step.output.clone()
         current.wait_stream(warmup)
@@ -216,9 +219,13 @@ class CudaGraphCache:
 
         started = perf_counter()
         with torch.cuda.device(self.device):
+            if step.prepare is not None:
+                step.prepare()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph), torch.inference_mode():
                 step.launch()
+            if step.prepare is not None:
+                step.prepare()
             graph.replay()
         torch.cuda.synchronize(self.device)
         if not torch.equal(expected, step.output):

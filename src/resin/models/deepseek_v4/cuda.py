@@ -27,7 +27,11 @@ from resin.backend.cuda.graphs import (
     graph_shapes,
 )
 from resin.backend.cuda.parallel import FlashInferAllReduce, TensorParallelContext
-from resin.backend.cuda.sampling import FlashInferSampler
+from resin.backend.cuda.sampling import (
+    SAMPLING_OFFSET_STRIDE,
+    FlashInferSampler,
+    SamplingTensors,
+)
 from resin.models.deepseek_v4.checkpoint import (
     load_config,
     resolve_model_path,
@@ -63,6 +67,7 @@ class DeepSeekV4FlashCudaRunner:
         device: str | torch.device | None = None,
         cuda_graph_decode_shapes: object = None,
         fast_allreduce: bool = True,
+        speculative_tokens: int = 0,
     ) -> None:
         if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, int):
             raise ValueError("max_seq_len must be a positive integer")
@@ -74,6 +79,12 @@ class DeepSeekV4FlashCudaRunner:
             raise ValueError("max_batch_size must be a positive integer")
         if max_batch_size * max_seq_len > 2**32 - 1:
             raise ValueError("max_batch_size * max_seq_len exceeds scheduler metadata")
+        if (
+            isinstance(speculative_tokens, bool)
+            or not isinstance(speculative_tokens, int)
+            or speculative_tokens < 0
+        ):
+            raise ValueError("speculative_tokens must be a non-negative integer")
         if not torch.cuda.is_available():
             raise RuntimeError("DeepSeekV4FlashCudaRunner requires CUDA")
 
@@ -100,19 +111,33 @@ class DeepSeekV4FlashCudaRunner:
         self.model_path = resolve_model_path(model)
         self.config = load_config(self.model_path)
         self.config.validate_tensor_parallel(self.tensor_parallel_size)
+        if speculative_tokens > self.config.dspark_block_size:
+            raise ValueError(
+                "speculative_tokens exceeds this checkpoint's DSpark block size"
+            )
+        if speculative_tokens and not self.config.dspark_target_layer_ids:
+            raise ValueError("speculative_tokens requires a DSpark checkpoint")
         if max_seq_len > 1_048_576:
             raise ValueError("max_seq_len exceeds the checkpoint context length")
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+        self.speculative_tokens = speculative_tokens
         self.max_batch_tokens = max_batch_size * max_seq_len
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = 1
         self._sampler = FlashInferSampler(torch)
         self._active_sequence_ids: list[int] = []
+        self._speculative_blocks = 0
+        self._speculative_drafts = 0
+        self._speculative_accepted = 0
+        self._speculative_emitted = 0
         decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
         if any(shape[0] > max_batch_size for shape in decode_graph_shapes):
             raise ValueError("CUDA graph batch capacity exceeds max_batch_size")
-        if any(shape[1] > max_seq_len for shape in decode_graph_shapes):
+        physical_seq_len = max_seq_len + speculative_tokens
+        if speculative_tokens:
+            physical_seq_len += 1
+        if any(shape[1] > physical_seq_len for shape in decode_graph_shapes):
             raise ValueError("CUDA graph sequence capacity exceeds max_seq_len")
         self._graphs = CudaGraphCache(
             torch,
@@ -121,6 +146,9 @@ class DeepSeekV4FlashCudaRunner:
             build=self._new_decode_graph_step,
             synchronize_failure=lambda: torch.cuda.synchronize(self.device),
         )
+        self._dspark_graph_checkpoints: dict[
+            GraphShape, list[tuple[torch.Tensor, torch.Tensor]]
+        ] = {}
 
         # Import only after CUDA validation: importing this module initializes
         # cuTile and is intentionally not part of Resin's CPU package path.
@@ -137,9 +165,15 @@ class DeepSeekV4FlashCudaRunner:
         inference_values.update(
             {
                 "max_batch_size": max_batch_size,
-                "max_seq_len": max_seq_len,
+                "max_seq_len": physical_seq_len,
+                "dspark_block_size": speculative_tokens,
             }
         )
+        if speculative_tokens:
+            if int(inference_values.get("n_mtp_layers", 0)) <= 0:
+                raise ValueError("DSpark checkpoint has no speculative stages")
+        else:
+            inference_values["n_mtp_layers"] = 0
         model_fields = native_model.ModelArgs.__dataclass_fields__
         args = native_model.ModelArgs(
             **{
@@ -152,7 +186,7 @@ class DeepSeekV4FlashCudaRunner:
             self._model = native_model.Transformer(args)
         self._allreduce = FlashInferAllReduce(
             self.tensor_parallel,
-            max_token_num=max_batch_size,
+            max_token_num=max_batch_size * max(1, speculative_tokens + 1),
             hidden_dim=self.config.hidden_size,
             dtype=torch.float32,
             enabled=fast_allreduce,
@@ -173,6 +207,21 @@ class DeepSeekV4FlashCudaRunner:
     @property
     def cuda_graph_stats(self) -> CudaGraphStats:
         return self._graphs.stats
+
+    @property
+    def speculative_stats(self) -> dict[str, int | float]:
+        acceptance = (
+            self._speculative_accepted / self._speculative_drafts
+            if self._speculative_drafts
+            else 0.0
+        )
+        return {
+            "blocks": self._speculative_blocks,
+            "drafts": self._speculative_drafts,
+            "accepted": self._speculative_accepted,
+            "emitted": self._speculative_emitted,
+            "acceptance_rate": acceptance,
+        }
 
     @staticmethod
     def _graph_capture_inputs(
@@ -250,6 +299,8 @@ class DeepSeekV4FlashCudaRunner:
         return self._graphs.stats
 
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
+        if self.speculative_tokens:
+            return self._new_dspark_graph_step(shape)
         batch_size, graph_seq_len = shape
         token_ids = torch.empty((batch_size, 1), dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
@@ -275,14 +326,83 @@ class DeepSeekV4FlashCudaRunner:
         inputs.update(self._sampler.graph_inputs(sampling))
         return CudaGraphStep(inputs=inputs, output=output_ids, launch=launch)
 
-    def _graph_forward(self, plan: BatchPlan) -> list[int] | None:
+    def _new_dspark_graph_step(self, shape: GraphShape) -> CudaGraphStep:
+        batch_size, graph_seq_len = shape
+        block_size = self.speculative_tokens
+        token_ids = torch.empty((batch_size, 1), dtype=torch.long, device=self.device)
+        positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
+        output_ids = torch.empty(
+            (batch_size, 2 * block_size + 2),
+            dtype=torch.long,
+            device=self.device,
+        )
+        sampling = self._sampler.empty(batch_size, self.device)
+        checkpoint_holder: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        def sample(logits: torch.Tensor, step: int) -> torch.Tensor:
+            step_sampling = SamplingTensors(
+                temperatures=sampling.temperatures,
+                top_ps=sampling.top_ps,
+                top_ks=sampling.top_ks,
+                seeds=sampling.seeds,
+                offsets=sampling.offsets + step * SAMPLING_OFFSET_STRIDE,
+                stochastic_mask=sampling.stochastic_mask,
+            )
+            return self._broadcast_tokens(
+                self._sampler.sample_tensors(logits, step_sampling)
+            )
+
+        def launch() -> None:
+            with _default_dtype(torch.bfloat16), torch.device(self.device):
+                target_logits, main_hidden = self._model.forward_decode_target(
+                    token_ids, positions, graph_seq_len
+                )
+                if main_hidden is None:
+                    raise RuntimeError("target did not produce DSpark hidden states")
+                first_target = sample(target_logits, 0)
+                drafts = self._broadcast_tokens(
+                    self._model.draft(
+                        first_target.view(batch_size, 1), main_hidden, positions
+                    )
+                )
+                verify_ids = torch.cat(
+                    (first_target.view(batch_size, 1), drafts), dim=1
+                )
+                verify_logits, verify_hidden, checkpoints = self._model.forward_verify(
+                    verify_ids, positions + 1, graph_seq_len
+                )
+                if verify_hidden is None:
+                    raise RuntimeError(
+                        "target did not produce DSpark verification states"
+                    )
+                self._model.commit_dspark_main_block(verify_hidden, positions + 1)
+                output_ids[:, :block_size].copy_(drafts)
+                output_ids[:, block_size].copy_(first_target)
+                for index in range(block_size + 1):
+                    output_ids[:, block_size + index + 1].copy_(
+                        sample(verify_logits[:, index], index + 1)
+                    )
+                checkpoint_holder[:] = checkpoints
+
+        inputs = {"token_ids": token_ids, "positions": positions}
+        inputs.update(self._sampler.graph_inputs(sampling))
+        self._dspark_graph_checkpoints[shape] = checkpoint_holder
+        return CudaGraphStep(
+            inputs=inputs,
+            output=output_ids,
+            launch=launch,
+            prepare=self._reset_model_state,
+        )
+
+    def _graph_forward(self, plan: BatchPlan) -> list[int] | list[list[int]] | None:
         if not self._graphs.shapes:
             return None
         batch_size = plan.num_sequences
         sequence_length = max(plan.positions) + 1
         shape = self._graphs.match(
-            lambda candidate: candidate[0] == batch_size
-            and candidate[1] >= sequence_length
+            lambda candidate: (
+                candidate[0] == batch_size and candidate[1] >= sequence_length
+            )
         )
         if shape is None:
             self._graphs.fallback("shape")
@@ -292,7 +412,17 @@ class DeepSeekV4FlashCudaRunner:
             "positions": plan.positions,
         }
         inputs.update(self._sampler.host_inputs(plan, self.vocab_size))
-        return self._graphs.run(shape, inputs)
+        output = self._graphs.run(shape, inputs)
+        if not self.speculative_tokens:
+            return output
+        block_size = self.speculative_tokens
+        drafts = [row[:block_size] for row in output]
+        targets = [row[block_size:] for row in output]
+        return self._accept_speculative(
+            drafts,
+            targets,
+            self._dspark_graph_checkpoints[shape],
+        )
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
         row_count = plan.num_sequences
@@ -315,7 +445,9 @@ class DeepSeekV4FlashCudaRunner:
         rows = tuple(zip(indptr, indptr[1:]))
         for row, (start, end) in enumerate(rows):
             context = plan.context_lengths[row]
-            if list(plan.positions[start:end]) != list(range(context, context + end - start)):
+            if list(plan.positions[start:end]) != list(
+                range(context, context + end - start)
+            ):
                 raise ValueError("DeepSeek-V4 positions must continue each row context")
 
         if plan.phase == BatchPhase.PREFILL:
@@ -334,7 +466,9 @@ class DeepSeekV4FlashCudaRunner:
             raise ValueError("DeepSeek-V4 plan phase must be prefill or decode")
         return rows
 
-    def _prefill(self, plan: BatchPlan, rows: tuple[tuple[int, int], ...]) -> torch.Tensor:
+    def _prefill(
+        self, plan: BatchPlan, rows: tuple[tuple[int, int], ...]
+    ) -> torch.Tensor:
         """Prefill rows independently, staging their recurrent state compactly."""
 
         logits: list[torch.Tensor | None] = [None] * len(rows)
@@ -346,11 +480,117 @@ class DeepSeekV4FlashCudaRunner:
             input_ids = torch.tensor(
                 plan.token_ids[start:end], dtype=torch.long, device=self.device
             ).unsqueeze(0)
-            logits[slot] = self._model(input_ids, 0)
+            if getattr(self, "speculative_tokens", 0):
+                row_logits, main_hidden = self._model.forward_target(input_ids, 0)
+                if main_hidden is None:
+                    raise RuntimeError("target did not produce DSpark hidden states")
+                self._model.prefill_dspark(main_hidden)
+                logits[slot] = row_logits
+            else:
+                logits[slot] = self._model(input_ids, 0)
             self._copy_model_state_row(0, slot)
         return torch.cat([row for row in logits if row is not None], dim=0)
 
-    def forward(self, plan: BatchPlan) -> list[int]:
+    def _broadcast_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
+        if self.tensor_parallel.enabled:
+            dist.broadcast(
+                token_ids,
+                src=0,
+                group=self.tensor_parallel.process_group,
+            )
+        return token_ids
+
+    def _sample_target(
+        self, logits: torch.Tensor, plan: BatchPlan, step: int
+    ) -> torch.Tensor:
+        return self._broadcast_tokens(
+            self._sampler(
+                logits,
+                plan,
+                offset_delta=step * SAMPLING_OFFSET_STRIDE,
+            )
+        )
+
+    def _accept_speculative(
+        self,
+        draft_rows: list[list[int]],
+        target_rows: list[list[int]],
+        checkpoints: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> list[list[int]]:
+        batch_size = len(draft_rows)
+        outputs = []
+        accepted = []
+        for row in range(batch_size):
+            accepted_count = 0
+            while (
+                accepted_count < self.speculative_tokens
+                and target_rows[row][accepted_count + 1]
+                == draft_rows[row][accepted_count]
+            ):
+                accepted_count += 1
+            outputs.append(
+                [
+                    target_rows[row][0],
+                    *draft_rows[row][:accepted_count],
+                    target_rows[row][accepted_count + 1],
+                ]
+            )
+            accepted.append(accepted_count)
+
+        checkpoint_rows = torch.tensor(
+            [count + 1 for count in accepted],
+            dtype=torch.long,
+            device=self.device,
+        )
+        batch_rows = torch.arange(batch_size, device=self.device)
+        for buffer, states in checkpoints:
+            buffer[:batch_size].copy_(states[checkpoint_rows, batch_rows])
+        self._speculative_blocks += batch_size
+        self._speculative_drafts += batch_size * self.speculative_tokens
+        self._speculative_accepted += sum(accepted)
+        self._speculative_emitted += sum(map(len, outputs))
+        return outputs
+
+    def _speculative_decode(self, plan: BatchPlan) -> list[list[int]]:
+        """Draft greedily and verify a fixed block against target samples."""
+
+        batch_size = plan.num_sequences
+        anchors = torch.tensor(
+            plan.token_ids, dtype=torch.long, device=self.device
+        ).view(batch_size, 1)
+        positions = torch.tensor(plan.positions, dtype=torch.long, device=self.device)
+        graph_seq_len = max(plan.positions) + self.speculative_tokens + 2
+        target_logits, main_hidden = self._model.forward_decode_target(
+            anchors, positions, graph_seq_len
+        )
+        if main_hidden is None:
+            raise RuntimeError("target did not produce DSpark hidden states")
+        first_target = self._sample_target(target_logits, plan, 0)
+        drafts = self._broadcast_tokens(
+            self._model.draft(first_target.view(batch_size, 1), main_hidden, positions)
+        )
+        verify_ids = torch.cat((first_target.view(batch_size, 1), drafts), dim=1)
+        verify_logits, verify_hidden, checkpoints = self._model.forward_verify(
+            verify_ids,
+            positions + 1,
+            graph_seq_len,
+        )
+        if verify_hidden is None:
+            raise RuntimeError("target did not produce DSpark verification states")
+        self._model.commit_dspark_main_block(verify_hidden, positions + 1)
+
+        target_columns = [first_target]
+        target_columns.extend(
+            self._sample_target(verify_logits[:, index], plan, index + 1)
+            for index in range(self.speculative_tokens + 1)
+        )
+        return self._accept_speculative(
+            drafts.tolist(),
+            torch.stack(target_columns, dim=1).tolist(),
+            checkpoints,
+        )
+
+    def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
         """Run one dynamically batched prefill or decode sampling step."""
 
         self._graphs.check()
@@ -369,6 +609,8 @@ class DeepSeekV4FlashCudaRunner:
             ):
                 if plan.phase == BatchPhase.PREFILL:
                     logits = self._prefill(plan, rows)
+                elif self.speculative_tokens:
+                    return self._speculative_decode(plan)
                 else:
                     input_ids = torch.tensor(
                         plan.token_ids, dtype=torch.long, device=self.device
@@ -379,17 +621,7 @@ class DeepSeekV4FlashCudaRunner:
                     logits = self._model.forward_decode(
                         input_ids, positions, max(plan.positions) + 1
                     )
-                output = self._sampler(logits, plan)
-                if self.tensor_parallel.enabled:
-                    # Sampling is a request-level decision, not a replicated
-                    # tensor-parallel computation.  Broadcast rank 0's draw so
-                    # tiny rank-local numerical differences cannot fork the
-                    # autoregressive sequence under stochastic sampling.
-                    dist.broadcast(
-                        output,
-                        src=0,
-                        group=self.tensor_parallel.process_group,
-                    )
+                output = self._sample_target(logits, plan, 0)
             if plan.phase == BatchPhase.PREFILL:
                 self._active_sequence_ids = list(plan.sequence_ids)
             return output.tolist()

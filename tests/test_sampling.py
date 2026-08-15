@@ -88,6 +88,29 @@ class TestSamplingContract:
         assert first.take_result() == [0, 0]
         assert second.take_result() == [0, 0]
 
+    def test_verified_block_advances_sampling_offset_per_committed_token(self) -> None:
+        class BlockRunner:
+            def __init__(self) -> None:
+                self.plans = []
+
+            def forward(self, plan):
+                self.plans.append(plan)
+                if plan.phase == resin.BatchPhase.PREFILL:
+                    return [1]
+                if len(self.plans) == 2:
+                    return [[2, 3, 4]]
+                return [[5]]
+
+        runner = BlockRunner()
+        engine = Engine(runner)
+        request = engine.submit([0], 5, sampling_params=SamplingParams(seed=7))
+
+        while engine.has_work():
+            engine.step()
+
+        assert [plan.sampling_offsets for plan in runner.plans] == [[0], [32], [128]]
+        assert request.take_result() == [1, 2, 3, 4, 5]
+
     def test_batch_plan_requires_row_aligned_sampling_annotations(self) -> None:
         params = SamplingParams()
         with pytest.raises(ValueError, match="one item per sequence"):
@@ -177,3 +200,6 @@ class TestSharedSampler:
         torch.testing.assert_close(calls["top_p"], torch.tensor([0.8, 1.0]))
         assert calls["seed"].tolist() == [31, 32]
         assert calls["offset"].tolist() == [64, 96]
+
+        shifted = sampler.host_inputs(plan, 3, offset_delta=64)
+        assert shifted["sampling_offsets"] == (128, 160)

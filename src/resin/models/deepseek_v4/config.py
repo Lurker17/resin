@@ -28,6 +28,10 @@ class DeepSeekV4Config:
     moe_intermediate_size: int
     hc_mult: int
     expert_dtype: str
+    dspark_block_size: int = 0
+    dspark_noise_token_id: int = 0
+    dspark_target_layer_ids: tuple[int, ...] = ()
+    dspark_markov_rank: int = 0
 
     @classmethod
     def from_hugging_face(cls, values: dict[str, Any]) -> Self:
@@ -52,6 +56,12 @@ class DeepSeekV4Config:
             moe_intermediate_size=int(values["moe_intermediate_size"]),
             hc_mult=int(values["hc_mult"]),
             expert_dtype=str(values["expert_dtype"]),
+            dspark_block_size=int(values.get("dspark_block_size", 0)),
+            dspark_noise_token_id=int(values.get("dspark_noise_token_id", 0)),
+            dspark_target_layer_ids=tuple(
+                int(layer_id) for layer_id in values.get("dspark_target_layer_ids", ())
+            ),
+            dspark_markov_rank=int(values.get("dspark_markov_rank", 0)),
         )
         config.validate()
         return config
@@ -89,6 +99,20 @@ class DeepSeekV4Config:
             raise ValueError("attention heads must be divisible by output groups")
         if self.expert_dtype != "fp4":
             raise ValueError("the DeepSeek-V4 Flash runner requires FP4 experts")
+        if self.dspark_block_size < 0 or self.dspark_markov_rank < 0:
+            raise ValueError("DSpark sizes cannot be negative")
+        if self.dspark_block_size:
+            if not 0 <= self.dspark_noise_token_id < self.vocab_size:
+                raise ValueError("DSpark noise token is outside the vocabulary")
+            if self.dspark_markov_rank <= 0:
+                raise ValueError("DSpark Markov rank must be positive")
+            if not self.dspark_target_layer_ids:
+                raise ValueError("DSpark target layers cannot be empty")
+            if any(
+                layer_id < 0 or layer_id >= self.num_hidden_layers
+                for layer_id in self.dspark_target_layer_ids
+            ):
+                raise ValueError("DSpark target layer is outside the target model")
 
     def validate_tensor_parallel(self, size: int) -> None:
         """Validate every checkpoint axis sharded by Resin's TP layout."""

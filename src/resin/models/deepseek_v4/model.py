@@ -77,6 +77,7 @@ class ModelArgs:
     moe_inter_dim: int = 4096
     n_layers: int = 7
     n_hash_layers: int = 0
+    n_mtp_layers: int = 0
     n_heads: int = 64
     # moe
     n_routed_experts: int = 8
@@ -109,6 +110,11 @@ class ModelArgs:
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
+    # dspark
+    dspark_block_size: int = 0
+    dspark_noise_token_id: int = 0
+    dspark_target_layer_ids: Tuple[int, ...] = ()
+    dspark_markov_rank: int = 256
 
 
 class ParallelEmbedding(nn.Module):
@@ -343,7 +349,10 @@ def apply_rotary_emb(
     if inverse:
         freqs_cis = freqs_cis.conj()
     row_aligned = x.size(1) == 1 and freqs_cis.size(0) == x.size(0)
-    if x.ndim == 3:
+    if freqs_cis.ndim == 3:
+        if x.ndim == 4:
+            freqs_cis = freqs_cis.unsqueeze(2)
+    elif x.ndim == 3:
         freqs_cis = freqs_cis.view(
             x.size(0) if row_aligned else 1, x.size(1), x.size(-1)
         )
@@ -410,6 +419,10 @@ def get_decode_window_topk_idxs(
         torch.zeros_like(position),
     ).unsqueeze(1)
     physical = (logical + start).remainder(window_size)
+    # The fixed-width row must not expose cache slots beyond a short prefix.
+    # FlashInfer also receives the logical length, but DSpark's parallel draft
+    # attention consumes these indices directly.
+    physical = torch.where(logical <= position.unsqueeze(1), physical, -1)
     return physical.to(torch.int32).unsqueeze(1)
 
 
@@ -964,6 +977,7 @@ class Attention(nn.Module):
             self.decode_overlap_stream.wait_stream(main_stream)
             with torch.cuda.stream(self.decode_overlap_stream):
                 if self.indexer is not None:
+                    self.compressor.forward_decode(x, position)
                     compress_topk_idxs = self.indexer.forward_decode(
                         x, qr, position, 0, compressed_width * ratio
                     )
@@ -994,7 +1008,7 @@ class Attention(nn.Module):
             )
             # FlashInfer sees each dense sequence row as one page in a shared pool,
             # so sparse indices are physical pool offsets rather than row-local IDs.
-            topk_idxs += cache_rows * win
+            topk_idxs = torch.where(topk_idxs >= 0, topk_idxs + cache_rows * win, -1)
 
         compressed_complete = torch.zeros_like(position)
         compressed_index_width = 0
@@ -1034,6 +1048,142 @@ class Attention(nn.Module):
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         o = grouped_bf16_linear(o, wo_a)
         return self.wo_b(o.flatten(2))
+
+    def _recurrent_buffers(self) -> tuple[torch.Tensor, ...]:
+        if not self.compress_ratio:
+            return ()
+        buffers = [self.compressor.kv_state, self.compressor.score_state]
+        if self.indexer is not None:
+            buffers.extend(
+                (
+                    self.indexer.compressor.kv_state,
+                    self.indexer.compressor.score_state,
+                )
+            )
+        return tuple(buffers)
+
+    def forward_verify(
+        self,
+        x: torch.Tensor,
+        position: torch.Tensor,
+        graph_seq_len: int,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Verify a short causal token block while checkpointing recurrence."""
+
+        batch_size, block_length, _ = x.shape
+        win, ratio, rd = self.window_size, self.compress_ratio, self.rope_head_dim
+        if ratio and self.compressor.kv_cache is None:
+            self.compressor.kv_cache = self.compressed_kv_cache
+            self.compressor.freqs_cis = self.freqs_cis
+            if self.indexer is not None:
+                self.indexer.freqs_cis = self.freqs_cis
+
+        if self._fused_wqkv:
+            qkv = linear(x, self._fused_wqkv_weight)
+            q_input, kv = qkv.split((self.q_lora_rank, self.head_dim), dim=-1)
+        else:
+            q_input, kv = self.wq_a(x), self.wkv(x)
+        qr = q = self.q_norm(q_input)
+        q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
+
+        recurrent = self._recurrent_buffers()
+        checkpoints = [(buffer, [buffer[:batch_size].clone()]) for buffer in recurrent]
+        compressed_width = 0
+        if ratio:
+            assert self.compressed_kv_cache is not None
+            compressed_width = min(
+                self.compressed_kv_cache.shape[1],
+                math.ceil(graph_seq_len / ratio / 4) * 4,
+            )
+
+        outputs = []
+        for index in range(block_length):
+            token_position = position + index
+            compressed_indices = None
+            compressed_index_width = 0
+            if ratio:
+                self.compressor.forward_decode(x[:, index : index + 1], token_position)
+                if self.indexer is not None:
+                    compressed_indices = self.indexer.forward_decode(
+                        x[:, index : index + 1],
+                        qr[:, index : index + 1],
+                        token_position,
+                        0,
+                        graph_seq_len,
+                    )
+                else:
+                    compressed_indices = get_decode_compress_topk_idxs(
+                        ratio,
+                        token_position,
+                        compressed_width,
+                        0,
+                    )
+            qk_norm_rope_store(
+                q[:, index : index + 1],
+                kv[:, index : index + 1],
+                self.kv_norm.weight,
+                torch.view_as_real(self.freqs_cis),
+                self.kv_cache[:batch_size, :win],
+                token_position,
+                self.eps,
+            )
+            topk_indices = get_decode_window_topk_idxs(win, token_position)
+            cache_rows = None
+            if batch_size > 1:
+                cache_rows = torch.arange(
+                    batch_size, dtype=torch.int32, device=x.device
+                ).view(batch_size, 1, 1)
+                topk_indices = torch.where(
+                    topk_indices >= 0, topk_indices + cache_rows * win, -1
+                )
+
+            compressed_complete = torch.zeros_like(token_position)
+            if ratio:
+                assert compressed_indices is not None
+                compressed_complete = torch.minimum(
+                    (token_position + 1).div(ratio, rounding_mode="floor"),
+                    torch.full_like(token_position, compressed_width),
+                )
+                if cache_rows is not None:
+                    compressed_indices = torch.where(
+                        compressed_indices >= 0,
+                        compressed_indices
+                        + cache_rows * self.compressed_kv_cache.shape[1],
+                        -1,
+                    )
+                compressed_index_width = compressed_indices.shape[-1]
+                topk_indices = torch.cat((topk_indices, compressed_indices), dim=-1)
+
+            assert self.attention_workspace is not None
+            window_cache = self.kv_cache[:batch_size, :win]
+            compressed_cache = (
+                self.compressed_kv_cache[:batch_size] if ratio else window_cache
+            )
+            output = sparse_decode_attention(
+                q[:, index : index + 1],
+                window_cache,
+                compressed_cache,
+                self.attn_sink,
+                topk_indices,
+                sparse_topk_lengths(compressed_complete, compressed_index_width, win),
+                (token_position + 1).to(torch.int32),
+                self.attention_workspace,
+                self.softmax_scale,
+            )
+            frequencies = self.freqs_cis.index_select(0, token_position)
+            apply_rotary_emb(output[..., -rd:], frequencies, True)
+            outputs.append(output)
+            for buffer, snapshots in checkpoints:
+                snapshots.append(buffer[:batch_size].clone())
+
+        o = torch.cat(outputs, dim=1)
+        o = o.view(batch_size, block_length, self.n_local_groups, -1)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        o = grouped_bf16_linear(o, wo_a)
+        frozen = [
+            (buffer, torch.stack(snapshots, dim=0)) for buffer, snapshots in checkpoints
+        ]
+        return self.wo_b(o.flatten(2)), frozen
 
 
 class Gate(nn.Module):
@@ -1395,11 +1545,13 @@ class Block(nn.Module):
     hc_pre: reduces hc copies -> 1 via learned weighted sum (pre-weights from Sinkhorn).
     hc_post: expands 1 -> hc copies via learned post-weights + combination matrix."""
 
+    attention_cls = Attention
+
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
-        self.attn = Attention(layer_id, args)
+        self.attn = self.attention_cls(layer_id, args)
         self.ffn = MoE(layer_id, args)
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
@@ -1497,6 +1649,31 @@ class Block(nn.Module):
         x = self.ffn(x, input_ids)
         return self.hc_post(x, residual, post, comb)
 
+    def forward_verify(
+        self,
+        x: torch.Tensor,
+        position: torch.Tensor,
+        input_ids: torch.Tensor,
+        graph_seq_len: int,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Run one target layer over a short causal verification block."""
+
+        residual = x
+        x, post, comb = self.hc_pre(
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        )
+        x = self.attn_norm(x)
+        x, checkpoints = self.attn.forward_verify(x, position, graph_seq_len)
+        x = self.hc_post(x, residual, post, comb)
+
+        residual = x
+        x, post, comb = self.hc_pre(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        )
+        x = self.ffn_norm(x)
+        x = self.ffn(x, input_ids)
+        return self.hc_post(x, residual, post, comb), checkpoints
+
     def hc_head(
         self,
         x: torch.Tensor,
@@ -1523,13 +1700,183 @@ class ParallelHead(nn.Module):
             torch.empty(part_vocab_size, dim, dtype=torch.float32)
         )
 
-    def forward(self, x: torch.Tensor):
-        logits = F.linear(x[:, -1].float(), self.weight)
+    def forward(self, x: torch.Tensor, *, full_logits: bool = False):
+        if not full_logits:
+            x = x[:, -1]
+        logits = F.linear(x.float(), self.weight)
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)
             logits = torch.cat(all_logits, dim=-1)
         return logits
+
+
+class DSparkAttention(Attention):
+    """Dense-window attention for one parallel DSpark draft block."""
+
+    def __init__(self, layer_id: int, args: ModelArgs):
+        super().__init__(layer_id, args)
+        if self.compress_ratio:
+            raise ValueError("DSpark layers must use uncompressed attention")
+
+    def _main_kv(self, main_x: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
+        frequencies = self.freqs_cis[position]
+        kv = self.kv_norm(self.wkv(main_x))
+        apply_rotary_emb(kv[..., -self.rope_head_dim :], frequencies)
+        act_quant(
+            kv[..., : -self.rope_head_dim],
+            64,
+            scale_fmt,
+            scale_dtype,
+            True,
+        )
+        return kv
+
+    def prefill_main(self, main_x: torch.Tensor) -> None:
+        """Populate the draft stage's rolling target-hidden cache."""
+
+        batch_size, sequence_length, _ = main_x.shape
+        positions = torch.arange(sequence_length, device=main_x.device)
+        kv = self._main_kv(main_x, positions)
+        if sequence_length <= self.window_size:
+            self.kv_cache[:batch_size, :sequence_length] = kv
+            return
+        cutoff = sequence_length % self.window_size
+        tail = kv[:, -self.window_size :]
+        self.kv_cache[:batch_size, cutoff:], self.kv_cache[:batch_size, :cutoff] = (
+            tail.split([self.window_size - cutoff, cutoff], dim=1)
+        )
+
+    def store_main(self, main_x: torch.Tensor, position: torch.Tensor) -> None:
+        """Commit one target hidden state at each row's logical position."""
+
+        rows = torch.arange(main_x.shape[0], device=main_x.device)
+        self.kv_cache[rows, position.remainder(self.window_size)] = self._main_kv(
+            main_x, position
+        ).squeeze(1)
+
+    def store_main_block(self, main_x: torch.Tensor, position: torch.Tensor) -> None:
+        """Commit a block; later unaccepted slots remain logically invisible."""
+
+        block_length = main_x.shape[1]
+        positions = position[:, None] + torch.arange(block_length, device=main_x.device)
+        kv = self._main_kv(main_x, positions)
+        rows = torch.arange(main_x.shape[0], device=main_x.device)[:, None]
+        self.kv_cache[rows, positions.remainder(self.window_size)] = kv
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position: torch.Tensor,
+        main_x: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, draft_length, _ = x.shape
+        self.store_main(main_x, position)
+
+        draft_positions = (
+            position[:, None] + 1 + torch.arange(draft_length, device=x.device)
+        )
+        frequencies = self.freqs_cis[draft_positions]
+        q = self.q_norm(self.wq_a(x))
+        q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
+        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+        apply_rotary_emb(q[..., -self.rope_head_dim :], frequencies)
+        kv = self.kv_norm(self.wkv(x))
+        apply_rotary_emb(kv[..., -self.rope_head_dim :], frequencies)
+        act_quant(
+            kv[..., : -self.rope_head_dim],
+            64,
+            scale_fmt,
+            scale_dtype,
+            True,
+        )
+
+        history = get_decode_window_topk_idxs(self.window_size, position).expand(
+            -1, draft_length, -1
+        )
+        draft = (
+            (
+                self.window_size
+                + torch.arange(draft_length, dtype=torch.int32, device=x.device)
+            )
+            .view(1, 1, -1)
+            .expand(batch_size, draft_length, -1)
+        )
+        indices = torch.cat((history, draft), dim=-1).contiguous()
+        o = sparse_attn(
+            q,
+            torch.cat((self.kv_cache[:batch_size], kv), dim=1),
+            self.attn_sink,
+            indices,
+            self.softmax_scale,
+        )
+        apply_rotary_emb(o[..., -self.rope_head_dim :], frequencies, True)
+        o = o.view(batch_size, draft_length, self.n_local_groups, -1)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        o = grouped_bf16_linear(o, wo_a)
+        return self.wo_b(o.flatten(2))
+
+
+class DSparkMarkovHead(nn.Module):
+    """Low-rank autoregressive correction over parallel draft logits."""
+
+    def __init__(self, vocab_size: int, markov_rank: int):
+        super().__init__()
+        self.markov_w1 = ParallelEmbedding(vocab_size, markov_rank)
+        self.markov_w2 = ParallelHead(vocab_size, markov_rank)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.markov_w2(self.markov_w1(token_ids), full_logits=True)
+
+
+class DSparkBlock(Block):
+    """One checkpoint DSpark stage under the ``mtp.*`` namespace."""
+
+    attention_cls = DSparkAttention
+
+    def __init__(self, layer_id: int, args: ModelArgs):
+        super().__init__(layer_id, args)
+        self.stage_id = layer_id - args.n_layers
+        if self.stage_id == 0:
+            if not args.dspark_target_layer_ids:
+                raise ValueError("DSpark requires target hidden layers")
+            self.main_proj = Linear(
+                args.dim * len(args.dspark_target_layer_ids), args.dim
+            )
+            self.main_norm = RMSNorm(args.dim, args.norm_eps)
+        if self.stage_id == args.n_mtp_layers - 1:
+            self.norm = RMSNorm(args.dim, args.norm_eps)
+            self.markov_head = DSparkMarkovHead(
+                args.vocab_size, args.dspark_markov_rank
+            )
+            hc_dim = self.hc_mult * args.dim
+            with set_dtype(torch.float32):
+                self.hc_head_fn = nn.Parameter(torch.empty(self.hc_mult, hc_dim))
+                self.hc_head_base = nn.Parameter(torch.empty(self.hc_mult))
+                self.hc_head_scale = nn.Parameter(torch.empty(1))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position: torch.Tensor,
+        input_ids: torch.Tensor,
+        main_x: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = x
+        x, post, comb = self.hc_pre(
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        )
+        x = self.attn_norm(x)
+        x = self.attn(x, position, main_x)
+        x = self.hc_post(x, residual, post, comb)
+
+        residual = x
+        x, post, comb = self.hc_pre(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        )
+        x = self.ffn_norm(x)
+        x = self.ffn(x, input_ids)
+        return self.hc_post(x, residual, post, comb)
 
 
 class Transformer(nn.Module):
@@ -1550,13 +1897,22 @@ class Transformer(nn.Module):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(args.n_layers):
             self.layers.append(Block(layer_id, args))
+        self.mtp = torch.nn.ModuleList(
+            DSparkBlock(args.n_layers + stage_id, args)
+            for stage_id in range(args.n_mtp_layers)
+        )
+        self.dspark_block_size = args.dspark_block_size
+        self.dspark_noise_token_id = args.dspark_noise_token_id
+        self.target_layer_ids = frozenset(
+            args.dspark_target_layer_ids if self.mtp else ()
+        )
         self.register_buffer(
             "_attention_workspace",
             torch.empty(128 * 1024 * 1024, dtype=torch.uint8),
             persistent=False,
         )
         self._decode_overlap_stream = torch.cuda.Stream()
-        for layer in self.layers:
+        for layer in (*self.layers, *self.mtp):
             layer.attn.attention_workspace = self._attention_workspace
             layer.attn.decode_overlap_stream = self._decode_overlap_stream
             layer.ffn.decode_overlap_stream = self._decode_overlap_stream
@@ -1579,15 +1935,26 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
+        logits, _ = self.forward_target(input_ids, start_pos)
+        return logits
+
+    @torch.inference_mode()
+    def forward_target(self, input_ids: torch.Tensor, start_pos: int = 0):
+        """Run target prefill and return the hidden states consumed by DSpark."""
+
         h = self.embed(input_ids)
         # Expand to hc_mult copies for Hyper-Connections
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
-        for layer in self.layers:
+        main_hiddens = []
+        for layer_id, layer in enumerate(self.layers):
             h = layer(h, start_pos, input_ids)
+            if layer_id in self.target_layer_ids:
+                main_hiddens.append(h.mean(dim=2))
         h = self.layers[-1].hc_head(
             h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
-        return self.head(self.norm(h))
+        main_hidden = torch.cat(main_hiddens, dim=-1) if main_hiddens else None
+        return self.head(self.norm(h)), main_hidden
 
     @torch.inference_mode()
     def forward_decode(
@@ -1598,11 +1965,105 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         """Decode one token using only graph-staged position data."""
 
+        logits, _ = self.forward_decode_target(input_ids, position, graph_seq_len)
+        return logits
+
+    @torch.inference_mode()
+    def forward_decode_target(
+        self,
+        input_ids: torch.Tensor,
+        position: torch.Tensor,
+        graph_seq_len: int,
+    ):
+        """Decode target tokens and expose DSpark's selected hidden states."""
+
         h = self.embed(input_ids)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
-        for layer in self.layers:
+        main_hiddens = []
+        for layer_id, layer in enumerate(self.layers):
             h = layer.forward_decode(h, position, input_ids, graph_seq_len)
+            if layer_id in self.target_layer_ids:
+                main_hiddens.append(h.mean(dim=2))
         h = self.layers[-1].hc_head(
             h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
-        return self.head(self.norm(h))
+        main_hidden = torch.cat(main_hiddens, dim=-1) if main_hiddens else None
+        return self.head(self.norm(h)), main_hidden
+
+    @torch.inference_mode()
+    def forward_verify(
+        self,
+        input_ids: torch.Tensor,
+        position: torch.Tensor,
+        graph_seq_len: int,
+    ):
+        """Run a fixed target verification block and retain recurrent checkpoints."""
+
+        h = self.embed(input_ids)
+        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        main_hiddens = []
+        checkpoints: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer_id, layer in enumerate(self.layers):
+            h, layer_checkpoints = layer.forward_verify(
+                h, position, input_ids, graph_seq_len
+            )
+            checkpoints.extend(layer_checkpoints)
+            if layer_id in self.target_layer_ids:
+                main_hiddens.append(h.mean(dim=2))
+        h = self.layers[-1].hc_head(
+            h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
+        )
+        main_hidden = torch.cat(main_hiddens, dim=-1) if main_hiddens else None
+        return self.head(self.norm(h), full_logits=True), main_hidden, checkpoints
+
+    def _project_main(self, main_hidden: torch.Tensor) -> torch.Tensor:
+        if not self.mtp:
+            raise RuntimeError("this checkpoint runner has no DSpark stages")
+        first = self.mtp[0]
+        return first.main_norm(first.main_proj(main_hidden))
+
+    @torch.inference_mode()
+    def prefill_dspark(self, main_hidden: torch.Tensor) -> None:
+        main_x = self._project_main(main_hidden)
+        for layer in self.mtp:
+            layer.attn.prefill_main(main_x)
+
+    @torch.inference_mode()
+    def commit_dspark_main_block(
+        self, main_hidden: torch.Tensor, position: torch.Tensor
+    ) -> None:
+        main_x = self._project_main(main_hidden)
+        for layer in self.mtp:
+            layer.attn.store_main_block(main_x, position)
+
+    @torch.inference_mode()
+    def draft(
+        self,
+        anchor_ids: torch.Tensor,
+        main_hidden: torch.Tensor,
+        position: torch.Tensor,
+    ) -> torch.Tensor:
+        """Draft a fixed greedy block from one target anchor per batch row."""
+
+        if main_hidden is None or not self.mtp or self.dspark_block_size <= 0:
+            raise RuntimeError("DSpark is not configured")
+        main_x = self._project_main(main_hidden)
+        input_ids = anchor_ids.new_full(
+            (anchor_ids.shape[0], self.dspark_block_size),
+            self.dspark_noise_token_id,
+        )
+        input_ids[:, 0] = anchor_ids.flatten()
+        h = self.embed(input_ids).unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        for layer in self.mtp:
+            h = layer(h, position, input_ids, main_x)
+
+        last = self.mtp[-1]
+        hidden = last.hc_head(h, last.hc_head_fn, last.hc_head_scale, last.hc_head_base)
+        logits = self.head(last.norm(hidden), full_logits=True)
+        previous = anchor_ids.flatten()
+        output = []
+        for index in range(self.dspark_block_size):
+            biased = logits[:, index] + last.markov_head(previous)
+            previous = biased.argmax(dim=-1)
+            output.append(previous)
+        return torch.stack(output, dim=1)

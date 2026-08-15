@@ -163,6 +163,24 @@ class TestCudaGraph:
         assert graphs.stats["replay_count"] == 1
         assert graphs.stats["captured_shapes"] == ((1, 4),)
 
+    def test_capture_can_prepare_mutable_state_before_each_parity_run(self) -> None:
+        prepared = []
+
+        def build(_shape):
+            state = _Tensor([0])
+            return CudaGraphStep(
+                {"value": state},
+                state,
+                lambda: None,
+                prepare=lambda: prepared.append(True),
+            )
+
+        graphs = _cache(_Torch(), ((1, 4),), build)
+
+        graphs.capture((1, 4), {"value": [7]})
+
+        assert len(prepared) == 5
+
     def test_run_never_captures_dynamically(self) -> None:
         graphs = _cache(
             _Torch(),

@@ -9,10 +9,13 @@ if TYPE_CHECKING:
     from resin._resin import BatchPlan
 
 
+RunnerOutput: TypeAlias = Sequence[int] | Sequence[Sequence[int]]
+
+
 class SyncRunner(Protocol):
     """Runner which completes one immutable plan synchronously."""
 
-    def forward(self, plan: BatchPlan) -> Sequence[int]: ...
+    def forward(self, plan: BatchPlan) -> RunnerOutput: ...
 
 
 class AsyncRunner(Protocol):
@@ -20,9 +23,9 @@ class AsyncRunner(Protocol):
 
     def dispatch(self, plan: BatchPlan) -> object: ...
 
-    def poll(self, completion: object) -> Sequence[int] | None: ...
+    def poll(self, completion: object) -> RunnerOutput | None: ...
 
 
 Runner: TypeAlias = SyncRunner | AsyncRunner
 
-__all__ = ["AsyncRunner", "Runner", "SyncRunner"]
+__all__ = ["AsyncRunner", "Runner", "RunnerOutput", "SyncRunner"]
