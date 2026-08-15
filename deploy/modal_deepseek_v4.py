@@ -270,7 +270,7 @@ def _real_prompt_ids(
         "README.md",
         "docs/architecture.md",
         "docs/scheduler.md",
-        "src/lib.rs",
+        "crates/resin-py/src/lib.rs",
     )
     body = "\n\n".join(
         f"===== {relative_path} =====\n{(prompt_root / relative_path).read_text()}"

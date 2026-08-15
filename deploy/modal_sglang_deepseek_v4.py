@@ -30,7 +30,7 @@ PROMPT_FILES = (
     "README.md",
     "docs/architecture.md",
     "docs/scheduler.md",
-    "src/lib.rs",
+    "crates/resin-py/src/lib.rs",
 )
 
 image = (
@@ -39,7 +39,10 @@ image = (
     .add_local_file("README.md", f"{PROMPT_ROOT}/README.md")
     .add_local_file("docs/architecture.md", f"{PROMPT_ROOT}/docs/architecture.md")
     .add_local_file("docs/scheduler.md", f"{PROMPT_ROOT}/docs/scheduler.md")
-    .add_local_file("src/lib.rs", f"{PROMPT_ROOT}/src/lib.rs")
+    .add_local_file(
+        "crates/resin-py/src/lib.rs",
+        f"{PROMPT_ROOT}/crates/resin-py/src/lib.rs",
+    )
 )
 model_cache_volume = modal.Volume.from_name(
     MODEL_CACHE_VOLUME_NAME, create_if_missing=False, version=1

@@ -121,7 +121,7 @@ def report() -> dict[str, dict[str, dict[str, int]]]:
     groups = {
         "rust": {
             "resin-core": source_files(ROOT / "crates/resin-core/src", "*.rs"),
-            "resin": source_files(ROOT / "src", "*.rs", recursive=False),
+            "resin-py": source_files(ROOT / "crates/resin-py/src", "*.rs"),
         },
         "python": {
             "top-level": source_files(ROOT / "src/resin", "*.py", recursive=False),

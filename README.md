@@ -178,7 +178,7 @@ The native layer currently provides:
 The native implementation is split in two. `crates/resin-core` is ordinary,
 PyO3-free Rust containing typed scheduling, token-range planning, full-context
 and sliding-window KV resources, recurrent-slot resources, allocation, and
-leases. The root crate adapts those types to Python and coordinates runner
+leases. `crates/resin-py` adapts those types to Python and coordinates runner
 acceptance and completion.
 
 History cache grows on demand to each frozen plan. Window cache grows toward
@@ -247,11 +247,11 @@ unavailable accelerator libraries.
 
 ## Repository map
 
-- `src/lib.rs` — Python API, Engine lifecycle, and transactional orchestration
-- `src/planning.rs` — conversion from core batch/resource views to `BatchPlan`
-- `src/runner.rs` — execution discovery and one-time resource binding
-- `src/cache.rs` — Python adapters for core KV descriptors
-- `src/state_pool.rs` — Python adapter for the core recurrent-slot pool
+- `crates/resin-py/src/lib.rs` — Python API, Engine lifecycle, and transactional orchestration
+- `crates/resin-py/src/planning.rs` — conversion from core batch/resource views to `BatchPlan`
+- `crates/resin-py/src/runner.rs` — execution discovery and one-time resource binding
+- `crates/resin-py/src/cache.rs` — Python adapters for core KV descriptors
+- `crates/resin-py/src/state_pool.rs` — Python adapter for the core recurrent-slot pool
 - `crates/resin-core/src/scheduler.rs` — cohort selection and queue-age policy
 - `crates/resin-core/src/planning.rs` — typed token-range planning
 - `crates/resin-core/src/resources/` — KV, recurrent, allocator, and lease logic

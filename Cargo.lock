@@ -102,16 +102,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "resin"
+name = "resin-core"
+version = "0.1.0"
+
+[[package]]
+name = "resin-py"
 version = "0.1.0"
 dependencies = [
  "pyo3",
  "resin-core",
 ]
-
-[[package]]
-name = "resin-core"
-version = "0.1.0"
 
 [[package]]
 name = "syn"

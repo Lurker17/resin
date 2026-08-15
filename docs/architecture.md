@@ -293,12 +293,10 @@ concrete model implementation loads the framework it uses.
 
 ## Code map
 
-- `src/lib.rs` — Python API, lifecycle, and transactional orchestration
-- `src/planning.rs` — token-range and grouped-plan construction
-- `src/runner.rs` — runner discovery and resource binding
-- `src/scheduler.rs` — cohort selection and queue-age policy
-- `src/cache.rs` — layout and plan descriptors
-- `src/cache_pool.rs` — flat allocation, ownership, and access leases
-- `src/state_pool.rs` — state ownership, access, and physical mappings
+- `crates/resin-py/src/lib.rs` — Python API, lifecycle, and transactional orchestration
+- `crates/resin-py/src/planning.rs` — token-range and grouped-plan construction
+- `crates/resin-py/src/runner.rs` — runner discovery and resource binding
+- `crates/resin-py/src/cache.rs` — layout and plan descriptors
+- `crates/resin-py/src/state_pool.rs` — state ownership, access, and physical mappings
 - `src/resin/backend/` — reusable execution and resource gadgets
 - `src/resin/models/` — concrete model definitions, loaders, and runners
