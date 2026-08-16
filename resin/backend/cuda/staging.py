@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import numpy as np
 import torch
 
 
@@ -19,12 +20,14 @@ class TensorStager:
         self.host_tensors = {}
 
     def host(self, name: str, values, dtype):
-        tensor = torch.tensor(
-            values,
+        values = np.asarray(values)
+        tensor = torch.empty(
+            values.shape,
             dtype=dtype,
             device="cpu",
             pin_memory=True,
         )
+        np.copyto(tensor.numpy(), values, casting="unsafe")
         self.host_tensors[name] = tensor
         return tensor
 

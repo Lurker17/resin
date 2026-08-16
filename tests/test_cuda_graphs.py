@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from resin.backend.cuda import staging
@@ -21,9 +22,9 @@ class _Context:
 
 class _Tensor:
     def __init__(self, values, *, dtype="int"):
-        self.values = list(values)
+        self.values = np.array(values, copy=True)
         self.dtype = dtype
-        self.shape = (len(self.values),)
+        self.shape = self.values.shape
         self.copy_error = None
 
     def clone(self):
@@ -42,10 +43,13 @@ class _Tensor:
         del non_blocking
         if self.copy_error is not None:
             raise self.copy_error
-        self.values[:] = source.values
+        self.values[...] = source.values
+
+    def numpy(self):
+        return self.values.reshape(self.shape)
 
     def tolist(self):
-        return list(self.values)
+        return self.values.tolist()
 
 
 class _Stream:
@@ -106,9 +110,14 @@ class _Torch:
         assert pin_memory
         return _Tensor(values, dtype=dtype)
 
+    def empty(self, shape, *, dtype, device, pin_memory=False):
+        assert device == "cpu"
+        assert pin_memory
+        return _Tensor(np.empty(shape), dtype=dtype)
+
     @staticmethod
     def equal(left, right):
-        return left.values == right.values
+        return np.array_equal(left.values, right.values)
 
 
 def _cache(torch, shapes, build, synchronize_failure=lambda: None):
