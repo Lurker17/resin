@@ -182,6 +182,52 @@ def _generate(engine, processor, prompt: str, max_new_tokens: int):
     return media, token_ids, steps
 
 
+def _text_batch(engine, processor, batch_size: int, prompt_words: int) -> dict[str, Any]:
+    from resin import SamplingParams
+    from resin_models_cuda.gemma4 import Gemma4Media
+
+    prompt = " ".join(["word"] * prompt_words)
+    leases = []
+    prompt_tokens = 0
+    for index in range(batch_size):
+        media = Gemma4Media.from_messages(
+            processor,
+            [
+                {
+                    "role": "user",
+                    "content": f"{prompt}\nReply with the number {index}.",
+                }
+            ],
+        )
+        prompt_tokens = len(media.token_ids)
+        leases.append(
+            engine.submit(
+                media=media,
+                max_new_tokens=3,
+                stop_token_ids=(1, 106),
+                sampling_params=SamplingParams(temperature=0.0),
+            )
+        )
+    steps = []
+    while engine.has_work():
+        started = time.perf_counter()
+        events = engine.step()
+        steps.append(
+            {
+                "ms": (time.perf_counter() - started) * 1000,
+                "tokens": len(events),
+            }
+        )
+    outputs = [lease.take_result() for lease in leases]
+    return {
+        "batch_size": batch_size,
+        "prompt_words": prompt_words,
+        "prompt_tokens": prompt_tokens,
+        "steps": steps,
+        "output_lengths": list(map(len, outputs)),
+    }
+
+
 @app.function(
     gpu="RTX-PRO-6000:1",
     cpu=16,
@@ -237,6 +283,34 @@ def smoke_test(max_new_tokens: int = 16) -> dict[str, Any]:
             engine.close()
 
 
+@app.function(
+    gpu="RTX-PRO-6000:1",
+    cpu=16,
+    memory=128 * 1024,
+    timeout=8 * 60 * 60,
+    single_use_containers=True,
+)
+def shape_profile() -> dict[str, Any]:
+    torch, _, processor, engine, report = _build_runtime()
+    try:
+        _generate(engine, processor, "Name the main colors.", 2)
+        cases = [(1, 8), (2, 8), (4, 8), (8, 8), (1, 128), (1, 512)]
+        cold = []
+        warm = []
+        for batch_size, prompt_words in cases:
+            engine.clear_prefix_cache()
+            cold.append(_text_batch(engine, processor, batch_size, prompt_words))
+            engine.clear_prefix_cache()
+            warm.append(_text_batch(engine, processor, batch_size, prompt_words))
+        torch.cuda.synchronize()
+        report["cold"] = cold
+        report["warm"] = warm
+        return report
+    finally:
+        if not engine.closed:
+            engine.close()
+
+
 def _serve() -> None:
     from resin.server import HttpServer
     from resin_models_cuda.gemma4 import Gemma4Codec
@@ -284,5 +358,7 @@ def main(mode: str = "smoke", max_new_tokens: int = 16) -> None:
         print(json.dumps(download_model.remote(), indent=2))
     elif mode == "smoke":
         print(json.dumps(smoke_test.remote(max_new_tokens), indent=2))
+    elif mode == "profile":
+        print(json.dumps(shape_profile.remote(), indent=2))
     else:
-        raise ValueError("mode must be 'download' or 'smoke'")
+        raise ValueError("mode must be 'download', 'smoke', or 'profile'")
