@@ -102,7 +102,7 @@ def test_tensor_parallel_plan_round_trip_preserves_native_contract() -> None:
         cache_groups=[
             CacheGroupPlan(0, [0, 1, 2], [3, 4], [0, 2], [3, 3, 4], [0, 1, 0])
         ],
-        sample_sequence_indices=[1],
+        sampling_mask=[False, True],
         sampling_params=[
             SamplingParams(temperature=0.5, seed=31),
             SamplingParams(top_p=0.9, seed=32),
@@ -118,7 +118,7 @@ def test_tensor_parallel_plan_round_trip_preserves_native_contract() -> None:
     assert restored.phase == plan.phase
     assert restored.batch_id == plan.batch_id
     assert restored.batch_key == plan.batch_key
-    assert restored.sample_sequence_indices.tolist() == [1]
+    assert restored.sampling_mask.tolist() == [False, True]
     assert restored.cache_groups[0].block_ids.tolist() == [3, 4]
     assert restored.sampling_params[0].temperature == 0.5
     assert restored.sampling_params[1].top_p == 0.9

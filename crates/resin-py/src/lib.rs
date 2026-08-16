@@ -303,26 +303,9 @@ struct BatchPlan {
     batch_id: u64,
     batch_key: Option<u64>,
     cache_groups: Vec<CacheGroupPlan>,
-    sample_sequence_indices: Vec<u32>,
+    sampling_mask: Vec<bool>,
     sampling_params: Vec<SamplingParams>,
     positions: OnceLock<Vec<u32>>,
-}
-
-fn validate_sequence_indices(name: &str, indices: &[u32], sequence_count: usize) -> PyResult<()> {
-    if indices
-        .iter()
-        .any(|sequence_index| *sequence_index as usize >= sequence_count)
-    {
-        return Err(PyValueError::new_err(format!(
-            "{name} contains an index outside the batch sequence range"
-        )));
-    }
-    if indices.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(PyValueError::new_err(format!(
-            "{name} must be strictly sorted and unique"
-        )));
-    }
-    Ok(())
 }
 
 impl BatchPlan {
@@ -333,7 +316,7 @@ impl BatchPlan {
             token_indptr,
             context_lengths,
             sampling_params,
-            sample_sequence_indices,
+            sampling_mask,
             ..
         } = &plan;
         if token_ids.is_empty() {
@@ -371,11 +354,11 @@ impl BatchPlan {
                 "sampling_params must contain an effective seed for every sequence",
             ));
         }
-        validate_sequence_indices(
-            "sample_sequence_indices",
-            sample_sequence_indices,
-            sequence_ids.len(),
-        )?;
+        if sampling_mask.len() != sequence_ids.len() {
+            return Err(PyValueError::new_err(
+                "sampling_mask must contain one item per sequence",
+            ));
+        }
         if token_indptr.first() != Some(&0) {
             return Err(PyValueError::new_err("token_indptr must start at zero"));
         }
@@ -466,7 +449,7 @@ impl BatchPlan {
         batch_id = 0,
         batch_key = None,
         cache_groups = None,
-        sample_sequence_indices = None,
+        sampling_mask = None,
         sampling_params = None
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -480,7 +463,7 @@ impl BatchPlan {
         batch_id: u64,
         batch_key: Option<u64>,
         cache_groups: Option<Vec<Py<CacheGroupPlan>>>,
-        sample_sequence_indices: Option<PyArrayLike1<'_, u32>>,
+        sampling_mask: Option<PyArrayLike1<'_, bool>>,
         sampling_params: Option<Vec<Py<SamplingParams>>>,
     ) -> PyResult<Self> {
         let sequence_ids = arrays::owned_vec(sequence_ids);
@@ -493,9 +476,9 @@ impl BatchPlan {
             .into_iter()
             .map(|group| group.borrow(py).clone())
             .collect();
-        let sample_sequence_indices = sample_sequence_indices
+        let sampling_mask = sampling_mask
             .map(arrays::owned_vec)
-            .unwrap_or_else(|| (0..sequence_count as u32).collect::<Vec<_>>());
+            .unwrap_or_else(|| vec![true; sequence_count]);
         let mut sampling_params = sampling_params
             .map(|params| {
                 params
@@ -518,7 +501,7 @@ impl BatchPlan {
             batch_id,
             batch_key,
             cache_groups,
-            sample_sequence_indices,
+            sampling_mask,
             sampling_params,
             positions: OnceLock::new(),
         })
@@ -596,11 +579,11 @@ impl BatchPlan {
         Ok(PyTuple::new(py, groups)?.unbind())
     }
 
-    /// Which sequence indices should generate a sampled token. Used for
-    /// chunked prefill, when some sequences only advance the cache.
+    /// Which sequences should generate a sampled token. Used for chunked
+    /// prefill, when some sequences only advance the cache.
     #[getter]
-    fn sample_sequence_indices<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        arrays::readonly_view(this.clone().into_any(), &this.get().sample_sequence_indices)
+    fn sampling_mask<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<bool>> {
+        arrays::readonly_view(this.clone().into_any(), &this.get().sampling_mask)
     }
 
     /// Effective sampling parameters, one per sequence.

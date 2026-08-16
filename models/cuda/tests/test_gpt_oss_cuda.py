@@ -106,7 +106,7 @@ def _flat_plan(
         token_indptr=token_indptr,
         context_lengths=list(context_lengths),
         phase=phase,
-        sample_sequence_indices=list(range(sequence_count)),
+        sampling_mask=[True] * sequence_count,
     )
 
 

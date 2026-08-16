@@ -276,7 +276,7 @@ def batch_plan_payload(plan: BatchPlan) -> dict[str, Any]:
             }
             for params in plan.sampling_params
         ],
-        "sample_sequence_indices": plan.sample_sequence_indices,
+        "sampling_mask": plan.sampling_mask,
         "cache_groups": [
             {
                 "group_index": group.group_index,
@@ -308,7 +308,7 @@ def batch_plan_from_payload(payload: dict[str, Any]) -> BatchPlan:
         batch_id=payload["batch_id"],
         batch_key=payload["batch_key"],
         cache_groups=cache_groups,
-        sample_sequence_indices=payload["sample_sequence_indices"],
+        sampling_mask=payload["sampling_mask"],
         sampling_params=sampling_params,
     )
 

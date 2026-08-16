@@ -138,7 +138,7 @@ class TestSamplingContract:
 
 class TestSharedSampler:
     @staticmethod
-    def _plan(params, *, sample_sequence_indices=None):
+    def _plan(params, *, sampling_mask=None):
         rows = len(params)
         return BatchPlan(
             list(range(10, 10 + rows)),
@@ -146,7 +146,7 @@ class TestSharedSampler:
             list(range(1, rows + 1)),
             list(range(rows + 1)),
             sampling_params=params,
-            sample_sequence_indices=sample_sequence_indices,
+            sampling_mask=sampling_mask,
         )
 
     def test_torch_sampler_unifies_greedy_top_k_and_unsampled_rows(self) -> None:
@@ -158,7 +158,7 @@ class TestSharedSampler:
                 SamplingParams(temperature=1.0, top_k=1),
                 SamplingParams(temperature=1.0),
             ],
-            sample_sequence_indices=[0, 1],
+            sampling_mask=[True, True, False],
         )
 
         assert sampler(logits, plan).tolist() == [1, 1, 1]

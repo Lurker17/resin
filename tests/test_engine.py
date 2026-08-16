@@ -87,14 +87,14 @@ class TestEngine:
         assert [event.token_id for event in initial] == [3, 9]
         assert runner.plans[0].phase == BatchPhase.PREFILL
         assert runner.plans[0].token_indptr.tolist() == [0, 2, 3]
-        assert runner.plans[0].sample_sequence_indices.tolist() == [0, 1]
+        assert runner.plans[0].sampling_mask.tolist() == [True, True]
         assert runner.released == [second]
 
         final = engine.step()
         assert [event.token_id for event in final] == [4]
         assert runner.plans[1].phase == BatchPhase.DECODE
         assert runner.plans[1].context_lengths.tolist() == [2]
-        assert runner.plans[1].sample_sequence_indices.tolist() == [0]
+        assert runner.plans[1].sampling_mask.tolist() == [True]
         assert not engine.has_work()
         assert first.done
         assert first.take_result() == [3, 4]
@@ -369,7 +369,7 @@ class TestEngine:
             if plan.sequence_ids.tolist() == [first]
             and plan.phase == BatchPhase.PREFILL
         )
-        assert first_replay.sample_sequence_indices.tolist() == []
+        assert first_replay.sampling_mask.tolist() == [False]
         assert engine.cache_occupied_block_count == 0
 
     def test_conservativeness_limits_initial_kv_admission(self) -> None:

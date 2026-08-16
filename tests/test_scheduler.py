@@ -289,20 +289,20 @@ class TestSchedulerConfigContract:
         with pytest.raises(OverflowError):
             engine.submit([1], 1, batch_key=2**64)
 
-    def test_batch_plan_freezes_phase_and_sampling_rows(self) -> None:
+    def test_batch_plan_freezes_phase_and_sampling_mask(self) -> None:
         plan = BatchPlan(
             [7, 8, 9],
             [0, 4, 0],
             [10, 20, 30],
             [0, 1, 2, 3],
-            sample_sequence_indices=[1, 2],
+            sampling_mask=[False, True, True],
         )
         assert plan.phase == BatchPhase.PREFILL
-        assert plan.sample_sequence_indices.tolist() == [1, 2]
+        assert plan.sampling_mask.tolist() == [False, True, True]
         assert plan.num_sequences == 3
         assert len(RecordingRunner().forward(plan)) == 3
         with pytest.raises(AttributeError):
-            plan.sample_sequence_indices = [0]
+            plan.sampling_mask = [True, False, False]
 
     def test_batch_plan_phase_is_batch_homogeneous(self) -> None:
         prefill = BatchPlan(
@@ -312,7 +312,7 @@ class TestSchedulerConfigContract:
             [0, 1, 2],
         )
         assert prefill.phase == BatchPhase.PREFILL
-        assert prefill.sample_sequence_indices.tolist() == [0, 1]
+        assert prefill.sampling_mask.tolist() == [True, True]
 
         decode = BatchPlan(
             [7, 8],
@@ -329,7 +329,7 @@ class TestSchedulerConfigContract:
             np.asarray([2, 4], dtype=np.uint32),
             np.asarray([11, 12, 13], dtype=np.uint32),
             np.asarray([0, 2, 3], dtype=np.uint32),
-            sample_sequence_indices=np.asarray([1], dtype=np.uint32),
+            sampling_mask=np.asarray([False, True], dtype=np.bool_),
         )
         expected = {
             "sequence_ids": (np.uint64, [7, 8]),
@@ -337,7 +337,7 @@ class TestSchedulerConfigContract:
             "token_ids": (np.uint32, [11, 12, 13]),
             "token_indptr": (np.uint32, [0, 2, 3]),
             "positions": (np.uint32, [2, 3, 4]),
-            "sample_sequence_indices": (np.uint32, [1]),
+            "sampling_mask": (np.bool_, [False, True]),
         }
         for name, (dtype, values) in expected.items():
             array = getattr(plan, name)
@@ -351,15 +351,15 @@ class TestSchedulerConfigContract:
                 array.flags.writeable = True
         assert np.shares_memory(plan.positions, plan.positions)
 
-    def test_batch_plan_rejects_invalid_sampling_rows(self) -> None:
-        for value in ([2, 1], [1, 1], [3]):
-            with pytest.raises(ValueError):
+    def test_batch_plan_rejects_invalid_sampling_mask(self) -> None:
+        for value in ([True], [True, False, True, False]):
+            with pytest.raises(ValueError, match="one item per sequence"):
                 BatchPlan(
                     [7, 8, 9],
                     [0, 4, 0],
                     [10, 20, 30],
                     [0, 1, 2, 3],
-                    sample_sequence_indices=value,
+                    sampling_mask=value,
                 )
 
         with pytest.raises(TypeError, match="prefill_sequence_indices"):
@@ -487,7 +487,7 @@ class TestNativePolicyIntegration:
             "token_ids",
             "token_indptr",
             "context_lengths",
-            "sample_sequence_indices",
+            "sampling_mask",
         ):
             left = getattr(failed, field)
             right = getattr(retry, field)
@@ -554,7 +554,7 @@ class TestNativePolicyIntegration:
         assert plan.phase == BatchPhase.PREFILL
         assert plan.token_ids.tolist() == [20, 21]
         assert plan.context_lengths.tolist() == [0]
-        assert plan.sample_sequence_indices.tolist() == []
+        assert plan.sampling_mask.tolist() == [False]
         assert events == []
         assert not partial.done
         assert runner.released == []
@@ -562,7 +562,7 @@ class TestNativePolicyIntegration:
         events = engine.step()
         assert runner.plans[-1].phase == BatchPhase.PREFILL
         assert runner.plans[-1].context_lengths.tolist() == [2]
-        assert runner.plans[-1].sample_sequence_indices.tolist() == [0]
+        assert runner.plans[-1].sampling_mask.tolist() == [True]
         assert [event.request_id for event in events] == [partial]
         assert partial.done
         assert partial.take_result() == [24]
@@ -602,7 +602,7 @@ class TestNativePolicyIntegration:
         )
         request = engine.submit([1, 2, 3], 1)
         engine.dispatch()
-        assert runner.dispatch_plans[-1].sample_sequence_indices.tolist() == []
+        assert runner.dispatch_plans[-1].sampling_mask.tolist() == [False]
         assert engine.poll() == []
         assert engine.cancel(request)
         assert engine.poll() == []

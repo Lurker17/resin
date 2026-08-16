@@ -116,10 +116,10 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
     let mut token_indptr = Vec::with_capacity(requests.len() + 1);
     let mut context_lengths = Vec::with_capacity(requests.len());
     let mut sampling_params = Vec::with_capacity(requests.len());
-    let mut sample_sequence_indices = Vec::with_capacity(requests.len());
+    let mut sampling_mask = Vec::with_capacity(requests.len());
     token_indptr.push(0);
 
-    for (sequence_index, (request, scheduled)) in requests.iter().zip(scheduled_rows).enumerate() {
+    for (request, scheduled) in requests.iter().zip(scheduled_rows) {
         sequence_ids.push(request.id);
         sampling_params.push(request.sampling_params.clone());
         if scheduled.phase != request.phase()
@@ -176,9 +176,7 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
                 context_lengths.push(scheduled.token_start());
             }
         }
-        if scheduled.sample {
-            sample_sequence_indices.push(sequence_index as u32);
-        }
+        sampling_mask.push(scheduled.sample);
         token_indptr.push(token_ids.len() as u32);
     }
 
@@ -202,7 +200,7 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
         batch_id,
         batch_key,
         cache_groups,
-        sample_sequence_indices,
+        sampling_mask,
         sampling_params,
         positions: OnceLock::new(),
     })

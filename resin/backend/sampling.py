@@ -5,7 +5,7 @@ from __future__ import annotations
 SAMPLING_OFFSET_STRIDE = 32
 
 
-def batch_sampling_inputs(plan, vocab_size: int) -> dict[str, tuple]:
+def batch_sampling_inputs(plan, vocab_size: int) -> dict[str, object]:
     """Extract backend-friendly primitive arrays from one immutable plan."""
 
     if vocab_size <= 0:
@@ -28,7 +28,6 @@ def batch_sampling_inputs(plan, vocab_size: int) -> dict[str, tuple]:
     seeds = tuple(item.seed for item in params)
     if any(seed is None for seed in seeds):
         raise ValueError("sampling params must contain effective seeds")
-    sample_rows = set(plan.sample_sequence_indices)
     return {
         "temperatures": tuple(float(item.temperature) for item in params),
         "top_ps": tuple(float(item.top_p) for item in params),
@@ -38,7 +37,7 @@ def batch_sampling_inputs(plan, vocab_size: int) -> dict[str, tuple]:
         ),
         "seeds": seeds,
         "offsets": offsets,
-        "sample_mask": tuple(index in sample_rows for index in range(rows)),
+        "sampling_mask": plan.sampling_mask,
     }
 
 
@@ -70,7 +69,7 @@ class TorchSampler:
 
         result = logits.argmax(dim=-1)
         for row, (temperature, should_sample) in enumerate(
-            zip(values["temperatures"], values["sample_mask"], strict=True)
+            zip(values["temperatures"], values["sampling_mask"], strict=True)
         ):
             if not should_sample or temperature == 0.0:
                 continue

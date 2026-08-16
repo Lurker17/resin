@@ -41,7 +41,7 @@ class BatchPlan:
         batch_id: int = 0,
         batch_key: int | None = None,
         cache_groups: Sequence[CacheGroupPlan] | None = None,
-        sample_sequence_indices: Sequence[int] | npt.NDArray[np.uint32] | None = None,
+        sampling_mask: Sequence[bool] | npt.NDArray[np.bool_] | None = None,
         sampling_params: Sequence[SamplingParams] | None = None,
     ) -> BatchPlan: ...
     def __repr__(self, /) -> str: ...
@@ -94,10 +94,10 @@ class BatchPlan:
         """
 
     @property
-    def sample_sequence_indices(self, /) -> npt.NDArray[np.uint32]:
+    def sampling_mask(self, /) -> npt.NDArray[np.bool_]:
         """
-        Which sequence indices should generate a sampled token. Used for
-        chunked prefill, when some sequences only advance the cache.
+        Which sequences should generate a sampled token. Used for chunked
+        prefill, when some sequences only advance the cache.
         """
 
     @property

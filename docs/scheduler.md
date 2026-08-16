@@ -126,8 +126,8 @@ attention. Multiple Window groups compose by taking the earliest boundary.
 `BatchPlan.token_indptr` describes the final flattened range for each row.
 `context_lengths` contains each row's pre-append logical length. Initial prefill
 is sampled only when it reaches the end of the prompt; replay prefill is never
-sampled; decode rows are always sampled. `sample_sequence_indices` makes this
-event/commit mask explicit. The runner still returns one token ID per row,
+sampled; decode rows are always sampled. `sampling_mask` makes this event/commit
+mask explicit. The runner still returns one token ID per row,
 including an unsampled continuation or replay row.
 
 `SamplingParams` is per request and defaults to temperature `1.0`, top-p `1.0`,

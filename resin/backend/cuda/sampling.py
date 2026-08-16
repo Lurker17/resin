@@ -54,7 +54,7 @@ class FlashInferSampler:
             "sampling_stochastic_mask": tuple(
                 should_sample and temperature > 0.0
                 for temperature, should_sample in zip(
-                    values["temperatures"], values["sample_mask"], strict=True
+                    values["temperatures"], values["sampling_mask"], strict=True
                 )
             ),
         }
@@ -116,7 +116,7 @@ class FlashInferSampler:
         if not any(
             should_sample and temperature > 0.0
             for temperature, should_sample in zip(
-                values["temperatures"], values["sample_mask"], strict=True
+                values["temperatures"], values["sampling_mask"], strict=True
             )
         ):
             result = greedy

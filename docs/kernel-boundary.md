@@ -27,11 +27,11 @@ pinned host staging path rather than calling `list()` or `tuple()` first.
 `batch_key` is an optional caller-defined compatibility key; the scheduler does
 not mix different keys in one batch.
 
-`sample_sequence_indices` lists the sequence indices that should generate a
-sampled token. It is used for chunked prefill, when some sequences only advance
-the cache. `sampling_params` contains one effective sampling policy per
-sequence. Random draw offsets are derived from the absolute sampled position
-rather than transported separately.
+`sampling_mask` has one Boolean per sequence and marks which sequences should
+generate a sampled token. It is used for chunked prefill, when some sequences
+only advance the cache. `sampling_params` contains one effective sampling policy
+per sequence. Random draw offsets are derived from the absolute sampled
+position rather than transported separately.
 
 ## Cache metadata
 
