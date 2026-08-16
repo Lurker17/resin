@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, TypedDict
+from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypeAlias, TypedDict
 
 if TYPE_CHECKING:
     from resin._resin import BatchPlan, ResourceBinding, RunnerConfig
@@ -17,6 +17,7 @@ class RenderedPrompt(TypedDict):
 
     token_ids: list[int]
     stop_token_ids: list[int]
+    input_payload: NotRequired[object]
 
 
 class ParserEvent(TypedDict, total=False):

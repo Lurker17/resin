@@ -9,6 +9,7 @@ use std::{
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
+    types::PyDict,
 };
 use pythonize::{depythonize, pythonize};
 use resin_http::{FinishReason, GenerationEvent, GenerationJob, RouteConfig};
@@ -311,6 +312,11 @@ fn admit(
     let result = Python::attach(|py| {
         let request = pythonize(py, &job.request)?;
         let rendered = codec.bind(py).call_method1("render", (&request,))?;
+        let input_payload = rendered
+            .cast::<PyDict>()?
+            .get_item("input_payload")?
+            .filter(|value| !value.is_none())
+            .map(Bound::unbind);
         let rendered: RenderedPrompt = depythonize(&rendered)?;
         if rendered.token_ids.is_empty() {
             return Err(PyValueError::new_err(
@@ -341,6 +347,7 @@ fn admit(
             None,
             Some(sampling_params),
             Some(rendered.stop_token_ids),
+            input_payload,
         )?;
         let request_id = lease.bind(py).borrow().request_id;
         Ok::<_, PyErr>((request_id, lease, parser, input_tokens))

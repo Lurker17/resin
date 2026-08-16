@@ -305,6 +305,7 @@ struct BatchPlan {
     cache_groups: Vec<CacheGroupPlan>,
     sampling_mask: Vec<bool>,
     sampling_params: Vec<SamplingParams>,
+    input_payloads: Vec<Option<Arc<Py<PyAny>>>>,
     positions: OnceLock<Vec<u32>>,
 }
 
@@ -317,6 +318,7 @@ impl BatchPlan {
             context_lengths,
             sampling_params,
             sampling_mask,
+            input_payloads,
             ..
         } = &plan;
         if token_ids.is_empty() {
@@ -357,6 +359,11 @@ impl BatchPlan {
         if sampling_mask.len() != sequence_ids.len() {
             return Err(PyValueError::new_err(
                 "sampling_mask must contain one item per sequence",
+            ));
+        }
+        if input_payloads.len() != sequence_ids.len() {
+            return Err(PyValueError::new_err(
+                "input_payloads must contain one item per sequence",
             ));
         }
         if token_indptr.first() != Some(&0) {
@@ -450,7 +457,8 @@ impl BatchPlan {
         batch_key = None,
         cache_groups = None,
         sampling_mask = None,
-        sampling_params = None
+        sampling_params = None,
+        input_payloads = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -465,6 +473,7 @@ impl BatchPlan {
         cache_groups: Option<Vec<Py<CacheGroupPlan>>>,
         sampling_mask: Option<PyArrayLike1<'_, bool>>,
         sampling_params: Option<Vec<Py<SamplingParams>>>,
+        input_payloads: Option<Vec<Option<Py<PyAny>>>>,
     ) -> PyResult<Self> {
         let sequence_ids = arrays::owned_vec(sequence_ids);
         let context_lengths = arrays::owned_vec(context_lengths);
@@ -492,6 +501,11 @@ impl BatchPlan {
                 .seed
                 .get_or_insert_with(|| default_sampling_seed(0, *sequence_id));
         }
+        let input_payloads = input_payloads
+            .unwrap_or_else(|| (0..sequence_count).map(|_| None).collect())
+            .into_iter()
+            .map(|payload| payload.map(Arc::new))
+            .collect();
         Self::checked(Self {
             sequence_ids,
             context_lengths,
@@ -503,6 +517,7 @@ impl BatchPlan {
             cache_groups,
             sampling_mask,
             sampling_params,
+            input_payloads,
             positions: OnceLock::new(),
         })
     }
@@ -596,6 +611,21 @@ impl BatchPlan {
             .map(|params| Py::new(py, params))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(PyTuple::new(py, params)?.unbind())
+    }
+
+    /// Opaque runner inputs, one per sequence. The scheduler never inspects them.
+    #[getter]
+    fn input_payloads(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        let payloads = self
+            .input_payloads
+            .iter()
+            .map(|payload| {
+                payload
+                    .as_ref()
+                    .map_or_else(|| py.None(), |payload| payload.clone_ref(py))
+            })
+            .collect::<Vec<_>>();
+        Ok(PyTuple::new(py, payloads)?.unbind())
     }
 
     /// Number of sequences (batch size).
@@ -812,6 +842,7 @@ struct RequestData {
     max_new_tokens: usize,
     stop_token_ids: Vec<u32>,
     sampling_params: SamplingParams,
+    input_payload: Option<Arc<Py<PyAny>>>,
     cancel_pending: bool,
 }
 
@@ -1099,7 +1130,8 @@ impl Engine {
         priority = 0,
         batch_key = None,
         sampling_params = None,
-        stop_token_ids = None
+        stop_token_ids = None,
+        input_payload = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn submit(
@@ -1111,6 +1143,7 @@ impl Engine {
         batch_key: Option<u64>,
         sampling_params: Option<Py<SamplingParams>>,
         stop_token_ids: Option<Vec<u32>>,
+        input_payload: Option<Py<PyAny>>,
     ) -> PyResult<Py<RequestLease>> {
         self.raise_if_open()?;
         if token_ids.is_empty() {
@@ -1172,8 +1205,10 @@ impl Engine {
                     .map_err(cache_pool_error)
             })
             .transpose()?;
-        let resident_tokens = match (&mut self.kv_resources, &mut pages) {
-            (Some(resources), Some(pages)) => resources
+        // Token identity alone is insufficient to identify multimodal KV. Keep
+        // opaque-payload requests out of the token-only prefix cache.
+        let resident_tokens = match (&mut self.kv_resources, &mut pages, &input_payload) {
+            (Some(resources), Some(pages), None) => resources
                 .restore_prefix(pages, &token_ids)
                 .map_err(cache_pool_error)?,
             _ => 0,
@@ -1193,6 +1228,7 @@ impl Engine {
                 max_new_tokens,
                 stop_token_ids,
                 sampling_params,
+                input_payload: input_payload.map(Arc::new),
                 cancel_pending: false,
             },
             resources: RequestResources { cache: pages },
@@ -1896,6 +1932,7 @@ impl Engine {
         };
         for (row, progress) in batch.rows.iter_mut().zip(progress) {
             if !progress.apply
+                || row.request.input_payload.is_some()
                 || progress.resident_tokens == 0
                 || progress.resident_tokens % alignment != 0
             {
@@ -2392,6 +2429,7 @@ mod tests {
                     seed: Some(default_sampling_seed(0, id)),
                     ..SamplingParams::default()
                 },
+                input_payload: None,
                 cancel_pending: false,
             },
             resources: RequestResources { cache: pages },

@@ -304,6 +304,49 @@ class TestSchedulerConfigContract:
         with pytest.raises(AttributeError):
             plan.sampling_mask = [True, False, False]
 
+    def test_opaque_input_payloads_preserve_identity(self) -> None:
+        payload = object()
+        plan = BatchPlan(
+            [7, 8],
+            [0, 0],
+            [10, 20],
+            [0, 1, 2],
+            input_payloads=[payload, None],
+        )
+
+        assert plan.input_payloads[0] is payload
+        assert plan.input_payloads[1] is None
+        with pytest.raises(ValueError, match="one item per sequence"):
+            BatchPlan(
+                [7, 8],
+                [0, 0],
+                [10, 20],
+                [0, 1, 2],
+                input_payloads=[payload],
+            )
+
+    def test_engine_carries_input_payload_through_prefill_and_decode(self) -> None:
+        class ChunkedRunner(ContinuationRecordingRunner):
+            runner_config = RunnerConfig(
+                continuation_prefill=True,
+                prefill_chunk_size=2,
+            )
+
+        runner = ChunkedRunner()
+        engine = Engine(runner)
+        payload = {"image": object()}
+        engine.submit([1, 2, 3], max_new_tokens=2, input_payload=payload)
+
+        while engine.has_work():
+            engine.step()
+
+        assert [plan.phase for plan in runner.plans] == [
+            BatchPhase.PREFILL,
+            BatchPhase.PREFILL,
+            BatchPhase.DECODE,
+        ]
+        assert all(plan.input_payloads == (payload,) for plan in runner.plans)
+
     def test_batch_plan_phase_is_batch_homogeneous(self) -> None:
         prefill = BatchPlan(
             [7, 8],

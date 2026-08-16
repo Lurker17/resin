@@ -116,12 +116,14 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
     let mut token_indptr = Vec::with_capacity(requests.len() + 1);
     let mut context_lengths = Vec::with_capacity(requests.len());
     let mut sampling_params = Vec::with_capacity(requests.len());
+    let mut input_payloads = Vec::with_capacity(requests.len());
     let mut sampling_mask = Vec::with_capacity(requests.len());
     token_indptr.push(0);
 
     for (request, scheduled) in requests.iter().zip(scheduled_rows) {
         sequence_ids.push(request.id);
         sampling_params.push(request.sampling_params.clone());
+        input_payloads.push(request.input_payload.clone());
         if scheduled.phase != request.phase()
             || scheduled.token_start() != request.logical_context()?
         {
@@ -202,6 +204,7 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
         cache_groups,
         sampling_mask,
         sampling_params,
+        input_payloads,
         positions: OnceLock::new(),
     })
 }
