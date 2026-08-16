@@ -486,12 +486,12 @@ class TestDeepSeekV4Gemms:
         args, kwargs = calls[0]
         assert args[0].shape == (132, 256)
         assert torch.count_nonzero(args[0][129:].float()) == 0
-        assert args[2].shape == (132, 2)
+        assert args[2].shape == (2, 132)
         assert args[2].dtype == torch.float32
-        assert torch.all(args[2][129:] == 1)
+        assert torch.all(args[2][:, 129:] == 1)
         assert args[3].shape == (1, 2)
         assert args[3].dtype == torch.float32
-        assert kwargs["scale_major_mode"] is None
+        assert kwargs["scale_major_mode"] == "MN"
         assert kwargs["scale_granularity_mnk"] == (1, 128, 128)
         assert kwargs["out"].shape == (132, 128)
         assert kwargs["out"].dtype == torch.bfloat16
@@ -808,7 +808,7 @@ class TestDeepSeekV4BatchPlan:
                 self.register_buffer("kv_state", torch.zeros(3, 2))
                 self.register_buffer("score_state", torch.full((3, 2), float("-inf")))
 
-            def forward(self, input_ids: torch.Tensor, _start_pos: int) -> torch.Tensor:
+            def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
                 markers = input_ids[:, :1].to(torch.float32)
                 rows = input_ids.shape[0]
                 self.kv_cache[:rows].copy_(markers.expand(rows, 2))
@@ -846,6 +846,7 @@ class TestDeepSeekV4BatchPlan:
         runner.vocab_size = 32
         runner.speculative_tokens = 0
         runner._dspark_phase_events = {}
+        runner._active_sequence_ids = [10, 11, 12]
 
         class Graphs:
             shapes = ((1, 128), (2, 128), (4, 128), (8, 128))
@@ -893,6 +894,40 @@ class TestDeepSeekV4BatchPlan:
         assert inputs["sampling_top_ps"] == (0.9, 0.9, 0.9, 1.0)
         assert inputs["sampling_top_ks"] == (31, 31, 31, 32)
         assert inputs["sampling_stochastic_mask"] == (True, True, True, False)
+
+    def test_decode_graph_does_not_pad_over_an_unscheduled_active_row(self) -> None:
+        runner = DeepSeekV4FlashCudaRunner.__new__(DeepSeekV4FlashCudaRunner)
+        runner.vocab_size = 32
+        runner.speculative_tokens = 0
+        runner._dspark_phase_events = {}
+        runner._active_sequence_ids = [10, 11, 12, 13]
+
+        class Graphs:
+            shapes = ((4, 128),)
+
+            def __init__(self) -> None:
+                self.fallbacks: list[str] = []
+
+            def match(self, predicate):
+                return next((shape for shape in self.shapes if predicate(shape)), None)
+
+            def fallback(self, reason: str) -> None:
+                self.fallbacks.append(reason)
+
+            @staticmethod
+            def run(_shape, _inputs):
+                raise AssertionError("an occupied padding row must not be replayed")
+
+        runner._graphs = Graphs()
+        runner._sampler = SimpleNamespace()
+        plan = SimpleNamespace(
+            num_sequences=3,
+            token_ids=[5, 6, 7],
+            positions=[11, 12, 13],
+        )
+
+        assert runner._graph_forward(plan) is None
+        assert runner._graphs.fallbacks == ["occupied_padding"]
 
     def test_ragged_prefill_then_decode_owns_compact_rows(self) -> None:
         runner = self._runner()

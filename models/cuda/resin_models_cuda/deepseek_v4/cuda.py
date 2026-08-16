@@ -460,6 +460,14 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         if shape is None:
             self._graphs.fallback("shape")
             return None
+        if shape[0] > batch_size and len(self._active_sequence_ids) > batch_size:
+            # Dense-row graphs mutate every captured row, including padding.
+            # Until DeepSeek uses Engine-issued cache pages, a padded row may
+            # still belong to an active request omitted from this batch. Never
+            # let synthetic graph inputs corrupt that request's persistent KV
+            # or compressor state.
+            self._graphs.fallback("occupied_padding")
+            return None
         padding = shape[0] - batch_size
         inputs: dict[str, object] = {
             "token_ids": tuple(plan.token_ids) + (0,) * padding,
@@ -566,7 +574,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
                     self._model.prefill_dspark(main_hidden)
                     logits[slot - active_rows] = row_logits
                 else:
-                    logits[slot - active_rows] = self._model(input_ids, 0)
+                    logits[slot - active_rows] = self._model(input_ids)
                 self._swap_model_state_rows(0, slot)
             return torch.cat([row for row in logits if row is not None], dim=0)
 
@@ -585,7 +593,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
                 self._model.prefill_dspark(main_hidden)
                 logits[slot] = row_logits
             else:
-                logits[slot] = self._model(input_ids, 0)
+                logits[slot] = self._model(input_ids)
             self._copy_model_state_row(0, slot)
         return torch.cat([row for row in logits if row is not None], dim=0)
 

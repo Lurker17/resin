@@ -102,6 +102,12 @@ def fp8_gemm(
             )
             padded_scales[:rows].copy_(activation_scales)
             activation_scales = padded_scales
+        # TRT-LLM supports the MN-major groupwise-scale contract: activation
+        # scales are [K / 128, M], while checkpoint weight scales remain
+        # [N / 128, K / 128].  Passing the ordinary K-major activation matrix
+        # happens to satisfy the loose Python shape checks but corrupts every
+        # prefill projection.
+        activation_scales = activation_scales.T.contiguous()
         weight_scales = _cached_transform(
             right_scales,
             "_resin_trtllm_float_scales",
@@ -117,7 +123,7 @@ def fp8_gemm(
             right,
             activation_scales,
             weight_scales,
-            scale_major_mode=None,
+            scale_major_mode="MN",
             scale_granularity_mnk=(1, 128, 128),
             out=output,
             backend="trtllm",
