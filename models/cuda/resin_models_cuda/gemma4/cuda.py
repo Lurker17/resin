@@ -1,0 +1,546 @@
+"""Blackwell CUDA forward pass for NVIDIA's Gemma 4 31B NVFP4 checkpoint."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+import torch
+from torch import Tensor
+
+from resin import (
+    BatchPhase,
+    CacheGroupLayout,
+    CacheLayout,
+    CacheRetention,
+    ResourceBinding,
+    RunnerConfig,
+)
+from resin.backend.cuda.sampling import FlashInferSampler
+from resin.backend.loading import default_device
+from resin.backend.resources import CachePoolBinding
+from resin.protocols import SyncRunner
+from resin_models_cuda.gemma4.checkpoint import (
+    DEFAULT_MODEL,
+    load_model,
+    resolve_model_path,
+)
+from resin_models_cuda.gemma4.config import SLIDING_ATTENTION
+from resin_models_cuda.gemma4.media import Gemma4Media
+from resin_models_cuda.gemma4.model import Gemma4ForConditionalGeneration
+from resin_models_cuda.gemma4.nvfp4 import prepare_nvfp4_modules
+from resin_models_cuda.gemma4.plan import (
+    PAGE_SIZE,
+    PREFILL_CHUNK_SIZE,
+    SLIDING_WINDOW,
+    WINDOW_RETENTION_TOKENS,
+    Gemma4BatchPlan,
+    PagedAttentionPlan,
+    build_gemma4_batch_plan,
+)
+
+if TYPE_CHECKING:
+    from resin import BatchPlan
+
+_WORKSPACE_BYTES = 128 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class Gemma4KvCapacityPlan:
+    total_memory_bytes: int
+    model_memory_bytes: int
+    static_memory_fraction: float
+    bytes_per_parent: int
+    parent_capacity: int
+    allocation_bytes: int
+
+
+def plan_gemma4_kv_capacity(
+    total_memory_bytes: int,
+    model_memory_bytes: int,
+    static_memory_fraction: float,
+    *,
+    workspace_bytes: int = 2 * _WORKSPACE_BYTES,
+) -> Gemma4KvCapacityPlan:
+    if not 0.0 < static_memory_fraction <= 1.0:
+        raise ValueError("static_memory_fraction must be in (0, 1]")
+    # One FP8 parent holds all 50 local layers for one 64-token page.
+    bytes_per_parent = 2 * 50 * PAGE_SIZE * 16 * 256
+    budget = int(total_memory_bytes * static_memory_fraction)
+    available = budget - model_memory_bytes - workspace_bytes
+    parent_capacity = available // bytes_per_parent
+    if parent_capacity <= 0:
+        raise ValueError("GPU memory budget leaves no room for Gemma 4 KV cache")
+    return Gemma4KvCapacityPlan(
+        total_memory_bytes=total_memory_bytes,
+        model_memory_bytes=model_memory_bytes,
+        static_memory_fraction=static_memory_fraction,
+        bytes_per_parent=bytes_per_parent,
+        parent_capacity=parent_capacity,
+        allocation_bytes=parent_capacity * bytes_per_parent,
+    )
+
+
+class _Gemma4KvArena:
+    def __init__(self, torch_module: Any, device, config, parent_capacity: int) -> None:
+        self.dtype = torch_module.float8_e4m3fn
+        self.parent_capacity = parent_capacity
+        local_shape = (
+            parent_capacity,
+            2,
+            config.local_layer_count,
+            PAGE_SIZE,
+            config.num_key_value_heads,
+            config.head_dim,
+        )
+        self.storage = torch_module.empty(
+            local_shape, dtype=self.dtype, device=device
+        )
+        local = self.storage.permute(1, 2, 0, 3, 4, 5)
+        self.local_keys, self.local_values = local[0], local[1]
+
+        packing = config.history_blocks_per_parent
+        global_shape = (
+            parent_capacity * packing,
+            2,
+            config.global_layer_count,
+            PAGE_SIZE,
+            config.num_global_key_value_heads,
+            config.global_head_dim,
+        )
+        global_view = self.storage.view(global_shape).permute(1, 2, 0, 3, 4, 5)
+        self.global_keys, self.global_values = global_view[0], global_view[1]
+
+
+@dataclass(frozen=True, slots=True)
+class _DevicePagedPlan:
+    qo_indptr: Tensor
+    kv_indptr: Tensor
+    page_indices: Tensor
+    last_page_lengths: Tensor
+    append_pages: Tensor
+    append_offsets: Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class _MediaFeatures:
+    media: Gemma4Media
+    image: Tensor | None
+    video: Tensor | None
+    positions: dict[int, tuple[str, int]]
+
+
+class Gemma4CudaRunner(SyncRunner):
+    """Dynamic paged forward pass with FP8 KV and W4A16 NVFP4 MLPs."""
+
+    page_size = PAGE_SIZE
+    prefill_chunk_size = PREFILL_CHUNK_SIZE
+    sliding_window = SLIDING_WINDOW
+
+    def __init__(
+        self,
+        model: str | Path = DEFAULT_MODEL,
+        *,
+        cache_parent_capacity: int,
+        revision: str | None = None,
+        device: str | None = None,
+        nvfp4_backend: str = "cudnn",
+    ) -> None:
+        if cache_parent_capacity <= 0:
+            raise ValueError("cache_parent_capacity must be positive")
+        self.device = torch.device(device or default_device(torch, require_cuda=True))
+        if self.device.type != "cuda":
+            raise RuntimeError("Gemma4CudaRunner requires CUDA")
+        capability = torch.cuda.get_device_capability(self.device)
+        if capability not in {(10, 0), (10, 3), (11, 0), (12, 0), (12, 1)}:
+            raise RuntimeError(
+                "Gemma 4 NVFP4 W4A16 requires Blackwell-class FP4 hardware, "
+                f"got sm{capability[0]}{capability[1]}"
+            )
+        if nvfp4_backend not in {"cudnn", "cute-dsl"}:
+            raise ValueError("nvfp4_backend must be 'cudnn' or 'cute-dsl'")
+
+        self.model_path = resolve_model_path(model, revision)
+        self._model, self.config, self.raw_config = load_model(
+            self.model_path, device=self.device
+        )
+        self._model.prepare_attention()
+        prepare_nvfp4_modules(self._model, nvfp4_backend)
+        self.nvfp4_backend = nvfp4_backend
+
+        self.cache_parent_capacity = cache_parent_capacity
+        self.cache_layout = CacheLayout(
+            cache_parent_capacity,
+            [
+                CacheGroupLayout(
+                    PAGE_SIZE,
+                    blocks_per_parent=self.config.history_blocks_per_parent,
+                ),
+                CacheGroupLayout(
+                    PAGE_SIZE,
+                    retention=CacheRetention.WINDOW,
+                    window_tokens=WINDOW_RETENTION_TOKENS,
+                ),
+            ],
+        )
+        self.runner_config = RunnerConfig(
+            max_batch_tokens=PREFILL_CHUNK_SIZE,
+            prefill_chunk_size=PREFILL_CHUNK_SIZE,
+            continuation_prefill=True,
+            cache_layout=self.cache_layout,
+        )
+        self._binding = CachePoolBinding(self.cache_layout, resource="Gemma 4 KV")
+        self._cache = _Gemma4KvArena(
+            torch, self.device, self.config, cache_parent_capacity
+        )
+        self._sampler = FlashInferSampler(torch)
+        self._media_features: dict[int, _MediaFeatures] = {}
+        self._build_attention_wrappers()
+
+    @property
+    def model(self) -> Gemma4ForConditionalGeneration:
+        return self._model
+
+    @property
+    def model_memory_bytes(self) -> int:
+        tensors = list(self._model.parameters()) + list(self._model.buffers())
+        return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+    def _build_attention_wrappers(self) -> None:
+        from flashinfer import (
+            BatchDecodeWithPagedKVCacheWrapper,
+            BatchPrefillWithPagedKVCacheWrapper,
+        )
+
+        local_workspace = torch.zeros(
+            _WORKSPACE_BYTES, dtype=torch.uint8, device=self.device
+        )
+        global_workspace = torch.zeros_like(local_workspace)
+        self._workspaces = (local_workspace, global_workspace)
+        self._local_prefill = BatchPrefillWithPagedKVCacheWrapper(
+            local_workspace, "NHD", backend="auto"
+        )
+        self._global_prefill = BatchPrefillWithPagedKVCacheWrapper(
+            global_workspace, "NHD", backend="auto"
+        )
+        self._local_decode = BatchDecodeWithPagedKVCacheWrapper(
+            local_workspace, "NHD", backend="auto"
+        )
+        self._global_decode = BatchDecodeWithPagedKVCacheWrapper(
+            global_workspace, "NHD", backend="auto"
+        )
+
+    def bind_resources(self, binding: ResourceBinding) -> None:
+        if binding.cache_pool_id is None or binding.cache_layout is None:
+            raise ValueError("Gemma 4 requires an Engine-owned cache pool")
+        self._binding.bind(binding.cache_pool_id, binding.cache_layout)
+
+    def release(self, request_ids: list[int]) -> None:
+        for request_id in request_ids:
+            self._media_features.pop(request_id, None)
+
+    def _device_plan(self, plan: PagedAttentionPlan) -> _DevicePagedPlan:
+        def tensor(values, dtype):
+            return torch.as_tensor(values, dtype=dtype, device=self.device)
+
+        append_slots = tensor(plan.append_slots, torch.int64)
+        return _DevicePagedPlan(
+            qo_indptr=tensor(plan.qo_indptr, torch.int32),
+            kv_indptr=tensor(plan.kv_indptr, torch.int32),
+            page_indices=tensor(plan.page_indices, torch.int32),
+            last_page_lengths=tensor(plan.last_page_lengths, torch.int32),
+            append_pages=torch.div(append_slots, PAGE_SIZE, rounding_mode="floor"),
+            append_offsets=append_slots.remainder(PAGE_SIZE),
+        )
+
+    def _plan_attention(
+        self,
+        batch: Gemma4BatchPlan,
+        local: _DevicePagedPlan,
+        global_: _DevicePagedPlan,
+        custom_mask: Tensor | None,
+    ) -> tuple[Any, Any]:
+        if batch.phase == BatchPhase.PREFILL:
+            self._local_prefill.plan(
+                local.qo_indptr,
+                local.kv_indptr,
+                local.page_indices,
+                local.last_page_lengths,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+                PAGE_SIZE,
+                custom_mask=custom_mask,
+                causal=custom_mask is None,
+                sm_scale=1.0,
+                window_left=SLIDING_WINDOW - 1,
+                q_data_type=torch.bfloat16,
+                kv_data_type=self._cache.dtype,
+                o_data_type=torch.bfloat16,
+            )
+            self._global_prefill.plan(
+                global_.qo_indptr,
+                global_.kv_indptr,
+                global_.page_indices,
+                global_.last_page_lengths,
+                self.config.num_attention_heads,
+                self.config.num_global_key_value_heads,
+                self.config.global_head_dim,
+                PAGE_SIZE,
+                causal=True,
+                sm_scale=1.0,
+                q_data_type=torch.bfloat16,
+                kv_data_type=self._cache.dtype,
+                o_data_type=torch.bfloat16,
+            )
+            return self._local_prefill, self._global_prefill
+
+        common = {
+            "pos_encoding_mode": "NONE",
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": self._cache.dtype,
+            "o_data_type": torch.bfloat16,
+            "sm_scale": 1.0,
+        }
+        self._local_decode.plan(
+            local.kv_indptr,
+            local.page_indices,
+            local.last_page_lengths,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            PAGE_SIZE,
+            window_left=SLIDING_WINDOW - 1,
+            **common,
+        )
+        self._global_decode.plan(
+            global_.kv_indptr,
+            global_.page_indices,
+            global_.last_page_lengths,
+            self.config.num_attention_heads,
+            self.config.num_global_key_value_heads,
+            self.config.global_head_dim,
+            PAGE_SIZE,
+            **common,
+        )
+        return self._local_decode, self._global_decode
+
+    def _features_for(self, sequence_id: int, media: Gemma4Media) -> _MediaFeatures:
+        existing = self._media_features.get(sequence_id)
+        if existing is not None:
+            if existing.media is not media:
+                raise ValueError("a live Gemma 4 sequence changed its media object")
+            return existing
+        media.validate_placeholder_tokens(
+            image_token_id=self.config.image_token_id,
+            video_token_id=self.config.video_token_id,
+        )
+        with torch.inference_mode():
+            image = (
+                self._model.get_image_features(
+                    media.pixel_values.to(self.device, dtype=torch.bfloat16),
+                    media.image_position_ids.to(self.device),
+                )
+                if media.pixel_values is not None
+                else None
+            )
+            video = (
+                self._model.get_video_features(
+                    media.pixel_values_videos.to(
+                        self.device, dtype=torch.bfloat16
+                    ),
+                    media.video_position_ids.to(self.device),
+                )
+                if media.pixel_values_videos is not None
+                else None
+            )
+        if image is not None and len(image) != len(media.image_positions):
+            raise ValueError("vision features do not match image placeholder count")
+        if video is not None and len(video) != len(media.video_positions):
+            raise ValueError("vision features do not match video placeholder count")
+        positions = {
+            position: ("image", index)
+            for index, position in enumerate(media.image_positions)
+        }
+        positions.update(
+            {
+                position: ("video", index)
+                for index, position in enumerate(media.video_positions)
+            }
+        )
+        features = _MediaFeatures(media, image, video, positions)
+        self._media_features[sequence_id] = features
+        return features
+
+    @staticmethod
+    def _validate_unsplit_vision_blocks(
+        media: Gemma4Media, query_start: int, query_end: int
+    ) -> None:
+        blocks = media.block_ids
+        for position in range(query_start, min(query_end, len(blocks))):
+            block = blocks[position]
+            if block < 0:
+                continue
+            start = position
+            while start and blocks[start - 1] == block:
+                start -= 1
+            end = position + 1
+            while end < len(blocks) and blocks[end] == block:
+                end += 1
+            if start < query_start or end > query_end:
+                raise ValueError(
+                    "a Gemma 4 vision block crosses a prefill chunk boundary; "
+                    "reduce earlier prompt length or increase the runner chunk size"
+                )
+
+    def _merge_media_embeddings(
+        self,
+        native: BatchPlan,
+        batch: Gemma4BatchPlan,
+        hidden: Tensor,
+    ) -> dict[int, _MediaFeatures]:
+        features_by_row = {}
+        sequence_ids = np.asarray(native.sequence_ids, dtype=np.uint64)
+        for row, media in enumerate(native.media):
+            if media is None:
+                continue
+            if not isinstance(media, Gemma4Media):
+                raise TypeError("Gemma4CudaRunner media must be Gemma4Media")
+            start, end = map(int, batch.token_indptr[row : row + 2])
+            positions = batch.positions[start:end]
+            for flat_index, position in zip(range(start, end), positions, strict=True):
+                absolute = int(position)
+                if absolute < len(media.token_ids) and (
+                    int(batch.token_ids[flat_index]) != media.token_ids[absolute]
+                ):
+                    raise ValueError("scheduled token does not match Gemma4Media prompt")
+            vision_positions = set(media.image_positions + media.video_positions)
+            if not any(int(position) in vision_positions for position in positions):
+                continue
+            self._validate_unsplit_vision_blocks(
+                media, int(positions[0]), int(positions[-1]) + 1
+            )
+            features = self._features_for(int(sequence_ids[row]), media)
+            features_by_row[row] = features
+            for flat_index, position in zip(range(start, end), positions, strict=True):
+                absolute = int(position)
+                location = features.positions.get(absolute)
+                if location is None:
+                    continue
+                kind, feature_index = location
+                source = features.image if kind == "image" else features.video
+                hidden[flat_index].copy_(source[feature_index])
+        return features_by_row
+
+    def _local_custom_mask(
+        self,
+        batch: Gemma4BatchPlan,
+        features_by_row: dict[int, _MediaFeatures],
+    ) -> Tensor | None:
+        if batch.phase != BatchPhase.PREFILL or not features_by_row:
+            return None
+        masks = []
+        any_bidirectional = False
+        for row in range(len(batch.token_indptr) - 1):
+            start, end = map(int, batch.token_indptr[row : row + 2])
+            query = batch.positions[start:end, None]
+            first = batch.local.first_token_positions[row]
+            keys = np.arange(first, first + batch.local.kv_lengths[row])[None, :]
+            allowed = (keys <= query) & (keys >= query - SLIDING_WINDOW + 1)
+            features = features_by_row.get(row)
+            if features is not None:
+                block_ids = np.asarray(features.media.block_ids, dtype=np.int64)
+                query_blocks = np.full(query.shape, -1, dtype=np.int64)
+                key_blocks = np.full(keys.shape, -1, dtype=np.int64)
+                valid_q = query[:, 0] < len(block_ids)
+                valid_k = keys[0] < len(block_ids)
+                query_blocks[valid_q, 0] = block_ids[query[valid_q, 0]]
+                key_blocks[0, valid_k] = block_ids[keys[0, valid_k]]
+                same = (query_blocks >= 0) & (query_blocks == key_blocks)
+                if np.any(same & ~allowed):
+                    any_bidirectional = True
+                allowed |= same & (keys >= query - SLIDING_WINDOW + 1)
+            masks.append(allowed.reshape(-1))
+        if not any_bidirectional:
+            return None
+        return torch.as_tensor(
+            np.concatenate(masks), dtype=torch.bool, device=self.device
+        )
+
+    @torch.inference_mode()
+    def forward(self, plan: BatchPlan) -> list[int]:
+        batch = build_gemma4_batch_plan(
+            plan,
+            history_blocks_per_parent=self.config.history_blocks_per_parent,
+            parent_capacity=self.cache_parent_capacity,
+        )
+        token_ids = torch.as_tensor(
+            batch.token_ids, dtype=torch.int64, device=self.device
+        )
+        positions = torch.as_tensor(
+            batch.positions, dtype=torch.int64, device=self.device
+        )
+        hidden = self._model.embed_tokens(token_ids)
+        features = self._merge_media_embeddings(plan, batch, hidden)
+        local_mask = self._local_custom_mask(batch, features)
+        local = self._device_plan(batch.local)
+        global_ = self._device_plan(batch.global_)
+        local_wrapper, global_wrapper = self._plan_attention(
+            batch, local, global_, local_mask
+        )
+
+        rotary = self._model.language_model.rotary_emb
+        embeddings = {
+            kind: rotary(positions, kind, hidden.dtype)
+            for kind in set(self.config.layer_types)
+        }
+        local_layer = 0
+        global_layer = 0
+        for layer in self._model.language_model.layers:
+            residual = hidden
+            normalized = layer.input_layernorm(hidden)
+            cos, sin = embeddings[layer.self_attn.layer_type]
+            query, key, value = layer.self_attn.project_qkv(
+                normalized, cos, sin
+            )
+            if layer.self_attn.layer_type == SLIDING_ATTENTION:
+                keys = self._cache.local_keys[local_layer]
+                values = self._cache.local_values[local_layer]
+                append_pages = local.append_pages
+                append_offsets = local.append_offsets
+                wrapper = local_wrapper
+                local_layer += 1
+            else:
+                keys = self._cache.global_keys[global_layer]
+                values = self._cache.global_values[global_layer]
+                append_pages = global_.append_pages
+                append_offsets = global_.append_offsets
+                wrapper = global_wrapper
+                global_layer += 1
+            keys[append_pages, append_offsets] = key.to(self._cache.dtype)
+            values[append_pages, append_offsets] = value.to(self._cache.dtype)
+            attended = wrapper.run(query, (keys, values))
+            hidden = layer.self_attn.o_proj(attended.reshape(len(hidden), -1))
+            hidden = residual + layer.post_attention_layernorm(hidden)
+
+            residual = hidden
+            hidden = layer.pre_feedforward_layernorm(hidden)
+            hidden = layer.mlp(hidden)
+            hidden = residual + layer.post_feedforward_layernorm(hidden)
+            hidden *= layer.layer_scalar
+
+        hidden = self._model.language_model.norm(hidden)
+        last = torch.as_tensor(
+            batch.last_token_indices, dtype=torch.int64, device=self.device
+        )
+        logits = self._model.logits(hidden[last])
+        return self._sampler(logits, plan).tolist()
+
+
+__all__ = [
+    "Gemma4CudaRunner",
+    "Gemma4KvCapacityPlan",
+    "plan_gemma4_kv_capacity",
+]
