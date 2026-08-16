@@ -1087,10 +1087,13 @@ def _serve_http_rank(
     master_port: int,
     model_key: str,
     model_path: Path,
+    tensor_parallel_size: int,
 ) -> None:
-    """Run one TP=2 rank; rank zero additionally owns the HTTP listener."""
+    """Run one model rank; rank zero additionally owns the HTTP listener."""
 
-    tensor_parallel = _initialize_tensor_parallel(rank, 2, master_port)
+    tensor_parallel = _initialize_tensor_parallel(
+        rank, tensor_parallel_size, master_port
+    )
     control_group = dist.new_group(backend="gloo", timeout=timedelta(minutes=30))
     install_flashinfer_hash_cache()
     per_request_capacity = _required_parent_capacity(131072, 1)
@@ -1153,14 +1156,20 @@ def _serve_http_rank(
 
 
 def _start_http_server(model_key: str) -> None:
-    """Spawn the two ranks backing one GPT-OSS HTTP deployment."""
+    """Spawn the model-specific ranks backing one GPT-OSS HTTP deployment."""
 
     prepare_kernel_cache(kernel_cache_volume)
     model_path, _ = _require_cached_model(model_key)
+    tensor_parallel_size = 1 if model_key == "20b" else 2
     process_context = torch.multiprocessing.spawn(
         _serve_http_rank,
-        args=(_free_local_port(), model_key, model_path),
-        nprocs=2,
+        args=(
+            _free_local_port(),
+            model_key,
+            model_path,
+            tensor_parallel_size,
+        ),
+        nprocs=tensor_parallel_size,
         join=False,
     )
     _http_server_processes.append(process_context)
@@ -1168,7 +1177,7 @@ def _start_http_server(model_key: str) -> None:
 
 
 @app.function(
-    gpu="H200:2",
+    gpu="H200:1",
     cpu=16,
     memory=256 * 1024,
     timeout=24 * 60 * 60,
