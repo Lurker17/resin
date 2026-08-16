@@ -30,6 +30,7 @@ The focused contracts are:
 - [flat cache pool](docs/cache-pool.md)
 - [scheduler](docs/scheduler.md)
 - [runner/kernel boundary](docs/kernel-boundary.md)
+- [authoring a CUDA model runner](docs/model-forward-pass.md)
 - [GPT-OSS runner status](docs/gpt-oss-itl.md)
 - [persistent kernel artifacts](docs/kernel-cache.md)
 
