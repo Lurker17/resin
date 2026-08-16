@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Resin</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/contrib/auto-render.min.js"></script>
+  <style>
+    :root { color-scheme:light dark; font:15px/1.6 ui-sans-serif,system-ui,-apple-system,sans-serif; --line:#8884; --muted:#888; --accent:#2563d9; --soft:#8881 }
+    * { box-sizing:border-box }
+    body { max-width:880px; height:100dvh; margin:0 auto; padding:24px 20px 18px; display:grid; grid-template-rows:auto minmax(0,1fr) auto; overflow:hidden; background:Canvas; color:CanvasText }
+    header { position:sticky; top:0; z-index:2; display:flex; align-items:baseline; justify-content:space-between; gap:20px; padding:0 0 12px; background:Canvas }
+    h1 { font-size:23px; letter-spacing:-.025em; margin:0 } .muted,#stats { color:var(--muted) }
+    #model { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    #chat-shell { position:relative; min-height:0 }
+    #chat-shell::before,#chat-shell::after { content:""; position:absolute; z-index:1; left:0; right:0; height:24px; opacity:0; pointer-events:none; transition:opacity .15s }
+    #chat-shell::before { top:0; background:linear-gradient(to bottom,Canvas,transparent) }
+    #chat-shell::after { bottom:0; background:linear-gradient(to bottom,transparent,Canvas) }
+    #chat-shell.can-scroll-up::before,#chat-shell.can-scroll-down::after { opacity:1 }
+    #chat { height:100%; display:flex; flex-direction:column; gap:18px; overflow-y:auto; scrollbar-gutter:stable; padding:18px 3px 26px; scroll-behavior:smooth }
+    .turn { border:1px solid var(--line); border-radius:15px; padding:14px 17px; overflow-wrap:anywhere }
+    .user { align-self:flex-end; width:min(88%,760px); background:var(--soft); white-space:pre-wrap }
+    .assistant { width:100%; padding:17px 19px }
+    .markdown > :first-child { margin-top:0 } .markdown > :last-child { margin-bottom:0 }
+    .markdown p { margin:.7em 0 } .markdown h1,.markdown h2,.markdown h3 { line-height:1.25; margin:1.15em 0 .45em }
+    .markdown h1 { font-size:1.45em } .markdown h2 { font-size:1.25em } .markdown h3 { font-size:1.08em }
+    .markdown ul,.markdown ol { margin:.6em 0; padding-left:1.5em }
+    .markdown blockquote { margin:.8em 0; padding:.1em 0 .1em 1em; border-left:3px solid var(--line); color:var(--muted) }
+    .markdown hr { border:0; border-top:1px solid var(--line); margin:1.3em 0 }
+    code { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--soft); border-radius:5px; padding:.15em .35em }
+    pre { overflow:auto; margin:.9em 0; padding:13px 15px; border:1px solid var(--line); border-radius:10px; background:var(--soft) }
+    pre code { background:none; padding:0 } a { color:var(--accent) }
+    details { color:var(--muted); margin:0 3px -5px } details summary { cursor:pointer; user-select:none; font-weight:600 }
+    details.pending summary { animation:pulse 1.4s ease-in-out infinite }
+    details .markdown { padding:7px 3px 2px }
+    .assistant:empty { display:none }
+    footer { position:sticky; bottom:0; z-index:2; padding-top:9px; background:Canvas }
+    #stats { min-height:24px; margin:0 3px 8px; font-size:13px }
+    #settings { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:8px; padding:11px 13px 12px; border:1px solid var(--line); border-radius:14px }
+    #settings[hidden] { display:none }
+    #settings label { display:grid; gap:4px; color:var(--muted); font-size:12px; font-weight:600 }
+    #settings input,#settings select { width:100%; height:34px; border:1px solid var(--line); border-radius:9px; padding:0 9px; background:Canvas; color:CanvasText; font:14px/1 ui-sans-serif,system-ui,-apple-system,sans-serif }
+    form { display:flex; align-items:flex-end; gap:8px; padding:7px 7px 7px 13px; border:1px solid var(--line); border-radius:17px; background:Canvas }
+    textarea { flex:1; min-height:38px; max-height:160px; resize:none; border:0; outline:0; padding:8px 2px; background:transparent; color:inherit; font:inherit; line-height:22px }
+    button { flex:0 0 38px; width:38px; height:38px; border:0; border-radius:11px; background:var(--accent); color:white; font:700 20px/1 system-ui; cursor:pointer }
+    #settings-toggle { background:var(--soft); color:CanvasText; font-size:20px; font-weight:400 }
+    #settings-toggle[aria-expanded="true"] { color:var(--accent) }
+    button:hover { filter:brightness(1.08) } button:disabled { opacity:.45; cursor:wait }
+    @keyframes pulse { 50% { opacity:.5 } }
+    @media (max-width:600px) { body { padding:16px 12px 10px } header { padding-bottom:8px } .user { width:94% } .assistant { padding:14px } #settings { grid-template-columns:repeat(2,minmax(0,1fr)) } }
+  </style>
+</head>
+<body>
+  <header><h1>Resin</h1><span id="model" class="muted"></span></header>
+  <div id="chat-shell"><main id="chat"></main></div>
+  <footer>
+    <div id="stats"></div>
+    <section id="settings" aria-label="Generation settings" hidden>
+      <label>Reasoning
+        <select id="reasoning-effort">
+          <option value="">Off</option>
+          <option value="minimal">Minimal</option>
+          <option value="low" selected>Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+          <option value="xhigh">Max</option>
+        </select>
+      </label>
+      <label>Temperature
+        <input id="temperature" type="number" min="0" max="2" step="0.1" value="1">
+      </label>
+      <label>Top P
+        <input id="top-p" type="number" min="0.01" max="1" step="0.01" value="1">
+      </label>
+      <label>Max output
+        <input id="max-output-tokens" type="number" min="1" max="32768" step="1" value="16384">
+      </label>
+    </section>
+    <form id="form">
+      <textarea id="prompt" rows="1" autofocus placeholder="Message the model…"></textarea>
+      <button id="settings-toggle" type="button" title="Generation settings" aria-label="Generation settings" aria-controls="settings" aria-expanded="false">⚙</button>
+      <button id="send" type="submit" title="Send" aria-label="Send">↑</button>
+    </form>
+  </footer>
+<script>
+const chat=document.querySelector('#chat'),chatShell=document.querySelector('#chat-shell'),form=document.querySelector('#form');
+const prompt=document.querySelector('#prompt'),send=document.querySelector('#send');
+const stats=document.querySelector('#stats'),modelEl=document.querySelector('#model');
+const settings=document.querySelector('#settings'),settingsToggle=document.querySelector('#settings-toggle');
+const reasoningEffort=document.querySelector('#reasoning-effort'),temperature=document.querySelector('#temperature');
+const topP=document.querySelector('#top-p'),maxOutputTokens=document.querySelector('#max-output-tokens');
+let history=[];
+fetch('/v1/models').then(r=>r.json()).then(x=>modelEl.textContent=x.data?.[0]?.id||'');
+function atChatBottom(){return chat.scrollHeight-chat.scrollTop-chat.clientHeight<48}
+function updateScrollFades(){const hidden=chat.scrollHeight-chat.clientHeight>1;chatShell.classList.toggle('can-scroll-up',hidden&&chat.scrollTop>1);chatShell.classList.toggle('can-scroll-down',hidden&&chat.scrollTop+chat.clientHeight<chat.scrollHeight-1)}
+function scrollChat(follow=true){requestAnimationFrame(()=>{if(follow)chat.scrollTop=chat.scrollHeight;updateScrollFades()})}
+function turn(role,text=''){const follow=atChatBottom(),e=document.createElement('div');e.className='turn '+role;if(role==='assistant')e.classList.add('markdown');else e.textContent=text;chat.append(e);scrollChat(follow);return e}
+function escapeHtml(s){return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;')}
+function inlineMarkdown(source){
+  const held=[]; let value=escapeHtml(source);
+  const hold=match=>{const token=`MDHOLD${held.length}TOKEN`;held.push(match);return token};
+  value=value.replace(/`([^`\n]+)`/g,hold);
+  value=value.replace(/\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$(?!\s)[^$\n]+?\$/g,hold);
+  value=value.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,(_,label,url)=>/^(https?:\/\/|mailto:|\/|#)/i.test(url)?`<a href="${url}" target="_blank" rel="noreferrer">${label}</a>`:`${label} (${url})`);
+  value=value.replace(/\*\*([^*]+)\*\*|__([^_]+)__/g,(_,a,b)=>`<strong>${a||b}</strong>`);
+  value=value.replace(/~~([^~]+)~~/g,'<del>$1</del>');
+  value=value.replace(/(^|[\s(])\*([^*\n]+)\*(?=$|[\s).,!?:;])/g,'$1<em>$2</em>');
+  value=value.replace(/(^|[\s(])_([^_\n]+)_(?=$|[\s).,!?:;])/g,'$1<em>$2</em>');
+  return held.reduce((text,item,index)=>text.replace(`MDHOLD${index}TOKEN`,item.startsWith('`')?`<code>${item.slice(1,-1)}</code>`:item),value);
+}
+function renderMarkdown(source){
+  const lines=source.replace(/\r/g,'').split('\n'),out=[]; let i=0;
+  while(i<lines.length){
+    const line=lines[i],trim=line.trim();
+    if(!trim){i++;continue}
+    if(trim.startsWith('```')){const language=trim.slice(3).trim().replace(/[^\w-]/g,'');const code=[];i++;while(i<lines.length&&!lines[i].trim().startsWith('```'))code.push(lines[i++]);if(i<lines.length)i++;out.push(`<pre><code${language?` class="language-${language}"`:''}>${escapeHtml(code.join('\n'))}</code></pre>`);continue}
+    if(trim==='$$'){const math=[];i++;while(i<lines.length&&lines[i].trim()!=='$$')math.push(lines[i++]);if(i<lines.length)i++;out.push(`<div>$$${escapeHtml(math.join('\n'))}$$</div>`);continue}
+    const heading=line.match(/^\s*(#{1,3})\s+(.+)$/);if(heading){const level=heading[1].length;out.push(`<h${level}>${inlineMarkdown(heading[2])}</h${level}>`);i++;continue}
+    if(/^\s*((\*|-|_)\s*){3,}$/.test(line)){out.push('<hr>');i++;continue}
+    const list=line.match(/^\s*([-*+]|\d+\.)\s+(.+)$/);if(list){const ordered=/\d/.test(list[1]),tag=ordered?'ol':'ul',items=[];while(i<lines.length){const item=lines[i].match(/^\s*([-*+]|\d+\.)\s+(.+)$/);if(!item||(/\d/.test(item[1]))!==ordered)break;items.push(`<li>${inlineMarkdown(item[2])}</li>`);i++}out.push(`<${tag}>${items.join('')}</${tag}>`);continue}
+    if(/^\s*>/.test(line)){const quoted=[];while(i<lines.length&&/^\s*>/.test(lines[i]))quoted.push(lines[i++].replace(/^\s*>\s?/,''));out.push(`<blockquote>${inlineMarkdown(quoted.join(' '))}</blockquote>`);continue}
+    const paragraph=[trim];i++;while(i<lines.length&&lines[i].trim()&&!/^\s*(#{1,3})\s|^\s*```|^\s*([-*+]|\d+\.)\s+|^\s*>|^\s*\$\$$/.test(lines[i]))paragraph.push(lines[i++].trim());out.push(`<p>${inlineMarkdown(paragraph.join(' '))}</p>`);
+  }
+  return out.join('');
+}
+function renderRich(element,text){const follow=atChatBottom();element.innerHTML=renderMarkdown(text);if(window.renderMathInElement)renderMathInElement(element,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false},{left:'$',right:'$',display:false}],throwOnError:false});scrollChat(follow)}
+function parseSse(buffer,onData){let cut;while((cut=buffer.indexOf('\n\n'))>=0){const block=buffer.slice(0,cut);buffer=buffer.slice(cut+2);for(const line of block.split('\n'))if(line.startsWith('data: '))onData(line.slice(6))}return buffer}
+function resizePrompt(){prompt.style.height='auto';prompt.style.height=Math.min(prompt.scrollHeight,160)+'px'}
+prompt.addEventListener('input',resizePrompt);
+chat.addEventListener('scroll',updateScrollFades,{passive:true});
+new ResizeObserver(updateScrollFades).observe(chat);
+settingsToggle.addEventListener('click',()=>{settings.hidden=!settings.hidden;settingsToggle.setAttribute('aria-expanded',String(!settings.hidden))});
+form.addEventListener('submit',async e=>{
+  e.preventDefault();const text=prompt.value.trim();if(!text)return;
+  prompt.value='';resizePrompt();send.disabled=true;stats.textContent='';turn('user',text);
+  history.push({role:'user',content:text});
+  const box=turn('assistant'),thinking=document.createElement('details'),summary=document.createElement('summary'),reasonBox=document.createElement('div');
+  reasonBox.className='markdown';thinking.className='pending';thinking.open=true;thinking.append(summary,reasonBox);box.before(thinking);
+  const requestStartedAt=performance.now();let pendingLabel='Starting model';
+  const updatePending=()=>{if(thinking.isConnected&&thinking.classList.contains('pending'))summary.textContent=`${pendingLabel}… ${((performance.now()-requestStartedAt)/1000).toFixed(1)}s`};
+  updatePending();const statusTimer=setInterval(updatePending,250);
+  let answer='',reason='',generationStartedAt=null,finishReason=null;
+  try {
+    const request={model:modelEl.textContent,messages:history,temperature:Number(temperature.value),top_p:Number(topP.value),max_completion_tokens:Number(maxOutputTokens.value),stream:true,stream_options:{include_usage:true}};
+    if(reasoningEffort.value)request.reasoning_effort=reasoningEffort.value;
+    const response=await fetch('/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(request)});
+    if(!response.ok)throw new Error((await response.json()).error?.message||response.statusText);
+    pendingLabel='Preparing prompt';updatePending();
+    const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';
+    while(true){const {value,done}=await reader.read();buffer+=decoder.decode(value||new Uint8Array(),{stream:!done});buffer=parseSse(buffer,data=>{
+      if(data==='[DONE]')return;const event=JSON.parse(data),delta=event.choices?.[0]?.delta||{};
+      finishReason=event.choices?.[0]?.finish_reason||finishReason;
+      if(delta.reasoning_content||delta.content)generationStartedAt??=performance.now();
+      if(delta.reasoning_content){reason+=delta.reasoning_content;summary.textContent='Reasoning';thinking.classList.remove('pending');renderRich(reasonBox,reason);thinking.open=true}
+      if(delta.content){if(!reason)thinking.remove();answer+=delta.content;renderRich(box,answer)}
+      if(event.resin){const r=event.resin,now=performance.now();if(!reason&&!answer)thinking.remove();const generationMs=r.generation_elapsed_ms>0?r.generation_elapsed_ms:(generationStartedAt===null?r.elapsed_ms:now-generationStartedAt);const observedTtftMs=generationStartedAt===null?r.time_to_first_token_ms:generationStartedAt-requestStartedAt;const rate=generationMs>0?r.completion_tokens*1000/generationMs:0;const stopNote=finishReason==='length'?' · max output reached':'';stats.textContent=`${r.prompt_tokens} prompt + ${r.completion_tokens} generated tokens · ${rate.toFixed(1)} tok/s · ${(generationMs/1000).toFixed(2)} s generation · ${(observedTtftMs/1000).toFixed(2)} s TTFT${stopNote}`}
+    });if(done)break}
+    history.push({role:'assistant',content:answer,...(reason?{reasoning_content:reason}:{})});
+  } catch(err) {if(!reason)thinking.remove();box.textContent='Error: '+err.message}
+  finally {clearInterval(statusTimer);send.disabled=false;prompt.focus()}
+});
+prompt.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit()}});
+</script>
+</body>
+</html>

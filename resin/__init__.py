@@ -4,6 +4,7 @@ Importing this module intentionally does not import an accelerator framework.
 Choose a separately installed model runner only when constructing an engine.
 """
 
+import resin.server as server
 from resin._resin import (
     BatchPhase,
     BatchPlan,
@@ -42,4 +43,5 @@ __all__ = [
     "SyncRunner",
     "__version__",
     "mint_state_mapping_arena_id",
+    "server",
 ]

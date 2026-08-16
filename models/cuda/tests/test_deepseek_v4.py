@@ -820,6 +820,81 @@ class TestDeepSeekV4BatchPlan:
         runner.release([7])
         assert runner._active_sequence_ids == [8]
 
+    def test_fresh_prefill_preserves_active_rows_and_appends_new_owners(self) -> None:
+        runner = self._runner()
+        runner._active_sequence_ids = [7]
+        runner._model.kv_cache[0].fill_(7)
+        runner._model.kv_state[0].fill_(17)
+        runner._model.score_state[0].fill_(27)
+        prefill = BatchPlan(
+            [8, 9],
+            [0, 1],
+            [8],
+            [0, 2],
+            [0],
+            phase=BatchPhase.PREFILL,
+        )
+
+        rows = runner._validate_plan(prefill)
+        logits = runner._prefill(prefill, rows)
+        runner._active_sequence_ids.extend(prefill.sequence_ids)
+
+        assert logits.argmax(dim=-1).flatten().tolist() == [9]
+        assert runner._active_sequence_ids == [7, 8]
+        assert torch.equal(runner._model.kv_cache[:2], torch.tensor([[7, 7], [8, 8]]))
+        assert torch.equal(
+            runner._model.kv_state[:2], torch.tensor([[17, 17], [18, 18]])
+        )
+        assert torch.equal(
+            runner._model.score_state[:2], torch.tensor([[27, 27], [28, 28]])
+        )
+
+    def test_fresh_ragged_prefills_append_after_multiple_active_rows(self) -> None:
+        runner = self._runner()
+        runner._active_sequence_ids = [7, 8]
+        runner._model.kv_cache[:2].copy_(torch.tensor([[7, 7], [8, 8]]))
+        runner._model.kv_state[:2].copy_(torch.tensor([[17, 17], [18, 18]]))
+        runner._model.score_state[:2].copy_(torch.tensor([[27, 27], [28, 28]]))
+        prefill = BatchPlan(
+            [9, 10, 11],
+            [0, 1, 2],
+            [9],
+            [0, 3],
+            [0],
+            phase=BatchPhase.PREFILL,
+        )
+
+        rows = runner._validate_plan(prefill)
+        logits = runner._prefill(prefill, rows)
+
+        assert logits.argmax(dim=-1).flatten().tolist() == [11]
+        assert torch.equal(
+            runner._model.kv_cache, torch.tensor([[7, 7], [8, 8], [9, 9]])
+        )
+        assert torch.equal(
+            runner._model.kv_state, torch.tensor([[17, 17], [18, 18], [19, 19]])
+        )
+        assert torch.equal(
+            runner._model.score_state,
+            torch.tensor([[27, 27], [28, 28], [29, 29]]),
+        )
+
+    def test_fresh_prefill_rejects_duplicate_or_excess_owners(self) -> None:
+        runner = self._runner()
+        runner._active_sequence_ids = [7, 8]
+
+        duplicate = BatchPlan(
+            [9], [0], [8], [0, 1], [0], phase=BatchPhase.PREFILL
+        )
+        excess = BatchPlan(
+            [9, 10], [0, 0], [9, 10], [0, 1, 2], [0, 0], phase=BatchPhase.PREFILL
+        )
+
+        with pytest.raises(ValueError, match="already active"):
+            runner._validate_plan(duplicate)
+        with pytest.raises(ValueError, match="capacity"):
+            runner._validate_plan(excess)
+
     def test_fixed_verification_restores_rows_after_their_first_rejection(
         self,
     ) -> None:

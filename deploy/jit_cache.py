@@ -283,6 +283,12 @@ def _reload_and_prepare(volume) -> None:
         _CACHE_PREPARED = True
 
 
+def prepare_kernel_cache(volume) -> None:
+    """Reload a mounted cache volume and prepare its compiler namespaces."""
+
+    _reload_and_prepare(volume)
+
+
 def install_flashinfer_hash_cache() -> None:
     """Use a content-validated JIT library without consulting Ninja on hits.
 

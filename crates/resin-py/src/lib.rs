@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
 mod cache;
+mod http;
 mod planning;
 mod runner;
 mod state_pool;
@@ -886,6 +887,22 @@ struct TokenEvent {
     token_id: u32,
     index: usize,
     finished: bool,
+    finish_reason: Option<CompletionReason>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CompletionReason {
+    Stop,
+    Length,
+}
+
+impl CompletionReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Length => "length",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1011,10 +1028,19 @@ impl TokenEvent {
         self.finished
     }
 
+    #[getter]
+    fn finish_reason(&self) -> Option<&'static str> {
+        self.finish_reason.map(CompletionReason::as_str)
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "TokenEvent(request_id={}, token_id={}, index={}, finished={})",
-            self.request_id, self.token_id, self.index, self.finished
+            "TokenEvent(request_id={}, token_id={}, index={}, finished={}, finish_reason={:?})",
+            self.request_id,
+            self.token_id,
+            self.index,
+            self.finished,
+            self.finish_reason.map(CompletionReason::as_str)
         )
     }
 }
@@ -1031,6 +1057,7 @@ struct RequestData {
     resident_tokens: u32,
     generated: Vec<u32>,
     max_new_tokens: usize,
+    stop_token_ids: Vec<u32>,
     sampling_params: SamplingParams,
     sampling_offset: i64,
     cancel_pending: bool,
@@ -1374,7 +1401,8 @@ impl Engine {
         state_access_modes = None,
         priority = 0,
         batch_key = None,
-        sampling_params = None
+        sampling_params = None,
+        stop_token_ids = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn submit(
@@ -1387,6 +1415,7 @@ impl Engine {
         priority: i32,
         batch_key: Option<u64>,
         sampling_params: Option<Py<SamplingParams>>,
+        stop_token_ids: Option<Vec<u32>>,
     ) -> PyResult<Py<RequestLease>> {
         self.raise_if_open()?;
         if token_ids.is_empty() {
@@ -1428,6 +1457,10 @@ impl Engine {
         sampling_params
             .seed
             .get_or_insert_with(|| default_sampling_seed(self.engine_id, request_id));
+        let mut stop_token_ids =
+            stop_token_ids.unwrap_or_else(|| self.eos_token_id.into_iter().collect::<Vec<_>>());
+        stop_token_ids.sort_unstable();
+        stop_token_ids.dedup();
         if let Some(mapping) = &self.recurrent_state_mapping
             && (state_handles.len() != mapping.access_modes.len()
                 || state_access_modes != mapping.access_modes)
@@ -1519,6 +1552,7 @@ impl Engine {
                 resident_tokens: 0,
                 generated: Vec::new(),
                 max_new_tokens,
+                stop_token_ids,
                 sampling_params,
                 sampling_offset: 0,
                 cancel_pending: false,
@@ -1834,8 +1868,14 @@ impl Engine {
             let mut committed = Vec::with_capacity(token_ids.len().min(remaining));
             let mut finished = false;
             for &token_id in token_ids.iter().take(remaining) {
-                finished = request.generated.len() + committed.len() + 1 >= request.max_new_tokens
-                    || self.eos_token_id == Some(token_id);
+                let finish_reason = if request.stop_token_ids.binary_search(&token_id).is_ok() {
+                    Some(CompletionReason::Stop)
+                } else if request.generated.len() + committed.len() + 1 >= request.max_new_tokens {
+                    Some(CompletionReason::Length)
+                } else {
+                    None
+                };
+                finished = finish_reason.is_some();
                 let event = match Py::new(
                     py,
                     TokenEvent {
@@ -1843,6 +1883,7 @@ impl Engine {
                         token_id,
                         index: request.generated.len() + committed.len(),
                         finished,
+                        finish_reason,
                     },
                 ) {
                     Ok(event) => event,
@@ -2792,6 +2833,9 @@ mod _resin {
     };
 
     #[pymodule_export]
+    use crate::http::NativeHttpServer;
+
+    #[pymodule_export]
     #[allow(non_upper_case_globals)]
     const __version__: &str = env!("CARGO_PKG_VERSION");
 }
@@ -2818,6 +2862,7 @@ mod tests {
                 },
                 generated: generated.to_vec(),
                 max_new_tokens: 8,
+                stop_token_ids: Vec::new(),
                 sampling_params: SamplingParams {
                     seed: Some(default_sampling_seed(0, id)),
                     ..SamplingParams::default()

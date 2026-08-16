@@ -20,13 +20,21 @@ import torch.distributed as dist
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from deploy.http import (
+    DeepSeekV4Codec,
+    TensorParallelServerRunner,
+    follow_tensor_parallel_server,
+    monitor_spawned_server,
+)
+from deploy.modal_image import build_modal_image
 from resin import Engine, SamplingParams, SchedulerConfig
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
+from resin.server import HttpServer
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_CACHE_MOUNT = "/models/resin-deepseek-v4"
 MODEL_CACHE_VOLUME_NAME = "resin-deepseek-v4-models-v1"
-KERNEL_CACHE_MOUNT = "/root/.cache"
+KERNEL_CACHE_MOUNT = "/kernel-cache/.cache"
 KERNEL_CACHE_VOLUME_NAME = "resin-deepseek-v4-kernels-v1"
 PROFILE_MOUNT = "/profiles"
 PROFILE_VOLUME_NAME = "resin-deepseek-v4-profiles-v1"
@@ -46,65 +54,18 @@ CHECKPOINT_PATTERNS = (
     "encoding/*.md",
 )
 
-image = (
-    modal.Image.from_registry("nvidia/cuda:13.3.1-devel-ubuntu22.04", add_python="3.12")
-    .apt_install("build-essential", "curl", "git", "ninja-build")
-    .run_commands(
-        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | "
-        "sh -s -- -y --profile minimal"
-    )
-    .env(
-        {
-            "PATH": "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
-            "MAX_JOBS": "16",
-            "CMAKE_BUILD_PARALLEL_LEVEL": "16",
-            "CC": "gcc",
-            "CXX": "g++",
-            "TORCH_CUDA_ARCH_LIST": "10.3",
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-            "DG_JIT_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/deep_gemm",
-            "TRITON_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/triton",
-            "TILELANG_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/tilelang",
-        }
-    )
-    .uv_sync(
-        str(ROOT),
-        extras=["gpu"],
-        groups=["dev"],
-        extra_options="--no-default-groups",
-    )
-    .uv_pip_install(
-        "flashinfer-cubin==0.6.15.post1",
-        extra_index_url="https://flashinfer.ai/whl",
-    )
-    .uv_pip_install(
-        "flashinfer-jit-cache==0.6.15.post1+cu130",
-        extra_index_url="https://flashinfer.ai/whl/cu130",
-    )
-    .add_local_file(ROOT / "deploy/__init__.py", "/root/deploy/__init__.py", copy=True)
-    .add_local_file(
-        ROOT / "deploy/modal_deepseek_v4.py",
-        "/root/deploy/modal_deepseek_v4.py",
-        copy=True,
-    )
-    .add_local_file(ROOT / "Cargo.toml", "/opt/resin/Cargo.toml", copy=True)
-    .add_local_file(ROOT / "Cargo.lock", "/opt/resin/Cargo.lock", copy=True)
-    .add_local_file(ROOT / "pyproject.toml", "/opt/resin/pyproject.toml", copy=True)
-    .add_local_file(ROOT / "README.md", "/opt/resin/README.md", copy=True)
-    .add_local_dir(ROOT / "docs", "/opt/resin/docs", copy=True)
-    .add_local_dir(ROOT / "crates", "/opt/resin/crates", copy=True)
-    .add_local_dir(ROOT / "resin", "/opt/resin/resin", copy=True)
-    .add_local_dir(
-        ROOT / "models/cuda",
-        "/opt/resin/models/cuda",
-        copy=True,
-    )
-    .uv_pip_install("/opt/resin", extra_options="--no-deps")
-    .uv_pip_install(
-        "/opt/resin/models/cuda",
-        extra_options="--no-deps",
-    )
+image = build_modal_image(
+    ROOT,
+    env={
+        "CC": "gcc",
+        "CXX": "g++",
+        "TORCH_CUDA_ARCH_LIST": "10.3",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "FLASHINFER_WORKSPACE_BASE": "/kernel-cache",
+        "DG_JIT_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/deep_gemm",
+        "TRITON_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/triton",
+        "TILELANG_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/tilelang",
+    },
 )
 
 with image.imports():
@@ -128,6 +89,8 @@ app = modal.App(
         PROFILE_MOUNT: profile_volume,
     },
 )
+
+_http_server_processes: list[object] = []
 
 
 def _model_path() -> Path:
@@ -331,289 +294,6 @@ def _initialize_tensor_parallel(
     )
 
 
-def _diagnose_verify_parity(
-    runner,
-    prompt_ids: list[int],
-    context_length: int,
-    tensor_parallel: TensorParallelContext,
-) -> dict[str, object]:
-    """Compare one six-token verify pass with causal one-token target steps."""
-
-    model = runner._model
-    device = runner.device
-    block_length = runner.speculative_tokens + 1
-    if block_length <= 1:
-        raise ValueError("verify parity diagnosis requires speculative decoding")
-    graph_seq_len = min(
-        context_length,
-        len(prompt_ids) + block_length + 64,
-    )
-
-    previous_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(torch.bfloat16)
-    try:
-        with torch.inference_mode(), torch.device(device):
-            prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device)[None]
-            prefill_logits, main_hidden = model.forward_target(prompt)
-            if main_hidden is None:
-                raise RuntimeError("target did not produce DSpark prefill states")
-            model.prefill_dspark(main_hidden)
-            current = prefill_logits.argmax(dim=-1, keepdim=True)
-            prefill_anchor = current.clone()
-            del prefill_logits
-            state = [
-                (buffer, buffer.clone())
-                for _, buffer in runner._sequence_state_buffers()
-            ]
-
-            sequential_inputs: list[torch.Tensor] = []
-            sequential_logits: list[torch.Tensor] = []
-            sequential_layers: list[list[torch.Tensor]] = [[] for _ in model.layers]
-            for step in range(block_length):
-                token = current.clone()
-                sequential_inputs.append(token)
-                position = torch.tensor(
-                    [len(prompt_ids) + step], dtype=torch.long, device=device
-                )
-                hidden = model.embed(token)
-                hidden = hidden.unsqueeze(2).repeat(1, 1, model.hc_mult, 1)
-                for layer_id, layer in enumerate(model.layers):
-                    hidden = layer.forward_decode(
-                        hidden,
-                        position,
-                        token,
-                        graph_seq_len,
-                    )
-                    sequential_layers[layer_id].append(hidden.clone())
-                collapsed = model.layers[-1].hc_head(
-                    hidden,
-                    model.hc_head_fn,
-                    model.hc_head_scale,
-                    model.hc_head_base,
-                )
-                logits = model.head(model.norm(collapsed), full_logits=True)
-                sequential_logits.append(logits)
-                current = logits[:, -1].argmax(dim=-1, keepdim=True)
-
-            def compressor_parity(
-                compressor, inputs: torch.Tensor
-            ) -> dict[str, object]:
-                """Compare the block compressor with repeated one-token updates."""
-
-                assert compressor.kv_cache is not None
-                initial_value_state = compressor.kv_state.clone()
-                initial_score_state = compressor.score_state.clone()
-                initial_cache = compressor.kv_cache.clone()
-                sequential_outputs: list[torch.Tensor] = []
-                for token_index in range(block_length):
-                    token_position = torch.tensor(
-                        [len(prompt_ids) + token_index],
-                        dtype=torch.long,
-                        device=device,
-                    )
-                    sequential_outputs.append(
-                        compressor.forward_decode(
-                            inputs[:, token_index : token_index + 1], token_position
-                        ).clone()
-                    )
-                sequential_value_state = compressor.kv_state.clone()
-                sequential_score_state = compressor.score_state.clone()
-                sequential_cache = compressor.kv_cache.clone()
-
-                compressor.kv_state.copy_(initial_value_state)
-                compressor.score_state.copy_(initial_score_state)
-                compressor.kv_cache.copy_(initial_cache)
-                block_positions = torch.arange(block_length, device=device).unsqueeze(
-                    0
-                ) + len(prompt_ids)
-                block_output = compressor.forward_verify(inputs, block_positions)
-
-                def difference(actual: torch.Tensor, expected: torch.Tensor):
-                    delta = (actual.float() - expected.float()).abs()
-                    matching_empty = torch.isneginf(actual) & torch.isneginf(expected)
-                    delta = torch.where(matching_empty, 0.0, delta)
-                    return {
-                        "maximum_absolute": float(delta.max().item()),
-                        "mean_absolute": float(delta.mean().item()),
-                    }
-
-                result = {
-                    "outputs": difference(
-                        block_output, torch.cat(sequential_outputs, dim=1)
-                    ),
-                    "final_value_state": difference(
-                        compressor.kv_state, sequential_value_state
-                    ),
-                    "final_score_state": difference(
-                        compressor.score_state, sequential_score_state
-                    ),
-                    "final_cache": difference(compressor.kv_cache, sequential_cache),
-                }
-                compressor.kv_state.copy_(initial_value_state)
-                compressor.score_state.copy_(initial_score_state)
-                compressor.kv_cache.copy_(initial_cache)
-                return result
-
-            # Layers 0 and 1 are uncompressed. Feed layer 2's compressors the
-            # exact per-token normalized inputs from the sequential baseline so
-            # this isolates the block scan from all other batched math.
-            compressed_layer = model.layers[2]
-            compressor_inputs: list[torch.Tensor] = []
-            for token_index in range(block_length):
-                layer_input, _, _ = compressed_layer.hc_pre(
-                    sequential_layers[1][token_index],
-                    compressed_layer.hc_attn_fn,
-                    compressed_layer.hc_attn_scale,
-                    compressed_layer.hc_attn_base,
-                )
-                compressor_inputs.append(compressed_layer.attn_norm(layer_input))
-            compressor_input = torch.cat(compressor_inputs, dim=1)
-            compressor_differences = {
-                "attention": compressor_parity(
-                    compressed_layer.attn.compressor, compressor_input
-                ),
-                "indexer": compressor_parity(
-                    compressed_layer.attn.indexer.compressor, compressor_input
-                ),
-            }
-            torch._foreach_copy_(
-                [buffer for buffer, _ in state],
-                [snapshot for _, snapshot in state],
-            )
-            verify_ids = torch.cat(sequential_inputs, dim=1)
-            one_block_verify_ids = verify_ids
-            base_position = torch.tensor(
-                [len(prompt_ids)], dtype=torch.long, device=device
-            )
-            token_positions = base_position[:, None] + torch.arange(
-                block_length, device=device
-            )
-            hidden = model.embed(verify_ids)
-            hidden = hidden.unsqueeze(2).repeat(1, 1, model.hc_mult, 1)
-            layer_differences: list[dict[str, float | int]] = []
-            for layer_id, layer in enumerate(model.layers):
-                hidden = layer.forward_verify(
-                    hidden,
-                    token_positions,
-                    verify_ids,
-                    graph_seq_len,
-                )
-                expected = torch.cat(sequential_layers[layer_id], dim=1)
-                difference = (hidden.float() - expected.float()).abs()
-                layer_differences.append(
-                    {
-                        "layer": layer_id,
-                        "maximum_absolute": float(difference.max().item()),
-                        "mean_absolute": float(difference.mean().item()),
-                    }
-                )
-            collapsed = model.layers[-1].hc_head(
-                hidden,
-                model.hc_head_fn,
-                model.hc_head_scale,
-                model.hc_head_base,
-            )
-            verify_logits = model.head(model.norm(collapsed), full_logits=True)
-            expected_logits = torch.cat(sequential_logits, dim=1)
-            sequential_top = expected_logits.argmax(dim=-1)
-            verify_top = verify_logits.argmax(dim=-1)
-            logits_difference = (verify_logits - expected_logits).abs()
-
-            def restore_prefill_state() -> None:
-                torch._foreach_copy_(
-                    [buffer for buffer, _ in state],
-                    [snapshot for _, snapshot in state],
-                )
-
-            parity_tokens = 64
-            restore_prefill_state()
-            sequential_completion = [int(prefill_anchor.item())]
-            sequential_anchor = prefill_anchor.clone()
-            sequential_position = len(prompt_ids)
-            while len(sequential_completion) < parity_tokens:
-                position = torch.tensor(
-                    [sequential_position], dtype=torch.long, device=device
-                )
-                logits, _ = model.forward_decode_target(
-                    sequential_anchor, position, graph_seq_len
-                )
-                sequential_anchor = logits.argmax(dim=-1, keepdim=True)
-                sequential_completion.append(int(sequential_anchor.item()))
-                sequential_position += 1
-
-            restore_prefill_state()
-            speculative_completion = [int(prefill_anchor.item())]
-            speculative_anchor = prefill_anchor.clone()
-            speculative_position = len(prompt_ids)
-            speculative_acceptance: list[int] = []
-            while len(speculative_completion) < parity_tokens:
-                position = torch.tensor(
-                    [speculative_position], dtype=torch.long, device=device
-                )
-                drafts = model.draft(speculative_anchor, position)
-                block_verify_ids = torch.cat((speculative_anchor, drafts), dim=1)
-                logits, verify_hidden = model.forward_verify(
-                    block_verify_ids, position, graph_seq_len
-                )
-                if verify_hidden is None:
-                    raise RuntimeError("target did not produce DSpark verify states")
-                model.commit_dspark_main_block(verify_hidden, position)
-                targets = logits.argmax(dim=-1)
-                accepted = 0
-                while (
-                    accepted < block_length - 1
-                    and targets[0, accepted] == drafts[0, accepted]
-                ):
-                    accepted += 1
-                emitted = [
-                    *drafts[0, :accepted].tolist(),
-                    int(targets[0, accepted].item()),
-                ]
-                model.clear_rejected_speculative_state(
-                    position,
-                    torch.tensor([accepted + 1], dtype=torch.int32, device=device),
-                    block_length,
-                )
-                speculative_acceptance.append(accepted)
-                speculative_completion.extend(map(int, emitted))
-                speculative_anchor.fill_(emitted[-1])
-                speculative_position += len(emitted)
-
-            speculative_completion = speculative_completion[:parity_tokens]
-            first_mismatch = next(
-                (
-                    index
-                    for index, (sequential, speculative) in enumerate(
-                        zip(sequential_completion, speculative_completion)
-                    )
-                    if sequential != speculative
-                ),
-                None,
-            )
-            restore_prefill_state()
-            tensor_parallel.barrier()
-            return {
-                "prompt_tokens": len(prompt_ids),
-                "verify_ids": one_block_verify_ids[0].tolist(),
-                "sequential_top": sequential_top[0].tolist(),
-                "verify_top": verify_top[0].tolist(),
-                "top1_matches": (sequential_top == verify_top)[0].tolist(),
-                "logits_maximum_absolute": float(logits_difference.max().item()),
-                "logits_mean_absolute": float(logits_difference.mean().item()),
-                "compressor_differences": compressor_differences,
-                "layer_differences": layer_differences,
-                "decode_parity": {
-                    "tokens": parity_tokens,
-                    "first_mismatch": first_mismatch,
-                    "speculative_acceptance": speculative_acceptance,
-                    "sequential": sequential_completion,
-                    "speculative": speculative_completion,
-                },
-            }
-    finally:
-        torch.set_default_dtype(previous_dtype)
-
-
 def _run_rank_workload(
     rank: int,
     model_path: Path,
@@ -626,7 +306,6 @@ def _run_rank_workload(
     profile: bool,
     profile_run_id: str | None,
     speculative_tokens: int,
-    diagnose_verify: bool,
 ) -> dict[str, object]:
     from resin_models_cuda.deepseek_v4 import DeepSeekV4FlashCudaRunner
 
@@ -660,14 +339,6 @@ def _run_rank_workload(
             f"[deepseek-v4] model loaded in {load_elapsed:.2f}s; "
             f"allreduce={runner.allreduce_backend}; capturing graph",
             flush=True,
-        )
-
-    if diagnose_verify:
-        return _diagnose_verify_parity(
-            runner,
-            prompt_rows[0],
-            context_length,
-            tensor_parallel,
         )
 
     tensor_parallel.barrier()
@@ -903,7 +574,6 @@ def _run_rank(
     profile: bool,
     profile_run_id: str | None,
     speculative_tokens: int,
-    diagnose_verify: bool,
 ) -> None:
     tensor_parallel = _initialize_tensor_parallel(
         rank, master_port, tensor_parallel_size
@@ -926,7 +596,6 @@ def _run_rank(
         profile,
         profile_run_id,
         speculative_tokens,
-        diagnose_verify,
     )
     tensor_parallel.barrier()
     if rank == 0:
@@ -948,7 +617,6 @@ def _launch_tensor_parallel(
     profile: bool,
     profile_run_id: str | None = None,
     speculative_tokens: int = DSPARK_TOKENS,
-    diagnose_verify: bool = False,
 ) -> dict[str, object]:
     master_port = _free_local_port()
     with tempfile.TemporaryDirectory(
@@ -973,7 +641,6 @@ def _launch_tensor_parallel(
                 profile,
                 profile_run_id,
                 speculative_tokens,
-                diagnose_verify,
             ),
             nprocs=tensor_parallel_size,
             join=True,
@@ -1246,6 +913,121 @@ def cache_checkpoint() -> dict[str, object]:
     return _download_checkpoint()
 
 
+def _serve_http_rank(
+    rank: int,
+    master_port: int,
+    model_path: Path,
+) -> None:
+    """Run one TP rank; rank zero additionally owns the public HTTP listener."""
+
+    from resin_models_cuda.deepseek_v4 import DeepSeekV4FlashCudaRunner
+
+    tensor_parallel = _initialize_tensor_parallel(rank, master_port, DEFAULT_TP_SIZE)
+    control_group = dist.new_group(backend="gloo", timeout=timedelta(minutes=30))
+    runner = DeepSeekV4FlashCudaRunner(
+        model_path,
+        max_seq_len=32768,
+        max_batch_size=8,
+        tensor_parallel=tensor_parallel,
+        device=f"cuda:{rank}",
+        cuda_graph_decode_shapes=tuple(
+            (
+                batch_size,
+                32768 + DSPARK_TOKENS + 1,
+            )
+            for batch_size in range(1, 9)
+        ),
+        speculative_tokens=DSPARK_TOKENS,
+    )
+    torch.cuda.synchronize(runner.device)
+    tensor_parallel.barrier()
+    runner.capture_cuda_graphs()
+    tensor_parallel.barrier()
+
+    if rank != 0:
+        follow_tensor_parallel_server(runner, control_group, dist)
+        os._exit(0)
+
+    tokenizer = cast(
+        PreTrainedTokenizerBase,
+        AutoTokenizer.from_pretrained(
+            str(model_path), local_files_only=True, trust_remote_code=False
+        ),
+    )
+    encoding = _load_encoding(model_path)
+    coordinated_runner = TensorParallelServerRunner(runner, control_group, dist)
+    engine = Engine(
+        coordinated_runner,
+        max_running_requests=8,
+        context_length=32768,
+        scheduler_config=SchedulerConfig(
+            max_batch_tokens=32768,
+            prefill_chunk_size=32768,
+        ),
+        eos_token_id=runner.eos_token_id,
+    )
+    for prompt, thinking_mode, reasoning_effort in (
+        ("hi", "chat", "low"),
+        ("Reply with one word.", "thinking", "high"),
+    ):
+        warmup = engine.submit(
+            _encode_prompt(
+                tokenizer,
+                encoding,
+                prompt,
+                thinking_mode,
+                reasoning_effort,
+            ),
+            max_new_tokens=2,
+            sampling_params=SamplingParams(temperature=0.0),
+        )
+        while engine.has_work():
+            engine.step()
+        warmup.take_result()
+    torch.cuda.synchronize(runner.device)
+    kernel_cache_volume.commit()
+    try:
+        HttpServer(
+            engine,
+            codec=DeepSeekV4Codec(tokenizer, encoding),
+            model=DEFAULT_MODEL,
+        ).serve(host="0.0.0.0", port=8000)
+    finally:
+        if not engine.closed:
+            engine.close()
+        coordinated_runner.close_followers()
+    os._exit(0)
+
+
+@app.function(
+    gpu="B300:4",
+    cpu=32,
+    memory=256 * 1024,
+    timeout=24 * 60 * 60,
+    startup_timeout=60 * 60,
+    scaledown_window=15 * 60,
+    max_containers=1,
+)
+@modal.concurrent(max_inputs=16, target_inputs=16)
+@modal.web_server(
+    8000,
+    startup_timeout=60 * 60,
+    label="deepseek-v4",
+    requires_proxy_auth=False,
+)
+def serve_deepseek_v4() -> None:
+    model_path, _ = _require_checkpoint()
+    kernel_cache_volume.reload()
+    process_context = torch.multiprocessing.spawn(
+        _serve_http_rank,
+        args=(_free_local_port(), model_path),
+        nprocs=DEFAULT_TP_SIZE,
+        join=False,
+    )
+    _http_server_processes.append(process_context)
+    monitor_spawned_server(process_context, "deepseek-v4-http")
+
+
 @app.function(
     gpu="B300:2",
     cpu=32,
@@ -1277,24 +1059,23 @@ def benchmark_tp4() -> dict[str, object]:
 )
 def run_model_tp4(
     prompt: str,
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 16384,
     context_length: int = 32768,
     thinking_mode: str = "chat",
-    reasoning_effort: str = "high",
+    reasoning_effort: str = "low",
     temperature: float = 1.0,
-    top_p: float = 0.95,
+    top_p: float = 1.0,
     top_k: int | None = None,
     seed: int | None = 0,
     profile: bool = False,
     batch_size: int = 1,
     profile_input_tokens: int | None = None,
     speculative_tokens: int = DSPARK_TOKENS,
-    diagnose_verify: bool = False,
 ) -> dict[str, object]:
     if thinking_mode not in {"chat", "thinking"}:
         raise ValueError("thinking_mode must be 'chat' or 'thinking'")
-    if reasoning_effort not in {"high", "max"}:
-        raise ValueError("reasoning_effort must be 'high' or 'max'")
+    if reasoning_effort not in {"low", "high", "max"}:
+        raise ValueError("reasoning_effort must be 'low', 'high', or 'max'")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     if not 0 <= speculative_tokens <= DSPARK_TOKENS:
@@ -1343,10 +1124,7 @@ def run_model_tp4(
         profile,
         profile_run_id,
         speculative_tokens,
-        diagnose_verify,
     )
-    if diagnose_verify:
-        return report
     output_rows = cast(list[list[int]], report.pop("_output_ids"))
     completions = [
         tokenizer.decode(output_ids, skip_special_tokens=False)
@@ -1371,12 +1149,12 @@ def run_model_tp4(
 def main(
     mode: str = "run",
     prompt: str = "Explain why batching improves language-model throughput.",
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 16384,
     context_length: int = 32768,
     thinking_mode: str = "chat",
-    reasoning_effort: str = "high",
+    reasoning_effort: str = "low",
     temperature: float = 1.0,
-    top_p: float = 0.95,
+    top_p: float = 1.0,
     top_k: int | None = None,
     seed: int | None = 0,
     profile: bool = False,
@@ -1390,7 +1168,7 @@ def main(
         report = benchmark_tp2.remote()
     elif mode == "bench-tp4":
         report = benchmark_tp4.remote()
-    elif mode in {"run", "real", "profile", "diagnose"}:
+    elif mode in {"run", "real", "profile"}:
         capture_profile = profile or mode == "profile"
         report = run_model_tp4.remote(
             prompt,
@@ -1404,13 +1182,12 @@ def main(
             seed,
             capture_profile,
             batch_size,
-            input_tokens if mode in {"real", "profile", "diagnose"} else None,
+            input_tokens if mode in {"real", "profile"} else None,
             speculative_tokens,
-            mode == "diagnose",
         )
     else:
         raise ValueError(
             "mode must be 'download', 'bench-tp2', 'bench-tp4', 'run', 'real', "
-            "'profile', or 'diagnose'"
+            "or 'profile'"
         )
     print(json.dumps(report, indent=2, sort_keys=True))

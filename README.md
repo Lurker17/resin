@@ -165,6 +165,62 @@ An asynchronous runner supplies `dispatch(plan)` and `poll(completion)` instead.
 Managed cache and recurrent state are optional runner-owned declarations that
 the Engine binds once during construction.
 
+## Local HTTP server
+
+The optional server exposes one Engine through OpenAI Chat Completions and
+Responses, Anthropic Messages, and a small streaming chat page. Model-specific
+prompt rendering and response parsing stay in Python so they can follow model
+formats without coupling them to the native scheduler.
+
+```bash
+uv sync --extra server
+uv run python scripts/lfm2_serve.py
+```
+
+Then open <http://127.0.0.1:8000>. The page reports prompt and generated token
+counts, elapsed generation time, and output tokens per second. The same process
+serves `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, and `/v1/models`.
+
+## Modal HTTP endpoints
+
+The DeepSeek-V4 and GPT-OSS Modal apps also expose the native server as public,
+unauthenticated Web Functions. Populate the pinned checkpoint volumes before
+the first request, then deploy the apps:
+
+```bash
+# GPT-OSS publishes separate 20B and 120B URLs.
+uv run modal run deploy/modal_gpt_oss.py --mode download --model 20b
+uv run modal run deploy/modal_gpt_oss.py --mode download --model 120b
+uv run modal deploy deploy/modal_gpt_oss.py
+
+# DeepSeek-V4 publishes one TP4 B300 URL.
+uv run modal run deploy/modal_deepseek_v4.py --mode download
+uv run modal deploy deploy/modal_deepseek_v4.py
+```
+
+Each deployed URL serves `/`, `/health`, `/v1/models`,
+`/v1/chat/completions`, `/v1/responses`, and `/v1/messages`. The functions
+scale to zero after 15 idle minutes and are capped at one GPU container apiece.
+The chat demo renders Markdown and TeX math and requests up to 16,384 output
+tokens by default. Model loading, CUDA graph capture, and one real prompt
+warmup all complete before the endpoint starts accepting traffic.
+Because `requires_proxy_auth=False`, anyone with a URL can submit inference
+requests and incur GPU usage; remove the deployment when it is no longer
+needed.
+
+For a custom model-format adapter, pass `codec=` instead of a renderer:
+
+```python
+from resin.server import HttpServer
+
+HttpServer(engine, codec=my_codec, model="my-model").serve()
+```
+
+`ConversationCodec.render()` returns prompt and stop token IDs;
+`create_parser()` returns a per-request incremental parser that emits text,
+reasoning, and tool-call deltas. `RendererCodec` supplies this contract for the
+optional `renderers` package.
+
 ## Current shape
 
 The native layer currently provides:

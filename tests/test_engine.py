@@ -157,7 +157,31 @@ class TestEngine:
 
         assert [event.token_id for event in events] == [3, 7]
         assert [event.finished for event in events] == [False, True]
+        assert [event.finish_reason for event in events] == [None, "stop"]
         assert request.take_result() == [2, 3, 7]
+
+    def test_request_stop_tokens_override_engine_eos(self) -> None:
+        engine = Engine(RecordingRunner(), eos_token_id=7)
+        request = engine.submit([1], max_new_tokens=5, stop_token_ids=[3])
+
+        first = engine.step()[0]
+        second = engine.step()[0]
+
+        assert not first.finished
+        assert first.finish_reason is None
+        assert second.finished
+        assert second.finish_reason == "stop"
+        assert request.take_result() == [2, 3]
+
+    def test_length_finish_reason_is_explicit(self) -> None:
+        engine = Engine(RecordingRunner())
+        request = engine.submit([1], max_new_tokens=1)
+
+        event = engine.step()[0]
+
+        assert event.finished
+        assert event.finish_reason == "length"
+        assert request.take_result() == [2]
 
     def test_speculative_rows_are_rejected_during_prefill(self) -> None:
         class BadRunner:

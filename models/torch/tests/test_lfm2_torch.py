@@ -76,6 +76,45 @@ class TestLfm2Torch:
                     full[:, split:], cached, rtol=1e-5, atol=1e-5
                 )
 
+    def test_batched_decode_matches_independent_cached_forwards(self) -> None:
+        torch = self.torch
+        independent_states = [self.model.make_cache(), self.model.make_cache()]
+        batched_states = [self.model.make_cache(), self.model.make_cache()]
+        prefixes = [torch.tensor([[1, 2, 3]]), torch.tensor([[4, 5]])]
+
+        with torch.inference_mode():
+            for prefix, independent, batched in zip(
+                prefixes, independent_states, batched_states, strict=True
+            ):
+                self.model(prefix, independent)
+                self.model(prefix, batched)
+
+            for tokens in (torch.tensor([[6], [7]]), torch.tensor([[8], [9]])):
+                expected = torch.cat(
+                    [
+                        self.model(tokens[index : index + 1], state)
+                        for index, state in enumerate(independent_states)
+                    ]
+                )
+                actual = self.model.forward_batch(tokens, batched_states)
+                torch.testing.assert_close(expected, actual, rtol=1e-5, atol=1e-5)
+
+        assert [state.length for state in batched_states] == [5, 4]
+        for independent, batched in zip(
+            independent_states, batched_states, strict=True
+        ):
+            for expected_layer, actual_layer in zip(
+                independent.layers, batched.layers, strict=True
+            ):
+                expected_tensors = vars(expected_layer).values()
+                actual_tensors = vars(actual_layer).values()
+                for expected_tensor, actual_tensor in zip(
+                    expected_tensors, actual_tensors, strict=True
+                ):
+                    torch.testing.assert_close(
+                        expected_tensor, actual_tensor, rtol=1e-5, atol=1e-5
+                    )
+
     def test_checkpoint_parameter_paths_match_the_released_layout(self) -> None:
         keys = set(self.model.state_dict())
         assert "model.layers.0.conv.in_proj.weight" in keys

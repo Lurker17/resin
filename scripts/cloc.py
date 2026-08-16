@@ -158,6 +158,7 @@ def report() -> dict[str, dict[str, object]]:
                     ROOT / "crates/resin-core/src/resources", "*.rs"
                 ),
             },
+            "resin-http": source_files(ROOT / "crates/resin-http/src", "*.rs"),
             "resin-py": source_files(ROOT / "crates/resin-py/src", "*.rs"),
         },
         "python": {

@@ -94,23 +94,48 @@ class Lfm2TorchRunner(SyncRunner):
         rows = plan_rows(plan, self._cache, self.vocab_size)
 
         with torch.inference_mode():
-            for row in rows:
-                cache = row.cache
-                if cache is None:
-                    cache = self._model.make_cache()
-                    self._cache[row.request_id] = cache
+            if len(rows) > 1 and all(len(row.token_ids) == 1 for row in rows):
+                caches = []
+                for row in rows:
+                    cache = row.cache
+                    if cache is None:
+                        cache = self._model.make_cache()
+                        self._cache[row.request_id] = cache
+                    caches.append(cache)
                 inputs = torch.tensor(
-                    [row.token_ids], dtype=torch.long, device=self.device
+                    [row.token_ids for row in rows],
+                    dtype=torch.long,
+                    device=self.device,
                 )
                 position_tensor = torch.tensor(
-                    [row.positions], dtype=torch.long, device=self.device
+                    [row.positions for row in rows],
+                    dtype=torch.long,
+                    device=self.device,
                 )
-                logits = self._model(inputs, cache, position_tensor, logits_to_keep=1)
+                logits = self._model.forward_batch(inputs, caches, position_tensor)
                 logits_rows.append(logits[:, -1, :])
+            else:
+                self._forward_rows(rows, logits_rows)
         sampler = getattr(self, "_sampler", None)
         if sampler is None:
             sampler = self._sampler = TorchSampler(torch)
         return sampler(torch.cat(logits_rows), plan).tolist()
+
+    def _forward_rows(self, rows, logits_rows) -> None:
+        torch = self._torch
+        for row in rows:
+            cache = row.cache
+            if cache is None:
+                cache = self._model.make_cache()
+                self._cache[row.request_id] = cache
+            inputs = torch.tensor(
+                [row.token_ids], dtype=torch.long, device=self.device
+            )
+            position_tensor = torch.tensor(
+                [row.positions], dtype=torch.long, device=self.device
+            )
+            logits = self._model(inputs, cache, position_tensor, logits_to_keep=1)
+            logits_rows.append(logits[:, -1, :])
 
     def release(self, request_ids: list[int]) -> None:
         for request_id in request_ids:

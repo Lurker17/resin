@@ -1,0 +1,18 @@
+[package]
+name = "resin-http"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "HTTP protocol adapters for the Resin inference engine"
+
+[dependencies]
+async-stream = "0.3"
+axum = { version = "0.8", features = ["json", "tokio", "http1"] }
+futures-core = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

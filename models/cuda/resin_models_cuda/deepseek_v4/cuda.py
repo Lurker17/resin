@@ -328,6 +328,17 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             for _, buffer in self._sequence_state_buffers():
                 buffer[destination].copy_(buffer[source])
 
+    def _swap_model_state_rows(self, left: int, right: int) -> None:
+        """Swap two sequence rows while preserving every recurrent buffer."""
+
+        if left == right:
+            return
+        with torch.no_grad():
+            for _, buffer in self._sequence_state_buffers():
+                temporary = buffer[left].clone()
+                buffer[left].copy_(buffer[right])
+                buffer[right].copy_(temporary)
+
     def capture_cuda_graphs(self) -> CudaGraphStats:
         """Capture configured decode capacities before accepting requests."""
 
@@ -422,7 +433,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
                 output_ids[:, :block_size].copy_(drafts)
                 for index in range(block_size + 1):
                     output_ids[:, block_size + index].copy_(
-                        sample(verify_logits[:, index], index)
+                        sample(verify_logits[:, index].contiguous(), index)
                     )
                 if phase_events is not None:
                     phase_events[3].record()
@@ -502,12 +513,12 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
                 raise ValueError("DeepSeek-V4 positions must continue each row context")
 
         if plan.phase == BatchPhase.PREFILL:
-            if self._active_sequence_ids:
-                raise RuntimeError(
-                    "DeepSeek-V4 cannot admit prefills while decode state is active"
-                )
             if any(context != 0 for context in plan.context_lengths):
                 raise ValueError("DeepSeek-V4 does not support continuation prefill")
+            if row_count + len(self._active_sequence_ids) > self.max_batch_size:
+                raise ValueError("DeepSeek-V4 prefill exceeds runner batch capacity")
+            if set(plan.sequence_ids) & set(self._active_sequence_ids):
+                raise ValueError("DeepSeek-V4 prefill sequence is already active")
         elif plan.phase == BatchPhase.DECODE:
             if any(end - start != 1 for start, end in rows):
                 raise ValueError("DeepSeek-V4 decode rows must contain one token")
@@ -523,6 +534,27 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         """Prefill rows independently, staging their recurrent state compactly."""
 
         logits: list[torch.Tensor | None] = [None] * len(rows)
+        active_rows = len(self._active_sequence_ids)
+        if active_rows:
+            # Target prefill uses model row zero as scratch. Preserve the active
+            # owner in each new request's destination, run that request, then
+            # swap the old and new states into their final compact rows.
+            for slot, (start, end) in enumerate(rows, start=active_rows):
+                self._copy_model_state_row(0, slot)
+                input_ids = torch.tensor(
+                    plan.token_ids[start:end], dtype=torch.long, device=self.device
+                ).unsqueeze(0)
+                if getattr(self, "speculative_tokens", 0):
+                    row_logits, main_hidden = self._model.forward_target(input_ids)
+                    if main_hidden is None:
+                        raise RuntimeError("target did not produce DSpark hidden states")
+                    self._model.prefill_dspark(main_hidden)
+                    logits[slot - active_rows] = row_logits
+                else:
+                    logits[slot - active_rows] = self._model(input_ids, 0)
+                self._swap_model_state_rows(0, slot)
+            return torch.cat([row for row in logits if row is not None], dim=0)
+
         # Row zero is the model's eager single-row target. Filling slots in
         # reverse means every completed row is copied out before row zero is
         # reused, with the final request naturally left in slot zero.
@@ -607,7 +639,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         self._model.commit_dspark_main_block(verify_hidden, positions)
 
         target_columns = [
-            self._sample_target(verify_logits[:, index], plan, index)
+            self._sample_target(verify_logits[:, index].contiguous(), plan, index)
             for index in range(self.speculative_tokens + 1)
         ]
         return self._accept_speculative(
@@ -649,7 +681,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
                     )
                 output = self._sample_target(logits, plan, 0)
             if plan.phase == BatchPhase.PREFILL:
-                self._active_sequence_ids = list(plan.sequence_ids)
+                self._active_sequence_ids.extend(plan.sequence_ids)
             return output.tolist()
         except BaseException:
             torch.cuda.synchronize(self.device)

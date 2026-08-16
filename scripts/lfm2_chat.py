@@ -4,6 +4,7 @@
 basic example of using Resin with a Torch-based forward pass.
 """
 
+import torch
 from tokenizers import Tokenizer
 
 from resin import Engine
@@ -11,6 +12,8 @@ from resin_models_torch.lfm2 import DEFAULT_MODEL, Lfm2TorchRunner
 
 
 def main() -> None:
+    torch.set_num_threads(1)
+
     model = DEFAULT_MODEL
     tokenizer = Tokenizer.from_pretrained(model)
     prompt = (

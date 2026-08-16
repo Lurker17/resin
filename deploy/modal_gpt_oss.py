@@ -19,6 +19,11 @@ from huggingface_hub import snapshot_download
 from renderers import GptOssRendererConfig, Message, Renderer, create_renderer
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from deploy.http import (
+    TensorParallelServerRunner,
+    follow_tensor_parallel_server,
+    monitor_spawned_server,
+)
 from deploy.jit_cache import (
     KERNEL_CACHE_ENV,
     KERNEL_CACHE_MOUNT,
@@ -27,13 +32,16 @@ from deploy.jit_cache import (
     KERNEL_CACHE_VOLUME_VERSION,
     flashinfer_autotune_context,
     install_flashinfer_hash_cache,
+    prepare_kernel_cache,
     run_cache_prewarm,
     run_cache_reuse_probe,
     run_cached_workload,
 )
+from deploy.modal_image import build_modal_image
 from resin import Engine, SamplingParams, SchedulerConfig, TokenEvent
 from resin.backend.cuda.graphs import CudaGraphStats
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
+from resin.server import HttpServer, RendererCodec
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -78,72 +86,19 @@ TOKENIZER_FILES = (
     "vocab.json",
 )
 
-SUPPORTED_TP_SIZES = (1, 2, 4, 8)
-
-
-image = (
-    modal.Image.from_registry("nvidia/cuda:13.3.1-devel-ubuntu22.04", add_python="3.12")
-    .apt_install("build-essential", "curl")
-    .run_commands(
-        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
-    )
-    .env(
-        {
-            "PATH": "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
-            "MAX_JOBS": "12",
-            "CMAKE_BUILD_PARALLEL_LEVEL": "12",
-        }
-    )
-    .uv_sync(
-        str(ROOT),
-        extras=["gpu"],
-        groups=["dev"],
-        extra_options="--no-default-groups",
-    )
-    # These accelerator-specific supplement wheels live outside PyPI, so the
-    # project extras own all ordinary dependencies while the image only owns
-    # their index locations.
-    .uv_pip_install(
-        "flashinfer-cubin==0.6.15.post1",
-        extra_index_url="https://flashinfer.ai/whl",
-    )
-    .uv_pip_install(
-        "flashinfer-jit-cache==0.6.15.post1+cu130",
-        extra_index_url="https://flashinfer.ai/whl/cu130",
-    )
-    # Keep the heavyweight dependency layers independent of local source so a
-    # normal code edit only rebuilds Resin itself.
-    .add_local_file(ROOT / "deploy/__init__.py", "/root/deploy/__init__.py", copy=True)
-    .add_local_file(
-        ROOT / "deploy/jit_cache.py", "/root/deploy/jit_cache.py", copy=True
-    )
-    .add_local_file(ROOT / "Cargo.toml", "/opt/resin/Cargo.toml", copy=True)
-    .add_local_file(ROOT / "Cargo.lock", "/opt/resin/Cargo.lock", copy=True)
-    .add_local_file(ROOT / "pyproject.toml", "/opt/resin/pyproject.toml", copy=True)
-    .add_local_file(ROOT / "README.md", "/opt/resin/README.md", copy=True)
-    .add_local_dir(ROOT / "crates", "/opt/resin/crates", copy=True)
-    .add_local_dir(ROOT / "resin", "/opt/resin/resin", copy=True)
-    .add_local_dir(
-        ROOT / "models/cuda",
-        "/opt/resin/models/cuda",
-        copy=True,
-    )
-    .uv_pip_install("/opt/resin", extra_options="--no-deps")
-    .uv_pip_install(
-        "/opt/resin/models/cuda",
-        extra_options="--no-deps",
-    )
-    .env(KERNEL_CACHE_ENV)
-)
+image = build_modal_image(
+    ROOT,
+    env={"MAX_JOBS": "12", "CMAKE_BUILD_PARALLEL_LEVEL": "12"},
+).env(KERNEL_CACHE_ENV)
 
 with image.imports():
     from resin_models_cuda.gpt_oss import GptOssCudaRunner
     from resin_models_cuda.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
-    from resin_models_cuda.gpt_oss.plan import PAGE_SIZE, WINDOW_TABLE_WIDTH
 
-PAGE_TOKENS = PAGE_SIZE
-WINDOW_RESIDENT_BLOCKS = WINDOW_TABLE_WIDTH
+# Mirror the runner's frozen paged-cache geometry without reading names from
+# ``image.imports()`` while Modal is still parsing this file locally.
+PAGE_TOKENS = 128
+WINDOW_RESIDENT_BLOCKS = 65
 
 kernel_cache_volume = modal.Volume.from_name(
     KERNEL_CACHE_VOLUME_NAME,
@@ -165,6 +120,8 @@ app = modal.App(
         PROFILE_MOUNT: profile_volume,
     },
 )
+
+_http_server_processes: list[object] = []
 
 
 def _model_path(model_key: str) -> Path:
@@ -788,12 +745,6 @@ def _bench_cuda(
             engine.close()
 
 
-def _validate_tensor_parallel_size(tensor_parallel_size: int) -> None:
-    if tensor_parallel_size not in SUPPORTED_TP_SIZES:
-        allowed = ", ".join(str(size) for size in SUPPORTED_TP_SIZES)
-        raise ValueError(f"tp must be one of: {allowed}")
-
-
 def _free_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
@@ -1068,10 +1019,8 @@ def _run_bench(
     batch_sizes: tuple[int, ...],
     context_length: int,
     schedule_conservativeness: float,
-    tensor_parallel_size: int,
     profile_decode_steps: int,
 ) -> dict[str, object]:
-    _validate_tensor_parallel_size(tensor_parallel_size)
     if model_key not in MODEL_SPECS:
         raise ValueError("model must be '20b' or '120b'")
     if cache_mode not in {"prewarm", "verify"}:
@@ -1089,23 +1038,8 @@ def _run_bench(
     protocol = "gpt-oss-throughput-v1"
 
     def workload() -> dict[str, object]:
-        if tensor_parallel_size == 1:
-            return _bench_rank_workload(
-                model_key,
-                model_path,
-                model_cache,
-                prompt_ids,
-                cache_mode,
-                prompt_tokens,
-                max_new_tokens,
-                batch_sizes,
-                context_length,
-                schedule_conservativeness,
-                profile_decode_steps,
-                TensorParallelContext(),
-            )
         return _launch_tensor_parallel_bench(
-            tensor_parallel_size,
+            2,
             model_key,
             model_path,
             model_cache,
@@ -1122,13 +1056,13 @@ def _run_bench(
     if cache_mode == "prewarm":
         report = run_cache_prewarm(
             kernel_cache_volume,
-            _workload_name(model_key, protocol, tensor_parallel_size),
+            _workload_name(model_key, protocol, 2),
             workload,
         )
     else:
         report = run_cache_reuse_probe(
             kernel_cache_volume,
-            _workload_name(model_key, protocol, tensor_parallel_size),
+            _workload_name(model_key, protocol, 2),
             workload,
         )
         cache = cast(KernelCacheVerification, report["kernel_cache"])
@@ -1148,26 +1082,141 @@ def cache_checkpoint(model_key: str) -> dict[str, object]:
     return _download_model(model_key)
 
 
+def _serve_http_rank(
+    rank: int,
+    master_port: int,
+    model_key: str,
+    model_path: Path,
+) -> None:
+    """Run one TP=2 rank; rank zero additionally owns the HTTP listener."""
+
+    tensor_parallel = _initialize_tensor_parallel(rank, 2, master_port)
+    control_group = dist.new_group(backend="gloo", timeout=timedelta(minutes=30))
+    install_flashinfer_hash_cache()
+    per_request_capacity = _required_parent_capacity(131072, 1)
+    runner = _new_cuda_runner(
+        model_path,
+        8 * per_request_capacity,
+        tensor_parallel,
+        cuda_graph_decode_shapes=tuple(
+            (batch_size, _required_history_width(131072, 1))
+            for batch_size in range(1, 9)
+        ),
+    )
+    _capture_cuda_graphs(runner)
+
+    if rank != 0:
+        print("[http-startup] follower ready for rank-zero commands", flush=True)
+        follow_tensor_parallel_server(runner, control_group, dist)
+        os._exit(0)
+
+    print("[http-startup] loading tokenizer and renderer...", flush=True)
+    tokenizer, renderer = _load_renderer(model_path)
+    print("[http-startup] tokenizer and renderer loaded", flush=True)
+    coordinated_runner = TensorParallelServerRunner(runner, control_group, dist)
+    print("[http-startup] creating engine and binding shared cache...", flush=True)
+    engine = Engine(
+        coordinated_runner,
+        max_running_requests=8,
+        context_length=131072,
+        scheduler_config=SchedulerConfig(
+            max_batch_tokens=runner.max_batch_tokens,
+            prefill_chunk_size=runner.prefill_chunk_size,
+        ),
+        eos_token_id=runner.eos_token_id,
+    )
+    print("[http-startup] engine created; running warmup...", flush=True)
+    warmup = engine.submit(
+        _encode_prompt(renderer, "Reply with one word."),
+        max_new_tokens=2,
+        sampling_params=SamplingParams(temperature=0.0),
+    )
+    while engine.has_work():
+        engine.step()
+    warmup.take_result()
+    torch.cuda.synchronize(runner.device)
+    print("[http-startup] warmup complete; starting HTTP server", flush=True)
+    codec = RendererCodec(
+        renderer,
+        tokenizer=tokenizer,
+        include_generation_prefix_in_parser=True,
+    )
+    server = HttpServer(engine, codec=codec, model=MODEL_SPECS[model_key]["repo_id"])
+    try:
+        server.serve(host="0.0.0.0", port=8000)
+    finally:
+        if not engine.closed:
+            engine.close()
+        coordinated_runner.close_followers()
+    os._exit(0)
+
+
+def _start_http_server(model_key: str) -> None:
+    """Spawn the two ranks backing one GPT-OSS HTTP deployment."""
+
+    prepare_kernel_cache(kernel_cache_volume)
+    model_path, _ = _require_cached_model(model_key)
+    process_context = torch.multiprocessing.spawn(
+        _serve_http_rank,
+        args=(_free_local_port(), model_key, model_path),
+        nprocs=2,
+        join=False,
+    )
+    _http_server_processes.append(process_context)
+    monitor_spawned_server(process_context, f"gpt-oss-{model_key}-http")
+
+
+@app.function(
+    gpu="H200:2",
+    cpu=16,
+    memory=256 * 1024,
+    timeout=24 * 60 * 60,
+    startup_timeout=60 * 60,
+    scaledown_window=15 * 60,
+    max_containers=1,
+)
+@modal.concurrent(max_inputs=32, target_inputs=8)
+@modal.web_server(
+    8000,
+    startup_timeout=60 * 60,
+    label="gpt-oss-20b",
+    requires_proxy_auth=False,
+)
+def serve_gpt_oss_20b() -> None:
+    _start_http_server("20b")
+
+
+@app.function(
+    gpu="H200:2",
+    cpu=16,
+    memory=256 * 1024,
+    timeout=24 * 60 * 60,
+    startup_timeout=60 * 60,
+    scaledown_window=15 * 60,
+    max_containers=1,
+)
+@modal.concurrent(max_inputs=32, target_inputs=8)
+@modal.web_server(
+    8000,
+    startup_timeout=60 * 60,
+    label="gpt-oss-120b",
+    requires_proxy_auth=False,
+)
+def serve_gpt_oss_120b() -> None:
+    _start_http_server("120b")
+
+
 def _run_model(
-    tensor_parallel_size: int,
     model_key: str,
     prompt: str,
-    max_new_tokens: int = 256,
-    context_length: int = 32768,
+    max_new_tokens: int = 16384,
+    context_length: int = 131072,
     schedule_conservativeness: float = 1.0,
     temperature: float = 1.0,
     top_p: float = 1.0,
     top_k: int | None = None,
     seed: int | None = None,
 ) -> dict[str, object]:
-    _validate_tensor_parallel_size(tensor_parallel_size)
-    sampling_params = SamplingParams(
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        seed=seed,
-    )
-
     def workload() -> dict[str, object]:
         # Volume v2 does not preserve the nanosecond mtimes Ninja uses to
         # validate FlashInfer JIT outputs. Install Resin's content-addressed
@@ -1177,34 +1226,20 @@ def _run_model(
         tokenizer, renderer = _load_renderer(model_path)
         prompt_ids = _encode_prompt(renderer, prompt)
         generation_prefix_ids = _generation_prefix_ids(renderer, prompt)
-        if tensor_parallel_size == 1:
-            install_flashinfer_hash_cache()
-            report = _run_prompt(
-                model_key,
-                model_path,
-                model_cache,
-                prompt_ids,
-                max_new_tokens,
-                context_length,
-                schedule_conservativeness,
-                sampling_params,
-                TensorParallelContext(),
-            )
-        else:
-            report = _launch_tensor_parallel_prompt(
-                tensor_parallel_size,
-                model_key,
-                model_path,
-                model_cache,
-                prompt_ids,
-                max_new_tokens,
-                context_length,
-                schedule_conservativeness,
-                temperature,
-                top_p,
-                top_k,
-                seed,
-            )
+        report = _launch_tensor_parallel_prompt(
+            2,
+            model_key,
+            model_path,
+            model_cache,
+            prompt_ids,
+            max_new_tokens,
+            context_length,
+            schedule_conservativeness,
+            temperature,
+            top_p,
+            top_k,
+            seed,
+        )
         return _render_prompt_report(
             report,
             tokenizer,
@@ -1216,7 +1251,7 @@ def _run_model(
 
 
 @app.function(
-    gpu="H200",
+    gpu="H200:2",
     cpu=16,
     memory=256 * 1024,
     timeout=4 * 60 * 60,
@@ -1225,8 +1260,8 @@ def _run_model(
 def run_model(
     model_key: str,
     prompt: str,
-    max_new_tokens: int = 256,
-    context_length: int = 32768,
+    max_new_tokens: int = 16384,
+    context_length: int = 131072,
     schedule_conservativeness: float = 1.0,
     temperature: float = 1.0,
     top_p: float = 1.0,
@@ -1234,7 +1269,6 @@ def run_model(
     seed: int | None = None,
 ) -> dict[str, object]:
     return _run_model(
-        1,
         model_key,
         prompt,
         max_new_tokens,
@@ -1249,102 +1283,6 @@ def run_model(
 
 @app.function(
     gpu="H200:2",
-    cpu=16,
-    memory=256 * 1024,
-    timeout=4 * 60 * 60,
-    single_use_containers=True,
-)
-def run_model_tp2(
-    model_key: str,
-    prompt: str,
-    max_new_tokens: int = 256,
-    context_length: int = 32768,
-    schedule_conservativeness: float = 1.0,
-    temperature: float = 1.0,
-    top_p: float = 1.0,
-    top_k: int | None = None,
-    seed: int | None = None,
-) -> dict[str, object]:
-    return _run_model(
-        2,
-        model_key,
-        prompt,
-        max_new_tokens,
-        context_length,
-        schedule_conservativeness,
-        temperature,
-        top_p,
-        top_k,
-        seed,
-    )
-
-
-@app.function(
-    gpu="H200:4",
-    cpu=16,
-    memory=256 * 1024,
-    timeout=4 * 60 * 60,
-    single_use_containers=True,
-)
-def run_model_tp4(
-    model_key: str,
-    prompt: str,
-    max_new_tokens: int = 256,
-    context_length: int = 32768,
-    schedule_conservativeness: float = 1.0,
-    temperature: float = 1.0,
-    top_p: float = 1.0,
-    top_k: int | None = None,
-    seed: int | None = None,
-) -> dict[str, object]:
-    return _run_model(
-        4,
-        model_key,
-        prompt,
-        max_new_tokens,
-        context_length,
-        schedule_conservativeness,
-        temperature,
-        top_p,
-        top_k,
-        seed,
-    )
-
-
-@app.function(
-    gpu="H200:8",
-    cpu=16,
-    memory=256 * 1024,
-    timeout=4 * 60 * 60,
-    single_use_containers=True,
-)
-def run_model_tp8(
-    model_key: str,
-    prompt: str,
-    max_new_tokens: int = 256,
-    context_length: int = 32768,
-    schedule_conservativeness: float = 1.0,
-    temperature: float = 1.0,
-    top_p: float = 1.0,
-    top_k: int | None = None,
-    seed: int | None = None,
-) -> dict[str, object]:
-    return _run_model(
-        8,
-        model_key,
-        prompt,
-        max_new_tokens,
-        context_length,
-        schedule_conservativeness,
-        temperature,
-        top_p,
-        top_k,
-        seed,
-    )
-
-
-@app.function(
-    gpu="H200",
     cpu=16,
     memory=256 * 1024,
     timeout=12 * 60 * 60,
@@ -1368,97 +1306,6 @@ def bench_model(
         batch_sizes,
         context_length,
         schedule_conservativeness,
-        1,
-        profile_decode_steps,
-    )
-
-
-@app.function(
-    gpu="H200:2",
-    cpu=16,
-    memory=256 * 1024,
-    timeout=12 * 60 * 60,
-    single_use_containers=True,
-)
-def bench_model_tp2(
-    model_key: str,
-    cache_mode: str = "prewarm",
-    prompt_tokens: int = 8192,
-    max_new_tokens: int = 256,
-    batch_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
-    context_length: int = 32768,
-    schedule_conservativeness: float = 1.0,
-    profile_decode_steps: int = 0,
-) -> dict[str, object]:
-    return _run_bench(
-        model_key,
-        cache_mode,
-        prompt_tokens,
-        max_new_tokens,
-        batch_sizes,
-        context_length,
-        schedule_conservativeness,
-        2,
-        profile_decode_steps,
-    )
-
-
-@app.function(
-    gpu="H200:4",
-    cpu=16,
-    memory=256 * 1024,
-    timeout=12 * 60 * 60,
-    single_use_containers=True,
-)
-def bench_model_tp4(
-    model_key: str,
-    cache_mode: str = "prewarm",
-    prompt_tokens: int = 8192,
-    max_new_tokens: int = 256,
-    batch_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
-    context_length: int = 32768,
-    schedule_conservativeness: float = 1.0,
-    profile_decode_steps: int = 0,
-) -> dict[str, object]:
-    return _run_bench(
-        model_key,
-        cache_mode,
-        prompt_tokens,
-        max_new_tokens,
-        batch_sizes,
-        context_length,
-        schedule_conservativeness,
-        4,
-        profile_decode_steps,
-    )
-
-
-@app.function(
-    gpu="H200:8",
-    cpu=16,
-    memory=256 * 1024,
-    timeout=12 * 60 * 60,
-    single_use_containers=True,
-)
-def bench_model_tp8(
-    model_key: str,
-    cache_mode: str = "prewarm",
-    prompt_tokens: int = 8192,
-    max_new_tokens: int = 256,
-    batch_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
-    context_length: int = 32768,
-    schedule_conservativeness: float = 1.0,
-    profile_decode_steps: int = 0,
-) -> dict[str, object]:
-    return _run_bench(
-        model_key,
-        cache_mode,
-        prompt_tokens,
-        max_new_tokens,
-        batch_sizes,
-        context_length,
-        schedule_conservativeness,
-        8,
         profile_decode_steps,
     )
 
@@ -1469,16 +1316,15 @@ def main(
     model: str = "120b",
     cache_mode: str = "prewarm",
     prompt: str = "Explain why batching improves language-model throughput.",
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 16384,
     prompt_tokens: int = 8192,
     batch_sizes: str = "1,2,8,16,32",
-    context_length: int = 32768,
+    context_length: int = 131072,
     schedule_conservativeness: float = 1.0,
     temperature: float = 1.0,
     top_p: float = 1.0,
     top_k: int | None = None,
     seed: int | None = None,
-    tp: int = 1,
     profile_decode_steps: int = 0,
 ) -> None:
     """Download a checkpoint, run one prompt, or benchmark throughput."""
@@ -1486,16 +1332,7 @@ def main(
     if mode == "download":
         report = cache_checkpoint.remote(model)
     elif mode == "run":
-        _validate_tensor_parallel_size(tp)
-        if tp == 1:
-            remote_run = run_model
-        elif tp == 2:
-            remote_run = run_model_tp2
-        elif tp == 4:
-            remote_run = run_model_tp4
-        else:
-            remote_run = run_model_tp8
-        report = remote_run.remote(
+        report = run_model.remote(
             model,
             prompt,
             max_new_tokens,
@@ -1507,22 +1344,13 @@ def main(
             seed,
         )
     elif mode == "bench":
-        _validate_tensor_parallel_size(tp)
         try:
             parsed_batch_sizes = tuple(int(value) for value in batch_sizes.split(","))
         except ValueError as error:
             raise ValueError(
                 "batch_sizes must be a comma-separated integer list"
             ) from error
-        if tp == 1:
-            remote_bench = bench_model
-        elif tp == 2:
-            remote_bench = bench_model_tp2
-        elif tp == 4:
-            remote_bench = bench_model_tp4
-        else:
-            remote_bench = bench_model_tp8
-        report = remote_bench.remote(
+        report = bench_model.remote(
             model,
             cache_mode,
             prompt_tokens,
