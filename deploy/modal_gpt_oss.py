@@ -1134,10 +1134,6 @@ def _serve_http_rank(
         engine_runner,
         max_running_requests=8,
         context_length=131072,
-        scheduler_config=SchedulerConfig(
-            max_batch_tokens=runner.max_batch_tokens,
-            prefill_chunk_size=runner.prefill_chunk_size,
-        ),
         eos_token_id=runner.eos_token_id,
         prefix_cache=True,
     )
