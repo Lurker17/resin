@@ -30,26 +30,42 @@ class TestImport:
         assert "dev" not in optional_dependencies
 
         gpu = optional_dependencies["gpu"]
-        assert any(item.startswith("torch") for item in gpu)
-        assert any(item.startswith("flashinfer-python") for item in gpu)
-        assert any(item.startswith("quack-kernels==0.6.4") for item in gpu)
-        assert any(item.startswith("nvidia-cutlass-dsl") for item in gpu)
-        assert any(item.startswith("flash-attn-4") for item in gpu)
-        assert not any(item.startswith("numpy") for item in gpu)
-        assert not any(item.startswith("huggingface-hub") for item in gpu)
-        assert not any(item.startswith("safetensors") for item in gpu)
+        assert gpu == [
+            "torch>=2.13.0",
+            "flashinfer-python>=0.6.15.post1; sys_platform == 'linux'",
+        ]
 
         workspace = tomllib.loads(Path("pyproject.toml").read_text())
         dev = workspace["dependency-groups"]["dev"]
-        assert "resin-models-torch==0.1.0" in dev
+        assert "resin-models-torch" in dev
+        assert "resin-models-cuda" in dev
         assert any(item.startswith("tokenizers") for item in dev)
+        assert not any(item.startswith("hf-xet") for item in dev)
+        overrides = workspace["tool"]["uv"]["override-dependencies"]
+        assert all("sys_platform == 'linux'" in item for item in overrides)
 
         cuda_models = tomllib.loads(Path("models/cuda/pyproject.toml").read_text())[
             "project"
         ]
-        assert "resin[gpu]==0.1.0" in cuda_models["dependencies"]
-        assert "huggingface-hub==1.27.0" in cuda_models["dependencies"]
-        assert "safetensors==0.8.0" in cuda_models["dependencies"]
+        cuda_dependencies = cuda_models["dependencies"]
+        assert "resin[gpu]==0.1.0" in cuda_dependencies
+        assert "resin-models-torch==0.1.0" in cuda_dependencies
+        assert "huggingface-hub>=0.35" in cuda_dependencies
+        assert "safetensors>=0.5" in cuda_dependencies
+        assert any(
+            item.startswith("flashinfer-python==0.6.15.post1")
+            for item in cuda_dependencies
+        )
+        assert any(
+            item.startswith("quack-kernels==0.6.4") for item in cuda_dependencies
+        )
+        assert any(
+            item.startswith("nvidia-cutlass-dsl==4.6.2") for item in cuda_dependencies
+        )
+        assert any(
+            item.startswith("flash-attn-4==4.0.0b26") for item in cuda_dependencies
+        )
+        assert not any(item.startswith("hf-xet") for item in cuda_dependencies)
 
         torch_models = tomllib.loads(Path("models/torch/pyproject.toml").read_text())[
             "project"

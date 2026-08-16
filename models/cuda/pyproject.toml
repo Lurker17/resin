@@ -11,9 +11,20 @@ license = "Apache-2.0"
 dependencies = [
   "resin[gpu]==0.1.0",
   "resin-models-torch==0.1.0",
-  "huggingface-hub==1.27.0",
-  "hf-xet==1.6.0",
-  "safetensors==0.8.0",
+  "huggingface-hub>=0.35",
+  "safetensors>=0.5",
+  # The optimized kernels are tested as one compatibility stack.
+  "torch==2.13.0",
+  "triton==3.7.1; sys_platform == 'linux'",
+  "tilelang==0.1.11; sys_platform == 'linux'",
+  "flashinfer-python==0.6.15.post1; sys_platform == 'linux'",
+  "flash-attn-4==4.0.0b26; sys_platform == 'linux'",
+  "nvidia-cutlass-dsl==4.6.2; sys_platform == 'linux'",
+  "nvidia-cutlass-dsl-libs-base==4.6.2; sys_platform == 'linux'",
+  "apache-tvm-ffi==0.1.11; sys_platform == 'linux'",
+  "cuda-tile==1.5.0; sys_platform == 'linux'",
+  "quack-kernels==0.6.4; sys_platform == 'linux'",
+  "sgl-deep-gemm==0.1.5.post2; sys_platform == 'linux'",
 ]
 
 [tool.uv.sources]

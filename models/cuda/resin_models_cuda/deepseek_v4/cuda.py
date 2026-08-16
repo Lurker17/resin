@@ -34,6 +34,7 @@ from resin.backend.cuda.sampling import (
     SamplingTensors,
 )
 from resin.backend.speculative import accept_speculative_tokens
+from resin.protocols import SyncRunner
 from resin_models_cuda.deepseek_v4.checkpoint import (
     load_config,
     resolve_model_path,
@@ -54,7 +55,7 @@ def _default_dtype(dtype: Any) -> Iterator[None]:
         torch.set_default_dtype(previous)
 
 
-class DeepSeekV4FlashCudaRunner:
+class DeepSeekV4FlashCudaRunner(SyncRunner):
     """Dynamically batched runner over Resin's DeepSeek-V4 implementation."""
 
     supports_continuation_prefill = False

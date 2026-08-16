@@ -46,6 +46,7 @@ from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.loading import default_device
+from resin.protocols import SyncRunner
 from resin_models_cuda.gpt_oss.checkpoint import (
     DEFAULT_MODEL,
     load_model,
@@ -197,7 +198,7 @@ class _DeviceAttentionBatch:
     sliding: PagedKvTable
 
 
-class GptOssCudaRunner:
+class GptOssCudaRunner(SyncRunner):
     """GPT-OSS BF16 attention on FA4 over one flat native cache pool."""
 
     # A continuation remains an explicit prefill row even when it contains one
