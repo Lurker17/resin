@@ -86,6 +86,8 @@ Test prefix caching with real continuation requests. A hit must prefill the
 uncached suffix as one chunk, restore recurrent and sliding-window state at the
 same checkpoint, and copy on write before mutating shared pages. Cover:
 
+- a fixture long enough to publish at least one aligned cache checkpoint; a
+  short prompt below the model's shared block alignment cannot produce a hit;
 - zero-hit and exact-hit requests;
 - hits immediately before and after every cache block/checkpoint boundary;
 - a long generated response followed by another user turn;
@@ -109,6 +111,37 @@ fast kernel can still produce slow generation when acceptance collapses. Test
 greedy and stochastic sampling with fixed seeds, EOS inside a draft block, and
 page/checkpoint crossings inside the verified block.
 
+At temperature zero, speculative decoding must produce exactly the same token
+sequence as target-only decoding. Compare tokens, not whether both answers look
+reasonable. Run this parity check for short and long generations, every
+verification-block size, fresh and prefix-cached prompts, and blocks that cross
+full-attention, sliding-window, or recurrent-checkpoint boundaries. Any first
+divergence is a correctness bug in verification, acceptance, commit, rollback,
+or cache addressing; a later repetition loop is only a symptom.
+
+Give every block-verification forward path a sequential oracle: compare each
+column's target logits and the final full-attention, sliding-window, and
+recurrent state with repeated one-token target decode from the same starting
+state. End-to-end acceptance can conceal an incorrect later column until a
+particular draft pattern exercises it.
+
+## Isolating regressions
+
+Do not infer model quality from one plausible response, or attribute a
+regression to tensor parallelism, the GPU node, or deployment state before
+isolating the runner. Hold the checkpoint, prompt, sampling parameters, and seed
+fixed, then compare target-only against speculative decoding, eager against
+graph replay, and fresh prefill against prefix reuse. Compare exact greedy token
+IDs and locate the first divergence. This turns intermittent gibberish into a
+small forward-path or state-management problem instead of a subjective quality
+judgment.
+
+Repeat deterministic probes from a clean runner and after unrelated requests.
+First-turn success does not rule out stale workspace, recurrent state, page
+reuse, or graph-buffer bugs. Conversely, a correct target-only run with a broken
+speculative run localizes the fault to verification or commit semantics rather
+than the checkpoint or renderer.
+
 ## Minimum validation
 
 Before publishing a runner:
@@ -119,11 +152,13 @@ Before publishing a runner:
    shape-specialized compilation required by the first.
 3. Verify CUDA graph capture/replay and prefix-cache parity across page and
    recurrent-state boundaries.
-4. Include a deterministic long-form oracle, such as an exact count or copied
+4. Verify exact greedy token parity between target-only and speculative decode
+   for every supported verification-block size and cache-boundary regime.
+5. Include a deterministic long-form oracle, such as an exact count or copied
    token pattern, that crosses many attention tiles and must terminate with EOS.
    Short conversational answers are too forgiving to expose cache-index drift.
-5. Stress multiple requests, cancellation, EOS, cache pressure, and page reuse.
-6. Record TTFT, output tok/s, speculative acceptance, phase timings, and a
+6. Stress multiple requests, cancellation, EOS, cache pressure, and page reuse.
+7. Record TTFT, output tok/s, speculative acceptance, phase timings, and a
    Perfetto trace. Compare kernel dispatches with the fastest trusted runner.
-7. Warm every unavoidable library/kernel regime during startup, then confirm a
+8. Warm every unavoidable library/kernel regime during startup, then confirm a
    warm server has no lazy compilation stalls.
