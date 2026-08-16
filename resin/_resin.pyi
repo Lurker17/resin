@@ -387,7 +387,7 @@ class Engine:
     def submit(
         self,
         /,
-        token_ids: Sequence[int],
+        token_ids: Sequence[int] | None = None,
         max_new_tokens: int | None = None,
         *,
         priority: int = 0,

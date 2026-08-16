@@ -341,7 +341,7 @@ fn admit(
         let input_tokens = rendered.token_ids.len();
         let lease = engine.bind(py).borrow_mut().submit(
             py,
-            rendered.token_ids,
+            Some(rendered.token_ids),
             Some(job.request.max_output_tokens),
             0,
             None,

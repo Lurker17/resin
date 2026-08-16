@@ -1124,7 +1124,7 @@ impl Engine {
     }
 
     #[pyo3(signature = (
-        token_ids,
+        token_ids = None,
         max_new_tokens = None,
         *,
         priority = 0,
@@ -1137,7 +1137,7 @@ impl Engine {
     fn submit(
         &mut self,
         py: Python<'_>,
-        token_ids: Vec<u32>,
+        token_ids: Option<Vec<u32>>,
         max_new_tokens: Option<usize>,
         priority: i32,
         batch_key: Option<u64>,
@@ -1146,6 +1146,18 @@ impl Engine {
         media: Option<Py<PyAny>>,
     ) -> PyResult<Py<RequestLease>> {
         self.raise_if_open()?;
+        let token_ids = match token_ids {
+            Some(token_ids) => token_ids,
+            None => media
+                .as_ref()
+                .ok_or_else(|| {
+                    PyValueError::new_err(
+                        "token_ids may be omitted only when media supplies token_ids",
+                    )
+                })?
+                .getattr(py, "token_ids")?
+                .extract(py)?,
+        };
         if token_ids.is_empty() {
             return Err(PyValueError::new_err("token_ids must be non-empty"));
         }

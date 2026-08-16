@@ -347,6 +347,23 @@ class TestSchedulerConfigContract:
         ]
         assert all(plan.media == (payload,) for plan in runner.plans)
 
+    def test_media_can_supply_its_own_token_ids(self) -> None:
+        class Media:
+            token_ids = [4, 5]
+
+        runner = RecordingRunner()
+        engine = Engine(runner)
+        media = Media()
+
+        engine.submit(max_new_tokens=1, media=media)
+        engine.step()
+
+        assert runner.plans[0].token_ids.tolist() == [4, 5]
+        assert runner.plans[0].media == (media,)
+
+        with pytest.raises(ValueError, match="only when media supplies"):
+            engine.submit(max_new_tokens=1)
+
     def test_batch_plan_phase_is_batch_homogeneous(self) -> None:
         prefill = BatchPlan(
             [7, 8],
