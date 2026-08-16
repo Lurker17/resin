@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use numpy::{PyArray1, PyArrayLike1};
-use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{
+    PyAttributeError, PyMemoryError, PyRuntimeError, PyTypeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
@@ -837,6 +839,7 @@ struct RequestData {
     turn_ordinal: u128,
     running: bool,
     prompt: Vec<u32>,
+    cache_prompt: Option<Vec<u32>>,
     resident_tokens: u32,
     generated: Vec<u32>,
     max_new_tokens: usize,
@@ -1161,6 +1164,22 @@ impl Engine {
         if token_ids.is_empty() {
             return Err(PyValueError::new_err("token_ids must be non-empty"));
         }
+        let cache_prompt = match media.as_ref() {
+            Some(media) => match media.getattr(py, "cache_token_ids") {
+                Ok(identity) => {
+                    let identity: Vec<u32> = identity.extract(py)?;
+                    if identity.len() != token_ids.len() {
+                        return Err(PyValueError::new_err(
+                            "media cache_token_ids must match token_ids length",
+                        ));
+                    }
+                    Some(identity)
+                }
+                Err(error) if error.is_instance_of::<PyAttributeError>(py) => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
         if max_new_tokens == Some(0) {
             return Err(PyValueError::new_err("max_new_tokens must be positive"));
         }
@@ -1217,11 +1236,14 @@ impl Engine {
                     .map_err(cache_pool_error)
             })
             .transpose()?;
-        // Token identity alone is insufficient to identify multimodal KV. Keep
-        // media-bearing requests out of the token-only prefix cache.
-        let resident_tokens = match (&mut self.kv_resources, &mut pages, &media) {
-            (Some(resources), Some(pages), None) => resources
-                .restore_prefix(pages, &token_ids)
+        // Media may provide a same-length, digest-derived identity stream. A
+        // media object without one stays out of the token-only prefix cache.
+        let cache_identity = cache_prompt
+            .as_deref()
+            .or_else(|| media.is_none().then_some(token_ids.as_slice()));
+        let resident_tokens = match (&mut self.kv_resources, &mut pages, cache_identity) {
+            (Some(resources), Some(pages), Some(identity)) => resources
+                .restore_prefix(pages, identity)
                 .map_err(cache_pool_error)?,
             _ => 0,
         };
@@ -1235,6 +1257,7 @@ impl Engine {
                 turn_ordinal: 0,
                 running: false,
                 prompt: token_ids,
+                cache_prompt,
                 resident_tokens,
                 generated: Vec::new(),
                 max_new_tokens,
@@ -1944,7 +1967,7 @@ impl Engine {
         };
         for (row, progress) in batch.rows.iter_mut().zip(progress) {
             if !progress.apply
-                || row.request.media.is_some()
+                || (row.request.media.is_some() && row.request.cache_prompt.is_none())
                 || progress.resident_tokens == 0
                 || progress.resident_tokens % alignment != 0
             {
@@ -1961,7 +1984,12 @@ impl Engine {
                         .saturating_add(progress.sampled_tokens.len()),
                 )
                 .map_err(|_| PyMemoryError::new_err("could not publish prefix token identity"))?;
-            tokens.extend_from_slice(&row.request.prompt);
+            tokens.extend_from_slice(
+                row.request
+                    .cache_prompt
+                    .as_deref()
+                    .unwrap_or(&row.request.prompt),
+            );
             tokens.extend_from_slice(&row.request.generated);
             tokens.extend_from_slice(&progress.sampled_tokens);
             if resident > tokens.len() {
@@ -2429,6 +2457,7 @@ mod tests {
                 turn_ordinal: 0,
                 running: false,
                 prompt: prompt.to_vec(),
+                cache_prompt: None,
                 resident_tokens: if generated.is_empty() {
                     0
                 } else {

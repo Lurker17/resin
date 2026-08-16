@@ -229,6 +229,34 @@ class TestFlatCacheEngine:
         assert engine.prefix_cache_stats == (0, 1, 1, 2)
         assert engine.cache_occupied_block_count == 0
 
+    def test_media_digest_identity_controls_prefix_reuse(self) -> None:
+        class Media:
+            token_ids = [1, 2, 3, 4]
+
+            def __init__(self, identity: list[int]) -> None:
+                self.cache_token_ids = identity
+
+        layout = CacheLayout(4, [CacheGroupLayout(2)])
+        runner = RecordingCachedRunner(layout)
+        engine = Engine(runner, prefix_cache=True)
+
+        first = Media([1, 101, 102, 4])
+        engine.submit(media=first, max_new_tokens=1)
+        while engine.has_work():
+            engine.step()
+
+        same_media = Media([1, 101, 102, 4])
+        engine.submit(media=same_media, max_new_tokens=1)
+        while engine.has_work():
+            engine.step()
+        assert runner.plans[-1].context_lengths.tolist() == [2]
+        assert runner.plans[-1].media == (same_media,)
+
+        changed_media = Media([1, 201, 202, 4])
+        engine.submit(media=changed_media, max_new_tokens=1)
+        engine.step()
+        assert runner.plans[-1].context_lengths.tolist() == [0]
+
     def test_prefix_cache_is_disabled_by_default(self) -> None:
         runner = RecordingCachedRunner(CacheLayout(2, [CacheGroupLayout(2)]))
         engine = Engine(runner)
