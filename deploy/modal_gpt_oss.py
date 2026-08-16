@@ -761,6 +761,8 @@ def _initialize_tensor_parallel(
         )
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
+    if tensor_parallel_size == 1:
+        return TensorParallelContext()
     dist.init_process_group(
         backend="nccl",
         init_method=f"tcp://127.0.0.1:{master_port}",
@@ -1094,7 +1096,11 @@ def _serve_http_rank(
     tensor_parallel = _initialize_tensor_parallel(
         rank, tensor_parallel_size, master_port
     )
-    control_group = dist.new_group(backend="gloo", timeout=timedelta(minutes=30))
+    control_group = (
+        dist.new_group(backend="gloo", timeout=timedelta(minutes=30))
+        if tensor_parallel.enabled
+        else None
+    )
     install_flashinfer_hash_cache()
     per_request_capacity = _required_parent_capacity(131072, 1)
     runner = _new_cuda_runner(
@@ -1109,6 +1115,7 @@ def _serve_http_rank(
     _capture_cuda_graphs(runner)
 
     if rank != 0:
+        assert control_group is not None
         print("[http-startup] follower ready for rank-zero commands", flush=True)
         follow_tensor_parallel_server(runner, control_group, dist)
         os._exit(0)
@@ -1116,10 +1123,15 @@ def _serve_http_rank(
     print("[http-startup] loading tokenizer and renderer...", flush=True)
     tokenizer, renderer = _load_renderer(model_path)
     print("[http-startup] tokenizer and renderer loaded", flush=True)
-    coordinated_runner = TensorParallelServerRunner(runner, control_group, dist)
+    coordinated_runner = (
+        TensorParallelServerRunner(runner, control_group, dist)
+        if control_group is not None
+        else None
+    )
+    engine_runner = coordinated_runner or runner
     print("[http-startup] creating engine and binding shared cache...", flush=True)
     engine = Engine(
-        coordinated_runner,
+        engine_runner,
         max_running_requests=8,
         context_length=131072,
         scheduler_config=SchedulerConfig(
@@ -1151,7 +1163,8 @@ def _serve_http_rank(
     finally:
         if not engine.closed:
             engine.close()
-        coordinated_runner.close_followers()
+        if coordinated_runner is not None:
+            coordinated_runner.close_followers()
     os._exit(0)
 
 
