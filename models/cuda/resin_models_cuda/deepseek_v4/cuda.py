@@ -454,18 +454,33 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         sequence_length = max(plan.positions) + 1
         shape = self._graphs.match(
             lambda candidate: (
-                candidate[0] == batch_size and candidate[1] >= sequence_length
+                candidate[0] >= batch_size and candidate[1] >= sequence_length
             )
         )
         if shape is None:
             self._graphs.fallback("shape")
             return None
+        padding = shape[0] - batch_size
         inputs: dict[str, object] = {
-            "token_ids": plan.token_ids,
-            "positions": plan.positions,
+            "token_ids": tuple(plan.token_ids) + (0,) * padding,
+            "positions": tuple(plan.positions) + (1,) * padding,
         }
-        inputs.update(self._sampler.host_inputs(plan, self.vocab_size))
-        output = self._graphs.run(shape, inputs)
+        sampling_inputs = self._sampler.host_inputs(plan, self.vocab_size)
+        sampling_padding = {
+            "sampling_temperatures": 1.0,
+            "sampling_top_ps": 1.0,
+            "sampling_top_ks": self.vocab_size,
+            "sampling_seeds": 0,
+            "sampling_offsets": 0,
+            "sampling_stochastic_mask": False,
+        }
+        inputs.update(
+            {
+                name: tuple(values) + (sampling_padding[name],) * padding
+                for name, values in sampling_inputs.items()
+            }
+        )
+        output = self._graphs.run(shape, inputs)[:batch_size]
         phase_events = self._dspark_phase_events.get(shape)
         if phase_events is not None:
             start, draft_end, verify_end, step_end = phase_events

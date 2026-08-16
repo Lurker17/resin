@@ -248,6 +248,7 @@ class TestDeepSeekV4Weights:
             "fp4_fused_moe",
             "fp4_gemm",
             "fp8_gemm",
+            "fp8_gemm_uses_packed_scales",
             "prepare_fp4_fused_moe_weights",
         ):
             setattr(gemm, name, None)
@@ -449,6 +450,52 @@ class TestDeepSeekV4Gemms:
             "recipe_b": (1, 128),
             "disable_ue8m0_cast": True,
         }
+
+    def test_fp8_prefill_uses_dynamic_trtllm_gemm_and_aligns_rows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        deepseek_gemm = self._module(monkeypatch)
+
+        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def flashinfer_gemm(*args: object, **kwargs: object) -> torch.Tensor:
+            calls.append((args, kwargs))
+            return kwargs["out"]
+
+        monkeypatch.setattr(
+            deepseek_gemm, "gemm_fp8_nt_groupwise", flashinfer_gemm
+        )
+        monkeypatch.setattr(
+            deepseek_gemm.torch, "get_default_dtype", lambda: torch.bfloat16
+        )
+        left = torch.zeros(1, 129, 256, dtype=torch.float8_e4m3fn)
+        left_scales = torch.ones(1, 129, 2, dtype=torch.float8_e8m0fnu)
+        right = torch.zeros(128, 256, dtype=torch.float8_e4m3fn)
+        right_scales = torch.ones(1, 2, dtype=torch.float8_e8m0fnu)
+
+        output = deepseek_gemm.fp8_gemm(
+            left,
+            left_scales,
+            right,
+            right_scales,
+            torch.float8_e8m0fnu,
+        )
+
+        assert output.shape == (1, 129, 128)
+        assert output.dtype == torch.bfloat16
+        args, kwargs = calls[0]
+        assert args[0].shape == (132, 256)
+        assert torch.count_nonzero(args[0][129:].float()) == 0
+        assert args[2].shape == (132, 2)
+        assert args[2].dtype == torch.float32
+        assert torch.all(args[2][129:] == 1)
+        assert args[3].shape == (1, 2)
+        assert args[3].dtype == torch.float32
+        assert kwargs["scale_major_mode"] is None
+        assert kwargs["scale_granularity_mnk"] == (1, 128, 128)
+        assert kwargs["out"].shape == (132, 128)
+        assert kwargs["out"].dtype == torch.bfloat16
+        assert kwargs["backend"] == "trtllm"
 
     def test_fp4_uses_deep_gemm_with_native_asymmetric_scale_recipes(
         self, monkeypatch: pytest.MonkeyPatch
@@ -793,6 +840,59 @@ class TestDeepSeekV4BatchPlan:
         assert inputs["positions"] == (1, 1, 1)
         assert inputs["sampling_top_ks"] == (256, 256, 256)
         assert inputs["sampling_stochastic_mask"] == (False, False, False)
+
+    def test_decode_graph_pads_to_the_next_configured_batch_bucket(self) -> None:
+        runner = DeepSeekV4FlashCudaRunner.__new__(DeepSeekV4FlashCudaRunner)
+        runner.vocab_size = 32
+        runner.speculative_tokens = 0
+        runner._dspark_phase_events = {}
+
+        class Graphs:
+            shapes = ((1, 128), (2, 128), (4, 128), (8, 128))
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[tuple[int, int], dict[str, object]]] = []
+
+            def match(self, predicate):
+                return next((shape for shape in self.shapes if predicate(shape)), None)
+
+            def fallback(self, _reason: str) -> None:
+                raise AssertionError("the padded graph ladder should match")
+
+            def run(self, shape, inputs):
+                self.calls.append((shape, inputs))
+                return list(range(shape[0]))
+
+        class Sampler:
+            @staticmethod
+            def host_inputs(plan, vocab_size):
+                rows = plan.num_sequences
+                return {
+                    "sampling_temperatures": (0.5,) * rows,
+                    "sampling_top_ps": (0.9,) * rows,
+                    "sampling_top_ks": (vocab_size - 1,) * rows,
+                    "sampling_seeds": tuple(range(rows)),
+                    "sampling_offsets": (7,) * rows,
+                    "sampling_stochastic_mask": (True,) * rows,
+                }
+
+        runner._graphs = Graphs()
+        runner._sampler = Sampler()
+        plan = SimpleNamespace(
+            num_sequences=3,
+            token_ids=[5, 6, 7],
+            positions=[11, 12, 13],
+        )
+
+        assert runner._graph_forward(plan) == [0, 1, 2]
+        shape, inputs = runner._graphs.calls[0]
+        assert shape == (4, 128)
+        assert inputs["token_ids"] == (5, 6, 7, 0)
+        assert inputs["positions"] == (11, 12, 13, 1)
+        assert inputs["sampling_temperatures"] == (0.5, 0.5, 0.5, 1.0)
+        assert inputs["sampling_top_ps"] == (0.9, 0.9, 0.9, 1.0)
+        assert inputs["sampling_top_ks"] == (31, 31, 31, 32)
+        assert inputs["sampling_stochastic_mask"] == (True, True, True, False)
 
     def test_ragged_prefill_then_decode_owns_compact_rows(self) -> None:
         runner = self._runner()

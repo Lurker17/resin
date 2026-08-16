@@ -62,7 +62,15 @@ image = build_modal_image(
         "TORCH_CUDA_ARCH_LIST": "10.3",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "FLASHINFER_WORKSPACE_BASE": "/kernel-cache",
+        # Keep lazy kernel work visible in Modal logs. FLASHINFER_LOGLEVEL is
+        # intentionally left disabled: API-call tracing would emit once per
+        # layer and decode step rather than only when a kernel is prepared.
+        "FLASHINFER_LOGGING_LEVEL": "INFO",
+        "FLASHINFER_LOG_LEVEL": "INFO",
+        "CUDA_TILE_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/cutile-python",
         "DG_JIT_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/deep_gemm",
+        "DG_JIT_DEBUG": "1",
+        "DG_JIT_PRINT_LOAD_TIME": "1",
         "TRITON_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/triton",
         "TILELANG_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/tilelang",
     },
@@ -927,7 +935,7 @@ def _serve_http_rank(
     runner = DeepSeekV4FlashCudaRunner(
         model_path,
         max_seq_len=32768,
-        max_batch_size=8,
+        max_batch_size=128,
         tensor_parallel=tensor_parallel,
         device=f"cuda:{rank}",
         cuda_graph_decode_shapes=tuple(
@@ -935,7 +943,7 @@ def _serve_http_rank(
                 batch_size,
                 32768 + DSPARK_TOKENS + 1,
             )
-            for batch_size in range(1, 9)
+            for batch_size in (1, 2, 4, 8, 16, 32, 64, 128)
         ),
         speculative_tokens=DSPARK_TOKENS,
     )
@@ -958,32 +966,42 @@ def _serve_http_rank(
     coordinated_runner = TensorParallelServerRunner(runner, control_group, dist)
     engine = Engine(
         coordinated_runner,
-        max_running_requests=8,
+        max_running_requests=128,
         context_length=32768,
         scheduler_config=SchedulerConfig(
-            max_batch_tokens=32768,
+            max_batch_tokens=128 * 32768,
             prefill_chunk_size=32768,
         ),
         eos_token_id=runner.eos_token_id,
     )
-    for prompt, thinking_mode, reasoning_effort in (
-        ("hi", "chat", "low"),
+    warmups = (
+        # Exercise the precompiled large-prefill GEMM and dynamic sparse
+        # attention once. Exact prompt lengths must not need their own warmup.
+        ("word " * 4096, "chat", "low"),
         ("Reply with one word.", "thinking", "high"),
-    ):
+    )
+    for prompt, thinking_mode, reasoning_effort in warmups:
+        prompt_ids = _encode_prompt(
+            tokenizer,
+            encoding,
+            prompt,
+            thinking_mode,
+            reasoning_effort,
+        )
+        warmup_started = time.perf_counter()
         warmup = engine.submit(
-            _encode_prompt(
-                tokenizer,
-                encoding,
-                prompt,
-                thinking_mode,
-                reasoning_effort,
-            ),
+            prompt_ids,
             max_new_tokens=2,
             sampling_params=SamplingParams(temperature=0.0),
         )
         while engine.has_work():
             engine.step()
         warmup.take_result()
+        print(
+            f"[prefill-warmup] {len(prompt_ids)} tokens ({thinking_mode}, "
+            f"{reasoning_effort}) in {time.perf_counter() - warmup_started:.2f}s",
+            flush=True,
+        )
     torch.cuda.synchronize(runner.device)
     kernel_cache_volume.commit()
     try:
@@ -1008,7 +1026,7 @@ def _serve_http_rank(
     scaledown_window=15 * 60,
     max_containers=1,
 )
-@modal.concurrent(max_inputs=16, target_inputs=16)
+@modal.concurrent(max_inputs=128, target_inputs=128)
 @modal.web_server(
     8000,
     startup_timeout=60 * 60,

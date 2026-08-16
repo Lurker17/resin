@@ -1678,7 +1678,6 @@ def _sparse_attention_kernel(
     output: _StaticLastTwoDims,
     heads: _ConstantInt,
     dimension: _ConstantInt,
-    index_width: _ConstantInt,
     softmax_scale: float,
 ):
     sequence = ct.bid(0)
@@ -1690,6 +1689,10 @@ def _sparse_attention_kernel(
     denominator = ct.full((heads, 1), 1.0, dtype=ct.float32)
     accumulator = ct.full((heads, dimension), 0.0, dtype=ct.float32)
     dimensions = ct.arange(dimension, dtype=ct.int32).reshape((1, dimension))
+    # Keep the number of sparse blocks dynamic. Prompt length determines this
+    # width, so specializing it would compile a new kernel for each 64-token
+    # context-width increment and stall an otherwise warm server.
+    index_width = ct.assume_divisible_by(indices.shape[-1], 64)
     for index_block in range(index_width // 64):
         selected = ct.load(
             indices, (batch, sequence, index_block), shape=(1, 1, 64)
@@ -1750,7 +1753,6 @@ def sparse_attn(
             output,
             query.shape[2],
             query.shape[3],
-            padded,
             softmax_scale,
         ),
     )

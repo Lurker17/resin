@@ -45,6 +45,7 @@ from resin_models_cuda.deepseek_v4.gemm import (
     fp4_fused_moe,
     fp4_gemm,
     fp8_gemm,
+    fp8_gemm_uses_packed_scales,
     prepare_fp4_fused_moe_weights,
 )
 from resin_models_cuda.deepseek_v4.tilelang_kernels import mhc_pre_norm
@@ -178,12 +179,13 @@ def linear(
         )
         return fp4_gemm(x, s, weight, weight.scale, scale_dtype)
     elif weight.dtype == torch.float8_e4m3fn:
+        rows = x.numel() // x.shape[-1]
         x, s = act_quant(
             x,
             block_size,
             scale_fmt,
             scale_dtype,
-            packed_scales=True,
+            packed_scales=fp8_gemm_uses_packed_scales(rows),
         )
         return fp8_gemm(x, s, weight, weight.scale, scale_dtype)
     else:

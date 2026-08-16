@@ -10,9 +10,12 @@ from flashinfer.fused_moe import (
     reorder_rows_for_gated_act_gemm,
     trtllm_fp4_block_scale_routed_moe,
 )
+from flashinfer.gemm import gemm_fp8_nt_groupwise
 from flashinfer.quantization import block_scale_interleave, shuffle_matrix_a
 from flashinfer.tllm_enums import ActivationType
 from torch import Tensor
+
+_DEEP_GEMM_MAX_ROWS = 128
 
 
 def _cached_transform(
@@ -30,6 +33,12 @@ def _cached_transform(
     return result
 
 
+def fp8_gemm_uses_packed_scales(rows: int) -> bool:
+    """Keep captured decode buckets on DeepGEMM; use TRT-LLM for prefills."""
+
+    return rows <= _DEEP_GEMM_MAX_ROWS
+
+
 def fp8_gemm(
     left: Tensor,
     left_scales: Tensor,
@@ -37,7 +46,7 @@ def fp8_gemm(
     right_scales: Tensor,
     scale_dtype: torch.dtype = torch.float32,
 ) -> Tensor:
-    """Run the checkpoint's K128-block W8A8 GEMM with DeepGEMM."""
+    """Run the checkpoint's K128-block W8A8 GEMM."""
 
     if scale_dtype != torch.float8_e8m0fnu:
         raise ValueError("DeepSeek-V4 FP8 scales must use float8_e8m0fnu")
@@ -49,20 +58,80 @@ def fp8_gemm(
     columns = right.shape[0]
     if right.shape != (columns, depth):
         raise ValueError("the FP8 weight must have logical shape (out, in)")
+    if depth % 128 or columns % 128:
+        raise ValueError("DeepSeek-V4 W8A8 dimensions must be divisible by 128")
+    expected_weight_scales = (columns // 128, depth // 128)
+    if (
+        right_scales.dtype != torch.float8_e8m0fnu
+        or right_scales.shape != expected_weight_scales
+    ):
+        raise ValueError(
+            "weight scales must be UE8M0 with shape "
+            f"{expected_weight_scales}, got {right_scales.dtype} "
+            f"{tuple(right_scales.shape)}"
+        )
+
+    if not fp8_gemm_uses_packed_scales(rows):
+        expected_activation_scales = (*left.shape[:-1], depth // 128)
+        if (
+            left_scales.dtype != torch.float8_e8m0fnu
+            or left_scales.shape != expected_activation_scales
+        ):
+            raise ValueError(
+                "prefill activation scales must be contiguous UE8M0 with shape "
+                f"{expected_activation_scales}, got {left_scales.dtype} "
+                f"{tuple(left_scales.shape)}"
+            )
+
+        # TensorRT-LLM ships a finite set of Blackwell GEMM tactics and keeps M
+        # runtime-dynamic. This avoids DeepGEMM selecting and JIT-compiling a
+        # new tile configuration when a warm server sees a novel prompt length.
+        matrix = left.view(rows, depth)
+        activation_scales = left_scales.view(rows, depth // 128).float()
+        aligned_rows = (rows + 3) // 4 * 4
+        if aligned_rows != rows:
+            padded_matrix = torch.zeros(
+                (aligned_rows, depth), dtype=matrix.dtype, device=matrix.device
+            )
+            padded_matrix[:rows].copy_(matrix)
+            matrix = padded_matrix
+            padded_scales = torch.ones(
+                (aligned_rows, depth // 128),
+                dtype=torch.float32,
+                device=matrix.device,
+            )
+            padded_scales[:rows].copy_(activation_scales)
+            activation_scales = padded_scales
+        weight_scales = _cached_transform(
+            right_scales,
+            "_resin_trtllm_float_scales",
+            lambda: right_scales.float().contiguous(),
+        )
+        output = torch.empty(
+            (aligned_rows, columns),
+            dtype=torch.get_default_dtype(),
+            device=left.device,
+        )
+        result = gemm_fp8_nt_groupwise(
+            matrix,
+            right,
+            activation_scales,
+            weight_scales,
+            scale_major_mode=None,
+            scale_granularity_mnk=(1, 128, 128),
+            out=output,
+            backend="trtllm",
+        )
+        return result[:rows].view(*left.shape[:-1], columns)
+
     expected_activation_scales = (rows, (depth // 128 + 3) // 4)
     if (
         left_scales.dtype != torch.int32
         or left_scales.shape != expected_activation_scales
     ):
         raise ValueError(
-            "activation scales must be packed UE8M0 with logical shape "
+            "decode activation scales must be packed UE8M0 with logical shape "
             f"{expected_activation_scales}, got {tuple(left_scales.shape)}"
-        )
-    expected_weight_scales = (columns // 128, depth // 128)
-    if right_scales.shape != expected_weight_scales:
-        raise ValueError(
-            f"weight scales must have shape {expected_weight_scales}, "
-            f"got {tuple(right_scales.shape)}"
         )
 
     # Expand the checkpoint's N128 blocks and pack them once. The runtime A
