@@ -19,17 +19,26 @@ if TYPE_CHECKING:
 class RMSNorm(nn.Module):
     def __init__(self, width: int, eps: float, *, with_scale: bool = True) -> None:
         super().__init__()
+        self.width = width
         self.eps = eps
         if with_scale:
             self.weight = nn.Parameter(torch.ones(width, dtype=torch.bfloat16))
         else:
             self.register_parameter("weight", None)
+        self.register_buffer("unit_weight", None, persistent=False)
 
     def forward(self, hidden: Tensor) -> Tensor:
-        if hidden.is_cuda and self.weight is not None:
+        if hidden.is_cuda:
             from quack import rmsnorm
 
-            return rmsnorm(hidden, self.weight, eps=self.eps)
+            weight = self.weight
+            if weight is None:
+                if self.unit_weight is None:
+                    self.unit_weight = torch.ones(
+                        self.width, dtype=hidden.dtype, device=hidden.device
+                    )
+                weight = self.unit_weight
+            return rmsnorm(hidden, weight, eps=self.eps)
         normalized = hidden.float()
         normalized *= torch.pow(
             normalized.square().mean(-1, keepdim=True) + self.eps, -0.5
