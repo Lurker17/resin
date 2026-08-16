@@ -192,6 +192,17 @@ def _generate(engine, processor, prompt: str, max_new_tokens: int):
 def smoke_test(max_new_tokens: int = 16) -> dict[str, Any]:
     torch, runner, processor, engine, report = _build_runtime()
     try:
+        warmup_started = time.perf_counter()
+        _, _, warmup_steps = _generate(
+            engine,
+            processor,
+            "Name the main colors.",
+            2,
+        )
+        torch.cuda.synchronize()
+        report["warmup_s"] = time.perf_counter() - warmup_started
+        report["warmup_step_ms"] = warmup_steps
+        torch.cuda.reset_peak_memory_stats()
         media, token_ids, steps = _generate(
             engine,
             processor,
@@ -199,7 +210,12 @@ def smoke_test(max_new_tokens: int = 16) -> dict[str, Any]:
             max_new_tokens,
         )
         torch.cuda.synchronize()
-        decode_ms = [step["ms"] for step in steps[1:] if step["tokens"]]
+        first_token_step = next(
+            index for index, step in enumerate(steps) if step["tokens"]
+        )
+        decode_ms = [
+            step["ms"] for step in steps[first_token_step + 1 :] if step["tokens"]
+        ]
         report.update(
             {
                 "prompt_tokens": len(media.token_ids),
@@ -209,6 +225,7 @@ def smoke_test(max_new_tokens: int = 16) -> dict[str, Any]:
                     token_ids, skip_special_tokens=True
                 ),
                 "step_ms": steps,
+                "ttft_ms": sum(step["ms"] for step in steps[: first_token_step + 1]),
                 "mean_tpot_ms": sum(decode_ms) / len(decode_ms) if decode_ms else 0.0,
                 "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                 "prefix_cache": engine.prefix_cache_stats,
