@@ -16,7 +16,6 @@ import torch
 from resin import BatchPhase, CacheGroupLayout, CacheLayout, StateMappingConfig
 from resin.backend.checks import nonempty_plan
 from resin.backend.checks import token_ids as check_token_ids
-from resin.backend.cuda.attention import paged_fa4
 from resin.backend.cuda.execution import CudaCompletion, CudaExecutor
 from resin.backend.cuda.mapped_state import MappedStateArena
 from resin.backend.cuda.paged_kv import PagedKvArena, PagedKvCsr
@@ -391,19 +390,29 @@ class Lfm2CudaRunner(AsyncRunner):
 
         if metadata["continuation_prefill_max_q_len"]:
             continuation_token_indices = metadata["continuation_prefill_token_indices"]
-            continuation_output = paged_fa4(
-                self._fa4,
+            continuation_output = self._fa4(
                 queries[continuation_token_indices],
                 k_cache,
                 v_cache,
                 cu_seqlens_q=metadata["continuation_prefill_cu_seqlens"],
+                cu_seqlens_k=None,
                 max_seqlen_q=metadata["continuation_prefill_max_q_len"],
-                page_table=metadata["continuation_prefill_page_table"],
-                seqused_k=metadata["continuation_prefill_seqused_k"],
-                min_seqlen_k=metadata["continuation_prefill_min_seqlen_k"],
                 max_seqlen_k=metadata["continuation_prefill_max_seqlen_k"],
+                min_seqlen_k=metadata["continuation_prefill_min_seqlen_k"],
+                seqused_q=None,
+                seqused_k=metadata["continuation_prefill_seqused_k"],
+                page_table=metadata["continuation_prefill_page_table"],
                 softmax_scale=self.scale,
+                causal=True,
+                window_size=(None, None),
+                softcap=0.0,
+                num_splits=1,
+                pack_gqa=True,
+                deterministic=False,
+                return_lse=False,
             )
+            if isinstance(continuation_output, tuple):
+                continuation_output = continuation_output[0]
             output[continuation_token_indices] = continuation_output
 
         if decode:

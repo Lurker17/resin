@@ -32,7 +32,6 @@ from resin import BatchPhase, CacheGroupLayout, CacheLayout
 from resin.backend.checks import positions as check_positions
 from resin.backend.checks import positive_int
 from resin.backend.checks import token_ids as check_token_ids
-from resin.backend.cuda.attention import paged_fa4
 from resin.backend.cuda.graphs import (
     CudaGraphCache,
     CudaGraphStats,
@@ -562,21 +561,30 @@ class GptOssCudaRunner(SyncRunner):
         value_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
             0, group.append_slots, value
         )
-        output = paged_fa4(
-            self._fa4,
+        output = self._fa4(
             query,
             key_cache,
             value_cache,
             cu_seqlens_q=batch.cu_seqlens_q,
+            cu_seqlens_k=None,
             max_seqlen_q=batch.max_seqlen_q,
-            page_table=group.page_table,
-            seqused_k=group.lengths,
-            min_seqlen_k=group.min_length,
             max_seqlen_k=group.max_length,
+            min_seqlen_k=group.min_length,
+            seqused_q=None,
+            seqused_k=group.lengths,
+            page_table=group.page_table,
             softmax_scale=self.softmax_scale,
+            causal=True,
             window_size=(_SLIDING_WINDOW - 1, 0) if sliding else (None, None),
+            softcap=0.0,
+            num_splits=1,
+            pack_gqa=True,
+            deterministic=False,
+            return_lse=False,
             learnable_sink=attention.sinks,
         )
+        if isinstance(output, tuple):
+            output = output[0]
         if output.dtype is not torch.bfloat16:
             raise TypeError("FA4 output tensor must be bfloat16")
         return attention.o_proj(output.reshape(1, token_count, -1))

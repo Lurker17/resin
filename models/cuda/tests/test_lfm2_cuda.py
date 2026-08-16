@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import gc
 import inspect
-import math
 import weakref
 from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
@@ -787,7 +786,9 @@ class TestLfm2CudaCachePoolBoundary:
         assert "plan.phase" in adapter_source
         assert "group.append_block_ids" in adapter_source
         assert "group.append_block_offsets" in adapter_source
-        assert "paged_fa4(" in inspect.getsource(Lfm2CudaRunner._attention)
+        attention_source = inspect.getsource(Lfm2CudaRunner._attention)
+        assert "self._fa4(" in attention_source
+        assert "num_splits=1" in attention_source
 
 
 class TestLfm2CudaRecurrentState:
@@ -961,172 +962,6 @@ class TestLfm2CudaRecurrentState:
         source = inspect.getsource(Lfm2CudaRunner)
         assert "_conv_cache" not in source
         assert "_InPlaceRecurrentState" in source
-
-
-class TestLfm2CudaFa4Continuation:
-    def test_exact_fa4_paged_surface(self) -> None:
-        from resin.backend.cuda.attention import paged_fa4
-
-        calls = []
-
-        def kernel(*args, **kwargs):
-            calls.append((args, kwargs))
-            return ("output", "lse")
-
-        values = {
-            "cu_seqlens_q": object(),
-            "page_table": object(),
-            "seqused_k": object(),
-        }
-        output = paged_fa4(
-            kernel,
-            "q",
-            "k_cache",
-            "v_cache",
-            cu_seqlens_q=values["cu_seqlens_q"],
-            max_seqlen_q=7,
-            page_table=values["page_table"],
-            seqused_k=values["seqused_k"],
-            min_seqlen_k=33,
-            max_seqlen_k=65,
-            softmax_scale=0.125,
-        )
-
-        assert output == "output"
-        assert calls[0][0] == ("q", "k_cache", "v_cache")
-        kwargs = calls[0][1]
-        assert kwargs["cu_seqlens_q"] is values["cu_seqlens_q"]
-        assert kwargs["cu_seqlens_k"] is None
-        assert kwargs["seqused_q"] is None
-        assert kwargs["seqused_k"] is values["seqused_k"]
-        assert kwargs["page_table"] is values["page_table"]
-        assert kwargs["max_seqlen_q"] == 7
-        assert kwargs["min_seqlen_k"] == 33
-        assert kwargs["max_seqlen_k"] == 65
-        assert kwargs["causal"]
-        assert kwargs["window_size"] == (None, None)
-        assert kwargs["num_splits"] == 1
-        assert kwargs["pack_gqa"]
-        assert not kwargs["deterministic"]
-        assert not kwargs["return_lse"]
-
-        paged_fa4(
-            kernel,
-            "q",
-            "k_cache",
-            "v_cache",
-            cu_seqlens_q=values["cu_seqlens_q"],
-            max_seqlen_q=1,
-            page_table=values["page_table"],
-            seqused_k=values["seqused_k"],
-            min_seqlen_k=1,
-            max_seqlen_k=128,
-            softmax_scale=0.125,
-            window_size=(127, 0),
-            learnable_sink="sink",
-        )
-        configured = calls[1][1]
-        assert configured["window_size"] == (127, 0)
-        assert configured["learnable_sink"] == "sink"
-
-    def test_bottom_right_causal_paged_call_matches_dense_suffix_oracle(self) -> None:
-        from resin.backend.cuda.attention import paged_fa4
-
-        query = [[0.5, -0.25], [0.1, 0.8], [-0.4, 0.3]]
-        key_cache = [
-            [[0.2, 0.1], [0.3, -0.2]],
-            [[-0.1, 0.7], [0.6, 0.4]],
-            [[0.9, -0.3], [0.2, 0.5]],
-            [[-0.5, 0.2], [0.8, -0.4]],
-            [[0.4, 0.6], [-0.2, -0.1]],
-        ]
-        value_cache = [
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[0.5, -0.5], [1.5, 0.5]],
-            [[-1.0, 0.2], [0.3, 0.7]],
-            [[0.8, -0.1], [-0.4, 1.2]],
-            [[0.6, 0.9], [-0.7, 0.4]],
-        ]
-        cu_seqlens_q = [0, 2, 3]
-        page_table = [[2, 0, 3], [1, 4, 1]]
-        seqused_k = [5, 3]
-        scale = 0.5
-
-        def logical_row(cache, row, length):
-            return [token for page in page_table[row] for token in cache[page]][:length]
-
-        def suffix_attention(q_row, k_row, v_row):
-            rows = []
-            for q_index, q_vector in enumerate(q_row):
-                last_key = q_index + len(k_row) - len(q_row)
-                scores = [
-                    scale * sum(q * k for q, k in zip(q_vector, k_vector))
-                    for k_vector in k_row[: last_key + 1]
-                ]
-                maximum = max(scores)
-                unnormalized = [math.exp(score - maximum) for score in scores]
-                denominator = sum(unnormalized)
-                weights = [weight / denominator for weight in unnormalized]
-                rows.append(
-                    [
-                        sum(
-                            weight * value_vector[dimension]
-                            for weight, value_vector in zip(weights, v_row)
-                        )
-                        for dimension in range(len(v_row[0]))
-                    ]
-                )
-            return rows
-
-        expected_rows = []
-        for row in range(2):
-            q_start, q_end = cu_seqlens_q[row : row + 2]
-            length = seqused_k[row]
-            expected_rows.append(
-                suffix_attention(
-                    query[q_start:q_end],
-                    logical_row(key_cache, row, length),
-                    logical_row(value_cache, row, length),
-                )
-            )
-        expected = [token for row in expected_rows for token in row]
-
-        def paged_oracle(q, k_cache, v_cache, **kwargs):
-            rows = []
-            cu = kwargs["cu_seqlens_q"]
-            lengths = kwargs["seqused_k"]
-            table = kwargs["page_table"]
-            assert kwargs["causal"]
-            for row in range(len(lengths)):
-                q_start, q_end = cu[row : row + 2]
-                length = lengths[row]
-                k_row = [token for page in table[row] for token in k_cache[page]][
-                    :length
-                ]
-                v_row = [token for page in table[row] for token in v_cache[page]][
-                    :length
-                ]
-                rows.extend(suffix_attention(q[q_start:q_end], k_row, v_row))
-            return rows
-
-        actual = paged_fa4(
-            paged_oracle,
-            query,
-            key_cache,
-            value_cache,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=2,
-            page_table=page_table,
-            seqused_k=seqused_k,
-            min_seqlen_k=3,
-            max_seqlen_k=5,
-            softmax_scale=scale,
-        )
-        for actual_row, expected_row in zip(actual, expected, strict=True):
-            for actual_value, expected_value in zip(
-                actual_row, expected_row, strict=True
-            ):
-                assert actual_value == pytest.approx(expected_value, abs=1e-12)
 
 
 class TestLfm2CudaAsyncLifecycle:
