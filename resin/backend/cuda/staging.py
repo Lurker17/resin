@@ -1,8 +1,10 @@
-"""Pinned host and device tensor staging without importing PyTorch."""
+"""Pinned host and asynchronous device tensor staging."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+
+import torch
 
 
 class StagingError(ValueError):
@@ -12,13 +14,12 @@ class StagingError(ValueError):
 class TensorStager:
     """Own host tensors until their asynchronous copies are complete."""
 
-    def __init__(self, torch, device) -> None:
-        self.torch = torch
+    def __init__(self, device) -> None:
         self.target_device = device
         self.host_tensors = {}
 
     def host(self, name: str, values, dtype):
-        tensor = self.torch.tensor(
+        tensor = torch.tensor(
             values,
             dtype=dtype,
             device="cpu",
@@ -33,7 +34,7 @@ class TensorStager:
         )
 
     def output(self, name: str, source):
-        tensor = self.torch.empty(
+        tensor = torch.empty(
             source.shape,
             dtype=source.dtype,
             device="cpu",

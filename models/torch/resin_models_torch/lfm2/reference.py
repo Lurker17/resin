@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from resin import RunnerConfig
@@ -104,12 +105,12 @@ class Lfm2TorchRunner(SyncRunner):
                         self._cache[row.request_id] = cache
                     caches.append(cache)
                 inputs = torch.tensor(
-                    [row.token_ids for row in rows],
+                    np.stack([row.token_ids for row in rows]),
                     dtype=torch.long,
                     device=self.device,
                 )
                 position_tensor = torch.tensor(
-                    [row.positions for row in rows],
+                    np.stack([row.positions for row in rows]),
                     dtype=torch.long,
                     device=self.device,
                 )
@@ -129,9 +130,11 @@ class Lfm2TorchRunner(SyncRunner):
             if cache is None:
                 cache = self._model.make_cache()
                 self._cache[row.request_id] = cache
-            inputs = torch.tensor([row.token_ids], dtype=torch.long, device=self.device)
+            inputs = torch.tensor(
+                row.token_ids[None], dtype=torch.long, device=self.device
+            )
             position_tensor = torch.tensor(
-                [row.positions], dtype=torch.long, device=self.device
+                row.positions[None], dtype=torch.long, device=self.device
             )
             logits = self._model(inputs, cache, position_tensor, logits_to_keep=1)
             logits_rows.append(logits[:, -1, :])

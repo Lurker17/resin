@@ -23,7 +23,7 @@ class TestImport:
 
     def test_accelerator_dependencies_are_optional(self) -> None:
         project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
-        assert project["dependencies"] == ["blake3>=1.0,<2"]
+        assert project["dependencies"] == ["blake3>=1.0,<2", "numpy>=1.26,<3"]
         optional_dependencies = project["optional-dependencies"]
         assert "torch" not in optional_dependencies
         assert "demo" not in optional_dependencies

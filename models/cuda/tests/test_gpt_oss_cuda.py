@@ -226,17 +226,19 @@ class TestGptOssCudaNativePlan:
         assert batch.phase == BatchPhase.PREFILL
         assert batch.sequence_indices == (0, 1)
         assert batch.query_lengths == (128, 5)
-        assert batch.token_indices[:3] == (0, 1, 2)
-        assert batch.token_indices[-3:] == (130, 131, 132)
+        assert batch.token_indices[:3].tolist() == [0, 1, 2]
+        assert batch.token_indices[-3:].tolist() == [130, 131, 132]
         assert batch.full_width == 2
-        assert batch.full_table == (1, 1, 129, 130)
+        assert batch.full_table.tolist() == [1, 1, 129, 130]
         assert batch.full_lengths == (128, 135)
         assert batch.sliding_width == WINDOW_TABLE_WIDTH
-        assert batch.sliding_table[:WINDOW_TABLE_WIDTH] == (1025,) * WINDOW_TABLE_WIDTH
-        assert batch.sliding_table[WINDOW_TABLE_WIDTH : WINDOW_TABLE_WIDTH + 2] == (
-            1153,
-            1154,
+        assert (
+            batch.sliding_table[:WINDOW_TABLE_WIDTH].tolist()
+            == [1025] * WINDOW_TABLE_WIDTH
         )
+        assert batch.sliding_table[
+            WINDOW_TABLE_WIDTH : WINDOW_TABLE_WIDTH + 2
+        ].tolist() == [1153, 1154]
         assert batch.sliding_lengths == (128, 135)
         assert batch.full_append_slots[0] == 128
         assert batch.full_append_slots[-1] == 130 * 128 + 6
@@ -250,16 +252,16 @@ class TestGptOssCudaNativePlan:
         assert len(prefill) == 1
         batch = prefill[0]
         assert batch.query_lengths == (1,)
-        assert batch.token_indices == (0,)
-        assert batch.full_table == (1, 2, 3)
+        assert batch.token_indices.tolist() == [0]
+        assert batch.full_table.tolist() == [1, 2, 3]
         assert batch.full_lengths == (261,)
-        assert batch.sliding_table[:3] == (1025, 1026, 1027)
+        assert batch.sliding_table[:3].tolist() == [1025, 1026, 1027]
         assert batch.sliding_lengths == (261,)
 
     def test_graph_padding_repeats_only_pages_owned_by_each_row(self) -> None:
         _, batch = build_attention_batches(_decode_plan())
         assert batch is not None
-        assert GptOssCudaRunner._pad_page_table(batch, 4) == (
+        assert GptOssCudaRunner._pad_page_table(batch, 4).tolist() == [
             1,
             2,
             1,
@@ -268,7 +270,7 @@ class TestGptOssCudaNativePlan:
             130,
             131,
             129,
-        )
+        ]
 
     def test_decode_tables_and_append_slots_come_from_sparse_groups(self) -> None:
         _, batch = build_attention_batches(_decode_plan())
@@ -278,17 +280,18 @@ class TestGptOssCudaNativePlan:
         assert batch.sequence_indices == (0, 1)
         assert batch.query_lengths == (1, 1)
         assert batch.full_width == 3
-        assert batch.full_table == (1, 2, 1, 129, 130, 131)
+        assert batch.full_table.tolist() == [1, 2, 1, 129, 130, 131]
         assert batch.full_lengths == (131, 261)
-        assert batch.sliding_table[:3] == (1025, 1026, 1025)
-        assert batch.sliding_table[WINDOW_TABLE_WIDTH : WINDOW_TABLE_WIDTH + 3] == (
-            1153,
-            1154,
-            1155,
-        )
+        assert batch.sliding_table[:3].tolist() == [1025, 1026, 1025]
+        assert batch.sliding_table[
+            WINDOW_TABLE_WIDTH : WINDOW_TABLE_WIDTH + 3
+        ].tolist() == [1153, 1154, 1155]
         assert batch.sliding_lengths == (131, 261)
-        assert batch.sliding_append_slots == (1026 * 128 + 2, 1155 * 128 + 4)
-        assert batch.full_append_slots == (2 * 128 + 2, 131 * 128 + 4)
+        assert batch.sliding_append_slots.tolist() == [
+            1026 * 128 + 2,
+            1155 * 128 + 4,
+        ]
+        assert batch.full_append_slots.tolist() == [2 * 128 + 2, 131 * 128 + 4]
 
     def test_frozen_append_destinations_are_a_validation_oracle(self) -> None:
         plan = _prefill_plan()

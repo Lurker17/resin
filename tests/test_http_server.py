@@ -111,15 +111,15 @@ def test_tensor_parallel_plan_round_trip_preserves_native_contract() -> None:
 
     restored = batch_plan_from_payload(batch_plan_payload(plan))
 
-    assert restored.sequence_ids == plan.sequence_ids
-    assert restored.context_lengths == plan.context_lengths
-    assert restored.token_ids == plan.token_ids
-    assert restored.token_indptr == plan.token_indptr
+    assert restored.sequence_ids.tolist() == plan.sequence_ids.tolist()
+    assert restored.context_lengths.tolist() == plan.context_lengths.tolist()
+    assert restored.token_ids.tolist() == plan.token_ids.tolist()
+    assert restored.token_indptr.tolist() == plan.token_indptr.tolist()
     assert restored.phase == plan.phase
     assert restored.batch_id == plan.batch_id
     assert restored.batch_key == plan.batch_key
-    assert restored.sample_sequence_indices == [1]
-    assert restored.cache_groups[0].block_ids == [3, 4]
+    assert restored.sample_sequence_indices.tolist() == [1]
+    assert restored.cache_groups[0].block_ids.tolist() == [3, 4]
     assert restored.sampling_params[0].temperature == 0.5
     assert restored.sampling_params[1].top_p == 0.9
 

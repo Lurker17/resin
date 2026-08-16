@@ -24,7 +24,6 @@ from resin.backend.cuda.execution import CudaCompletion, CudaExecutor
 from resin.backend.cuda.paged_kv import PagedKvCsr
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
-from resin.backend.plans import plan_positions
 from resin.protocols import AsyncRunner
 from resin_models_cuda.lfm2.plan import CacheMetadata, build_cache_metadata
 from resin_models_torch.lfm2.reference import (
@@ -271,10 +270,10 @@ class Lfm2CudaRunner(AsyncRunner):
 
     def _state_rows(self, plan: BatchPlan) -> tuple[_StateRow, ...]:
         group = plan.cache_groups[1]
-        block_indptr = tuple(group.block_indptr)
-        block_ids = tuple(group.block_ids)
-        first_blocks = tuple(group.first_logical_blocks)
-        rows = len(plan.sequence_ids)
+        block_indptr = group.block_indptr
+        block_ids = group.block_ids
+        first_blocks = group.first_logical_blocks
+        rows = plan.num_sequences
         if (
             len(block_indptr) != rows + 1
             or block_indptr[0] != 0
@@ -285,17 +284,18 @@ class Lfm2CudaRunner(AsyncRunner):
         self._cache.check_pages(1, block_ids)
         result = []
         for index, context in enumerate(plan.context_lengths):
-            token_start, token_end = plan.token_indptr[index : index + 2]
+            context = int(context)
+            token_start, token_end = map(int, plan.token_indptr[index : index + 2])
             post_length = context + token_end - token_start
-            first = first_blocks[index]
-            page_start, page_end = block_indptr[index : index + 2]
+            first = int(first_blocks[index])
+            page_start, page_end = map(int, block_indptr[index : index + 2])
             pages = block_ids[page_start:page_end]
 
             def page(logical: int) -> int:
                 column = logical - first
                 if column < 0 or column >= len(pages):
                     raise ValueError("LFM2 state table does not cover a checkpoint")
-                return pages[column]
+                return int(pages[column])
 
             input_page = (
                 None
@@ -326,7 +326,7 @@ class Lfm2CudaRunner(AsyncRunner):
         prefill = derived.prefill
 
         if staging is None:
-            staging = TensorStager(torch, self.device)
+            staging = TensorStager(self.device)
         metadata = {"_pinned": staging.host_tensors, "_staging": staging}
         metadata.update(
             staging.tensors(
@@ -535,7 +535,7 @@ class Lfm2CudaRunner(AsyncRunner):
         conv_slot = self._conv_slot[layer_index]
         outputs = []
         for index, row in enumerate(recurrent_rows):
-            start, end = plan.token_indptr[index : index + 2]
+            start, end = map(int, plan.token_indptr[index : index + 2])
             state = self._cache.state(row.output_page)[conv_slot].unsqueeze(0)
             cache = _InPlaceRecurrentState(state)
             # The facade turns ShortConv's ``state.value = next_state`` into an
@@ -625,11 +625,11 @@ class Lfm2CudaRunner(AsyncRunner):
             completion.retain(metadata, recurrent_rows)
             tokens = completion.staging.device("tokens", plan.token_ids, torch.long)
             positions = completion.staging.device(
-                "positions", plan_positions(plan), torch.long
+                "positions", plan.positions, torch.long
             )
             final_indices = completion.staging.device(
                 "final_indices",
-                [end - 1 for end in plan.token_indptr[1:]],
+                plan.token_indptr[1:] - 1,
                 torch.long,
             )
             completion.retain(tokens, positions, final_indices)

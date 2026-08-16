@@ -88,14 +88,15 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
         token_ids=[5, 6, 7],
         sequence_ids=[1, 2, 3],
         context_lengths=[11, 12, 13],
+        positions=torch.tensor([11, 12, 13]).numpy(),
         token_indptr=[0, 1, 2, 3],
     )
 
     assert runner._graph_forward(plan, "cache-plan") == [11, 12, 13]
     shape, inputs = runner._graphs.calls[0]
     assert shape == (4, 128)
-    assert inputs["token_ids"] == (5, 6, 7, 0)
-    assert inputs["positions"] == (11, 12, 13, 1)
+    assert inputs["token_ids"].tolist() == [5, 6, 7, 0]
+    assert inputs["positions"].tolist() == [11, 12, 13, 1]
     assert inputs["cache.0.pages"] == (7, 8, 9, 0)
     assert inputs["sampling_top_ks"] == (32, 32, 32, 32)
 
@@ -150,7 +151,13 @@ def test_prefill_uses_fresh_prompt_then_replays_only_continuation_suffix() -> No
         phase=BatchPhase.PREFILL,
     )
 
-    logits = runner._prefill(plan, ((0, 2), (2, 4)), cache)
+    logits = runner._prefill(
+        plan,
+        ((0, 2), (2, 4)),
+        cache,
+        torch.tensor(plan.token_ids, dtype=torch.long),
+        torch.tensor(plan.positions, dtype=torch.long),
+    )
 
     assert logits.argmax(dim=-1).tolist() == [3, 9]
     assert runner._model.calls == [

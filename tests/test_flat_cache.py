@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 import resin
@@ -110,11 +111,35 @@ class TestFlatCacheApi:
         assert len(plan.cache_groups) == 1
         frozen = plan.cache_groups[0]
         assert frozen.group_index == group.group_index
-        assert frozen.block_indptr == [0, 2]
-        assert frozen.block_ids == [3, 4]
-        assert frozen.first_logical_blocks == [0]
-        assert frozen.append_block_ids == [3, 4]
-        assert frozen.append_block_offsets == [1, 0]
+        assert frozen.block_indptr.tolist() == [0, 2]
+        assert frozen.block_ids.tolist() == [3, 4]
+        assert frozen.first_logical_blocks.tolist() == [0]
+        assert frozen.append_block_ids.tolist() == [3, 4]
+        assert frozen.append_block_offsets.tolist() == [1, 0]
+
+    def test_cache_group_numeric_metadata_is_read_only_zero_copy_numpy(self) -> None:
+        group = CacheGroupPlan(
+            0,
+            np.asarray([0, 2], dtype=np.uint32),
+            np.asarray([3, 4], dtype=np.uint32),
+            np.asarray([0], dtype=np.uint32),
+            np.asarray([3, 4], dtype=np.uint32),
+            np.asarray([1, 0], dtype=np.uint32),
+        )
+        for name in (
+            "block_indptr",
+            "block_ids",
+            "first_logical_blocks",
+            "append_block_ids",
+            "append_block_offsets",
+        ):
+            array = getattr(group, name)
+            assert array.dtype == np.uint32
+            assert array.base is group
+            assert not array.flags.writeable
+            assert np.shares_memory(array, getattr(group, name))
+            with pytest.raises(ValueError, match="read-only"):
+                array[0] = 0
 
     def test_binding_requires_an_exact_layout_callable_and_pool_ack(self) -> None:
         layout = CacheLayout(2, [CacheGroupLayout(2)])
@@ -196,8 +221,8 @@ class TestFlatCacheEngine:
         assert engine.prefix_cache_stats == (2, 1, 1, 0)
         engine.step()
         reused = runner.plans[-1]
-        assert reused.token_ids == [5]
-        assert reused.context_lengths == [4]
+        assert reused.token_ids.tolist() == [5]
+        assert reused.context_lengths.tolist() == [4]
         assert second.done
 
         engine.clear_prefix_cache()
@@ -228,23 +253,23 @@ class TestFlatCacheEngine:
         assert len(prefill.cache_groups) == 1
         group = prefill.cache_groups[0]
         assert group.group_index == 0
-        assert group.block_indptr == [0, 2]
-        assert group.first_logical_blocks == [0]
+        assert group.block_indptr.tolist() == [0, 2]
+        assert group.first_logical_blocks.tolist() == [0]
         assert len(group.block_ids) == 2
         assert all(block_id > 0 for block_id in group.block_ids)
-        assert group.append_block_ids == [
-            group.block_ids[0],
-            group.block_ids[0],
-            group.block_ids[1],
+        assert group.append_block_ids.tolist() == [
+            int(group.block_ids[0]),
+            int(group.block_ids[0]),
+            int(group.block_ids[1]),
         ]
-        assert group.append_block_offsets == [0, 1, 0]
+        assert group.append_block_offsets.tolist() == [0, 1, 0]
 
         final_event = engine.step()[0]
         assert final_event.finished
         decode_group = runner.plans[1].cache_groups[0]
-        assert decode_group.block_ids == group.block_ids
-        assert decode_group.append_block_ids == [group.block_ids[1]]
-        assert decode_group.append_block_offsets == [1]
+        assert decode_group.block_ids.tolist() == group.block_ids.tolist()
+        assert decode_group.append_block_ids.tolist() == [int(group.block_ids[1])]
+        assert decode_group.append_block_offsets.tolist() == [1]
         assert runner.released == [request]
         assert engine.cache_free_parent_count == 3
         assert engine.cache_occupied_block_count == 0
@@ -268,18 +293,18 @@ class TestFlatCacheEngine:
         assert [group.group_index for group in plan.cache_groups] == [0, 1]
 
         coarse, fine = plan.cache_groups
-        assert coarse.block_indptr == [0, 1]
-        assert coarse.first_logical_blocks == [0]
-        assert coarse.append_block_offsets == [0, 1, 2]
-        assert coarse.append_block_ids == [coarse.block_ids[0]] * 3
+        assert coarse.block_indptr.tolist() == [0, 1]
+        assert coarse.first_logical_blocks.tolist() == [0]
+        assert coarse.append_block_offsets.tolist() == [0, 1, 2]
+        assert coarse.append_block_ids.tolist() == [int(coarse.block_ids[0])] * 3
 
-        assert fine.block_indptr == [0, 2]
-        assert fine.first_logical_blocks == [0]
-        assert fine.append_block_offsets == [0, 1, 0]
-        assert fine.append_block_ids == [
-            fine.block_ids[0],
-            fine.block_ids[0],
-            fine.block_ids[1],
+        assert fine.block_indptr.tolist() == [0, 2]
+        assert fine.first_logical_blocks.tolist() == [0]
+        assert fine.append_block_offsets.tolist() == [0, 1, 0]
+        assert fine.append_block_ids.tolist() == [
+            int(fine.block_ids[0]),
+            int(fine.block_ids[0]),
+            int(fine.block_ids[1]),
         ]
 
         engine.step()
@@ -306,8 +331,8 @@ class TestFlatCacheEngine:
         events = engine.poll()
         assert [event.request_id for event in events] == [request]
         assert (
-            runner.plans[0].cache_groups[0].block_ids
-            == runner.plans[1].cache_groups[0].block_ids
+            runner.plans[0].cache_groups[0].block_ids.tolist()
+            == runner.plans[1].cache_groups[0].block_ids.tolist()
         )
         assert engine.cache_free_parent_count == 1
         assert engine.cache_occupied_block_count == 0
@@ -326,10 +351,10 @@ class TestFlatCacheEngine:
         events = engine.step()
         assert len(events) == 1
         prefill = runner.plans[-1].cache_groups[0]
-        assert prefill.first_logical_blocks == [0]
+        assert prefill.first_logical_blocks.tolist() == [0]
         assert len(prefill.block_ids) == 3
-        assert prefill.append_block_ids == [
-            page for page in prefill.block_ids for _ in range(4)
+        assert prefill.append_block_ids.tolist() == [
+            int(page) for page in prefill.block_ids for _ in range(4)
         ]
         assert engine.cache_occupied_block_count == 0
         assert engine.cache_free_parent_count == 4

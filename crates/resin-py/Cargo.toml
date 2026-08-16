@@ -10,6 +10,7 @@ name = "_resin"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+numpy = "0.29"
 pyo3 = { version = "0.29", features = ["abi3-py311", "experimental-inspect"] }
 pythonize = "0.29"
 resin-core = { path = "../resin-core" }

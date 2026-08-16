@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 from typing import Any, Final, final
-
+import numpy as np
+import numpy.typing as npt
 from resin.protocols import ConversationCodec, Runner
 
 __version__: Final[str]
@@ -9,6 +10,7 @@ __version__: Final[str]
 class BatchPhase:
     DECODE: Final[BatchPhase]
     PREFILL: Final[BatchPhase]
+
     def __eq__(self, value: object, /) -> bool: ...
     def __hash__(self, /) -> int: ...
     def __int__(self, /) -> int: ...
@@ -26,19 +28,20 @@ class BatchPlan:
     sequence ``i``; positions are therefore implicit and start at that value.
     ``cache_groups`` supplies the pages used by those sequences.
     """
+
     def __new__(
         cls,
         /,
-        sequence_ids: Sequence[int],
-        context_lengths: Sequence[int],
-        token_ids: Sequence[int],
-        token_indptr: Sequence[int],
+        sequence_ids: Sequence[int] | npt.NDArray[np.uint64],
+        context_lengths: Sequence[int] | npt.NDArray[np.uint32],
+        token_ids: Sequence[int] | npt.NDArray[np.uint32],
+        token_indptr: Sequence[int] | npt.NDArray[np.uint32],
         *,
         phase: BatchPhase = ...,
         batch_id: int = 0,
         batch_key: int | None = None,
         cache_groups: Sequence[CacheGroupPlan] | None = None,
-        sample_sequence_indices: Sequence[int] | None = None,
+        sample_sequence_indices: Sequence[int] | npt.NDArray[np.uint32] | None = None,
         sampling_params: Sequence[SamplingParams] | None = None,
     ) -> BatchPlan: ...
     def __repr__(self, /) -> str: ...
@@ -47,57 +50,80 @@ class BatchPlan:
         """
         Monotonic identifier used to match an async dispatch with its result.
         """
+
     @property
     def batch_key(self, /) -> int | None:
         """
         Optional key that prevents incompatible requests from sharing a batch.
         """
+
     @property
     def cache_groups(self, /) -> tuple[CacheGroupPlan, ...]:
         """
         Ordered physical placement plans corresponding to CacheLayout groups.
         """
+
     @property
-    def context_lengths(self, /) -> list[int]:
+    def context_lengths(self, /) -> npt.NDArray[np.uint32]:
         """
         Number of tokens already processed for each sequence.
         """
+
     @property
     def num_sequences(self, /) -> int:
         """
         Number of sequences (batch size).
         """
+
+    @property
+    def num_tokens(self, /) -> int:
+        """
+        Number of flattened scheduled tokens.
+        """
+
     @property
     def phase(self, /) -> BatchPhase:
         """
         Whether this is a prefill or decode batch. Mixed-chunk is not supported.
         """
+
     @property
-    def sample_sequence_indices(self, /) -> list[int]:
+    def positions(self, /) -> npt.NDArray[np.uint32]:
+        """
+        Absolute position of every flattened scheduled token.
+        """
+
+    @property
+    def sample_sequence_indices(self, /) -> npt.NDArray[np.uint32]:
         """
         Which sequence indices should generate a sampled token. Used for
         chunked prefill, when some sequences only advance the cache.
         """
+
     @property
     def sampling_params(self, /) -> tuple[SamplingParams, ...]:
         """
         Effective sampling parameters, one per sequence.
         """
+
     @property
-    def sequence_ids(self, /) -> list[int]:
+    def sequence_ids(self, /) -> npt.NDArray[np.uint64]:
         """
         Stable request identifier for each sequence.
         """
+
     @property
-    def token_ids(self, /) -> list[int]:
+    def token_ids(self, /) -> npt.NDArray[np.uint32]:
         """
         Flattened scheduled token IDs, grouped by sequence.
         """
+
     @property
-    def token_indptr(self, /) -> list[int]:
+    def token_indptr(self, /) -> npt.NDArray[np.uint32]:
         """
         Offsets into ``token_ids`` for each sequence.
         """
+
     def token_range(self, /, sequence_index: int) -> tuple[int, int]:
         """
         Return the half-open range in ``token_ids`` for one sequence.
@@ -111,6 +137,7 @@ class CacheGroupFamily:
 
     HISTORY: Final[CacheGroupFamily]
     STATE: Final[CacheGroupFamily]
+
     def __eq__(self, value: object, /) -> bool: ...
     def __hash__(self, /) -> int: ...
     def __int__(self, /) -> int: ...
@@ -125,6 +152,7 @@ class CacheGroupLayout:
     Groups with different tensor layouts share the parent pool. A group packs
     ``blocks_per_parent`` logical blocks into each equally-sized parent.
     """
+
     def __new__(
         cls,
         /,
@@ -141,26 +169,31 @@ class CacheGroupLayout:
         """
         Number of token positions represented by one logical block.
         """
+
     @property
     def blocks_per_parent(self, /) -> int:
         """
         Number of this group's logical blocks packed into one parent allocation.
         """
+
     @property
     def family(self, /) -> CacheGroupFamily:
         """
         Whether this group stores token history or recurrent checkpoints.
         """
+
     @property
     def retention(self, /) -> CacheRetention:
         """
         Lifetime policy for logical blocks in this group.
         """
+
     @property
     def window_resident_block_count(self, /) -> int | None:
         """
         Maximum resident logical blocks per sequence for a window group.
         """
+
     @property
     def window_tokens(self, /) -> int | None:
         """
@@ -177,42 +210,48 @@ class CacheGroupPlan:
     by each sequence's first physical block. The two ``append_*`` arrays contain
     one write target per flattened batch token.
     """
+
     def __new__(
         cls,
         /,
         group_index: int,
-        block_indptr: Sequence[int],
-        block_ids: Sequence[int],
-        first_logical_blocks: Sequence[int],
-        append_block_ids: Sequence[int],
-        append_block_offsets: Sequence[int],
+        block_indptr: Sequence[int] | npt.NDArray[np.uint32],
+        block_ids: Sequence[int] | npt.NDArray[np.uint32],
+        first_logical_blocks: Sequence[int] | npt.NDArray[np.uint32],
+        append_block_ids: Sequence[int] | npt.NDArray[np.uint32],
+        append_block_offsets: Sequence[int] | npt.NDArray[np.uint32],
     ) -> CacheGroupPlan: ...
     def __repr__(self, /) -> str: ...
     @property
-    def append_block_ids(self, /) -> list[int]:
+    def append_block_ids(self, /) -> npt.NDArray[np.uint32]:
         """
         Physical destination block for every flattened batch token.
         """
+
     @property
-    def append_block_offsets(self, /) -> list[int]:
+    def append_block_offsets(self, /) -> npt.NDArray[np.uint32]:
         """
         In-block destination offset for every flattened batch token.
         """
+
     @property
-    def block_ids(self, /) -> list[int]:
+    def block_ids(self, /) -> npt.NDArray[np.uint32]:
         """
         Flattened physical block IDs, grouped chronologically by sequence.
         """
+
     @property
-    def block_indptr(self, /) -> list[int]:
+    def block_indptr(self, /) -> npt.NDArray[np.uint32]:
         """
         Offsets into ``block_ids`` for each sequence.
         """
+
     @property
-    def first_logical_blocks(self, /) -> list[int]:
+    def first_logical_blocks(self, /) -> npt.NDArray[np.uint32]:
         """
         Logical block number corresponding to each sequence's first block.
         """
+
     @property
     def group_index(self, /) -> int:
         """
@@ -227,6 +266,7 @@ class CacheLayout:
     ``parent_capacity`` is the number of fungible physical parents shared by
     every group. Group order is stable and identifies each group in BatchPlan.
     """
+
     def __new__(
         cls, /, parent_capacity: int, groups: Sequence[CacheGroupLayout]
     ) -> CacheLayout: ...
@@ -236,6 +276,7 @@ class CacheLayout:
         """
         Number of logical cache groups.
         """
+
     def group_kernel_page_capacity(self, /, group_index: int) -> int: ...
     def group_kernel_page_count(self, /, group_index: int) -> int: ...
     @property
@@ -243,6 +284,7 @@ class CacheLayout:
         """
         Ordered immutable cache-group descriptors.
         """
+
     @property
     def parent_capacity(self, /) -> int:
         """
@@ -261,6 +303,7 @@ class CacheRetention:
 
     HISTORY: Final[CacheRetention]
     WINDOW: Final[CacheRetention]
+
     def __eq__(self, value: object, /) -> bool: ...
     def __hash__(self, /) -> int: ...
     def __int__(self, /) -> int: ...
@@ -302,6 +345,7 @@ class Engine:
         """
         Drop all reusable cache prefixes.
         """
+
     def close(self, /) -> None: ...
     @property
     def closed(self, /) -> bool: ...
@@ -329,6 +373,7 @@ class Engine:
         """
         ``(entries, hits, misses, evictions)`` when prefix caching is enabled.
         """
+
     @property
     def ready_request_count(self, /) -> int: ...
     @property
@@ -356,6 +401,7 @@ class RequestLease:
     the caller drops the lease without taking the result, the token buffer is
     released when the last internal reference disappears.
     """
+
     def __eq__(self, other: object, /) -> bool: ...
     def __index__(self, /) -> int: ...
     def __int__(self, /) -> int: ...
@@ -378,6 +424,7 @@ class ResourceBinding:
     """
     Concrete Engine-owned resource identities passed to ``bind_resources``.
     """
+
     def __repr__(self, /) -> str: ...
     @property
     def cache_layout(self, /) -> CacheLayout | None: ...
@@ -391,6 +438,7 @@ class RunnerConfig:
 
     Runners without special requirements may omit ``runner_config`` entirely.
     """
+
     def __new__(
         cls,
         /,
@@ -421,6 +469,7 @@ class SamplingParams:
     A zero temperature selects the maximum-logit token. Positive temperatures
     enable stochastic sampling after optional top-k and top-p filtering.
     """
+
     def __new__(
         cls,
         /,
@@ -448,6 +497,7 @@ class SchedulerConfig:
     """
     Native admission and token-budget policy for an Engine.
     """
+
     def __new__(
         cls,
         /,

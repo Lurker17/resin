@@ -127,7 +127,7 @@ class CudaExecutor:
             self._resources(),
             self.stream,
             self._quarantine,
-            TensorStager(torch, self.device),
+            TensorStager(self.device),
             torch.cuda.Event(),
             torch.cuda.Event(),
         )

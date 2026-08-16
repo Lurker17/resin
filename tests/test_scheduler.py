@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
+import numpy as np
 import pytest
 
 from resin import (
@@ -92,7 +93,7 @@ class TestSchedulerConfigContract:
 
         engine.step()
 
-        assert runner.plans[0].token_indptr == [0, 2]
+        assert runner.plans[0].token_indptr.tolist() == [0, 2]
         assert not request.done
         engine.close()
 
@@ -111,8 +112,8 @@ class TestSchedulerConfigContract:
 
         engine.step()
 
-        assert runner.plans[0].sequence_ids == [first]
-        assert runner.plans[0].token_indptr == [0, 4]
+        assert runner.plans[0].sequence_ids.tolist() == [first]
+        assert runner.plans[0].token_indptr.tolist() == [0, 4]
         assert first.done
         assert not second.done
         engine.close()
@@ -140,7 +141,7 @@ class TestSchedulerConfigContract:
 
         events = engine.step()
 
-        assert runner.plans[0].token_ids == [1, 2, 3, 4, 5, 6]
+        assert runner.plans[0].token_ids.tolist() == [1, 2, 3, 4, 5, 6]
         assert [event.request_id for event in events] == [request]
         assert request.done
         engine.close()
@@ -297,7 +298,7 @@ class TestSchedulerConfigContract:
             sample_sequence_indices=[1, 2],
         )
         assert plan.phase == BatchPhase.PREFILL
-        assert plan.sample_sequence_indices == [1, 2]
+        assert plan.sample_sequence_indices.tolist() == [1, 2]
         assert plan.num_sequences == 3
         assert len(RecordingRunner().forward(plan)) == 3
         with pytest.raises(AttributeError):
@@ -311,7 +312,7 @@ class TestSchedulerConfigContract:
             [0, 1, 2],
         )
         assert prefill.phase == BatchPhase.PREFILL
-        assert prefill.sample_sequence_indices == [0, 1]
+        assert prefill.sample_sequence_indices.tolist() == [0, 1]
 
         decode = BatchPlan(
             [7, 8],
@@ -321,6 +322,34 @@ class TestSchedulerConfigContract:
             phase=BatchPhase.DECODE,
         )
         assert decode.phase == BatchPhase.DECODE
+
+    def test_batch_plan_numeric_metadata_is_read_only_zero_copy_numpy(self) -> None:
+        plan = BatchPlan(
+            np.asarray([7, 8], dtype=np.uint64),
+            np.asarray([2, 4], dtype=np.uint32),
+            np.asarray([11, 12, 13], dtype=np.uint32),
+            np.asarray([0, 2, 3], dtype=np.uint32),
+            sample_sequence_indices=np.asarray([1], dtype=np.uint32),
+        )
+        expected = {
+            "sequence_ids": (np.uint64, [7, 8]),
+            "context_lengths": (np.uint32, [2, 4]),
+            "token_ids": (np.uint32, [11, 12, 13]),
+            "token_indptr": (np.uint32, [0, 2, 3]),
+            "positions": (np.uint32, [2, 3, 4]),
+            "sample_sequence_indices": (np.uint32, [1]),
+        }
+        for name, (dtype, values) in expected.items():
+            array = getattr(plan, name)
+            assert array.dtype == dtype
+            assert array.tolist() == values
+            assert array.base is plan
+            assert not array.flags.writeable
+            with pytest.raises(ValueError, match="read-only"):
+                array[0] = 0
+            with pytest.raises(ValueError, match="WRITEABLE"):
+                array.flags.writeable = True
+        assert np.shares_memory(plan.positions, plan.positions)
 
     def test_batch_plan_rejects_invalid_sampling_rows(self) -> None:
         for value in ([2, 1], [1, 1], [3]):
@@ -358,7 +387,7 @@ class TestNativePolicyIntegration:
             engine.step()
             engine.close()
             assert [first, second, third] == [1, 2, 3]
-            return [plan.sequence_ids for plan in runner.plans]
+            return [plan.sequence_ids.tolist() for plan in runner.plans]
 
         expected = [[1, 2], [3]]
         assert trace(None) == expected
@@ -374,17 +403,20 @@ class TestNativePolicyIntegration:
         middle = engine.submit([50], 1, priority=4, batch_key=7)
 
         engine.step()
-        assert runner.plans[-1].sequence_ids == [high_keyed_first, high_keyed_second]
+        assert runner.plans[-1].sequence_ids.tolist() == [
+            high_keyed_first,
+            high_keyed_second,
+        ]
         assert runner.plans[-1].batch_key == 7
         assert runner.plans[-1].num_sequences == 2
 
         engine.step()
-        assert runner.plans[-1].sequence_ids == [high_none]
+        assert runner.plans[-1].sequence_ids.tolist() == [high_none]
         assert runner.plans[-1].batch_key is None
         engine.step()
-        assert runner.plans[-1].sequence_ids == [middle]
+        assert runner.plans[-1].sequence_ids.tolist() == [middle]
         engine.step()
-        assert runner.plans[-1].sequence_ids == [low]
+        assert runner.plans[-1].sequence_ids.tolist() == [low]
 
     def test_none_and_zero_are_distinct_homogeneous_keys(self) -> None:
         runner = RecordingRunner()
@@ -394,10 +426,10 @@ class TestNativePolicyIntegration:
         none_second = engine.submit([3], 1)
 
         engine.step()
-        assert runner.plans[-1].sequence_ids == [none_first, none_second]
+        assert runner.plans[-1].sequence_ids.tolist() == [none_first, none_second]
         assert runner.plans[-1].batch_key is None
         engine.step()
-        assert runner.plans[-1].sequence_ids == [zero]
+        assert runner.plans[-1].sequence_ids.tolist() == [zero]
         assert runner.plans[-1].batch_key == 0
 
     def test_fresh_prefill_runs_before_the_decode_batch_resumes(self) -> None:
@@ -407,10 +439,10 @@ class TestNativePolicyIntegration:
         engine.step()
         fresh = engine.submit([20], 1)
         engine.step()
-        assert runner.plans[-1].sequence_ids == [fresh]
+        assert runner.plans[-1].sequence_ids.tolist() == [fresh]
         assert runner.plans[-1].phase == BatchPhase.PREFILL
         engine.step()
-        assert runner.plans[-1].sequence_ids == [decode]
+        assert runner.plans[-1].sequence_ids.tolist() == [decode]
         assert runner.plans[-1].phase == BatchPhase.DECODE
 
     def test_survivors_stay_ahead_of_inflight_submissions(self) -> None:
@@ -425,7 +457,7 @@ class TestNativePolicyIntegration:
         engine.poll()
 
         engine.dispatch()
-        assert runner.dispatch_plans[-1].sequence_ids == [first, second]
+        assert runner.dispatch_plans[-1].sequence_ids.tolist() == [first, second]
         engine.poll()
         engine.close()
 
@@ -447,8 +479,8 @@ class TestNativePolicyIntegration:
         assert engine.dispatch() == 2
         failed, retry = runner.dispatch_plans[:2]
         assert (failed.batch_id, retry.batch_id) == (1, 2)
-        assert failed.sequence_ids == [first, third]
-        assert retry.sequence_ids == [first, third]
+        assert failed.sequence_ids.tolist() == [first, third]
+        assert retry.sequence_ids.tolist() == [first, third]
         for field in (
             "batch_key",
             "phase",
@@ -457,11 +489,17 @@ class TestNativePolicyIntegration:
             "context_lengths",
             "sample_sequence_indices",
         ):
-            assert getattr(failed, field) == getattr(retry, field), field
+            left = getattr(failed, field)
+            right = getattr(retry, field)
+            assert (
+                left.tolist() == right.tolist()
+                if hasattr(left, "tolist")
+                else left == right
+            ), field
         engine.poll()
 
         engine.dispatch()
-        assert runner.dispatch_plans[-1].sequence_ids == [other_key]
+        assert runner.dispatch_plans[-1].sequence_ids.tolist() == [other_key]
         engine.poll()
         engine.close()
         assert lower.done
@@ -475,7 +513,7 @@ class TestNativePolicyIntegration:
         third = ready_engine.submit([30], 1)
         assert ready_engine.cancel(middle)
         ready_engine.step()
-        assert ready_runner.plans[-1].sequence_ids == [first, third]
+        assert ready_runner.plans[-1].sequence_ids.tolist() == [first, third]
 
         async_runner = ControlledAsyncRunner([[101, 301], [201]])
         async_engine = Engine(async_runner, max_running_requests=2)
@@ -483,14 +521,14 @@ class TestNativePolicyIntegration:
         other_key = async_engine.submit([200], 1, priority=2)
         third = async_engine.submit([300], 1, priority=2, batch_key=7)
         async_engine.dispatch()
-        assert async_runner.dispatch_plans[-1].sequence_ids == [first, third]
+        assert async_runner.dispatch_plans[-1].sequence_ids.tolist() == [first, third]
         assert async_engine.cancel(third)
         events = async_engine.poll()
         assert [event.request_id for event in events] == [first]
         assert async_runner.released == [first, third]
 
         async_engine.dispatch()
-        assert async_runner.dispatch_plans[-1].sequence_ids == [other_key]
+        assert async_runner.dispatch_plans[-1].sequence_ids.tolist() == [other_key]
         async_engine.poll()
 
     def test_decode_and_partial_prefill_are_dispatched_separately(
@@ -512,28 +550,28 @@ class TestNativePolicyIntegration:
 
         events = engine.step()
         plan = runner.plans[-1]
-        assert plan.sequence_ids == [partial]
+        assert plan.sequence_ids.tolist() == [partial]
         assert plan.phase == BatchPhase.PREFILL
-        assert plan.token_ids == [20, 21]
-        assert plan.context_lengths == [0]
-        assert plan.sample_sequence_indices == []
+        assert plan.token_ids.tolist() == [20, 21]
+        assert plan.context_lengths.tolist() == [0]
+        assert plan.sample_sequence_indices.tolist() == []
         assert events == []
         assert not partial.done
         assert runner.released == []
 
         events = engine.step()
         assert runner.plans[-1].phase == BatchPhase.PREFILL
-        assert runner.plans[-1].context_lengths == [2]
-        assert runner.plans[-1].sample_sequence_indices == [0]
+        assert runner.plans[-1].context_lengths.tolist() == [2]
+        assert runner.plans[-1].sample_sequence_indices.tolist() == [0]
         assert [event.request_id for event in events] == [partial]
         assert partial.done
         assert partial.take_result() == [24]
         assert runner.released == [partial]
 
         events = engine.step()
-        assert runner.plans[-1].sequence_ids == [decoding]
+        assert runner.plans[-1].sequence_ids.tolist() == [decoding]
         assert runner.plans[-1].phase == BatchPhase.DECODE
-        assert runner.plans[-1].token_ids == [11]
+        assert runner.plans[-1].token_ids.tolist() == [11]
         assert [event.request_id for event in events] == [decoding]
         assert runner.released == [partial, decoding]
 
@@ -564,7 +602,7 @@ class TestNativePolicyIntegration:
         )
         request = engine.submit([1, 2, 3], 1)
         engine.dispatch()
-        assert runner.dispatch_plans[-1].sample_sequence_indices == []
+        assert runner.dispatch_plans[-1].sample_sequence_indices.tolist() == []
         assert engine.poll() == []
         assert engine.cancel(request)
         assert engine.poll() == []

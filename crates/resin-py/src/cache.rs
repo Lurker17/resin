@@ -1,7 +1,9 @@
 //! Python adapters for the pure Rust cache descriptors in `resin-core`.
 
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
+use numpy::{PyArray1, PyArrayLike1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -322,12 +324,14 @@ impl CacheLayout {
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CacheGroupPlan {
-    inner: KvGroupPlan,
+    inner: Arc<KvGroupPlan>,
 }
 
 impl CacheGroupPlan {
     pub(crate) fn from_inner(inner: KvGroupPlan) -> Self {
-        Self { inner }
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 
     pub(crate) fn from_parts(
@@ -339,15 +343,17 @@ impl CacheGroupPlan {
         append_block_offsets: Vec<u32>,
     ) -> PyResult<Self> {
         Ok(Self {
-            inner: KvGroupPlan::new(
-                group_index,
-                block_indptr,
-                block_ids,
-                first_logical_blocks,
-                append_block_ids,
-                append_block_offsets,
-            )
-            .map_err(plan_error)?,
+            inner: Arc::new(
+                KvGroupPlan::new(
+                    group_index,
+                    block_indptr,
+                    block_ids,
+                    first_logical_blocks,
+                    append_block_ids,
+                    append_block_offsets,
+                )
+                .map_err(plan_error)?,
+            ),
         })
     }
 
@@ -355,8 +361,8 @@ impl CacheGroupPlan {
         self.inner.validate().map_err(plan_error)
     }
 
-    pub(crate) const fn inner_native(&self) -> &KvGroupPlan {
-        &self.inner
+    pub(crate) fn inner_native(&self) -> &KvGroupPlan {
+        self.inner.as_ref()
     }
 
     fn repr_string(&self) -> String {
@@ -375,19 +381,19 @@ impl CacheGroupPlan {
     #[new]
     fn new(
         group_index: u32,
-        block_indptr: Vec<u32>,
-        block_ids: Vec<u32>,
-        first_logical_blocks: Vec<u32>,
-        append_block_ids: Vec<u32>,
-        append_block_offsets: Vec<u32>,
+        block_indptr: PyArrayLike1<'_, u32>,
+        block_ids: PyArrayLike1<'_, u32>,
+        first_logical_blocks: PyArrayLike1<'_, u32>,
+        append_block_ids: PyArrayLike1<'_, u32>,
+        append_block_offsets: PyArrayLike1<'_, u32>,
     ) -> PyResult<Self> {
         Self::from_parts(
             group_index,
-            block_indptr,
-            block_ids,
-            first_logical_blocks,
-            append_block_ids,
-            append_block_offsets,
+            crate::arrays::owned_vec(block_indptr),
+            crate::arrays::owned_vec(block_ids),
+            crate::arrays::owned_vec(first_logical_blocks),
+            crate::arrays::owned_vec(append_block_ids),
+            crate::arrays::owned_vec(append_block_offsets),
         )
     }
 
@@ -399,32 +405,38 @@ impl CacheGroupPlan {
 
     /// Offsets into ``block_ids`` for each sequence.
     #[getter]
-    fn block_indptr(&self) -> Vec<u32> {
-        self.inner.block_indptr.clone()
+    fn block_indptr<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_indptr)
     }
 
     /// Flattened physical block IDs, grouped chronologically by sequence.
     #[getter]
-    fn block_ids(&self) -> Vec<u32> {
-        self.inner.block_ids.clone()
+    fn block_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_ids)
     }
 
     /// Logical block number corresponding to each sequence's first block.
     #[getter]
-    fn first_logical_blocks(&self) -> Vec<u32> {
-        self.inner.first_logical_blocks.clone()
+    fn first_logical_blocks<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(
+            this.clone().into_any(),
+            &this.get().inner.first_logical_blocks,
+        )
     }
 
     /// Physical destination block for every flattened batch token.
     #[getter]
-    fn append_block_ids(&self) -> Vec<u32> {
-        self.inner.append_block_ids.clone()
+    fn append_block_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.append_block_ids)
     }
 
     /// In-block destination offset for every flattened batch token.
     #[getter]
-    fn append_block_offsets(&self) -> Vec<u32> {
-        self.inner.append_block_offsets.clone()
+    fn append_block_offsets<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(
+            this.clone().into_any(),
+            &this.get().inner.append_block_offsets,
+        )
     }
 
     fn __repr__(&self) -> String {

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 from flashinfer.comm import (
     AllReduceFusionPattern,
@@ -49,7 +50,6 @@ from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.loading import default_device
-from resin.backend.plans import plan_positions
 from resin.protocols import SyncRunner
 from resin_models_cuda.gpt_oss.checkpoint import (
     DEFAULT_MODEL,
@@ -682,20 +682,20 @@ class GptOssCudaRunner(SyncRunner):
         return final_hidden.index_select(0, batch.last_token_indices)
 
     @staticmethod
-    def _pad_page_table(batch: AttentionBatch, width: int) -> tuple[int, ...]:
+    def _pad_page_table(batch: AttentionBatch, width: int):
         """Pad each row by repeating one page already owned by that row."""
 
         if batch.full_width > width:
             raise GraphInputError("decode page table exceeds CUDA graph shape")
-        padded = []
         source_width = batch.full_width
-        for row in range(len(batch.sequence_indices)):
-            pages = batch.full_table[row * source_width : (row + 1) * source_width]
-            if not pages:
-                raise GraphInputError("decode page-table row is empty")
-            padded.extend(pages)
-            padded.extend((pages[0],) * (width - source_width))
-        return tuple(padded)
+        rows = len(batch.sequence_indices)
+        if source_width == 0:
+            raise GraphInputError("decode page-table row is empty")
+        source = batch.full_table.reshape(rows, source_width)
+        padded = np.empty((rows, width), dtype=np.uint32)
+        padded[:, :source_width] = source
+        padded[:, source_width:] = source[:, :1]
+        return padded.reshape(-1)
 
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         batch_size, full_width = shape
@@ -788,7 +788,7 @@ class GptOssCudaRunner(SyncRunner):
             return None
         inputs = {
             "token_ids": plan.token_ids,
-            "positions": plan_positions(plan),
+            "positions": plan.positions,
             "token_indices": host.token_indices,
             "sequence_indices": host.sequence_indices,
             "full_page_table": self._pad_page_table(host, shape[1]),
@@ -804,7 +804,7 @@ class GptOssCudaRunner(SyncRunner):
 
     def forward(self, plan: BatchPlan) -> list[int]:
         self._graphs.check()
-        host_positions = plan_positions(plan)
+        host_positions = plan.positions
 
         prefill_batches, decode_batch = build_attention_batches(
             plan, parent_capacity=self.cache_parent_capacity
@@ -826,7 +826,7 @@ class GptOssCudaRunner(SyncRunner):
                 return graph_output
 
         torch = self._torch
-        staging = TensorStager(torch, self.device)
+        staging = TensorStager(self.device)
         token_ids = staging.device("token_ids", plan.token_ids, torch.long)
         positions = staging.device("positions", host_positions, torch.long)
         final_hidden = torch.empty(

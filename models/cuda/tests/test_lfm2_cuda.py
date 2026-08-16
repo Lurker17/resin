@@ -41,10 +41,10 @@ class _Cache:
 
 def test_attention_metadata_uses_only_the_history_group() -> None:
     metadata = build_cache_metadata(_plan(), 16)
-    assert metadata.block_ids == (5, 3, 7)
-    assert metadata.append_positions == (0, 1, 16)
-    assert metadata.prefill.dense_token_indices == (0, 1)
-    assert metadata.prefill.continuation_token_indices == (2,)
+    assert metadata.block_ids.tolist() == [5, 3, 7]
+    assert metadata.append_positions.tolist() == [0, 1, 16]
+    assert metadata.prefill.dense_token_indices.tolist() == [0, 1]
+    assert metadata.prefill.continuation_token_indices.tolist() == [2]
 
 
 def test_recurrent_rows_are_derived_from_the_state_page_table() -> None:

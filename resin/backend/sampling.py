@@ -11,9 +11,9 @@ def batch_sampling_inputs(plan, vocab_size: int) -> dict[str, tuple]:
     if vocab_size <= 0:
         raise ValueError("vocab_size must be positive")
     params = tuple(plan.sampling_params)
-    rows = len(plan.sequence_ids)
-    indptr = tuple(plan.token_indptr)
-    context_lengths = tuple(plan.context_lengths)
+    rows = plan.num_sequences
+    indptr = plan.token_indptr
+    context_lengths = plan.context_lengths
     if len(params) != rows:
         raise ValueError("sampling params must contain one item per sequence")
     if len(context_lengths) != rows:
@@ -21,7 +21,7 @@ def batch_sampling_inputs(plan, vocab_size: int) -> dict[str, tuple]:
     if len(indptr) != rows + 1 or indptr[0] != 0 or indptr[-1] != len(plan.token_ids):
         raise ValueError("token_indptr does not partition token_ids")
     offsets = tuple(
-        (context_lengths[index] + indptr[index + 1] - indptr[index])
+        (int(context_lengths[index]) + int(indptr[index + 1] - indptr[index]))
         * SAMPLING_OFFSET_STRIDE
         for index in range(rows)
     )

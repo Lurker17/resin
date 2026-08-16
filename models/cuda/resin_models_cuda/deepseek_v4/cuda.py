@@ -13,6 +13,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -32,7 +33,6 @@ from resin.backend.cuda.sampling import (
     SamplingTensors,
 )
 from resin.backend.cuda.staging import TensorStager
-from resin.backend.plans import plan_positions
 from resin.backend.speculative import accept_speculative_tokens
 from resin.protocols import SyncRunner
 from resin_models_cuda.deepseek_v4.cache import (
@@ -505,8 +505,8 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         if not self._graphs.shapes:
             return None
         batch_size = plan.num_sequences
-        positions = plan_positions(plan)
-        sequence_length = max(positions) + 1
+        positions = plan.positions
+        sequence_length = int(positions.max()) + 1
         shape = self._graphs.match(
             lambda candidate: (
                 candidate[0] >= batch_size
@@ -518,8 +518,8 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             return None
         padding_rows = shape[0] - batch_size
         inputs: dict[str, object] = {
-            "token_ids": (*plan.token_ids, *((0,) * padding_rows)),
-            "positions": (*positions, *((1,) * padding_rows)),
+            "token_ids": np.pad(plan.token_ids, (0, padding_rows)),
+            "positions": np.pad(positions, (0, padding_rows), constant_values=1),
         }
         graph_cache = self._graph_device_caches[shape]
         inputs.update(self._cache.graph_plan_inputs(graph_cache, cache_plan))
@@ -564,24 +564,19 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         row_count = plan.num_sequences
         if row_count == 0 or row_count > self.max_batch_size:
             raise ValueError("DeepSeek-V4 batch size is outside runner capacity")
-        indptr = tuple(plan.token_indptr)
+        indptr = plan.token_indptr
         if (
             len(indptr) != row_count + 1
             or indptr[0] != 0
             or indptr[-1] != len(plan.token_ids)
-            or any(left >= right for left, right in zip(indptr, indptr[1:]))
+            or np.any(indptr[1:] <= indptr[:-1])
         ):
             raise ValueError("DeepSeek-V4 sequence metadata is malformed")
         if len(plan.context_lengths) != row_count:
             raise ValueError("DeepSeek-V4 requires one context length per sequence")
         if len(set(plan.sequence_ids)) != row_count:
             raise ValueError("DeepSeek-V4 sequence IDs must be unique within a batch")
-        positions = plan_positions(plan)
-        rows = tuple(zip(indptr, indptr[1:]))
-        for row, (start, end) in enumerate(rows):
-            context = plan.context_lengths[row]
-            if positions[start:end] != list(range(context, context + end - start)):
-                raise ValueError("DeepSeek-V4 positions must continue each row context")
+        rows = tuple((int(start), int(end)) for start, end in zip(indptr, indptr[1:]))
 
         if plan.phase == BatchPhase.PREFILL:
             pass
@@ -597,16 +592,16 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         plan: BatchPlan,
         rows: tuple[tuple[int, int], ...],
         cache,
+        token_ids: torch.Tensor,
+        positions: torch.Tensor,
     ) -> torch.Tensor:
         """Prefill fresh prompts eagerly and replay only a restored suffix."""
 
         logits = []
         for slot, (start, end) in enumerate(rows):
             row_cache = cache.row(slot)
-            input_ids = torch.tensor(
-                plan.token_ids[start:end], dtype=torch.long, device=self.device
-            ).unsqueeze(0)
-            context = plan.context_lengths[slot]
+            input_ids = token_ids[start:end].unsqueeze(0)
+            context = int(plan.context_lengths[slot])
             if context == 0:
                 row_logits, main_hidden = self._model.forward_target(
                     input_ids, cache=row_cache
@@ -620,9 +615,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             else:
                 row_logits = None
                 for relative, token_id in enumerate(input_ids.unbind(dim=1)):
-                    position = torch.tensor(
-                        [context + relative], dtype=torch.long, device=self.device
-                    )
+                    position = positions[start + relative : start + relative + 1]
                     row_logits, main_hidden = self._model.forward_decode_target(
                         token_id[:, None],
                         position,
@@ -688,16 +681,14 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         self._speculative_emitted += sum(map(len, acceptance.token_rows))
         return acceptance.token_rows
 
-    def _speculative_decode(self, plan: BatchPlan, cache) -> list[list[int]]:
+    def _speculative_decode(
+        self, plan: BatchPlan, cache, token_ids, positions
+    ) -> list[list[int]]:
         """Draft greedily and verify a fixed block against target samples."""
 
         batch_size = plan.num_sequences
-        anchors = torch.tensor(
-            plan.token_ids, dtype=torch.long, device=self.device
-        ).view(batch_size, 1)
-        host_positions = plan_positions(plan)
-        positions = torch.tensor(host_positions, dtype=torch.long, device=self.device)
-        graph_seq_len = max(host_positions) + self.speculative_tokens + 1
+        anchors = token_ids.view(batch_size, 1)
+        graph_seq_len = int(plan.positions.max()) + self.speculative_tokens + 1
         drafts = self._broadcast_tokens(
             self._model.draft(anchors, positions, cache=cache)
         )
@@ -736,29 +727,25 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         elif self._graphs.shapes:
             self._graphs.fallback("prefill")
         try:
-            staging = TensorStager(torch, self.device)
+            staging = TensorStager(self.device)
             cache = self._cache.tensorize(cache_plan, staging)
+            token_ids = staging.device("token_ids", plan.token_ids, torch.long)
+            positions = staging.device("positions", plan.positions, torch.long)
             with (
                 torch.inference_mode(),
                 _default_dtype(torch.bfloat16),
                 torch.device(self.device),
             ):
                 if plan.phase == BatchPhase.PREFILL:
-                    logits = self._prefill(plan, rows, cache)
+                    logits = self._prefill(plan, rows, cache, token_ids, positions)
                 elif self.speculative_tokens:
-                    return self._speculative_decode(plan, cache)
+                    return self._speculative_decode(plan, cache, token_ids, positions)
                 else:
-                    input_ids = torch.tensor(
-                        plan.token_ids, dtype=torch.long, device=self.device
-                    ).view(plan.num_sequences, 1)
-                    host_positions = plan_positions(plan)
-                    positions = torch.tensor(
-                        host_positions, dtype=torch.long, device=self.device
-                    )
+                    input_ids = token_ids.view(plan.num_sequences, 1)
                     logits = self._model.forward_decode(
                         input_ids,
                         positions,
-                        max(host_positions) + 1,
+                        int(plan.positions.max()) + 1,
                         cache=cache,
                     )
                 output = self._sample_target(logits, plan, 0)

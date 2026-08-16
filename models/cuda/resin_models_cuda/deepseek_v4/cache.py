@@ -6,8 +6,10 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
+import numpy.typing as npt
+
 from resin import BatchPhase, CacheGroupLayout, CacheLayout, CacheRetention
-from resin.backend.plans import plan_positions
 from resin.backend.resources import CachePoolBinding
 
 if TYPE_CHECKING:
@@ -318,10 +320,8 @@ def plan_cache_capacity(
 
 @dataclass(frozen=True, slots=True)
 class GroupPlan:
-    pages: tuple[tuple[int, ...], ...]
-    first_blocks: tuple[int, ...]
-    append_pages: tuple[int, ...]
-    append_offsets: tuple[int, ...]
+    pages: tuple[npt.NDArray[np.uint32], ...]
+    first_blocks: npt.NDArray[np.uint32]
 
 
 @dataclass(frozen=True, slots=True)
@@ -561,16 +561,16 @@ class DeviceCache:
 def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> CachePlan:
     """Validate the six Engine-issued page tables before a CUDA launch."""
 
-    rows = len(plan.sequence_ids)
-    indptr = _ints("token_indptr", plan.token_indptr)
-    positions = _ints("positions", plan_positions(plan))
-    contexts = _ints("context_lengths", plan.context_lengths)
+    rows = plan.num_sequences
+    indptr = np.asarray(plan.token_indptr, dtype=np.uint32)
+    positions = np.asarray(plan.positions, dtype=np.uint32)
+    contexts = np.asarray(plan.context_lengths, dtype=np.uint32)
     if (
         rows == 0
         or len(indptr) != rows + 1
         or indptr[0] != 0
         or indptr[-1] != len(positions)
-        or any(left >= right for left, right in zip(indptr, indptr[1:]))
+        or np.any(indptr[1:] <= indptr[:-1])
         or len(contexts) != rows
     ):
         raise ValueError("DeepSeek sequence metadata is malformed")
@@ -580,11 +580,11 @@ def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> Cac
 
     groups = []
     for group_index, (source, descriptor) in enumerate(zip(native, layout.groups)):
-        block_indptr = _ints("block_indptr", source.block_indptr)
-        block_ids = _ints("block_ids", source.block_ids, positive=True)
-        first = _ints("first_logical_blocks", source.first_logical_blocks)
-        append_pages = _ints("append_block_ids", source.append_block_ids, positive=True)
-        append_offsets = _ints("append_block_offsets", source.append_block_offsets)
+        block_indptr = np.asarray(source.block_indptr, dtype=np.uint32)
+        block_ids = np.asarray(source.block_ids, dtype=np.uint32)
+        first = np.asarray(source.first_logical_blocks, dtype=np.uint32)
+        append_pages = np.asarray(source.append_block_ids, dtype=np.uint32)
+        append_offsets = np.asarray(source.append_block_offsets, dtype=np.uint32)
         block_tokens = descriptor.block_tokens
         capacity = layout.group_kernel_page_capacity(group_index)
         if (
@@ -595,16 +595,19 @@ def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> Cac
             or len(first) != rows
             or len(append_pages) != len(positions)
             or len(append_offsets) != len(positions)
-            or any(page > capacity for page in (*block_ids, *append_pages))
-            or any(offset >= block_tokens for offset in append_offsets)
+            or np.any(block_ids == 0)
+            or np.any(append_pages == 0)
+            or np.any(block_ids > capacity)
+            or np.any(append_pages > capacity)
+            or np.any(append_offsets >= block_tokens)
         ):
             raise ValueError(f"DeepSeek cache group {group_index} is malformed")
         page_rows = []
         for row in range(rows):
             start, end = indptr[row : row + 2]
-            context = contexts[row]
-            if positions[start:end] != tuple(range(context, context + end - start)):
-                raise ValueError("DeepSeek positions do not continue their context")
+            start = int(start)
+            end = int(end)
+            context = int(contexts[row])
             leased = context + end - start
             if plan.phase == BatchPhase.DECODE:
                 leased += decode_lookahead
@@ -615,28 +618,28 @@ def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> Cac
                 )
             else:
                 expected_first = 0
-            page_start, page_end = block_indptr[row : row + 2]
+            page_start, page_end = map(int, block_indptr[row : row + 2])
             row_pages = block_ids[page_start:page_end]
             if (
-                first[row] != expected_first
+                int(first[row]) != expected_first
                 or len(row_pages) != last - expected_first + 1
             ):
                 raise ValueError("DeepSeek cache row has the wrong logical extent")
-            for token in range(start, end):
-                logical = positions[token] // block_tokens
-                if logical < expected_first:
-                    # Sliding state/history groups intentionally ignore the old
-                    # part of a large prefill; only their retained tail is
-                    # materialized by the model.
-                    continue
-                relative = logical - expected_first
-                if (
-                    append_pages[token] != row_pages[relative]
-                    or append_offsets[token] != positions[token] % block_tokens
-                ):
-                    raise ValueError("DeepSeek cache append target is not row-owned")
+            row_positions = positions[start:end]
+            logical = row_positions // block_tokens
+            retained = logical >= expected_first
+            # Sliding state/history groups intentionally ignore the old part of
+            # a large prefill; only their retained tail is materialized.
+            relative = logical[retained] - expected_first
+            if not np.array_equal(
+                append_pages[start:end][retained], row_pages[relative]
+            ) or not np.array_equal(
+                append_offsets[start:end][retained],
+                row_positions[retained] % block_tokens,
+            ):
+                raise ValueError("DeepSeek cache append target is not row-owned")
             page_rows.append(row_pages)
-        groups.append(GroupPlan(tuple(page_rows), first, append_pages, append_offsets))
+        groups.append(GroupPlan(tuple(page_rows), first))
     return CachePlan(tuple(groups))
 
 
@@ -720,16 +723,12 @@ class CacheArena:
         groups = []
         for index, group in enumerate(plan.groups):
             width = max(map(len, group.pages))
-            padded = tuple(
-                page
-                for row in group.pages
-                for page in (*row, *((0,) * (width - len(row))))
-            )
+            padded = np.zeros((len(group.pages), width), dtype=np.uint32)
+            for row_index, row in enumerate(group.pages):
+                padded[row_index, : len(row)] = row
             groups.append(
                 DeviceGroup(
-                    staging.device(f"cache.{index}.pages", padded, torch.int32).view(
-                        len(group.pages), width
-                    ),
+                    staging.device(f"cache.{index}.pages", padded, torch.int32),
                     staging.device(
                         f"cache.{index}.first_blocks",
                         group.first_blocks,
@@ -790,7 +789,7 @@ class CacheArena:
 
     def graph_shape_capture_inputs(
         self, batch_size: int, sequence_capacity: int
-    ) -> dict[str, tuple[int, ...]]:
+    ) -> dict[str, object]:
         inputs = {}
         for index, width in enumerate(self._graph_widths(sequence_capacity)):
             packing = self.geometry.packings[index]
@@ -801,9 +800,7 @@ class CacheArena:
         return inputs
 
     @staticmethod
-    def graph_plan_inputs(
-        cache: DeviceCache, plan: CachePlan
-    ) -> dict[str, tuple[int, ...]]:
+    def graph_plan_inputs(cache: DeviceCache, plan: CachePlan) -> dict[str, object]:
         inputs = {}
         for index, (target, source) in enumerate(zip(cache.groups, plan.groups)):
             width = target.pages.shape[1]
@@ -812,14 +809,12 @@ class CacheArena:
                 raise ValueError("DeepSeek cache batch exceeds CUDA graph capacity")
             if any(len(row) > width for row in source.pages):
                 raise ValueError("DeepSeek cache table exceeds CUDA graph capacity")
-            padded = tuple(
-                page
-                for row in source.pages + ((),) * padding_rows
-                for page in (*row, *((0,) * (width - len(row))))
-            )
+            padded = np.zeros(target.pages.shape, dtype=np.uint32)
+            for row_index, row in enumerate(source.pages):
+                padded[row_index, : len(row)] = row
             inputs[f"cache.{index}.pages"] = padded
-            inputs[f"cache.{index}.first_blocks"] = (
-                source.first_blocks + (0,) * padding_rows
+            inputs[f"cache.{index}.first_blocks"] = np.pad(
+                source.first_blocks, (0, padding_rows)
             )
         return inputs
 

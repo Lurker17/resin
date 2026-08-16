@@ -86,15 +86,15 @@ class TestEngine:
         initial = engine.step()
         assert [event.token_id for event in initial] == [3, 9]
         assert runner.plans[0].phase == BatchPhase.PREFILL
-        assert runner.plans[0].token_indptr == [0, 2, 3]
-        assert runner.plans[0].sample_sequence_indices == [0, 1]
+        assert runner.plans[0].token_indptr.tolist() == [0, 2, 3]
+        assert runner.plans[0].sample_sequence_indices.tolist() == [0, 1]
         assert runner.released == [second]
 
         final = engine.step()
         assert [event.token_id for event in final] == [4]
         assert runner.plans[1].phase == BatchPhase.DECODE
-        assert runner.plans[1].context_lengths == [2]
-        assert runner.plans[1].sample_sequence_indices == [0]
+        assert runner.plans[1].context_lengths.tolist() == [2]
+        assert runner.plans[1].sample_sequence_indices.tolist() == [0]
         assert not engine.has_work()
         assert first.done
         assert first.take_result() == [3, 4]
@@ -138,8 +138,8 @@ class TestEngine:
         assert [event.token_id for event in final] == [6, 7]
         assert [event.index for event in final] == [4, 5]
         assert [event.finished for event in final] == [False, True]
-        assert runner.plans[2].token_ids == [5]
-        assert runner.plans[2].context_lengths == [4]
+        assert runner.plans[2].token_ids.tolist() == [5]
+        assert runner.plans[2].context_lengths.tolist() == [4]
         assert request.take_result() == [2, 3, 4, 5, 6, 7]
 
     def test_managed_cache_leases_declared_speculative_write_lookahead(self) -> None:
@@ -255,21 +255,21 @@ class TestEngine:
 
         first_events = engine.step()
         assert [event.request_id for event in first_events] == [surviving, terminal]
-        assert runner.plans[0].sequence_ids == [surviving, terminal]
+        assert runner.plans[0].sequence_ids.tolist() == [surviving, terminal]
 
         second_events = engine.step()
         assert [event.request_id for event in second_events] == [untouched]
-        assert runner.plans[1].sequence_ids == [untouched]
+        assert runner.plans[1].sequence_ids.tolist() == [untouched]
         assert untouched.done
         assert not surviving.done
 
         third_events = engine.step()
         assert [event.request_id for event in third_events] == [surviving]
-        assert runner.plans[2].sequence_ids == [surviving]
+        assert runner.plans[2].sequence_ids.tolist() == [surviving]
 
         fourth_events = engine.step()
         assert [event.request_id for event in fourth_events] == [surviving]
-        assert runner.plans[3].sequence_ids == [surviving]
+        assert runner.plans[3].sequence_ids.tolist() == [surviving]
         assert untouched.take_result() == [21]
 
     def test_public_batch_plan_validates_indptr(self) -> None:
@@ -310,18 +310,22 @@ class TestEngine:
         assert len(prefill.cache_groups) == 1
         group = prefill.cache_groups[0]
         assert group.group_index == 0
-        assert group.block_indptr == [0, 2]
-        assert group.first_logical_blocks == [0]
-        assert group.append_block_ids == [group.block_ids[0]] * 2 + [group.block_ids[1]]
-        assert group.append_block_offsets == [0, 1, 0]
+        assert group.block_indptr.tolist() == [0, 2]
+        assert group.first_logical_blocks.tolist() == [0]
+        assert group.append_block_ids.tolist() == [
+            int(group.block_ids[0]),
+            int(group.block_ids[0]),
+            int(group.block_ids[1]),
+        ]
+        assert group.append_block_offsets.tolist() == [0, 1, 0]
 
         engine.step()
         decode = runner.plans[1]
-        assert decode.context_lengths == [3]
+        assert decode.context_lengths.tolist() == [3]
         decode_group = decode.cache_groups[0]
-        assert decode_group.block_ids == group.block_ids
-        assert decode_group.append_block_ids == [group.block_ids[1]]
-        assert decode_group.append_block_offsets == [1]
+        assert decode_group.block_ids.tolist() == group.block_ids.tolist()
+        assert decode_group.append_block_ids.tolist() == [int(group.block_ids[1])]
+        assert decode_group.append_block_offsets.tolist() == [1]
 
         assert runner.released == [request]
         assert engine.cache_occupied_block_count == 0
@@ -351,7 +355,7 @@ class TestEngine:
 
         engine.step()
         assert engine.cache_occupied_block_count == 2
-        assert runner.plans[-1].sequence_ids == [first, second]
+        assert runner.plans[-1].sequence_ids.tolist() == [first, second]
 
         while engine.has_work():
             engine.step()
@@ -362,9 +366,10 @@ class TestEngine:
         first_replay = next(
             plan
             for plan in runner.plans[1:]
-            if plan.sequence_ids == [first] and plan.phase == BatchPhase.PREFILL
+            if plan.sequence_ids.tolist() == [first]
+            and plan.phase == BatchPhase.PREFILL
         )
-        assert first_replay.sample_sequence_indices == []
+        assert first_replay.sample_sequence_indices.tolist() == []
         assert engine.cache_occupied_block_count == 0
 
     def test_conservativeness_limits_initial_kv_admission(self) -> None:
@@ -382,6 +387,6 @@ class TestEngine:
         first = engine.submit([1], max_new_tokens=3)
         second = engine.submit([10], max_new_tokens=3)
         engine.step()
-        assert runner.plans[-1].sequence_ids == [first]
+        assert runner.plans[-1].sequence_ids.tolist() == [first]
         assert not second.done
         engine.close()

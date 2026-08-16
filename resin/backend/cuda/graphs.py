@@ -152,7 +152,7 @@ class CudaGraphCache:
         entry.step = self._build(shape)
         assert entry.step is not None
         try:
-            entry.staging = TensorStager(self.torch, self.device)
+            entry.staging = TensorStager(self.device)
             entry.staging.copy_into(entry.step.inputs, inputs)
         except StagingError as error:
             entry.step = None
@@ -182,7 +182,7 @@ class CudaGraphCache:
                 "capture configured graphs during runner initialization"
             )
         try:
-            entry.staging = TensorStager(self.torch, self.device)
+            entry.staging = TensorStager(self.device)
             entry.staging.copy_into(entry.step.inputs, inputs)
         except StagingError as error:
             raise GraphInputError(str(error)) from error

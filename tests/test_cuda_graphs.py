@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from resin.backend.cuda import staging
 from resin.backend.cuda.graphs import (
     CudaGraphCache,
     CudaGraphStep,
@@ -143,8 +144,11 @@ class TestCudaGraph:
         assert graphs.match(lambda shape: shape[0] == 2 and shape[1] >= 5) == (2, 8)
         assert graphs.match(lambda shape: shape[0] == 1 and shape[1] >= 5) is None
 
-    def test_explicit_capture_precedes_replay_of_the_same_static_step(self) -> None:
+    def test_explicit_capture_precedes_replay_of_the_same_static_step(
+        self, monkeypatch
+    ) -> None:
         torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
         staged = [7]
         allocations = []
 
@@ -163,7 +167,9 @@ class TestCudaGraph:
         assert graphs.stats["replay_count"] == 1
         assert graphs.stats["captured_shapes"] == ((1, 4),)
 
-    def test_capture_can_prepare_mutable_state_before_each_parity_run(self) -> None:
+    def test_capture_can_prepare_mutable_state_before_each_parity_run(
+        self, monkeypatch
+    ) -> None:
         prepared = []
 
         def build(_shape):
@@ -175,7 +181,9 @@ class TestCudaGraph:
                 prepare=lambda: prepared.append(True),
             )
 
-        graphs = _cache(_Torch(), ((1, 4),), build)
+        torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
+        graphs = _cache(torch, ((1, 4),), build)
 
         graphs.capture((1, 4), {"value": [7]})
 
@@ -191,7 +199,9 @@ class TestCudaGraph:
             graphs.run((1, 4), {})
         assert graphs.stats["capture_count"] == 0
 
-    def test_host_shape_error_is_retryable_and_drops_fresh_step(self) -> None:
+    def test_host_shape_error_is_retryable_and_drops_fresh_step(
+        self, monkeypatch
+    ) -> None:
         builds = []
 
         def build(_shape):
@@ -199,14 +209,16 @@ class TestCudaGraph:
             state = _Tensor([0])
             return CudaGraphStep({"value": state}, state, lambda: None)
 
-        graphs = _cache(_Torch(), ((1, 4),), build)
+        torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
+        graphs = _cache(torch, ((1, 4),), build)
         with pytest.raises(GraphInputError):
             graphs.capture((1, 4), {})
         assert not graphs.stats["poisoned"]
         assert graphs.capture((1, 4), {"value": [1]}) == [1]
         assert len(builds) == 2
 
-    def test_capture_mismatch_poisons_before_future_work(self) -> None:
+    def test_capture_mismatch_poisons_before_future_work(self, monkeypatch) -> None:
         synchronized = []
 
         def build(_shape):
@@ -217,7 +229,9 @@ class TestCudaGraph:
 
             return CudaGraphStep({"value": state}, state, launch)
 
-        graphs = _cache(_Torch(), ((1, 4),), build, lambda: synchronized.append(True))
+        torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
+        graphs = _cache(torch, ((1, 4),), build, lambda: synchronized.append(True))
         with pytest.raises(RuntimeError, match="differs"):
             graphs.capture((1, 4), {"value": [0]})
         assert synchronized == [True]
@@ -225,11 +239,13 @@ class TestCudaGraph:
         with pytest.raises(RuntimeError, match="poisoned"):
             graphs.check()
 
-    def test_device_copy_failure_poisons_before_capture(self) -> None:
+    def test_device_copy_failure_poisons_before_capture(self, monkeypatch) -> None:
         state = _Tensor([0])
         state.copy_error = RuntimeError("copy failed")
+        torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
         graphs = _cache(
-            _Torch(),
+            torch,
             ((1, 4),),
             lambda _shape: CudaGraphStep({"value": state}, state, lambda: None),
         )
@@ -239,8 +255,9 @@ class TestCudaGraph:
         assert graphs.stats["capture_count"] == 0
         assert "graph input copy" in graphs.stats["poison_error"]
 
-    def test_replay_failure_poisons_without_counting_replay(self) -> None:
+    def test_replay_failure_poisons_without_counting_replay(self, monkeypatch) -> None:
         torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
 
         def build(_shape):
             state = _Tensor([1])

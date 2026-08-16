@@ -1,5 +1,6 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use std::sync::OnceLock;
 
 use crate::cache::CacheGroupPlan;
 use crate::{BatchPhase, BatchPlan, Request, ScheduledRow, SchedulerConfig};
@@ -203,5 +204,6 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
         cache_groups,
         sample_sequence_indices,
         sampling_params,
+        positions: OnceLock::new(),
     })
 }

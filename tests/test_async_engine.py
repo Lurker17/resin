@@ -436,7 +436,7 @@ class TestAsyncEngineContract:
         assert (engine.ready_request_count, engine.in_flight_request_count) == (3, 0)
 
         assert engine.dispatch() == 2
-        assert [plan.sequence_ids for plan in runner.dispatch_plans] == [
+        assert [plan.sequence_ids.tolist() for plan in runner.dispatch_plans] == [
             [first, second],
             [first, second],
         ]
@@ -449,7 +449,13 @@ class TestAsyncEngineContract:
             "token_indptr",
             "context_lengths",
         ):
-            assert getattr(failed_plan, field) == getattr(retry_plan, field), field
+            left = getattr(failed_plan, field)
+            right = getattr(retry_plan, field)
+            assert (
+                left.tolist() == right.tolist()
+                if hasattr(left, "tolist")
+                else left == right
+            ), field
         events = engine.poll()
         assert [event.request_id for event in events] == [first, second]
         assert engine.ready_request_count == 1
@@ -457,7 +463,7 @@ class TestAsyncEngineContract:
         runner.poll_results.append([31])
         tail_events = engine.step()
         assert [event.request_id for event in tail_events] == [tail]
-        assert runner.dispatch_plans[-1].sequence_ids == [tail]
+        assert runner.dispatch_plans[-1].sequence_ids.tolist() == [tail]
 
     def test_canceled_terminal_and_surviving_rows_preserve_tail_rotation(self) -> None:
         runner = ControlledAsyncRunner([[11, 21, 31], [41], [32]])
@@ -474,11 +480,11 @@ class TestAsyncEngineContract:
         assert runner.released == [canceled, terminal]
 
         second_events = engine.step()
-        assert runner.dispatch_plans[-1].sequence_ids == [untouched]
+        assert runner.dispatch_plans[-1].sequence_ids.tolist() == [untouched]
         assert [event.request_id for event in second_events] == [untouched]
 
         third_events = engine.step()
-        assert runner.dispatch_plans[-1].sequence_ids == [surviving]
+        assert runner.dispatch_plans[-1].sequence_ids.tolist() == [surviving]
         assert [event.request_id for event in third_events] == [surviving]
 
     def test_async_step_dispatches_and_polls_exactly_once(self) -> None:

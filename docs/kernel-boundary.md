@@ -14,8 +14,14 @@ The independent sequence metadata is deliberately small:
 - `token_indptr`: offsets that slice `token_ids` for each sequence.
 - `phase`: prefill or decode. A dispatch never mixes phases.
 
-Positions are implicit. For sequence `i`, its scheduled positions are
-`range(context_lengths[i], context_lengths[i] + token_count(i))`.
+Positions are derived rather than transported independently. `plan.positions`
+memoizes the flattened ranges beginning at each `context_lengths[i]`.
+
+The numeric fields on `BatchPlan` are read-only NumPy arrays backed directly by
+the frozen native plan: `sequence_ids` is `uint64`; token, position, pointer,
+and sequence-index arrays are `uint32`. Repeated property access creates a new
+view, not a new data buffer. A runner should pass these arrays directly to its
+pinned host staging path rather than calling `list()` or `tuple()` first.
 
 `batch_id` correlates an asynchronous dispatch with its later poll result.
 `batch_key` is an optional caller-defined compatibility key; the scheduler does
@@ -33,6 +39,11 @@ rather than transported separately.
 `CacheGroupPlan` contains a CSR physical page table and exact append locations.
 The Engine has already allocated, retained, and leased those pages. The runner
 must not allocate pages or keep a request-ID cache map.
+
+Its pointer, block, and append fields are likewise read-only, zero-copy
+`uint32` arrays. Constructors accept ordinary integer sequences or arrays with
+the exact native dtype; the Engine-generated execution path does not perform a
+Python element-by-element conversion.
 
 The cache pool ID appears only in `ResourceBinding`, which permanently binds the
 runner's physical arena to one Engine. Repeating it in every `BatchPlan` would

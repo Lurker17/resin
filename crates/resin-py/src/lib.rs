@@ -1,13 +1,15 @@
 use std::cmp::Reverse;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use numpy::{PyArray1, PyArrayLike1};
 use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
+mod arrays;
 mod cache;
 mod http;
 mod planning;
@@ -303,6 +305,7 @@ struct BatchPlan {
     cache_groups: Vec<CacheGroupPlan>,
     sample_sequence_indices: Vec<u32>,
     sampling_params: Vec<SamplingParams>,
+    positions: OnceLock<Vec<u32>>,
 }
 
 fn validate_sequence_indices(name: &str, indices: &[u32], sequence_count: usize) -> PyResult<()> {
@@ -386,6 +389,15 @@ impl BatchPlan {
                 "each sequence must contain at least one token",
             ));
         }
+        if context_lengths
+            .iter()
+            .zip(token_indptr.windows(2))
+            .any(|(context, range)| context.checked_add(range[1] - range[0]).is_none())
+        {
+            return Err(PyValueError::new_err(
+                "scheduled positions exceed the u32 metadata range",
+            ));
+        }
         let mut sorted_ids = sequence_ids.clone();
         sorted_ids.sort_unstable();
         if sorted_ids.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -460,17 +472,21 @@ impl BatchPlan {
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
-        sequence_ids: Vec<u64>,
-        context_lengths: Vec<u32>,
-        token_ids: Vec<u32>,
-        token_indptr: Vec<u32>,
+        sequence_ids: PyArrayLike1<'_, u64>,
+        context_lengths: PyArrayLike1<'_, u32>,
+        token_ids: PyArrayLike1<'_, u32>,
+        token_indptr: PyArrayLike1<'_, u32>,
         phase: BatchPhase,
         batch_id: u64,
         batch_key: Option<u64>,
         cache_groups: Option<Vec<Py<CacheGroupPlan>>>,
-        sample_sequence_indices: Option<Vec<u32>>,
+        sample_sequence_indices: Option<PyArrayLike1<'_, u32>>,
         sampling_params: Option<Vec<Py<SamplingParams>>>,
     ) -> PyResult<Self> {
+        let sequence_ids = arrays::owned_vec(sequence_ids);
+        let context_lengths = arrays::owned_vec(context_lengths);
+        let token_ids = arrays::owned_vec(token_ids);
+        let token_indptr = arrays::owned_vec(token_indptr);
         let sequence_count = sequence_ids.len();
         let cache_groups = cache_groups
             .unwrap_or_default()
@@ -478,6 +494,7 @@ impl BatchPlan {
             .map(|group| group.borrow(py).clone())
             .collect();
         let sample_sequence_indices = sample_sequence_indices
+            .map(arrays::owned_vec)
             .unwrap_or_else(|| (0..sequence_count as u32).collect::<Vec<_>>());
         let mut sampling_params = sampling_params
             .map(|params| {
@@ -503,31 +520,50 @@ impl BatchPlan {
             cache_groups,
             sample_sequence_indices,
             sampling_params,
+            positions: OnceLock::new(),
         })
     }
 
     /// Stable request identifier for each sequence.
     #[getter]
-    fn sequence_ids(&self) -> Vec<u64> {
-        self.sequence_ids.clone()
+    fn sequence_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u64>> {
+        arrays::readonly_view(this.clone().into_any(), &this.get().sequence_ids)
     }
 
     /// Number of tokens already processed for each sequence.
     #[getter]
-    fn context_lengths(&self) -> Vec<u32> {
-        self.context_lengths.clone()
+    fn context_lengths<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        arrays::readonly_view(this.clone().into_any(), &this.get().context_lengths)
     }
 
     /// Flattened scheduled token IDs, grouped by sequence.
     #[getter]
-    fn token_ids(&self) -> Vec<u32> {
-        self.token_ids.clone()
+    fn token_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        arrays::readonly_view(this.clone().into_any(), &this.get().token_ids)
     }
 
     /// Offsets into ``token_ids`` for each sequence.
     #[getter]
-    fn token_indptr(&self) -> Vec<u32> {
-        self.token_indptr.clone()
+    fn token_indptr<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        arrays::readonly_view(this.clone().into_any(), &this.get().token_indptr)
+    }
+
+    /// Absolute position of every flattened scheduled token.
+    #[getter]
+    fn positions<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        let plan = this.get();
+        let positions = plan.positions.get_or_init(|| {
+            let mut positions = Vec::with_capacity(plan.token_ids.len());
+            for (context, range) in plan
+                .context_lengths
+                .iter()
+                .zip(plan.token_indptr.windows(2))
+            {
+                positions.extend(*context..*context + range[1] - range[0]);
+            }
+            positions
+        });
+        arrays::readonly_view(this.clone().into_any(), positions)
     }
 
     /// Whether this is a prefill or decode batch. Mixed-chunk is not supported.
@@ -563,8 +599,8 @@ impl BatchPlan {
     /// Which sequence indices should generate a sampled token. Used for
     /// chunked prefill, when some sequences only advance the cache.
     #[getter]
-    fn sample_sequence_indices(&self) -> Vec<u32> {
-        self.sample_sequence_indices.clone()
+    fn sample_sequence_indices<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        arrays::readonly_view(this.clone().into_any(), &this.get().sample_sequence_indices)
     }
 
     /// Effective sampling parameters, one per sequence.
@@ -583,6 +619,12 @@ impl BatchPlan {
     #[getter]
     fn num_sequences(&self) -> usize {
         self.sequence_ids.len()
+    }
+
+    /// Number of flattened scheduled tokens.
+    #[getter]
+    fn num_tokens(&self) -> usize {
+        self.token_ids.len()
     }
 
     /// Return the half-open range in ``token_ids`` for one sequence.
