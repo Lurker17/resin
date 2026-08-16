@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from resin import BatchPhase
+from resin.backend.plans import plan_positions
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,9 +43,9 @@ def build_cache_metadata(plan, page_size: int) -> CacheMetadata:
     if page_size <= 0:
         raise ValueError("page_size must be positive")
     rows = len(plan.sequence_ids)
-    indptr = tuple(plan.sequence_indptr)
+    indptr = tuple(plan.token_indptr)
     contexts = tuple(plan.context_lengths)
-    positions = tuple(plan.positions)
+    positions = tuple(plan_positions(plan))
     token_count = len(plan.token_ids)
     if (
         rows == 0
@@ -59,8 +60,8 @@ def build_cache_metadata(plan, page_size: int) -> CacheMetadata:
     if plan.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
         raise ValueError("plan phase must be prefill or decode")
     groups = tuple(plan.cache_groups)
-    if len(groups) != 1 or groups[0].group_index != 0:
-        raise ValueError("LFM2 requires one History cache group")
+    if len(groups) != 2 or tuple(group.group_index for group in groups) != (0, 1):
+        raise ValueError("LFM2 requires History and State cache groups")
     group = groups[0]
     block_indptr = tuple(group.block_indptr)
     block_ids = tuple(group.block_ids)

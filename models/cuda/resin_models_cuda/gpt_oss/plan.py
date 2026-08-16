@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from resin import BatchPhase
+from resin.backend.plans import plan_positions
 
 PAGE_SIZE = 128
 SLIDING_WINDOW = 128
@@ -147,8 +148,8 @@ def build_attention_batches(
 
     sequence_ids = _integers("sequence_ids", plan.sequence_ids)
     tokens = _integers("token_ids", plan.token_ids)
-    positions = _integers("positions", plan.positions)
-    indptr = _integers("sequence_indptr", plan.sequence_indptr)
+    positions = _integers("positions", plan_positions(plan))
+    indptr = _integers("token_indptr", plan.token_indptr)
     contexts = _integers("context_lengths", plan.context_lengths)
     row_count = len(sequence_ids)
     if row_count == 0:

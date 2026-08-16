@@ -29,7 +29,6 @@ The focused contracts are:
 
 - [flat cache pool](docs/cache-pool.md)
 - [scheduler](docs/scheduler.md)
-- [state ownership](docs/state-pool.md)
 - [runner/kernel boundary](docs/kernel-boundary.md)
 - [GPT-OSS runner status](docs/gpt-oss-itl.md)
 - [persistent kernel artifacts](docs/kernel-cache.md)
@@ -162,11 +161,9 @@ class Runner:
 ```
 
 An asynchronous runner supplies `dispatch(plan)` and `poll(completion)` instead.
-Managed cache and recurrent state are optional runner-owned declarations that
-the Engine binds once during construction through a frozen `RunnerConfig` and
-one `bind_resources(binding)` callback. Pass `prefix_cache=True` to `Engine`
-to opt into cross-request reuse for paged-KV runners and recurrent runners
-that declare an aligned state-checkpoint contract.
+Managed history and recurrent state are cache groups declared through a frozen
+`RunnerConfig`. The Engine binds their one physical arena during construction.
+Pass `prefix_cache=True` to reuse aligned prefixes across requests.
 
 ## Local HTTP server
 
@@ -230,35 +227,25 @@ The native layer currently provides:
 
 - sticky continual batching with prefill priority and memory retraction;
 - phase-homogeneous prefill or decode batches, token budgets, and prefill chunks;
-- one flat physical cache pool shared by ordered History and Window groups;
+- one flat physical cache pool shared by History, Window, and State groups;
 - sparse, chronological `CacheGroupPlan` rows and exact append destinations;
 - opt-in exact-token LRU prefix caching with immutable page sharing and
   sliding-window and recurrent-state copy-on-write;
-- generation-checked `StatePool` slots with shared-read/exclusive-write access;
 - retryable pre-accept failure and fail-stop post-accept quarantine.
 
 The native implementation is split in two. `crates/resin-core` is ordinary,
-PyO3-free Rust containing typed scheduling, token-range planning, full-context
-and sliding-window KV resources, recurrent-slot resources, allocation, and
-leases. `crates/resin-py` adapts those types to Python and coordinates runner
-acceptance and completion.
+PyO3-free Rust containing typed scheduling, token-range planning, grouped cache
+allocation, and leases. `crates/resin-py` adapts those types to Python and
+coordinates runner acceptance and completion.
 
 History cache grows on demand to each frozen plan. Window cache grows toward
 bounded cyclic storage whose plan row is projected into chronological order.
 With prefix caching enabled, a block trie indexes exact token prefixes, cached
 pages become immutable readers, and Window pages are copied on write when a
-request advances its ring. LRU entries use spare capacity in the same physical
-pool and are evicted when live allocation needs their pages or state slots.
-
-Request-sized recurrent model state is a separate `StatePool` resource. A mapped runner may
-omit both the pool and request handles: Engine sizes the pool from the running
-limit, allocates slots at admission, and emits their indices in `BatchPlan`.
-Explicit handles remain available for shared-state requests. Prefix reuse is
-accepted only when a recurrent mapping declares `checkpoint_granularity`.
-At aligned prefill boundaries the cache retains the matching state generation;
-a hit supplies an ordered read-checkpoint/write-destination pair, and the
-runner copies that checkpoint before updating its private destination. LFM2
-uses this contract for convolution state while sharing its attention pages.
+request advances its ring. State groups retain a two-checkpoint ring. At an
+aligned prefix hit, the input checkpoint stays immutable while the next page is
+writable; the runner copies only when input and output pages differ. LRU entries
+use spare capacity in the same pool and are evicted when live requests need it.
 
 Implemented runner modules include a synchronous LFM2 reference and local CUDA
 implementations for LFM2, GPT-OSS, and DeepSeek-V4-Flash. The GPT-OSS CUDA path uses one
@@ -268,9 +255,10 @@ multi-H200 allocations and reusable distributed decode CUDA graphs. Attention
 heads, KV storage, and MXFP4 expert intermediate dimensions are sharded; row
 parallel attention and expert outputs are reduced through one NCCL group.
 
-The LFM2 CUDA runner has one route: atomic cache-plus-state binding followed by
-asynchronous dispatch/poll. Its continuation harness uses native Engine plans;
-there is no parallel manual-plan or synchronous compatibility path.
+The LFM2 CUDA runner stores attention history and 128-token convolution-state
+checkpoints in the same fungible parent allocation. One KV page occupies a
+whole parent; six recurrent checkpoints fit in one parent. Its only execution
+route is asynchronous dispatch/poll over native Engine plans.
 
 DeepSeek-V4 uses six logical groups over one fungible physical parent pool:
 sliding attention KV, c4 compressed history, the c4 compressor tail, c128
@@ -305,12 +293,9 @@ RunnerConfig
 ResourceBinding
 ResourceRunner
 CacheGroupLayout
+CacheGroupFamily
 CacheLayout
 CacheGroupPlan
-StatePool
-StateHandle
-StateMappingConfig
-mint_state_mapping_arena_id
 ```
 
 Concrete runners are explicit imports from architecture submodules such as
@@ -336,10 +321,9 @@ unavailable accelerator libraries.
 - `crates/resin-py/src/planning.rs` — conversion from core batch/resource views to `BatchPlan`
 - `crates/resin-py/src/runner.rs` — execution discovery and one-time resource binding
 - `crates/resin-py/src/cache.rs` — Python adapters for core KV descriptors
-- `crates/resin-py/src/state_pool.rs` — Python adapter for the core recurrent-slot pool
 - `crates/resin-core/src/scheduler.rs` — cohort selection and queue-age policy
 - `crates/resin-core/src/planning.rs` — typed token-range planning
-- `crates/resin-core/src/resources/` — KV, recurrent, allocator, and lease logic
+- `crates/resin-core/src/resources/` — grouped cache allocation, prefix reuse, and leases
 - `resin/backend/` — reusable execution and resource gadgets
 - `models/` — separately installable model definitions, loaders, and runners
 - `scripts/` — examples, benchmarks, and local maintenance tools

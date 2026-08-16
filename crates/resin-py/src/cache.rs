@@ -1,4 +1,4 @@
-//! Python adapters for the pure Rust attention-KV descriptors in `resin-core`.
+//! Python adapters for the pure Rust cache descriptors in `resin-core`.
 
 use std::num::NonZeroU32;
 
@@ -6,7 +6,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use resin_core::resources::kv::{
-    KvGroupLayout, KvGroupPlan, KvLayout, KvLayoutError, KvPlanError, KvRetention,
+    KvGroupFamily, KvGroupLayout, KvGroupPlan, KvLayout, KvLayoutError, KvPlanError, KvRetention,
 };
 
 fn layout_error(error: KvLayoutError) -> PyErr {
@@ -19,8 +19,9 @@ fn plan_error(error: KvPlanError) -> PyErr {
 
 /// Cache-block lifetime policy.
 ///
-/// ``HISTORY`` retains every logical block. ``WINDOW`` retains only the
-/// rolling suffix selected by ``CacheGroupLayout.window_tokens``.
+/// For history groups, ``HISTORY`` retains every logical block and ``WINDOW``
+/// retains the suffix selected by ``CacheGroupLayout.window_tokens``. Recurrent
+/// state groups use ``HISTORY`` and retain their two-page checkpoint ring.
 #[pyclass(
     frozen,
     eq,
@@ -35,15 +36,34 @@ pub(crate) enum CacheRetention {
     Window,
 }
 
+/// Whether a group stores token history or recurrent checkpoints.
+#[pyclass(
+    frozen,
+    eq,
+    hash,
+    rename_all = "SCREAMING_SNAKE_CASE",
+    from_py_object,
+    module = "resin._resin"
+)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum CacheGroupFamily {
+    History,
+    State,
+}
+
 fn group_repr(group: KvGroupLayout) -> String {
+    let family = match group.family() {
+        KvGroupFamily::History => "",
+        KvGroupFamily::State => ", family=CacheGroupFamily.STATE",
+    };
     match group.retention() {
         KvRetention::FullContext => format!(
-            "CacheGroupLayout(block_tokens={}, blocks_per_parent={}, retention=CacheRetention.HISTORY)",
+            "CacheGroupLayout(block_tokens={}, blocks_per_parent={}, retention=CacheRetention.HISTORY{family})",
             group.block_tokens(),
             group.blocks_per_parent()
         ),
         KvRetention::SlidingWindow { tokens } => format!(
-            "CacheGroupLayout(block_tokens={}, blocks_per_parent={}, retention=CacheRetention.WINDOW, window_tokens={tokens})",
+            "CacheGroupLayout(block_tokens={}, blocks_per_parent={}, retention=CacheRetention.WINDOW, window_tokens={tokens}{family})",
             group.block_tokens(),
             group.blocks_per_parent()
         ),
@@ -66,6 +86,7 @@ impl CacheGroupLayout {
         blocks_per_parent: u32,
         retention: CacheRetention,
         window_tokens: Option<u32>,
+        family: CacheGroupFamily,
     ) -> PyResult<Self> {
         let retention = match retention {
             CacheRetention::History => {
@@ -85,9 +106,18 @@ impl CacheGroupLayout {
                 KvRetention::SlidingWindow { tokens }
             }
         };
+        let family = match family {
+            CacheGroupFamily::History => KvGroupFamily::History,
+            CacheGroupFamily::State => KvGroupFamily::State,
+        };
         Ok(Self {
-            inner: KvGroupLayout::new(block_tokens, blocks_per_parent, retention)
-                .map_err(layout_error)?,
+            inner: KvGroupLayout::new_with_family(
+                block_tokens,
+                blocks_per_parent,
+                retention,
+                family,
+            )
+            .map_err(layout_error)?,
         })
     }
 
@@ -113,31 +143,39 @@ impl CacheGroupLayout {
         *,
         blocks_per_parent = 1,
         retention = CacheRetention::History,
-        window_tokens = None
+        window_tokens = None,
+        family = CacheGroupFamily::History
     ))]
     fn new(
         block_tokens: u32,
         blocks_per_parent: u32,
         retention: CacheRetention,
         window_tokens: Option<u32>,
+        family: CacheGroupFamily,
     ) -> PyResult<Self> {
-        Self::from_parts(block_tokens, blocks_per_parent, retention, window_tokens)
+        Self::from_parts(
+            block_tokens,
+            blocks_per_parent,
+            retention,
+            window_tokens,
+            family,
+        )
     }
 
-    #[getter]
     /// Number of token positions represented by one logical block.
+    #[getter]
     fn block_tokens(&self) -> u32 {
         self.inner.block_tokens().get()
     }
 
-    #[getter]
     /// Number of this group's logical blocks packed into one parent allocation.
+    #[getter]
     fn blocks_per_parent(&self) -> u32 {
         self.inner.blocks_per_parent().get()
     }
 
-    #[getter]
     /// Lifetime policy for logical blocks in this group.
+    #[getter]
     fn retention(&self) -> CacheRetention {
         match self.inner.retention() {
             KvRetention::FullContext => CacheRetention::History,
@@ -145,14 +183,23 @@ impl CacheGroupLayout {
         }
     }
 
+    /// Whether this group stores token history or recurrent checkpoints.
     #[getter]
+    fn family(&self) -> CacheGroupFamily {
+        match self.inner.family() {
+            KvGroupFamily::History => CacheGroupFamily::History,
+            KvGroupFamily::State => CacheGroupFamily::State,
+        }
+    }
+
     /// Retained suffix length for ``WINDOW`` groups, otherwise ``None``.
+    #[getter]
     fn window_tokens(&self) -> Option<u32> {
         self.inner.retention().window_tokens().map(NonZeroU32::get)
     }
 
-    #[getter]
     /// Maximum resident logical blocks per sequence for a window group.
+    #[getter]
     fn window_resident_block_count(&self) -> Option<u32> {
         self.inner.window_resident_blocks().map(NonZeroU32::get)
     }
@@ -223,20 +270,20 @@ impl CacheLayout {
         Self::from_groups(parent_capacity, groups)
     }
 
-    #[getter]
     /// Number of fungible physical parent allocations in the pool.
+    #[getter]
     fn parent_capacity(&self) -> u32 {
         self.inner.parent_capacity().get()
     }
 
-    #[getter]
     /// Number of logical cache groups.
+    #[getter]
     fn group_count(&self) -> usize {
         self.inner.groups().len()
     }
 
-    #[getter]
     /// Ordered immutable cache-group descriptors.
+    #[getter]
     fn groups(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         let groups = self
             .inner
@@ -268,10 +315,10 @@ impl CacheLayout {
 
 /// Physical page placement for one cache group in a BatchPlan.
 ///
-/// ``block_indptr`` and ``block_ids`` form a CSR block table with one row per
-/// sequence. ``first_logical_blocks`` gives the logical number represented by
-/// each row's first physical block. The two ``append_*`` arrays contain one
-/// write target per flattened batch token.
+/// Adjacent ``block_indptr`` values select each sequence's physical pages from
+/// ``block_ids``. ``first_logical_blocks`` gives the logical number represented
+/// by each sequence's first physical block. The two ``append_*`` arrays contain
+/// one write target per flattened batch token.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CacheGroupPlan {
@@ -344,38 +391,38 @@ impl CacheGroupPlan {
         )
     }
 
-    #[getter]
     /// Zero-based index into the Engine's CacheLayout groups.
+    #[getter]
     fn group_index(&self) -> u32 {
         self.inner.group_index
     }
 
+    /// Offsets into ``block_ids`` for each sequence.
     #[getter]
-    /// CSR row offsets into ``block_ids``; length is sequence count plus one.
     fn block_indptr(&self) -> Vec<u32> {
         self.inner.block_indptr.clone()
     }
 
-    #[getter]
     /// Flattened physical block IDs, grouped chronologically by sequence.
+    #[getter]
     fn block_ids(&self) -> Vec<u32> {
         self.inner.block_ids.clone()
     }
 
+    /// Logical block number corresponding to each sequence's first block.
     #[getter]
-    /// Logical block number corresponding to each sequence row's first block.
     fn first_logical_blocks(&self) -> Vec<u32> {
         self.inner.first_logical_blocks.clone()
     }
 
-    #[getter]
     /// Physical destination block for every flattened batch token.
+    #[getter]
     fn append_block_ids(&self) -> Vec<u32> {
         self.inner.append_block_ids.clone()
     }
 
-    #[getter]
     /// In-block destination offset for every flattened batch token.
+    #[getter]
     fn append_block_offsets(&self) -> Vec<u32> {
         self.inner.append_block_offsets.clone()
     }
@@ -390,7 +437,14 @@ mod tests {
     use super::*;
 
     fn history(block_tokens: u32, packing: u32) -> CacheGroupLayout {
-        CacheGroupLayout::from_parts(block_tokens, packing, CacheRetention::History, None).unwrap()
+        CacheGroupLayout::from_parts(
+            block_tokens,
+            packing,
+            CacheRetention::History,
+            None,
+            CacheGroupFamily::History,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -408,8 +462,14 @@ mod tests {
     #[test]
     fn representations_keep_the_public_python_vocabulary() {
         let history = history(128, 1);
-        let window =
-            CacheGroupLayout::from_parts(128, 1, CacheRetention::Window, Some(128)).unwrap();
+        let window = CacheGroupLayout::from_parts(
+            128,
+            1,
+            CacheRetention::Window,
+            Some(128),
+            CacheGroupFamily::History,
+        )
+        .unwrap();
         let layout = CacheLayout::from_groups(8, vec![history, window]).unwrap();
         assert_eq!(
             layout.repr_string(),

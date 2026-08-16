@@ -64,7 +64,7 @@ class ResourceRunner(Protocol):
 
     runner_config: RunnerConfig
 
-    def bind_resources(self, binding: ResourceBinding) -> int | None: ...
+    def bind_resources(self, binding: ResourceBinding) -> None: ...
 
 
 Runner: TypeAlias = SyncRunner | AsyncRunner

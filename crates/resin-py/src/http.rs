@@ -337,8 +337,6 @@ fn admit(
             py,
             rendered.token_ids,
             Some(job.request.max_output_tokens),
-            None,
-            None,
             0,
             None,
             Some(sampling_params),

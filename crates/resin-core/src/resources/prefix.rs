@@ -1,14 +1,5 @@
 use std::collections::HashMap;
 
-use super::paged::CachedPages;
-use super::slots::SlotHandle;
-
-#[derive(Debug)]
-pub(crate) struct PrefixSnapshot {
-    pub(crate) pages: CachedPages,
-    pub(crate) recurrent_checkpoint: Option<SlotHandle>,
-}
-
 #[derive(Debug)]
 struct Entry<T> {
     snapshot: T,
@@ -68,7 +59,7 @@ impl<T> PrefixCache<T> {
 
     pub(crate) fn find(&mut self, tokens: &[u32]) -> Option<(u32, &T)> {
         let alignment = self.alignment as usize;
-        let usable = if tokens.len() % alignment == 0 {
+        let usable = if tokens.len().is_multiple_of(alignment) {
             tokens.len().saturating_sub(alignment)
         } else {
             tokens.len() / alignment * alignment
@@ -99,7 +90,7 @@ impl<T> PrefixCache<T> {
     }
 
     pub(crate) fn insert(&mut self, tokens: &[u32], snapshot: T) -> Option<T> {
-        debug_assert!(!tokens.is_empty() && tokens.len() % self.alignment as usize == 0);
+        debug_assert!(!tokens.is_empty() && tokens.len().is_multiple_of(self.alignment as usize));
         let mut node = 0usize;
         for block in tokens.chunks_exact(self.alignment as usize) {
             node = match self.nodes[node].children.get(block).copied() {
@@ -187,64 +178,5 @@ impl<T> PrefixCache<T> {
 
     pub(crate) const fn evictions(&self) -> u64 {
         self.evictions
-    }
-}
-
-/// Exact-token LRU checkpoints for runners whose complete sequence state is
-/// represented by one Engine-managed recurrent slot rather than paged KV.
-#[derive(Debug)]
-pub struct StatePrefixResources {
-    cache: PrefixCache<SlotHandle>,
-}
-
-impl StatePrefixResources {
-    pub fn new(alignment: u32) -> Self {
-        Self {
-            cache: PrefixCache::new(alignment),
-        }
-    }
-
-    pub fn restore(&mut self, tokens: &[u32]) -> Option<(u32, SlotHandle)> {
-        self.cache
-            .find(tokens)
-            .map(|(length, checkpoint)| (length, *checkpoint))
-    }
-
-    pub fn publish(
-        &mut self,
-        tokens: &[u32],
-        resident_tokens: u32,
-        checkpoint: SlotHandle,
-    ) -> (bool, Option<SlotHandle>) {
-        let length = resident_tokens as usize;
-        if length == 0 || length > tokens.len() || resident_tokens % self.cache.alignment() != 0 {
-            return (false, None);
-        }
-        (true, self.cache.insert(&tokens[..length], checkpoint))
-    }
-
-    pub fn evict_lru(&mut self) -> Option<SlotHandle> {
-        self.cache.evict_lru()
-    }
-
-    pub fn clear(&mut self) -> Vec<SlotHandle> {
-        let mut checkpoints = Vec::with_capacity(self.cache.len());
-        while let Some(checkpoint) = self.evict_lru() {
-            checkpoints.push(checkpoint);
-        }
-        checkpoints
-    }
-
-    pub fn metrics(&self) -> (usize, u64, u64, u64) {
-        (
-            self.cache.len(),
-            self.cache.hits(),
-            self.cache.misses(),
-            self.cache.evictions(),
-        )
-    }
-
-    pub const fn alignment(&self) -> u32 {
-        self.cache.alignment()
     }
 }

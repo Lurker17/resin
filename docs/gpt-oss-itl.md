@@ -46,8 +46,8 @@ geometry. The runner allocates one physical parent slab with a zero/null row;
 the History and Window views alias those same bytes. Native group binding ensures
 that a live parent is interpreted as one group, never both simultaneously.
 
-The Engine passes one `cache_pool_id` and two ordered sparse
-`CacheGroupPlan`s. History rows contain the chronological prefix. Window rows
+The Engine binds one cache pool during runner construction, then passes two
+ordered sparse `CacheGroupPlan`s per batch. History rows contain the chronological prefix. Window rows
 contain the chronological retained suffix even though their private physical
 blocks cycle. The runner derives FA4 tables and bounded prefill rounds from these
 rows and validates every append page and offset before launching device work.

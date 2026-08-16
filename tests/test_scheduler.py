@@ -92,7 +92,7 @@ class TestSchedulerConfigContract:
 
         engine.step()
 
-        assert runner.plans[0].sequence_indptr == [0, 2]
+        assert runner.plans[0].token_indptr == [0, 2]
         assert not request.done
         engine.close()
 
@@ -112,7 +112,7 @@ class TestSchedulerConfigContract:
         engine.step()
 
         assert runner.plans[0].sequence_ids == [first]
-        assert runner.plans[0].sequence_indptr == [0, 4]
+        assert runner.plans[0].token_indptr == [0, 4]
         assert first.done
         assert not second.done
         engine.close()
@@ -275,12 +275,12 @@ class TestSchedulerConfigContract:
         assert default.scheduler_config.max_batch_tokens is None
 
     def test_batch_plan_batch_key_defaults_and_range_validation(self) -> None:
-        default = BatchPlan([1], [0], [7], [0, 1], [0])
-        keyed = BatchPlan([1], [0], [7], [0, 1], [0], batch_key=9)
+        default = BatchPlan([7], [0], [1], [0, 1])
+        keyed = BatchPlan([7], [0], [1], [0, 1], batch_key=9)
         assert default.batch_key is None
         assert keyed.batch_key == 9
         with pytest.raises(OverflowError):
-            BatchPlan([1], [0], [7], [0, 1], [0], batch_key=2**64)
+            BatchPlan([7], [0], [1], [0, 1], batch_key=2**64)
 
         engine = Engine(RecordingRunner())
         with pytest.raises(OverflowError):
@@ -290,11 +290,10 @@ class TestSchedulerConfigContract:
 
     def test_batch_plan_freezes_phase_and_sampling_rows(self) -> None:
         plan = BatchPlan(
-            [10, 20, 30],
-            [0, 4, 0],
             [7, 8, 9],
-            [0, 1, 2, 3],
             [0, 4, 0],
+            [10, 20, 30],
+            [0, 1, 2, 3],
             sample_sequence_indices=[1, 2],
         )
         assert plan.phase == BatchPhase.PREFILL
@@ -306,21 +305,19 @@ class TestSchedulerConfigContract:
 
     def test_batch_plan_phase_is_batch_homogeneous(self) -> None:
         prefill = BatchPlan(
-            [1, 2],
-            [0, 0],
             [7, 8],
-            [0, 1, 2],
             [0, 0],
+            [1, 2],
+            [0, 1, 2],
         )
         assert prefill.phase == BatchPhase.PREFILL
         assert prefill.sample_sequence_indices == [0, 1]
 
         decode = BatchPlan(
-            [1, 2],
-            [3, 5],
             [7, 8],
-            [0, 1, 2],
             [3, 5],
+            [1, 2],
+            [0, 1, 2],
             phase=BatchPhase.DECODE,
         )
         assert decode.phase == BatchPhase.DECODE
@@ -329,21 +326,19 @@ class TestSchedulerConfigContract:
         for value in ([2, 1], [1, 1], [3]):
             with pytest.raises(ValueError):
                 BatchPlan(
-                    [10, 20, 30],
-                    [0, 4, 0],
                     [7, 8, 9],
-                    [0, 1, 2, 3],
                     [0, 4, 0],
+                    [10, 20, 30],
+                    [0, 1, 2, 3],
                     sample_sequence_indices=value,
                 )
 
         with pytest.raises(TypeError, match="prefill_sequence_indices"):
             BatchPlan(
-                [1],
-                [0],
                 [7],
-                [0, 1],
                 [0],
+                [1],
+                [0, 1],
                 prefill_sequence_indices=[0],
             )
 
@@ -458,8 +453,7 @@ class TestNativePolicyIntegration:
             "batch_key",
             "phase",
             "token_ids",
-            "positions",
-            "sequence_indptr",
+            "token_indptr",
             "context_lengths",
             "sample_sequence_indices",
         ):

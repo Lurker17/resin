@@ -55,7 +55,7 @@ def _flat_plan(
 ):
     sequence_count = len(context_lengths)
     assert len(query_lengths) == sequence_count
-    sequence_indptr = [0]
+    token_indptr = [0]
     positions = []
     history_rows = []
     window_rows = []
@@ -65,7 +65,7 @@ def _flat_plan(
     ):
         assert context >= 0 and query > 0
         positions.extend(range(context, context + query))
-        sequence_indptr.append(len(positions))
+        token_indptr.append(len(positions))
         post_length = context + query
         last_block = (post_length - 1) // 128
         history_rows.append(
@@ -87,14 +87,14 @@ def _flat_plan(
         history_rows,
         [0] * sequence_count,
         positions,
-        sequence_indptr,
+        token_indptr,
     )
     window = _group_plan(
         1,
         window_rows,
         window_first,
         positions,
-        sequence_indptr,
+        token_indptr,
     )
     return SimpleNamespace(
         cache_pool_id=cache_pool_id,
@@ -103,7 +103,7 @@ def _flat_plan(
         positions=positions,
         sequence_ids=list(range(100, 100 + sequence_count)),
         num_sequences=sequence_count,
-        sequence_indptr=sequence_indptr,
+        token_indptr=token_indptr,
         context_lengths=list(context_lengths),
         phase=phase,
         sample_sequence_indices=list(range(sequence_count)),
@@ -130,7 +130,6 @@ class TestGptOssCudaNativePlan:
         binding = CachePoolBinding(runner.cache_layout, resource="GPT-OSS KV")
         runner._kv = SimpleNamespace(
             bind=binding.bind,
-            check=lambda plan: binding.check(plan.cache_pool_id),
         )
         return runner
 
@@ -139,7 +138,6 @@ class TestGptOssCudaNativePlan:
         return SimpleNamespace(
             cache_pool_id=pool_id,
             cache_layout=runner.cache_layout if layout is None else layout,
-            state_pool_id=None,
         )
 
     def test_cuda_graphs_use_the_shared_static_step_lifecycle(self) -> None:
@@ -218,15 +216,6 @@ class TestGptOssCudaNativePlan:
             with pytest.raises(ValueError):
                 fresh = self._binding_runner()
                 fresh.bind_resources(self._resources(fresh, pool_id=invalid))
-
-    def test_plan_binding_requires_the_one_bound_pool(self) -> None:
-        runner = self._binding_runner()
-        with pytest.raises(ValueError, match="not bound"):
-            runner._validate_plan_binding(_prefill_plan())
-        runner.bind_resources(self._resources(runner))
-        runner._validate_plan_binding(_prefill_plan())
-        with pytest.raises(ValueError, match="does not match"):
-            runner._validate_plan_binding(_flat_plan([0], [1], cache_pool_id=42))
 
     def test_prefill_tables_are_derived_from_history_and_window_csr(self) -> None:
         batches, decode = build_attention_batches(_prefill_plan())

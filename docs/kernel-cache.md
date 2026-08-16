@@ -8,8 +8,7 @@ libraries live. A Python runner or deployment harness may opt into
 Keep these stores conceptually separate:
 
 - model checkpoints contain weights;
-- the native flat cache pool contains live request data;
-- `StatePool` mappings contain live recurrent state;
+- the native flat cache pool contains live history and recurrent state;
 - the kernel-artifact store contains compiled libraries and tuning records.
 
 None of them contains tokenizer or chat-template state.

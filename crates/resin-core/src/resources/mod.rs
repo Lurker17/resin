@@ -7,8 +7,6 @@ pub mod kv;
 pub mod paged;
 pub mod paged_kv;
 mod prefix;
-pub use prefix::StatePrefixResources;
-pub mod slots;
 
 /// An owner and the resource state whose lifetime exactly matches it.
 #[derive(Debug)]
@@ -59,13 +57,6 @@ impl<T: Schedulable, R> Schedulable for WithResources<T, R> {
     fn set_turn_ordinal(&mut self, turn: u128) {
         self.inner.set_turn_ordinal(turn);
     }
-}
-
-/// Attention and recurrent state at one ownership boundary.
-#[derive(Debug)]
-pub struct ResourceSet<A, R> {
-    pub attention: A,
-    pub recurrent: R,
 }
 
 #[derive(Clone, Copy, Debug)]

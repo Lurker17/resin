@@ -19,19 +19,17 @@ def _validation_runner() -> DeepSeekV4FlashCudaRunner:
 def test_managed_pages_allow_continuation_and_arbitrary_decode_rows() -> None:
     runner = _validation_runner()
     continuation = BatchPlan(
-        [4, 5],
-        [128, 129],
         [70],
-        [0, 2],
         [128],
+        [4, 5],
+        [0, 2],
         phase=BatchPhase.PREFILL,
     )
     decode = BatchPlan(
-        [9, 10],
-        [130, 7],
         [70, 99],
-        [0, 1, 2],
         [130, 7],
+        [9, 10],
+        [0, 1, 2],
         phase=BatchPhase.DECODE,
     )
 
@@ -88,7 +86,9 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
     plan = SimpleNamespace(
         num_sequences=3,
         token_ids=[5, 6, 7],
-        positions=[11, 12, 13],
+        sequence_ids=[1, 2, 3],
+        context_lengths=[11, 12, 13],
+        token_indptr=[0, 1, 2, 3],
     )
 
     assert runner._graph_forward(plan, "cache-plan") == [11, 12, 13]
@@ -143,11 +143,10 @@ def test_prefill_uses_fresh_prompt_then_replays_only_continuation_suffix() -> No
     runner._model = Model()
     cache = Cache()
     plan = BatchPlan(
-        [2, 3, 8, 9],
-        [0, 1, 128, 129],
         [7, 8],
-        [0, 2, 4],
         [0, 128],
+        [2, 3, 8, 9],
+        [0, 2, 4],
         phase=BatchPhase.PREFILL,
     )
 

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from resin.backend.sampling import batch_sampling_inputs
-
-SAMPLING_OFFSET_STRIDE = 32
+from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, batch_sampling_inputs
 
 
 @dataclass(frozen=True, slots=True)

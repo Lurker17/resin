@@ -31,12 +31,3 @@ class CachePoolBinding:
 
     def bind(self, pool_id: int, layout) -> int:
         return self.commit(self.validate(pool_id, layout))
-
-    def check(self, plan_pool_id: int | None) -> None:
-        if self.pool_id is None:
-            raise ValueError(f"{self.resource} cache pool is not bound")
-        if plan_pool_id != self.pool_id:
-            raise ValueError(
-                f"BatchPlan cache pool id {plan_pool_id!r} does not match the "
-                f"bound cache pool {self.pool_id!r}"
-            )

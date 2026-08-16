@@ -8,6 +8,7 @@ import resin.server as server
 from resin._resin import (
     BatchPhase,
     BatchPlan,
+    CacheGroupFamily,
     CacheGroupLayout,
     CacheGroupPlan,
     CacheLayout,
@@ -18,12 +19,8 @@ from resin._resin import (
     RunnerConfig,
     SamplingParams,
     SchedulerConfig,
-    StateHandle,
-    StateMappingConfig,
-    StatePool,
     TokenEvent,
     __version__,
-    mint_state_mapping_arena_id,
 )
 from resin.protocols import (
     AsyncRunner,
@@ -36,6 +33,7 @@ from resin.protocols import (
 __all__ = [
     "BatchPhase",
     "BatchPlan",
+    "CacheGroupFamily",
     "CacheGroupLayout",
     "CacheGroupPlan",
     "CacheLayout",
@@ -47,15 +45,11 @@ __all__ = [
     "RunnerConfig",
     "SamplingParams",
     "SchedulerConfig",
-    "StateHandle",
-    "StateMappingConfig",
-    "StatePool",
     "TokenEvent",
     "AsyncRunner",
     "ResourceRunner",
     "Runner",
     "SyncRunner",
     "__version__",
-    "mint_state_mapping_arena_id",
     "server",
 ]

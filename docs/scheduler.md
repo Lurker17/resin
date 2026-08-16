@@ -102,25 +102,9 @@ frees the request's KV, returns it to the waiting tail, and later replays its
 prompt plus committed generated inputs. Replay prefill never samples a duplicate
 token.
 
-Requests with recurrent-state handles are not currently retracted. Their state
-cannot be discarded safely without an explicit reset protocol; they remain
-sticky and an unrecoverable KV shortfall is reported instead.
-
-## State compatibility
-
-Each submitted state handle has a `"read"` or `"write"` access mode. Omission
-defaults to write. Reads may coexist; writes are exclusive. Duplicate handles in
-one row collapse for conflict checking, with write dominating read, while the
-plan preserves the submitted occurrences.
-
-After selecting the homogeneous cohort, Resin keeps its longest state-compatible
-prefix. It stops immediately before the first conflicting row and never skips
-that row to backfill a younger one. At dispatch, `StatePool` also checks leases
-already held by another Engine sharing the pool. A conflict before runner
-acceptance rejects the dispatch without advancing requests.
-
-Access remains leased through asynchronous completion and runner cleanup. See
-[state ownership](state-pool.md) for lifetime details.
+Retracted requests release all History, Window, and State pages together, then
+replay from their token history when readmitted. A prefix-cache hit may avoid
+recomputing the aligned shared prefix.
 
 ## Token-range planning
 
@@ -139,7 +123,7 @@ boundary. That makes each accepted range safe for the current private cyclic
 Window storage: no plan overwrites a physical block that it still exposes for
 attention. Multiple Window groups compose by taking the earliest boundary.
 
-`BatchPlan.sequence_indptr` describes the final flattened range for each row.
+`BatchPlan.token_indptr` describes the final flattened range for each row.
 `context_lengths` contains each row's pre-append logical length. Initial prefill
 is sampled only when it reaches the end of the prompt; replay prefill is never
 sampled; decode rows are always sampled. `sample_sequence_indices` makes this
@@ -189,10 +173,8 @@ allowed while Resin can prove that physical execution did not begin.
 
 ## Current limits
 
-Scheduling does not choose CUDA graph buckets, kernel shapes, cache admission,
-or sampling kernels. Those remain runner concerns; the Engine only transports
-per-request policy and advances random offsets transactionally. The native scheduler is
-single-Engine and deliberately single-in-flight; `StatePool` leases are the
-mechanism that coordinates state access across Engines. Resin does not support
-overlap scheduling: it never plans the next batch ahead, takes future-batch
-locks, or duplicates recurrent-state residency to hide scheduler overhead.
+Scheduling does not choose CUDA graph buckets, kernel shapes, or sampling
+kernels. Those remain runner concerns. Cache admission and request progress are
+Engine concerns; sampling offsets are derived from absolute sequence progress.
+The native scheduler is deliberately single-in-flight. Resin does not yet plan
+the next batch ahead or overlap prefill and decode dispatches.

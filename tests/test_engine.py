@@ -12,7 +12,6 @@ from resin import (
     ResourceBinding,
     RunnerConfig,
     SchedulerConfig,
-    StatePool,
 )
 
 
@@ -87,14 +86,14 @@ class TestEngine:
         initial = engine.step()
         assert [event.token_id for event in initial] == [3, 9]
         assert runner.plans[0].phase == BatchPhase.PREFILL
-        assert runner.plans[0].sequence_indptr == [0, 2, 3]
+        assert runner.plans[0].token_indptr == [0, 2, 3]
         assert runner.plans[0].sample_sequence_indices == [0, 1]
         assert runner.released == [second]
 
         final = engine.step()
         assert [event.token_id for event in final] == [4]
         assert runner.plans[1].phase == BatchPhase.DECODE
-        assert runner.plans[1].positions == [2]
+        assert runner.plans[1].context_lengths == [2]
         assert runner.plans[1].sample_sequence_indices == [0]
         assert not engine.has_work()
         assert first.done
@@ -140,7 +139,7 @@ class TestEngine:
         assert [event.index for event in final] == [4, 5]
         assert [event.finished for event in final] == [False, True]
         assert runner.plans[2].token_ids == [5]
-        assert runner.plans[2].positions == [4]
+        assert runner.plans[2].context_lengths == [4]
         assert request.take_result() == [2, 3, 4, 5, 6, 7]
 
     def test_managed_cache_leases_declared_speculative_write_lookahead(self) -> None:
@@ -276,48 +275,11 @@ class TestEngine:
     def test_public_batch_plan_validates_indptr(self) -> None:
         with pytest.raises(ValueError, match="end at the token count"):
             BatchPlan(
+                [7],
+                [0],
                 [1, 2],
                 [0, 1],
-                [7],
-                [0, 1],
-                [0],
             )
-
-    def test_engine_pins_native_state_through_forward_and_release(self) -> None:
-        pool = StatePool(2)
-        handle = pool.allocate()[0]
-
-        class StateAwareRunner:
-            def __init__(self) -> None:
-                self.plan = None
-
-            def forward(self, plan):
-                self.plan = plan
-                self.assert_pinned()
-                return [7]
-
-            def release(self, request_ids):
-                self.assert_pinned()
-
-            @staticmethod
-            def assert_pinned() -> None:
-                assert pool.counts(handle) == (1, 1)
-
-        runner = StateAwareRunner()
-        engine = Engine(runner, eos_token_id=7, state_pool=pool)
-        request = engine.submit([11], max_new_tokens=2, state_handles=[handle])
-        assert pool.counts(handle) == (2, 0)
-        pool.release([handle])  # Transfer the caller's reference to the engine.
-
-        event = engine.step()[0]
-        assert event.finished
-        assert request.done
-        assert request.take_result() == [7]
-        assert runner.plan.state_slots == [handle.slot]
-        assert runner.plan.state_generations == [handle.generation]
-        assert runner.plan.state_indptr == [0, 1]
-        assert not pool.contains(handle)
-        assert pool.free_count == 2
 
     def test_rust_owns_flat_cache_allocation_and_sparse_group_metadata(self) -> None:
         layout = CacheLayout(3, [CacheGroupLayout(2)])
@@ -345,7 +307,6 @@ class TestEngine:
         assert engine.cache_occupied_block_count == 2
         assert engine.cache_free_parent_count == 1
         prefill = runner.plans[0]
-        assert prefill.cache_pool_id == engine.cache_pool_id
         assert len(prefill.cache_groups) == 1
         group = prefill.cache_groups[0]
         assert group.group_index == 0
@@ -356,7 +317,7 @@ class TestEngine:
 
         engine.step()
         decode = runner.plans[1]
-        assert decode.positions == [3]
+        assert decode.context_lengths == [3]
         decode_group = decode.cache_groups[0]
         assert decode_group.block_ids == group.block_ids
         assert decode_group.append_block_ids == [group.block_ids[1]]

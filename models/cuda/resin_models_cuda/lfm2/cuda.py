@@ -1,9 +1,8 @@
 """Paged FA4/FlashInfer execution for the Resin-owned PyTorch LFM2 model.
 
 This deliberately specializes one model and one CUDA stack. Rust supplies the
-complete immutable page, append, prefill, and decode subplans. This runner only
-tensorizes that metadata and addresses the corresponding physical K/V slab while
-mapping short-convolution state into one native-StatePool-owned physical slab.
+complete immutable page, append, prefill, and decode subplans. Attention history
+and recurrent checkpoints share one Engine-owned pool of fungible parents.
 """
 
 from __future__ import annotations
@@ -15,19 +14,17 @@ import torch
 
 from resin import (
     BatchPhase,
+    CacheGroupFamily,
     CacheGroupLayout,
     CacheLayout,
     ResourceBinding,
     RunnerConfig,
-    StateMappingConfig,
 )
-from resin.backend.checks import nonempty_plan
-from resin.backend.checks import token_ids as check_token_ids
 from resin.backend.cuda.execution import CudaCompletion, CudaExecutor
-from resin.backend.cuda.mapped_state import MappedStateArena
-from resin.backend.cuda.paged_kv import PagedKvArena, PagedKvCsr
+from resin.backend.cuda.paged_kv import PagedKvCsr
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
+from resin.backend.plans import plan_positions
 from resin.protocols import AsyncRunner
 from resin_models_cuda.lfm2.plan import CacheMetadata, build_cache_metadata
 from resin_models_torch.lfm2.reference import (
@@ -41,7 +38,76 @@ if TYPE_CHECKING:
     from resin import BatchPlan
 
 
-_RECURRENT_STATE_MAPPING_PROTOCOL = "lfm2.conv_state.v1"
+_STATE_CHECKPOINT_TOKENS = 128
+
+
+class _Lfm2CacheArena:
+    """Model-specific views over one fungible parent allocation."""
+
+    def __init__(
+        self,
+        torch,
+        device,
+        layout,
+        *,
+        attention_layers: int,
+        conv_layers: int,
+        page_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+        hidden_size: int,
+        state_length: int,
+        dtype,
+    ) -> None:
+        from resin.backend.resources import CachePoolBinding
+
+        self.binding = CachePoolBinding(layout, resource="LFM2 cache")
+        self.parent_capacity = layout.parent_capacity
+        self.state_packing = layout.groups[1].blocks_per_parent
+        kv_elements = 2 * attention_layers * page_size * num_kv_heads * head_dim
+        state_elements = conv_layers * hidden_size * state_length
+        if kv_elements != self.state_packing * state_elements:
+            raise ValueError("LFM2 cache groups do not exactly fill one parent")
+        self.storage = torch.zeros(
+            (self.parent_capacity + 1, kv_elements), dtype=dtype, device=device
+        )
+        kv = self.storage.view(
+            self.parent_capacity + 1,
+            2,
+            attention_layers,
+            page_size,
+            num_kv_heads,
+            head_dim,
+        ).permute(1, 2, 0, 3, 4, 5)
+        self.keys = kv[0]
+        self.values = kv[1]
+        self._state = self.storage[1:].view(
+            self.parent_capacity,
+            self.state_packing,
+            conv_layers,
+            hidden_size,
+            state_length,
+        )
+
+    def bind(self, pool_id: int, layout) -> int:
+        return self.binding.bind(pool_id, layout)
+
+    def check_pages(self, group: int, page_ids) -> None:
+        capacity = self.parent_capacity * (1 if group == 0 else self.state_packing)
+        if any(page <= 0 or page > capacity for page in page_ids):
+            raise ValueError("BatchPlan cache page is outside the physical arena")
+
+    def state(self, page_id: int):
+        index = page_id - 1
+        return self._state[index // self.state_packing, index % self.state_packing]
+
+
+class _StateRow:
+    __slots__ = ("input_page", "output_page")
+
+    def __init__(self, input_page: int | None, output_page: int) -> None:
+        self.input_page = input_page
+        self.output_page = output_page
 
 
 class _InPlaceRecurrentState:
@@ -93,19 +159,6 @@ class Lfm2CudaRunner(AsyncRunner):
         self._stream = torch.cuda.Stream(device=self.device)
         self.page_size = page_size
         self.max_pages = max_pages
-        self.cache_layout = CacheLayout(
-            max_pages,
-            [CacheGroupLayout(page_size)],
-        )
-        self.runner_config = RunnerConfig(
-            continuation_prefill=True,
-            cache_layout=self.cache_layout,
-            state_mapping=StateMappingConfig(
-                _RECURRENT_STATE_MAPPING_PROTOCOL,
-                ["write"],
-                checkpoint_granularity=page_size,
-            ),
-        )
         self.model_path = resolve_model_path(model, revision)
         # Persistent CUDA state is created on the same private stream used for
         # every launch, so dispatch never needs an implicit default-stream handoff.
@@ -140,19 +193,51 @@ class Lfm2CudaRunner(AsyncRunner):
             self.hidden_size = args.hidden_size
             self.conv_cache_length = args.conv_cache_length
 
+            kv_elements = (
+                2
+                * len(self._attention_layers)
+                * page_size
+                * self.num_kv_heads
+                * self.head_dim
+            )
+            state_elements = (
+                len(self._conv_layers) * self.hidden_size * (self.conv_cache_length - 1)
+            )
+            if state_elements == 0 or kv_elements % state_elements:
+                raise ValueError("LFM2 recurrent state does not pack into a KV parent")
+            state_packing = kv_elements // state_elements
+            self.cache_layout = CacheLayout(
+                max_pages,
+                [
+                    CacheGroupLayout(page_size),
+                    CacheGroupLayout(
+                        _STATE_CHECKPOINT_TOKENS,
+                        blocks_per_parent=state_packing,
+                        family=CacheGroupFamily.STATE,
+                    ),
+                ],
+            )
+            self.runner_config = RunnerConfig(
+                continuation_prefill=True,
+                prefill_chunk_size=_STATE_CHECKPOINT_TOKENS,
+                cache_layout=self.cache_layout,
+            )
+
             # FA4's SM90 paged path may issue TMA loads for the full final
             # physical page and mask scores afterwards. Zero the unwritten tail
             # so a masked lane can never feed NaN/garbage into the PV reduction.
-            self._kv = PagedKvArena(
+            self._cache = _Lfm2CacheArena(
                 torch,
                 self.device,
                 self.cache_layout,
-                layer_count=len(self._attention_layers),
+                attention_layers=len(self._attention_layers),
+                conv_layers=len(self._conv_layers),
                 page_size=page_size,
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_dim,
+                hidden_size=self.hidden_size,
+                state_length=self.conv_cache_length - 1,
                 dtype=torch.bfloat16,
-                resource="LFM2 KV",
             )
             self._decode_workspace = torch.zeros(
                 workspace_bytes, dtype=torch.uint8, device=self.device
@@ -160,16 +245,6 @@ class Lfm2CudaRunner(AsyncRunner):
             self._decode = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
                 self._decode_workspace, "NHD"
             )
-        self._state = MappedStateArena(
-            torch,
-            self.device,
-            self._stream,
-            protocol=_RECURRENT_STATE_MAPPING_PROTOCOL,
-            layer_indices=self._conv_layers,
-            row_shape=(self.hidden_size, self.conv_cache_length - 1),
-            dtype=torch.bfloat16,
-            label="LFM2 recurrent state",
-        )
         self._executor = CudaExecutor(
             torch,
             self.device,
@@ -177,40 +252,67 @@ class Lfm2CudaRunner(AsyncRunner):
             resources=self._completion_resources,
         )
 
-    def bind_resources(self, binding: ResourceBinding) -> int:
-        """Atomically bind the cache and recurrent-state physical arenas."""
+    def bind_resources(self, binding: ResourceBinding) -> None:
+        """Bind the unified physical arena to its Engine cache pool."""
 
-        if (
-            binding.cache_pool_id is None
-            or binding.cache_layout is None
-            or binding.state_pool_id is None
-            or binding.state_capacity is None
-            or binding.state_mapping is None
-        ):
-            raise ValueError("LFM2 requires cache and mapped-state resources")
-        cache_id = self._kv.binding.validate(
-            binding.cache_pool_id, binding.cache_layout
-        )
-        state_binding, prepared, arena_id = self._state.prepare_binding(
-            binding.state_pool_id,
-            binding.state_capacity,
-            binding.state_mapping.protocol,
-            binding.required_state_arena_id,
-        )
-        self._state.commit_binding(state_binding, prepared)
-        self._kv.binding.commit(cache_id)
-        return arena_id
+        if binding.cache_pool_id is None or binding.cache_layout is None:
+            raise ValueError("LFM2 requires managed cache resources")
+        self._cache.bind(binding.cache_pool_id, binding.cache_layout)
 
     def _preflight_cache(self, plan: BatchPlan) -> CacheMetadata:
         """Validate and derive the complete cache launch before CUDA acceptance."""
 
-        self._kv.check(plan)
         groups = tuple(plan.cache_groups)
-        if len(groups) != 1 or groups[0].group_index != 0:
-            raise ValueError("BatchPlan does not contain LFM2 cache group zero")
+        if len(groups) != 2 or tuple(group.group_index for group in groups) != (0, 1):
+            raise ValueError("BatchPlan does not contain LFM2 history and state groups")
         derived = build_cache_metadata(plan, self.page_size)
-        self._kv.check_pages(derived.block_ids)
+        self._cache.check_pages(0, derived.block_ids)
         return derived
+
+    def _state_rows(self, plan: BatchPlan) -> tuple[_StateRow, ...]:
+        group = plan.cache_groups[1]
+        block_indptr = tuple(group.block_indptr)
+        block_ids = tuple(group.block_ids)
+        first_blocks = tuple(group.first_logical_blocks)
+        rows = len(plan.sequence_ids)
+        if (
+            len(block_indptr) != rows + 1
+            or block_indptr[0] != 0
+            or block_indptr[-1] != len(block_ids)
+            or len(first_blocks) != rows
+        ):
+            raise ValueError("LFM2 state page table is malformed")
+        self._cache.check_pages(1, block_ids)
+        result = []
+        for index, context in enumerate(plan.context_lengths):
+            token_start, token_end = plan.token_indptr[index : index + 2]
+            post_length = context + token_end - token_start
+            first = first_blocks[index]
+            page_start, page_end = block_indptr[index : index + 2]
+            pages = block_ids[page_start:page_end]
+
+            def page(logical: int) -> int:
+                column = logical - first
+                if column < 0 or column >= len(pages):
+                    raise ValueError("LFM2 state table does not cover a checkpoint")
+                return pages[column]
+
+            input_page = (
+                None
+                if context == 0
+                else page((context - 1) // _STATE_CHECKPOINT_TOKENS)
+            )
+            output_page = page((post_length - 1) // _STATE_CHECKPOINT_TOKENS)
+            result.append(_StateRow(input_page, output_page))
+        return tuple(result)
+
+    def _prepare_state_rows(self, rows: tuple[_StateRow, ...]) -> None:
+        for row in rows:
+            output = self._cache.state(row.output_page)
+            if row.input_page is None:
+                output.zero_()
+            elif row.input_page != row.output_page:
+                output.copy_(self._cache.state(row.input_page))
 
     def _metadata(
         self,
@@ -359,8 +461,8 @@ class Lfm2CudaRunner(AsyncRunner):
         keys = keys.squeeze(0).transpose(0, 1).contiguous()
 
         cache_slot = self._attention_slot[layer_index]
-        k_cache = self._kv.keys[cache_slot]
-        v_cache = self._kv.values[cache_slot]
+        k_cache = self._cache.keys[cache_slot]
+        v_cache = self._cache.values[cache_slot]
         paged = metadata["paged_kv"]
         self._flashinfer.append_paged_kv_cache(
             keys,
@@ -433,8 +535,8 @@ class Lfm2CudaRunner(AsyncRunner):
         conv_slot = self._conv_slot[layer_index]
         outputs = []
         for index, row in enumerate(recurrent_rows):
-            start, end = plan.sequence_indptr[index : index + 2]
-            state = self._state.view(conv_slot, row).unsqueeze(0)
+            start, end = plan.token_indptr[index : index + 2]
+            state = self._cache.state(row.output_page)[conv_slot].unsqueeze(0)
             cache = _InPlaceRecurrentState(state)
             # The facade turns ShortConv's ``state.value = next_state`` into an
             # in-place copy and therefore cannot detach this generation from its
@@ -498,18 +600,13 @@ class Lfm2CudaRunner(AsyncRunner):
             self._flashinfer,
             self._fa4,
             self._model,
-            self._kv,
-            self._kv.storage,
-            self._kv.keys,
-            self._kv.values,
+            self._cache,
+            self._cache.storage,
+            self._cache.keys,
+            self._cache.values,
             self._decode_workspace,
             self._decode,
             self._stream,
-            self._state,
-            self._state.slab,
-            self._state.generations,
-            self._state.owners,
-            self._state.binding,
         )
 
     def dispatch(self, plan: BatchPlan):
@@ -517,24 +614,22 @@ class Lfm2CudaRunner(AsyncRunner):
 
         if self._executor.inflight is not None:
             raise RuntimeError("Lfm2CudaRunner already has an in-flight batch")
-        nonempty_plan(plan)
-        check_token_ids(plan.token_ids, self.vocab_size)
         cache_metadata = self._preflight_cache(plan)
-        recurrent_rows = self._state.rows(plan)
+        recurrent_rows = self._state_rows(plan)
 
         torch = self._torch
 
         def launch(completion: CudaCompletion):
-            self._state.prepare_rows(recurrent_rows)
+            self._prepare_state_rows(recurrent_rows)
             metadata = self._metadata(plan, cache_metadata, completion.staging)
             completion.retain(metadata, recurrent_rows)
             tokens = completion.staging.device("tokens", plan.token_ids, torch.long)
             positions = completion.staging.device(
-                "positions", plan.positions, torch.long
+                "positions", plan_positions(plan), torch.long
             )
             final_indices = completion.staging.device(
                 "final_indices",
-                [end - 1 for end in plan.sequence_indptr[1:]],
+                [end - 1 for end in plan.token_indptr[1:]],
                 torch.long,
             )
             completion.retain(tokens, positions, final_indices)

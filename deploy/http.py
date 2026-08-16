@@ -262,11 +262,9 @@ def batch_plan_payload(plan: BatchPlan) -> dict[str, Any]:
         "phase": phase,
         "batch_id": plan.batch_id,
         "batch_key": plan.batch_key,
-        "engine_id": plan.engine_id,
         "token_ids": plan.token_ids,
-        "positions": plan.positions,
         "sequence_ids": plan.sequence_ids,
-        "sequence_indptr": plan.sequence_indptr,
+        "token_indptr": plan.token_indptr,
         "context_lengths": plan.context_lengths,
         "sampling_params": [
             {
@@ -278,14 +276,7 @@ def batch_plan_payload(plan: BatchPlan) -> dict[str, Any]:
             }
             for params in plan.sampling_params
         ],
-        "sampling_offsets": plan.sampling_offsets,
         "sample_sequence_indices": plan.sample_sequence_indices,
-        "state_pool_id": plan.state_pool_id,
-        "state_slots": plan.state_slots,
-        "state_generations": plan.state_generations,
-        "state_indptr": plan.state_indptr,
-        "state_access_modes": plan.state_access_modes,
-        "cache_pool_id": plan.cache_pool_id,
         "cache_groups": [
             {
                 "group_index": group.group_index,
@@ -309,25 +300,16 @@ def batch_plan_from_payload(payload: dict[str, Any]) -> BatchPlan:
     ]
     cache_groups = [CacheGroupPlan(**values) for values in payload["cache_groups"]]
     return BatchPlan(
-        payload["token_ids"],
-        payload["positions"],
         payload["sequence_ids"],
-        payload["sequence_indptr"],
         payload["context_lengths"],
+        payload["token_ids"],
+        payload["token_indptr"],
         phase=phase,
         batch_id=payload["batch_id"],
         batch_key=payload["batch_key"],
-        engine_id=payload["engine_id"],
-        state_pool_id=payload["state_pool_id"],
-        state_slots=payload["state_slots"],
-        state_generations=payload["state_generations"],
-        state_indptr=payload["state_indptr"],
-        state_access_modes=payload["state_access_modes"],
-        cache_pool_id=payload["cache_pool_id"],
         cache_groups=cache_groups,
         sample_sequence_indices=payload["sample_sequence_indices"],
         sampling_params=sampling_params,
-        sampling_offsets=payload["sampling_offsets"],
     )
 
 
@@ -352,9 +334,6 @@ class TensorParallelServerRunner:
             {
                 "operation": "bind_resources",
                 "cache_pool_id": binding.cache_pool_id,
-                "state_pool_id": binding.state_pool_id,
-                "state_capacity": binding.state_capacity,
-                "required_state_arena_id": binding.required_state_arena_id,
             }
         )
         return self._runner.bind_resources(binding)
@@ -396,10 +375,6 @@ def follow_tensor_parallel_server(
                 SimpleNamespace(
                     cache_pool_id=command["cache_pool_id"],
                     cache_layout=runner.runner_config.cache_layout,
-                    state_pool_id=command["state_pool_id"],
-                    state_capacity=command["state_capacity"],
-                    state_mapping=runner.runner_config.state_mapping,
-                    required_state_arena_id=command["required_state_arena_id"],
                 )
             )
         elif operation == "forward":

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+SAMPLING_OFFSET_STRIDE = 32
+
 
 def batch_sampling_inputs(plan, vocab_size: int) -> dict[str, tuple]:
     """Extract backend-friendly primitive arrays from one immutable plan."""
@@ -10,9 +12,19 @@ def batch_sampling_inputs(plan, vocab_size: int) -> dict[str, tuple]:
         raise ValueError("vocab_size must be positive")
     params = tuple(plan.sampling_params)
     rows = len(plan.sequence_ids)
-    offsets = tuple(plan.sampling_offsets)
-    if len(params) != rows or len(offsets) != rows:
-        raise ValueError("sampling annotations must contain one item per sequence")
+    indptr = tuple(plan.token_indptr)
+    context_lengths = tuple(plan.context_lengths)
+    if len(params) != rows:
+        raise ValueError("sampling params must contain one item per sequence")
+    if len(context_lengths) != rows:
+        raise ValueError("context_lengths must contain one item per sequence")
+    if len(indptr) != rows + 1 or indptr[0] != 0 or indptr[-1] != len(plan.token_ids):
+        raise ValueError("token_indptr does not partition token_ids")
+    offsets = tuple(
+        (context_lengths[index] + indptr[index + 1] - indptr[index])
+        * SAMPLING_OFFSET_STRIDE
+        for index in range(rows)
+    )
     seeds = tuple(item.seed for item in params)
     if any(seed is None for seed in seeds):
         raise ValueError("sampling params must contain effective seeds")
@@ -91,6 +103,7 @@ class TorchSampler:
 
 
 __all__ = [
+    "SAMPLING_OFFSET_STRIDE",
     "TorchSampler",
     "batch_sampling_inputs",
 ]

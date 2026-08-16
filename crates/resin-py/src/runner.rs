@@ -2,11 +2,9 @@ use std::num::NonZeroU32;
 
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyInt};
+use pyo3::types::PyBool;
 
-use crate::StateMappingConfig;
 use crate::cache::CacheLayout;
-use crate::state_pool::StatePool;
 
 fn positive_u32(name: &str, value: Option<u32>) -> PyResult<Option<NonZeroU32>> {
     value
@@ -28,7 +26,6 @@ pub(crate) struct RunnerConfig {
     pub(super) continuation_prefill: bool,
     pub(super) cache_write_lookahead_tokens: u32,
     pub(super) cache_layout: Option<Py<CacheLayout>>,
-    pub(super) state_mapping: Option<StateMappingConfig>,
 }
 
 impl RunnerConfig {
@@ -42,7 +39,6 @@ impl RunnerConfig {
                 .cache_layout
                 .as_ref()
                 .map(|layout| layout.clone_ref(py)),
-            state_mapping: self.state_mapping.clone(),
         }
     }
 }
@@ -56,17 +52,15 @@ impl RunnerConfig {
         prefill_chunk_size = None,
         continuation_prefill = false,
         cache_write_lookahead_tokens = 0,
-        cache_layout = None,
-        state_mapping = None
+        cache_layout = None
     ))]
     fn new(
-        py: Python<'_>,
+        _py: Python<'_>,
         max_batch_tokens: Option<u32>,
         prefill_chunk_size: Option<u32>,
         continuation_prefill: bool,
         cache_write_lookahead_tokens: u32,
         cache_layout: Option<Py<CacheLayout>>,
-        state_mapping: Option<Py<StateMappingConfig>>,
     ) -> PyResult<Self> {
         if cache_write_lookahead_tokens > 0 && cache_layout.is_none() {
             return Err(PyValueError::new_err(
@@ -79,7 +73,6 @@ impl RunnerConfig {
             continuation_prefill,
             cache_write_lookahead_tokens,
             cache_layout,
-            state_mapping: state_mapping.map(|mapping| mapping.borrow(py).clone()),
         })
     }
 
@@ -110,23 +103,14 @@ impl RunnerConfig {
             .map(|layout| layout.clone_ref(py))
     }
 
-    #[getter]
-    fn state_mapping(&self, py: Python<'_>) -> PyResult<Option<Py<StateMappingConfig>>> {
-        self.state_mapping
-            .clone()
-            .map(|mapping| Py::new(py, mapping))
-            .transpose()
-    }
-
     fn __repr__(&self) -> String {
         format!(
-            "RunnerConfig(max_batch_tokens={:?}, prefill_chunk_size={:?}, continuation_prefill={}, cache_write_lookahead_tokens={}, cache={}, state={})",
+            "RunnerConfig(max_batch_tokens={:?}, prefill_chunk_size={:?}, continuation_prefill={}, cache_write_lookahead_tokens={}, cache={})",
             self.max_batch_tokens(),
             self.prefill_chunk_size(),
             self.continuation_prefill,
             self.cache_write_lookahead_tokens,
             self.cache_layout.is_some(),
-            self.state_mapping.is_some(),
         )
     }
 }
@@ -136,10 +120,6 @@ impl RunnerConfig {
 pub(crate) struct ResourceBinding {
     cache_pool_id: Option<u64>,
     cache_layout: Option<Py<CacheLayout>>,
-    state_pool_id: Option<u64>,
-    state_capacity: Option<usize>,
-    state_mapping: Option<StateMappingConfig>,
-    required_state_arena_id: Option<u64>,
 }
 
 #[pymethods]
@@ -156,37 +136,8 @@ impl ResourceBinding {
             .map(|layout| layout.clone_ref(py))
     }
 
-    #[getter]
-    fn state_pool_id(&self) -> Option<u64> {
-        self.state_pool_id
-    }
-
-    #[getter]
-    fn state_capacity(&self) -> Option<usize> {
-        self.state_capacity
-    }
-
-    #[getter]
-    fn state_mapping(&self, py: Python<'_>) -> PyResult<Option<Py<StateMappingConfig>>> {
-        self.state_mapping
-            .clone()
-            .map(|mapping| Py::new(py, mapping))
-            .transpose()
-    }
-
-    #[getter]
-    fn required_state_arena_id(&self) -> Option<u64> {
-        self.required_state_arena_id
-    }
-
     fn __repr__(&self) -> String {
-        format!(
-            "ResourceBinding(cache_pool_id={:?}, state_pool_id={:?}, state_capacity={:?}, required_state_arena_id={:?})",
-            self.cache_pool_id,
-            self.state_pool_id,
-            self.state_capacity,
-            self.required_state_arena_id,
-        )
+        format!("ResourceBinding(cache_pool_id={:?})", self.cache_pool_id)
     }
 }
 
@@ -276,7 +227,7 @@ pub(super) fn resolve_runner_config(
         Err(error) if error.is_instance_of::<PyAttributeError>(py) => RunnerConfig::default(),
         Err(error) => return Err(error),
     };
-    let has_resources = config.cache_layout.is_some() || config.state_mapping.is_some();
+    let has_resources = config.cache_layout.is_some();
     let binder = has_resources
         .then(|| optional_runner_callable(py, runner, "bind_resources"))
         .transpose()?
@@ -293,7 +244,6 @@ pub(super) fn bind_runner_resources(
     py: Python<'_>,
     resolved: ResolvedRunnerConfig,
     cache_pool_id: Option<u64>,
-    state_pool: Option<&Py<StatePool>>,
 ) -> PyResult<RunnerConfig> {
     let ResolvedRunnerConfig { config, binder } = resolved;
     if config.cache_layout.is_some() != cache_pool_id.is_some() {
@@ -301,31 +251,8 @@ pub(super) fn bind_runner_resources(
             "runner cache declaration and native cache pool disagree",
         ));
     }
-    let state_descriptor = match (&config.state_mapping, state_pool) {
-        (None, _) => None,
-        (Some(_), None) => {
-            return Err(PyRuntimeError::new_err(
-                "runner state declaration and native state pool disagree",
-            ));
-        }
-        (Some(mapping), Some(pool)) => {
-            let pool = pool.bind(py).borrow();
-            let physical = pool
-                .physical_mapping_descriptor()
-                .map(|(protocol, arena_id)| (protocol.to_owned(), arena_id));
-            if let Some((protocol, _)) = &physical
-                && protocol != &mapping.protocol
-            {
-                return Err(PyValueError::new_err(format!(
-                    "state pool is already bound to protocol {protocol:?}, not {:?}",
-                    mapping.protocol,
-                )));
-            }
-            Some((pool.id(), pool.slot_capacity(), physical.map(|(_, id)| id)))
-        }
-    };
     let Some(binder) = binder else {
-        debug_assert!(cache_pool_id.is_none() && state_descriptor.is_none());
+        debug_assert!(cache_pool_id.is_none());
         return Ok(config);
     };
     let binding = Py::new(
@@ -336,43 +263,13 @@ pub(super) fn bind_runner_resources(
                 .cache_layout
                 .as_ref()
                 .map(|layout| layout.clone_ref(py)),
-            state_pool_id: state_descriptor.as_ref().map(|(id, _, _)| *id),
-            state_capacity: state_descriptor.as_ref().map(|(_, capacity, _)| *capacity),
-            state_mapping: config.state_mapping.clone(),
-            required_state_arena_id: state_descriptor
-                .as_ref()
-                .and_then(|(_, _, arena_id)| *arena_id),
         },
     )?;
     let acknowledgement = binder.bind(py).call1((binding,))?;
-    match &config.state_mapping {
-        None if !acknowledgement.is_none() => {
-            return Err(PyTypeError::new_err(
-                "runner.bind_resources must return None without mapped state",
-            ));
-        }
-        None => {}
-        Some(mapping) => {
-            if !acknowledgement.is_exact_instance_of::<PyInt>() {
-                return Err(PyTypeError::new_err(
-                    "runner.bind_resources must return the positive state arena id",
-                ));
-            }
-            let arena_id = acknowledgement.extract::<u64>()?;
-            let required_state_arena_id = state_descriptor.as_ref().and_then(|(_, _, id)| *id);
-            if arena_id == 0 || required_state_arena_id.is_some_and(|required| required != arena_id)
-            {
-                return Err(PyValueError::new_err(format!(
-                    "runner returned state arena {arena_id}, expected {:?} or any positive id when unbound",
-                    required_state_arena_id,
-                )));
-            }
-            state_pool
-                .expect("state mapping resolution required a pool")
-                .bind(py)
-                .borrow_mut()
-                .bind_physical_mapping(&mapping.protocol, arena_id)?;
-        }
+    if !acknowledgement.is_none() {
+        return Err(PyTypeError::new_err(
+            "runner.bind_resources must return None",
+        ));
     }
     Ok(config)
 }

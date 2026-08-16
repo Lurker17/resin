@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from resin._resin import BatchPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,23 +17,39 @@ class PlanRow:
     cache: Any
 
 
-def plan_rows(plan, caches: dict[int, Any], vocab_size: int) -> list[PlanRow]:
+def plan_positions(plan: BatchPlan) -> list[int]:
+    """Return the absolute position of every scheduled token."""
+
+    positions: list[int] = []
+    for index, context_length in enumerate(plan.context_lengths):
+        start, end = plan.token_indptr[index : index + 2]
+        positions.extend(range(context_length, context_length + end - start))
+    return positions
+
+
+def plan_rows(
+    plan: BatchPlan, caches: dict[int, Any], vocab_size: int
+) -> list[PlanRow]:
     """Validate and split one native plan into request-local rows."""
 
     rows = []
-    for index, request_id in enumerate(plan.sequence_ids):
-        start, end = plan.sequence_indptr[index : index + 2]
-        cache = caches.get(request_id)
+    for index, sequence_id in enumerate(plan.sequence_ids):
+        start, end = plan.token_indptr[index : index + 2]
+        cache = caches.get(sequence_id)
         offset = 0 if cache is None else cache.length
-        positions = plan.positions[start:end]
+        positions = list(
+            range(
+                plan.context_lengths[index], plan.context_lengths[index] + end - start
+            )
+        )
         expected = list(range(offset, offset + end - start))
         if positions != expected:
             raise ValueError(
-                f"non-contiguous positions for request {request_id}: "
+                f"non-contiguous positions for request {sequence_id}: "
                 f"expected {expected}, got {positions}"
             )
         row_tokens = plan.token_ids[start:end]
         if any(token < 0 or token >= vocab_size for token in row_tokens):
-            raise ValueError(f"token id is out of range for request {request_id}")
-        rows.append(PlanRow(request_id, row_tokens, positions, cache))
+            raise ValueError(f"token id is out of range for request {sequence_id}")
+        rows.append(PlanRow(sequence_id, row_tokens, positions, cache))
     return rows

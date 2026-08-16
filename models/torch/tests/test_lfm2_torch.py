@@ -138,22 +138,20 @@ class TestLfm2Torch:
         runner.forward_calls = 0
 
         prefill = BatchPlan(
-            [1, 2, 8],
-            [0, 1, 0],
             [17, 23],
-            [0, 2, 3],
             [0, 0],
+            [1, 2, 8],
+            [0, 2, 3],
         )
         first = runner.forward(prefill)
         assert len(first) == 2
         assert runner.live_cache_count == 2
 
         decode = BatchPlan(
-            first,
-            [2, 1],
             [17, 23],
-            [0, 1, 2],
             [2, 1],
+            first,
+            [0, 1, 2],
             phase=BatchPhase.DECODE,
         )
         second = runner.forward(decode)

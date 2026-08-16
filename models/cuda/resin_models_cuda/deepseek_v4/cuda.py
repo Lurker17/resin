@@ -18,8 +18,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from resin import BatchPhase, ResourceBinding, RunnerConfig
-from resin.backend.checks import positions as check_positions
-from resin.backend.checks import token_ids as check_token_ids
 from resin.backend.cuda.graphs import (
     CudaGraphCache,
     CudaGraphStats,
@@ -34,6 +32,7 @@ from resin.backend.cuda.sampling import (
     SamplingTensors,
 )
 from resin.backend.cuda.staging import TensorStager
+from resin.backend.plans import plan_positions
 from resin.backend.speculative import accept_speculative_tokens
 from resin.protocols import SyncRunner
 from resin_models_cuda.deepseek_v4.cache import (
@@ -339,12 +338,9 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
 
         if binding.cache_pool_id is None or binding.cache_layout is None:
             raise ValueError("DeepSeek-V4 requires managed cache resources")
-        if binding.state_pool_id is not None:
-            raise ValueError("DeepSeek-V4 recurrent state is part of the cache pool")
         self._cache.bind(binding.cache_pool_id, binding.cache_layout)
 
     def _cache_plan(self, plan: BatchPlan):
-        self._cache.check(plan)
         return build_cache_plan(
             plan,
             self.cache_layout,
@@ -509,7 +505,8 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         if not self._graphs.shapes:
             return None
         batch_size = plan.num_sequences
-        sequence_length = max(plan.positions) + 1
+        positions = plan_positions(plan)
+        sequence_length = max(positions) + 1
         shape = self._graphs.match(
             lambda candidate: (
                 candidate[0] >= batch_size
@@ -522,7 +519,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         padding_rows = shape[0] - batch_size
         inputs: dict[str, object] = {
             "token_ids": (*plan.token_ids, *((0,) * padding_rows)),
-            "positions": (*plan.positions, *((1,) * padding_rows)),
+            "positions": (*positions, *((1,) * padding_rows)),
         }
         graph_cache = self._graph_device_caches[shape]
         inputs.update(self._cache.graph_plan_inputs(graph_cache, cache_plan))
@@ -559,7 +556,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         return self._accept_speculative(
             drafts,
             targets,
-            torch.tensor(plan.positions, dtype=torch.long, device=self.device),
+            torch.tensor(positions, dtype=torch.long, device=self.device),
             graph_cache,
         )
 
@@ -567,7 +564,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         row_count = plan.num_sequences
         if row_count == 0 or row_count > self.max_batch_size:
             raise ValueError("DeepSeek-V4 batch size is outside runner capacity")
-        indptr = tuple(plan.sequence_indptr)
+        indptr = tuple(plan.token_indptr)
         if (
             len(indptr) != row_count + 1
             or indptr[0] != 0
@@ -579,14 +576,11 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             raise ValueError("DeepSeek-V4 requires one context length per sequence")
         if len(set(plan.sequence_ids)) != row_count:
             raise ValueError("DeepSeek-V4 sequence IDs must be unique within a batch")
-        check_token_ids(plan.token_ids, self.vocab_size)
-        check_positions(plan.positions, self.max_seq_len)
+        positions = plan_positions(plan)
         rows = tuple(zip(indptr, indptr[1:]))
         for row, (start, end) in enumerate(rows):
             context = plan.context_lengths[row]
-            if list(plan.positions[start:end]) != list(
-                range(context, context + end - start)
-            ):
+            if positions[start:end] != list(range(context, context + end - start)):
                 raise ValueError("DeepSeek-V4 positions must continue each row context")
 
         if plan.phase == BatchPhase.PREFILL:
@@ -701,8 +695,9 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         anchors = torch.tensor(
             plan.token_ids, dtype=torch.long, device=self.device
         ).view(batch_size, 1)
-        positions = torch.tensor(plan.positions, dtype=torch.long, device=self.device)
-        graph_seq_len = max(plan.positions) + self.speculative_tokens + 1
+        host_positions = plan_positions(plan)
+        positions = torch.tensor(host_positions, dtype=torch.long, device=self.device)
+        graph_seq_len = max(host_positions) + self.speculative_tokens + 1
         drafts = self._broadcast_tokens(
             self._model.draft(anchors, positions, cache=cache)
         )
@@ -756,13 +751,14 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
                     input_ids = torch.tensor(
                         plan.token_ids, dtype=torch.long, device=self.device
                     ).view(plan.num_sequences, 1)
+                    host_positions = plan_positions(plan)
                     positions = torch.tensor(
-                        plan.positions, dtype=torch.long, device=self.device
+                        host_positions, dtype=torch.long, device=self.device
                     )
                     logits = self._model.forward_decode(
                         input_ids,
                         positions,
-                        max(plan.positions) + 1,
+                        max(host_positions) + 1,
                         cache=cache,
                     )
                 output = self._sample_target(logits, plan, 0)

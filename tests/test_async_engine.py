@@ -12,7 +12,6 @@ from resin import (
     Engine,
     ResourceBinding,
     RunnerConfig,
-    StatePool,
 )
 
 PollResult = list[int] | list[list[int]] | tuple[int, ...] | BaseException | None
@@ -93,7 +92,7 @@ class TestAsyncEngineContract:
 
             def forward(self, plan):
                 self.plans.append(plan)
-                return [plan.token_ids[end - 1] + 1 for end in plan.sequence_indptr[1:]]
+                return [plan.token_ids[end - 1] + 1 for end in plan.token_indptr[1:]]
 
             def release(self, request_ids):
                 self.released.extend(request_ids)
@@ -148,12 +147,9 @@ class TestAsyncEngineContract:
             def release(self, request_ids):
                 self.released.extend(request_ids)
 
-        pool = StatePool(1)
-        state = pool.allocate()[0]
         runner = SyncRunner()
-        engine = Engine(runner, state_pool=pool)
-        request = engine.submit([1, 2], max_new_tokens=1, state_handles=[state])
-        pool.release([state])
+        engine = Engine(runner)
+        request = engine.submit([1, 2], max_new_tokens=1)
 
         with pytest.raises(PostAcceptError, match="quiescence failed"):
             engine.dispatch()
@@ -163,8 +159,6 @@ class TestAsyncEngineContract:
         assert runner.released == []
         assert (engine.ready_request_count, engine.in_flight_request_count) == (0, 1)
         assert engine.in_flight_batch_id == 1
-        assert pool.counts(state) == (1, 1)
-        assert pool.access_counts(state) == (0, True)
         assert (engine.cache_free_parent_count, engine.cache_occupied_block_count) == (
             1,
             1,
@@ -192,24 +186,18 @@ class TestAsyncEngineContract:
             def bind_resources(binding: ResourceBinding) -> None:
                 del binding
 
-        pool = StatePool(1)
-        state = pool.allocate()[0]
         runner = SyncRunner()
-        engine = Engine(runner, state_pool=pool)
-        engine.submit([1, 2], max_new_tokens=1, state_handles=[state])
-        pool.release([state])
+        engine = Engine(runner)
+        engine.submit([1, 2], max_new_tokens=1)
 
         with pytest.raises(RuntimeError, match="retryable forward failure"):
             engine.dispatch()
         assert not engine.poisoned
         assert (engine.ready_request_count, engine.in_flight_request_count) == (1, 0)
-        assert pool.counts(state) == (1, 0)
-        assert pool.access_counts(state) == (0, False)
 
         assert engine.dispatch() == 2
         assert [event.token_id for event in engine.poll()] == [3]
         assert runner.calls == 2
-        assert not pool.contains(state)
         assert (engine.cache_free_parent_count, engine.cache_occupied_block_count) == (
             2,
             0,
@@ -240,12 +228,9 @@ class TestAsyncEngineContract:
                 def release(self, request_ids):
                     self.released.extend(request_ids)
 
-            pool = StatePool(1)
-            state = pool.allocate()[0]
             runner = SyncRunner()
-            engine = Engine(runner, state_pool=pool)
-            request = engine.submit([1, 2], max_new_tokens=1, state_handles=[state])
-            pool.release([state])
+            engine = Engine(runner)
+            request = engine.submit([1, 2], max_new_tokens=1)
 
             with pytest.raises(error_type):
                 engine.dispatch()
@@ -257,8 +242,6 @@ class TestAsyncEngineContract:
                 0,
                 1,
             )
-            assert pool.counts(state) == (1, 1)
-            assert pool.access_counts(state) == (0, True)
             assert (
                 engine.cache_free_parent_count,
                 engine.cache_occupied_block_count,
@@ -296,12 +279,9 @@ class TestAsyncEngineContract:
             def release(self, request_ids):
                 self.released.extend(request_ids)
 
-        pool = StatePool(1)
-        state = pool.allocate()[0]
         runner = AsyncRunner()
-        engine = Engine(runner, state_pool=pool)
-        request = engine.submit([1, 2], max_new_tokens=1, state_handles=[state])
-        pool.release([state])
+        engine = Engine(runner)
+        request = engine.submit([1, 2], max_new_tokens=1)
 
         with pytest.raises(PostAcceptError, match="lost its accepted completion"):
             engine.dispatch()
@@ -310,8 +290,6 @@ class TestAsyncEngineContract:
         assert runner.calls == 1
         assert runner.released == []
         assert (engine.ready_request_count, engine.in_flight_request_count) == (0, 1)
-        assert pool.counts(state) == (1, 1)
-        assert pool.access_counts(state) == (0, True)
         assert (engine.cache_free_parent_count, engine.cache_occupied_block_count) == (
             1,
             1,
@@ -320,20 +298,16 @@ class TestAsyncEngineContract:
             engine.cancel(request)
         assert runner.calls == 1
 
-    def test_pending_completion_keeps_state_pinned_and_cache_blocks_owned(self) -> None:
-        pool = StatePool(1)
-        state = pool.allocate()[0]
+    def test_pending_completion_keeps_cache_blocks_owned(self) -> None:
         runner = ControlledAsyncRunner(
             [None, [7]],
             cache_layout=history_layout(1),
         )
-        engine = Engine(runner, state_pool=pool)
-        request = engine.submit([1, 2], max_new_tokens=1, state_handles=[state])
-        pool.release([state])
+        engine = Engine(runner)
+        request = engine.submit([1, 2], max_new_tokens=1)
 
         assert engine.asynchronous
         assert engine.dispatch() == 1
-        assert pool.counts(state) == (1, 1)
         assert (engine.ready_request_count, engine.in_flight_request_count) == (0, 1)
         assert (engine.cache_free_parent_count, engine.cache_occupied_block_count) == (
             0,
@@ -341,7 +315,6 @@ class TestAsyncEngineContract:
         )
 
         assert engine.poll() == []
-        assert pool.counts(state) == (1, 1)
         waiting = engine.submit([9], max_new_tokens=1)
         assert engine.cache_occupied_block_count == 1
 
@@ -349,7 +322,6 @@ class TestAsyncEngineContract:
         assert [event.token_id for event in events] == [7]
         assert events[0].finished
         assert runner.released == [request]
-        assert not pool.contains(state)
         assert (engine.cache_free_parent_count, engine.cache_occupied_block_count) == (
             1,
             0,
@@ -358,21 +330,17 @@ class TestAsyncEngineContract:
         assert engine.cancel(waiting)
 
     def test_in_flight_cancel_waits_for_terminal_poll_and_discards_output(self) -> None:
-        pool = StatePool(1)
-        state = pool.allocate()[0]
         runner = ControlledAsyncRunner(
             [None, [99]],
             cache_layout=history_layout(2),
         )
-        engine = Engine(runner, state_pool=pool)
-        request = engine.submit([4], max_new_tokens=3, state_handles=[state])
-        pool.release([state])
+        engine = Engine(runner)
+        request = engine.submit([4], max_new_tokens=3)
         engine.dispatch()
 
         assert engine.cancel(request)
         assert engine.cancel(request)
         assert engine.poll() == []
-        assert pool.counts(state) == (1, 1)
         assert engine.cache_occupied_block_count == 1
         waiting = engine.submit([8], max_new_tokens=1)
         assert engine.cache_occupied_block_count == 1
@@ -381,7 +349,6 @@ class TestAsyncEngineContract:
         assert request.done
         assert request.take_result() == []
         assert runner.released == [request]
-        assert not pool.contains(state)
         assert (engine.cache_free_parent_count, engine.cache_occupied_block_count) == (
             2,
             0,
@@ -434,7 +401,7 @@ class TestAsyncEngineContract:
         )
         assert engine.cancel(waiting)
 
-    def test_ready_cancel_retires_existing_physical_state_immediately(self) -> None:
+    def test_ready_cancel_retires_existing_cache_immediately(self) -> None:
         runner = ControlledAsyncRunner([[3]], cache_layout=history_layout(2))
         engine = Engine(runner)
         request = engine.submit([1, 2], max_new_tokens=2)
@@ -456,23 +423,17 @@ class TestAsyncEngineContract:
         )
         assert not engine.has_work()
 
-    def test_dispatch_rejection_restores_ready_order_and_temporary_pins(self) -> None:
-        pool = StatePool(3)
-        first_state, second_state, tail_state = pool.allocate(3)
+    def test_dispatch_rejection_restores_ready_order(self) -> None:
         runner = ControlledAsyncRunner([[11, 21]], dispatch_failures=1)
-        engine = Engine(runner, max_running_requests=2, state_pool=pool)
-        first = engine.submit([10], max_new_tokens=1, state_handles=[first_state])
-        second = engine.submit([20], max_new_tokens=1, state_handles=[second_state])
-        tail = engine.submit([30], max_new_tokens=1, state_handles=[tail_state])
-        pool.release([first_state, second_state, tail_state])
+        engine = Engine(runner, max_running_requests=2)
+        first = engine.submit([10], max_new_tokens=1)
+        second = engine.submit([20], max_new_tokens=1)
+        tail = engine.submit([30], max_new_tokens=1)
 
         with pytest.raises(RuntimeError, match="before acceptance"):
             engine.dispatch()
         assert not engine.poisoned
         assert (engine.ready_request_count, engine.in_flight_request_count) == (3, 0)
-        assert pool.counts(first_state) == (1, 0)
-        assert pool.counts(second_state) == (1, 0)
-        assert pool.counts(tail_state) == (1, 0)
 
         assert engine.dispatch() == 2
         assert [plan.sequence_ids for plan in runner.dispatch_plans] == [
@@ -484,13 +445,9 @@ class TestAsyncEngineContract:
         for field in (
             "phase",
             "token_ids",
-            "positions",
             "sequence_ids",
-            "sequence_indptr",
+            "token_indptr",
             "context_lengths",
-            "state_slots",
-            "state_generations",
-            "state_indptr",
         ):
             assert getattr(failed_plan, field) == getattr(retry_plan, field), field
         events = engine.poll()
@@ -545,15 +502,12 @@ class TestAsyncEngineContract:
             ("bad_token", [-1], OverflowError, "out of range"),
         )
         for name, result, error_type, message in cases:
-            pool = StatePool(1)
-            state = pool.allocate()[0]
             runner = ControlledAsyncRunner(
                 [result],
                 cache_layout=history_layout(1),
             )
-            engine = Engine(runner, state_pool=pool)
-            request = engine.submit([1], max_new_tokens=1, state_handles=[state])
-            pool.release([state])
+            engine = Engine(runner)
+            request = engine.submit([1], max_new_tokens=1)
             engine.dispatch()
 
             with pytest.raises(error_type, match=message):
@@ -562,7 +516,6 @@ class TestAsyncEngineContract:
             assert "poll" in engine.poison_error
             assert engine.in_flight_request_count == 1
             assert not request.done
-            assert pool.counts(state) == (1, 1)
             assert (
                 engine.cache_free_parent_count,
                 engine.cache_occupied_block_count,
@@ -575,16 +528,13 @@ class TestAsyncEngineContract:
     def test_terminal_release_failure_poison_quarantines_before_native_reuse(
         self,
     ) -> None:
-        pool = StatePool(1)
-        state = pool.allocate()[0]
         runner = ControlledAsyncRunner(
             [[7]],
             release_error=RuntimeError("physical cleanup failed"),
             cache_layout=history_layout(1),
         )
-        engine = Engine(runner, state_pool=pool)
-        request = engine.submit([1], max_new_tokens=1, state_handles=[state])
-        pool.release([state])
+        engine = Engine(runner)
+        request = engine.submit([1], max_new_tokens=1)
         engine.dispatch()
 
         with pytest.raises(RuntimeError, match="physical cleanup failed"):
@@ -592,15 +542,12 @@ class TestAsyncEngineContract:
         assert engine.poisoned
         assert "release" in engine.poison_error
         assert not request.done
-        assert pool.counts(state) == (1, 1)
         assert (engine.cache_free_parent_count, engine.cache_occupied_block_count) == (
             0,
             1,
         )
 
     def test_close_drains_pending_work_and_retires_ready_requests(self) -> None:
-        pool = StatePool(2)
-        pending_state, ready_state = pool.allocate(2)
         runner = ControlledAsyncRunner(
             [None, [7]],
             cache_layout=history_layout(2),
@@ -608,11 +555,9 @@ class TestAsyncEngineContract:
         engine = Engine(
             runner,
             max_running_requests=1,
-            state_pool=pool,
         )
-        pending = engine.submit([1], max_new_tokens=2, state_handles=[pending_state])
-        ready = engine.submit([2], max_new_tokens=2, state_handles=[ready_state])
-        pool.release([pending_state, ready_state])
+        pending = engine.submit([1], max_new_tokens=2)
+        ready = engine.submit([2], max_new_tokens=2)
         engine.dispatch()
 
         engine.close()
@@ -626,8 +571,6 @@ class TestAsyncEngineContract:
         assert ready.take_result() == []
         assert runner.released == [pending, ready]
         assert len(runner.poll_handles) == 2
-        assert not pool.contains(pending_state)
-        assert not pool.contains(ready_state)
         assert (engine.cache_free_parent_count, engine.cache_occupied_block_count) == (
             2,
             0,
@@ -662,22 +605,6 @@ class TestAsyncEngineContract:
         assert request.take_result() == []
         assert runner.released == [request]
 
-    def test_destructor_releases_ready_state_pool_ownership(self) -> None:
-        pool = StatePool(1)
-        state = pool.allocate()[0]
-        runner = ControlledAsyncRunner()
-        engine = Engine(runner, state_pool=pool)
-        request = engine.submit([1], max_new_tokens=1, state_handles=[state])
-        pool.release([state])
-        assert pool.counts(state) == (1, 0)
-
-        del engine
-        gc.collect()
-
-        assert runner.released == [request]
-        assert not pool.contains(state)
-        assert pool.free_count == 1
-
     def test_destructor_drains_healthy_pending_work_before_runner(self) -> None:
         destruction_order: list[str] = []
 
@@ -708,26 +635,19 @@ class TestAsyncEngineContract:
             def __del__(self) -> None:
                 destruction_order.append("runner")
 
-        pool = StatePool(1)
-        state = pool.allocate()[0]
-        engine = Engine(OrderedRunner(), state_pool=pool)
-        engine.submit([1], max_new_tokens=1, state_handles=[state])
-        pool.release([state])
+        engine = Engine(OrderedRunner())
+        engine.submit([1], max_new_tokens=1)
         engine.dispatch()
 
         del engine
         gc.collect()
 
         assert destruction_order == ["completion", "runner"]
-        assert not pool.contains(state)
 
-    def test_destructor_quarantines_undrainable_shared_state(self) -> None:
-        pool = StatePool(1)
-        state = pool.allocate()[0]
-        runner = ControlledAsyncRunner()
-        engine = Engine(runner, state_pool=pool)
-        engine.submit([1], max_new_tokens=1, state_handles=[state])
-        pool.release([state])
+    def test_destructor_quarantines_undrainable_completion(self) -> None:
+        runner = ControlledAsyncRunner(cache_layout=history_layout(1))
+        engine = Engine(runner)
+        engine.submit([1], max_new_tokens=1)
         engine.dispatch()
 
         del engine
@@ -735,8 +655,6 @@ class TestAsyncEngineContract:
 
         assert len(runner.poll_handles) > 0
         assert runner.released == []
-        assert pool.counts(state) == (1, 1)
-        assert (pool.free_count, pool.retiring_count) == (0, 0)
 
 
 class TestRunnerContractConstruction:

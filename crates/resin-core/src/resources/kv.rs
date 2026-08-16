@@ -3,7 +3,16 @@ use std::num::NonZeroU32;
 
 pub const MAX_KERNEL_VALUE: u32 = i32::MAX as u32;
 
-/// Logical history retained by an attention KV group.
+/// How a cache group advances through a sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KvGroupFamily {
+    /// Token-addressed attention or rolling model state.
+    History,
+    /// A page-aligned recurrent checkpoint ring.
+    State,
+}
+
+/// Logical history retained by a token-addressed cache group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KvRetention {
     /// Full attention: every logical block remains resident for the request.
@@ -21,12 +30,13 @@ impl KvRetention {
     }
 }
 
-/// Static geometry and retention policy for one ordered KV group.
+/// Static geometry and retention policy for one ordered cache group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KvGroupLayout {
     block_tokens: NonZeroU32,
     blocks_per_parent: NonZeroU32,
     retention: KvRetention,
+    family: KvGroupFamily,
 }
 
 impl KvGroupLayout {
@@ -34,6 +44,20 @@ impl KvGroupLayout {
         block_tokens: u32,
         blocks_per_parent: u32,
         retention: KvRetention,
+    ) -> Result<Self, KvLayoutError> {
+        Self::new_with_family(
+            block_tokens,
+            blocks_per_parent,
+            retention,
+            KvGroupFamily::History,
+        )
+    }
+
+    pub fn new_with_family(
+        block_tokens: u32,
+        blocks_per_parent: u32,
+        retention: KvRetention,
+        family: KvGroupFamily,
     ) -> Result<Self, KvLayoutError> {
         let block_tokens = NonZeroU32::new(block_tokens)
             .ok_or_else(|| KvLayoutError::new("block_tokens must be positive"))?;
@@ -52,10 +76,18 @@ impl KvGroupLayout {
                 "window_tokens exceeds the signed int32 kernel metadata range",
             ));
         }
+        if matches!(family, KvGroupFamily::State)
+            && matches!(retention, KvRetention::SlidingWindow { .. })
+        {
+            return Err(KvLayoutError::new(
+                "recurrent state groups do not accept window retention",
+            ));
+        }
         Ok(Self {
             block_tokens,
             blocks_per_parent,
             retention,
+            family,
         })
     }
 
@@ -71,6 +103,15 @@ impl KvGroupLayout {
         self.retention
     }
 
+    pub const fn family(self) -> KvGroupFamily {
+        self.family
+    }
+
+    /// Whether this group stores a page-aligned recurrent-state snapshot.
+    pub const fn is_recurrent(self) -> bool {
+        matches!(self.family, KvGroupFamily::State)
+    }
+
     /// Maximum request-owned suffix width after a sliding window saturates.
     pub const fn window_resident_blocks(self) -> Option<NonZeroU32> {
         match self.retention {
@@ -83,7 +124,7 @@ impl KvGroupLayout {
     }
 }
 
-/// Frozen geometry for every attention KV group sharing one parent pool.
+/// Frozen geometry for every cache group sharing one parent pool.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KvLayout {
     parent_capacity: NonZeroU32,
@@ -190,7 +231,7 @@ impl fmt::Display for KvLayoutError {
 
 impl std::error::Error for KvLayoutError {}
 
-/// Executor-facing CSR block table and append locations for one KV group.
+/// Executor-facing block table and append locations for one cache group.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KvGroupPlan {
     pub group_index: u32,
@@ -293,6 +334,17 @@ mod tests {
         .unwrap();
         assert_eq!(full.window_resident_blocks(), None);
         assert_eq!(sliding.window_resident_blocks().unwrap().get(), 4);
+        assert!(
+            KvGroupLayout::new_with_family(
+                128,
+                1,
+                KvRetention::SlidingWindow {
+                    tokens: NonZeroU32::new(128).unwrap(),
+                },
+                KvGroupFamily::State,
+            )
+            .is_err()
+        );
     }
 
     #[test]

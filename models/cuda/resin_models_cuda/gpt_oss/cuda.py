@@ -36,9 +36,6 @@ from resin import (
     ResourceBinding,
     RunnerConfig,
 )
-from resin.backend.checks import positions as check_positions
-from resin.backend.checks import positive_int
-from resin.backend.checks import token_ids as check_token_ids
 from resin.backend.cuda.graphs import (
     CudaGraphCache,
     CudaGraphStats,
@@ -52,6 +49,7 @@ from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.loading import default_device
+from resin.backend.plans import plan_positions
 from resin.protocols import SyncRunner
 from resin_models_cuda.gpt_oss.checkpoint import (
     DEFAULT_MODEL,
@@ -228,9 +226,7 @@ class GptOssCudaRunner(SyncRunner):
         self.tensor_parallel = tensor_parallel or TensorParallelContext()
         self.tensor_parallel_rank = self.tensor_parallel.rank
         self.tensor_parallel_size = self.tensor_parallel.size
-        self.cache_parent_capacity = positive_int(
-            "cache_parent_capacity", cache_parent_capacity
-        )
+        self.cache_parent_capacity = cache_parent_capacity
         self.cache_layout = CacheLayout(
             self.cache_parent_capacity,
             [
@@ -435,12 +431,7 @@ class GptOssCudaRunner(SyncRunner):
 
         if binding.cache_pool_id is None or binding.cache_layout is None:
             raise ValueError("GPT-OSS requires a cache resource binding")
-        if binding.state_pool_id is not None:
-            raise ValueError("GPT-OSS does not declare mapped state")
         self._kv.bind(binding.cache_pool_id, binding.cache_layout)
-
-    def _validate_plan_binding(self, plan: BatchPlan) -> None:
-        self._kv.check(plan)
 
     def _synchronize_failed_eager_forward(self) -> None:
         """Make a launched eager failure quiescent or mark it post-accept."""
@@ -797,7 +788,7 @@ class GptOssCudaRunner(SyncRunner):
             return None
         inputs = {
             "token_ids": plan.token_ids,
-            "positions": plan.positions,
+            "positions": plan_positions(plan),
             "token_indices": host.token_indices,
             "sequence_indices": host.sequence_indices,
             "full_page_table": self._pad_page_table(host, shape[1]),
@@ -813,9 +804,7 @@ class GptOssCudaRunner(SyncRunner):
 
     def forward(self, plan: BatchPlan) -> list[int]:
         self._graphs.check()
-        self._validate_plan_binding(plan)
-        check_token_ids(plan.token_ids, self.vocab_size)
-        check_positions(plan.positions, self._model.args.max_position_embeddings)
+        host_positions = plan_positions(plan)
 
         prefill_batches, decode_batch = build_attention_batches(
             plan, parent_capacity=self.cache_parent_capacity
@@ -839,7 +828,7 @@ class GptOssCudaRunner(SyncRunner):
         torch = self._torch
         staging = TensorStager(torch, self.device)
         token_ids = staging.device("token_ids", plan.token_ids, torch.long)
-        positions = staging.device("positions", plan.positions, torch.long)
+        positions = staging.device("positions", host_positions, torch.long)
         final_hidden = torch.empty(
             len(plan.sequence_ids),
             self.hidden_size,

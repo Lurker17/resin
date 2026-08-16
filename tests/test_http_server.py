@@ -5,8 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from deploy.http import TensorParallelServerRunner, follow_tensor_parallel_server
-from resin import Engine
+from deploy.http import (
+    TensorParallelServerRunner,
+    batch_plan_from_payload,
+    batch_plan_payload,
+    follow_tensor_parallel_server,
+)
+from resin import BatchPhase, BatchPlan, CacheGroupPlan, Engine, SamplingParams
 from resin.server import HttpServer, RendererCodec
 
 
@@ -38,28 +43,21 @@ def test_tensor_parallel_server_broadcasts_resource_binding() -> None:
     binding = SimpleNamespace(
         cache_pool_id=41,
         cache_layout=layout,
-        state_pool_id=None,
-        state_capacity=None,
-        required_state_arena_id=None,
     )
 
     class Runner:
         @staticmethod
         def bind_resources(bound):
             assert bound is binding
-            return 41
 
     distributed = RecordingDistributed()
     runner = TensorParallelServerRunner(Runner(), "control", distributed)
 
-    assert runner.bind_resources(binding) == 41
+    assert runner.bind_resources(binding) is None
     assert distributed.broadcasts == [
         {
             "operation": "bind_resources",
             "cache_pool_id": 41,
-            "state_pool_id": None,
-            "state_capacity": None,
-            "required_state_arena_id": None,
         }
     ]
 
@@ -80,9 +78,6 @@ def test_tensor_parallel_follower_applies_resource_binding() -> None:
             {
                 "operation": "bind_resources",
                 "cache_pool_id": 41,
-                "state_pool_id": None,
-                "state_capacity": None,
-                "required_state_arena_id": None,
             },
             {"operation": "close"},
         ]
@@ -93,7 +88,40 @@ def test_tensor_parallel_follower_applies_resource_binding() -> None:
     assert len(Runner.calls) == 1
     assert Runner.calls[0].cache_pool_id == 41
     assert Runner.calls[0].cache_layout is layout
-    assert Runner.calls[0].state_mapping is None
+
+
+def test_tensor_parallel_plan_round_trip_preserves_native_contract() -> None:
+    plan = BatchPlan(
+        [11, 22],
+        [0, 32],
+        [1, 2, 3],
+        [0, 2, 3],
+        phase=BatchPhase.PREFILL,
+        batch_id=7,
+        batch_key=9,
+        cache_groups=[
+            CacheGroupPlan(0, [0, 1, 2], [3, 4], [0, 2], [3, 3, 4], [0, 1, 0])
+        ],
+        sample_sequence_indices=[1],
+        sampling_params=[
+            SamplingParams(temperature=0.5, seed=31),
+            SamplingParams(top_p=0.9, seed=32),
+        ],
+    )
+
+    restored = batch_plan_from_payload(batch_plan_payload(plan))
+
+    assert restored.sequence_ids == plan.sequence_ids
+    assert restored.context_lengths == plan.context_lengths
+    assert restored.token_ids == plan.token_ids
+    assert restored.token_indptr == plan.token_indptr
+    assert restored.phase == plan.phase
+    assert restored.batch_id == plan.batch_id
+    assert restored.batch_key == plan.batch_key
+    assert restored.sample_sequence_indices == [1]
+    assert restored.cache_groups[0].block_ids == [3, 4]
+    assert restored.sampling_params[0].temperature == 0.5
+    assert restored.sampling_params[1].top_p == 0.9
 
 
 @dataclass

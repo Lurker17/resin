@@ -6,7 +6,7 @@ import torch
 import resin
 from resin import BatchPlan, Engine, SamplingParams
 from resin.backend.cuda.sampling import FlashInferSampler
-from resin.backend.sampling import TorchSampler
+from resin.backend.sampling import TorchSampler, batch_sampling_inputs
 from resin.backend.speculative import accept_speculative_tokens
 
 
@@ -29,10 +29,6 @@ class TestSamplingContract:
         assert acceptance.token_rows == [[10, 11, 13], [31]]
         assert acceptance.accepted_counts == [2, 0]
         assert acceptance.processed_counts == [3, 1]
-
-    def test_state_mapping_arena_mint_is_public_backend_api(self) -> None:
-        assert callable(resin.mint_state_mapping_arena_id)
-        assert "mint_state_mapping_arena_id" in resin.__all__
 
     def test_sampling_params_validate_defaults_and_preserve_extra_identity(
         self,
@@ -91,11 +87,11 @@ class TestSamplingContract:
         assert initial.sampling_params[0].extra is first_extra
         assert initial.sampling_params[1].extra is second_extra
         assert [params.seed for params in initial.sampling_params] == [11, 22]
-        assert initial.sampling_offsets == [0, 0]
+        assert batch_sampling_inputs(initial, 128)["offsets"] == (32, 32)
 
         engine.step()
         decode = runner.plans[1]
-        assert decode.sampling_offsets == [32, 0]
+        assert batch_sampling_inputs(decode, 128)["offsets"] == (64, 64)
         assert first.take_result() == [0, 0]
         assert second.take_result() == [0, 0]
 
@@ -119,28 +115,24 @@ class TestSamplingContract:
         while engine.has_work():
             engine.step()
 
-        assert [plan.sampling_offsets for plan in runner.plans] == [[0], [32], [128]]
+        assert [
+            batch_sampling_inputs(plan, 128)["offsets"] for plan in runner.plans
+        ] == [
+            (32,),
+            (64,),
+            (160,),
+        ]
         assert request.take_result() == [1, 2, 3, 4, 5]
 
-    def test_batch_plan_requires_row_aligned_sampling_annotations(self) -> None:
+    def test_batch_plan_requires_sequence_aligned_sampling_annotations(self) -> None:
         params = SamplingParams()
         with pytest.raises(ValueError, match="one item per sequence"):
             BatchPlan(
-                [1, 2],
-                [0, 0],
                 [7, 8],
-                [0, 1, 2],
                 [0, 0],
+                [1, 2],
+                [0, 1, 2],
                 sampling_params=[params],
-            )
-        with pytest.raises(ValueError, match="sampling_offsets"):
-            BatchPlan(
-                [1, 2],
-                [0, 0],
-                [7, 8],
-                [0, 1, 2],
-                [0, 0],
-                sampling_offsets=[1],
             )
 
 
@@ -149,13 +141,11 @@ class TestSharedSampler:
     def _plan(params, *, sample_sequence_indices=None):
         rows = len(params)
         return BatchPlan(
-            list(range(1, rows + 1)),
-            [0] * rows,
             list(range(10, 10 + rows)),
-            list(range(rows + 1)),
             [0] * rows,
+            list(range(1, rows + 1)),
+            list(range(rows + 1)),
             sampling_params=params,
-            sampling_offsets=[0] * rows,
             sample_sequence_indices=sample_sequence_indices,
         )
 
@@ -192,16 +182,14 @@ class TestSharedSampler:
         sampler._softmax = softmax
         sampler._sample = sample
         plan = BatchPlan(
-            [1, 2],
-            [0, 0],
             [10, 11],
+            [1, 2],
+            [1, 2],
             [0, 1, 2],
-            [0, 0],
             sampling_params=[
                 SamplingParams(temperature=0.5, top_p=0.8, top_k=2, seed=31),
                 SamplingParams(temperature=0.0, seed=32),
             ],
-            sampling_offsets=[64, 96],
         )
         logits = torch.tensor([[0.0, 1.0, 2.0], [0.0, 3.0, 1.0]])
 

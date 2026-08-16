@@ -100,16 +100,13 @@ class TestFlatCacheApi:
             [1, 0],
         )
         plan = BatchPlan(
-            [8, 9],
-            [1, 2],
             [11],
-            [0, 2],
             [1],
-            cache_pool_id=7,
+            [8, 9],
+            [0, 2],
             cache_groups=[group],
         )
 
-        assert plan.cache_pool_id == 7
         assert len(plan.cache_groups) == 1
         frozen = plan.cache_groups[0]
         assert frozen.group_index == group.group_index
@@ -200,7 +197,6 @@ class TestFlatCacheEngine:
         engine.step()
         reused = runner.plans[-1]
         assert reused.token_ids == [5]
-        assert reused.positions == [4]
         assert reused.context_lengths == [4]
         assert second.done
 
@@ -229,7 +225,6 @@ class TestFlatCacheEngine:
         assert engine.cache_occupied_block_count == 2
         assert not first_event.finished
         prefill = runner.plans[0]
-        assert prefill.cache_pool_id == engine.cache_pool_id
         assert len(prefill.cache_groups) == 1
         group = prefill.cache_groups[0]
         assert group.group_index == 0

@@ -20,52 +20,37 @@ class BatchPlan:
     """
     Immutable Engine-issued execution plan for one homogeneous batch phase.
 
-    Token metadata is flattened across sequences. ``sequence_ids`` has one
-    entry per row, while ``sequence_indptr`` is a CSR pointer array of length
-    ``num_sequences + 1`` whose adjacent entries slice ``token_ids`` and
-    ``positions``. ``context_lengths`` gives the resident prefix length before
-    the scheduled slice.
-
-    Recurrent handles use the same row convention through ``state_indptr``.
-    Attention placement is carried by ``cache_groups``; each CacheGroupPlan has
-    per-sequence block-table CSR metadata and per-token append destinations.
-    ``sample_sequence_indices`` selects rows that produce a sampled output;
-    omitted rows only advance prefill state.
+    ``token_ids`` contains every sequence's new tokens in one flat array.
+    Adjacent values in ``token_indptr`` select each sequence's tokens.
+    ``context_lengths[i]`` is the number of tokens already processed for
+    sequence ``i``; positions are therefore implicit and start at that value.
+    ``cache_groups`` supplies the pages used by those sequences.
     """
     def __new__(
         cls,
         /,
-        token_ids: Sequence[int],
-        positions: Sequence[int],
         sequence_ids: Sequence[int],
-        sequence_indptr: Sequence[int],
         context_lengths: Sequence[int],
+        token_ids: Sequence[int],
+        token_indptr: Sequence[int],
         *,
         phase: BatchPhase = ...,
         batch_id: int = 0,
         batch_key: int | None = None,
-        engine_id: int | None = None,
-        state_pool_id: int | None = None,
-        state_slots: Sequence[int] | None = None,
-        state_generations: Sequence[int] | None = None,
-        state_indptr: Sequence[int] | None = None,
-        state_access_modes: Sequence[str] | None = None,
-        cache_pool_id: int | None = None,
         cache_groups: Sequence[CacheGroupPlan] | None = None,
         sample_sequence_indices: Sequence[int] | None = None,
         sampling_params: Sequence[SamplingParams] | None = None,
-        sampling_offsets: Sequence[int] | None = None,
     ) -> BatchPlan: ...
     def __repr__(self, /) -> str: ...
     @property
     def batch_id(self, /) -> int:
         """
-        Monotonic Engine-issued identifier for this dispatch.
+        Monotonic identifier used to match an async dispatch with its result.
         """
     @property
     def batch_key(self, /) -> int | None:
         """
-        Optional runner batching key shared by compatible plans.
+        Optional key that prevents incompatible requests from sharing a batch.
         """
     @property
     def cache_groups(self, /) -> tuple[CacheGroupPlan, ...]:
@@ -73,94 +58,64 @@ class BatchPlan:
         Ordered physical placement plans corresponding to CacheLayout groups.
         """
     @property
-    def cache_pool_id(self, /) -> int | None:
-        """
-        Identity of the Engine-owned grouped cache pool, if present.
-        """
-    @property
     def context_lengths(self, /) -> list[int]:
         """
-        Resident prefix-token count before each sequence's scheduled slice.
-        """
-    @property
-    def engine_id(self, /) -> int | None:
-        """
-        Identity of the Engine that issued this plan, when Engine-owned.
+        Number of tokens already processed for each sequence.
         """
     @property
     def num_sequences(self, /) -> int:
         """
-        Number of sequence rows in this plan.
+        Number of sequences (batch size).
         """
     @property
     def phase(self, /) -> BatchPhase:
         """
-        Homogeneous execution phase for every sequence row.
-        """
-    @property
-    def positions(self, /) -> list[int]:
-        """
-        Absolute position of each flattened scheduled token.
+        Whether this is a prefill or decode batch. Mixed-chunk is not supported.
         """
     @property
     def sample_sequence_indices(self, /) -> list[int]:
         """
-        Sorted sequence-row indices that must return one sampled token.
-        """
-    @property
-    def sampling_offsets(self, /) -> list[int]:
-        """
-        Deterministic RNG draw offset for each sequence row.
+        Which sequence indices should generate a sampled token. Used for
+        chunked prefill, when some sequences only advance the cache.
         """
     @property
     def sampling_params(self, /) -> tuple[SamplingParams, ...]:
         """
-        Effective sampling parameters, one per sequence row.
+        Effective sampling parameters, one per sequence.
         """
     @property
     def sequence_ids(self, /) -> list[int]:
         """
-        Stable request/sequence identifier for each batch row.
-        """
-    @property
-    def sequence_indptr(self, /) -> list[int]:
-        """
-        CSR offsets slicing flattened token arrays by sequence row.
-        """
-    @property
-    def state_access_modes(self, /) -> list[str]:
-        """
-        ``"read"`` or ``"write"`` access mode for each recurrent-state slot.
-        """
-    @property
-    def state_generations(self, /) -> list[int]:
-        """
-        Generation counters paired elementwise with ``state_slots``.
-        """
-    @property
-    def state_indptr(self, /) -> list[int]:
-        """
-        CSR offsets slicing recurrent-state arrays by sequence row.
-        """
-    @property
-    def state_pool_id(self, /) -> int | None:
-        """
-        Identity of the Engine-owned recurrent-state pool, if present.
-        """
-    @property
-    def state_slots(self, /) -> list[int]:
-        """
-        Flattened recurrent-state slot numbers grouped by sequence row.
+        Stable request identifier for each sequence.
         """
     @property
     def token_ids(self, /) -> list[int]:
         """
-        Flattened scheduled token IDs in sequence-row order.
+        Flattened scheduled token IDs, grouped by sequence.
+        """
+    @property
+    def token_indptr(self, /) -> list[int]:
+        """
+        Offsets into ``token_ids`` for each sequence.
         """
     def token_range(self, /, sequence_index: int) -> tuple[int, int]:
         """
-        Return the half-open flattened token range for one sequence row.
+        Return the half-open range in ``token_ids`` for one sequence.
         """
+
+@final
+class CacheGroupFamily:
+    """
+    Whether a group stores token history or recurrent checkpoints.
+    """
+
+    HISTORY: Final[CacheGroupFamily]
+    STATE: Final[CacheGroupFamily]
+    def __eq__(self, value: object, /) -> bool: ...
+    def __hash__(self, /) -> int: ...
+    def __int__(self, /) -> int: ...
+    def __ne__(self, value: object, /) -> bool: ...
+    def __repr__(self, /) -> str: ...
 
 @final
 class CacheGroupLayout:
@@ -178,6 +133,7 @@ class CacheGroupLayout:
         blocks_per_parent: int = 1,
         retention: CacheRetention = ...,
         window_tokens: int | None = None,
+        family: CacheGroupFamily = ...,
     ) -> CacheGroupLayout: ...
     def __repr__(self, /) -> str: ...
     @property
@@ -189,6 +145,11 @@ class CacheGroupLayout:
     def blocks_per_parent(self, /) -> int:
         """
         Number of this group's logical blocks packed into one parent allocation.
+        """
+    @property
+    def family(self, /) -> CacheGroupFamily:
+        """
+        Whether this group stores token history or recurrent checkpoints.
         """
     @property
     def retention(self, /) -> CacheRetention:
@@ -211,10 +172,10 @@ class CacheGroupPlan:
     """
     Physical page placement for one cache group in a BatchPlan.
 
-    ``block_indptr`` and ``block_ids`` form a CSR block table with one row per
-    sequence. ``first_logical_blocks`` gives the logical number represented by
-    each row's first physical block. The two ``append_*`` arrays contain one
-    write target per flattened batch token.
+    Adjacent ``block_indptr`` values select each sequence's physical pages from
+    ``block_ids``. ``first_logical_blocks`` gives the logical number represented
+    by each sequence's first physical block. The two ``append_*`` arrays contain
+    one write target per flattened batch token.
     """
     def __new__(
         cls,
@@ -245,12 +206,12 @@ class CacheGroupPlan:
     @property
     def block_indptr(self, /) -> list[int]:
         """
-        CSR row offsets into ``block_ids``; length is sequence count plus one.
+        Offsets into ``block_ids`` for each sequence.
         """
     @property
     def first_logical_blocks(self, /) -> list[int]:
         """
-        Logical block number corresponding to each sequence row's first block.
+        Logical block number corresponding to each sequence's first block.
         """
     @property
     def group_index(self, /) -> int:
@@ -293,8 +254,9 @@ class CacheRetention:
     """
     Cache-block lifetime policy.
 
-    ``HISTORY`` retains every logical block. ``WINDOW`` retains only the
-    rolling suffix selected by ``CacheGroupLayout.window_tokens``.
+    For history groups, ``HISTORY`` retains every logical block and ``WINDOW``
+    retains the suffix selected by ``CacheGroupLayout.window_tokens``. Recurrent
+    state groups use ``HISTORY`` and retain their two-page checkpoint ring.
     """
 
     HISTORY: Final[CacheRetention]
@@ -318,7 +280,6 @@ class Engine:
         context_length: int = 32768,
         scheduler_config: SchedulerConfig | None = None,
         eos_token_id: int | None = None,
-        state_pool: StatePool | None = None,
         prefix_cache: bool = False,
     ) -> Engine: ...
     def __repr__(self, /) -> str: ...
@@ -339,7 +300,7 @@ class Engine:
     def cancel(self, /, request: RequestLease) -> bool: ...
     def clear_prefix_cache(self, /) -> None:
         """
-        Drop all reusable KV prefixes and recurrent-state checkpoints.
+        Drop all reusable cache prefixes.
         """
     def close(self, /) -> None: ...
     @property
@@ -372,10 +333,6 @@ class Engine:
     def ready_request_count(self, /) -> int: ...
     @property
     def scheduler_config(self, /) -> SchedulerConfig: ...
-    @property
-    def state_free_slot_count(self, /) -> int | None: ...
-    @property
-    def state_pool_id(self, /) -> int | None: ...
     def step(self, /) -> list[TokenEvent]: ...
     def submit(
         self,
@@ -383,8 +340,6 @@ class Engine:
         token_ids: Sequence[int],
         max_new_tokens: int | None = None,
         *,
-        state_handles: Sequence[StateHandle] | None = None,
-        state_access_modes: Sequence[str] | None = None,
         priority: int = 0,
         batch_key: int | None = None,
         sampling_params: SamplingParams | None = None,
@@ -428,14 +383,6 @@ class ResourceBinding:
     def cache_layout(self, /) -> CacheLayout | None: ...
     @property
     def cache_pool_id(self, /) -> int | None: ...
-    @property
-    def required_state_arena_id(self, /) -> int | None: ...
-    @property
-    def state_capacity(self, /) -> int | None: ...
-    @property
-    def state_mapping(self, /) -> StateMappingConfig | None: ...
-    @property
-    def state_pool_id(self, /) -> int | None: ...
 
 @final
 class RunnerConfig:
@@ -453,7 +400,6 @@ class RunnerConfig:
         continuation_prefill: bool = False,
         cache_write_lookahead_tokens: int = 0,
         cache_layout: CacheLayout | None = None,
-        state_mapping: StateMappingConfig | None = None,
     ) -> RunnerConfig: ...
     def __repr__(self, /) -> str: ...
     @property
@@ -466,8 +412,6 @@ class RunnerConfig:
     def max_batch_tokens(self, /) -> int | None: ...
     @property
     def prefill_chunk_size(self, /) -> int | None: ...
-    @property
-    def state_mapping(self, /) -> StateMappingConfig | None: ...
 
 @final
 class SamplingParams:
@@ -521,67 +465,6 @@ class SchedulerConfig:
     def schedule_conservativeness(self, /) -> float: ...
 
 @final
-class StateHandle:
-    def __repr__(self, /) -> str: ...
-    @property
-    def generation(self, /) -> int: ...
-    @property
-    def slot(self, /) -> int: ...
-
-@final
-class StateMappingConfig:
-    """
-    Frozen runner-declared recurrent-state ABI.
-
-    `access_modes` is the exact, ordered handle pattern for every submitted
-    sequence. The protocol is deliberately opaque to the native control plane:
-    runners own its layout and interpretation while Rust owns admission,
-    scheduling, and lifetime enforcement.
-    """
-    def __new__(
-        cls,
-        /,
-        protocol: str,
-        access_modes: Sequence[str],
-        *,
-        checkpoint_granularity: int | None = None,
-    ) -> StateMappingConfig: ...
-    def __repr__(self, /) -> str: ...
-    @property
-    def access_modes(self, /) -> list[str]: ...
-    @property
-    def checkpoint_granularity(self, /) -> int | None: ...
-    @property
-    def handles_per_sequence(self, /) -> int: ...
-    @property
-    def protocol(self, /) -> str: ...
-
-@final
-class StatePool:
-    def __new__(cls, /, capacity: int) -> StatePool: ...
-    def __repr__(self, /) -> str: ...
-    def access_counts(self, /, handle: StateHandle) -> tuple[int, bool]: ...
-    @property
-    def active_count(self, /) -> int: ...
-    def allocate(self, /, count: int = 1) -> list[StateHandle]: ...
-    @property
-    def capacity(self, /) -> int: ...
-    def contains(self, /, handle: StateHandle) -> bool: ...
-    def counts(self, /, handle: StateHandle) -> tuple[int, int]: ...
-    @property
-    def free_count(self, /) -> int: ...
-    @property
-    def physical_mapping(self, /) -> tuple[str, int] | None: ...
-    def pin(self, /, handles: Sequence[StateHandle]) -> None: ...
-    @property
-    def pool_id(self, /) -> int: ...
-    def release(self, /, handles: Sequence[StateHandle]) -> None: ...
-    def retain(self, /, handles: Sequence[StateHandle]) -> None: ...
-    @property
-    def retiring_count(self, /) -> int: ...
-    def unpin(self, /, handles: Sequence[StateHandle]) -> None: ...
-
-@final
 class TokenEvent:
     def __repr__(self, /) -> str: ...
     @property
@@ -614,8 +497,3 @@ class _HttpServer:
     @property
     def running(self, /) -> bool: ...
     def serve(self, /, *, host: str = "127.0.0.1", port: int = 8000) -> None: ...
-
-def mint_state_mapping_arena_id() -> int:
-    """
-    Return a new process-unique identity for a backend mapped-state arena.
-    """

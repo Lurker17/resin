@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from resin import BatchPhase, CacheGroupLayout, CacheLayout, CacheRetention
+from resin.backend.plans import plan_positions
 from resin.backend.resources import CachePoolBinding
 
 if TYPE_CHECKING:
@@ -325,7 +326,6 @@ class GroupPlan:
 
 @dataclass(frozen=True, slots=True)
 class CachePlan:
-    pool_id: int
     groups: tuple[GroupPlan, ...]
 
 
@@ -561,11 +561,9 @@ class DeviceCache:
 def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> CachePlan:
     """Validate the six Engine-issued page tables before a CUDA launch."""
 
-    if plan.cache_pool_id is None or plan.cache_pool_id <= 0:
-        raise ValueError("DeepSeek BatchPlan is missing its cache pool")
     rows = len(plan.sequence_ids)
-    indptr = _ints("sequence_indptr", plan.sequence_indptr)
-    positions = _ints("positions", plan.positions)
+    indptr = _ints("token_indptr", plan.token_indptr)
+    positions = _ints("positions", plan_positions(plan))
     contexts = _ints("context_lengths", plan.context_lengths)
     if (
         rows == 0
@@ -639,7 +637,7 @@ def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> Cac
                     raise ValueError("DeepSeek cache append target is not row-owned")
             page_rows.append(row_pages)
         groups.append(GroupPlan(tuple(page_rows), first, append_pages, append_offsets))
-    return CachePlan(plan.cache_pool_id, tuple(groups))
+    return CachePlan(tuple(groups))
 
 
 class CacheArena:
@@ -666,9 +664,6 @@ class CacheArena:
 
     def bind(self, pool_id: int, layout) -> int:
         return self.binding.bind(pool_id, layout)
-
-    def check(self, plan) -> None:
-        self.binding.check(plan.cache_pool_id)
 
     def reset_scratch(self) -> None:
         self.storage[0].zero_()

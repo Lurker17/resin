@@ -109,7 +109,7 @@ def build_modal_image(
             root / "models/cuda",
             f"{_SOURCE_ROOT}/models/cuda",
             copy=True,
-            ignore=["tests", "resin_models_cuda/lfm2", "**/__pycache__"],
+            ignore=["tests", "**/__pycache__"],
         )
         .uv_pip_install(_SOURCE_ROOT, extra_options="--no-deps")
         .uv_pip_install(f"{_SOURCE_ROOT}/models/torch", extra_options="--no-deps")
