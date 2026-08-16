@@ -34,6 +34,7 @@ class TestLfm2TorchImport:
     def test_import_loads_torch_but_not_checkpoint_stacks(self) -> None:
         script = """
 import sys
+sys.path.insert(0, 'models/torch')
 import resin_models_torch.lfm2
 assert 'torch' in sys.modules
 for name in ('transformers', 'tokenizers', 'huggingface_hub', 'safetensors'):

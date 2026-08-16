@@ -9,7 +9,8 @@ from pathlib import Path
 class TestImport:
     def test_import_resin_does_not_import_accelerator_stacks(self) -> None:
         code = (
-            "import sys; import resin; import resin.backend; "
+            "import sys; sys.path[:0] = ['models/cuda', 'models/torch']; "
+            "import resin; import resin.backend; "
             "import resin.backend.cuda; import resin_models_cuda; "
             "import resin_models_torch; "
             "print(*(int(name in sys.modules) for name in "
