@@ -18,6 +18,16 @@ def source_files(path: Path, pattern: str, *, recursive: bool = True) -> list[Pa
     return sorted(file for file in files if "tests" not in file.parts)
 
 
+def python_package(path: Path) -> dict[str, object]:
+    groups: dict[str, object] = {"package": source_files(path, "*.py", recursive=False)}
+    for directory in sorted(path.iterdir()):
+        if directory.is_dir() and not directory.name.startswith("__"):
+            files = source_files(directory, "*.py")
+            if files:
+                groups[directory.name.replace("_", "-")] = files
+    return groups
+
+
 def rust_item_end(source: str, start: int) -> int:
     """Find the end of the item following a cfg(test) attribute."""
 
@@ -103,6 +113,8 @@ def rust_without_tests(paths: list[Path], destination: Path) -> list[Path]:
 
 
 def count(paths: list[Path], language: str) -> dict[str, int]:
+    if not paths:
+        return {"files": 0, "code": 0}
     with tempfile.TemporaryDirectory() as temporary:
         inputs = (
             rust_without_tests(paths, Path(temporary)) if language == "Rust" else paths
@@ -117,29 +129,68 @@ def count(paths: list[Path], language: str) -> dict[str, int]:
     return {"files": len(paths), "code": json.loads(result.stdout)[language]["code"]}
 
 
-def report() -> dict[str, dict[str, dict[str, int]]]:
+def count_tree(groups: dict[str, object], language: str) -> dict[str, object]:
+    children = {}
+    for name, group in groups.items():
+        children[name] = (
+            count(group, language)
+            if isinstance(group, list)
+            else count_tree(group, language)
+        )
+    return {
+        "files": sum(child["files"] for child in children.values()),
+        "code": sum(child["code"] for child in children.values()),
+        "children": children,
+    }
+
+
+def report() -> dict[str, dict[str, object]]:
     groups = {
         "rust": {
-            "resin-core": source_files(ROOT / "crates/resin-core/src", "*.rs"),
+            "resin-core": {
+                "core": source_files(
+                    ROOT / "crates/resin-core/src", "*.rs", recursive=False
+                ),
+                "resources": source_files(
+                    ROOT / "crates/resin-core/src/resources", "*.rs"
+                ),
+            },
             "resin-py": source_files(ROOT / "crates/resin-py/src", "*.rs"),
         },
         "python": {
-            "top-level": source_files(ROOT / "resin", "*.py", recursive=False),
-            "backend": source_files(ROOT / "resin/backend", "*.py"),
-            "models-cuda": source_files(ROOT / "models/cuda", "*.py"),
-            "models-torch": source_files(ROOT / "models/torch", "*.py"),
+            "resin": {
+                "package": source_files(ROOT / "resin", "*.py", recursive=False),
+                "backend": {
+                    "shared": source_files(
+                        ROOT / "resin/backend", "*.py", recursive=False
+                    ),
+                    "cuda": source_files(ROOT / "resin/backend/cuda", "*.py"),
+                },
+            },
+            "resin-models-cuda": python_package(ROOT / "models/cuda/resin_models_cuda"),
+            "resin-models-torch": python_package(
+                ROOT / "models/torch/resin_models_torch"
+            ),
         },
     }
-    output = {}
-    for section, paths_by_group in groups.items():
-        language = section.title()
-        rows = {name: count(paths, language) for name, paths in paths_by_group.items()}
-        rows["total"] = {
-            "files": sum(row["files"] for row in rows.values()),
-            "code": sum(row["code"] for row in rows.values()),
-        }
-        output[section] = rows
-    return output
+    return {
+        section: count_tree(section_groups, section.title())
+        for section, section_groups in groups.items()
+    }
+
+
+def tree_rows(
+    children: dict[str, dict[str, object]], prefix: str = ""
+) -> list[tuple[str, dict[str, object]]]:
+    rows = []
+    items = list(children.items())
+    for index, (name, node) in enumerate(items):
+        last = index == len(items) - 1
+        rows.append((f"{prefix}{'└──' if last else '├──'} {name}", node))
+        nested = node.get("children")
+        if nested:
+            rows.extend(tree_rows(nested, prefix + ("    " if last else "│   ")))
+    return rows
 
 
 def main() -> None:
@@ -154,11 +205,15 @@ def main() -> None:
         print(json.dumps(counts, indent=2))
         return
     print("Production code lines (Tokei; comments, blanks, and test code excluded)")
-    for section, rows in counts.items():
+    for section, root in counts.items():
         print(f"\n{section.title()}")
-        width = max(map(len, rows))
-        for name, row in rows.items():
-            print(f"  {name:<{width}}  {row['code']:>6,}  ({row['files']} files)")
+        children = dict(root["children"])
+        children["total"] = {"files": root["files"], "code": root["code"]}
+        rows = tree_rows(children)
+        width = max(len(label) for label, _ in rows)
+        for label, row in rows:
+            noun = "file" if row["files"] == 1 else "files"
+            print(f"  {label:<{width}}  {row['code']:>6,}  ({row['files']} {noun})")
 
 
 if __name__ == "__main__":
