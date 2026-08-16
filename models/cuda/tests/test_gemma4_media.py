@@ -44,6 +44,7 @@ def test_media_owns_processor_tensors_and_absolute_placeholder_mapping() -> None
     assert media.image_positions == (1, 2)
     assert media.video_positions == (4, 5)
     assert media.block_ids == (-1, 0, 0, -1, 1, 1)
+    assert media.prefill_atomic_spans == ((1, 3), (4, 6))
     assert media.pixel_values.sum().item() == 108
     media.validate_placeholder_tokens(image_token_id=8, video_token_id=9)
     assert len(media.digest) == 64

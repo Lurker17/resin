@@ -257,6 +257,21 @@ class TestFlatCacheEngine:
         engine.step()
         assert runner.plans[-1].context_lengths.tolist() == [0]
 
+    def test_media_atomic_prefill_span_is_not_cut_at_cache_alignment(self) -> None:
+        class Media:
+            token_ids = [1, 2, 3, 4, 5, 6]
+            cache_token_ids = [1, 20, 30, 40, 50, 6]
+            prefill_atomic_spans = [(1, 5)]
+
+        runner = RecordingCachedRunner(CacheLayout(4, [CacheGroupLayout(4)]))
+        engine = Engine(runner, prefix_cache=True)
+
+        engine.submit(media=Media(), max_new_tokens=1)
+        engine.step()
+
+        assert runner.plans[0].token_ids.tolist() == [1, 2, 3, 4, 5]
+        assert runner.plans[0].context_lengths.tolist() == [0]
+
     def test_prefix_cache_is_disabled_by_default(self) -> None:
         runner = RecordingCachedRunner(CacheLayout(2, [CacheGroupLayout(2)]))
         engine = Engine(runner)

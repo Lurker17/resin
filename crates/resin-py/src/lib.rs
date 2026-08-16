@@ -840,6 +840,7 @@ struct RequestData {
     running: bool,
     prompt: Vec<u32>,
     cache_prompt: Option<Vec<u32>>,
+    atomic_prefill_spans: Vec<(u32, u32)>,
     resident_tokens: u32,
     generated: Vec<u32>,
     max_new_tokens: usize,
@@ -1180,6 +1181,37 @@ impl Engine {
             },
             None => None,
         };
+        let atomic_prefill_spans = match media.as_ref() {
+            Some(media) => match media.getattr(py, "prefill_atomic_spans") {
+                Ok(spans) => spans.extract::<Vec<(u32, u32)>>(py)?,
+                Err(error) if error.is_instance_of::<PyAttributeError>(py) => Vec::new(),
+                Err(error) => return Err(error),
+            },
+            None => Vec::new(),
+        };
+        let mut previous_end = 0;
+        let effective_limits = self.scheduler_config.with_runner_limits(
+            self.runner_config.prefill_chunk_size,
+            self.runner_config.max_batch_tokens,
+        );
+        let atomic_limit = effective_limits
+            .max_batch_tokens
+            .map_or(effective_limits.prefill_chunk_size, |budget| {
+                budget.min(effective_limits.prefill_chunk_size)
+            })
+            .get();
+        for &(start, end) in &atomic_prefill_spans {
+            if start >= end
+                || end as usize > token_ids.len()
+                || start < previous_end
+                || end - start > atomic_limit
+            {
+                return Err(PyValueError::new_err(
+                    "media prefill_atomic_spans must be sorted, disjoint, within the prompt, and fit one prefill row",
+                ));
+            }
+            previous_end = end;
+        }
         if max_new_tokens == Some(0) {
             return Err(PyValueError::new_err("max_new_tokens must be positive"));
         }
@@ -1258,6 +1290,7 @@ impl Engine {
                 running: false,
                 prompt: token_ids,
                 cache_prompt,
+                atomic_prefill_spans,
                 resident_tokens,
                 generated: Vec::new(),
                 max_new_tokens,
@@ -2458,6 +2491,7 @@ mod tests {
                 running: false,
                 prompt: prompt.to_vec(),
                 cache_prompt: None,
+                atomic_prefill_spans: Vec::new(),
                 resident_tokens: if generated.is_empty() {
                     0
                 } else {

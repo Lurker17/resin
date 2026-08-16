@@ -40,6 +40,7 @@ pub(super) fn schedule_ready_prefix<R: RequestLike>(
                 prefill_length: request.prefill_length()?,
                 logical_context: request.logical_context()?,
                 sample_at_prefill_end: request.sample_at_prefill_end(),
+                atomic_prefill_spans: request.atomic_prefill_spans.clone(),
             })
         })
         .collect::<PyResult<Vec<_>>>()?;
@@ -52,7 +53,9 @@ pub(super) fn schedule_ready_prefix<R: RequestLike>(
         },
     )
     .map_err(|error| match error {
-        PlanningError::TokenRangeOverflow => PyValueError::new_err(error.to_string()),
+        PlanningError::TokenRangeOverflow | PlanningError::AtomicPrefillSpanExceedsBudget => {
+            PyValueError::new_err(error.to_string())
+        }
         PlanningError::MixedPhases | PlanningError::InvalidPrefillProgress => {
             PyRuntimeError::new_err(error.to_string())
         }

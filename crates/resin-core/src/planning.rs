@@ -10,18 +10,21 @@ pub struct PlanningConfig {
     pub checkpoint_alignment: Option<NonZeroU32>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestProgress {
     pub phase: Phase,
     pub prefill_length: u32,
     pub logical_context: u32,
     pub sample_at_prefill_end: bool,
+    /// Half-open token ranges which must be processed in one prefill row.
+    pub atomic_prefill_spans: Vec<(u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlanningError {
     MixedPhases,
     InvalidPrefillProgress,
+    AtomicPrefillSpanExceedsBudget,
     TokenRangeOverflow,
 }
 
@@ -33,6 +36,9 @@ impl fmt::Display for PlanningError {
             }
             Self::InvalidPrefillProgress => {
                 formatter.write_str("prefill cursor must be before prompt length")
+            }
+            Self::AtomicPrefillSpanExceedsBudget => {
+                formatter.write_str("an atomic prefill span exceeds the current row token budget")
             }
             Self::TokenRangeOverflow => formatter.write_str("scheduled token range overflows u32"),
         }
@@ -91,11 +97,32 @@ pub fn schedule_ready_prefix(
                 count = checkpoint_end - request.logical_context;
             }
         }
-        let count = NonZeroU32::new(count).expect("positive request work and budget");
-        let end = request
+        let mut end = request
             .logical_context
-            .checked_add(count.get())
+            .checked_add(count)
             .ok_or(PlanningError::TokenRangeOverflow)?;
+        if request.phase == Phase::Prefill {
+            for &(span_start, span_end) in &request.atomic_prefill_spans {
+                if span_start < end && end < span_end {
+                    let hard_end = request
+                        .logical_context
+                        .checked_add(desired.min(remaining_batch_tokens.unwrap_or(desired)))
+                        .ok_or(PlanningError::TokenRangeOverflow)?;
+                    if span_end <= hard_end {
+                        end = span_end;
+                    } else if span_start > request.logical_context {
+                        end = span_start;
+                    } else if steps.is_empty() {
+                        return Err(PlanningError::AtomicPrefillSpanExceedsBudget);
+                    } else {
+                        return Ok(steps);
+                    }
+                    break;
+                }
+            }
+        }
+        let count = NonZeroU32::new(end - request.logical_context)
+            .expect("atomic spans preserve positive request work");
         steps.push(SequenceStep {
             phase: request.phase,
             tokens: TokenRange {
@@ -124,6 +151,7 @@ mod tests {
             prefill_length,
             logical_context,
             sample_at_prefill_end: true,
+            atomic_prefill_spans: Vec::new(),
         }
     }
 
@@ -215,6 +243,25 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_rounding_never_splits_an_atomic_prefill_span() {
+        let mut request = prefill(284, 0);
+        request.atomic_prefill_spans = vec![(14, 280)];
+        let first = schedule_ready_prefix(
+            &[request],
+            PlanningConfig {
+                max_batch_tokens: NonZeroU32::new(4096),
+                prefill_chunk_size: NonZeroU32::new(4096).unwrap(),
+                checkpoint_alignment: NonZeroU32::new(64),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first[0].tokens.start, 0);
+        assert_eq!(first[0].token_end(), Some(280));
+        assert!(!first[0].sample);
+    }
+
+    #[test]
     fn replay_prefill_does_not_sample_an_already_generated_token() {
         let steps = schedule_ready_prefix(
             &[RequestProgress {
@@ -222,6 +269,7 @@ mod tests {
                 prefill_length: 6,
                 logical_context: 0,
                 sample_at_prefill_end: false,
+                atomic_prefill_spans: Vec::new(),
             }],
             PlanningConfig {
                 max_batch_tokens: None,
@@ -241,6 +289,7 @@ mod tests {
             prefill_length: 4,
             logical_context: 4,
             sample_at_prefill_end: false,
+            atomic_prefill_spans: Vec::new(),
         };
         assert_eq!(
             schedule_ready_prefix(

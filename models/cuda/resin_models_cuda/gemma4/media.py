@@ -153,6 +153,20 @@ class Gemma4Media:
             previous_vision = vision
         return tuple(result)
 
+    @property
+    def prefill_atomic_spans(self) -> tuple[tuple[int, int], ...]:
+        """Contiguous vision ranges that require one bidirectional prefill row."""
+
+        spans = []
+        start = None
+        for index, token_type in enumerate((*self.mm_token_type_ids, 0)):
+            if token_type in {1, 2} and start is None:
+                start = index
+            elif token_type not in {1, 2} and start is not None:
+                spans.append((start, index))
+                start = None
+        return tuple(spans)
+
     def validate_placeholder_tokens(
         self, *, image_token_id: int, video_token_id: int
     ) -> None:
