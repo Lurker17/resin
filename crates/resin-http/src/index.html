@@ -10,46 +10,52 @@
   <style>
     :root { color-scheme:light dark; font:15px/1.6 ui-sans-serif,system-ui,-apple-system,sans-serif; --line:#8884; --muted:#888; --accent:#2563d9; --soft:#8881 }
     * { box-sizing:border-box }
-    body { max-width:880px; height:100dvh; margin:0 auto; padding:24px 20px 18px; display:grid; grid-template-rows:auto minmax(0,1fr) auto; overflow:hidden; background:Canvas; color:CanvasText }
+    body { max-width:880px; height:100dvh; margin:0 auto; padding:24px 20px 18px; display:grid; grid-template-columns:minmax(0,1fr); grid-template-rows:auto minmax(0,1fr) auto; overflow:hidden; background:Canvas; color:CanvasText }
     header { position:sticky; top:0; z-index:2; display:flex; align-items:baseline; justify-content:space-between; gap:20px; padding:0 0 12px; background:Canvas }
     h1 { font-size:23px; letter-spacing:-.025em; margin:0 } .muted,#stats { color:var(--muted) }
-    #model { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
-    #chat-shell { position:relative; min-height:0 }
+    #model { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    #chat-shell { position:relative; min-width:0; min-height:0 }
     #chat-shell::before,#chat-shell::after { content:""; position:absolute; z-index:1; left:0; right:0; height:24px; opacity:0; pointer-events:none; transition:opacity .15s }
     #chat-shell::before { top:0; background:linear-gradient(to bottom,Canvas,transparent) }
     #chat-shell::after { bottom:0; background:linear-gradient(to bottom,transparent,Canvas) }
     #chat-shell.can-scroll-up::before,#chat-shell.can-scroll-down::after { opacity:1 }
-    #chat { height:100%; display:flex; flex-direction:column; gap:18px; overflow-y:auto; scrollbar-gutter:stable; padding:18px 3px 26px; scroll-behavior:smooth }
-    .turn { border:1px solid var(--line); border-radius:15px; padding:14px 17px; overflow-wrap:anywhere }
+    #chat { min-width:0; height:100%; display:flex; flex-direction:column; gap:18px; overflow-y:auto; scrollbar-gutter:stable; padding:18px 3px 26px; scroll-behavior:smooth }
+    .turn { min-width:0; border:1px solid var(--line); border-radius:15px; padding:14px 17px; overflow-wrap:anywhere }
     .user { align-self:flex-end; width:min(88%,760px); background:var(--soft); white-space:pre-wrap }
     .assistant { width:100%; padding:17px 19px }
+    .markdown { min-width:0; max-width:100% }
     .markdown > :first-child { margin-top:0 } .markdown > :last-child { margin-bottom:0 }
     .markdown p { margin:.7em 0 } .markdown h1,.markdown h2,.markdown h3 { line-height:1.25; margin:1.15em 0 .45em }
     .markdown h1 { font-size:1.45em } .markdown h2 { font-size:1.25em } .markdown h3 { font-size:1.08em }
     .markdown ul,.markdown ol { margin:.6em 0; padding-left:1.5em }
     .markdown blockquote { margin:.8em 0; padding:.1em 0 .1em 1em; border-left:3px solid var(--line); color:var(--muted) }
     .markdown hr { border:0; border-top:1px solid var(--line); margin:1.3em 0 }
+    .table-wrap { width:100%; max-width:100%; overflow-x:auto; margin:.9em 0 }
+    .markdown table { width:100%; border-collapse:collapse; font-size:.95em }
+    .markdown th,.markdown td { padding:.45em .7em; border:1px solid var(--line); text-align:left; vertical-align:top }
+    .markdown th { background:var(--soft); font-weight:650 }
+    .markdown .align-center { text-align:center } .markdown .align-right { text-align:right }
     code { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--soft); border-radius:5px; padding:.15em .35em }
-    pre { overflow:auto; margin:.9em 0; padding:13px 15px; border:1px solid var(--line); border-radius:10px; background:var(--soft) }
+    pre { max-width:100%; overflow:auto; margin:.9em 0; padding:13px 15px; border:1px solid var(--line); border-radius:10px; background:var(--soft) }
     pre code { background:none; padding:0 } a { color:var(--accent) }
-    details { color:var(--muted); margin:0 3px -5px } details summary { cursor:pointer; user-select:none; font-weight:600 }
+    details { min-width:0; color:var(--muted); margin:0 3px -5px } details summary { cursor:pointer; user-select:none; font-weight:600 }
     details.pending summary { animation:pulse 1.4s ease-in-out infinite }
     details .markdown { padding:7px 3px 2px }
     .assistant:empty { display:none }
-    footer { position:sticky; bottom:0; z-index:2; padding-top:9px; background:Canvas }
+    footer { min-width:0; position:sticky; bottom:0; z-index:2; padding-top:9px; background:Canvas }
     #stats { min-height:24px; margin:0 3px 8px; font-size:13px }
     #settings { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:8px; padding:11px 13px 12px; border:1px solid var(--line); border-radius:14px }
     #settings[hidden] { display:none }
     #settings label { display:grid; gap:4px; color:var(--muted); font-size:12px; font-weight:600 }
     #settings input,#settings select { width:100%; height:34px; border:1px solid var(--line); border-radius:9px; padding:0 9px; background:Canvas; color:CanvasText; font:14px/1 ui-sans-serif,system-ui,-apple-system,sans-serif }
     form { display:flex; align-items:flex-end; gap:8px; padding:7px 7px 7px 13px; border:1px solid var(--line); border-radius:17px; background:Canvas }
-    textarea { flex:1; min-height:38px; max-height:160px; resize:none; border:0; outline:0; padding:8px 2px; background:transparent; color:inherit; font:inherit; line-height:22px }
+    textarea { flex:1; min-height:38px; min-width:0; max-height:160px; resize:none; border:0; outline:0; padding:8px 2px; background:transparent; color:inherit; font:inherit; line-height:22px }
     button { flex:0 0 38px; width:38px; height:38px; border:0; border-radius:11px; background:var(--accent); color:white; font:700 20px/1 system-ui; cursor:pointer }
     #settings-toggle { background:var(--soft); color:CanvasText; font-size:20px; font-weight:400 }
     #settings-toggle[aria-expanded="true"] { color:var(--accent) }
     button:hover { filter:brightness(1.08) } button:disabled { opacity:.45; cursor:wait }
     @keyframes pulse { 50% { opacity:.5 } }
-    @media (max-width:600px) { body { padding:16px 12px 10px } header { padding-bottom:8px } .user { width:94% } .assistant { padding:14px } #settings { grid-template-columns:repeat(2,minmax(0,1fr)) } }
+    @media (max-width:600px) { body { padding:16px 12px 10px } header { padding-bottom:8px } .user { width:94% } .assistant { padding:14px } #settings { grid-template-columns:repeat(2,minmax(0,1fr)) } textarea,#settings input,#settings select { font-size:16px } }
   </style>
 </head>
 <body>
@@ -110,6 +116,14 @@ function inlineMarkdown(source){
   value=value.replace(/(^|[\s(])_([^_\n]+)_(?=$|[\s).,!?:;])/g,'$1<em>$2</em>');
   return held.reduce((text,item,index)=>text.replace(`MDHOLD${index}TOKEN`,item.startsWith('`')?`<code>${item.slice(1,-1)}</code>`:item),value);
 }
+function tableCells(line){
+  let value=line.trim();if(!value.includes('|'))return null;
+  if(value.startsWith('|'))value=value.slice(1);if(value.endsWith('|')&&!value.endsWith('\\|'))value=value.slice(0,-1);
+  const cells=[];let cell='',code=false;
+  for(let i=0;i<value.length;i++){const char=value[i];if(char==='\\'&&value[i+1]==='|'){cell+='|';i++;continue}if(char==='`')code=!code;if(char==='|'&&!code){cells.push(cell.trim());cell=''}else cell+=char}
+  cells.push(cell.trim());return cells;
+}
+function tableAlignment(cell){const marker=cell.replace(/\s/g,'');return marker.startsWith(':')&&marker.endsWith(':')?'align-center':marker.endsWith(':')?'align-right':''}
 function renderMarkdown(source){
   const lines=source.replace(/\r/g,'').split('\n'),out=[]; let i=0;
   while(i<lines.length){
@@ -117,6 +131,8 @@ function renderMarkdown(source){
     if(!trim){i++;continue}
     if(trim.startsWith('```')){const language=trim.slice(3).trim().replace(/[^\w-]/g,'');const code=[];i++;while(i<lines.length&&!lines[i].trim().startsWith('```'))code.push(lines[i++]);if(i<lines.length)i++;out.push(`<pre><code${language?` class="language-${language}"`:''}>${escapeHtml(code.join('\n'))}</code></pre>`);continue}
     if(trim==='$$'){const math=[];i++;while(i<lines.length&&lines[i].trim()!=='$$')math.push(lines[i++]);if(i<lines.length)i++;out.push(`<div>$$${escapeHtml(math.join('\n'))}$$</div>`);continue}
+    const header=tableCells(line),divider=i+1<lines.length?tableCells(lines[i+1]):null;
+    if(header&&header.length>1&&divider&&divider.length===header.length&&divider.every(cell=>/^:?-{3,}:?$/.test(cell.replace(/\s/g,'')))){const align=divider.map(tableAlignment),rows=[];i+=2;while(i<lines.length&&lines[i].trim()){const cells=tableCells(lines[i]);if(!cells||cells.length<2)break;rows.push(cells);i++}const rowHtml=cells=>header.map((_,column)=>`<td${align[column]?` class="${align[column]}"`:''}>${inlineMarkdown(cells[column]||'')}</td>`).join('');out.push(`<div class="table-wrap"><table><thead><tr>${header.map((cell,column)=>`<th${align[column]?` class="${align[column]}"`:''}>${inlineMarkdown(cell)}</th>`).join('')}</tr></thead><tbody>${rows.map(cells=>`<tr>${rowHtml(cells)}</tr>`).join('')}</tbody></table></div>`);continue}
     const heading=line.match(/^\s*(#{1,3})\s+(.+)$/);if(heading){const level=heading[1].length;out.push(`<h${level}>${inlineMarkdown(heading[2])}</h${level}>`);i++;continue}
     if(/^\s*((\*|-|_)\s*){3,}$/.test(line)){out.push('<hr>');i++;continue}
     const list=line.match(/^\s*([-*+]|\d+\.)\s+(.+)$/);if(list){const ordered=/\d/.test(list[1]),tag=ordered?'ol':'ul',items=[];while(i<lines.length){const item=lines[i].match(/^\s*([-*+]|\d+\.)\s+(.+)$/);if(!item||(/\d/.test(item[1]))!==ordered)break;items.push(`<li>${inlineMarkdown(item[2])}</li>`);i++}out.push(`<${tag}>${items.join('')}</${tag}>`);continue}
