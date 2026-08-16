@@ -1165,12 +1165,12 @@ impl Engine {
         if token_ids.is_empty() {
             return Err(PyValueError::new_err("token_ids must be non-empty"));
         }
-        let cache_prompt = match media.as_ref() {
+        let cache_prompt: Option<Vec<u32>> = match media.as_ref() {
             Some(media) => match media.getattr(py, "cache_key") {
-                Ok(identity) => Some(identity.extract(py)?),
+                Ok(identity) => Some(identity.extract::<Vec<u32>>(py)?),
                 Err(error) if error.is_instance_of::<PyAttributeError>(py) => {
                     match media.getattr(py, "cache_token_ids") {
-                        Ok(identity) => Some(identity.extract(py)?),
+                        Ok(identity) => Some(identity.extract::<Vec<u32>>(py)?),
                         Err(error) if error.is_instance_of::<PyAttributeError>(py) => None,
                         Err(error) => return Err(error),
                     }
