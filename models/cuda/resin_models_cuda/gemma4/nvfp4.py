@@ -51,8 +51,8 @@ class NvFp4Linear(nn.Module):
                 out_features, in_features // group_size, dtype=torch.float8_e4m3fn
             ),
         )
-        self.register_buffer("input_scale", torch.empty(1, dtype=torch.float32))
-        self.register_buffer("weight_scale_2", torch.empty(1, dtype=torch.float32))
+        self.register_buffer("input_scale", torch.empty((), dtype=torch.float32))
+        self.register_buffer("weight_scale_2", torch.empty((), dtype=torch.float32))
 
     def prepare(
         self,
