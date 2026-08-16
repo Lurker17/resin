@@ -28,7 +28,13 @@ from quack import rmsnorm
 from quack.rotary import apply_rotary
 from torch import Tensor
 
-from resin import BatchPhase, CacheGroupLayout, CacheLayout
+from resin import (
+    BatchPhase,
+    CacheGroupLayout,
+    CacheLayout,
+    ResourceBinding,
+    RunnerConfig,
+)
 from resin.backend.checks import positions as check_positions
 from resin.backend.checks import positive_int
 from resin.backend.checks import token_ids as check_token_ids
@@ -200,14 +206,8 @@ class _DeviceAttentionBatch:
 class GptOssCudaRunner(SyncRunner):
     """GPT-OSS BF16 attention on FA4 over one flat native cache pool."""
 
-    # A continuation remains an explicit prefill row even when it contains one
-    # token. Sparse History/Window rows are chronological; dense FA4 tables and
-    # page-aligned execution rounds are derived locally without any cache state.
-    supports_continuation_prefill = True
-    max_batch_tokens = _PREFILL_CHUNK_SIZE
     page_size = _PAGE_SIZE
     sliding_window = _SLIDING_WINDOW
-    prefill_chunk_size = _PREFILL_CHUNK_SIZE
 
     def __init__(
         self,
@@ -240,6 +240,14 @@ class GptOssCudaRunner(SyncRunner):
                     window_tokens=WINDOW_RETENTION_TOKENS,
                 ),
             ],
+        )
+        # Sparse native plans remain chronological; the runner only derives
+        # dense FA4 tables and page-aligned kernel rounds from each frozen plan.
+        self.runner_config = RunnerConfig(
+            max_batch_tokens=_PREFILL_CHUNK_SIZE,
+            prefill_chunk_size=_PREFILL_CHUNK_SIZE,
+            continuation_prefill=True,
+            cache_layout=self.cache_layout,
         )
 
         self._torch = torch
@@ -421,10 +429,14 @@ class GptOssCudaRunner(SyncRunner):
             self._torch.cuda.synchronize(self.device)
         return self._graphs.stats
 
-    def bind_cache_pool(self, pool_id: int, layout: CacheLayout) -> int:
-        """Permanently bind this runner's frozen layout to one native pool."""
+    def bind_resources(self, binding: ResourceBinding) -> None:
+        """Permanently bind the Engine-owned cache identity."""
 
-        return self._kv.bind(pool_id, layout)
+        if binding.cache_pool_id is None or binding.cache_layout is None:
+            raise ValueError("GPT-OSS requires a cache resource binding")
+        if binding.state_pool_id is not None:
+            raise ValueError("GPT-OSS does not declare mapped state")
+        self._kv.bind(binding.cache_pool_id, binding.cache_layout)
 
     def _validate_plan_binding(self, plan: BatchPlan) -> None:
         self._kv.check(plan)

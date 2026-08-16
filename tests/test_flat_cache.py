@@ -9,12 +9,12 @@ from resin import (
     CacheGroupPlan,
     CacheLayout,
     Engine,
+    ResourceBinding,
+    RunnerConfig,
 )
 
 
 class RecordingCachedRunner:
-    supports_continuation_prefill = True
-
     def __init__(
         self,
         layout: CacheLayout,
@@ -22,14 +22,19 @@ class RecordingCachedRunner:
         forward_failures: int = 0,
     ) -> None:
         self.cache_layout = layout
+        self.runner_config = RunnerConfig(
+            continuation_prefill=True,
+            cache_layout=layout,
+        )
         self.forward_failures = forward_failures
         self.bindings: list[tuple[int, CacheLayout]] = []
         self.plans: list[BatchPlan] = []
         self.released: list[int] = []
 
-    def bind_cache_pool(self, pool_id: int, layout: CacheLayout) -> int:
-        self.bindings.append((pool_id, layout))
-        return pool_id
+    def bind_resources(self, binding: ResourceBinding) -> None:
+        assert binding.cache_pool_id is not None
+        assert binding.cache_layout is not None
+        self.bindings.append((binding.cache_pool_id, binding.cache_layout))
 
     def forward(self, plan: BatchPlan) -> list[int]:
         self.plans.append(plan)
@@ -117,37 +122,36 @@ class TestFlatCacheApi:
         layout = CacheLayout(2, [CacheGroupLayout(2)])
 
         class MissingBinder:
-            cache_layout = layout
+            runner_config = RunnerConfig(cache_layout=layout)
 
             @staticmethod
             def forward(plan: BatchPlan) -> list[int]:
                 return [0] * plan.num_sequences
 
-        with pytest.raises(TypeError, match="bind_cache_pool"):
+        with pytest.raises(TypeError, match="bind_resources"):
             Engine(MissingBinder())
 
         class BadLayout(MissingBinder):
-            cache_layout = {"parent_capacity": 2}
+            runner_config = {"cache_layout": {"parent_capacity": 2}}
 
             @staticmethod
-            def bind_cache_pool(pool_id: int, bound_layout: object) -> int:
-                del bound_layout
-                return pool_id
+            def bind_resources(binding: object) -> None:
+                del binding
 
-        with pytest.raises(TypeError, match="exactly a CacheLayout"):
+        with pytest.raises(TypeError, match="exactly a RunnerConfig"):
             Engine(BadLayout())
 
         class BadAck(MissingBinder):
             def __init__(self, acknowledgement: object) -> None:
                 self.acknowledgement = acknowledgement
 
-            def bind_cache_pool(self, pool_id: int, bound_layout: CacheLayout):
-                del pool_id, bound_layout
+            def bind_resources(self, binding: ResourceBinding):
+                del binding
                 return self.acknowledgement
 
-        with pytest.raises(TypeError, match="exactly an int"):
+        with pytest.raises(TypeError, match="must return None"):
             Engine(BadAck(True))
-        with pytest.raises(ValueError, match="acknowledged cache pool"):
+        with pytest.raises(TypeError, match="must return None"):
             Engine(BadAck(999_999))
 
         runner = RecordingCachedRunner(layout)
@@ -158,13 +162,11 @@ class TestFlatCacheApi:
 
     def test_explicit_none_layout_is_unmanaged_and_ignores_stray_binder(self) -> None:
         class UnmanagedRunner:
-            cache_layout = None
-
             def __init__(self) -> None:
                 self.bind_calls = 0
 
-            def bind_cache_pool(self, pool_id: int, layout: object) -> int:
-                del pool_id, layout
+            def bind_resources(self, binding: object) -> None:
+                del binding
                 self.bind_calls += 1
                 raise AssertionError("an unmanaged runner must not bind a cache pool")
 
@@ -180,6 +182,35 @@ class TestFlatCacheApi:
 
 
 class TestFlatCacheEngine:
+    def test_opt_in_lru_prefix_cache_skips_the_shared_prefill(self) -> None:
+        layout = CacheLayout(4, [CacheGroupLayout(2)])
+        runner = RecordingCachedRunner(layout)
+        engine = Engine(runner, prefix_cache=True)
+
+        first = engine.submit([1, 2, 3, 4], max_new_tokens=1)
+        while engine.has_work():
+            engine.step()
+        assert first.done
+        assert engine.prefix_cache_stats == (2, 0, 1, 0)
+        assert engine.cache_occupied_block_count == 2
+
+        second = engine.submit([1, 2, 3, 4, 5], max_new_tokens=1)
+        assert engine.prefix_cache_stats == (2, 1, 1, 0)
+        engine.step()
+        reused = runner.plans[-1]
+        assert reused.token_ids == [5]
+        assert reused.positions == [4]
+        assert reused.context_lengths == [4]
+        assert second.done
+
+    def test_prefix_cache_is_disabled_by_default(self) -> None:
+        runner = RecordingCachedRunner(CacheLayout(2, [CacheGroupLayout(2)]))
+        engine = Engine(runner)
+        engine.submit([1, 2], max_new_tokens=1)
+        engine.step()
+        assert engine.prefix_cache_stats is None
+        assert engine.cache_occupied_block_count == 0
+
     def test_one_history_group_uses_positive_sparse_block_ids(self) -> None:
         layout = CacheLayout(3, [CacheGroupLayout(2)])
         runner = RecordingCachedRunner(layout)

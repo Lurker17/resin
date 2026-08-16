@@ -252,6 +252,21 @@ impl SlotPool {
     }
 
     pub fn allocate(&mut self, count: usize) -> Result<Vec<SlotHandle>, SlotPoolError> {
+        self.allocate_owned(count, true)
+    }
+
+    /// Allocate slots whose initial lifetime belongs to the inference engine.
+    /// Unlike [`Self::allocate`], callers do not need to manufacture a Python
+    /// or other external owner before admitting a request.
+    pub fn allocate_engine(&mut self, count: usize) -> Result<Vec<SlotHandle>, SlotPoolError> {
+        self.allocate_owned(count, false)
+    }
+
+    fn allocate_owned(
+        &mut self,
+        count: usize,
+        external_owner: bool,
+    ) -> Result<Vec<SlotHandle>, SlotPoolError> {
         if count == 0 {
             return Err(SlotPoolError::value("count must be positive"));
         }
@@ -275,8 +290,8 @@ impl SlotPool {
             let slot_index = self.free.pop().expect("capacity preflighted");
             let slot = &mut self.slots[slot_index as usize];
             slot.generation += 1;
-            slot.external_references = 1;
-            slot.engine_references = 0;
+            slot.external_references = u32::from(external_owner);
+            slot.engine_references = u32::from(!external_owner);
             slot.external_completion_pins = 0;
             slot.engine_completion_pins = 0;
             slot.engine_read_leases = 0;

@@ -347,9 +347,17 @@ class TensorParallelServerRunner:
         self._broadcast({"operation": "forward", "plan": batch_plan_payload(plan)})
         return self._runner.forward(plan)
 
-    def bind_cache_pool(self, pool_id: int, layout: Any) -> int:
-        self._broadcast({"operation": "bind_cache_pool", "pool_id": pool_id})
-        return self._runner.bind_cache_pool(pool_id, layout)
+    def bind_resources(self, binding: Any):
+        self._broadcast(
+            {
+                "operation": "bind_resources",
+                "cache_pool_id": binding.cache_pool_id,
+                "state_pool_id": binding.state_pool_id,
+                "state_capacity": binding.state_capacity,
+                "required_state_arena_id": binding.required_state_arena_id,
+            }
+        )
+        return self._runner.bind_resources(binding)
 
     def release(self, sequence_ids: Sequence[int]) -> None:
         ids = list(sequence_ids)
@@ -381,8 +389,19 @@ def follow_tensor_parallel_server(
             return
         if operation == "release":
             runner.release(command["sequence_ids"])
-        elif operation == "bind_cache_pool":
-            runner.bind_cache_pool(command["pool_id"], runner.cache_layout)
+        elif operation == "bind_resources":
+            from types import SimpleNamespace
+
+            runner.bind_resources(
+                SimpleNamespace(
+                    cache_pool_id=command["cache_pool_id"],
+                    cache_layout=runner.runner_config.cache_layout,
+                    state_pool_id=command["state_pool_id"],
+                    state_capacity=command["state_capacity"],
+                    state_mapping=runner.runner_config.state_mapping,
+                    required_state_arena_id=command["required_state_arena_id"],
+                )
+            )
         elif operation == "forward":
             runner.forward(batch_plan_from_payload(command["plan"]))
         else:

@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from resin import BatchPhase
+from resin import BatchPhase, RunnerConfig
 from resin.backend.checks import positions as check_positions
 from resin.backend.checks import token_ids as check_token_ids
 from resin.backend.cuda.graphs import (
@@ -57,8 +57,6 @@ def _default_dtype(dtype: Any) -> Iterator[None]:
 
 class DeepSeekV4FlashCudaRunner(SyncRunner):
     """Dynamically batched runner over Resin's DeepSeek-V4 implementation."""
-
-    supports_continuation_prefill = False
 
     def __init__(
         self,
@@ -129,7 +127,9 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         self.profile_graph_phases = profile_graph_phases
         self._dspark_phase_events: dict[GraphShape, tuple[torch.cuda.Event, ...]] = {}
         self._last_dspark_phase_ms: dict[str, float] | None = None
-        self.max_batch_tokens = max_batch_size * max_seq_len
+        self.runner_config = RunnerConfig(
+            max_batch_tokens=max_batch_size * max_seq_len,
+        )
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = 1
         self._sampler = FlashInferSampler(torch)

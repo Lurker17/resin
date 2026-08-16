@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import pytest
@@ -10,6 +11,8 @@ from resin import (
     CacheGroupLayout,
     CacheLayout,
     Engine,
+    ResourceBinding,
+    RunnerConfig,
     SchedulerConfig,
 )
 
@@ -31,7 +34,7 @@ class RecordingRunner:
 
 
 class ContinuationRecordingRunner(RecordingRunner):
-    supports_continuation_prefill = True
+    runner_config = RunnerConfig(continuation_prefill=True)
 
 
 class ControlledAsyncRunner:
@@ -71,13 +74,16 @@ class ControlledAsyncRunner:
 
 
 class ContinuationControlledAsyncRunner(ControlledAsyncRunner):
-    supports_continuation_prefill = True
+    runner_config = RunnerConfig(continuation_prefill=True)
 
 
 class TestSchedulerConfigContract:
     def test_runner_prefill_limit_is_an_execution_bound(self) -> None:
         class LimitedRunner(ContinuationRecordingRunner):
-            prefill_chunk_size = 2
+            runner_config = RunnerConfig(
+                continuation_prefill=True,
+                prefill_chunk_size=2,
+            )
 
         runner = LimitedRunner()
         engine = Engine(runner)
@@ -91,8 +97,11 @@ class TestSchedulerConfigContract:
 
     def test_runner_batch_limit_is_consumed_in_request_order(self) -> None:
         class LimitedRunner(ContinuationRecordingRunner):
-            prefill_chunk_size = 8192
-            max_batch_tokens = 4
+            runner_config = RunnerConfig(
+                continuation_prefill=True,
+                prefill_chunk_size=8192,
+                max_batch_tokens=4,
+            )
 
         runner = LimitedRunner()
         engine = Engine(runner, max_running_requests=2)
@@ -114,13 +123,15 @@ class TestSchedulerConfigContract:
         )
 
         class MultiPageRunner(ContinuationRecordingRunner):
-            prefill_chunk_size = 8
-            max_batch_tokens = 8
-            cache_layout = layout
+            runner_config = RunnerConfig(
+                continuation_prefill=True,
+                prefill_chunk_size=8,
+                max_batch_tokens=8,
+                cache_layout=layout,
+            )
 
-            def bind_cache_pool(self, pool_id, bound_layout):
-                self.bound_layout = bound_layout
-                return pool_id
+            def bind_resources(self, binding: ResourceBinding) -> None:
+                self.bound_layout = binding.cache_layout
 
         runner = MultiPageRunner()
         engine = Engine(runner)
@@ -179,37 +190,31 @@ class TestSchedulerConfigContract:
                 return [0] * plan.num_sequences
 
         class FalseRunner(Missing):
-            supports_continuation_prefill = False
+            runner_config = RunnerConfig(continuation_prefill=False)
 
         class IntegerTrueRunner(Missing):
-            supports_continuation_prefill = 1
+            runner_config = 1
 
         class RaisingDescriptor(Missing):
             @property
-            def supports_continuation_prefill(self):
+            def runner_config(self):
                 raise RuntimeError("capability descriptor accessed")
 
-        # Unmanaged construction must not inspect an optional descriptor.
-        Engine(RaisingDescriptor()).close()
-        for runner in (Missing(), FalseRunner(), IntegerTrueRunner()):
+        with pytest.raises(RuntimeError, match="capability descriptor accessed"):
+            Engine(RaisingDescriptor())
+        with pytest.raises(TypeError, match="exactly a RunnerConfig"):
+            Engine(IntegerTrueRunner())
+        for runner in (Missing(), FalseRunner()):
             engine = Engine(
                 runner,
                 scheduler_config=SchedulerConfig(prefill_chunk_size=2),
             )
             engine.submit([1, 2, 3], 1)
             with pytest.raises(
-                ValueError, match="supports_continuation_prefill is True"
+                ValueError, match="runner_config.continuation_prefill is false"
             ):
                 engine.dispatch()
             engine.close()
-        raising_engine = Engine(
-            RaisingDescriptor(),
-            scheduler_config=SchedulerConfig(max_batch_tokens=2),
-        )
-        raising_engine.submit([1, 2, 3], 1)
-        with pytest.raises(RuntimeError, match="capability descriptor accessed"):
-            raising_engine.dispatch()
-        raising_engine.close()
 
         engine = Engine(
             ContinuationRecordingRunner(),
@@ -221,15 +226,17 @@ class TestSchedulerConfigContract:
         layout = CacheLayout(2, [CacheGroupLayout(2)])
 
         class ContinuationCachedRunner(ContinuationRecordingRunner):
-            cache_layout = layout
+            runner_config = RunnerConfig(
+                continuation_prefill=True,
+                cache_layout=layout,
+            )
 
             def __init__(self) -> None:
                 super().__init__()
                 self.binding = None
 
-            def bind_cache_pool(self, pool_id, bound_layout):
-                self.binding = (pool_id, bound_layout)
-                return pool_id
+            def bind_resources(self, binding: ResourceBinding) -> None:
+                self.binding = (binding.cache_pool_id, binding.cache_layout)
 
         runner = ContinuationCachedRunner()
         cached_engine = Engine(
@@ -244,10 +251,12 @@ class TestSchedulerConfigContract:
         from resin_models_cuda.lfm2 import Lfm2CudaRunner
         from resin_models_torch.lfm2 import Lfm2TorchRunner
 
-        assert GptOssCudaRunner.supports_continuation_prefill is True
-        assert GptOssCudaRunner.max_batch_tokens == 8192
-        assert Lfm2CudaRunner.supports_continuation_prefill is True
-        assert Lfm2TorchRunner.supports_continuation_prefill is True
+        gpt_source = inspect.getsource(GptOssCudaRunner.__init__)
+        lfm_source = inspect.getsource(Lfm2CudaRunner.__init__)
+        assert "RunnerConfig(" in gpt_source and "continuation_prefill=True" in gpt_source
+        assert "max_batch_tokens=_PREFILL_CHUNK_SIZE" in gpt_source
+        assert "RunnerConfig(" in lfm_source and "continuation_prefill=True" in lfm_source
+        assert Lfm2TorchRunner.runner_config.continuation_prefill is True
 
     def test_engine_freezes_a_copy_of_the_effective_config(self) -> None:
         runner = RecordingRunner()

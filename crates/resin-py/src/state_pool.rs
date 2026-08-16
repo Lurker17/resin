@@ -79,13 +79,19 @@ pub(crate) struct StatePool {
     inner: CoreSlotPool,
 }
 
+impl StatePool {
+    pub(crate) fn new_native(capacity: usize) -> PyResult<Self> {
+        Ok(Self {
+            inner: CoreSlotPool::new(capacity).map_err(|error| state_pool_error(error, None))?,
+        })
+    }
+}
+
 #[pymethods]
 impl StatePool {
     #[new]
     fn new(capacity: usize) -> PyResult<Self> {
-        Ok(Self {
-            inner: CoreSlotPool::new(capacity).map_err(|error| state_pool_error(error, None))?,
-        })
+        Self::new_native(capacity)
     }
 
     #[pyo3(signature = (count = 1))]
@@ -208,6 +214,16 @@ impl StatePool {
 
     pub(crate) fn slot_capacity(&self) -> usize {
         self.inner.capacity()
+    }
+
+    pub(crate) fn free_slots(&self) -> usize {
+        self.inner.free_count()
+    }
+
+    pub(crate) fn allocate_handles(&mut self, count: usize) -> PyResult<Vec<SlotHandle>> {
+        self.inner
+            .allocate_engine(count)
+            .map_err(|error| state_pool_error(error, None))
     }
 
     pub(crate) fn physical_mapping_descriptor(&self) -> Option<(&str, u64)> {

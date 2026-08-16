@@ -5,7 +5,15 @@ from collections.abc import Callable
 
 import pytest
 
-from resin import BatchPlan, CacheGroupLayout, CacheLayout, Engine, StatePool
+from resin import (
+    BatchPlan,
+    CacheGroupLayout,
+    CacheLayout,
+    Engine,
+    ResourceBinding,
+    RunnerConfig,
+    StatePool,
+)
 
 PollResult = list[int] | list[list[int]] | tuple[int, ...] | BaseException | None
 
@@ -40,11 +48,13 @@ class ControlledAsyncRunner:
         self.cache_binding: tuple[int, CacheLayout] | None = None
         if cache_layout is not None:
             self.cache_layout = cache_layout
+            self.runner_config = RunnerConfig(cache_layout=cache_layout)
         self._accepted: dict[object, BatchPlan] = {}
 
-    def bind_cache_pool(self, pool_id: int, layout: CacheLayout) -> int:
-        self.cache_binding = (pool_id, layout)
-        return pool_id
+    def bind_resources(self, binding: ResourceBinding) -> None:
+        assert binding.cache_pool_id is not None
+        assert binding.cache_layout is not None
+        self.cache_binding = (binding.cache_pool_id, binding.cache_layout)
 
     def dispatch(self, plan: BatchPlan) -> object:
         self.dispatch_plans.append(plan)
@@ -120,7 +130,7 @@ class TestAsyncEngineContract:
             _resin_post_accept = True
 
         class SyncRunner:
-            cache_layout = history_layout(2)
+            runner_config = RunnerConfig(cache_layout=history_layout(2))
 
             def __init__(self) -> None:
                 self.calls = 0
@@ -132,9 +142,8 @@ class TestAsyncEngineContract:
                 raise PostAcceptError("CUDA quiescence failed")
 
             @staticmethod
-            def bind_cache_pool(pool_id, layout):
-                del layout
-                return pool_id
+            def bind_resources(binding: ResourceBinding) -> None:
+                del binding
 
             def release(self, request_ids):
                 self.released.extend(request_ids)
@@ -168,7 +177,7 @@ class TestAsyncEngineContract:
 
     def test_unmarked_sync_failure_remains_preaccept_and_retryable(self) -> None:
         class SyncRunner:
-            cache_layout = history_layout(2)
+            runner_config = RunnerConfig(cache_layout=history_layout(2))
 
             def __init__(self) -> None:
                 self.calls = 0
@@ -180,9 +189,8 @@ class TestAsyncEngineContract:
                 return [plan.token_ids[-1] + 1]
 
             @staticmethod
-            def bind_cache_pool(pool_id, layout):
-                del layout
-                return pool_id
+            def bind_resources(binding: ResourceBinding) -> None:
+                del binding
 
         pool = StatePool(1)
         state = pool.allocate()[0]
@@ -214,7 +222,7 @@ class TestAsyncEngineContract:
         ):
 
             class SyncRunner:
-                cache_layout = history_layout(2)
+                runner_config = RunnerConfig(cache_layout=history_layout(2))
 
                 def __init__(self) -> None:
                     self.calls = 0
@@ -226,9 +234,8 @@ class TestAsyncEngineContract:
                     return malformed
 
                 @staticmethod
-                def bind_cache_pool(pool_id, layout):
-                    del layout
-                    return pool_id
+                def bind_resources(binding: ResourceBinding) -> None:
+                    del binding
 
                 def release(self, request_ids):
                     self.released.extend(request_ids)
@@ -267,16 +274,15 @@ class TestAsyncEngineContract:
             _resin_post_accept = True
 
         class AsyncRunner:
-            cache_layout = history_layout(2)
+            runner_config = RunnerConfig(cache_layout=history_layout(2))
 
             def __init__(self) -> None:
                 self.calls = 0
                 self.released: list[int] = []
 
             @staticmethod
-            def bind_cache_pool(pool_id, layout):
-                del layout
-                return pool_id
+            def bind_resources(binding: ResourceBinding) -> None:
+                del binding
 
             def dispatch(self, plan):
                 del plan

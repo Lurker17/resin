@@ -7,6 +7,7 @@ use crate::{Phase, SequenceStep, TokenRange};
 pub struct PlanningConfig {
     pub max_batch_tokens: Option<NonZeroU32>,
     pub prefill_chunk_size: NonZeroU32,
+    pub checkpoint_alignment: Option<NonZeroU32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,7 +69,28 @@ pub fn schedule_ready_prefix(
                 .min(config.prefill_chunk_size.get()),
             Phase::Decode => 1,
         };
-        let count = remaining_batch_tokens.map_or(desired, |budget| desired.min(budget));
+        let mut count = remaining_batch_tokens.map_or(desired, |budget| desired.min(budget));
+        if request.phase == Phase::Prefill
+            && let Some(alignment) = config.checkpoint_alignment
+        {
+            let proposed_end = request
+                .logical_context
+                .checked_add(count)
+                .ok_or(PlanningError::TokenRangeOverflow)?;
+            // A cached request must replay at least one token to recover its
+            // logits. At prompt end, therefore stop at the final checkpoint
+            // strictly before the input boundary. Intermediate chunks merely
+            // round down to a checkpoint without forcing tiny per-block calls.
+            let checkpoint_limit = if proposed_end == request.prefill_length {
+                proposed_end.saturating_sub(1)
+            } else {
+                proposed_end
+            };
+            let checkpoint_end = checkpoint_limit / alignment.get() * alignment.get();
+            if checkpoint_end > request.logical_context && checkpoint_end < proposed_end {
+                count = checkpoint_end - request.logical_context;
+            }
+        }
         let count = NonZeroU32::new(count).expect("positive request work and budget");
         let end = request
             .logical_context
@@ -112,6 +134,7 @@ mod tests {
             PlanningConfig {
                 max_batch_tokens: NonZeroU32::new(3),
                 prefill_chunk_size: NonZeroU32::new(2).unwrap(),
+                checkpoint_alignment: None,
             },
         )
         .unwrap();
@@ -129,6 +152,7 @@ mod tests {
             PlanningConfig {
                 max_batch_tokens: NonZeroU32::new(4),
                 prefill_chunk_size: NonZeroU32::new(8).unwrap(),
+                checkpoint_alignment: None,
             },
         )
         .unwrap();
@@ -144,10 +168,50 @@ mod tests {
             PlanningConfig {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(50).unwrap(),
+                checkpoint_alignment: None,
             },
         )
         .unwrap();
         assert_eq!(steps[0].tokens.count.get(), 50);
+    }
+
+    #[test]
+    fn recurrent_prefill_stops_once_at_the_last_checkpoint_before_prompt_end() {
+        let first = schedule_ready_prefix(
+            &[prefill(10, 0)],
+            PlanningConfig {
+                max_batch_tokens: None,
+                prefill_chunk_size: NonZeroU32::new(32).unwrap(),
+                checkpoint_alignment: NonZeroU32::new(4),
+            },
+        )
+        .unwrap();
+        assert_eq!(first[0].token_end(), Some(8));
+        assert!(!first[0].sample);
+
+        let suffix = schedule_ready_prefix(
+            &[prefill(10, 8)],
+            PlanningConfig {
+                max_batch_tokens: None,
+                prefill_chunk_size: NonZeroU32::new(32).unwrap(),
+                checkpoint_alignment: NonZeroU32::new(4),
+            },
+        )
+        .unwrap();
+        assert_eq!(suffix[0].token_end(), Some(10));
+        assert!(suffix[0].sample);
+
+        let exact = schedule_ready_prefix(
+            &[prefill(8, 0)],
+            PlanningConfig {
+                max_batch_tokens: None,
+                prefill_chunk_size: NonZeroU32::new(32).unwrap(),
+                checkpoint_alignment: NonZeroU32::new(4),
+            },
+        )
+        .unwrap();
+        assert_eq!(exact[0].token_end(), Some(4));
+        assert!(!exact[0].sample);
     }
 
     #[test]
@@ -162,6 +226,7 @@ mod tests {
             PlanningConfig {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(8).unwrap(),
+                checkpoint_alignment: None,
             },
         )
         .unwrap();
@@ -183,6 +248,7 @@ mod tests {
                 PlanningConfig {
                     max_batch_tokens: None,
                     prefill_chunk_size: NonZeroU32::new(4).unwrap(),
+                    checkpoint_alignment: None,
                 },
             ),
             Err(PlanningError::MixedPhases)

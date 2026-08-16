@@ -13,7 +13,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from resin import BatchPhase, CacheGroupLayout, CacheLayout, StateMappingConfig
+from resin import (
+    BatchPhase,
+    CacheGroupLayout,
+    CacheLayout,
+    ResourceBinding,
+    RunnerConfig,
+    StateMappingConfig,
+)
 from resin.backend.checks import nonempty_plan
 from resin.backend.checks import token_ids as check_token_ids
 from resin.backend.cuda.execution import CudaCompletion, CudaExecutor
@@ -59,13 +66,6 @@ class _InPlaceRecurrentState:
 class Lfm2CudaRunner(AsyncRunner):
     """BF16 LFM2 runner with FA4 prefill and FlashInfer paged decode."""
 
-    supports_continuation_prefill = True
-    supports_recurrent_state_mapping = True
-    recurrent_state_mapping = StateMappingConfig(
-        _RECURRENT_STATE_MAPPING_PROTOCOL,
-        ["write"],
-    )
-
     def __init__(
         self,
         model: str | Path = DEFAULT_MODEL,
@@ -96,6 +96,15 @@ class Lfm2CudaRunner(AsyncRunner):
         self.cache_layout = CacheLayout(
             max_pages,
             [CacheGroupLayout(page_size)],
+        )
+        self.runner_config = RunnerConfig(
+            continuation_prefill=True,
+            cache_layout=self.cache_layout,
+            state_mapping=StateMappingConfig(
+                _RECURRENT_STATE_MAPPING_PROTOCOL,
+                ["write"],
+                checkpoint_granularity=page_size,
+            ),
         )
         self.model_path = resolve_model_path(model, revision)
         # Persistent CUDA state is created on the same private stream used for
@@ -168,33 +177,29 @@ class Lfm2CudaRunner(AsyncRunner):
             resources=self._completion_resources,
         )
 
-    def bind_cache_and_recurrent_state(
-        self,
-        cache_pool_id: int,
-        layout: CacheLayout,
-        state_pool_id: int,
-        state_capacity: int,
-        protocol: str,
-        required_arena_id: int | None,
-    ) -> tuple[int, int, int, str, int]:
+    def bind_resources(self, binding: ResourceBinding) -> int:
         """Atomically bind the cache and recurrent-state physical arenas."""
 
-        cache_id = self._kv.binding.validate(cache_pool_id, layout)
+        if (
+            binding.cache_pool_id is None
+            or binding.cache_layout is None
+            or binding.state_pool_id is None
+            or binding.state_capacity is None
+            or binding.state_mapping is None
+        ):
+            raise ValueError("LFM2 requires cache and mapped-state resources")
+        cache_id = self._kv.binding.validate(
+            binding.cache_pool_id, binding.cache_layout
+        )
         state_binding, prepared, arena_id = self._state.prepare_binding(
-            state_pool_id,
-            state_capacity,
-            protocol,
-            required_arena_id,
+            binding.state_pool_id,
+            binding.state_capacity,
+            binding.state_mapping.protocol,
+            binding.required_state_arena_id,
         )
         self._state.commit_binding(state_binding, prepared)
         self._kv.binding.commit(cache_id)
-        return (
-            cache_id,
-            state_pool_id,
-            state_capacity,
-            protocol,
-            arena_id,
-        )
+        return arena_id
 
     def _preflight_cache(self, plan: BatchPlan) -> CacheMetadata:
         """Validate and derive the complete cache launch before CUDA acceptance."""

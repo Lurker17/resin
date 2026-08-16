@@ -28,6 +28,7 @@ impl RequestLike for &Request {
 pub(super) fn schedule_ready_prefix<R: RequestLike>(
     scheduled: &[R],
     config: SchedulerConfig,
+    checkpoint_alignment: Option<std::num::NonZeroU32>,
 ) -> PyResult<Vec<ScheduledRow>> {
     let requests = scheduled
         .iter()
@@ -46,6 +47,7 @@ pub(super) fn schedule_ready_prefix<R: RequestLike>(
         PlanningConfig {
             max_batch_tokens: config.max_batch_tokens,
             prefill_chunk_size: config.prefill_chunk_size,
+            checkpoint_alignment,
         },
     )
     .map_err(|error| match error {

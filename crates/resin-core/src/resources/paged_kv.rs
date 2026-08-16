@@ -4,27 +4,51 @@ use crate::{RequestId, SequenceStep};
 
 use super::kv::{KvGroupLayout, KvGroupPlan, KvLayout, KvPlanError, KvRetention};
 use super::paged::{
-    CachePool, CachePoolError, GroupDemand, GroupId, RequestPages, RetireRequestFailure,
-    SequenceId, WriterAccessClaim, WriterAccessLease,
+    CachePool, CachePoolError, GroupDemand, GroupId, PageAccessClaim, RequestPages,
+    RetireRequestFailure, SequenceId, WriterAccessLease,
 };
+use super::prefix::{PrefixCache, PrefixSnapshot};
+use super::slots::SlotHandle;
 use super::{BatchAccess, RequestResourceRef};
 
 #[derive(Debug)]
 pub struct PagedKvResources {
     layout: KvLayout,
     pool: CachePool,
+    prefix_cache: Option<PrefixCache<PrefixSnapshot>>,
+    retired_checkpoints: Vec<SlotHandle>,
     batch_active: bool,
 }
 
 impl PagedKvResources {
     pub fn new(layout: KvLayout) -> Result<Self, CachePoolError> {
+        Self::configured(layout, None)
+    }
+
+    pub fn with_prefix_cache(layout: KvLayout) -> Result<Self, CachePoolError> {
+        let alignment = prefix_alignment(&layout)?;
+        Self::configured(layout, Some(alignment))
+    }
+
+    pub fn with_prefix_cache_alignment(
+        layout: KvLayout,
+        checkpoint_alignment: u32,
+    ) -> Result<Self, CachePoolError> {
+        let alignment = least_common_multiple(prefix_alignment(&layout)?, checkpoint_alignment)?;
+        Self::configured(layout, Some(alignment))
+    }
+
+    fn configured(layout: KvLayout, prefix_alignment: Option<u32>) -> Result<Self, CachePoolError> {
         let pool = CachePool::new(
             layout.parent_capacity().get(),
             &layout.packings().collect::<Vec<_>>(),
         )?;
+        let prefix_cache = prefix_alignment.map(PrefixCache::new);
         Ok(Self {
             layout,
             pool,
+            prefix_cache,
+            retired_checkpoints: Vec::new(),
             batch_active: false,
         })
     }
@@ -53,10 +77,136 @@ impl PagedKvResources {
     pub fn ensure_context(
         &mut self,
         state: &mut RequestPages,
+        token_start: u32,
         context: u32,
     ) -> Result<(), CachePoolError> {
         let demands = self.demands(context);
-        self.pool.grow_request(state, &demands)
+        loop {
+            match self.pool.grow_request(state, &demands) {
+                Ok(()) => break,
+                Err(error @ CachePoolError::InsufficientCapacity { .. }) => {
+                    if !self.evict_one_prefix()? {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let mut replacements = vec![Vec::new(); self.layout.groups().len()];
+        for (group_index, group) in self.layout.groups().iter().copied().enumerate() {
+            let table = &state.groups()[group_index];
+            for position in token_start..context {
+                let logical = position / group.block_tokens().get();
+                let index = match group.retention() {
+                    KvRetention::FullContext => logical as usize,
+                    KvRetention::SlidingWindow { .. } => logical as usize % table.pages().len(),
+                };
+                let page = &table.pages()[index];
+                if !page.is_writable() {
+                    if group.retention() == KvRetention::FullContext {
+                        return Err(CachePoolError::PageNotWritable);
+                    }
+                    replacements[group_index].push(index);
+                }
+            }
+            replacements[group_index].sort_unstable();
+            replacements[group_index].dedup();
+        }
+        loop {
+            match self.pool.replace_shared_pages(state, &replacements) {
+                Ok(()) => return Ok(()),
+                Err(error @ CachePoolError::InsufficientCapacity { .. }) => {
+                    if !self.evict_one_prefix()? {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Attach the longest aligned cached prefix and return its resident token
+    /// count. A miss leaves the empty request untouched.
+    pub fn restore_prefix(
+        &mut self,
+        state: &mut RequestPages,
+        tokens: &[u32],
+    ) -> Result<(u32, Option<SlotHandle>), CachePoolError> {
+        let (pool, cache) = (&mut self.pool, &mut self.prefix_cache);
+        let Some((length, snapshot)) = cache.as_mut().and_then(|cache| cache.find(tokens)) else {
+            return Ok((0, None));
+        };
+        pool.attach_shared_prefix(state, &snapshot.pages)?;
+        Ok((length, snapshot.recurrent_checkpoint))
+    }
+
+    /// Publish a completed aligned resident boundary. Returns false when the
+    /// current progress cannot form a safe block-complete snapshot.
+    pub fn publish_prefix(
+        &mut self,
+        state: &mut RequestPages,
+        tokens: &[u32],
+        resident_tokens: u32,
+        recurrent_checkpoint: Option<SlotHandle>,
+    ) -> Result<bool, CachePoolError> {
+        let Some(cache) = &self.prefix_cache else {
+            return Ok(false);
+        };
+        let length = resident_tokens as usize;
+        if length == 0 || length > tokens.len() || resident_tokens % cache.alignment() != 0 {
+            return Ok(false);
+        }
+        let demands = self.demands(resident_tokens);
+        let pages = self.pool.share_request_prefix(state, &demands)?;
+        let replaced = self
+            .prefix_cache
+            .as_mut()
+            .expect("cache enablement was checked")
+            .insert(
+                &tokens[..length],
+                PrefixSnapshot {
+                    pages,
+                    recurrent_checkpoint,
+                },
+            );
+        if let Some(replaced) = replaced {
+            self.pool.retire_cached_prefix(replaced.pages)?;
+            if let Some(checkpoint) = replaced.recurrent_checkpoint {
+                self.retired_checkpoints.push(checkpoint);
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn evict_one_prefix(&mut self) -> Result<bool, CachePoolError> {
+        let Some(snapshot) = self.prefix_cache.as_mut().and_then(PrefixCache::evict_lru) else {
+            return Ok(false);
+        };
+        self.pool.retire_cached_prefix(snapshot.pages)?;
+        if let Some(checkpoint) = snapshot.recurrent_checkpoint {
+            self.retired_checkpoints.push(checkpoint);
+        }
+        Ok(true)
+    }
+
+    pub fn take_retired_checkpoints(&mut self) -> Vec<SlotHandle> {
+        std::mem::take(&mut self.retired_checkpoints)
+    }
+
+    pub fn clear_prefix_cache(&mut self) -> Result<(), CachePoolError> {
+        while self.evict_one_prefix()? {}
+        Ok(())
+    }
+
+    pub fn prefix_cache_metrics(&self) -> Option<(usize, u64, u64, u64)> {
+        self.prefix_cache
+            .as_ref()
+            .map(|cache| (cache.len(), cache.hits(), cache.misses(), cache.evictions()))
+    }
+
+    pub fn prefix_alignment(&self) -> Option<u32> {
+        self.prefix_cache.as_ref().map(PrefixCache::alignment)
     }
 
     /// Drop resident KV while retaining the request's allocator identity.
@@ -158,7 +308,7 @@ impl PagedKvResources {
             .map(|step| step.token_count().get() as usize)
             .sum();
         let mut groups = Vec::with_capacity(self.layout.groups().len());
-        let mut claims = Vec::<WriterAccessClaim>::new();
+        let mut claims = Vec::<PageAccessClaim>::new();
         for (group_index, group) in self.layout.groups().iter().copied().enumerate() {
             let mut indptr = Vec::with_capacity(requests.len() + 1);
             let mut block_ids = Vec::new();
@@ -189,7 +339,7 @@ impl PagedKvResources {
                         ))
                     })?;
                     block_ids.push(self.pool.kernel_page_id(page.handle())?);
-                    claims.push(request.state.write_claim(page));
+                    claims.push(request.state.access_claim(page));
                 }
                 indptr.push(
                     u32::try_from(block_ids.len()).map_err(|_| {
@@ -230,6 +380,34 @@ impl PagedKvResources {
             lease,
         })
     }
+}
+
+fn prefix_alignment(layout: &KvLayout) -> Result<u32, CachePoolError> {
+    fn gcd(mut left: u32, mut right: u32) -> u32 {
+        while right != 0 {
+            (left, right) = (right, left % right);
+        }
+        left
+    }
+    layout.groups().iter().try_fold(1u32, |alignment, group| {
+        alignment
+            .checked_mul(group.block_tokens().get() / gcd(alignment, group.block_tokens().get()))
+            .ok_or(CachePoolError::DemandOverflow)
+    })
+}
+
+fn least_common_multiple(left: u32, right: u32) -> Result<u32, CachePoolError> {
+    if right == 0 {
+        return Err(CachePoolError::DemandOverflow);
+    }
+    fn gcd(mut left: u32, mut right: u32) -> u32 {
+        while right != 0 {
+            (left, right) = (right, left % right);
+        }
+        left
+    }
+    left.checked_mul(right / gcd(left, right))
+        .ok_or(CachePoolError::DemandOverflow)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -293,6 +471,7 @@ mod tests {
     use crate::{Phase, TokenRange};
 
     use super::*;
+    use crate::resources::slots::SlotPool;
 
     #[test]
     fn full_and_sliding_groups_share_one_current_batch_lease() {
@@ -345,11 +524,11 @@ mod tests {
         let mut state = resources.attach(id, 0).unwrap();
         assert_eq!(resources.pool().occupied_block_count(), 0);
 
-        resources.ensure_context(&mut state, 5).unwrap();
+        resources.ensure_context(&mut state, 0, 5).unwrap();
         assert_eq!(state.groups()[0].pages().len(), 2);
         assert_eq!(resources.pool().occupied_block_count(), 2);
         assert!(matches!(
-            resources.ensure_context(&mut state, 9),
+            resources.ensure_context(&mut state, 5, 9),
             Err(CachePoolError::InsufficientCapacity { .. })
         ));
         assert_eq!(state.groups()[0].pages().len(), 2);
@@ -357,9 +536,188 @@ mod tests {
         resources.reset(&mut state).unwrap();
         assert!(state.groups()[0].pages().is_empty());
         assert_eq!(resources.pool().occupied_block_count(), 0);
-        resources.ensure_context(&mut state, 4).unwrap();
+        resources.ensure_context(&mut state, 0, 4).unwrap();
         assert_eq!(state.groups()[0].pages().len(), 1);
         resources.retire(state).unwrap();
         assert_eq!(resources.pool().occupied_block_count(), 0);
+    }
+
+    #[test]
+    fn immutable_history_prefix_is_shared_and_suffix_stays_writable() {
+        let layout = KvLayout::new(
+            4,
+            vec![KvGroupLayout::new(2, 1, KvRetention::FullContext).unwrap()],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::with_prefix_cache(layout).unwrap();
+        let first_id = RequestId::new(NonZeroU64::new(1).unwrap());
+        let mut first = resources.attach(first_id, 0).unwrap();
+        resources.ensure_context(&mut first, 0, 4).unwrap();
+        let write = resources
+            .acquire(
+                &[RequestResourceRef {
+                    request_id: first_id,
+                    state: &first,
+                }],
+                &[SequenceStep {
+                    phase: Phase::Prefill,
+                    tokens: TokenRange {
+                        start: 0,
+                        count: NonZeroU32::new(4).unwrap(),
+                    },
+                    sample: false,
+                }],
+            )
+            .unwrap();
+        resources.release(write.lease);
+        assert!(
+            resources
+                .publish_prefix(&mut first, &[10, 11, 12, 13], 4, None)
+                .unwrap()
+        );
+
+        let second_id = RequestId::new(NonZeroU64::new(2).unwrap());
+        let mut second = resources.attach(second_id, 0).unwrap();
+        assert_eq!(
+            resources
+                .restore_prefix(&mut second, &[10, 11, 12, 13, 14])
+                .unwrap(),
+            (4, None)
+        );
+        assert_eq!(resources.pool().occupied_block_count(), 2);
+        resources.ensure_context(&mut second, 4, 5).unwrap();
+        assert_eq!(resources.pool().occupied_block_count(), 3);
+        let access = resources
+            .acquire(
+                &[RequestResourceRef {
+                    request_id: second_id,
+                    state: &second,
+                }],
+                &[SequenceStep {
+                    phase: Phase::Prefill,
+                    tokens: TokenRange {
+                        start: 4,
+                        count: NonZeroU32::new(1).unwrap(),
+                    },
+                    sample: true,
+                }],
+            )
+            .unwrap();
+        assert_eq!(access.view.groups[0].block_ids.len(), 3);
+        resources.release(access.lease);
+        assert_eq!(resources.prefix_cache_metrics(), Some((1, 1, 0, 0)));
+        resources.retire(second).unwrap();
+        resources.retire(first).unwrap();
+    }
+
+    #[test]
+    fn shared_sliding_snapshot_is_copy_on_write_when_ring_advances() {
+        let layout = KvLayout::new(
+            5,
+            vec![
+                KvGroupLayout::new(
+                    2,
+                    1,
+                    KvRetention::SlidingWindow {
+                        tokens: NonZeroU32::new(4).unwrap(),
+                    },
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::with_prefix_cache(layout).unwrap();
+        let first_id = RequestId::new(NonZeroU64::new(1).unwrap());
+        let mut first = resources.attach(first_id, 0).unwrap();
+        resources.ensure_context(&mut first, 0, 6).unwrap();
+        let write = resources
+            .acquire(
+                &[RequestResourceRef {
+                    request_id: first_id,
+                    state: &first,
+                }],
+                &[SequenceStep {
+                    phase: Phase::Prefill,
+                    tokens: TokenRange {
+                        start: 0,
+                        count: NonZeroU32::new(6).unwrap(),
+                    },
+                    sample: false,
+                }],
+            )
+            .unwrap();
+        resources.release(write.lease);
+        resources
+            .publish_prefix(&mut first, &[1, 2, 3, 4, 5, 6], 6, None)
+            .unwrap();
+
+        let second_id = RequestId::new(NonZeroU64::new(2).unwrap());
+        let mut second = resources.attach(second_id, 0).unwrap();
+        assert_eq!(
+            resources
+                .restore_prefix(&mut second, &[1, 2, 3, 4, 5, 6, 7])
+                .unwrap(),
+            (6, None)
+        );
+        resources.ensure_context(&mut second, 6, 7).unwrap();
+        assert_eq!(resources.pool().occupied_block_count(), 4);
+        assert!(second.groups()[0].pages()[0].is_writable());
+        resources.retire(second).unwrap();
+        resources.retire(first).unwrap();
+    }
+
+    #[test]
+    fn live_allocation_evicts_lru_prefix_pages_under_pressure() {
+        let layout = KvLayout::new(
+            2,
+            vec![KvGroupLayout::new(2, 1, KvRetention::FullContext).unwrap()],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::with_prefix_cache(layout).unwrap();
+        let cached_id = RequestId::new(NonZeroU64::new(1).unwrap());
+        let mut cached = resources.attach(cached_id, 0).unwrap();
+        resources.ensure_context(&mut cached, 0, 4).unwrap();
+        resources
+            .publish_prefix(&mut cached, &[1, 2, 3, 4], 4, None)
+            .unwrap();
+        resources.retire(cached).unwrap();
+        assert_eq!(resources.pool().occupied_block_count(), 2);
+
+        let live_id = RequestId::new(NonZeroU64::new(2).unwrap());
+        let mut live = resources.attach(live_id, 0).unwrap();
+        resources.ensure_context(&mut live, 0, 4).unwrap();
+        assert_eq!(resources.prefix_cache_metrics(), Some((0, 0, 0, 1)));
+        assert_eq!(resources.pool().occupied_block_count(), 2);
+        resources.retire(live).unwrap();
+    }
+
+    #[test]
+    fn recurrent_checkpoint_identity_follows_the_composite_prefix_lifetime() {
+        let layout = KvLayout::new(
+            2,
+            vec![KvGroupLayout::new(2, 1, KvRetention::FullContext).unwrap()],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::with_prefix_cache_alignment(layout, 2).unwrap();
+        let checkpoint = SlotPool::new(1).unwrap().allocate_engine(1).unwrap()[0];
+        let mut first = resources
+            .attach(RequestId::new(NonZeroU64::new(71).unwrap()), 0)
+            .unwrap();
+        resources.ensure_context(&mut first, 0, 2).unwrap();
+        assert!(
+            resources
+                .publish_prefix(&mut first, &[4, 5], 2, Some(checkpoint))
+                .unwrap()
+        );
+
+        let mut second = resources
+            .attach(RequestId::new(NonZeroU64::new(72).unwrap()), 0)
+            .unwrap();
+        assert_eq!(
+            resources.restore_prefix(&mut second, &[4, 5, 6]).unwrap(),
+            (2, Some(checkpoint))
+        );
+        assert!(resources.evict_one_prefix().unwrap());
+        assert_eq!(resources.take_retired_checkpoints(), vec![checkpoint]);
     }
 }

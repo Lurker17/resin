@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from resin import RunnerConfig
 from resin.backend.loading import (
     MODEL_FILES,
     default_device,
@@ -66,7 +67,7 @@ def load_model(model_path: Path, *, device, dtype=None):
 class Lfm2TorchRunner(SyncRunner):
     """LFM2 runner consuming Rust-built integer-token batches."""
 
-    supports_continuation_prefill = True
+    runner_config = RunnerConfig(continuation_prefill=True)
 
     def __init__(
         self,

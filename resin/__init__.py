@@ -13,6 +13,8 @@ from resin._resin import (
     CacheLayout,
     Engine,
     RequestLease,
+    ResourceBinding,
+    RunnerConfig,
     SamplingParams,
     SchedulerConfig,
     StateHandle,
@@ -22,7 +24,7 @@ from resin._resin import (
     __version__,
     mint_state_mapping_arena_id,
 )
-from resin.protocols import AsyncRunner, Runner, SyncRunner
+from resin.protocols import AsyncRunner, ResourceRunner, Runner, SyncRunner
 
 __all__ = [
     "BatchPhase",
@@ -31,7 +33,9 @@ __all__ = [
     "CacheGroupPlan",
     "CacheLayout",
     "Engine",
+    "ResourceBinding",
     "RequestLease",
+    "RunnerConfig",
     "SamplingParams",
     "SchedulerConfig",
     "StateHandle",
@@ -39,6 +43,7 @@ __all__ = [
     "StatePool",
     "TokenEvent",
     "AsyncRunner",
+    "ResourceRunner",
     "Runner",
     "SyncRunner",
     "__version__",

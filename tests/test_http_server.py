@@ -33,47 +33,67 @@ class RecordingDistributed:
             self.broadcasts.append(objects[0])
 
 
-def test_tensor_parallel_server_broadcasts_cache_pool_binding() -> None:
+def test_tensor_parallel_server_broadcasts_resource_binding() -> None:
     layout = object()
+    binding = SimpleNamespace(
+        cache_pool_id=41,
+        cache_layout=layout,
+        state_pool_id=None,
+        state_capacity=None,
+        required_state_arena_id=None,
+    )
 
     class Runner:
-        cache_layout = layout
-
         @staticmethod
-        def bind_cache_pool(pool_id, bound_layout):
-            assert bound_layout is layout
-            return pool_id
+        def bind_resources(bound):
+            assert bound is binding
+            return 41
 
     distributed = RecordingDistributed()
     runner = TensorParallelServerRunner(Runner(), "control", distributed)
 
-    assert runner.bind_cache_pool(41, layout) == 41
+    assert runner.bind_resources(binding) == 41
     assert distributed.broadcasts == [
-        {"operation": "bind_cache_pool", "pool_id": 41}
+        {
+            "operation": "bind_resources",
+            "cache_pool_id": 41,
+            "state_pool_id": None,
+            "state_capacity": None,
+            "required_state_arena_id": None,
+        }
     ]
 
 
-def test_tensor_parallel_follower_applies_cache_pool_binding() -> None:
+def test_tensor_parallel_follower_applies_resource_binding() -> None:
     layout = object()
 
     class Runner:
-        cache_layout = layout
+        runner_config = SimpleNamespace(cache_layout=layout, state_mapping=None)
         calls = []
 
         @classmethod
-        def bind_cache_pool(cls, pool_id, bound_layout):
-            cls.calls.append((pool_id, bound_layout))
+        def bind_resources(cls, binding):
+            cls.calls.append(binding)
 
     distributed = RecordingDistributed(
         [
-            {"operation": "bind_cache_pool", "pool_id": 41},
+            {
+                "operation": "bind_resources",
+                "cache_pool_id": 41,
+                "state_pool_id": None,
+                "state_capacity": None,
+                "required_state_arena_id": None,
+            },
             {"operation": "close"},
         ]
     )
 
     follow_tensor_parallel_server(Runner(), "control", distributed)
 
-    assert Runner.calls == [(41, layout)]
+    assert len(Runner.calls) == 1
+    assert Runner.calls[0].cache_pool_id == 41
+    assert Runner.calls[0].cache_layout is layout
+    assert Runner.calls[0].state_mapping is None
 
 
 @dataclass

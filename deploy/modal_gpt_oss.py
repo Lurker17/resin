@@ -1124,6 +1124,7 @@ def _serve_http_rank(
             prefill_chunk_size=runner.prefill_chunk_size,
         ),
         eos_token_id=runner.eos_token_id,
+        prefix_cache=True,
     )
     print("[http-startup] engine created; running warmup...", flush=True)
     warmup = engine.submit(

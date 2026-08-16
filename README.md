@@ -163,7 +163,10 @@ class Runner:
 
 An asynchronous runner supplies `dispatch(plan)` and `poll(completion)` instead.
 Managed cache and recurrent state are optional runner-owned declarations that
-the Engine binds once during construction.
+the Engine binds once during construction through a frozen `RunnerConfig` and
+one `bind_resources(binding)` callback. Pass `prefix_cache=True` to `Engine`
+to opt into cross-request reuse for paged-KV runners and recurrent runners
+that declare an aligned state-checkpoint contract.
 
 ## Local HTTP server
 
@@ -229,6 +232,8 @@ The native layer currently provides:
 - phase-homogeneous prefill or decode batches, token budgets, and prefill chunks;
 - one flat physical cache pool shared by ordered History and Window groups;
 - sparse, chronological `CacheGroupPlan` rows and exact append destinations;
+- opt-in exact-token LRU prefix caching with immutable page sharing and
+  sliding-window and recurrent-state copy-on-write;
 - generation-checked `StatePool` slots with shared-read/exclusive-write access;
 - retryable pre-accept failure and fail-stop post-accept quarantine.
 
@@ -239,13 +244,21 @@ leases. `crates/resin-py` adapts those types to Python and coordinates runner
 acceptance and completion.
 
 History cache grows on demand to each frozen plan. Window cache grows toward
-bounded private cyclic storage whose plan row is projected into chronological order.
-Cache retention is exactly History or Window. Recurrent model state is a
-separate resource owned through `StatePool`.
+bounded cyclic storage whose plan row is projected into chronological order.
+With prefix caching enabled, a block trie indexes exact token prefixes, cached
+pages become immutable readers, and Window pages are copied on write when a
+request advances its ring. LRU entries use spare capacity in the same physical
+pool and are evicted when live allocation needs their pages or state slots.
 
-Resin has no content index or cross-request cache sharing today, so it performs
-no prefix reuse. The current cache surface only describes live allocation and
-runner placement.
+Recurrent model state is a separate `StatePool` resource. A mapped runner may
+omit both the pool and request handles: Engine sizes the pool from the running
+limit, allocates slots at admission, and emits their indices in `BatchPlan`.
+Explicit handles remain available for shared-state requests. Prefix reuse is
+accepted only when a recurrent mapping declares `checkpoint_granularity`.
+At aligned prefill boundaries the cache retains the matching state generation;
+a hit supplies an ordered read-checkpoint/write-destination pair, and the
+runner copies that checkpoint before updating its private destination. LFM2
+uses this contract for convolution state while sharing its attention pages.
 
 Implemented runner modules include a synchronous LFM2 reference and local CUDA
 implementations for LFM2 and GPT-OSS. The GPT-OSS CUDA path uses one
@@ -259,9 +272,13 @@ The LFM2 CUDA runner has one route: atomic cache-plus-state binding followed by
 asynchronous dispatch/poll. Its continuation harness uses native Engine plans;
 there is no parallel manual-plan or synchronous compatibility path.
 
-Current limits include one in-flight batch per Engine, no expert parallel or
-data-parallel attention, and no multi-node serving. Tensor parallelism remains
-a GPT-OSS CUDA backend concern rather than part of the native scheduler.
+Current limits include one in-flight batch per Engine, no prefill/decode
+disaggregation, no expert parallel or data-parallel attention, and no
+multi-node serving. Tensor parallelism remains a model-backend concern rather
+than part of the native scheduler. DeepSeek-V4 still keeps its heterogeneous
+compressed, sliding-window, and recurrent state in compact runner-owned rows;
+moving those rows behind Engine-issued state/page indices is required before
+its web deployment can safely enable the same prefix cache.
 
 ## Public surface
 
@@ -278,6 +295,9 @@ TokenEvent
 RequestLease
 SamplingParams
 SchedulerConfig
+RunnerConfig
+ResourceBinding
+ResourceRunner
 CacheGroupLayout
 CacheLayout
 CacheGroupPlan

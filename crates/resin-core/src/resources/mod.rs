@@ -6,6 +6,8 @@ use crate::Schedulable;
 pub mod kv;
 pub mod paged;
 pub mod paged_kv;
+mod prefix;
+pub use prefix::StatePrefixResources;
 pub mod slots;
 
 /// An owner and the resource state whose lifetime exactly matches it.

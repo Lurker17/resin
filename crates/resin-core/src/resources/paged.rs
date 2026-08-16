@@ -117,11 +117,32 @@ impl<R> GroupTable<R> {
 #[derive(Debug)]
 pub struct PageRef {
     handle: PageHandle,
+    writable: bool,
 }
 
 impl PageRef {
     pub const fn handle(&self) -> PageHandle {
         self.handle
+    }
+
+    pub const fn is_writable(&self) -> bool {
+        self.writable
+    }
+}
+
+/// Move-only ownership of an immutable prefix snapshot. Pages may be shared by
+/// any number of requests, but the issuing pool remains responsible for every
+/// reference and for eviction.
+#[derive(Debug)]
+#[must_use = "cached pages must be retired through their issuing pool"]
+pub struct CachedPages {
+    pool_id: u64,
+    groups: Vec<GroupTable<PageRef>>,
+}
+
+impl CachedPages {
+    pub fn groups(&self) -> &[GroupTable<PageRef>] {
+        &self.groups
     }
 }
 
@@ -178,25 +199,27 @@ impl RequestPages {
 
     /// Construct an exact-writer claim. Passing a page from another request is
     /// harmless: pool validation rejects the substituted writer atomically.
-    pub const fn write_claim(&self, page: &PageRef) -> WriterAccessClaim {
-        WriterAccessClaim {
+    pub const fn access_claim(&self, page: &PageRef) -> PageAccessClaim {
+        PageAccessClaim {
             pool_id: self.pool_id,
             writer: self.writer,
             handle: page.handle,
+            write: page.writable,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WriterAccessClaim {
+pub struct PageAccessClaim {
     pool_id: u64,
     writer: WriterId,
     handle: PageHandle,
+    write: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PreparedWriterClaim {
-    claim: WriterAccessClaim,
+    claim: PageAccessClaim,
     expected_write_epoch: u64,
 }
 
@@ -257,7 +280,7 @@ pub enum CachePoolError {
     ForeignAccess,
     WrongWriter,
     PageNotWritable,
-    DuplicateWriteClaim,
+    DuplicateAccessClaim,
     AccessConflict,
     WriteEpochExhausted,
     WriteEpochChanged {
@@ -327,8 +350,8 @@ impl fmt::Display for CachePoolError {
             Self::PageNotWritable => {
                 formatter.write_str("cache page has no exclusive mutable request owner")
             }
-            Self::DuplicateWriteClaim => {
-                formatter.write_str("one cache page has duplicate exclusive write claims")
+            Self::DuplicateAccessClaim => {
+                formatter.write_str("one cache page has incompatible duplicate access claims")
             }
             Self::AccessConflict => {
                 formatter.write_str("cache page already has an incompatible access lease")
@@ -357,13 +380,7 @@ pub struct RetireRequestFailure {
 enum PageMode {
     Reserved { writer: WriterId },
     Mutable { writer: WriterId },
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum LeaseState {
-    #[default]
-    Idle,
-    Writer,
+    Shared,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -371,7 +388,8 @@ struct PageSlot {
     generation: u64,
     mode: Option<PageMode>,
     request_refs: u32,
-    lease: LeaseState,
+    reader_leases: u32,
+    writer_lease: bool,
     write_epoch: u64,
 }
 
@@ -379,7 +397,8 @@ impl PageSlot {
     fn is_live(self) -> bool {
         matches!(self.mode, Some(PageMode::Reserved { .. }))
             || self.request_refs != 0
-            || self.lease != LeaseState::Idle
+            || self.reader_leases != 0
+            || self.writer_lease
     }
 
     fn reserved_request(generation: u64, writer: WriterId) -> Self {
@@ -394,7 +413,8 @@ impl PageSlot {
         debug_assert!(!self.is_live());
         self.mode = None;
         self.request_refs = 0;
-        self.lease = LeaseState::Idle;
+        self.reader_leases = 0;
+        self.writer_lease = false;
         self.write_epoch = 0;
     }
 }
@@ -551,6 +571,7 @@ impl PlannedParent {
                     slot: slot_index as u32,
                     generation,
                 },
+                writable: true,
             });
         }
         Ok(allocated)
@@ -818,7 +839,6 @@ impl CachePool {
         {
             return Err(CachePoolError::StaleHandle);
         }
-
         let mut total_blocks = 0usize;
         let mut additions = Vec::new();
         additions
@@ -886,6 +906,223 @@ impl CachePool {
         Ok(())
     }
 
+    /// Freeze an ordered subset of an idle request's pages and retain one
+    /// immutable cache reference to each page. The request keeps its own read
+    /// reference, so publishing a prefix never invalidates its current table.
+    pub fn share_request_prefix(
+        &mut self,
+        request: &mut RequestPages,
+        demands: &[GroupDemand],
+    ) -> Result<CachedPages, CachePoolError> {
+        self.validate_request_idle(request)?;
+        if demands.len() != request.groups.len()
+            || demands.iter().zip(&request.groups).any(|(demand, group)| {
+                demand.group != group.group || demand.blocks > group.pages.len()
+            })
+        {
+            return Err(CachePoolError::StaleHandle);
+        }
+        for (demand, group) in demands.iter().zip(&request.groups) {
+            for page in &group.pages[..demand.blocks] {
+                if self.validate_live_handle(page.handle)?.request_refs == u32::MAX {
+                    return Err(CachePoolError::DemandOverflow);
+                }
+            }
+        }
+
+        let mut groups = Vec::new();
+        groups
+            .try_reserve_exact(demands.len())
+            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        for (demand, source) in demands.iter().zip(&request.groups) {
+            let mut pages = Vec::new();
+            pages
+                .try_reserve_exact(demand.blocks)
+                .map_err(|_| CachePoolError::MetadataAllocation)?;
+            pages.extend(source.pages[..demand.blocks].iter().map(|page| PageRef {
+                handle: page.handle,
+                writable: false,
+            }));
+            groups.push(GroupTable {
+                group: demand.group,
+                pages,
+            });
+        }
+
+        for (demand, source) in demands.iter().zip(&mut request.groups) {
+            for page in &mut source.pages[..demand.blocks] {
+                let slot = self.slot_mut(page.handle);
+                match slot.mode {
+                    Some(PageMode::Mutable { writer }) => {
+                        debug_assert_eq!(writer, request.writer);
+                        debug_assert!(page.writable);
+                        debug_assert_eq!(slot.request_refs, 1);
+                        slot.mode = Some(PageMode::Shared);
+                        page.writable = false;
+                    }
+                    Some(PageMode::Shared) => debug_assert!(!page.writable),
+                    _ => unreachable!("validated request pages remain mutable or shared"),
+                }
+                slot.request_refs += 1;
+            }
+        }
+        Ok(CachedPages {
+            pool_id: self.id,
+            groups,
+        })
+    }
+
+    /// Attach an immutable cached prefix to an otherwise empty request table.
+    pub fn attach_shared_prefix(
+        &mut self,
+        request: &mut RequestPages,
+        cached: &CachedPages,
+    ) -> Result<(), CachePoolError> {
+        self.validate_request_idle(request)?;
+        if cached.pool_id != self.id || cached.groups.len() != request.groups.len() {
+            return Err(CachePoolError::ForeignPool);
+        }
+        for (target, source) in request.groups.iter().zip(&cached.groups) {
+            if target.group != source.group || !target.pages.is_empty() {
+                return Err(CachePoolError::StaleHandle);
+            }
+            for page in &source.pages {
+                let slot = self.validate_live_handle(page.handle)?;
+                if slot.mode != Some(PageMode::Shared) || page.writable {
+                    return Err(CachePoolError::StaleHandle);
+                }
+                if slot.request_refs == u32::MAX {
+                    return Err(CachePoolError::DemandOverflow);
+                }
+            }
+        }
+        for (target, source) in request.groups.iter_mut().zip(&cached.groups) {
+            target
+                .pages
+                .try_reserve_exact(source.pages.len())
+                .map_err(|_| CachePoolError::MetadataAllocation)?;
+        }
+        for (target, source) in request.groups.iter_mut().zip(&cached.groups) {
+            for page in &source.pages {
+                self.slot_mut(page.handle).request_refs += 1;
+                target.pages.push(PageRef {
+                    handle: page.handle,
+                    writable: false,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn retire_cached_prefix(&mut self, cached: CachedPages) -> Result<(), CachePoolError> {
+        if cached.pool_id != self.id {
+            return Err(CachePoolError::ForeignPool);
+        }
+        for group in &cached.groups {
+            for page in &group.pages {
+                let slot = self.validate_live_handle(page.handle)?;
+                if slot.mode != Some(PageMode::Shared) || page.writable || slot.request_refs == 0 {
+                    return Err(CachePoolError::StaleHandle);
+                }
+            }
+        }
+        for group in cached.groups.iter().rev() {
+            for page in group.pages.iter().rev() {
+                self.slot_mut(page.handle).request_refs -= 1;
+                self.retire_slot_if_unused(page.handle);
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy-on-write selected immutable pages for a request which is about to
+    /// recycle sliding-window slots. Replacement placement is transactional;
+    /// the old shared references remain untouched on failure.
+    pub fn replace_shared_pages(
+        &mut self,
+        request: &mut RequestPages,
+        replacements: &[Vec<usize>],
+    ) -> Result<(), CachePoolError> {
+        self.validate_request_idle(request)?;
+        if replacements.len() != request.groups.len() {
+            return Err(CachePoolError::StaleHandle);
+        }
+        let mut total = 0usize;
+        for (indices, group) in replacements.iter().zip(&request.groups) {
+            if indices.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(CachePoolError::DuplicateHandle);
+            }
+            for &index in indices {
+                let page = group.pages.get(index).ok_or(CachePoolError::StaleHandle)?;
+                if page.writable
+                    || self.validate_live_handle(page.handle)?.mode != Some(PageMode::Shared)
+                {
+                    return Err(CachePoolError::StaleHandle);
+                }
+            }
+            total = total
+                .checked_add(indices.len())
+                .ok_or(CachePoolError::DemandOverflow)?;
+        }
+        if total == 0 {
+            return Ok(());
+        }
+        self.occupied_blocks
+            .checked_add(total)
+            .ok_or(CachePoolError::DemandOverflow)?;
+
+        let mut additions = Vec::new();
+        additions
+            .try_reserve_exact(request.groups.len())
+            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        for (indices, group) in replacements.iter().zip(&request.groups) {
+            let mut pages = Vec::new();
+            pages
+                .try_reserve_exact(indices.len())
+                .map_err(|_| CachePoolError::MetadataAllocation)?;
+            additions.push(GroupTable {
+                group: group.group,
+                pages,
+            });
+        }
+
+        let mut plan = PlacementPlan::new(self.group_packings.len(), total, self.parents.len())?;
+        for (indices, addition) in replacements.iter().zip(&mut additions) {
+            self.plan_partition(
+                &mut plan,
+                request.writer,
+                GroupDemand::new(addition.group, indices.len()),
+                &mut addition.pages,
+            )?;
+        }
+        debug_assert_eq!(plan.block_count, total);
+        self.commit_plan(plan);
+        for page in additions.iter().flat_map(|group| &group.pages) {
+            let slot = self.slot_mut(page.handle);
+            debug_assert_eq!(
+                slot.mode,
+                Some(PageMode::Reserved {
+                    writer: request.writer
+                })
+            );
+            slot.mode = Some(PageMode::Mutable {
+                writer: request.writer,
+            });
+            slot.request_refs = 1;
+        }
+        for ((indices, group), additions) in
+            replacements.iter().zip(&mut request.groups).zip(additions)
+        {
+            for (&index, replacement) in indices.iter().zip(additions.pages) {
+                let old = std::mem::replace(&mut group.pages[index], replacement);
+                debug_assert!(!old.writable);
+                self.slot_mut(old.handle).request_refs -= 1;
+                self.retire_slot_if_unused(old.handle);
+            }
+        }
+        Ok(())
+    }
+
     /// Release every page while retaining the request's sequence and writer.
     pub fn clear_request(&mut self, request: &mut RequestPages) -> Result<(), CachePoolError> {
         self.validate_request_idle(request)?;
@@ -936,7 +1173,7 @@ impl CachePool {
     /// before runner acceptance. No lease state changes here.
     pub fn prepare_writer_access(
         &self,
-        mut claims: Vec<WriterAccessClaim>,
+        mut claims: Vec<PageAccessClaim>,
     ) -> Result<PreparedWriterAccess, CachePoolError> {
         for claim in &claims {
             self.validate_writer_claim(*claim)?;
@@ -944,10 +1181,11 @@ impl CachePool {
         claims.sort_unstable_by_key(|claim| claim.handle);
         if claims
             .windows(2)
-            .any(|pair| pair[0].handle == pair[1].handle)
+            .any(|pair| pair[0].handle == pair[1].handle && (pair[0].write || pair[1].write))
         {
-            return Err(CachePoolError::DuplicateWriteClaim);
+            return Err(CachePoolError::DuplicateAccessClaim);
         }
+        claims.dedup_by_key(|claim| claim.handle);
 
         let mut prepared_claims = Vec::new();
         prepared_claims
@@ -987,7 +1225,12 @@ impl CachePool {
             }
         }
         for prepared_claim in &prepared.claims {
-            self.slot_mut(prepared_claim.claim.handle).lease = LeaseState::Writer;
+            let slot = self.slot_mut(prepared_claim.claim.handle);
+            if prepared_claim.claim.write {
+                slot.writer_lease = true;
+            } else {
+                slot.reader_leases += 1;
+            }
         }
         Ok(WriterAccessLease {
             pool_id: prepared.pool_id,
@@ -1007,15 +1250,27 @@ impl CachePool {
             let slot = self
                 .validate_live_handle(claim.handle)
                 .expect("writer lease keeps its page live");
-            assert_eq!(slot.lease, LeaseState::Writer);
+            if claim.write {
+                assert!(slot.writer_lease);
+            } else {
+                assert_ne!(slot.reader_leases, 0);
+            }
             assert_eq!(slot.write_epoch, prepared_claim.expected_write_epoch);
-            assert_ne!(slot.write_epoch, u64::MAX);
+            if claim.write {
+                assert_ne!(slot.write_epoch, u64::MAX);
+            }
         }
         for prepared_claim in lease.claims {
             let claim = prepared_claim.claim;
             let slot = self.slot_mut(claim.handle);
-            slot.lease = LeaseState::Idle;
-            slot.write_epoch += 1;
+            if claim.write {
+                slot.writer_lease = false;
+            } else {
+                slot.reader_leases -= 1;
+            }
+            if claim.write {
+                slot.write_epoch += 1;
+            }
             self.retire_slot_if_unused(claim.handle);
         }
     }
@@ -1183,8 +1438,8 @@ impl CachePool {
                     return Err(CachePoolError::StaleHandle);
                 }
                 let slot = self.validate_live_handle(page.handle)?;
-                match slot.mode {
-                    Some(PageMode::Mutable { writer }) => {
+                match (slot.mode, page.writable) {
+                    (Some(PageMode::Mutable { writer }), true) => {
                         if writer != request.writer {
                             return Err(CachePoolError::WrongWriter);
                         }
@@ -1192,6 +1447,7 @@ impl CachePool {
                             return Err(CachePoolError::StaleHandle);
                         }
                     }
+                    (Some(PageMode::Shared), false) if slot.request_refs != 0 => {}
                     _ => return Err(CachePoolError::StaleHandle),
                 }
             }
@@ -1202,7 +1458,8 @@ impl CachePool {
     fn validate_request_idle(&self, request: &RequestPages) -> Result<(), CachePoolError> {
         self.validate_request(request)?;
         for page in request.groups.iter().flat_map(|group| &group.pages) {
-            if self.validate_live_handle(page.handle)?.lease != LeaseState::Idle {
+            let slot = self.validate_live_handle(page.handle)?;
+            if slot.writer_lease || slot.reader_leases != 0 {
                 return Err(CachePoolError::AccessConflict);
             }
         }
@@ -1229,32 +1486,36 @@ impl CachePool {
         false
     }
 
-    fn validate_writer_claim(&self, claim: WriterAccessClaim) -> Result<(), CachePoolError> {
+    fn validate_writer_claim(&self, claim: PageAccessClaim) -> Result<(), CachePoolError> {
         if claim.pool_id != self.id {
             return Err(CachePoolError::ForeignAccess);
         }
         let slot = self.validate_live_handle(claim.handle)?;
-        let Some(PageMode::Mutable { writer }) = slot.mode else {
-            return Err(CachePoolError::PageNotWritable);
-        };
-        if writer != claim.writer {
-            return Err(CachePoolError::WrongWriter);
-        }
-        if slot.request_refs != 1 {
-            return Err(CachePoolError::PageNotWritable);
+        if claim.write {
+            let Some(PageMode::Mutable { writer }) = slot.mode else {
+                return Err(CachePoolError::PageNotWritable);
+            };
+            if writer != claim.writer {
+                return Err(CachePoolError::WrongWriter);
+            }
+            if slot.request_refs != 1 {
+                return Err(CachePoolError::PageNotWritable);
+            }
+        } else if slot.mode != Some(PageMode::Shared) || slot.request_refs == 0 {
+            return Err(CachePoolError::StaleHandle);
         }
         Ok(())
     }
 
     fn validate_writer_available(
         &self,
-        claim: WriterAccessClaim,
+        claim: PageAccessClaim,
     ) -> Result<&PageSlot, CachePoolError> {
         let slot = self.validate_live_handle(claim.handle)?;
-        if slot.write_epoch == u64::MAX {
+        if claim.write && slot.write_epoch == u64::MAX {
             return Err(CachePoolError::WriteEpochExhausted);
         }
-        if slot.lease != LeaseState::Idle {
+        if slot.writer_lease || (claim.write && slot.reader_leases != 0) {
             return Err(CachePoolError::AccessConflict);
         }
         Ok(slot)
@@ -1308,7 +1569,8 @@ impl CachePool {
                     })
                 );
                 assert_eq!(slot.request_refs, 0);
-                assert_eq!(slot.lease, LeaseState::Idle);
+                assert_eq!(slot.reader_leases, 0);
+                assert!(!slot.writer_lease);
                 assert_eq!(slot.write_epoch, 0);
             }
         }
@@ -1400,11 +1662,11 @@ mod tests {
             .collect()
     }
 
-    fn writer_claims(request: &RequestPages) -> Vec<WriterAccessClaim> {
+    fn writer_claims(request: &RequestPages) -> Vec<PageAccessClaim> {
         request
             .groups()
             .iter()
-            .flat_map(|group| group.pages().iter().map(|page| request.write_claim(page)))
+            .flat_map(|group| group.pages().iter().map(|page| request.access_claim(page)))
             .collect()
     }
 
@@ -1722,7 +1984,10 @@ mod tests {
             .unwrap();
         let mut request = pool.promote_request(pending);
         let handle = request.groups[0].pages[0].handle;
-        request.groups[0].pages.push(PageRef { handle });
+        request.groups[0].pages.push(PageRef {
+            handle,
+            writable: true,
+        });
 
         let mut failure = pool.retire_request(request).unwrap_err();
         assert_eq!(failure.error, CachePoolError::DuplicateHandle);
@@ -1821,10 +2086,11 @@ mod tests {
             .reserve_request(sequence(9), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
         let page = &pending.groups()[0].pages()[0];
-        let claim = WriterAccessClaim {
+        let claim = PageAccessClaim {
             pool_id: pool.id(),
             writer: pending.writer,
             handle: page.handle(),
+            write: true,
         };
         assert_eq!(
             pool.prepare_writer_access(vec![claim]).unwrap_err(),
@@ -1847,8 +2113,8 @@ mod tests {
         assert_eq!(first.sequence(), second.sequence());
         assert_ne!(first.writer, second.writer);
         let claims = vec![
-            first.write_claim(&first.groups()[0].pages()[0]),
-            first.write_claim(&second.groups()[0].pages()[0]),
+            first.access_claim(&first.groups()[0].pages()[0]),
+            first.access_claim(&second.groups()[0].pages()[0]),
         ];
         assert_eq!(
             pool.prepare_writer_access(claims).unwrap_err(),
@@ -1858,10 +2124,8 @@ mod tests {
             .into_iter()
             .chain(request_handles(&second))
         {
-            assert_eq!(
-                pool.validate_live_handle(handle).unwrap().lease,
-                LeaseState::Idle
-            );
+            let slot = pool.validate_live_handle(handle).unwrap();
+            assert!(!slot.writer_lease && slot.reader_leases == 0);
         }
         pool.retire_request(first).unwrap();
         pool.retire_request(second).unwrap();
@@ -1874,11 +2138,11 @@ mod tests {
             .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 2)])
             .unwrap();
         let request = pool.promote_request(pending);
-        let first_claim = request.write_claim(&request.groups()[0].pages()[0]);
+        let first_claim = request.access_claim(&request.groups()[0].pages()[0]);
         assert_eq!(
             pool.prepare_writer_access(vec![first_claim, first_claim])
                 .unwrap_err(),
-            CachePoolError::DuplicateWriteClaim
+            CachePoolError::DuplicateAccessClaim
         );
 
         let first = pool
@@ -1890,10 +2154,8 @@ mod tests {
             CachePoolError::AccessConflict
         );
         let second_handle = request.groups()[0].pages()[1].handle();
-        assert_eq!(
-            pool.validate_live_handle(second_handle).unwrap().lease,
-            LeaseState::Idle
-        );
+        let slot = pool.validate_live_handle(second_handle).unwrap();
+        assert!(!slot.writer_lease && slot.reader_leases == 0);
         pool.release_writer_access(first);
         pool.retire_request(request).unwrap();
     }
@@ -1912,8 +2174,8 @@ mod tests {
         let first_handle = first.groups()[0].pages()[0].handle();
         let prepared = pool
             .prepare_writer_access(vec![
-                first.write_claim(&first.groups()[0].pages()[0]),
-                second.write_claim(&second.groups()[0].pages()[0]),
+                first.access_claim(&first.groups()[0].pages()[0]),
+                second.access_claim(&second.groups()[0].pages()[0]),
             ])
             .unwrap();
         pool.retire_request(second).unwrap();
@@ -1921,10 +2183,8 @@ mod tests {
             pool.acquire_writer_access(prepared).unwrap_err(),
             CachePoolError::StaleHandle
         );
-        assert_eq!(
-            pool.validate_live_handle(first_handle).unwrap().lease,
-            LeaseState::Idle
-        );
+        let slot = pool.validate_live_handle(first_handle).unwrap();
+        assert!(!slot.writer_lease && slot.reader_leases == 0);
         pool.retire_request(first).unwrap();
     }
 
@@ -1954,9 +2214,10 @@ mod tests {
                 .unwrap_err(),
             CachePoolError::WriteEpochExhausted
         );
-        assert!(handles
-            .iter()
-            .all(|handle| pool.validate_live_handle(*handle).unwrap().lease == LeaseState::Idle));
+        assert!(handles.iter().all(|handle| {
+            let slot = pool.validate_live_handle(*handle).unwrap();
+            !slot.writer_lease && slot.reader_leases == 0
+        }));
         pool.slot_mut(handles[1]).write_epoch = 1;
         pool.retire_request(request).unwrap();
     }
@@ -1968,7 +2229,7 @@ mod tests {
             .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
         let request = pool.promote_request(pending);
-        let claim = request.write_claim(&request.groups()[0].pages()[0]);
+        let claim = request.access_claim(&request.groups()[0].pages()[0]);
         let stale = pool.prepare_writer_access(vec![claim]).unwrap();
         let newer = pool.prepare_writer_access(vec![claim]).unwrap();
 
@@ -1981,10 +2242,8 @@ mod tests {
                 actual: 1,
             }
         );
-        assert_eq!(
-            pool.validate_live_handle(claim.handle).unwrap().lease,
-            LeaseState::Idle
-        );
+        let slot = pool.validate_live_handle(claim.handle).unwrap();
+        assert!(!slot.writer_lease && slot.reader_leases == 0);
         pool.retire_request(request).unwrap();
     }
 
@@ -2002,7 +2261,7 @@ mod tests {
         pool.retire_request(request).unwrap();
         let slot = pool.validate_live_handle(handle).unwrap();
         assert_eq!(slot.request_refs, 0);
-        assert_eq!(slot.lease, LeaseState::Writer);
+        assert!(slot.writer_lease);
         assert_eq!(pool.occupied_block_count(), 1);
         assert_eq!(
             pool.reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)],)

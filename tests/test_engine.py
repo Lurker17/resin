@@ -9,6 +9,8 @@ from resin import (
     CacheLayout,
     Engine,
     RequestLease,
+    ResourceBinding,
+    RunnerConfig,
     SchedulerConfig,
     StatePool,
 )
@@ -287,15 +289,14 @@ class TestEngine:
         layout = CacheLayout(3, [CacheGroupLayout(2)])
 
         class CachedRunner(RecordingRunner):
-            cache_layout = layout
+            runner_config = RunnerConfig(cache_layout=layout)
 
             def __init__(self) -> None:
                 super().__init__()
                 self.binding = None
 
-            def bind_cache_pool(self, pool_id, bound_layout):
-                self.binding = (pool_id, bound_layout)
-                return pool_id
+            def bind_resources(self, binding: ResourceBinding) -> None:
+                self.binding = (binding.cache_pool_id, binding.cache_layout)
 
         runner = CachedRunner()
         engine = Engine(runner)
@@ -335,12 +336,13 @@ class TestEngine:
         layout = CacheLayout(3, [CacheGroupLayout(1)])
 
         class TinyCachedRunner(RecordingRunner):
-            cache_layout = layout
-            supports_continuation_prefill = True
+            runner_config = RunnerConfig(
+                cache_layout=layout,
+                continuation_prefill=True,
+            )
 
-            def bind_cache_pool(self, pool_id, bound_layout):
-                self.binding = (pool_id, bound_layout)
-                return pool_id
+            def bind_resources(self, binding: ResourceBinding) -> None:
+                self.binding = (binding.cache_pool_id, binding.cache_layout)
 
         runner = TinyCachedRunner()
         engine = Engine(
@@ -374,10 +376,11 @@ class TestEngine:
         layout = CacheLayout(3, [CacheGroupLayout(1)])
 
         class TinyCachedRunner(RecordingRunner):
-            cache_layout = layout
+            runner_config = RunnerConfig(cache_layout=layout)
 
-            def bind_cache_pool(self, pool_id, bound_layout):
-                return pool_id
+            @staticmethod
+            def bind_resources(binding: ResourceBinding) -> None:
+                del binding
 
         runner = TinyCachedRunner()
         engine = Engine(runner, max_running_requests=2, context_length=3)

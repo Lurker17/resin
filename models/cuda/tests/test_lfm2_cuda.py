@@ -8,7 +8,7 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 
-from resin import BatchPhase
+from resin import BatchPhase, RunnerConfig, StateMappingConfig
 from resin.backend.cuda.execution import CudaExecutor
 from resin.backend.cuda.mapped_state import MappedStateArena
 from resin.backend.cuda.paged_kv import PagedKvArena
@@ -301,12 +301,10 @@ class TestLfm2CudaImport:
         constructor = inspect.getsource(Lfm2CudaRunner.__init__)
         assert "self._kv = PagedKvArena(" in constructor
         assert "self.cache_layout = CacheLayout(" in constructor
-        assert Lfm2CudaRunner.supports_continuation_prefill is True
-        assert Lfm2CudaRunner.supports_recurrent_state_mapping is True
-        assert Lfm2CudaRunner.recurrent_state_mapping.protocol == "lfm2.conv_state.v1"
-        assert Lfm2CudaRunner.recurrent_state_mapping.access_modes == ["write"]
-        assert Lfm2CudaRunner.recurrent_state_mapping.handles_per_sequence == 1
-        assert callable(Lfm2CudaRunner.bind_cache_and_recurrent_state)
+        assert "RunnerConfig(" in constructor
+        assert "continuation_prefill=True" in constructor
+        assert 'StateMappingConfig(\n                _RECURRENT_STATE_MAPPING_PROTOCOL,\n                ["write"],' in constructor
+        assert callable(Lfm2CudaRunner.bind_resources)
         assert callable(Lfm2CudaRunner.dispatch)
         assert callable(Lfm2CudaRunner.poll)
         assert not hasattr(Lfm2CudaRunner, "recurrent_state_mapping_protocol")
@@ -332,6 +330,11 @@ class TestLfm2CudaCachePoolBoundary:
         runner.page_size = 16
         runner.max_pages = 8
         runner.cache_layout = object()
+        runner.runner_config = RunnerConfig(
+            continuation_prefill=True,
+            cache_layout=None,
+            state_mapping=StateMappingConfig("lfm2.conv_state.v1", ["write"]),
+        )
         runner._kv = PagedKvArena.__new__(PagedKvArena)
         runner._kv.capacity = runner.max_pages
         runner._kv.page_size = runner.page_size
@@ -412,21 +415,39 @@ class TestLfm2CudaCachePoolBoundary:
         state_pool_id=53,
         capacity=4,
     ):
-        return runner.bind_cache_and_recurrent_state(
-            cache_pool_id,
-            runner.cache_layout,
-            state_pool_id,
-            capacity,
-            "lfm2.conv_state.v1",
-            None,
+        return runner.bind_resources(
+            TestLfm2CudaCachePoolBoundary._binding(
+                runner,
+                cache_pool_id=cache_pool_id,
+                state_pool_id=state_pool_id,
+                capacity=capacity,
+            )
+        )
+
+    @staticmethod
+    def _binding(
+        runner,
+        *,
+        cache_pool_id=41,
+        layout=None,
+        state_pool_id=53,
+        capacity=4,
+        protocol="lfm2.conv_state.v1",
+        required_arena_id=None,
+    ):
+        return SimpleNamespace(
+            cache_pool_id=cache_pool_id,
+            cache_layout=runner.cache_layout if layout is None else layout,
+            state_pool_id=state_pool_id,
+            state_capacity=capacity,
+            state_mapping=SimpleNamespace(protocol=protocol),
+            required_state_arena_id=required_arena_id,
         )
 
     def test_combined_binding_requires_the_exact_layout(self) -> None:
         runner = self._runner()
         with pytest.raises(ValueError, match="frozen layout object"):
-            runner.bind_cache_and_recurrent_state(
-                41, object(), 53, 4, "lfm2.conv_state.v1", None
-            )
+            runner.bind_resources(self._binding(runner, layout=object()))
         assert runner._kv.binding.pool_id is None
         assert runner._state.binding is None
 
@@ -435,21 +456,16 @@ class TestLfm2CudaCachePoolBoundary:
         first = self._bind(runner, capacity=7)
         second = self._bind(runner, capacity=7)
 
-        assert first[:4] == (41, 53, 7, "lfm2.conv_state.v1")
-        assert first[-1] > 0
+        assert first > 0
         assert second == first
         assert runner._kv.binding.pool_id == 41
         assert runner._state.binding == (53, 7, "lfm2.conv_state.v1")
         assert runner._state.slab.shape == (4, 7, 8, 2)
 
         with pytest.raises(ValueError, match="different cache pool"):
-            runner.bind_cache_and_recurrent_state(
-                42, runner.cache_layout, 53, 7, "lfm2.conv_state.v1", None
-            )
+            runner.bind_resources(self._binding(runner, cache_pool_id=42, capacity=7))
         with pytest.raises(ValueError, match="different mapped-state"):
-            runner.bind_cache_and_recurrent_state(
-                41, runner.cache_layout, 54, 7, "lfm2.conv_state.v1", None
-            )
+            runner.bind_resources(self._binding(runner, state_pool_id=54, capacity=7))
 
     def test_combined_binding_reuses_the_exact_registered_arena_object(
         self, monkeypatch: pytest.MonkeyPatch
@@ -463,9 +479,7 @@ class TestLfm2CudaCachePoolBoundary:
                 "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
                 lambda: 1234,
             )
-            first_ack = first.bind_cache_and_recurrent_state(
-                41, first.cache_layout, 53, 7, "lfm2.conv_state.v1", None
-            )
+            first_ack = first.bind_resources(self._binding(first, capacity=7))
 
             second = self._runner()
 
@@ -476,12 +490,17 @@ class TestLfm2CudaCachePoolBoundary:
                 "resin.backend.cuda.mapped_state.mint_state_mapping_arena_id",
                 unexpected_mint,
             )
-            second_ack = second.bind_cache_and_recurrent_state(
-                42, second.cache_layout, 53, 7, "lfm2.conv_state.v1", 1234
+            second_ack = second.bind_resources(
+                self._binding(
+                    second,
+                    cache_pool_id=42,
+                    capacity=7,
+                    required_arena_id=1234,
+                )
             )
 
-            assert first_ack[-1] == 1234
-            assert second_ack[-1] == 1234
+            assert first_ack == 1234
+            assert second_ack == 1234
             assert second._state.slab is first._state.slab
             assert second._state.generations is first._state.generations
             assert second._state.owners is first._state.owners
@@ -496,8 +515,13 @@ class TestLfm2CudaCachePoolBoundary:
                 incompatible.conv_cache_length - 1,
             )
             with pytest.raises(ValueError, match="incompatible"):
-                incompatible.bind_cache_and_recurrent_state(
-                    43, incompatible.cache_layout, 53, 7, "lfm2.conv_state.v1", 1234
+                incompatible.bind_resources(
+                    self._binding(
+                        incompatible,
+                        cache_pool_id=43,
+                        capacity=7,
+                        required_arena_id=1234,
+                    )
                 )
             assert incompatible._kv.binding.pool_id is None
             assert incompatible._state.binding is None
@@ -519,9 +543,7 @@ class TestLfm2CudaCachePoolBoundary:
             lambda: 1234,
         )
         with pytest.raises(RuntimeError, match="synthetic recurrent slab"):
-            runner.bind_cache_and_recurrent_state(
-                41, runner.cache_layout, 53, 7, "lfm2.conv_state.v1", None
-            )
+            runner.bind_resources(self._binding(runner, capacity=7))
 
         assert runner._kv.binding.pool_id is None
         assert runner._state.binding is None
@@ -545,14 +567,16 @@ class TestLfm2CudaCachePoolBoundary:
         pool = StatePool(4)
 
         class SeedRunner:
-            supports_recurrent_state_mapping = True
-            recurrent_state_mapping = StateMappingConfig(
-                "lfm2.conv_state.v1", ["write"]
+            runner_config = RunnerConfig(
+                state_mapping=StateMappingConfig(
+                    "lfm2.conv_state.v1", ["write"]
+                )
             )
 
             @staticmethod
-            def bind_recurrent_state_mapping(pool_id, capacity, protocol):
-                return pool_id, capacity, protocol, arena_id
+            def bind_resources(binding):
+                del binding
+                return arena_id
 
             @staticmethod
             def forward(plan):
@@ -564,6 +588,10 @@ class TestLfm2CudaCachePoolBoundary:
         runner = self._runner()
         runner.cache_layout = CacheLayout(8, [CacheGroupLayout(16)])
         runner._kv.binding.layout = runner.cache_layout
+        runner.runner_config = RunnerConfig(
+            cache_layout=runner.cache_layout,
+            state_mapping=StateMappingConfig("lfm2.conv_state.v1", ["write"]),
+        )
 
         def unexpected_mint():
             raise AssertionError("prebound native arena must not be reminted")
@@ -803,8 +831,7 @@ class TestLfm2CudaRecurrentState:
         first = TestLfm2CudaCachePoolBoundary._bind(runner, capacity=7)
         second = TestLfm2CudaCachePoolBoundary._bind(runner, capacity=7)
 
-        assert first[:4] == (41, 53, 7, "lfm2.conv_state.v1")
-        assert first[-1] > 0
+        assert first > 0
         assert second == first
         assert runner._state.slab.shape == (4, 7, 8, 2)
         assert runner._state.slab.dtype == "bfloat16"
@@ -819,12 +846,14 @@ class TestLfm2CudaRecurrentState:
         assert allocation < exit_index
 
         with pytest.raises(ValueError, match="different mapped-state"):
-            runner.bind_cache_and_recurrent_state(
-                41, runner.cache_layout, 54, 7, "lfm2.conv_state.v1", None
+            runner.bind_resources(
+                TestLfm2CudaCachePoolBoundary._binding(
+                    runner, state_pool_id=54, capacity=7
+                )
             )
         with pytest.raises(ValueError, match="different mapped-state"):
-            runner.bind_cache_and_recurrent_state(
-                41, runner.cache_layout, 53, 8, "lfm2.conv_state.v1", None
+            runner.bind_resources(
+                TestLfm2CudaCachePoolBoundary._binding(runner, capacity=8)
             )
 
     def test_binding_rejects_invalid_identity_capacity_and_protocol_before_mint(
@@ -847,9 +876,15 @@ class TestLfm2CudaRecurrentState:
         )
         for arguments, message in cases:
             runner = TestLfm2CudaCachePoolBoundary._runner()
+            pool_id, capacity, protocol = arguments
             with pytest.raises(ValueError, match=message):
-                runner.bind_cache_and_recurrent_state(
-                    41, runner.cache_layout, *arguments, None
+                runner.bind_resources(
+                    TestLfm2CudaCachePoolBoundary._binding(
+                        runner,
+                        state_pool_id=pool_id,
+                        capacity=capacity,
+                        protocol=protocol,
+                    )
                 )
             assert runner._state.slab is None
 
@@ -857,17 +892,17 @@ class TestLfm2CudaRecurrentState:
         cases = (
             ({"state_pool_id": 54}, "state pool id"),
             ({"engine_id": 0}, "engine_id"),
-            ({"state_indptr": [0, 0, 2]}, "exactly one handle per row"),
-            ({"state_slots": [0]}, "exactly one handle per row"),
-            ({"state_access_modes": ["write", "read"]}, "write access"),
+            ({"state_indptr": [0, 0, 2]}, "one write handle"),
+            ({"state_slots": [0]}, "does not cover every state handle"),
+            ({"state_access_modes": ["write", "read"]}, "one write handle"),
             ({"state_slots": [0, 4]}, "outside capacity"),
             (
                 {"state_slots": [0, 0], "state_generations": [1, 1]},
-                "duplicate mapped-state",
+                "destination",
             ),
             (
                 {"state_slots": [0, 0], "state_generations": [1, 2]},
-                "cannot serve two",
+                "destination",
             ),
         )
         for overrides, message in cases:
@@ -923,6 +958,30 @@ class TestLfm2CudaRecurrentState:
                 runner.dispatch(plan)
             assert not runner._torch.cuda.events
             assert len(runner._state.slab.zeroed) == 3
+
+    def test_checkpoint_is_copied_to_a_fresh_request_owned_destination(self) -> None:
+        runner = self._bound_runner()
+        initial = TestLfm2CudaCachePoolBoundary._plan()
+        with runner._torch.cuda.stream(runner._stream):
+            runner._state.prepare_rows(runner._state.rows(initial))
+
+        copied = TestLfm2CudaCachePoolBoundary._plan(
+            sequence_ids=[99],
+            state_slots=[0, 2],
+            state_generations=[1, 1],
+            state_access_modes=["read", "write"],
+            state_indptr=[0, 2],
+        )
+        rows = runner._state.rows(copied)
+        assert rows[0].slot == 2
+        assert rows[0].copy_from_slot == 0
+        with runner._torch.cuda.stream(runner._stream):
+            runner._state.prepare_rows(rows)
+
+        assert runner._state.slab.copies[-1][0] == (slice(None), 2)
+        assert runner._state.slab.copies[-1][1].key == (slice(None), 0)
+        assert runner._state.owners[0] == (71, 10)
+        assert runner._state.owners[2] == (71, 99)
 
     def test_short_conv_assignment_updates_fixed_layer_slot_view_in_place(self) -> None:
         runner = self._bound_runner()

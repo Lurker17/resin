@@ -134,6 +134,14 @@ class TestGptOssCudaNativePlan:
         )
         return runner
 
+    @staticmethod
+    def _resources(runner, pool_id=41, layout=None):
+        return SimpleNamespace(
+            cache_pool_id=pool_id,
+            cache_layout=runner.cache_layout if layout is None else layout,
+            state_pool_id=None,
+        )
+
     def test_cuda_graphs_use_the_shared_static_step_lifecycle(self) -> None:
         parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
         source = inspect.getsource(GptOssCudaRunner)
@@ -183,10 +191,11 @@ class TestGptOssCudaNativePlan:
     def test_runner_exposes_only_the_flat_grouped_cache_path(self) -> None:
         source = inspect.getsource(GptOssCudaRunner)
         parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
-        assert GptOssCudaRunner.supports_continuation_prefill is True
-        assert GptOssCudaRunner.prefill_chunk_size == 8192
-        assert GptOssCudaRunner.max_batch_tokens == 8192
-        assert "bind_cache_pool" in source
+        assert "RunnerConfig(" in source
+        assert "continuation_prefill=True" in source
+        assert "prefill_chunk_size=_PREFILL_CHUNK_SIZE" in source
+        assert "max_batch_tokens=_PREFILL_CHUNK_SIZE" in source
+        assert "bind_resources" in source
         assert "CacheGroupLayout(_PAGE_SIZE)" in source
         assert 'retention="window"' in source
         assert "build_attention_batches" in source
@@ -198,23 +207,23 @@ class TestGptOssCudaNativePlan:
     def test_cache_pool_binding_is_exact_idempotent_and_permanent(self) -> None:
         runner = self._binding_runner()
 
-        assert runner.bind_cache_pool(41, runner.cache_layout) == 41
-        assert runner.bind_cache_pool(41, runner.cache_layout) == 41
+        assert runner.bind_resources(self._resources(runner)) is None
+        assert runner.bind_resources(self._resources(runner)) is None
         fresh = self._binding_runner()
         with pytest.raises(ValueError, match="frozen layout object"):
-            fresh.bind_cache_pool(41, object())
+            fresh.bind_resources(self._resources(fresh, layout=object()))
         with pytest.raises(ValueError, match="different cache pool"):
-            runner.bind_cache_pool(42, runner.cache_layout)
+            runner.bind_resources(self._resources(runner, pool_id=42))
         for invalid in (0, -1, True, 1.5):
             with pytest.raises(ValueError):
                 fresh = self._binding_runner()
-                fresh.bind_cache_pool(invalid, fresh.cache_layout)
+                fresh.bind_resources(self._resources(fresh, pool_id=invalid))
 
     def test_plan_binding_requires_the_one_bound_pool(self) -> None:
         runner = self._binding_runner()
         with pytest.raises(ValueError, match="not bound"):
             runner._validate_plan_binding(_prefill_plan())
-        runner.bind_cache_pool(41, runner.cache_layout)
+        runner.bind_resources(self._resources(runner))
         runner._validate_plan_binding(_prefill_plan())
         with pytest.raises(ValueError, match="does not match"):
             runner._validate_plan_binding(_flat_plan([0], [1], cache_pool_id=42))

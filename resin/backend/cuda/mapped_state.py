@@ -14,6 +14,8 @@ class MappedStateRow:
     generation: int
     engine_id: int
     request_id: int
+    copy_from_slot: int | None = None
+    copy_from_generation: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,22 +184,31 @@ class MappedStateArena:
         slots = tuple(plan.state_slots)
         state_generations = tuple(plan.state_generations)
         access_modes = tuple(plan.state_access_modes)
-        if tuple(plan.state_indptr) != tuple(range(row_count + 1)):
-            raise ValueError("mapped-state CSR must contain exactly one handle per row")
-        if not (len(slots) == len(state_generations) == len(access_modes) == row_count):
-            raise ValueError(
-                "mapped-state metadata must contain exactly one handle per row"
-            )
-        if any(mode != self.access_mode for mode in access_modes):
-            raise ValueError(
-                f"mapped-state handles must all use {self.access_mode} access"
-            )
+        indptr = tuple(plan.state_indptr)
+        if len(indptr) != row_count + 1 or indptr[0] != 0 or indptr[-1] != len(slots):
+            raise ValueError("mapped-state CSR does not cover every state handle")
+        if not (len(slots) == len(state_generations) == len(access_modes)):
+            raise ValueError("mapped-state slot, generation, and access metadata disagree")
 
         rows = []
-        seen: dict[int, int] = {}
-        for request_id, slot, generation in zip(
-            request_ids, slots, state_generations, strict=True
+        seen: dict[int, tuple[int, str]] = {}
+        for request_id, start, end in zip(
+            request_ids, indptr[:-1], indptr[1:], strict=True
         ):
+            row_slots = slots[start:end]
+            row_generations = state_generations[start:end]
+            row_modes = access_modes[start:end]
+            if row_modes == (self.access_mode,):
+                copy_from = None
+                slot, generation = row_slots[0], row_generations[0]
+            elif row_modes == ("read", self.access_mode):
+                copy_from = (row_slots[0], row_generations[0])
+                slot, generation = row_slots[1], row_generations[1]
+            else:
+                raise ValueError(
+                    "mapped-state rows require either one write handle or an ordered "
+                    "[read checkpoint, write destination] pair"
+                )
             if isinstance(slot, bool) or not isinstance(slot, int):
                 raise ValueError("mapped-state slot must be an integer")
             if slot < 0 or slot >= capacity:
@@ -206,13 +217,9 @@ class MappedStateArena:
                 )
             positive_int("mapped-state generation", generation)
             previous = seen.get(slot)
-            if previous == generation:
-                raise ValueError(
-                    "duplicate mapped-state (slot, generation) in one batch"
-                )
             if previous is not None:
-                raise ValueError("one mapped-state slot cannot serve two batch rows")
-            seen[slot] = generation
+                raise ValueError("one mapped-state destination cannot serve two batch rows")
+            seen[slot] = (generation, self.access_mode)
 
             current_generation = generations[slot]
             current_owner = owners[slot]
@@ -226,7 +233,35 @@ class MappedStateArena:
                     "mapped-state slot/generation is already owned by a different "
                     "Engine request"
                 )
-            rows.append(MappedStateRow(slot, generation, engine_id, request_id))
+            copy_slot = copy_generation = None
+            if copy_from is not None:
+                copy_slot, copy_generation = copy_from
+                if isinstance(copy_slot, bool) or not isinstance(copy_slot, int):
+                    raise ValueError("mapped-state checkpoint slot must be an integer")
+                if copy_slot < 0 or copy_slot >= capacity:
+                    raise ValueError(
+                        f"mapped-state checkpoint slot {copy_slot!r} is outside "
+                        f"capacity {capacity}"
+                    )
+                positive_int("mapped-state checkpoint generation", copy_generation)
+                if generations[copy_slot] != copy_generation:
+                    raise ValueError("mapped-state checkpoint generation is stale")
+                previous = seen.get(copy_slot)
+                if previous is not None and previous != (copy_generation, "read"):
+                    raise ValueError(
+                        "a mapped-state checkpoint cannot be written while it is copied"
+                    )
+                seen[copy_slot] = (copy_generation, "read")
+            rows.append(
+                MappedStateRow(
+                    slot,
+                    generation,
+                    engine_id,
+                    request_id,
+                    copy_slot,
+                    copy_generation,
+                )
+            )
         return tuple(rows)
 
     def prepare_rows(self, rows: tuple[MappedStateRow, ...]) -> None:
@@ -235,7 +270,12 @@ class MappedStateArena:
         for row in rows:
             if self.generations[row.slot] == row.generation:
                 continue
-            self.slab[:, row.slot].zero_()
+            if row.copy_from_slot is None:
+                self.slab[:, row.slot].zero_()
+            else:
+                if self.generations[row.copy_from_slot] != row.copy_from_generation:
+                    raise ValueError("mapped-state checkpoint generation became stale")
+                self.slab[:, row.slot].copy_(self.slab[:, row.copy_from_slot])
             self.generations[row.slot] = row.generation
             self.owners[row.slot] = (row.engine_id, row.request_id)
 
