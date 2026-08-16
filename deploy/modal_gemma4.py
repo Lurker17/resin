@@ -315,6 +315,7 @@ def smoke_test(
         decode_ms = [
             step["ms"] for step in steps[first_token_step + 1 :] if step["tokens"]
         ]
+        decode_tokens = sum(step["tokens"] for step in steps[first_token_step + 1 :])
         report.update(
             {
                 "prompt_tokens": len(media.token_ids),
@@ -325,7 +326,9 @@ def smoke_test(
                 ),
                 "step_ms": steps,
                 "ttft_ms": sum(step["ms"] for step in steps[: first_token_step + 1]),
-                "mean_tpot_ms": sum(decode_ms) / len(decode_ms) if decode_ms else 0.0,
+                "mean_tpot_ms": (
+                    sum(decode_ms) / decode_tokens if decode_tokens else 0.0
+                ),
                 "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                 "prefix_cache": engine.prefix_cache_stats,
                 "cuda_graphs": runner.cuda_graph_stats,
@@ -433,7 +436,7 @@ def _serve() -> None:
     from resin.server import HttpServer
     from resin_models_cuda.gemma4 import Gemma4Codec
 
-    torch, runner, processor, engine, _ = _build_runtime()
+    torch, runner, processor, engine, _ = _build_runtime(speculative_tokens=3)
     try:
         # Compile/load every exact kernel geometry before opening the socket.
         warmup, _, _ = _generate(engine, processor, "Name the main colors.", 2)

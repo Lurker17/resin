@@ -68,7 +68,15 @@ class TensorStager:
         staged = []
         try:
             for name, target in targets.items():
-                source = self.host(name, values[name], target.dtype).view(target.shape)
+                value = values[name]
+                if isinstance(value, getattr(torch, "Tensor", ())):
+                    if value.shape != target.shape or value.dtype != target.dtype:
+                        raise StagingError(
+                            f"device input {name!r} does not match its graph buffer"
+                        )
+                    source = value
+                else:
+                    source = self.host(name, value, target.dtype).view(target.shape)
                 staged.append((name, target, source))
         except Exception as error:
             self.host_tensors.clear()

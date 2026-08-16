@@ -99,6 +99,8 @@ class _Cuda:
 
 
 class _Torch:
+    Tensor = _Tensor
+
     def __init__(self):
         self.cuda = _Cuda()
 
@@ -197,6 +199,21 @@ class TestCudaGraph:
         graphs.capture((1, 4), {"value": [7]})
 
         assert len(prepared) == 5
+
+    def test_graph_inputs_can_copy_directly_from_device_tensors(
+        self, monkeypatch
+    ) -> None:
+        torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
+
+        def build(_shape):
+            state = _Tensor([0])
+            return CudaGraphStep({"value": state}, state, lambda: None)
+
+        graphs = _cache(torch, ((1, 4),), build)
+        source = _Tensor([9])
+
+        assert graphs.capture((1, 4), {"value": source}) == [9]
 
     def test_run_never_captures_dynamically(self) -> None:
         graphs = _cache(

@@ -229,7 +229,10 @@ class CudaGraphCache:
             graph.replay()
         torch.cuda.synchronize(self.device)
         if not torch.equal(expected, step.output):
-            raise RuntimeError("CUDA graph replay differs from eager warmup")
+            raise RuntimeError(
+                "CUDA graph replay differs from eager warmup "
+                f"(expected={expected.tolist()}, actual={step.output.tolist()})"
+            )
         entry.graph = graph
         entry.captures = 1
         entry.capture_ms = (perf_counter() - started) * 1000
