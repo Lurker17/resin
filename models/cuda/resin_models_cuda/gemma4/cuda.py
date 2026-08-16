@@ -30,7 +30,14 @@ from resin.backend.cuda.graphs import (
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.loading import default_device
 from resin.backend.resources import CachePoolBinding
+from resin.backend.sampling import SAMPLING_OFFSET_STRIDE
+from resin.backend.speculative import accept_speculative_tokens
 from resin.protocols import SyncRunner
+from resin_models_cuda.gemma4.assistant_checkpoint import (
+    DEFAULT_ASSISTANT,
+    load_assistant,
+    resolve_assistant_path,
+)
 from resin_models_cuda.gemma4.checkpoint import (
     DEFAULT_MODEL,
     load_model,
@@ -48,6 +55,8 @@ from resin_models_cuda.gemma4.plan import (
     Gemma4BatchPlan,
     PagedAttentionPlan,
     build_gemma4_batch_plan,
+    expand_gemma4_decode_batch,
+    gemma4_assistant_context,
 )
 
 if TYPE_CHECKING:
@@ -178,6 +187,9 @@ class Gemma4CudaRunner(SyncRunner):
         *,
         cache_parent_capacity: int | None = None,
         revision: str | None = None,
+        assistant_model: str | Path | None = None,
+        assistant_revision: str | None = None,
+        speculative_tokens: int = 0,
         device: str | None = None,
         nvfp4_backend: str = "auto",
         cuda_graph_decode_shapes: object | None = None,
@@ -189,6 +201,13 @@ class Gemma4CudaRunner(SyncRunner):
             or cache_parent_capacity <= 0
         ):
             raise ValueError("cache_parent_capacity must be a positive integer")
+        if (
+            isinstance(speculative_tokens, bool)
+            or not isinstance(speculative_tokens, int)
+            or speculative_tokens < 0
+            or speculative_tokens > 8
+        ):
+            raise ValueError("speculative_tokens must be an integer between 0 and 8")
         self.device = torch.device(device or default_device(torch, require_cuda=True))
         if self.device.type != "cuda":
             raise RuntimeError("Gemma4CudaRunner requires CUDA")
@@ -209,6 +228,27 @@ class Gemma4CudaRunner(SyncRunner):
         self._model.prepare_attention()
         prepare_nvfp4_modules(self._model, nvfp4_backend)
         self.nvfp4_backend = nvfp4_backend
+        self.speculative_tokens = speculative_tokens
+        self._assistant = None
+        self.assistant_path: Path | None = None
+        if speculative_tokens:
+            selected_assistant = assistant_model or DEFAULT_ASSISTANT
+            self.assistant_path = resolve_assistant_path(
+                selected_assistant, assistant_revision
+            )
+            self._assistant, assistant_config = load_assistant(
+                self.assistant_path, device=self.device
+            )
+            if assistant_config.backbone_hidden_size != self.config.hidden_size:
+                raise ValueError(
+                    "assistant backbone width does not match Gemma 4 target"
+                )
+            if assistant_config.vocab_size != self.config.vocab_size:
+                raise ValueError("assistant vocabulary does not match Gemma 4 target")
+        self._speculative_blocks = 0
+        self._speculative_drafts = 0
+        self._speculative_accepted = 0
+        self._speculative_emitted = 0
         self._graph_attention: dict[GraphShape, tuple[Any, Any]] = {}
         torch.cuda.synchronize(self.device)
         free_memory, total_memory = torch.cuda.mem_get_info(self.device)
@@ -261,6 +301,7 @@ class Gemma4CudaRunner(SyncRunner):
             max_batch_tokens=PREFILL_CHUNK_SIZE,
             prefill_chunk_size=PREFILL_CHUNK_SIZE,
             continuation_prefill=True,
+            cache_write_lookahead_tokens=speculative_tokens,
             cache_layout=self.cache_layout,
         )
         self._binding = CachePoolBinding(self.cache_layout, resource="Gemma 4 KV")
@@ -269,6 +310,7 @@ class Gemma4CudaRunner(SyncRunner):
         )
         self._sampler = FlashInferSampler(torch)
         self._media_features: dict[int, _MediaFeatures] = {}
+        self._target_hidden: dict[int, Tensor] = {}
         self._build_attention_wrappers()
 
     @property
@@ -278,7 +320,27 @@ class Gemma4CudaRunner(SyncRunner):
     @property
     def model_memory_bytes(self) -> int:
         tensors = list(self._model.parameters()) + list(self._model.buffers())
+        if self._assistant is not None:
+            tensors += list(self._assistant.parameters()) + list(
+                self._assistant.buffers()
+            )
         return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+    @property
+    def speculative_stats(self) -> dict[str, int | float]:
+        acceptance_rate = (
+            self._speculative_accepted / self._speculative_drafts
+            if self._speculative_drafts
+            else 0.0
+        )
+        return {
+            "draft_tokens": self.speculative_tokens,
+            "blocks": self._speculative_blocks,
+            "drafts": self._speculative_drafts,
+            "accepted": self._speculative_accepted,
+            "emitted": self._speculative_emitted,
+            "acceptance_rate": acceptance_rate,
+        }
 
     @property
     def cuda_graph_stats(self) -> CudaGraphStats:
@@ -316,6 +378,7 @@ class Gemma4CudaRunner(SyncRunner):
     def release(self, request_ids: list[int]) -> None:
         for request_id in request_ids:
             self._media_features.pop(request_id, None)
+            self._target_hidden.pop(request_id, None)
 
     def _device_plan(self, plan: PagedAttentionPlan) -> _DevicePagedPlan:
         def tensor(values, dtype):
@@ -882,20 +945,7 @@ class Gemma4CudaRunner(SyncRunner):
         self._prepare_graph_attention(shape, inputs)
         return self._graphs.run(shape, inputs)[:active_rows]
 
-    @torch.inference_mode()
-    def forward(self, plan: BatchPlan) -> list[int]:
-        self._graphs.check()
-        batch = build_gemma4_batch_plan(
-            plan,
-            history_blocks_per_parent=self.config.history_blocks_per_parent,
-            parent_capacity=self.cache_parent_capacity,
-        )
-        if batch.phase == BatchPhase.DECODE:
-            graph_output = self._graph_forward(plan, batch)
-            if graph_output is not None:
-                return graph_output
-        elif self._graphs.shapes:
-            self._graphs.fallback("prefill")
+    def _eager_transformer(self, native: BatchPlan, batch: Gemma4BatchPlan) -> Tensor:
         token_ids = torch.as_tensor(
             batch.token_ids, dtype=torch.int64, device=self.device
         )
@@ -903,15 +953,14 @@ class Gemma4CudaRunner(SyncRunner):
             batch.positions, dtype=torch.int64, device=self.device
         )
         hidden = self._model.embed_tokens(token_ids)
-        features = self._merge_media_embeddings(plan, batch, hidden)
+        features = self._merge_media_embeddings(native, batch, hidden)
         local_mask = self._local_custom_mask(batch, features)
         local = self._device_plan(batch.local)
         global_ = self._device_plan(batch.global_)
         local_wrapper, global_wrapper = self._plan_attention(
             batch, local, global_, local_mask
         )
-
-        hidden = self._run_transformer(
+        return self._run_transformer(
             hidden,
             positions,
             local,
@@ -919,11 +968,135 @@ class Gemma4CudaRunner(SyncRunner):
             local_wrapper,
             global_wrapper,
         )
+
+    def _store_last_hidden(
+        self, native: BatchPlan, batch: Gemma4BatchPlan, hidden: Tensor
+    ) -> None:
+        for sequence_id, index in zip(
+            native.sequence_ids, batch.last_token_indices, strict=True
+        ):
+            self._target_hidden[int(sequence_id)] = hidden[int(index)].detach().clone()
+
+    def _sample_target(self, logits: Tensor, plan: BatchPlan, step: int) -> Tensor:
+        return self._sampler(
+            logits,
+            plan,
+            offset_delta=step * SAMPLING_OFFSET_STRIDE,
+        )
+
+    def _single_target_decode(
+        self, native: BatchPlan, batch: Gemma4BatchPlan
+    ) -> list[int]:
+        rows = native.num_sequences
+        target = expand_gemma4_decode_batch(batch, np.empty((rows, 0), dtype=np.int64))
+        hidden = self._eager_transformer(native, target)
+        self._store_last_hidden(native, target, hidden)
+        logits = self._model.logits(hidden[target.last_token_indices])
+        return self._sample_target(logits, native, 0).tolist()
+
+    def _speculative_decode(
+        self, native: BatchPlan, batch: Gemma4BatchPlan
+    ) -> list[list[int]] | list[int]:
+        assistant = self._assistant
+        if assistant is None:
+            raise RuntimeError("speculative decode requires the Gemma 4 assistant")
+        sequence_ids = [int(value) for value in native.sequence_ids]
+        if any(sequence_id not in self._target_hidden for sequence_id in sequence_ids):
+            # A complete prefix-cache hit has target K/V but no sequence-local
+            # final hidden state. Materialize it with one ordinary target step;
+            # all subsequent steps can draft normally.
+            return self._single_target_decode(native, batch)
+
+        context = gemma4_assistant_context(batch)
+        local = self._device_plan(context.local)
+        global_ = self._device_plan(context.global_)
+        local_wrapper, global_wrapper = self._plan_attention(
+            context, local, global_, custom_mask=None
+        )
+        anchors = torch.as_tensor(
+            batch.token_ids, dtype=torch.int64, device=self.device
+        )
+        positions = torch.as_tensor(
+            batch.positions, dtype=torch.int64, device=self.device
+        )
+        target_hidden = torch.stack(
+            [self._target_hidden[sequence_id] for sequence_id in sequence_ids]
+        )
+        last_ids = anchors
+        last_hidden = target_hidden
+        draft_columns = []
+        shared_local = (self._cache.local_keys[-1], self._cache.local_values[-1])
+        shared_global = (self._cache.global_keys[-1], self._cache.global_values[-1])
+        for _ in range(self.speculative_tokens):
+            token_embedding = self._model.embed_tokens(last_ids)
+            inputs_embeds = torch.cat((token_embedding, last_hidden), dim=-1)
+            draft_logits, last_hidden = assistant.forward_step(
+                inputs_embeds,
+                positions,
+                local_wrapper=local_wrapper,
+                global_wrapper=global_wrapper,
+                local_kv=shared_local,
+                global_kv=shared_global,
+            )
+            last_ids = draft_logits.argmax(dim=-1)
+            draft_columns.append(last_ids)
+        drafts = torch.stack(draft_columns, dim=1)
+
+        verify = expand_gemma4_decode_batch(batch, drafts.cpu().numpy())
+        verify_hidden = self._eager_transformer(native, verify)
+        width = self.speculative_tokens + 1
+        verify_hidden_rows = verify_hidden.view(
+            native.num_sequences, width, self.config.hidden_size
+        )
+        verify_logits = self._model.logits(verify_hidden).view(
+            native.num_sequences, width, self.config.vocab_size
+        )
+        target_columns = [
+            self._sample_target(verify_logits[:, index].contiguous(), native, index)
+            for index in range(width)
+        ]
+        acceptance = accept_speculative_tokens(
+            drafts.tolist(),
+            torch.stack(target_columns, dim=1).tolist(),
+        )
+        for row, (sequence_id, accepted) in enumerate(
+            zip(sequence_ids, acceptance.accepted_counts, strict=True)
+        ):
+            self._target_hidden[sequence_id] = (
+                verify_hidden_rows[row, accepted].detach().clone()
+            )
+        self._speculative_blocks += native.num_sequences
+        self._speculative_drafts += native.num_sequences * self.speculative_tokens
+        self._speculative_accepted += sum(acceptance.accepted_counts)
+        self._speculative_emitted += sum(map(len, acceptance.token_rows))
+        return acceptance.token_rows
+
+    @torch.inference_mode()
+    def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
+        self._graphs.check()
+        batch = build_gemma4_batch_plan(
+            plan,
+            history_blocks_per_parent=self.config.history_blocks_per_parent,
+            parent_capacity=self.cache_parent_capacity,
+            decode_lookahead=self.speculative_tokens,
+        )
+        if batch.phase == BatchPhase.DECODE:
+            if self.speculative_tokens:
+                if self._graphs.shapes:
+                    self._graphs.fallback("speculative")
+                return self._speculative_decode(plan, batch)
+            graph_output = self._graph_forward(plan, batch)
+            if graph_output is not None:
+                return graph_output
+        elif self._graphs.shapes:
+            self._graphs.fallback("prefill")
+        hidden = self._eager_transformer(plan, batch)
+        self._store_last_hidden(plan, batch, hidden)
         last = torch.as_tensor(
             batch.last_token_indices, dtype=torch.int64, device=self.device
         )
         logits = self._model.logits(hidden[last])
-        return self._sampler(logits, plan).tolist()
+        return self._sample_target(logits, plan, 0).tolist()
 
 
 __all__ = [

@@ -19,6 +19,9 @@ MODEL_REVISION = "4135a98a9b728a548947683219633b25682223ac"
 MODEL_VOLUME_NAME = "resin-gemma4-models-v1"
 MODEL_MOUNT = "/models/resin-gemma4"
 MODEL_PATH = Path(MODEL_MOUNT) / MODEL_REVISION
+ASSISTANT_ID = "google/gemma-4-31B-it-assistant"
+ASSISTANT_REVISION = "627c5ec1458b9086b841a91e0512fd31fd2fbbf1"
+ASSISTANT_PATH = Path(MODEL_MOUNT) / "assistant" / ASSISTANT_REVISION
 PROFILE_VOLUME_NAME = "resin-gemma4-profiles-v1"
 PROFILE_MOUNT = "/profiles/resin-gemma4"
 MODEL_FILES = (
@@ -32,6 +35,7 @@ MODEL_FILES = (
     "tokenizer.model",
     "tokenizer_config.json",
 )
+ASSISTANT_FILES = ("config.json", "model.safetensors")
 CUDA_GRAPH_DECODE_SHAPES = tuple((batch_size, 4096) for batch_size in (1, 2, 4, 8))
 
 image = build_modal_image(
@@ -60,7 +64,16 @@ def _inventory() -> dict[str, int]:
         not path.is_file() or path.stat().st_size <= 0 for path in required
     ):
         raise RuntimeError("the pinned Gemma 4 checkpoint is incomplete")
-    return {path.name: path.stat().st_size for path in required}
+    assistant_required = [ASSISTANT_PATH / name for name in ASSISTANT_FILES]
+    if any(
+        not path.is_file() or path.stat().st_size <= 0 for path in assistant_required
+    ):
+        raise RuntimeError("the pinned Gemma 4 assistant checkpoint is incomplete")
+    inventory = {f"target/{path.name}": path.stat().st_size for path in required}
+    inventory.update(
+        {f"assistant/{path.name}": path.stat().st_size for path in assistant_required}
+    )
+    return inventory
 
 
 def _checkpoint_size() -> int:
@@ -93,6 +106,13 @@ def download_model() -> dict[str, Any]:
             allow_patterns=list(MODEL_FILES),
             local_dir=MODEL_PATH,
         )
+        ASSISTANT_PATH.mkdir(parents=True, exist_ok=True)
+        snapshot_download(
+            repo_id=ASSISTANT_ID,
+            revision=ASSISTANT_REVISION,
+            allow_patterns=list(ASSISTANT_FILES),
+            local_dir=ASSISTANT_PATH,
+        )
         inventory = _inventory()
         model_volume.commit()
     return {
@@ -103,7 +123,9 @@ def download_model() -> dict[str, Any]:
     }
 
 
-def _build_runtime(*, static_memory_fraction: float = 0.95):
+def _build_runtime(
+    *, static_memory_fraction: float = 0.95, speculative_tokens: int = 0
+):
     import torch
     from transformers import AutoProcessor
 
@@ -114,6 +136,8 @@ def _build_runtime(*, static_memory_fraction: float = 0.95):
     load_started = time.perf_counter()
     runner = Gemma4CudaRunner(
         MODEL_PATH,
+        assistant_model=ASSISTANT_PATH if speculative_tokens else None,
+        speculative_tokens=speculative_tokens,
         cuda_graph_decode_shapes=CUDA_GRAPH_DECODE_SHAPES,
         static_memory_fraction=static_memory_fraction,
     )
@@ -142,6 +166,9 @@ def _build_runtime(*, static_memory_fraction: float = 0.95):
         "load_s": time.perf_counter() - load_started,
         "capacity": asdict(capacity),
         "checkpoint_bytes": _checkpoint_size(),
+        "assistant_checkpoint_bytes": (
+            (ASSISTANT_PATH / "model.safetensors").stat().st_size
+        ),
         "actual_model_bytes": runner.model_memory_bytes,
         "device": torch.cuda.get_device_name(0),
         "capability": torch.cuda.get_device_capability(0),
@@ -257,8 +284,12 @@ def _text_batch(
     timeout=8 * 60 * 60,
     single_use_containers=True,
 )
-def smoke_test(max_new_tokens: int = 16) -> dict[str, Any]:
-    torch, runner, processor, engine, report = _build_runtime()
+def smoke_test(
+    max_new_tokens: int = 16, *, speculative_tokens: int = 0
+) -> dict[str, Any]:
+    torch, runner, processor, engine, report = _build_runtime(
+        speculative_tokens=speculative_tokens
+    )
     try:
         warmup_started = time.perf_counter()
         _, _, warmup_steps = _generate(
@@ -298,6 +329,7 @@ def smoke_test(max_new_tokens: int = 16) -> dict[str, Any]:
                 "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                 "prefix_cache": engine.prefix_cache_stats,
                 "cuda_graphs": runner.cuda_graph_stats,
+                "speculative": runner.speculative_stats,
             }
         )
         return report
@@ -445,6 +477,12 @@ def main(mode: str = "smoke", max_new_tokens: int = 16) -> None:
         print(json.dumps(download_model.remote(), indent=2))
     elif mode == "smoke":
         print(json.dumps(smoke_test.remote(max_new_tokens), indent=2))
+    elif mode == "spec-smoke":
+        print(
+            json.dumps(
+                smoke_test.remote(max_new_tokens, speculative_tokens=3), indent=2
+            )
+        )
     elif mode == "profile":
         print(json.dumps(shape_profile.remote(), indent=2))
     elif mode == "trace":
@@ -457,5 +495,6 @@ def main(mode: str = "smoke", max_new_tokens: int = 16) -> None:
         )
     else:
         raise ValueError(
-            "mode must be 'download', 'smoke', 'profile', 'trace', or 'trace-lite'"
+            "mode must be 'download', 'smoke', 'spec-smoke', 'profile', "
+            "'trace', or 'trace-lite'"
         )
