@@ -10,6 +10,11 @@ do not recreate those policies in the forward pass.
 - Write persistent kernels whose work is bounded by runtime metadata. Attention
   must not specialize or do useful work up to the configured maximum sequence
   length, and MoE kernels must not specialize on the current token count.
+- A persistent kernel still needs an explicit, testable work-distribution
+  scheme. Do not replace a correct fixed tile grid with a runtime loop merely
+  to reduce dispatch geometry; prove that every tile is visited exactly once
+  at the minimum, boundary, and maximum logical lengths. A fixed maximum grid
+  whose programs immediately mask inactive tiles is often the safer baseline.
 - Do not make batch size 1 a separate architecture. A small number of measured
   batch regimes is acceptable when the implementation genuinely changes, such
   as switching tiny projections to a TinyGEMM path.
@@ -45,6 +50,10 @@ do not recreate those policies in the forward pass.
 - Preserve numerical intent when fusing: accumulation dtype, quantization scale
   layout, causal masking, top-k sentinel handling, and collective placement are
   part of model correctness.
+- Sort or compact sparse-selection candidates before converting logical
+  indices to physical cache rows. Padding sentinels such as `-inf` must never
+  displace a finite candidate because a top-k primitive returns an unspecified
+  order. Test histories with fewer valid entries than the configured top-k.
 
 ## CUDA graphs
 
@@ -59,9 +68,12 @@ Use graph variants only for a small number of measured execution regimes, not
 as a lookup table for sequence lengths.
 
 Test eager-versus-graph output parity, repeated replay, the largest supported
-shape, and transitions across any graph regime boundary. A replay failure
-poisons the runner; never silently fall back after the GPU may have accepted
-work.
+shape, and transitions across any graph regime boundary. Do not validate only
+the synthetic positions used during capture: replay the same graph at short,
+tile-boundary, page-boundary, recurrent-checkpoint, and near-capacity history
+lengths. Long-context bugs can remain invisible when capture always starts at
+position one. A replay failure poisons the runner; never silently fall back
+after the GPU may have accepted work.
 
 ## Paged state and prefix reuse
 
@@ -107,8 +119,11 @@ Before publishing a runner:
    shape-specialized compilation required by the first.
 3. Verify CUDA graph capture/replay and prefix-cache parity across page and
    recurrent-state boundaries.
-4. Stress multiple requests, cancellation, EOS, cache pressure, and page reuse.
-5. Record TTFT, output tok/s, speculative acceptance, phase timings, and a
+4. Include a deterministic long-form oracle, such as an exact count or copied
+   token pattern, that crosses many attention tiles and must terminate with EOS.
+   Short conversational answers are too forgiving to expose cache-index drift.
+5. Stress multiple requests, cancellation, EOS, cache pressure, and page reuse.
+6. Record TTFT, output tok/s, speculative acceptance, phase timings, and a
    Perfetto trace. Compare kernel dispatches with the fastest trusted runner.
-6. Warm every unavoidable library/kernel regime during startup, then confirm a
+7. Warm every unavoidable library/kernel regime during startup, then confirm a
    warm server has no lazy compilation stalls.
