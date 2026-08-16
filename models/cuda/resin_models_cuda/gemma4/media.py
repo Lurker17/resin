@@ -191,7 +191,11 @@ class Gemma4Media:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
+        processor_kwargs: dict[str, Any] | None = None,
     ) -> Gemma4Media:
+        template_kwargs = {}
+        if processor_kwargs is not None:
+            template_kwargs["processor_kwargs"] = processor_kwargs
         output = processor.apply_chat_template(
             messages,
             tools=tools,
@@ -199,6 +203,7 @@ class Gemma4Media:
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
+            **template_kwargs,
         )
         return cls.from_processor_output(output)
 
@@ -212,23 +217,16 @@ class Gemma4Media:
     ) -> Gemma4Media:
         """Build media from canonical RGB/HWC float32 arrays in ``[0, 1]``."""
 
-        owned = [_normalized_rgb(image, index) for index, image in enumerate(images)]
+        owned = [canonical_rgb_image(image, index=index) for index, image in enumerate(images)]
         if not owned:
             raise ValueError("images must not be empty")
-        content = [
-            {"type": "image", "image": image}
-            for image in owned
-        ]
+        content = [{"type": "image", "image": image} for image in owned]
         content.append({"type": "text", "text": prompt})
-        output = processor.apply_chat_template(
+        return cls.from_messages(
+            processor,
             [{"role": "user", "content": content}],
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
             processor_kwargs={"do_rescale": False},
         )
-        return cls.from_processor_output(output)
 
     @classmethod
     def from_bytes(
@@ -261,7 +259,9 @@ def _single_row(value: Any, name: str) -> Tensor:
     return tensor[0].to(torch.int64)
 
 
-def _normalized_rgb(image: np.ndarray, index: int) -> np.ndarray:
+def canonical_rgb_image(image: np.ndarray, *, index: int = 0) -> np.ndarray:
+    """Validate and own one float32 RGB/HWC image in ``[0, 1]``."""
+
     if not isinstance(image, np.ndarray):
         raise TypeError(f"images[{index}] must be a numpy array")
     if image.dtype != np.float32:
@@ -311,4 +311,4 @@ def _cache_identity(media: Gemma4Media, digest: str) -> tuple[int, ...]:
     return tuple(identity)
 
 
-__all__ = ["Gemma4Media", "decode_image"]
+__all__ = ["Gemma4Media", "canonical_rgb_image", "decode_image"]
