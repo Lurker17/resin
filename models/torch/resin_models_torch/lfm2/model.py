@@ -180,8 +180,7 @@ class Attention(nn.Module):
             )
             key_positions = torch.arange(max_length, device=hidden.device)
             mask = (
-                key_positions[None, None, None, :]
-                < cache_lengths[:, None, None, None]
+                key_positions[None, None, None, :] < cache_lengths[:, None, None, None]
             )
         output = F.scaled_dot_product_attention(
             queries,
@@ -229,9 +228,7 @@ class ShortConv(nn.Module):
         )
         return self.out_proj(gate_c * output.transpose(1, 2))
 
-    def forward_batch(
-        self, hidden: Tensor, states: list[RecurrentState]
-    ) -> Tensor:
+    def forward_batch(self, hidden: Tensor, states: list[RecurrentState]) -> Tensor:
         """Decode one token for each independently cached sequence."""
 
         batch, length, _ = hidden.shape

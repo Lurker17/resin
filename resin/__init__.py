@@ -11,6 +11,7 @@ from resin._resin import (
     CacheGroupLayout,
     CacheGroupPlan,
     CacheLayout,
+    CacheRetention,
     Engine,
     RequestLease,
     ResourceBinding,
@@ -24,7 +25,13 @@ from resin._resin import (
     __version__,
     mint_state_mapping_arena_id,
 )
-from resin.protocols import AsyncRunner, ResourceRunner, Runner, SyncRunner
+from resin.protocols import (
+    AsyncRunner,
+    ConversationCodec,
+    ResourceRunner,
+    Runner,
+    SyncRunner,
+)
 
 __all__ = [
     "BatchPhase",
@@ -32,6 +39,8 @@ __all__ = [
     "CacheGroupLayout",
     "CacheGroupPlan",
     "CacheLayout",
+    "CacheRetention",
+    "ConversationCodec",
     "Engine",
     "ResourceBinding",
     "RequestLease",

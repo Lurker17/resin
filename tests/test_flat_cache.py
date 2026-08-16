@@ -8,6 +8,7 @@ from resin import (
     CacheGroupLayout,
     CacheGroupPlan,
     CacheLayout,
+    CacheRetention,
     Engine,
     ResourceBinding,
     RunnerConfig,
@@ -76,17 +77,17 @@ class TestFlatCacheApi:
 
     def test_cache_retention_is_only_history_or_window(self) -> None:
         history = CacheGroupLayout(4)
-        window = CacheGroupLayout(4, retention="window", window_tokens=4)
+        window = CacheGroupLayout(4, retention=CacheRetention.WINDOW, window_tokens=4)
 
-        assert history.retention == "history"
+        assert history.retention is CacheRetention.HISTORY
         assert history.window_tokens is None
-        assert window.retention == "window"
+        assert window.retention is CacheRetention.WINDOW
         assert window.window_tokens == 4
         with pytest.raises(AttributeError):
             _ = history.resident_blocks
         with pytest.raises(TypeError, match="resident_blocks"):
             CacheGroupLayout(4, resident_blocks=1)
-        with pytest.raises(ValueError, match="'history' or 'window'"):
+        with pytest.raises(TypeError):
             CacheGroupLayout(4, retention="state")
 
     def test_manual_sparse_group_plan_is_the_only_batch_cache_metadata(self) -> None:
@@ -203,6 +204,10 @@ class TestFlatCacheEngine:
         assert reused.context_lengths == [4]
         assert second.done
 
+        engine.clear_prefix_cache()
+        assert engine.prefix_cache_stats == (0, 1, 1, 2)
+        assert engine.cache_occupied_block_count == 0
+
     def test_prefix_cache_is_disabled_by_default(self) -> None:
         runner = RecordingCachedRunner(CacheLayout(2, [CacheGroupLayout(2)]))
         engine = Engine(runner)
@@ -317,7 +322,7 @@ class TestFlatCacheEngine:
     ) -> None:
         layout = CacheLayout(
             4,
-            [CacheGroupLayout(4, retention="window", window_tokens=12)],
+            [CacheGroupLayout(4, retention=CacheRetention.WINDOW, window_tokens=12)],
         )
         runner = RecordingCachedRunner(layout)
         engine = Engine(runner)

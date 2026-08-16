@@ -250,7 +250,7 @@ pages become immutable readers, and Window pages are copied on write when a
 request advances its ring. LRU entries use spare capacity in the same physical
 pool and are evicted when live allocation needs their pages or state slots.
 
-Recurrent model state is a separate `StatePool` resource. A mapped runner may
+Request-sized recurrent model state is a separate `StatePool` resource. A mapped runner may
 omit both the pool and request handles: Engine sizes the pool from the running
 limit, allocates slots at admission, and emits their indices in `BatchPlan`.
 Explicit handles remain available for shared-state requests. Prefix reuse is
@@ -261,7 +261,7 @@ runner copies that checkpoint before updating its private destination. LFM2
 uses this contract for convolution state while sharing its attention pages.
 
 Implemented runner modules include a synchronous LFM2 reference and local CUDA
-implementations for LFM2 and GPT-OSS. The GPT-OSS CUDA path uses one
+implementations for LFM2, GPT-OSS, and DeepSeek-V4-Flash. The GPT-OSS CUDA path uses one
 History group and one Window group over the flat pool. Its deployment harness
 supports intra-container tensor parallel sizes 1, 2, 4, and 8, with matching
 multi-H200 allocations and reusable distributed decode CUDA graphs. Attention
@@ -272,13 +272,19 @@ The LFM2 CUDA runner has one route: atomic cache-plus-state binding followed by
 asynchronous dispatch/poll. Its continuation harness uses native Engine plans;
 there is no parallel manual-plan or synchronous compatibility path.
 
+DeepSeek-V4 uses six logical groups over one fungible physical parent pool:
+sliding attention KV, c4 compressed history, the c4 compressor tail, c128
+compressed history, the c128 compressor tail, and the c4 indexer tail. Smaller
+groups use power-of-two child packing, while the parent count is computed from
+post-load free VRAM and a configurable memory-utilization target. Compressor
+tails are cache-like rolling token rows rather than whole-request checkpoints,
+so aligned prefix snapshots share them exactly like attention pages. The Modal
+web deployment enables the native exact-token LRU prefix cache.
+
 Current limits include one in-flight batch per Engine, no prefill/decode
 disaggregation, no expert parallel or data-parallel attention, and no
 multi-node serving. Tensor parallelism remains a model-backend concern rather
-than part of the native scheduler. DeepSeek-V4 still keeps its heterogeneous
-compressed, sliding-window, and recurrent state in compact runner-owned rows;
-moving those rows behind Engine-issued state/page indices is required before
-its web deployment can safely enable the same prefix cache.
+than part of the native scheduler.
 
 ## Public surface
 

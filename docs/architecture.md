@@ -101,7 +101,7 @@ CacheGroupLayout(
     block_tokens,
     *,
     blocks_per_parent=1,
-    retention="history",          # "history" or "window"
+    retention=CacheRetention.HISTORY,
     window_tokens=None,
 )
 

@@ -1,15 +1,15 @@
 """Native DeepSeek-V4-Flash-0731 execution on Blackwell with TP sharding.
 
 Resin owns the model hierarchy, kernels, request lifetime, sampling, and
-scheduling. Sequence state occupies compact runner-owned rows; a later
-DP-attention/prefix-cache implementation can replace that state contract
-without treating compressed and recurrent state as fungible pages.
+scheduling. SWA, compressed history, and recurrent compressor tails are
+logical cache groups backed by one fungible Engine-owned parent pool.
 """
 
 from __future__ import annotations
 
 import json
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from resin import BatchPhase, RunnerConfig
+from resin import BatchPhase, ResourceBinding, RunnerConfig
 from resin.backend.checks import positions as check_positions
 from resin.backend.checks import token_ids as check_token_ids
 from resin.backend.cuda.graphs import (
@@ -33,8 +33,16 @@ from resin.backend.cuda.sampling import (
     FlashInferSampler,
     SamplingTensors,
 )
+from resin.backend.cuda.staging import TensorStager
 from resin.backend.speculative import accept_speculative_tokens
 from resin.protocols import SyncRunner
+from resin_models_cuda.deepseek_v4.cache import (
+    GRAPH_SCRATCH_PARENTS,
+    CacheArena,
+    CacheGeometry,
+    build_cache_plan,
+    plan_cache_capacity,
+)
 from resin_models_cuda.deepseek_v4.checkpoint import (
     load_config,
     resolve_model_path,
@@ -66,10 +74,12 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         max_batch_size: int = 1,
         tensor_parallel: TensorParallelContext,
         device: str | torch.device | None = None,
-        cuda_graph_decode_shapes: object = None,
+        cuda_graph_decode_shapes: object | None = None,
         fast_allreduce: bool = True,
         speculative_tokens: int = 0,
         profile_graph_phases: bool = False,
+        gpu_memory_utilization: float = 0.95,
+        cache_parent_capacity: int | None = None,
     ) -> None:
         if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, int):
             raise ValueError("max_seq_len must be a positive integer")
@@ -89,6 +99,14 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             raise ValueError("speculative_tokens must be a non-negative integer")
         if not torch.cuda.is_available():
             raise RuntimeError("DeepSeekV4FlashCudaRunner requires CUDA")
+        if not 0 < gpu_memory_utilization < 1:
+            raise ValueError("gpu_memory_utilization must be between zero and one")
+        if cache_parent_capacity is not None and (
+            isinstance(cache_parent_capacity, bool)
+            or not isinstance(cache_parent_capacity, int)
+            or cache_parent_capacity <= 0
+        ):
+            raise ValueError("cache_parent_capacity must be a positive integer")
 
         self.tensor_parallel = tensor_parallel
         self.tensor_parallel_rank = tensor_parallel.rank
@@ -127,13 +145,10 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         self.profile_graph_phases = profile_graph_phases
         self._dspark_phase_events: dict[GraphShape, tuple[torch.cuda.Event, ...]] = {}
         self._last_dspark_phase_ms: dict[str, float] | None = None
-        self.runner_config = RunnerConfig(
-            max_batch_tokens=max_batch_size * max_seq_len,
-        )
+        self._graph_device_caches = {}
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = 1
         self._sampler = FlashInferSampler(torch)
-        self._active_sequence_ids: list[int] = []
         self._speculative_blocks = 0
         self._speculative_drafts = 0
         self._speculative_accepted = 0
@@ -240,6 +255,58 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             if isinstance(module, native_model.MoE):
                 module.prepare_fused_weights()
 
+        self.cache_geometry = CacheGeometry.build(
+            args.compress_ratios,
+            target_layers=args.n_layers,
+            dspark_layers=args.n_mtp_layers,
+            window_size=args.window_size,
+            decode_input_tokens=max(1, speculative_tokens + 1),
+        )
+        torch.cuda.synchronize(self.device)
+        free_memory, total_memory = torch.cuda.mem_get_info(self.device)
+        capacity_plan = plan_cache_capacity(
+            total_memory,
+            free_memory,
+            gpu_memory_utilization,
+            self.cache_geometry,
+            reserved_parent_count=1 + GRAPH_SCRATCH_PARENTS,
+        )
+        local_capacity = capacity_plan.parent_capacity
+        if cache_parent_capacity is not None:
+            local_capacity = min(local_capacity, cache_parent_capacity)
+        if self.tensor_parallel.enabled:
+            capacity_tensor = torch.tensor(
+                local_capacity, dtype=torch.int64, device=self.device
+            )
+            dist.all_reduce(
+                capacity_tensor,
+                op=dist.ReduceOp.MIN,
+                group=self.tensor_parallel.process_group,
+            )
+            local_capacity = int(capacity_tensor.item())
+        self.cache_capacity_plan = replace(
+            capacity_plan,
+            parent_capacity=local_capacity,
+            allocation_bytes=(local_capacity + capacity_plan.reserved_parent_count)
+            * capacity_plan.bytes_per_parent,
+        )
+        self.cache_layout = self.cache_geometry.layout(local_capacity)
+        self._cache = CacheArena(
+            torch,
+            self.device,
+            self.cache_layout,
+            self.cache_geometry,
+            dtype=torch.bfloat16,
+        )
+        self._model.bind_cache_arena(self._cache)
+        self.runner_config = RunnerConfig(
+            max_batch_tokens=max_batch_size * max_seq_len,
+            prefill_chunk_size=max_seq_len,
+            continuation_prefill=True,
+            cache_write_lookahead_tokens=speculative_tokens,
+            cache_layout=self.cache_layout,
+        )
+
     @property
     def cuda_graph_stats(self) -> CudaGraphStats:
         return self._graphs.stats
@@ -267,6 +334,23 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             return None
         return dict(self._last_dspark_phase_ms)
 
+    def bind_resources(self, binding: ResourceBinding) -> None:
+        """Permanently bind the packed allocation to the Engine cache pool."""
+
+        if binding.cache_pool_id is None or binding.cache_layout is None:
+            raise ValueError("DeepSeek-V4 requires managed cache resources")
+        if binding.state_pool_id is not None:
+            raise ValueError("DeepSeek-V4 recurrent state is part of the cache pool")
+        self._cache.bind(binding.cache_pool_id, binding.cache_layout)
+
+    def _cache_plan(self, plan: BatchPlan):
+        self._cache.check(plan)
+        return build_cache_plan(
+            plan,
+            self.cache_layout,
+            decode_lookahead=self.speculative_tokens,
+        )
+
     @staticmethod
     def _graph_capture_inputs(
         shape: GraphShape, vocab_size: int = 129_280
@@ -276,7 +360,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         batch_size, sequence_capacity = shape
         if sequence_capacity < 2:
             raise ValueError("DeepSeek-V4 decode graphs require capacity >= 2")
-        return {
+        inputs = {
             "token_ids": (0,) * batch_size,
             "positions": (1,) * batch_size,
             "sampling_temperatures": (1.0,) * batch_size,
@@ -286,58 +370,12 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             "sampling_offsets": (0,) * batch_size,
             "sampling_stochastic_mask": (False,) * batch_size,
         }
-
-    def _sequence_state_buffers(self) -> Iterator[tuple[str, torch.Tensor]]:
-        """Yield the model buffers whose first dimension is a sequence row."""
-
-        suffixes = ("kv_cache", "kv_state", "score_state")
-        for name, buffer in self._model.named_buffers():
-            if name.endswith(suffixes) and buffer.shape[0] == self.max_batch_size:
-                yield name, buffer
+        return inputs
 
     def _reset_model_state(self) -> None:
-        """Restore static recurrent/cache buffers before a new sequence."""
+        """Restore the graph-only null parent after synthetic writes."""
 
-        with torch.no_grad():
-            for name, buffer in self._sequence_state_buffers():
-                if name.endswith("score_state"):
-                    buffer.fill_(float("-inf"))
-                else:
-                    buffer.zero_()
-
-    def _compact_model_state(self, source_rows: tuple[int, ...]) -> None:
-        """Move surviving sequence rows to a dense prefix in stable order."""
-
-        with torch.no_grad():
-            for name, buffer in self._sequence_state_buffers():
-                for destination, source in enumerate(source_rows):
-                    if destination != source:
-                        buffer[destination].copy_(buffer[source])
-                inactive = buffer[len(source_rows) :]
-                if name.endswith("score_state"):
-                    inactive.fill_(float("-inf"))
-                else:
-                    inactive.zero_()
-
-    def _copy_model_state_row(self, source: int, destination: int) -> None:
-        """Copy one complete sequence row after a ragged single-row prefill."""
-
-        if source == destination:
-            return
-        with torch.no_grad():
-            for _, buffer in self._sequence_state_buffers():
-                buffer[destination].copy_(buffer[source])
-
-    def _swap_model_state_rows(self, left: int, right: int) -> None:
-        """Swap two sequence rows while preserving every recurrent buffer."""
-
-        if left == right:
-            return
-        with torch.no_grad():
-            for _, buffer in self._sequence_state_buffers():
-                temporary = buffer[left].clone()
-                buffer[left].copy_(buffer[right])
-                buffer[right].copy_(temporary)
+        self._cache.initialize_state_sentinels()
 
     def capture_cuda_graphs(self) -> CudaGraphStats:
         """Capture configured decode capacities before accepting requests."""
@@ -345,9 +383,11 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         captured = set(self._graphs.stats["captured_shapes"])
         for shape in self._graphs.shapes:
             if shape not in captured:
-                self._graphs.capture(
-                    shape, self._graph_capture_inputs(shape, self.vocab_size)
+                inputs = self._graph_capture_inputs(shape, self.vocab_size)
+                inputs.update(
+                    self._cache.graph_shape_capture_inputs(shape[0], shape[1])
                 )
+                self._graphs.capture(shape, inputs)
         if self._graphs.shapes:
             self._reset_model_state()
             torch.cuda.synchronize(self.device)
@@ -357,6 +397,8 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         if self.speculative_tokens:
             return self._new_dspark_graph_step(shape)
         batch_size, graph_seq_len = shape
+        cache = self._cache.graph_cache(batch_size, graph_seq_len)
+        self._graph_device_caches[shape] = cache
         token_ids = torch.empty((batch_size, 1), dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
         output_ids = torch.empty(batch_size, dtype=torch.long, device=self.device)
@@ -368,6 +410,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
                     token_ids,
                     positions,
                     graph_seq_len,
+                    cache=cache,
                 )
                 self._sampler.sample_tensors(logits, sampling, out=output_ids)
                 if self.tensor_parallel.enabled:
@@ -378,11 +421,19 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
                     )
 
         inputs = {"token_ids": token_ids, "positions": positions}
+        inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(self._sampler.graph_inputs(sampling))
-        return CudaGraphStep(inputs=inputs, output=output_ids, launch=launch)
+        return CudaGraphStep(
+            inputs=inputs,
+            output=output_ids,
+            launch=launch,
+            prepare=self._reset_model_state,
+        )
 
     def _new_dspark_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         batch_size, graph_seq_len = shape
+        cache = self._cache.graph_cache(batch_size, graph_seq_len)
+        self._graph_device_caches[shape] = cache
         block_size = self.speculative_tokens
         token_ids = torch.empty((batch_size, 1), dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
@@ -416,12 +467,14 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             with _default_dtype(torch.bfloat16), torch.device(self.device):
                 if phase_events is not None:
                     phase_events[0].record()
-                drafts = self._broadcast_tokens(self._model.draft(token_ids, positions))
+                drafts = self._broadcast_tokens(
+                    self._model.draft(token_ids, positions, cache=cache)
+                )
                 if phase_events is not None:
                     phase_events[1].record()
                 verify_ids = torch.cat((token_ids, drafts), dim=1)
                 verify_logits, verify_hidden = self._model.forward_verify(
-                    verify_ids, positions, graph_seq_len
+                    verify_ids, positions, graph_seq_len, cache=cache
                 )
                 if phase_events is not None:
                     phase_events[2].record()
@@ -429,7 +482,9 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
                     raise RuntimeError(
                         "target did not produce DSpark verification states"
                     )
-                self._model.commit_dspark_main_block(verify_hidden, positions)
+                self._model.commit_dspark_main_block(
+                    verify_hidden, positions, cache=cache
+                )
                 output_ids[:, :block_size].copy_(drafts)
                 for index in range(block_size + 1):
                     output_ids[:, block_size + index].copy_(
@@ -439,6 +494,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
                     phase_events[3].record()
 
         inputs = {"token_ids": token_ids, "positions": positions}
+        inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(self._sampler.graph_inputs(sampling))
         return CudaGraphStep(
             inputs=inputs,
@@ -447,34 +503,31 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             prepare=self._reset_model_state,
         )
 
-    def _graph_forward(self, plan: BatchPlan) -> list[int] | list[list[int]] | None:
+    def _graph_forward(
+        self, plan: BatchPlan, cache_plan
+    ) -> list[int] | list[list[int]] | None:
         if not self._graphs.shapes:
             return None
         batch_size = plan.num_sequences
         sequence_length = max(plan.positions) + 1
         shape = self._graphs.match(
             lambda candidate: (
-                candidate[0] >= batch_size and candidate[1] >= sequence_length
+                candidate[0] >= batch_size
+                and candidate[1] >= sequence_length + self.speculative_tokens
             )
         )
         if shape is None:
             self._graphs.fallback("shape")
             return None
-        if shape[0] > batch_size and len(self._active_sequence_ids) > batch_size:
-            # Dense-row graphs mutate every captured row, including padding.
-            # Until DeepSeek uses Engine-issued cache pages, a padded row may
-            # still belong to an active request omitted from this batch. Never
-            # let synthetic graph inputs corrupt that request's persistent KV
-            # or compressor state.
-            self._graphs.fallback("occupied_padding")
-            return None
-        padding = shape[0] - batch_size
+        padding_rows = shape[0] - batch_size
         inputs: dict[str, object] = {
-            "token_ids": tuple(plan.token_ids) + (0,) * padding,
-            "positions": tuple(plan.positions) + (1,) * padding,
+            "token_ids": (*plan.token_ids, *((0,) * padding_rows)),
+            "positions": (*plan.positions, *((1,) * padding_rows)),
         }
+        graph_cache = self._graph_device_caches[shape]
+        inputs.update(self._cache.graph_plan_inputs(graph_cache, cache_plan))
         sampling_inputs = self._sampler.host_inputs(plan, self.vocab_size)
-        sampling_padding = {
+        padding_defaults = {
             "sampling_temperatures": 1.0,
             "sampling_top_ps": 1.0,
             "sampling_top_ks": self.vocab_size,
@@ -482,12 +535,12 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             "sampling_offsets": 0,
             "sampling_stochastic_mask": False,
         }
-        inputs.update(
-            {
-                name: tuple(values) + (sampling_padding[name],) * padding
-                for name, values in sampling_inputs.items()
-            }
-        )
+        for name, default in padding_defaults.items():
+            sampling_inputs[name] = (
+                *sampling_inputs[name],
+                *((default,) * padding_rows),
+            )
+        inputs.update(sampling_inputs)
         output = self._graphs.run(shape, inputs)[:batch_size]
         phase_events = self._dspark_phase_events.get(shape)
         if phase_events is not None:
@@ -507,6 +560,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             drafts,
             targets,
             torch.tensor(plan.positions, dtype=torch.long, device=self.device),
+            graph_cache,
         )
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
@@ -536,66 +590,63 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
                 raise ValueError("DeepSeek-V4 positions must continue each row context")
 
         if plan.phase == BatchPhase.PREFILL:
-            if any(context != 0 for context in plan.context_lengths):
-                raise ValueError("DeepSeek-V4 does not support continuation prefill")
-            if row_count + len(self._active_sequence_ids) > self.max_batch_size:
-                raise ValueError("DeepSeek-V4 prefill exceeds runner batch capacity")
-            if set(plan.sequence_ids) & set(self._active_sequence_ids):
-                raise ValueError("DeepSeek-V4 prefill sequence is already active")
+            pass
         elif plan.phase == BatchPhase.DECODE:
             if any(end - start != 1 for start, end in rows):
                 raise ValueError("DeepSeek-V4 decode rows must contain one token")
-            if list(plan.sequence_ids) != self._active_sequence_ids[:row_count]:
-                raise ValueError("DeepSeek-V4 decode rows do not own compact state")
         else:
             raise ValueError("DeepSeek-V4 plan phase must be prefill or decode")
         return rows
 
     def _prefill(
-        self, plan: BatchPlan, rows: tuple[tuple[int, int], ...]
+        self,
+        plan: BatchPlan,
+        rows: tuple[tuple[int, int], ...],
+        cache,
     ) -> torch.Tensor:
-        """Prefill rows independently, staging their recurrent state compactly."""
+        """Prefill fresh prompts eagerly and replay only a restored suffix."""
 
-        logits: list[torch.Tensor | None] = [None] * len(rows)
-        active_rows = len(self._active_sequence_ids)
-        if active_rows:
-            # Target prefill uses model row zero as scratch. Preserve the active
-            # owner in each new request's destination, run that request, then
-            # swap the old and new states into their final compact rows.
-            for slot, (start, end) in enumerate(rows, start=active_rows):
-                self._copy_model_state_row(0, slot)
-                input_ids = torch.tensor(
-                    plan.token_ids[start:end], dtype=torch.long, device=self.device
-                ).unsqueeze(0)
-                if getattr(self, "speculative_tokens", 0):
-                    row_logits, main_hidden = self._model.forward_target(input_ids)
-                    if main_hidden is None:
-                        raise RuntimeError("target did not produce DSpark hidden states")
-                    self._model.prefill_dspark(main_hidden)
-                    logits[slot - active_rows] = row_logits
-                else:
-                    logits[slot - active_rows] = self._model(input_ids)
-                self._swap_model_state_rows(0, slot)
-            return torch.cat([row for row in logits if row is not None], dim=0)
-
-        # Row zero is the model's eager single-row target. Filling slots in
-        # reverse means every completed row is copied out before row zero is
-        # reused, with the final request naturally left in slot zero.
-        for slot in reversed(range(len(rows))):
-            start, end = rows[slot]
+        logits = []
+        for slot, (start, end) in enumerate(rows):
+            row_cache = cache.row(slot)
             input_ids = torch.tensor(
                 plan.token_ids[start:end], dtype=torch.long, device=self.device
             ).unsqueeze(0)
-            if getattr(self, "speculative_tokens", 0):
-                row_logits, main_hidden = self._model.forward_target(input_ids)
-                if main_hidden is None:
-                    raise RuntimeError("target did not produce DSpark hidden states")
-                self._model.prefill_dspark(main_hidden)
-                logits[slot] = row_logits
+            context = plan.context_lengths[slot]
+            if context == 0:
+                row_logits, main_hidden = self._model.forward_target(
+                    input_ids, cache=row_cache
+                )
+                if self.speculative_tokens:
+                    if main_hidden is None:
+                        raise RuntimeError(
+                            "target did not produce DSpark hidden states"
+                        )
+                    self._model.prefill_dspark(main_hidden, cache=row_cache)
             else:
-                logits[slot] = self._model(input_ids)
-            self._copy_model_state_row(0, slot)
-        return torch.cat([row for row in logits if row is not None], dim=0)
+                row_logits = None
+                for relative, token_id in enumerate(input_ids.unbind(dim=1)):
+                    position = torch.tensor(
+                        [context + relative], dtype=torch.long, device=self.device
+                    )
+                    row_logits, main_hidden = self._model.forward_decode_target(
+                        token_id[:, None],
+                        position,
+                        context + relative + 1,
+                        cache=row_cache,
+                    )
+                    if self.speculative_tokens:
+                        if main_hidden is None:
+                            raise RuntimeError(
+                                "target did not produce DSpark hidden states"
+                            )
+                        self._model.commit_dspark_main_block(
+                            main_hidden, position, cache=row_cache
+                        )
+                if row_logits is None:
+                    raise ValueError("continuation prefill row cannot be empty")
+            logits.append(row_logits)
+        return torch.cat(logits, dim=0)
 
     def _broadcast_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
         if self.tensor_parallel.enabled:
@@ -622,6 +673,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         draft_rows: list[list[int]],
         target_rows: list[list[int]],
         positions: torch.Tensor,
+        cache,
     ) -> list[list[int]]:
         batch_size = len(draft_rows)
         acceptance = accept_speculative_tokens(draft_rows, target_rows)
@@ -634,6 +686,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             positions,
             processed_counts,
             self.speculative_tokens + 1,
+            cache=cache,
         )
         self._speculative_blocks += batch_size
         self._speculative_drafts += batch_size * self.speculative_tokens
@@ -641,7 +694,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         self._speculative_emitted += sum(map(len, acceptance.token_rows))
         return acceptance.token_rows
 
-    def _speculative_decode(self, plan: BatchPlan) -> list[list[int]]:
+    def _speculative_decode(self, plan: BatchPlan, cache) -> list[list[int]]:
         """Draft greedily and verify a fixed block against target samples."""
 
         batch_size = plan.num_sequences
@@ -650,16 +703,19 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         ).view(batch_size, 1)
         positions = torch.tensor(plan.positions, dtype=torch.long, device=self.device)
         graph_seq_len = max(plan.positions) + self.speculative_tokens + 1
-        drafts = self._broadcast_tokens(self._model.draft(anchors, positions))
+        drafts = self._broadcast_tokens(
+            self._model.draft(anchors, positions, cache=cache)
+        )
         verify_ids = torch.cat((anchors, drafts), dim=1)
         verify_logits, verify_hidden = self._model.forward_verify(
             verify_ids,
             positions,
             graph_seq_len,
+            cache=cache,
         )
         if verify_hidden is None:
             raise RuntimeError("target did not produce DSpark verification states")
-        self._model.commit_dspark_main_block(verify_hidden, positions)
+        self._model.commit_dspark_main_block(verify_hidden, positions, cache=cache)
 
         target_columns = [
             self._sample_target(verify_logits[:, index].contiguous(), plan, index)
@@ -669,6 +725,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
             drafts.tolist(),
             torch.stack(target_columns, dim=1).tolist(),
             positions,
+            cache,
         )
 
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
@@ -676,22 +733,25 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
 
         self._graphs.check()
         rows = self._validate_plan(plan)
+        cache_plan = self._cache_plan(plan)
         if plan.phase == BatchPhase.DECODE:
-            graph_output = self._graph_forward(plan)
+            graph_output = self._graph_forward(plan, cache_plan)
             if graph_output is not None:
                 return graph_output
         elif self._graphs.shapes:
             self._graphs.fallback("prefill")
         try:
+            staging = TensorStager(torch, self.device)
+            cache = self._cache.tensorize(cache_plan, staging)
             with (
                 torch.inference_mode(),
                 _default_dtype(torch.bfloat16),
                 torch.device(self.device),
             ):
                 if plan.phase == BatchPhase.PREFILL:
-                    logits = self._prefill(plan, rows)
+                    logits = self._prefill(plan, rows, cache)
                 elif self.speculative_tokens:
-                    return self._speculative_decode(plan)
+                    return self._speculative_decode(plan, cache)
                 else:
                     input_ids = torch.tensor(
                         plan.token_ids, dtype=torch.long, device=self.device
@@ -700,29 +760,19 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
                         plan.positions, dtype=torch.long, device=self.device
                     )
                     logits = self._model.forward_decode(
-                        input_ids, positions, max(plan.positions) + 1
+                        input_ids,
+                        positions,
+                        max(plan.positions) + 1,
+                        cache=cache,
                     )
                 output = self._sample_target(logits, plan, 0)
-            if plan.phase == BatchPhase.PREFILL:
-                self._active_sequence_ids.extend(plan.sequence_ids)
             return output.tolist()
         except BaseException:
             torch.cuda.synchronize(self.device)
             raise
 
     def release(self, sequence_ids: list[int]) -> None:
-        """Release rows and compact survivors without changing their order."""
-
-        retired = set(sequence_ids)
-        survivors = tuple(
-            (row, sequence_id)
-            for row, sequence_id in enumerate(self._active_sequence_ids)
-            if sequence_id not in retired
-        )
-        if len(survivors) == len(self._active_sequence_ids):
-            return
-        self._compact_model_state(tuple(row for row, _ in survivors))
-        self._active_sequence_ids = [sequence_id for _, sequence_id in survivors]
+        """Physical pages are retired by Engine after this callback returns."""
 
 
 __all__ = ["DeepSeekV4FlashCudaRunner"]

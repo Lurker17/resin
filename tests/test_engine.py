@@ -143,6 +143,40 @@ class TestEngine:
         assert runner.plans[2].positions == [4]
         assert request.take_result() == [2, 3, 4, 5, 6, 7]
 
+    def test_managed_cache_leases_declared_speculative_write_lookahead(self) -> None:
+        layout = CacheLayout(2, [CacheGroupLayout(2)])
+
+        class BlockRunner:
+            runner_config = RunnerConfig(
+                cache_layout=layout,
+                cache_write_lookahead_tokens=2,
+            )
+
+            def __init__(self) -> None:
+                self.plans: list[BatchPlan] = []
+
+            @staticmethod
+            def bind_resources(_binding: ResourceBinding) -> None:
+                return None
+
+            def forward(self, plan: BatchPlan):
+                self.plans.append(plan)
+                return [2] if plan.phase == BatchPhase.PREFILL else [[3, 4, 5]]
+
+        runner = BlockRunner()
+        assert runner.runner_config.cache_write_lookahead_tokens == 2
+        engine = Engine(runner)
+        request = engine.submit([1], max_new_tokens=4)
+
+        engine.step()
+        events = engine.step()
+
+        assert [event.token_id for event in events] == [3, 4, 5]
+        decode = runner.plans[1]
+        assert len(decode.cache_groups[0].block_ids) == 2
+        assert len(decode.cache_groups[0].append_block_ids) == 1
+        assert request.take_result() == [2, 3, 4, 5]
+
     def test_verified_block_stops_at_eos_and_discards_its_suffix(self) -> None:
         class BlockRunner:
             @staticmethod

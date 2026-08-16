@@ -9,36 +9,15 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from typing import Any, Protocol, TypedDict, runtime_checkable
+from typing import Any
 
 from resin._resin import Engine, _HttpServer
-
-
-class RenderedPrompt(TypedDict):
-    token_ids: list[int]
-    stop_token_ids: list[int]
-
-
-class ParserEvent(TypedDict, total=False):
-    type: str
-    delta: str
-    index: int
-    id: str
-    name: str
-
-
-@runtime_checkable
-class ResponseParser(Protocol):
-    def feed(self, token_ids: Sequence[int]) -> list[ParserEvent]: ...
-
-
-@runtime_checkable
-class ConversationCodec(Protocol):
-    def render(self, request: dict[str, Any]) -> RenderedPrompt: ...
-
-    def create_parser(
-        self, request: dict[str, Any], prompt_ids: Sequence[int]
-    ) -> ResponseParser: ...
+from resin.protocols import (
+    ConversationCodec,
+    ParserEvent,
+    RenderedPrompt,
+    ResponseParser,
+)
 
 
 class RendererCodec:

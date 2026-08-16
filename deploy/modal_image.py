@@ -64,11 +64,7 @@ def build_modal_image(
             "--group deployment --compile-bytecode"
         )
         .env(
-            {
-                "PATH": (
-                    f"{_DEPENDENCY_ROOT}/.venv/bin:/root/.cargo/bin:{_SYSTEM_PATH}"
-                )
-            }
+            {"PATH": (f"{_DEPENDENCY_ROOT}/.venv/bin:/root/.cargo/bin:{_SYSTEM_PATH}")}
         )
         # These accelerator-specific supplement wheels live outside PyPI.
         .uv_pip_install(

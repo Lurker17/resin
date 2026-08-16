@@ -14,7 +14,7 @@ mod planning;
 mod runner;
 mod state_pool;
 
-use cache::{CacheGroupLayout, CacheGroupPlan, CacheLayout};
+use cache::{CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention};
 use planning::{build_plan_for_engine, schedule_ready_prefix};
 use resin_core::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
 use resin_core::resources::paged_kv::{PagedKvError, PagedKvResources};
@@ -50,6 +50,7 @@ fn mint_engine_id() -> PyResult<u64> {
         .map_err(|_| PyRuntimeError::new_err("engine id space is exhausted"))
 }
 
+/// Native admission and token-budget policy for an Engine.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SchedulerConfig {
@@ -376,6 +377,19 @@ impl StateMappingConfig {
     }
 }
 
+/// Immutable Engine-issued execution plan for one homogeneous batch phase.
+///
+/// Token metadata is flattened across sequences. ``sequence_ids`` has one
+/// entry per row, while ``sequence_indptr`` is a CSR pointer array of length
+/// ``num_sequences + 1`` whose adjacent entries slice ``token_ids`` and
+/// ``positions``. ``context_lengths`` gives the resident prefix length before
+/// the scheduled slice.
+///
+/// Recurrent handles use the same row convention through ``state_indptr``.
+/// Attention placement is carried by ``cache_groups``; each CacheGroupPlan has
+/// per-sequence block-table CSR metadata and per-token append destinations.
+/// ``sample_sequence_indices`` selects rows that produce a sampled output;
+/// omitted rows only advance prefill state.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug)]
 struct BatchPlan {
@@ -767,51 +781,61 @@ impl BatchPlan {
     }
 
     #[getter]
+    /// Monotonic Engine-issued identifier for this dispatch.
     fn batch_id(&self) -> u64 {
         self.batch_id
     }
 
     #[getter]
+    /// Optional runner batching key shared by compatible plans.
     fn batch_key(&self) -> Option<u64> {
         self.batch_key
     }
 
     #[getter]
+    /// Identity of the Engine that issued this plan, when Engine-owned.
     fn engine_id(&self) -> Option<u64> {
         self.engine_id
     }
 
     #[getter]
+    /// Homogeneous execution phase for every sequence row.
     fn phase(&self) -> BatchPhase {
         self.phase
     }
 
     #[getter]
+    /// Flattened scheduled token IDs in sequence-row order.
     fn token_ids(&self) -> Vec<u32> {
         self.token_ids.clone()
     }
 
     #[getter]
+    /// Absolute position of each flattened scheduled token.
     fn positions(&self) -> Vec<u32> {
         self.positions.clone()
     }
 
     #[getter]
+    /// Stable request/sequence identifier for each batch row.
     fn sequence_ids(&self) -> Vec<u64> {
         self.sequence_ids.clone()
     }
 
     #[getter]
+    /// CSR offsets slicing flattened token arrays by sequence row.
     fn sequence_indptr(&self) -> Vec<u32> {
         self.sequence_indptr.clone()
     }
 
     #[getter]
+    /// Resident prefix-token count before each sequence's scheduled slice.
     fn context_lengths(&self) -> Vec<u32> {
         self.context_lengths.clone()
     }
 
     #[getter]
+    /// Effective sampling parameters, one per sequence row.
     fn sampling_params(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         let params = self
             .sampling_params
@@ -823,26 +847,31 @@ impl BatchPlan {
     }
 
     #[getter]
+    /// Deterministic RNG draw offset for each sequence row.
     fn sampling_offsets(&self) -> Vec<i64> {
         self.sampling_offsets.clone()
     }
 
     #[getter]
+    /// Sorted sequence-row indices that must return one sampled token.
     fn sample_sequence_indices(&self) -> Vec<u32> {
         self.sample_sequence_indices.clone()
     }
 
     #[getter]
+    /// Flattened recurrent-state slot numbers grouped by sequence row.
     fn state_slots(&self) -> Vec<u32> {
         self.state_slots.clone()
     }
 
     #[getter]
+    /// Generation counters paired elementwise with ``state_slots``.
     fn state_generations(&self) -> Vec<u64> {
         self.state_generations.clone()
     }
 
     #[getter]
+    /// ``"read"`` or ``"write"`` access mode for each recurrent-state slot.
     fn state_access_modes(&self) -> Vec<&'static str> {
         self.state_access_modes
             .iter()
@@ -851,21 +880,25 @@ impl BatchPlan {
     }
 
     #[getter]
+    /// CSR offsets slicing recurrent-state arrays by sequence row.
     fn state_indptr(&self) -> Vec<u32> {
         self.state_indptr.clone()
     }
 
     #[getter]
+    /// Identity of the Engine-owned recurrent-state pool, if present.
     fn state_pool_id(&self) -> Option<u64> {
         self.state_pool_id
     }
 
     #[getter]
+    /// Identity of the Engine-owned grouped cache pool, if present.
     fn cache_pool_id(&self) -> Option<u64> {
         self.cache_pool_id
     }
 
     #[getter]
+    /// Ordered physical placement plans corresponding to CacheLayout groups.
     fn cache_groups(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         let groups = self
             .cache_groups
@@ -877,10 +910,12 @@ impl BatchPlan {
     }
 
     #[getter]
+    /// Number of sequence rows in this plan.
     fn num_sequences(&self) -> usize {
         self.sequence_ids.len()
     }
 
+    /// Return the half-open flattened token range for one sequence row.
     fn token_range(&self, sequence_index: usize) -> PyResult<(usize, usize)> {
         if sequence_index >= self.sequence_ids.len() {
             return Err(PyValueError::new_err("sequence index is out of range"));
@@ -1806,9 +1841,18 @@ impl Engine {
         let growth_error = if let Some(resources) = self.kv_resources.as_mut() {
             let mut growth_error = None;
             for (request, row) in scheduled.iter_mut().zip(&scheduled_rows) {
-                let context = row
+                let scheduled_end = row
                     .token_end()
                     .ok_or_else(|| PyValueError::new_err("scheduled token range overflows u32"))?;
+                let context = if row.phase == Phase::Decode {
+                    scheduled_end
+                        .checked_add(self.runner_config.cache_write_lookahead_tokens)
+                        .ok_or_else(|| {
+                            PyValueError::new_err("decode cache write lookahead overflows u32")
+                        })?
+                } else {
+                    scheduled_end
+                };
                 let pages = request
                     .resources
                     .attention
@@ -1847,7 +1891,11 @@ impl Engine {
                             .expect("managed requests keep their KV resource state"),
                     })
                     .collect::<Vec<_>>();
-                match resources.acquire(&requests, &scheduled_rows) {
+                match resources.acquire(
+                    &requests,
+                    &scheduled_rows,
+                    self.runner_config.cache_write_lookahead_tokens,
+                ) {
                     Ok(acquired) => Some(acquired),
                     Err(error) => {
                         self.scheduler.restore_rejected(scheduled);
@@ -2439,6 +2487,20 @@ impl Engine {
                     .as_ref()
                     .map(StatePrefixResources::metrics)
             })
+    }
+
+    /// Drop all reusable KV prefixes and recurrent-state checkpoints.
+    fn clear_prefix_cache(&mut self, py: Python<'_>) -> PyResult<()> {
+        if let Some(resources) = self.kv_resources.as_mut() {
+            resources.clear_prefix_cache().map_err(cache_pool_error)?;
+        }
+        self.release_retired_checkpoints(py)?;
+        let state_checkpoints = self
+            .state_prefix_cache
+            .as_mut()
+            .map(StatePrefixResources::clear)
+            .unwrap_or_default();
+        self.release_state(py, &state_checkpoints)
     }
 
     #[getter]
@@ -3057,9 +3119,15 @@ impl Engine {
                 ));
             }
             if token_ids.len() > 1 && request.resources.attention.is_some() {
-                return Err(PyRuntimeError::new_err(
-                    "speculative token rows require runner-managed attention state",
-                ));
+                let maximum = usize::try_from(self.runner_config.cache_write_lookahead_tokens)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1);
+                if token_ids.len() > maximum {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "runner returned {} decode tokens but leased cache space for at most {maximum}",
+                        token_ids.len(),
+                    )));
+                }
             }
             if request.cancel_pending {
                 prepared.push(PreparedProgress {
@@ -3301,9 +3369,9 @@ fn mint_state_mapping_arena_id() -> PyResult<u64> {
 mod _resin {
     #[pymodule_export]
     use super::{
-        BatchPhase, BatchPlan, CacheGroupLayout, CacheGroupPlan, CacheLayout, Engine, RequestLease,
-        ResourceBinding, RunnerConfig, SamplingParams, SchedulerConfig, StateHandle,
-        StateMappingConfig, StatePool, TokenEvent, mint_state_mapping_arena_id,
+        BatchPhase, BatchPlan, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention,
+        Engine, RequestLease, ResourceBinding, RunnerConfig, SamplingParams, SchedulerConfig,
+        StateHandle, StateMappingConfig, StatePool, TokenEvent, mint_state_mapping_arena_id,
     };
 
     #[pymodule_export]
@@ -3360,8 +3428,8 @@ mod tests {
         CacheLayout::from_groups(
             8,
             vec![
-                CacheGroupLayout::from_parts(4, 1, "history", None).unwrap(),
-                CacheGroupLayout::from_parts(2, 2, "history", None).unwrap(),
+                CacheGroupLayout::from_parts(4, 1, CacheRetention::History, None).unwrap(),
+                CacheGroupLayout::from_parts(2, 2, CacheRetention::History, None).unwrap(),
             ],
         )
         .unwrap()
@@ -3370,7 +3438,7 @@ mod tests {
     fn window_layout() -> CacheLayout {
         CacheLayout::from_groups(
             4,
-            vec![CacheGroupLayout::from_parts(4, 1, "window", Some(4)).unwrap()],
+            vec![CacheGroupLayout::from_parts(4, 1, CacheRetention::Window, Some(4)).unwrap()],
         )
         .unwrap()
     }
@@ -3403,7 +3471,7 @@ mod tests {
             request_id: core_request_id(41),
             state: managed.resources.attention.as_ref().unwrap(),
         }];
-        let acquired = resources.acquire(&resource_refs, &rows).unwrap();
+        let acquired = resources.acquire(&resource_refs, &rows, 0).unwrap();
         let plan = build_plan(9, &scheduled, &rows, Some(&acquired.view)).unwrap();
 
         assert_eq!(plan.cache_pool_id, Some(resources.pool().id()));
@@ -3456,7 +3524,7 @@ mod tests {
             request_id: core_request_id(51),
             state: managed.resources.attention.as_ref().unwrap(),
         }];
-        let acquired = resources.acquire(&resource_refs, &rows).unwrap();
+        let acquired = resources.acquire(&resource_refs, &rows, 0).unwrap();
         let plan = build_plan(10, &scheduled, &rows, Some(&acquired.view)).unwrap();
         let window = &plan.cache_groups[0];
         assert_eq!(window.inner_native().first_logical_blocks, [1]);

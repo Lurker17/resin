@@ -62,14 +62,14 @@ image = build_modal_image(
         "TORCH_CUDA_ARCH_LIST": "10.3",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "FLASHINFER_WORKSPACE_BASE": "/kernel-cache",
-        # Keep lazy kernel work visible in Modal logs. FLASHINFER_LOGLEVEL is
-        # intentionally left disabled: API-call tracing would emit once per
-        # layer and decode step rather than only when a kernel is prepared.
+        # Keep lazy kernel work visible without DeepGEMM's per-launch debug
+        # dump. Compiler commands appear only for an actual cache miss.
         "FLASHINFER_LOGGING_LEVEL": "INFO",
         "FLASHINFER_LOG_LEVEL": "INFO",
         "CUDA_TILE_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/cutile-python",
         "DG_JIT_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/deep_gemm",
-        "DG_JIT_DEBUG": "1",
+        "DG_JIT_DEBUG": "0",
+        "DG_JIT_PRINT_COMPILER_COMMAND": "1",
         "DG_JIT_PRINT_LOAD_TIME": "1",
         "TRITON_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/triton",
         "TILELANG_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/tilelang",
@@ -302,6 +302,18 @@ def _initialize_tensor_parallel(
     )
 
 
+def _log_cache_capacity(runner) -> None:
+    cache = runner.cache_capacity_plan
+    print(
+        "[deepseek-v4] cache "
+        f"parents={runner.cache_layout.parent_capacity:,}; "
+        f"parent={cache.bytes_per_parent / 2**20:.2f} MiB; "
+        f"allocation={cache.allocation_bytes / 2**30:.2f} GiB; "
+        f"packings={runner.cache_geometry.packings}",
+        flush=True,
+    )
+
+
 def _run_rank_workload(
     rank: int,
     model_path: Path,
@@ -339,6 +351,8 @@ def _run_rank_workload(
         speculative_tokens=speculative_tokens,
         profile_graph_phases=profile,
     )
+    if rank == 0:
+        _log_cache_capacity(runner)
     torch.cuda.synchronize(runner.device)
     tensor_parallel.barrier()
     load_elapsed = time.perf_counter() - load_start
@@ -364,6 +378,7 @@ def _run_rank_workload(
         runner,
         max_running_requests=batch_size,
         context_length=context_length,
+        prefix_cache=profile,
         scheduler_config=SchedulerConfig(
             max_batch_tokens=batch_size * context_length,
             prefill_chunk_size=context_length,
@@ -376,6 +391,7 @@ def _run_rank_workload(
         profile_tables: dict[str, str] = {}
         profile_trace_files: list[dict[str, object]] = []
         profile_phase_timings: list[dict[str, float]] = []
+        prefix_cache_validation: dict[str, object] | None = None
         if profile:
             if profile_run_id is None:
                 raise ValueError("profile_run_id is required when profiling")
@@ -451,7 +467,36 @@ def _run_rank_workload(
                     engine.step()
                 request.take_result()
             tensor_parallel.barrier()
+            before_prefix = engine.prefix_cache_stats
+            probes = [
+                engine.submit(
+                    [*row, 0],
+                    max_new_tokens=1,
+                    sampling_params=SamplingParams(temperature=0.0),
+                )
+                for row in prompt_rows
+            ]
+            while engine.has_work():
+                engine.step()
+            probe_outputs = [probe.take_result() for probe in probes]
+            after_prefix = engine.prefix_cache_stats
+            if (
+                before_prefix is None
+                or after_prefix is None
+                or after_prefix[1] <= before_prefix[1]
+            ):
+                raise RuntimeError("DeepSeek prefix-cache continuation did not hit")
+            prefix_cache_validation = {
+                "before": before_prefix,
+                "after": after_prefix,
+                "output_tokens": tuple(map(len, probe_outputs)),
+            }
+            engine.clear_prefix_cache()
             if rank == 0:
+                print(
+                    f"[deepseek-v4] prefix continuation passed: {prefix_cache_validation}",
+                    flush=True,
+                )
                 print("[deepseek-v4] profiling complete", flush=True)
 
         tensor_parallel.barrier()
@@ -537,6 +582,7 @@ def _run_rank_workload(
             "clean_graph_phase_timings_ms": clean_phase_timings,
             "profile_run_id": profile_run_id,
             "perfetto_traces": profile_trace_files,
+            "prefix_cache_validation": prefix_cache_validation,
             "batch_size": batch_size,
             "prompt_tokens": [len(row) for row in prompt_rows],
             "output_tokens": [len(row) for row in output_rows],
@@ -770,6 +816,8 @@ def _run_rank_benchmark(
         ),
         speculative_tokens=DSPARK_TOKENS,
     )
+    if rank == 0:
+        _log_cache_capacity(runner)
     torch.cuda.synchronize(runner.device)
     tensor_parallel.barrier()
     load_elapsed = time.perf_counter() - load_start
@@ -947,6 +995,8 @@ def _serve_http_rank(
         ),
         speculative_tokens=DSPARK_TOKENS,
     )
+    if rank == 0:
+        _log_cache_capacity(runner)
     torch.cuda.synchronize(runner.device)
     tensor_parallel.barrier()
     runner.capture_cuda_graphs()
@@ -968,6 +1018,7 @@ def _serve_http_rank(
         coordinated_runner,
         max_running_requests=128,
         context_length=32768,
+        prefix_cache=True,
         scheduler_config=SchedulerConfig(
             max_batch_tokens=128 * 32768,
             prefill_chunk_size=32768,

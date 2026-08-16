@@ -267,6 +267,7 @@ impl PagedKvResources {
         &mut self,
         requests: &[RequestResourceRef<'_, RequestPages>],
         steps: &[SequenceStep],
+        decode_write_lookahead: u32,
     ) -> Result<BatchAccess<PagedKvBatchView, WriterAccessLease>, PagedKvError> {
         if self.batch_active {
             return Err(Self::invalid(
@@ -322,7 +323,16 @@ impl PagedKvResources {
                 let post_length = step
                     .token_end()
                     .ok_or_else(|| Self::invalid("scheduled token range overflows u32"))?;
-                let (first, count) = active_blocks(group, post_length);
+                let leased_length = if step.phase == crate::Phase::Decode {
+                    post_length
+                        .checked_add(decode_write_lookahead)
+                        .ok_or_else(|| {
+                            Self::invalid("decode cache write lookahead overflows u32")
+                        })?
+                } else {
+                    post_length
+                };
+                let (first, count) = active_blocks(group, leased_length);
                 if count as usize > table.pages().len() {
                     return Err(Self::invalid(format!(
                         "request {} cache group {group_index} needs {count} blocks but reserved {}",
@@ -505,9 +515,9 @@ mod tests {
             request_id: id,
             state: &state,
         }];
-        let access = resources.acquire(&requests, &[step]).unwrap();
+        let access = resources.acquire(&requests, &[step], 0).unwrap();
         assert_eq!(access.view.groups.len(), 2);
-        assert!(resources.acquire(&requests, &[step]).is_err());
+        assert!(resources.acquire(&requests, &[step], 0).is_err());
         resources.release(access.lease);
         resources.retire(state).unwrap();
     }
@@ -543,6 +553,43 @@ mod tests {
     }
 
     #[test]
+    fn decode_write_lookahead_is_leased_but_not_reported_as_input_append() {
+        let layout = KvLayout::new(
+            2,
+            vec![KvGroupLayout::new(4, 1, KvRetention::FullContext).unwrap()],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::new(layout).unwrap();
+        let id = RequestId::new(NonZeroU64::new(1).unwrap());
+        let mut state = resources.attach(id, 0).unwrap();
+        resources.ensure_context(&mut state, 4, 8).unwrap();
+        let step = SequenceStep {
+            phase: Phase::Decode,
+            tokens: TokenRange {
+                start: 4,
+                count: NonZeroU32::new(1).unwrap(),
+            },
+            sample: true,
+        };
+        let access = resources
+            .acquire(
+                &[RequestResourceRef {
+                    request_id: id,
+                    state: &state,
+                }],
+                &[step],
+                3,
+            )
+            .unwrap();
+        let group = &access.view.groups[0];
+        assert_eq!(group.block_ids.len(), 2);
+        assert_eq!(group.append_block_ids, vec![group.block_ids[1]]);
+        assert_eq!(group.append_block_offsets, vec![0]);
+        resources.release(access.lease);
+        resources.retire(state).unwrap();
+    }
+
+    #[test]
     fn immutable_history_prefix_is_shared_and_suffix_stays_writable() {
         let layout = KvLayout::new(
             4,
@@ -567,6 +614,7 @@ mod tests {
                     },
                     sample: false,
                 }],
+                0,
             )
             .unwrap();
         resources.release(write.lease);
@@ -601,6 +649,7 @@ mod tests {
                     },
                     sample: true,
                 }],
+                0,
             )
             .unwrap();
         assert_eq!(access.view.groups[0].block_ids.len(), 3);
@@ -644,6 +693,7 @@ mod tests {
                     },
                     sample: false,
                 }],
+                0,
             )
             .unwrap();
         resources.release(write.lease);

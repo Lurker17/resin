@@ -197,7 +197,7 @@ class TestGptOssCudaNativePlan:
         assert "max_batch_tokens=_PREFILL_CHUNK_SIZE" in source
         assert "bind_resources" in source
         assert "CacheGroupLayout(_PAGE_SIZE)" in source
-        assert 'retention="window"' in source
+        assert "retention=CacheRetention.WINDOW" in source
         assert "build_attention_batches" in source
         assert "tensor_parallel" in parameters
         assert "fast_allreduce" in parameters

@@ -129,9 +129,7 @@ class Lfm2TorchRunner(SyncRunner):
             if cache is None:
                 cache = self._model.make_cache()
                 self._cache[row.request_id] = cache
-            inputs = torch.tensor(
-                [row.token_ids], dtype=torch.long, device=self.device
-            )
+            inputs = torch.tensor([row.token_ids], dtype=torch.long, device=self.device)
             position_tensor = torch.tensor(
                 [row.positions], dtype=torch.long, device=self.device
             )

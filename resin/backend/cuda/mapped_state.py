@@ -188,7 +188,9 @@ class MappedStateArena:
         if len(indptr) != row_count + 1 or indptr[0] != 0 or indptr[-1] != len(slots):
             raise ValueError("mapped-state CSR does not cover every state handle")
         if not (len(slots) == len(state_generations) == len(access_modes)):
-            raise ValueError("mapped-state slot, generation, and access metadata disagree")
+            raise ValueError(
+                "mapped-state slot, generation, and access metadata disagree"
+            )
 
         rows = []
         seen: dict[int, tuple[int, str]] = {}
@@ -218,7 +220,9 @@ class MappedStateArena:
             positive_int("mapped-state generation", generation)
             previous = seen.get(slot)
             if previous is not None:
-                raise ValueError("one mapped-state destination cannot serve two batch rows")
+                raise ValueError(
+                    "one mapped-state destination cannot serve two batch rows"
+                )
             seen[slot] = (generation, self.access_mode)
 
             current_generation = generations[slot]

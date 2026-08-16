@@ -243,6 +243,9 @@ class TestCombinedResources:
         assert restored.state_slots[1] != checkpoint_slot
         assert engine.prefix_cache_stats == (1, 1, 1, 1)
         assert engine.state_free_slot_count == 1
+        engine.clear_prefix_cache()
+        assert engine.prefix_cache_stats == (0, 1, 1, 2)
+        assert engine.state_free_slot_count == 2
         engine.close()
         assert engine.state_free_slot_count == 2
 

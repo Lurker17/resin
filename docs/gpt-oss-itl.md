@@ -34,8 +34,8 @@ The CUDA runner owns this frozen layout:
 CacheLayout(
     cache_parent_capacity,
     [
-        CacheGroupLayout(128, retention="history"),
-        CacheGroupLayout(128, retention="window", window_tokens=128),
+        CacheGroupLayout(128),
+        CacheGroupLayout(128, retention=CacheRetention.WINDOW, window_tokens=128),
     ],
 )
 ```

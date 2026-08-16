@@ -303,7 +303,10 @@ class TestLfm2CudaImport:
         assert "self.cache_layout = CacheLayout(" in constructor
         assert "RunnerConfig(" in constructor
         assert "continuation_prefill=True" in constructor
-        assert 'StateMappingConfig(\n                _RECURRENT_STATE_MAPPING_PROTOCOL,\n                ["write"],' in constructor
+        assert (
+            'StateMappingConfig(\n                _RECURRENT_STATE_MAPPING_PROTOCOL,\n                ["write"],'
+            in constructor
+        )
         assert callable(Lfm2CudaRunner.bind_resources)
         assert callable(Lfm2CudaRunner.dispatch)
         assert callable(Lfm2CudaRunner.poll)
@@ -568,9 +571,7 @@ class TestLfm2CudaCachePoolBoundary:
 
         class SeedRunner:
             runner_config = RunnerConfig(
-                state_mapping=StateMappingConfig(
-                    "lfm2.conv_state.v1", ["write"]
-                )
+                state_mapping=StateMappingConfig("lfm2.conv_state.v1", ["write"])
             )
 
             @staticmethod

@@ -10,7 +10,6 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from resin import BatchPhase, BatchPlan
 from resin.backend.cuda.parallel import FlashInferAllReduce
 from resin_models_cuda.deepseek_v4 import DeepSeekV4FlashCudaRunner
 from resin_models_cuda.deepseek_v4.checkpoint import resolve_model_path
@@ -225,6 +224,7 @@ class TestDeepSeekV4Weights:
             "hadamard_transform",
             "hash_sqrt_softplus",
             "index_scores",
+            "kv_norm_rope_store",
             "moe_act_quant",
             "qk_norm_rope_block",
             "qk_norm_rope_store",
@@ -291,20 +291,6 @@ class TestDeepSeekV4Weights:
             2,
             64,
         )
-        window_indices = native_model.get_decode_window_topk_idxs(
-            4, torch.tensor([1, 5])
-        )
-        assert window_indices.tolist() == [
-            [[0, 1, -1, -1]],
-            [[2, 3, 0, 1]],
-        ]
-        guarded_indices = native_model.get_decode_window_topk_idxs(
-            4, torch.tensor([5, 6]), 6
-        )
-        assert guarded_indices.tolist() == [
-            [[2, 3, 4, 5]],
-            [[3, 4, 5, 0]],
-        ]
         guard_args = native_model.ModelArgs(
             max_batch_size=1,
             max_seq_len=32,
@@ -324,7 +310,8 @@ class TestDeepSeekV4Weights:
         )
         attention = native_model.DSparkAttention(0, guard_args)
         assert attention.window_capacity == 10
-        assert attention.kv_cache.shape == (1, 10, 64)
+        assert not hasattr(attention, "kv_cache")
+        assert "paged_cache" not in native_model.ModelArgs.__dataclass_fields__
         native_model.world_size = 2
         native_model.rank = 1
         args = native_model.ModelArgs(
@@ -462,9 +449,7 @@ class TestDeepSeekV4Gemms:
             calls.append((args, kwargs))
             return kwargs["out"]
 
-        monkeypatch.setattr(
-            deepseek_gemm, "gemm_fp8_nt_groupwise", flashinfer_gemm
-        )
+        monkeypatch.setattr(deepseek_gemm, "gemm_fp8_nt_groupwise", flashinfer_gemm)
         monkeypatch.setattr(
             deepseek_gemm.torch, "get_default_dtype", lambda: torch.bfloat16
         )
@@ -792,36 +777,7 @@ class TestDeepSeekV4Attention:
         assert calls[1][1]["enable_pdl"] is False
 
 
-class TestDeepSeekV4BatchPlan:
-    @staticmethod
-    def _runner() -> DeepSeekV4FlashCudaRunner:
-        runner = DeepSeekV4FlashCudaRunner.__new__(DeepSeekV4FlashCudaRunner)
-        runner.vocab_size = 32
-        runner.max_seq_len = 16
-        runner.max_batch_size = 3
-        runner._active_sequence_ids = []
-
-        class StateModel(torch.nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.register_buffer("kv_cache", torch.zeros(3, 2))
-                self.register_buffer("kv_state", torch.zeros(3, 2))
-                self.register_buffer("score_state", torch.full((3, 2), float("-inf")))
-
-            def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-                markers = input_ids[:, :1].to(torch.float32)
-                rows = input_ids.shape[0]
-                self.kv_cache[:rows].copy_(markers.expand(rows, 2))
-                self.kv_state[:rows].copy_((markers + 10).expand(rows, 2))
-                self.score_state[:rows].copy_((markers + 20).expand(rows, 2))
-                return torch.nn.functional.one_hot(input_ids[:, -1], num_classes=32).to(
-                    torch.float32
-                )
-
-        runner._model = StateModel()
-        runner.device = torch.device("cpu")
-        return runner
-
+class TestDeepSeekV4Runner:
     def test_cuda_graphs_use_shared_static_lifecycle(self) -> None:
         parameters = inspect.signature(DeepSeekV4FlashCudaRunner.__init__).parameters
         source = inspect.getsource(DeepSeekV4FlashCudaRunner)
@@ -840,338 +796,3 @@ class TestDeepSeekV4BatchPlan:
         assert inputs["positions"] == (1, 1, 1)
         assert inputs["sampling_top_ks"] == (256, 256, 256)
         assert inputs["sampling_stochastic_mask"] == (False, False, False)
-
-    def test_decode_graph_pads_to_the_next_configured_batch_bucket(self) -> None:
-        runner = DeepSeekV4FlashCudaRunner.__new__(DeepSeekV4FlashCudaRunner)
-        runner.vocab_size = 32
-        runner.speculative_tokens = 0
-        runner._dspark_phase_events = {}
-        runner._active_sequence_ids = [10, 11, 12]
-
-        class Graphs:
-            shapes = ((1, 128), (2, 128), (4, 128), (8, 128))
-
-            def __init__(self) -> None:
-                self.calls: list[tuple[tuple[int, int], dict[str, object]]] = []
-
-            def match(self, predicate):
-                return next((shape for shape in self.shapes if predicate(shape)), None)
-
-            def fallback(self, _reason: str) -> None:
-                raise AssertionError("the padded graph ladder should match")
-
-            def run(self, shape, inputs):
-                self.calls.append((shape, inputs))
-                return list(range(shape[0]))
-
-        class Sampler:
-            @staticmethod
-            def host_inputs(plan, vocab_size):
-                rows = plan.num_sequences
-                return {
-                    "sampling_temperatures": (0.5,) * rows,
-                    "sampling_top_ps": (0.9,) * rows,
-                    "sampling_top_ks": (vocab_size - 1,) * rows,
-                    "sampling_seeds": tuple(range(rows)),
-                    "sampling_offsets": (7,) * rows,
-                    "sampling_stochastic_mask": (True,) * rows,
-                }
-
-        runner._graphs = Graphs()
-        runner._sampler = Sampler()
-        plan = SimpleNamespace(
-            num_sequences=3,
-            token_ids=[5, 6, 7],
-            positions=[11, 12, 13],
-        )
-
-        assert runner._graph_forward(plan) == [0, 1, 2]
-        shape, inputs = runner._graphs.calls[0]
-        assert shape == (4, 128)
-        assert inputs["token_ids"] == (5, 6, 7, 0)
-        assert inputs["positions"] == (11, 12, 13, 1)
-        assert inputs["sampling_temperatures"] == (0.5, 0.5, 0.5, 1.0)
-        assert inputs["sampling_top_ps"] == (0.9, 0.9, 0.9, 1.0)
-        assert inputs["sampling_top_ks"] == (31, 31, 31, 32)
-        assert inputs["sampling_stochastic_mask"] == (True, True, True, False)
-
-    def test_decode_graph_does_not_pad_over_an_unscheduled_active_row(self) -> None:
-        runner = DeepSeekV4FlashCudaRunner.__new__(DeepSeekV4FlashCudaRunner)
-        runner.vocab_size = 32
-        runner.speculative_tokens = 0
-        runner._dspark_phase_events = {}
-        runner._active_sequence_ids = [10, 11, 12, 13]
-
-        class Graphs:
-            shapes = ((4, 128),)
-
-            def __init__(self) -> None:
-                self.fallbacks: list[str] = []
-
-            def match(self, predicate):
-                return next((shape for shape in self.shapes if predicate(shape)), None)
-
-            def fallback(self, reason: str) -> None:
-                self.fallbacks.append(reason)
-
-            @staticmethod
-            def run(_shape, _inputs):
-                raise AssertionError("an occupied padding row must not be replayed")
-
-        runner._graphs = Graphs()
-        runner._sampler = SimpleNamespace()
-        plan = SimpleNamespace(
-            num_sequences=3,
-            token_ids=[5, 6, 7],
-            positions=[11, 12, 13],
-        )
-
-        assert runner._graph_forward(plan) is None
-        assert runner._graphs.fallbacks == ["occupied_padding"]
-
-    def test_ragged_prefill_then_decode_owns_compact_rows(self) -> None:
-        runner = self._runner()
-        prefill = BatchPlan(
-            [2, 3, 4, 5, 6],
-            [0, 1, 0, 1, 2],
-            [7, 8],
-            [0, 2, 5],
-            [0, 0],
-            phase=BatchPhase.PREFILL,
-        )
-        decode = BatchPlan(
-            [9, 10],
-            [2, 3],
-            [7, 8],
-            [0, 1, 2],
-            [2, 3],
-            phase=BatchPhase.DECODE,
-        )
-
-        assert runner._validate_plan(prefill) == ((0, 2), (2, 5))
-        runner._active_sequence_ids = [7, 8]
-        assert runner._validate_plan(decode) == ((0, 1), (1, 2))
-
-        runner.release([7])
-        assert runner._active_sequence_ids == [8]
-
-    def test_fresh_prefill_preserves_active_rows_and_appends_new_owners(self) -> None:
-        runner = self._runner()
-        runner._active_sequence_ids = [7]
-        runner._model.kv_cache[0].fill_(7)
-        runner._model.kv_state[0].fill_(17)
-        runner._model.score_state[0].fill_(27)
-        prefill = BatchPlan(
-            [8, 9],
-            [0, 1],
-            [8],
-            [0, 2],
-            [0],
-            phase=BatchPhase.PREFILL,
-        )
-
-        rows = runner._validate_plan(prefill)
-        logits = runner._prefill(prefill, rows)
-        runner._active_sequence_ids.extend(prefill.sequence_ids)
-
-        assert logits.argmax(dim=-1).flatten().tolist() == [9]
-        assert runner._active_sequence_ids == [7, 8]
-        assert torch.equal(runner._model.kv_cache[:2], torch.tensor([[7, 7], [8, 8]]))
-        assert torch.equal(
-            runner._model.kv_state[:2], torch.tensor([[17, 17], [18, 18]])
-        )
-        assert torch.equal(
-            runner._model.score_state[:2], torch.tensor([[27, 27], [28, 28]])
-        )
-
-    def test_fresh_ragged_prefills_append_after_multiple_active_rows(self) -> None:
-        runner = self._runner()
-        runner._active_sequence_ids = [7, 8]
-        runner._model.kv_cache[:2].copy_(torch.tensor([[7, 7], [8, 8]]))
-        runner._model.kv_state[:2].copy_(torch.tensor([[17, 17], [18, 18]]))
-        runner._model.score_state[:2].copy_(torch.tensor([[27, 27], [28, 28]]))
-        prefill = BatchPlan(
-            [9, 10, 11],
-            [0, 1, 2],
-            [9],
-            [0, 3],
-            [0],
-            phase=BatchPhase.PREFILL,
-        )
-
-        rows = runner._validate_plan(prefill)
-        logits = runner._prefill(prefill, rows)
-
-        assert logits.argmax(dim=-1).flatten().tolist() == [11]
-        assert torch.equal(
-            runner._model.kv_cache, torch.tensor([[7, 7], [8, 8], [9, 9]])
-        )
-        assert torch.equal(
-            runner._model.kv_state, torch.tensor([[17, 17], [18, 18], [19, 19]])
-        )
-        assert torch.equal(
-            runner._model.score_state,
-            torch.tensor([[27, 27], [28, 28], [29, 29]]),
-        )
-
-    def test_fresh_prefill_rejects_duplicate_or_excess_owners(self) -> None:
-        runner = self._runner()
-        runner._active_sequence_ids = [7, 8]
-
-        duplicate = BatchPlan(
-            [9], [0], [8], [0, 1], [0], phase=BatchPhase.PREFILL
-        )
-        excess = BatchPlan(
-            [9, 10], [0, 0], [9, 10], [0, 1, 2], [0, 0], phase=BatchPhase.PREFILL
-        )
-
-        with pytest.raises(ValueError, match="already active"):
-            runner._validate_plan(duplicate)
-        with pytest.raises(ValueError, match="capacity"):
-            runner._validate_plan(excess)
-
-    def test_fixed_verification_restores_rows_after_their_first_rejection(
-        self,
-    ) -> None:
-        class SpecModel(torch.nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.register_buffer("kv_state", torch.zeros(2, 1))
-                self.commits: list[list[int]] = []
-
-            @staticmethod
-            def draft(anchors, positions):
-                assert anchors.tolist() == [[1], [2]]
-                assert positions.tolist() == [4, 7]
-                return torch.tensor([[10, 11, 12], [20, 21, 22]])
-
-            def forward_verify(self, input_ids, positions, graph_seq_len):
-                del positions, graph_seq_len
-                for _ in range(input_ids.shape[1]):
-                    self.kv_state.add_(1)
-                return (
-                    torch.zeros(2, input_ids.shape[1], 32),
-                    input_ids.to(torch.float32).unsqueeze(-1),
-                )
-
-            def clear_rejected_speculative_state(
-                self, positions, processed_counts, block_length
-            ):
-                del positions, block_length
-                self.kv_state.copy_(processed_counts[:, None])
-
-            def commit_dspark_main_block(self, hidden, positions):
-                del hidden
-                self.commits.append(positions.tolist())
-
-        class Sampler:
-            def __init__(self) -> None:
-                self.offsets: list[int] = []
-
-            def __call__(self, logits, plan, *, offset_delta):
-                del logits, plan
-                self.offsets.append(offset_delta)
-                return {
-                    0: torch.tensor([10, 31]),
-                    32: torch.tensor([11, 30]),
-                    64: torch.tensor([13, 29]),
-                    96: torch.tensor([14, 28]),
-                }[offset_delta]
-
-        runner = DeepSeekV4FlashCudaRunner.__new__(DeepSeekV4FlashCudaRunner)
-        runner.device = torch.device("cpu")
-        runner.speculative_tokens = 3
-        runner.tensor_parallel = SimpleNamespace(enabled=False)
-        runner._model = SpecModel()
-        runner._sampler = Sampler()
-        runner._speculative_blocks = 0
-        runner._speculative_drafts = 0
-        runner._speculative_accepted = 0
-        runner._speculative_emitted = 0
-        plan = BatchPlan(
-            [1, 2],
-            [4, 7],
-            [100, 101],
-            [0, 1, 2],
-            [4, 7],
-            phase=BatchPhase.DECODE,
-        )
-
-        output = runner._speculative_decode(plan)
-
-        assert output == [[10, 11, 13], [31]]
-        assert runner._sampler.offsets == [0, 32, 64, 96]
-        assert runner._model.commits == [[4, 7]]
-        assert runner._model.kv_state.flatten().tolist() == [3.0, 1.0]
-        assert runner.speculative_stats == {
-            "blocks": 2,
-            "drafts": 6,
-            "accepted": 2,
-            "emitted": 4,
-            "acceptance_rate": pytest.approx(1 / 3),
-        }
-
-    def test_rejects_continuation_prefill_and_foreign_decode(self) -> None:
-        runner = self._runner()
-        continuation = BatchPlan(
-            [4, 5],
-            [2, 3],
-            [7],
-            [0, 2],
-            [2],
-            phase=BatchPhase.PREFILL,
-        )
-
-        with pytest.raises(ValueError, match="continuation prefill"):
-            runner._validate_plan(continuation)
-        runner._active_sequence_ids = [7]
-        foreign = BatchPlan(
-            [4],
-            [2],
-            [8],
-            [0, 1],
-            [2],
-            phase=BatchPhase.DECODE,
-        )
-        with pytest.raises(ValueError, match="do not own"):
-            runner._validate_plan(foreign)
-
-    def test_release_compacts_every_sequence_state_buffer(self) -> None:
-        runner = self._runner()
-        runner._active_sequence_ids = [7, 8, 9]
-        runner._model.kv_cache.copy_(torch.tensor([[7, 7], [8, 8], [9, 9]]))
-        runner._model.kv_state.copy_(torch.tensor([[17, 17], [18, 18], [19, 19]]))
-        runner._model.score_state.copy_(torch.tensor([[27, 27], [28, 28], [29, 29]]))
-
-        runner.release([8])
-
-        assert runner._active_sequence_ids == [7, 9]
-        assert torch.equal(
-            runner._model.kv_cache, torch.tensor([[7, 7], [9, 9], [0, 0]])
-        )
-        assert torch.equal(
-            runner._model.kv_state, torch.tensor([[17, 17], [19, 19], [0, 0]])
-        )
-        assert torch.equal(
-            runner._model.score_state[:2], torch.tensor([[27, 27], [29, 29]])
-        )
-        assert torch.isneginf(runner._model.score_state[2]).all()
-
-    def test_ragged_prefill_places_each_sequence_in_its_compact_row(self) -> None:
-        runner = self._runner()
-        plan = BatchPlan(
-            [2, 3, 8, 9, 10],
-            [0, 1, 0, 1, 2],
-            [7, 8],
-            [0, 2, 5],
-            [0, 0],
-            phase=BatchPhase.PREFILL,
-        )
-
-        logits = runner._prefill(plan, ((0, 2), (2, 5)))
-
-        assert logits.argmax(dim=-1).tolist() == [3, 10]
-        assert torch.equal(runner._model.kv_cache[:2], torch.tensor([[2, 2], [8, 8]]))
-        assert torch.equal(
-            runner._model.kv_state[:2], torch.tensor([[12, 12], [18, 18]])
-        )

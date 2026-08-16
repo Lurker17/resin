@@ -36,17 +36,16 @@ def sparse_decode_attention(
     if query.ndim != 4 or query.shape[1] != 1:
         raise ValueError("DeepSeek-V4 graph decode requires one query per batch row")
     batch_size = query.shape[0]
-    if window_cache.ndim != 3 or window_cache.shape[0] != batch_size:
-        raise ValueError("DeepSeek-V4 window KV must contain one pool per batch row")
-    if compressed_cache.ndim != 3 or compressed_cache.shape[0] != batch_size:
-        raise ValueError(
-            "DeepSeek-V4 compressed KV must contain one pool per batch row"
-        )
+    if window_cache.ndim != 3 or compressed_cache.ndim != 3:
+        raise ValueError("DeepSeek-V4 physical KV pools must be paged tensors")
     if not window_cache.is_contiguous() or not compressed_cache.is_contiguous():
         raise ValueError("DeepSeek-V4 physical KV pools must be contiguous")
     if indices.shape[:2] != (batch_size, 1):
         raise ValueError("DeepSeek-V4 sparse indices must contain one row per query")
-    if query.shape[-1] != window_cache.shape[-1]:
+    if (
+        query.shape[-1] != window_cache.shape[-1]
+        or query.shape[-1] != compressed_cache.shape[-1]
+    ):
         raise ValueError("query and latent KV dimensions must match")
     if sinks.shape != (query.shape[2],):
         raise ValueError("learnable sinks must contain one value per query head")

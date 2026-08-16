@@ -8,13 +8,13 @@ methods.
 ## Layout declaration
 
 ```python
-from resin import CacheGroupLayout, CacheLayout
+from resin import CacheGroupLayout, CacheLayout, CacheRetention
 
 layout = CacheLayout(
     parent_capacity=4096,
     groups=[
-        CacheGroupLayout(128, retention="history"),
-        CacheGroupLayout(128, retention="window", window_tokens=128),
+        CacheGroupLayout(128),
+        CacheGroupLayout(128, retention=CacheRetention.WINDOW, window_tokens=128),
     ],
 )
 ```
@@ -26,10 +26,12 @@ Every value is structural:
 - `parent_capacity` is the number of equal-byte physical parents;
 - `block_tokens` is one group's logical block width;
 - `blocks_per_parent` is that group's packing factor;
-- retention is exactly `"history"` or `"window"`.
+- retention is the `CacheRetention.HISTORY` or `CacheRetention.WINDOW` enum.
 
-Window groups require `window_tokens`. Recurrent model state is deliberately
-outside this layout and uses `StatePool`.
+Window groups require `window_tokens`. Request-sized recurrent state normally
+uses `StatePool`; rolling state that has a token position, retention window, and
+page representation may instead be an ordinary Window group. DeepSeek-V4 uses
+that form for its compressor and indexer tails.
 
 ## Physical addressing
 
@@ -74,9 +76,9 @@ Logical blocks cycle over those physical slots. A plan never exposes this cyclic
 order: it emits the retained suffix chronologically and sets
 `first_logical_blocks[row]` to its first logical block. Prefill is split at a
 Window block boundary, preventing one accepted plan from overwriting bytes that
-the same plan still needs for attention. The current Window path is private
-request storage; it does not share immutable pages and does not perform snapshot
-restore copies.
+the same plan still needs for attention. A restored prefix holds immutable
+Window pages. When its cyclic slot is needed again, Resin replaces the shared
+page before granting the writer lease.
 
 ## Sparse runner ABI
 
@@ -108,18 +110,17 @@ A managed runner owns one exact layout object:
 
 ```python
 class Runner:
-    cache_layout = layout
+    runner_config = RunnerConfig(cache_layout=layout)
 
-    def bind_cache_pool(self, pool_id, bound_layout):
-        assert bound_layout is self.cache_layout
-        # Allocate or expose physical group slabs here.
-        return pool_id
+    def bind_resources(self, binding):
+        assert binding.cache_layout is layout
+        self.cache.bind(binding.cache_pool_id, binding.cache_layout)
 ```
 
 The Engine completes native allocation before calling the binder. The runner
-must accept its same frozen layout object, bind permanently to the positive pool
-ID, and return that exact integer. Repeating the same pair may be idempotent;
-rebinding the same physical storage to another pool is an error.
+must accept its same frozen layout object and bind its storage permanently to
+the positive pool ID. Repeating the same pair may be idempotent; rebinding the
+same physical storage to another pool is an error.
 
 If a runner also maps `StatePool` slots, it implements the combined atomic
 binding described in [state ownership](state-pool.md). Resin deliberately avoids
@@ -143,20 +144,73 @@ Engine diagnostics expose `cache_pool_id`, `cache_parent_capacity`,
 `cache_free_parent_count`, and `cache_occupied_block_count`. The allocator itself
 is not public Python API.
 
-Under memory pressure, eligible attention-only requests can release all pages
-while retaining their allocator identity. The scheduler later replays committed
-inputs into newly grown tables. Recurrent state is separate and currently makes
-a request ineligible for this reset path.
+Under memory pressure, eligible cache-only requests can release all pages while
+retaining their allocator identity. The scheduler later replays committed
+inputs into newly grown tables. Separately mapped `StatePool` state currently
+makes a request ineligible for this reset path; cache-addressed rolling state
+does not.
 
-## Content reuse status
+## Exact-token LRU prefix reuse
 
-The current path has no content index, cache admission, or physical block
-sharing. Every request receives private cache blocks and therefore receives no
-prefix reuse.
+Prefix caching is opt-in at `Engine` construction. A token trie finds the
+longest block-complete prefix shared with an earlier request. Published pages
+become immutable, a hit attaches references to those same physical pages, and
+the first subsequent write uses copy-on-write where necessary. Entries consume
+the ordinary pool budget and an LRU victim is evicted automatically when live
+allocation needs capacity. `Engine.prefix_cache_stats` reports entries, hits,
+misses, and evictions. `Engine.clear_prefix_cache()` explicitly releases every
+cached page and recurrent checkpoint while leaving live requests untouched.
+
+The alignment is the least common multiple of every group's `block_tokens` and,
+when applicable, a mapped recurrent checkpoint granularity. Thus a prefix hit
+never exposes a partially written History block. A model whose recurrent tail
+is represented by cache groups needs no separate checkpoint object: its aligned
+state pages participate in the same immutable snapshot.
 
 ## Model mappings
 
 `Lfm2CudaRunner` declares one History group. `GptOssCudaRunner` declares one
 History group followed by one Window group, both over the same parent pool. The
-model runner decides which layers interpret each group; the native allocator only
-needs their ordered identities and equal parent-byte geometry.
+model runner decides which layers interpret each group; the native allocator
+only needs their ordered identities and equal parent-byte geometry.
+
+### DeepSeek-V4
+
+DeepSeek-V4 declares six groups in one pool:
+
+| Group | Logical block | Retention | Blocks per parent |
+| --- | ---: | --- | ---: |
+| sliding-attention KV | 128 tokens | Window | 1 |
+| c4 compressed history + index keys | 128 input tokens | History | 4 |
+| c4 compressor tail | 4 tokens | Window | 8 |
+| c128 compressed history | 128 input tokens | History | 256 |
+| c128 compressor tail | 8 tokens | Window | 8 |
+| c4 indexer tail | 4 tokens | Window | 32 |
+
+These are byte-compatible interpretations of a 5.75 MiB parent on each TP
+rank for the released 43-layer checkpoint plus its three DSpark stages. There are no
+fixed SWA/full/recurrent allocation ratios. A free parent binds to whichever
+group currently needs it; small groups pack multiple child blocks into that
+parent, and it becomes fungible again when its last child is released.
+
+The runner allocates after loading weights and static collective workspaces. It
+queries CUDA total and free memory and applies:
+
+```text
+protected bytes  = ceil(total bytes * (1 - gpu_memory_utilization))
+cache bytes      = free bytes - protected bytes
+physical parents = floor(cache bytes / bytes per parent)
+```
+
+One physical parent is reserved as the zero/null target used by masked runtime
+rows, and six more provide group-private graph-capture scratch space; the
+remainder becomes the Engine's `parent_capacity`. The scratch parents prevent
+synthetic captures from aliasing six incompatible tensor interpretations. The
+calculation uses the actual current BF16 KV and FP32 recurrent-state byte
+geometry. It does not assume FP8 KV. CUDA graphs are captured after this
+allocation inside the protected headroom.
+
+For DSpark-5, c4 compressor correctness needs twelve retained token positions.
+cuTile kernels require a power-of-two static iteration extent, so the runner
+presents a masked sixteen-position view while only the final twelve positions
+have allocator-backed pages. The four masked positions do not consume cache.

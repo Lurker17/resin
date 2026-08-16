@@ -32,6 +32,7 @@ from resin import (
     BatchPhase,
     CacheGroupLayout,
     CacheLayout,
+    CacheRetention,
     ResourceBinding,
     RunnerConfig,
 )
@@ -236,7 +237,7 @@ class GptOssCudaRunner(SyncRunner):
                 CacheGroupLayout(_PAGE_SIZE),
                 CacheGroupLayout(
                     _PAGE_SIZE,
-                    retention="window",
+                    retention=CacheRetention.WINDOW,
                     window_tokens=WINDOW_RETENTION_TOKENS,
                 ),
             ],

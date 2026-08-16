@@ -1,6 +1,8 @@
 # Adapted from DeepSeek-V4-Flash-0731 (MIT).
 """Resin-owned DeepSeek-V4 target-model hierarchy."""
 
+from __future__ import annotations
+
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,8 +20,15 @@ from torch import nn
 
 from resin_models_cuda.deepseek_v4.attention import (
     sparse_decode_attention,
-    sparse_topk_lengths,
     sparse_verify_attention,
+)
+from resin_models_cuda.deepseek_v4.cache import (
+    C4_STATE_GROUP,
+    C128_STATE_GROUP,
+    INDEX_STATE_GROUP,
+    CacheArena,
+    DeviceCache,
+    DeviceMapping,
 )
 from resin_models_cuda.deepseek_v4.cutile import (
     act_quant,
@@ -32,6 +41,7 @@ from resin_models_cuda.deepseek_v4.cutile import (
     hadamard_transform,
     hash_sqrt_softplus,
     index_scores,
+    kv_norm_rope_store,
     moe_act_quant,
     qk_norm_rope_block,
     qk_norm_rope_store,
@@ -420,43 +430,6 @@ def get_compress_topk_idxs(ratio: int, bsz: int, seqlen: int, offset: int):
     return matrix.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
 
 
-def get_decode_window_topk_idxs(
-    window_size: int,
-    position: torch.Tensor,
-    capacity: int | None = None,
-) -> torch.Tensor:
-    """Build one fixed-width ring-cache row from a staged device position."""
-
-    capacity = capacity or window_size
-    logical = torch.arange(
-        window_size, dtype=torch.long, device=position.device
-    ).unsqueeze(0)
-    start = (position - window_size + 1).clamp_min(0).unsqueeze(1)
-    physical = (logical + start).remainder(capacity)
-    # The fixed-width row must not expose cache slots beyond a short prefix.
-    # FlashInfer also receives the logical length, but DSpark's parallel draft
-    # attention consumes these indices directly.
-    physical = torch.where(logical <= position.unsqueeze(1), physical, -1)
-    return physical.to(torch.int32).unsqueeze(1)
-
-
-def get_decode_compress_topk_idxs(
-    ratio: int,
-    position: torch.Tensor,
-    width: int,
-    offset: int,
-) -> torch.Tensor:
-    """Build a graph-static compressed-cache row and mask unfinished groups."""
-
-    logical = torch.arange(width, dtype=torch.long, device=position.device).unsqueeze(0)
-    complete = (position + 1).div(ratio, rounding_mode="floor").unsqueeze(1)
-    return (
-        torch.where(logical < complete, logical + offset, -1)
-        .to(torch.int32)
-        .unsqueeze(1)
-    )
-
-
 class Compressor(nn.Module):
     """Compresses KV cache via learned gated pooling over `compress_ratio` consecutive tokens.
     When overlap=True (ratio==4), uses overlapping windows for smoother compression boundaries."""
@@ -503,36 +476,34 @@ class Compressor(nn.Module):
             weight_storage=self._fused_projection_weight[projection_width:],
         )
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
-        self.kv_cache: torch.Tensor = None  # assigned lazily from Attention.kv_cache
         logical_window = compress_ratio * coff
-        self.ring_size = (
-            (16 if compress_ratio == 4 else 256)
+        retained_ring_size = (
+            (
+                math.ceil(
+                    max(logical_window, compress_ratio + args.dspark_block_size + 1)
+                    / compress_ratio
+                )
+                * compress_ratio
+            )
             if args.dspark_block_size
             else logical_window
         )
+        # cuTile requires static tile extents to be powers of two. Paged state
+        # maps entries outside the Engine-retained window to the null parent.
+        self.ring_size = 1 << (retained_ring_size - 1).bit_length()
         # Speculative decode appends raw projected rows into a padded ring.
         # The extra capacity prevents an unaccepted tail from overwriting the
         # committed compressor window.
-        self.register_buffer(
-            "kv_state",
-            torch.zeros(
-                args.max_batch_size,
-                self.ring_size,
-                coff * self.head_dim,
-                dtype=torch.float32,
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "score_state",
-            torch.full(
-                (args.max_batch_size, self.ring_size, coff * self.head_dim),
-                float("-inf"),
-                dtype=torch.float32,
-            ),
-            persistent=False,
-        )
-        self.freqs_cis: torch.Tensor = None
+        self.kv_state: torch.Tensor | None
+        self.register_buffer("kv_state", None, persistent=False)
+        self.score_state: torch.Tensor | None
+        self.register_buffer("score_state", None, persistent=False)
+        self.freqs_cis: torch.Tensor | None = None
+
+    def _state_tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.kv_state is None or self.score_state is None:
+            raise RuntimeError("compressor state is not bound to the cache arena")
+        return self.kv_state, self.score_state
 
     def overlap_transform(self, tensor: torch.Tensor, value=0):
         # tensor: [b,s,r,2d]
@@ -543,8 +514,15 @@ class Compressor(nn.Module):
         new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
         return new_tensor
 
-    def forward(self, x: torch.Tensor):
-        assert self.kv_cache is not None
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        cache_pool: torch.Tensor,
+        cache_rows: torch.Tensor,
+        state_pages: torch.Tensor,
+        state_offsets: torch.Tensor,
+    ):
         bsz, seqlen, _ = x.size()
         ratio, overlap, rd = (
             self.compress_ratio,
@@ -557,16 +535,26 @@ class Compressor(nn.Module):
         cutoff = seqlen - seqlen % ratio
 
         # Stage the raw prompt tail in the same physical ring used by decode.
-        self.kv_state[:bsz].zero_()
-        self.score_state[:bsz].fill_(float("-inf"))
         tail_start = max(0, seqlen - self.ring_size)
         tail_positions = torch.arange(tail_start, seqlen, device=x.device)
-        tail_slots = tail_positions.remainder(self.ring_size)
         ape_slots = tail_positions.remainder(ratio)
-        self.kv_state[:bsz, tail_slots] = raw_kv[:, tail_start:]
-        self.score_state[:bsz, tail_slots] = (
-            raw_score[:, tail_start:] + self.ape[ape_slots]
-        )
+        if (
+            state_pages.shape != (bsz, seqlen)
+            or state_offsets.shape != state_pages.shape
+        ):
+            raise ValueError("paged prompt state requires one location per token")
+        value_state, score_state = self._state_tensors()
+        pages = state_pages[:, tail_start:].flatten().long()
+        offsets = state_offsets[:, tail_start:].flatten().long()
+        valid = pages >= 0
+        pages = pages[valid]
+        offsets = offsets[valid]
+        tail_values = raw_kv[:, tail_start:].flatten(0, 1)[valid]
+        tail_scores = (raw_score[:, tail_start:] + self.ape[ape_slots]).flatten(0, 1)[
+            valid
+        ]
+        value_state[pages, offsets] = tail_values
+        score_state[pages, offsets] = tail_scores
 
         if cutoff == 0:
             return
@@ -584,48 +572,77 @@ class Compressor(nn.Module):
             fp4_act_quant(kv, fp4_block_size, True)
         else:
             act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
-        self.kv_cache[:bsz, : seqlen // ratio] = kv
+        if cache_rows.shape != (bsz, seqlen):
+            raise ValueError("paged compressor writes need one row per source token")
+        complete_rows = cache_rows[:, ratio - 1 : cutoff : ratio]
+        cache_pool.index_copy_(
+            0,
+            complete_rows.flatten().long(),
+            kv.flatten(0, 1).to(cache_pool.dtype),
+        )
         return kv
 
-    def forward_decode(self, x: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
+    def forward_decode(
+        self,
+        x: torch.Tensor,
+        position: torch.Tensor,
+        *,
+        cache_pool: torch.Tensor,
+        cache_mapping: DeviceMapping,
+        state_mapping: DeviceMapping,
+    ) -> torch.Tensor:
         """Update recurrent compression state from a graph-staged position."""
 
-        assert self.kv_cache is not None
+        value_state, score_state = self._state_tensors()
         kv, score = bf16_linear_fp32(x, self._fused_projection_weight).chunk(2, dim=-1)
         compress_decode(
             kv,
             score,
             self.ape,
-            self.kv_state[: x.shape[0]],
-            self.score_state[: x.shape[0]],
+            value_state,
+            score_state,
             self.norm.weight,
             torch.view_as_real(self.freqs_cis),
-            self.kv_cache[: x.shape[0]],
+            cache_pool,
             position,
             self.compress_ratio,
             self.rotate,
             self.norm.eps,
+            cache_mapping=cache_mapping,
+            state_mapping=state_mapping,
+            state_ring_size=self.ring_size,
         )
         return kv[..., : self.head_dim]
 
-    def forward_verify(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward_verify(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        cache_pool: torch.Tensor,
+        cache_mapping: DeviceMapping,
+        state_mapping: DeviceMapping,
+    ) -> torch.Tensor:
         """Update a fixed verification block with one projection and scan."""
 
-        assert self.kv_cache is not None
+        value_state, score_state = self._state_tensors()
         kv, score = bf16_linear_fp32(x, self._fused_projection_weight).chunk(2, dim=-1)
         compress_verify(
             kv,
             score,
             self.ape,
-            self.kv_state[: x.shape[0]],
-            self.score_state[: x.shape[0]],
+            value_state,
+            score_state,
             self.norm.weight,
             torch.view_as_real(self.freqs_cis),
-            self.kv_cache[: x.shape[0]],
+            cache_pool,
             positions,
             self.compress_ratio,
             self.rotate,
             self.norm.eps,
+            cache_mapping=cache_mapping,
+            state_mapping=state_mapping,
+            state_ring_size=self.ring_size,
         )
         return kv[..., : self.head_dim]
 
@@ -634,16 +651,21 @@ class Compressor(nn.Module):
         positions: torch.Tensor,
         processed_counts: torch.Tensor,
         block_length: int,
+        *,
+        state_mapping: DeviceMapping,
     ) -> None:
         """Clear only rollback-sensitive c128 rows after target acceptance."""
 
         if self.compress_ratio == 128:
+            value_state, score_state = self._state_tensors()
             clear_rejected_compress_state(
-                self.kv_state[: positions.shape[0]],
-                self.score_state[: positions.shape[0]],
+                value_state,
+                score_state,
                 positions,
                 processed_counts,
                 block_length,
+                state_mapping=state_mapping,
+                state_ring_size=self.ring_size,
             )
 
 
@@ -651,8 +673,9 @@ class Indexer(torch.nn.Module):
     """Selects top-k compressed KV positions for sparse attention via learned scoring.
     Has its own Compressor (with Hadamard rotation) to build compressed KV for scoring."""
 
-    def __init__(self, args: ModelArgs, compress_ratio: int = 4):
+    def __init__(self, layer_id: int, args: ModelArgs, compress_ratio: int = 4):
         super().__init__()
+        self.layer_id = layer_id
         self.dim = args.dim
         self.n_heads = args.index_n_heads
         self.n_local_heads = args.index_n_heads // world_size
@@ -669,33 +692,43 @@ class Indexer(torch.nn.Module):
         self.allreduce: Callable[[torch.Tensor], torch.Tensor] = _distributed_sum
 
         self.compressor = Compressor(args, compress_ratio, self.head_dim, True)
-        cache_width = math.ceil(args.max_seq_len / compress_ratio / 64) * 64
-        self.register_buffer(
-            "kv_cache",
-            torch.zeros(args.max_batch_size, cache_width, self.head_dim),
-            persistent=False,
-        )
-        self.freqs_cis = None
+        self.freqs_cis: torch.Tensor | None = None
 
-    def forward(self, x: torch.Tensor, qr: torch.Tensor, offset: int):
+    def forward(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        offset: int,
+        *,
+        cache: DeviceCache,
+    ):
         bsz, seqlen, _ = x.size()
         freqs_cis = self.freqs_cis[:seqlen]
         ratio, rd = self.compress_ratio, self.rope_head_dim
-        if self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.kv_cache
-            self.compressor.freqs_cis = self.freqs_cis
         q = self.wq_b(qr)
         q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
         apply_rotary_emb(q[..., -rd:], freqs_cis)
         q = rotate_activation(q)
         # use fp4 simulation for q and kv in indexer
         fp4_act_quant(q, fp4_block_size, True)
-        self.compressor(x)
+        token_positions = (
+            torch.arange(seqlen, device=x.device).view(1, -1).expand(bsz, -1)
+        )
+        state_pages, state_offsets = cache.state_locations(
+            INDEX_STATE_GROUP, token_positions
+        )
+        compressed = self.compressor(
+            x,
+            cache_pool=cache.index_keys.view(-1, self.head_dim),
+            cache_rows=cache.index_rows(self.layer_id, token_positions),
+            state_pages=state_pages,
+            state_offsets=state_offsets,
+        )
+        if compressed is None:
+            compressed = x.new_empty((bsz, 0, self.head_dim))
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
         # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
-        index_score = torch.einsum(
-            "bshd,btd->bsht", q, self.kv_cache[:bsz, : seqlen // ratio]
-        )
+        index_score = torch.einsum("bshd,btd->bsht", q, compressed)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         if world_size > 1:
             index_score = self.allreduce(index_score)
@@ -712,17 +745,22 @@ class Indexer(torch.nn.Module):
         position: torch.Tensor,
         offset: int,
         graph_seq_len: int,
+        *,
+        cache: DeviceCache,
     ) -> torch.Tensor:
         """Select compressed positions with graph-static score geometry."""
 
         bsz, _, _ = x.size()
         ratio, rd = self.compress_ratio, self.rope_head_dim
-        if self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.kv_cache
-            self.compressor.freqs_cis = self.freqs_cis
-        self.compressor.forward_decode(x, position)
+        width = math.ceil(graph_seq_len / ratio / 64) * 64
+        self.compressor.forward_decode(
+            x,
+            position,
+            cache_pool=cache.index_keys.view(-1, self.head_dim),
+            cache_mapping=cache.index_mapping(self.layer_id),
+            state_mapping=cache.state_mapping(INDEX_STATE_GROUP),
+        )
 
-        width = min(self.kv_cache.shape[1], math.ceil(graph_seq_len / ratio / 64) * 64)
         if width == 0:
             return torch.empty((bsz, 1, 0), dtype=torch.int32, device=x.device)
 
@@ -732,14 +770,16 @@ class Indexer(torch.nn.Module):
         q = rotate_activation(q)
         fp4_act_quant(q, fp4_block_size, True)
         weights = self.weights_proj(x)
-        cache = self.kv_cache[:bsz, :width]
+        index_cache = cache.index_keys.view(-1, self.head_dim)
         index_score = index_scores(
             q,
-            cache,
+            index_cache,
             weights,
             position[:, None],
             ratio,
             self.softmax_scale * self.n_heads**-0.5,
+            cache_mapping=cache.index_mapping(self.layer_id),
+            cache_width=width,
         )
         if world_size > 1:
             index_score = self.allreduce(index_score)
@@ -748,7 +788,14 @@ class Indexer(torch.nn.Module):
             index_score.flatten(0, 1), topk_width, sorted=False
         )
         topk_idxs = topk_idxs.view(*index_score.shape[:2], topk_width)
-        return finish_index_topk(topk_idxs, position[:, None], ratio, offset)
+        selected = finish_index_topk(
+            topk_idxs,
+            position[:, None],
+            ratio,
+            offset,
+            cache_mapping=cache.compressed_mapping(self.layer_id, ratio),
+        )
+        return selected
 
     def forward_verify(
         self,
@@ -757,12 +804,14 @@ class Indexer(torch.nn.Module):
         positions: torch.Tensor,
         offset: int,
         graph_seq_len: int,
+        *,
+        cache: DeviceCache,
     ) -> torch.Tensor:
         """Score a fixed verification block with one projection and collective."""
 
         bsz, block_length, _ = x.shape
         ratio = self.compress_ratio
-        width = min(self.kv_cache.shape[1], math.ceil(graph_seq_len / ratio / 64) * 64)
+        width = math.ceil(graph_seq_len / ratio / 64) * 64
         if width == 0:
             return torch.empty(
                 (bsz, block_length, 0), dtype=torch.int32, device=x.device
@@ -777,14 +826,16 @@ class Indexer(torch.nn.Module):
         q = rotate_activation(q)
         fp4_act_quant(q, fp4_block_size, True)
         weights = self.weights_proj(x)
-        cache = self.kv_cache[:bsz, :width]
+        index_cache = cache.index_keys.view(-1, self.head_dim)
         index_score = index_scores(
             q,
-            cache,
+            index_cache,
             weights,
             positions,
             ratio,
             self.softmax_scale * self.n_heads**-0.5,
+            cache_mapping=cache.index_mapping(self.layer_id),
+            cache_width=width,
         )
         if world_size > 1:
             index_score = self.allreduce(index_score)
@@ -793,7 +844,14 @@ class Indexer(torch.nn.Module):
             index_score.flatten(0, 1), topk_width, sorted=False
         )
         topk_idxs = topk_idxs.view(*index_score.shape[:2], topk_width)
-        return finish_index_topk(topk_idxs, positions, ratio, offset)
+        selected = finish_index_topk(
+            topk_idxs,
+            positions,
+            ratio,
+            offset,
+            cache_mapping=cache.compressed_mapping(self.layer_id, ratio),
+        )
+        return selected
 
 
 class Attention(nn.Module):
@@ -875,28 +933,11 @@ class Attention(nn.Module):
         if self.compress_ratio:
             self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
             if self.compress_ratio == 4:
-                self.indexer = Indexer(args, self.compress_ratio)
+                self.indexer = Indexer(layer_id, args, self.compress_ratio)
             else:
                 self.indexer = None
 
-        self.register_buffer(
-            "kv_cache",
-            torch.zeros(args.max_batch_size, self.window_capacity, self.head_dim),
-            persistent=False,
-        )
-        if self.compress_ratio:
-            self.register_buffer(
-                "compressed_kv_cache",
-                torch.zeros(
-                    args.max_batch_size,
-                    args.max_seq_len // self.compress_ratio,
-                    self.head_dim,
-                ),
-                persistent=False,
-            )
-        else:
-            self.compressed_kv_cache = None
-        self.attention_workspace: torch.Tensor = None
+        self.attention_workspace: torch.Tensor | None = None
         self.decode_overlap_stream: torch.cuda.Stream | None = None
         if self.compress_ratio:
             original_seq_len, rope_theta = (
@@ -917,17 +958,44 @@ class Attention(nn.Module):
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
-    def forward(self, x: torch.Tensor):
+    def _paged_attention_metadata(
+        self,
+        cache: DeviceCache,
+        token_positions: torch.Tensor,
+        compressed_indices: torch.Tensor | None = None,
+        generated_compressed_width: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build physical sparse rows inside the existing metadata launch."""
+
+        compressed_mapping = None
+        if self.compress_ratio:
+            compressed_mapping = cache.compressed_mapping(
+                self.layer_id, self.compress_ratio
+            )
+        return verify_attention_metadata(
+            token_positions[:, 0],
+            token_positions.shape[1],
+            self.window_size,
+            self.window_capacity,
+            compressed_indices,
+            0,
+            self.compress_ratio,
+            generated_compressed_width,
+            window_mapping=cache.window_mapping(self.layer_id),
+            compressed_mapping=compressed_mapping,
+        )
+
+    def forward(self, x: torch.Tensor, *, cache: DeviceCache) -> torch.Tensor:
         bsz, seqlen, _ = x.size()
         freqs_cis = self.freqs_cis[:seqlen]
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
-        if self.compress_ratio and self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.compressed_kv_cache
+        if self.compress_ratio and self.compressor.freqs_cis is None:
             self.compressor.freqs_cis = self.freqs_cis
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
+                self.indexer.compressor.freqs_cis = self.freqs_cis
         # q
         if self._fused_wqkv:
             qkv = linear(x, self._fused_wqkv_weight)
@@ -948,22 +1016,38 @@ class Attention(nn.Module):
         if self.compress_ratio:
             offset = kv.size(1)
             if self.indexer is not None:
-                compress_topk_idxs = self.indexer(x, qr, offset).int()
+                compress_topk_idxs = self.indexer(x, qr, offset, cache=cache).int()
             else:
                 compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, offset)
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
 
         # compress kv & attn
-        if seqlen <= win:
-            self.kv_cache[:bsz, :seqlen] = kv
-        else:
-            positions = torch.arange(seqlen - win, seqlen, device=kv.device).remainder(
-                self.window_capacity
-            )
-            rows = torch.arange(bsz, device=kv.device).unsqueeze(1)
-            self.kv_cache[rows, positions.unsqueeze(0)] = kv[:, -win:]
+        token_positions = (
+            torch.arange(seqlen, device=x.device).view(1, -1).expand(bsz, -1)
+        )
+        window_rows = cache.window_rows(self.layer_id, token_positions)
+        retained = window_rows >= 0
+        cache.latents.view(-1, self.head_dim).index_copy_(
+            0,
+            window_rows[retained].long(),
+            kv[retained].to(cache.latents.dtype),
+        )
         if self.compress_ratio:
-            if (kv_compress := self.compressor(x)) is not None:
+            state_group = C4_STATE_GROUP if ratio == 4 else C128_STATE_GROUP
+            state_pages, state_offsets = cache.state_locations(
+                state_group, token_positions
+            )
+            if (
+                kv_compress := self.compressor(
+                    x,
+                    cache_pool=cache.latents.view(-1, self.head_dim),
+                    cache_rows=cache.compressed_rows(
+                        self.layer_id, ratio, token_positions
+                    ),
+                    state_pages=state_pages,
+                    state_offsets=state_offsets,
+                )
+            ) is not None:
                 kv = torch.cat([kv, kv_compress], dim=1)
         # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
         o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
@@ -982,16 +1066,18 @@ class Attention(nn.Module):
         x: torch.Tensor,
         position: torch.Tensor,
         graph_seq_len: int,
+        *,
+        cache: DeviceCache,
     ) -> torch.Tensor:
         """Run one reusable fixed-geometry decode attention step."""
 
         bsz, _, _ = x.size()
-        win, ratio, rd = self.window_size, self.compress_ratio, self.rope_head_dim
-        if ratio and self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.compressed_kv_cache
+        ratio, rd = self.compress_ratio, self.rope_head_dim
+        if ratio and self.compressor.freqs_cis is None:
             self.compressor.freqs_cis = self.freqs_cis
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
+                self.indexer.compressor.freqs_cis = self.freqs_cis
 
         if self._fused_wqkv:
             qkv = linear(x, self._fused_wqkv_weight)
@@ -1002,32 +1088,37 @@ class Attention(nn.Module):
 
         compressed_width = 0
         compress_topk_idxs = None
+        generated_compressed_width = 0
         main_stream = None
         if ratio:
-            assert self.compressed_kv_cache is not None
-            compressed_width = min(
-                self.compressed_kv_cache.shape[1],
-                math.ceil(graph_seq_len / ratio / 4) * 4,
-            )
+            padded_width = math.ceil(graph_seq_len / ratio / 4) * 4
+            compressed_width = padded_width
             assert self.decode_overlap_stream is not None
             # Compression/indexing depends on normalized Q but is otherwise
             # independent of the dense Q projection and window-cache update.
             main_stream = torch.cuda.current_stream(x.device)
             self.decode_overlap_stream.wait_stream(main_stream)
             with torch.cuda.stream(self.decode_overlap_stream):
+                self.compressor.forward_decode(
+                    x,
+                    position,
+                    cache_pool=cache.latents.view(-1, self.head_dim),
+                    cache_mapping=cache.compressed_mapping(self.layer_id, ratio),
+                    state_mapping=cache.state_mapping(
+                        C4_STATE_GROUP if ratio == 4 else C128_STATE_GROUP
+                    ),
+                )
                 if self.indexer is not None:
-                    self.compressor.forward_decode(x, position)
                     compress_topk_idxs = self.indexer.forward_decode(
-                        x, qr, position, 0, compressed_width * ratio
+                        x,
+                        qr,
+                        position,
+                        0,
+                        compressed_width * ratio,
+                        cache=cache,
                     )
                 else:
-                    self.compressor.forward_decode(x, position)
-                    compress_topk_idxs = get_decode_compress_topk_idxs(
-                        ratio,
-                        position,
-                        compressed_width,
-                        0,
-                    )
+                    generated_compressed_width = compressed_width
 
         q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
         qk_norm_rope_store(
@@ -1035,53 +1126,33 @@ class Attention(nn.Module):
             kv,
             self.kv_norm.weight,
             torch.view_as_real(self.freqs_cis),
-            self.kv_cache[:bsz],
+            cache.latents.view(-1, self.head_dim),
             position,
             self.eps,
+            cache_mapping=cache.window_mapping(self.layer_id),
         )
-        topk_idxs = get_decode_window_topk_idxs(win, position, self.window_capacity)
-        cache_rows = None
-        if bsz > 1:
-            cache_rows = torch.arange(bsz, dtype=torch.int32, device=x.device).view(
-                bsz, 1, 1
-            )
-            # FlashInfer sees each dense sequence row as one page in a shared pool,
-            # so sparse indices are physical pool offsets rather than row-local IDs.
-            topk_idxs = torch.where(
-                topk_idxs >= 0,
-                topk_idxs + cache_rows * self.window_capacity,
-                -1,
-            )
 
-        compressed_complete = torch.zeros_like(position)
-        compressed_index_width = 0
         if ratio:
-            compressed_complete = torch.minimum(
-                (position + 1).div(ratio, rounding_mode="floor"),
-                torch.full_like(position, compressed_width),
-            )
-            assert main_stream is not None and compress_topk_idxs is not None
+            assert main_stream is not None
             main_stream.wait_stream(self.decode_overlap_stream)
-            if cache_rows is not None:
-                compress_topk_idxs = torch.where(
-                    compress_topk_idxs >= 0,
-                    compress_topk_idxs + cache_rows * self.compressed_kv_cache.shape[1],
-                    -1,
-                )
-            compressed_index_width = compress_topk_idxs.shape[-1]
-            topk_idxs = torch.cat((topk_idxs, compress_topk_idxs), dim=-1)
+        topk_idxs, sparse_lengths, sequence_lengths = self._paged_attention_metadata(
+            cache,
+            position[:, None],
+            compress_topk_idxs if ratio else None,
+            generated_compressed_width,
+        )
+        sparse_lengths = sparse_lengths.flatten()
+        sequence_lengths = sequence_lengths.flatten()
 
         assert self.attention_workspace is not None
-        window_cache = self.kv_cache[:bsz]
-        compressed_cache = self.compressed_kv_cache[:bsz] if ratio else window_cache
         o = sparse_decode_attention(
             q,
-            window_cache,
-            compressed_cache,
+            cache.latents,
+            cache.latents,
             self.attn_sink,
             topk_idxs,
-            sparse_topk_lengths(compressed_complete, compressed_index_width, win),
-            (position + 1).to(torch.int32),
+            sparse_lengths,
+            sequence_lengths,
             self.attention_workspace,
             self.softmax_scale,
         )
@@ -1097,16 +1168,18 @@ class Attention(nn.Module):
         x: torch.Tensor,
         token_positions: torch.Tensor,
         graph_seq_len: int,
+        *,
+        cache: DeviceCache,
     ) -> torch.Tensor:
         """Verify a short causal token block through padded recurrent rings."""
 
         batch_size, block_length, _ = x.shape
-        win, ratio = self.window_size, self.compress_ratio
-        if ratio and self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.compressed_kv_cache
+        ratio = self.compress_ratio
+        if ratio and self.compressor.freqs_cis is None:
             self.compressor.freqs_cis = self.freqs_cis
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
+                self.indexer.compressor.freqs_cis = self.freqs_cis
 
         if self._fused_wqkv:
             qkv = linear(x, self._fused_wqkv_weight)
@@ -1117,22 +1190,29 @@ class Attention(nn.Module):
 
         compressed_width = 0
         if ratio:
-            assert self.compressed_kv_cache is not None
-            compressed_width = min(
-                self.compressed_kv_cache.shape[1],
-                math.ceil(graph_seq_len / ratio / 4) * 4,
-            )
+            padded_width = math.ceil(graph_seq_len / ratio / 4) * 4
+            compressed_width = padded_width
 
         if token_positions.shape != (batch_size, block_length):
             raise ValueError("target layers must share one verification position block")
-        position = token_positions[:, 0]
         if ratio:
-            self.compressor.forward_verify(x, token_positions)
+            self.compressor.forward_verify(
+                x,
+                token_positions,
+                cache_pool=cache.latents.view(-1, self.head_dim),
+                cache_mapping=cache.compressed_mapping(self.layer_id, ratio),
+                state_mapping=cache.state_mapping(
+                    C4_STATE_GROUP if ratio == 4 else C128_STATE_GROUP
+                ),
+            )
             if self.indexer is not None:
-                if self.indexer.compressor.kv_cache is None:
-                    self.indexer.compressor.kv_cache = self.indexer.kv_cache
-                    self.indexer.compressor.freqs_cis = self.freqs_cis
-                self.indexer.compressor.forward_verify(x, token_positions)
+                self.indexer.compressor.forward_verify(
+                    x,
+                    token_positions,
+                    cache_pool=cache.index_keys.view(-1, self.indexer.head_dim),
+                    cache_mapping=cache.index_mapping(self.layer_id),
+                    state_mapping=cache.state_mapping(INDEX_STATE_GROUP),
+                )
 
         q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
 
@@ -1146,6 +1226,7 @@ class Attention(nn.Module):
                     token_positions,
                     0,
                     graph_seq_len,
+                    cache=cache,
                 )
             else:
                 generated_compressed_width = compressed_width
@@ -1155,31 +1236,23 @@ class Attention(nn.Module):
             kv,
             self.kv_norm.weight,
             torch.view_as_real(self.freqs_cis),
-            self.kv_cache[:batch_size],
+            cache.latents.view(-1, self.head_dim),
             token_positions,
             self.eps,
+            cache_mapping=cache.window_mapping(self.layer_id),
         )
-        compressed_pool_width = self.compressed_kv_cache.shape[1] if ratio else 0
-        topk_indices, sparse_lengths, sequence_lengths = verify_attention_metadata(
-            position,
-            block_length,
-            win,
-            self.window_capacity,
+        topk_indices, sparse_lengths, sequence_lengths = self._paged_attention_metadata(
+            cache,
+            token_positions,
             block_compressed_indices,
-            compressed_pool_width,
-            ratio,
             generated_compressed_width,
-        )
-        window_cache = self.kv_cache[:batch_size]
-        compressed_cache = (
-            self.compressed_kv_cache[:batch_size] if ratio else window_cache
         )
 
         assert self.attention_workspace is not None
         o = sparse_verify_attention(
             q,
-            window_cache,
-            compressed_cache,
+            cache.latents,
+            cache.latents,
             self.attn_sink,
             topk_indices,
             sparse_lengths,
@@ -1667,13 +1740,15 @@ class Block(nn.Module):
         self,
         x: torch.Tensor,
         input_ids: torch.Tensor,
+        *,
+        cache: DeviceCache,
     ) -> torch.Tensor:
         residual = x
         x, post, comb = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attn_norm(x)
-        x = self.attn(x)
+        x = self.attn(x, cache=cache)
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
@@ -1691,6 +1766,8 @@ class Block(nn.Module):
         position: torch.Tensor,
         input_ids: torch.Tensor,
         graph_seq_len: int,
+        *,
+        cache: DeviceCache,
     ) -> torch.Tensor:
         """Run a target block without host-side position specialization."""
 
@@ -1698,7 +1775,7 @@ class Block(nn.Module):
             x,
             input_ids,
             lambda layer_input: self.attn.forward_decode(
-                layer_input, position, graph_seq_len
+                layer_input, position, graph_seq_len, cache=cache
             ),
         )
 
@@ -1708,6 +1785,8 @@ class Block(nn.Module):
         token_positions: torch.Tensor,
         input_ids: torch.Tensor,
         graph_seq_len: int,
+        *,
+        cache: DeviceCache,
     ) -> torch.Tensor:
         """Run one target layer over a short causal verification block."""
 
@@ -1715,7 +1794,7 @@ class Block(nn.Module):
             x,
             input_ids,
             lambda layer_input: self.attn.forward_verify(
-                layer_input, token_positions, graph_seq_len
+                layer_input, token_positions, graph_seq_len, cache=cache
             ),
         )
 
@@ -1794,49 +1873,49 @@ class DSparkAttention(Attention):
         if self.compress_ratio:
             raise ValueError("DSpark layers must use uncompressed attention")
 
-    def _main_kv(self, main_x: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
-        frequencies = self.freqs_cis[position]
-        kv = self.kv_norm(self.wkv(main_x))
-        apply_rotary_emb(kv[..., -self.rope_head_dim :], frequencies)
-        act_quant(
-            kv[..., : -self.rope_head_dim],
-            64,
-            scale_fmt,
-            scale_dtype,
-            True,
-        )
-        return kv
-
-    def prefill_main(self, main_x: torch.Tensor) -> None:
+    def prefill_main(self, main_x: torch.Tensor, *, cache: DeviceCache) -> None:
         """Populate the draft stage's rolling target-hidden cache."""
 
         batch_size, sequence_length, _ = main_x.shape
-        positions = torch.arange(sequence_length, device=main_x.device)
-        kv = self._main_kv(main_x, positions)
-        if sequence_length <= self.window_size:
-            self.kv_cache[:batch_size, :sequence_length] = kv
-            return
-        positions = torch.arange(
-            sequence_length - self.window_size,
-            sequence_length,
-            device=main_x.device,
-        ).remainder(self.window_capacity)
-        rows = torch.arange(batch_size, device=main_x.device).unsqueeze(1)
-        self.kv_cache[rows, positions.unsqueeze(0)] = kv[:, -self.window_size :]
+        start = max(0, sequence_length - self.window_size)
+        positions = torch.arange(start, sequence_length, device=main_x.device)
+        kv_norm_rope_store(
+            self.wkv(main_x[:, start:]),
+            self.kv_norm.weight,
+            torch.view_as_real(self.freqs_cis),
+            cache.latents.view(-1, self.head_dim),
+            positions.view(1, -1).expand(batch_size, -1),
+            self.kv_norm.eps,
+            cache_mapping=cache.window_mapping(self.layer_id),
+        )
 
-    def store_main_block(self, main_x: torch.Tensor, position: torch.Tensor) -> None:
+    def store_main_block(
+        self,
+        main_x: torch.Tensor,
+        position: torch.Tensor,
+        *,
+        cache: DeviceCache,
+    ) -> None:
         """Commit a block; later unaccepted slots remain logically invisible."""
 
         block_length = main_x.shape[1]
         positions = position[:, None] + torch.arange(block_length, device=main_x.device)
-        kv = self._main_kv(main_x, positions)
-        rows = torch.arange(main_x.shape[0], device=main_x.device)[:, None]
-        self.kv_cache[rows, positions.remainder(self.window_capacity)] = kv
+        kv_norm_rope_store(
+            self.wkv(main_x),
+            self.kv_norm.weight,
+            torch.view_as_real(self.freqs_cis),
+            cache.latents.view(-1, self.head_dim),
+            positions,
+            self.kv_norm.eps,
+            cache_mapping=cache.window_mapping(self.layer_id),
+        )
 
     def forward(
         self,
         x: torch.Tensor,
         position: torch.Tensor,
+        *,
+        cache: DeviceCache,
     ) -> torch.Tensor:
         batch_size, draft_length, _ = x.shape
         draft_positions = position[:, None] + torch.arange(
@@ -1862,12 +1941,13 @@ class DSparkAttention(Attention):
             draft_length,
             self.window_size,
             self.window_capacity,
+            window_mapping=cache.window_mapping(self.layer_id),
         )
         if self.attention_workspace is None:
             raise RuntimeError("DSpark attention workspace is not initialized")
         o = sparse_verify_attention(
             q,
-            self.kv_cache[:batch_size],
+            cache.latents,
             kv.contiguous(),
             self.attn_sink,
             indices,
@@ -1927,11 +2007,13 @@ class DSparkBlock(Block):
         x: torch.Tensor,
         position: torch.Tensor,
         input_ids: torch.Tensor,
+        *,
+        cache: DeviceCache,
     ) -> torch.Tensor:
         return self._forward_graph(
             x,
             input_ids,
-            lambda layer_input: self.attn(layer_input, position),
+            lambda layer_input: self.attn(layer_input, position, cache=cache),
         )
 
 
@@ -1998,9 +2080,30 @@ class Transformer(nn.Module):
                     else reducer
                 )
 
+    def bind_cache_arena(self, arena: CacheArena) -> None:
+        """Attach compressor fields to their packed physical parent views."""
+
+        for layer in self.layers:
+            attention = layer.attn
+            compressor = getattr(attention, "compressor", None)
+            if compressor is None:
+                continue
+            compressor.kv_state, compressor.score_state = arena.state_tensors(
+                layer.layer_id
+            )
+            compressor.freqs_cis = attention.freqs_cis
+            indexer = getattr(attention, "indexer", None)
+            if indexer is not None:
+                (
+                    indexer.compressor.kv_state,
+                    indexer.compressor.score_state,
+                ) = arena.state_tensors(layer.layer_id, indexer=True)
+                indexer.compressor.freqs_cis = attention.freqs_cis
+                indexer.freqs_cis = attention.freqs_cis
+
     @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor):
-        logits, _ = self.forward_target(input_ids)
+    def forward(self, input_ids: torch.Tensor, *, cache: DeviceCache) -> torch.Tensor:
+        logits, _ = self.forward_target(input_ids, cache=cache)
         return logits
 
     def _forward_layers(
@@ -2033,12 +2136,14 @@ class Transformer(nn.Module):
         return self.head(self.norm(hidden), full_logits=full_logits), main_hidden
 
     @torch.inference_mode()
-    def forward_target(self, input_ids: torch.Tensor):
+    def forward_target(
+        self, input_ids: torch.Tensor, *, cache: DeviceCache
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run target prefill and return the hidden states consumed by DSpark."""
 
         h, main_hidden = self._forward_layers(
             input_ids,
-            lambda layer, hidden: layer(hidden, input_ids),
+            lambda layer, hidden: layer(hidden, input_ids, cache=cache),
         )
         return self._target_output(h, main_hidden)
 
@@ -2048,10 +2153,14 @@ class Transformer(nn.Module):
         input_ids: torch.Tensor,
         position: torch.Tensor,
         graph_seq_len: int,
+        *,
+        cache: DeviceCache,
     ) -> torch.Tensor:
         """Decode one token using only graph-staged position data."""
 
-        logits, _ = self.forward_decode_target(input_ids, position, graph_seq_len)
+        logits, _ = self.forward_decode_target(
+            input_ids, position, graph_seq_len, cache=cache
+        )
         return logits
 
     @torch.inference_mode()
@@ -2060,13 +2169,15 @@ class Transformer(nn.Module):
         input_ids: torch.Tensor,
         position: torch.Tensor,
         graph_seq_len: int,
-    ):
+        *,
+        cache: DeviceCache,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Decode target tokens and expose DSpark's selected hidden states."""
 
         h, main_hidden = self._forward_layers(
             input_ids,
             lambda layer, hidden: layer.forward_decode(
-                hidden, position, input_ids, graph_seq_len
+                hidden, position, input_ids, graph_seq_len, cache=cache
             ),
         )
         return self._target_output(h, main_hidden)
@@ -2077,7 +2188,9 @@ class Transformer(nn.Module):
         input_ids: torch.Tensor,
         position: torch.Tensor,
         graph_seq_len: int,
-    ):
+        *,
+        cache: DeviceCache,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run one fixed target verification block."""
 
         token_positions = position[:, None] + torch.arange(
@@ -2086,7 +2199,7 @@ class Transformer(nn.Module):
         h, main_hidden = self._forward_layers(
             input_ids,
             lambda layer, hidden: layer.forward_verify(
-                hidden, token_positions, input_ids, graph_seq_len
+                hidden, token_positions, input_ids, graph_seq_len, cache=cache
             ),
         )
         return self._target_output(h, main_hidden, full_logits=True)
@@ -2097,17 +2210,19 @@ class Transformer(nn.Module):
         positions: torch.Tensor,
         processed_counts: torch.Tensor,
         block_length: int,
+        *,
+        cache: DeviceCache,
     ) -> None:
         """Discard rejected recurrent rows after engine-level acceptance."""
 
         for layer in self.layers:
             compressor = getattr(layer.attn, "compressor", None)
-            if compressor is not None:
-                compressor.clear_rejected(positions, processed_counts, block_length)
-            indexer = getattr(layer.attn, "indexer", None)
-            if indexer is not None:
-                indexer.compressor.clear_rejected(
-                    positions, processed_counts, block_length
+            if compressor is not None and compressor.compress_ratio == 128:
+                compressor.clear_rejected(
+                    positions,
+                    processed_counts,
+                    block_length,
+                    state_mapping=cache.state_mapping(C128_STATE_GROUP),
                 )
 
     def _project_main(self, main_hidden: torch.Tensor) -> torch.Tensor:
@@ -2117,24 +2232,30 @@ class Transformer(nn.Module):
         return first.main_norm(first.main_proj(main_hidden))
 
     @torch.inference_mode()
-    def prefill_dspark(self, main_hidden: torch.Tensor) -> None:
+    def prefill_dspark(self, main_hidden: torch.Tensor, *, cache: DeviceCache) -> None:
         main_x = self._project_main(main_hidden)
         for layer in self.mtp:
-            layer.attn.prefill_main(main_x)
+            layer.attn.prefill_main(main_x, cache=cache)
 
     @torch.inference_mode()
     def commit_dspark_main_block(
-        self, main_hidden: torch.Tensor, position: torch.Tensor
+        self,
+        main_hidden: torch.Tensor,
+        position: torch.Tensor,
+        *,
+        cache: DeviceCache,
     ) -> None:
         main_x = self._project_main(main_hidden)
         for layer in self.mtp:
-            layer.attn.store_main_block(main_x, position)
+            layer.attn.store_main_block(main_x, position, cache=cache)
 
     @torch.inference_mode()
     def draft(
         self,
         anchor_ids: torch.Tensor,
         position: torch.Tensor,
+        *,
+        cache: DeviceCache,
     ) -> torch.Tensor:
         """Draft a fixed greedy block from one target anchor per batch row."""
 
@@ -2147,7 +2268,7 @@ class Transformer(nn.Module):
         input_ids[:, 0] = anchor_ids.flatten()
         h = self.embed(input_ids).unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.mtp:
-            h = layer(h, position, input_ids)
+            h = layer(h, position, input_ids, cache=cache)
 
         last = self.mtp[-1]
         hidden = last.hc_head(h, last.hc_head_fn, last.hc_head_scale, last.hc_head_base)

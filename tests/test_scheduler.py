@@ -10,6 +10,7 @@ from resin import (
     BatchPlan,
     CacheGroupLayout,
     CacheLayout,
+    CacheRetention,
     Engine,
     ResourceBinding,
     RunnerConfig,
@@ -119,7 +120,7 @@ class TestSchedulerConfigContract:
     def test_window_prefill_spans_multiple_pages_by_default(self) -> None:
         layout = CacheLayout(
             8,
-            [CacheGroupLayout(2, retention="window", window_tokens=8)],
+            [CacheGroupLayout(2, retention=CacheRetention.WINDOW, window_tokens=8)],
         )
 
         class MultiPageRunner(ContinuationRecordingRunner):
@@ -253,9 +254,13 @@ class TestSchedulerConfigContract:
 
         gpt_source = inspect.getsource(GptOssCudaRunner.__init__)
         lfm_source = inspect.getsource(Lfm2CudaRunner.__init__)
-        assert "RunnerConfig(" in gpt_source and "continuation_prefill=True" in gpt_source
+        assert (
+            "RunnerConfig(" in gpt_source and "continuation_prefill=True" in gpt_source
+        )
         assert "max_batch_tokens=_PREFILL_CHUNK_SIZE" in gpt_source
-        assert "RunnerConfig(" in lfm_source and "continuation_prefill=True" in lfm_source
+        assert (
+            "RunnerConfig(" in lfm_source and "continuation_prefill=True" in lfm_source
+        )
         assert Lfm2TorchRunner.runner_config.continuation_prefill is True
 
     def test_engine_freezes_a_copy_of_the_effective_config(self) -> None:

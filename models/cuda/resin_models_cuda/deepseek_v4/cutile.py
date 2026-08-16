@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import math
-from typing import Annotated, TypeAlias
+from typing import TYPE_CHECKING, Annotated, TypeAlias
 
 import cuda.tile as ct
 import torch
 from torch import Tensor
 from torch.nn import functional as F
+
+if TYPE_CHECKING:
+    from resin_models_cuda.deepseek_v4.cache import DeviceMapping
 
 _ConstantInt: TypeAlias = ct.Constant[int]
 _ConstantBool: TypeAlias = ct.Constant[bool]
@@ -23,6 +26,162 @@ _StaticLastTwoDims: TypeAlias = Annotated[
 _NEGATIVE = -3.402823466e38
 _MIN_WIDE_TILE_PROGRAMS = 64
 _INDEX_SCORE_TILE = 64
+_CACHE_MAP_TILE = 64
+
+
+@ct.kernel
+def _paged_rows_kernel(
+    pages,
+    first_blocks,
+    positions,
+    output,
+    block_tokens: _ConstantInt,
+    divisor: _ConstantInt,
+    parent_rows: _ConstantInt,
+    packing: _ConstantInt,
+    row_scale: _ConstantInt,
+    layer_offset: int,
+):
+    """Map logical token positions to physical cache rows in one launch."""
+
+    tile = ct.bid(0)
+    batch = ct.bid(1)
+    logical_positions = ct.load(
+        positions,
+        (batch, tile),
+        shape=(1, _CACHE_MAP_TILE),
+        padding_mode=ct.PaddingMode.ZERO,
+    ).astype(ct.int32)
+    first = ct.load(first_blocks, (batch,), shape=(1,)).item()
+    columns = logical_positions // block_tokens - first
+    batches = ct.full((1, _CACHE_MAP_TILE), batch, dtype=ct.int32)
+    selected_pages = ct.gather(pages, (batches, columns), padding_value=0)
+
+    child_rows = parent_rows // packing
+    parents = (selected_pages - 1) // packing + 1
+    children = (selected_pages - 1) % packing
+    offsets = (logical_positions % block_tokens) // divisor
+    physical = (
+        (parents * parent_rows + children * child_rows) * row_scale
+        + layer_offset
+        + offsets
+    )
+    in_table = (columns >= 0) & (columns < pages.shape[1])
+    physical = ct.where(selected_pages > 0, physical, 0)
+    physical = ct.where(in_table, physical, -1)
+    ct.store(output, (batch, tile), physical.astype(ct.int32))
+
+
+def paged_cache_rows(
+    pages: Tensor,
+    first_blocks: Tensor,
+    positions: Tensor,
+    *,
+    block_tokens: int,
+    divisor: int,
+    parent_rows: int,
+    packing: int,
+    row_scale: int,
+    layer_offset: int,
+) -> Tensor:
+    """Map a batched logical-position tensor without PyTorch kernel chains."""
+
+    if positions.ndim < 2 or pages.ndim != 2:
+        raise ValueError("paged cache mapping requires batched tensors")
+    batch_size = positions.shape[0]
+    if first_blocks.shape != (batch_size,) or pages.shape[0] != batch_size:
+        raise ValueError("paged cache rows must share one batch dimension")
+    flat_positions = positions.reshape(batch_size, -1)
+    output = torch.empty_like(flat_positions, dtype=torch.int32)
+    ct.launch(
+        torch.cuda.current_stream(positions.device),
+        (math.ceil(flat_positions.shape[1] / _CACHE_MAP_TILE), batch_size),
+        _paged_rows_kernel,
+        (
+            pages,
+            first_blocks,
+            flat_positions,
+            output,
+            block_tokens,
+            divisor,
+            parent_rows,
+            packing,
+            row_scale,
+            layer_offset,
+        ),
+    )
+    return output.view(positions.shape)
+
+
+@ct.kernel
+def _paged_state_locations_kernel(
+    pages,
+    first_blocks,
+    positions,
+    output_pages,
+    output_offsets,
+    block_tokens: _ConstantInt,
+    packing: _ConstantInt,
+):
+    tile = ct.bid(0)
+    batch = ct.bid(1)
+    logical_positions = ct.load(
+        positions,
+        (batch, tile),
+        shape=(1, _CACHE_MAP_TILE),
+        padding_mode=ct.PaddingMode.ZERO,
+    ).astype(ct.int32)
+    first = ct.load(first_blocks, (batch,), shape=(1,)).item()
+    columns = logical_positions // block_tokens - first
+    batches = ct.full((1, _CACHE_MAP_TILE), batch, dtype=ct.int32)
+    selected_pages = ct.gather(pages, (batches, columns), padding_value=0)
+    valid = (columns >= 0) & (columns < pages.shape[1])
+    physical_children = ct.where(selected_pages > 0, selected_pages + packing - 1, 0)
+    ct.store(
+        output_pages,
+        (batch, tile),
+        ct.where(valid, physical_children, -1).astype(ct.int32),
+    )
+    ct.store(
+        output_offsets,
+        (batch, tile),
+        ct.where(valid, logical_positions % block_tokens, 0).astype(ct.int32),
+    )
+
+
+def paged_state_locations(
+    pages: Tensor,
+    first_blocks: Tensor,
+    positions: Tensor,
+    *,
+    block_tokens: int,
+    packing: int,
+) -> tuple[Tensor, Tensor]:
+    """Map recurrent state locations in one launch."""
+
+    if positions.ndim < 2 or pages.ndim != 2:
+        raise ValueError("paged state mapping requires batched tensors")
+    batch_size = positions.shape[0]
+    if first_blocks.shape != (batch_size,) or pages.shape[0] != batch_size:
+        raise ValueError("paged state rows must share one batch dimension")
+    flat_positions = positions.reshape(batch_size, -1)
+    output_pages = torch.empty_like(flat_positions, dtype=torch.int32)
+    output_offsets = torch.empty_like(flat_positions, dtype=torch.int32)
+    ct.launch(
+        torch.cuda.current_stream(positions.device),
+        (math.ceil(flat_positions.shape[1] / _CACHE_MAP_TILE), batch_size),
+        _paged_state_locations_kernel,
+        (
+            pages,
+            first_blocks,
+            flat_positions,
+            output_pages,
+            output_offsets,
+            block_tokens,
+            packing,
+        ),
+    )
+    return output_pages.view(positions.shape), output_offsets.view(positions.shape)
 
 
 def _quant_groups_per_program(rows: int, group_count: int) -> int:
@@ -256,6 +415,8 @@ def hash_sqrt_softplus(
 def _index_score_kernel(
     query: _StaticLastTwoDims,
     cache: _StaticLastDim,
+    cache_pages,
+    cache_first_blocks,
     head_weights: _StaticLastDim,
     positions,
     output,
@@ -263,6 +424,11 @@ def _index_score_kernel(
     heads: _ConstantInt,
     head_dim: _ConstantInt,
     tile_width: _ConstantInt,
+    paged_cache: _ConstantBool,
+    parent_rows: _ConstantInt,
+    packing: _ConstantInt,
+    row_scale: _ConstantInt,
+    layer_offset: int,
     weight_scale: float,
 ):
     """Fuse index QK, activation, head reduction, and causal masking."""
@@ -273,9 +439,34 @@ def _index_score_kernel(
     q = ct.load(query, (batch, sequence, 0, 0), shape=(1, 1, heads, head_dim)).reshape(
         (heads, head_dim)
     )
-    keys = ct.load(cache, (batch, tile, 0), shape=(1, tile_width, head_dim)).reshape(
-        (tile_width, head_dim)
-    )
+    if paged_cache:
+        logical_positions = (
+            tile * tile_width + ct.arange(tile_width, dtype=ct.int32)
+        ) * ratio
+        first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
+        page_columns = logical_positions // 128 - first
+        selected_pages = ct.gather(
+            cache_pages,
+            (
+                ct.full((tile_width,), batch, dtype=ct.int32),
+                page_columns,
+            ),
+            padding_value=0,
+        )
+        child_rows = parent_rows // packing
+        parents = (selected_pages - 1) // packing + 1
+        children = (selected_pages - 1) % packing
+        rows = (
+            (parents * parent_rows + children * child_rows) * row_scale
+            + layer_offset
+            + (logical_positions % 128) // ratio
+        ).reshape((tile_width, 1))
+        dimensions = ct.arange(head_dim, dtype=ct.int32).reshape((1, head_dim))
+        keys = ct.gather(cache, (rows, dimensions), padding_value=0)
+    else:
+        keys = ct.load(
+            cache, (batch, tile, 0), shape=(1, tile_width, head_dim)
+        ).reshape((tile_width, head_dim))
     scores = ct.mma(
         q,
         keys.permute((1, 0)),
@@ -304,17 +495,25 @@ def index_scores(
     positions: Tensor,
     ratio: int,
     weight_scale: float,
+    *,
+    cache_mapping: DeviceMapping,
+    cache_width: int | None = None,
 ) -> Tensor:
     """Compute and collapse per-head index logits in one tensor-core launch."""
 
-    if query.ndim != 4 or cache.ndim != 3:
-        raise ValueError("index QK inputs must have rank four and three")
+    if query.ndim != 4 or cache.ndim != 2:
+        raise ValueError("index QK inputs have invalid ranks")
     batch_size, block_length, heads, head_dim = query.shape
-    width = cache.shape[1]
+    width = cache_width
+    if width is None:
+        width = (
+            math.ceil(cache_mapping.pages.shape[1] * 128 / ratio / _INDEX_SCORE_TILE)
+            * _INDEX_SCORE_TILE
+        )
     if (
         head_weights.shape != (batch_size, block_length, heads)
         or positions.shape != (batch_size, block_length)
-        or cache.shape != (batch_size, width, head_dim)
+        or cache.shape[-1] != head_dim
         or width % _INDEX_SCORE_TILE
     ):
         raise ValueError("index scoring requires matching padded inputs")
@@ -323,6 +522,8 @@ def index_scores(
         dtype=query.dtype,
         device=query.device,
     )
+    if cache_mapping.block_tokens != 128 or cache_mapping.divisor != ratio:
+        raise ValueError("index score cache mapping has incompatible geometry")
     ct.launch(
         torch.cuda.current_stream(query.device),
         (width // _INDEX_SCORE_TILE, block_length, batch_size),
@@ -330,6 +531,8 @@ def index_scores(
         (
             query,
             cache,
+            cache_mapping.pages,
+            cache_mapping.first_blocks,
             head_weights,
             positions,
             output,
@@ -337,6 +540,11 @@ def index_scores(
             heads,
             head_dim,
             _INDEX_SCORE_TILE,
+            True,
+            cache_mapping.parent_rows,
+            cache_mapping.packing,
+            cache_mapping.row_scale,
+            cache_mapping.layer_offset,
             weight_scale,
         ),
     )
@@ -347,9 +555,15 @@ def index_scores(
 def _finish_index_topk_kernel(
     indices: _StaticLastDim,
     positions,
+    cache_pages,
+    cache_first_blocks,
     output: _StaticLastDim,
     ratio: _ConstantInt,
     width: _ConstantInt,
+    direct_page_mapping: _ConstantBool,
+    parent_rows: _ConstantInt,
+    packing: _ConstantInt,
+    layer_offset: int,
     offset: int,
 ):
     sequence = ct.bid(0)
@@ -360,6 +574,28 @@ def _finish_index_topk_kernel(
     for tile in range(width // 64):
         values = ct.load(indices, (batch, sequence, tile), shape=(1, 1, 64))
         values = ct.where(values < (token + 1) // ratio, values + offset, -1)
+        if direct_page_mapping:
+            logical_positions = values * ratio
+            first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
+            page_columns = logical_positions // 128 - first
+            selected_pages = ct.gather(
+                cache_pages,
+                (
+                    ct.full((1, 1, 64), batch, dtype=ct.int32),
+                    page_columns,
+                ),
+                padding_value=0,
+            )
+            child_rows = parent_rows // packing
+            parents = (selected_pages - 1) // packing + 1
+            children = (selected_pages - 1) % packing
+            physical = (
+                parents * parent_rows
+                + children * child_rows
+                + layer_offset
+                + (logical_positions % 128) // ratio
+            )
+            values = ct.where((values >= 0) & (selected_pages > 0), physical, -1)
         ct.store(output, (batch, sequence, tile), values.astype(ct.int32))
 
 
@@ -368,6 +604,8 @@ def finish_index_topk(
     positions: Tensor,
     ratio: int,
     offset: int,
+    *,
+    cache_mapping: DeviceMapping,
 ) -> Tensor:
     """Mask causal index results and convert them to attention indices."""
 
@@ -376,6 +614,8 @@ def finish_index_topk(
     if indices.shape[-1] % 64:
         raise ValueError("index top-k width must be divisible by 64")
     output = torch.empty_like(indices, dtype=torch.int32)
+    if cache_mapping.block_tokens != 128 or cache_mapping.divisor != ratio:
+        raise ValueError("index top-k cache mapping has incompatible geometry")
     ct.launch(
         torch.cuda.current_stream(indices.device),
         (indices.shape[1], indices.shape[0]),
@@ -383,9 +623,15 @@ def finish_index_topk(
         (
             indices,
             positions,
+            cache_mapping.pages,
+            cache_mapping.first_blocks,
             output,
             ratio,
             indices.shape[-1],
+            True,
+            cache_mapping.parent_rows,
+            cache_mapping.packing,
+            cache_mapping.layer_offset,
             offset,
         ),
     )
@@ -722,12 +968,18 @@ def _qk_norm_rope_kernel(
     norm_weight: _StaticLastDim,
     frequencies: _StaticLastTwoDims,
     cache: _StaticLastTwoDims,
+    cache_pages,
+    cache_first_blocks,
     position,
     heads: _ConstantInt,
     dimension: _ConstantInt,
     rope_dimension: _ConstantInt,
     window: _ConstantInt,
     store_cache: _ConstantBool,
+    paged_cache: _ConstantBool,
+    parent_rows: _ConstantInt,
+    packing: _ConstantInt,
+    layer_offset: int,
     epsilon: float,
 ):
     block = ct.bid(0)
@@ -806,11 +1058,37 @@ def _qk_norm_rope_kernel(
             (dimension,)
         )
         if store_cache:
-            ct.store(
-                cache,
-                (batch, token % window, 0),
-                value.reshape((1, 1, dimension)).astype(cache.dtype),
-            )
+            if paged_cache:
+                first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
+                column = token // 128 - first
+                cache_page = ct.gather(
+                    cache_pages,
+                    (
+                        ct.full((1,), batch, dtype=ct.int32),
+                        ct.full((1,), column, dtype=ct.int32),
+                    ),
+                    padding_value=0,
+                ).item()
+                child_rows = parent_rows // packing
+                parent = (cache_page - 1) // packing + 1
+                child = (cache_page - 1) % packing
+                cache_row = (
+                    parent * parent_rows
+                    + child * child_rows
+                    + layer_offset
+                    + token % 128
+                )
+                ct.store(
+                    cache,
+                    (cache_row, 0),
+                    value.reshape((1, dimension)).astype(cache.dtype),
+                )
+            else:
+                ct.store(
+                    cache,
+                    (batch, token % window, 0),
+                    value.reshape((1, 1, dimension)).astype(cache.dtype),
+                )
         else:
             ct.store(
                 key_value,
@@ -827,6 +1105,8 @@ def qk_norm_rope_store(
     cache: Tensor,
     position: Tensor,
     epsilon: float,
+    *,
+    cache_mapping: DeviceMapping,
 ) -> None:
     """Normalize Q/K, apply RoPE, quantize K, and update the decode cache."""
 
@@ -835,7 +1115,8 @@ def qk_norm_rope_store(
         query.shape[1] != 1
         or key_value.shape != (batch_size, 1, query.shape[-1])
         or position.shape != (batch_size,)
-        or cache.shape[0] != batch_size
+        or cache.ndim != 2
+        or cache.shape[-1] != query.shape[-1]
     ):
         raise ValueError("fused Q/K decode requires one token per matching batch row")
     dimension = query.shape[-1]
@@ -844,6 +1125,8 @@ def qk_norm_rope_store(
         raise ValueError(
             "DeepSeek-V4 fused Q/K decode requires 512D heads and 64D RoPE"
         )
+    if cache_mapping.block_tokens != 128 or cache_mapping.divisor != 1:
+        raise ValueError("Q/K cache mapping must address 128-token window rows")
     ct.launch(
         torch.cuda.current_stream(query.device),
         (query.shape[2] + 1, batch_size, 1),
@@ -854,12 +1137,18 @@ def qk_norm_rope_store(
             norm_weight,
             frequencies,
             cache,
+            cache_mapping.pages,
+            cache_mapping.first_blocks,
             position.view(batch_size, 1),
             query.shape[2],
             dimension,
             rope_dimension,
             cache.shape[1],
             True,
+            True,
+            cache_mapping.parent_rows,
+            cache_mapping.packing,
+            cache_mapping.layer_offset,
             epsilon,
         ),
     )
@@ -873,6 +1162,8 @@ def qk_norm_rope_block(
     cache: Tensor,
     positions: Tensor,
     epsilon: float,
+    *,
+    cache_mapping: DeviceMapping,
 ) -> None:
     """Normalize/rotate a verification block and store its guarded window KV."""
 
@@ -881,7 +1172,7 @@ def qk_norm_rope_block(
         block_length == 0
         or key_value.shape != (batch_size, block_length, query.shape[-1])
         or positions.shape != (batch_size, block_length)
-        or cache.shape[0] != batch_size
+        or cache.ndim != 2
         or cache.shape[-1] != query.shape[-1]
     ):
         raise ValueError("fused Q/K verification requires matching token blocks")
@@ -891,6 +1182,8 @@ def qk_norm_rope_block(
         raise ValueError(
             "DeepSeek-V4 fused Q/K verification requires 512D heads and 64D RoPE"
         )
+    if cache_mapping.block_tokens != 128 or cache_mapping.divisor != 1:
+        raise ValueError("Q/K cache mapping must address 128-token window rows")
     ct.launch(
         torch.cuda.current_stream(query.device),
         (query.shape[2] + 1, batch_size, block_length),
@@ -901,12 +1194,71 @@ def qk_norm_rope_block(
             norm_weight,
             frequencies,
             cache,
+            cache_mapping.pages,
+            cache_mapping.first_blocks,
             positions,
             query.shape[2],
             dimension,
             rope_dimension,
             cache.shape[1],
             True,
+            True,
+            cache_mapping.parent_rows,
+            cache_mapping.packing,
+            cache_mapping.layer_offset,
+            epsilon,
+        ),
+    )
+
+
+def kv_norm_rope_store(
+    key_value: Tensor,
+    norm_weight: Tensor,
+    frequencies: Tensor,
+    cache: Tensor,
+    positions: Tensor,
+    epsilon: float,
+    *,
+    cache_mapping: DeviceMapping,
+) -> None:
+    """Fuse DSpark main-KV normalization, RoPE, quantization, and cache store."""
+
+    if (
+        key_value.ndim != 3
+        or key_value.shape[-1] != 512
+        or positions.shape != key_value.shape[:2]
+        or frequencies.shape[-2:] != (32, 2)
+        or norm_weight.shape != (512,)
+        or cache.ndim != 2
+        or cache.shape[-1] != 512
+    ):
+        raise ValueError("DSpark main-KV store requires matching 512D token blocks")
+    if cache_mapping.block_tokens != 128 or cache_mapping.divisor != 1:
+        raise ValueError("DSpark main-KV mapping must address window rows")
+    # The query array is an unused view when the compile-time head count is zero.
+    query_placeholder = key_value.unsqueeze(2)
+    ct.launch(
+        torch.cuda.current_stream(key_value.device),
+        (1, key_value.shape[0], key_value.shape[1]),
+        _qk_norm_rope_kernel,
+        (
+            query_placeholder,
+            key_value,
+            norm_weight,
+            frequencies,
+            cache,
+            cache_mapping.pages,
+            cache_mapping.first_blocks,
+            positions,
+            0,
+            512,
+            64,
+            cache.shape[1],
+            True,
+            True,
+            cache_mapping.parent_rows,
+            cache_mapping.packing,
+            cache_mapping.layer_offset,
             epsilon,
         ),
     )
@@ -990,6 +1342,10 @@ def rope_last_block_inplace(
 @ct.kernel
 def _verify_attention_metadata_kernel(
     position,
+    window_pages,
+    window_first_blocks,
+    compressed_pages,
+    compressed_first_blocks,
     compressed_indices: _StaticLastDim,
     indices: _StaticLastDim,
     sparse_lengths,
@@ -1000,6 +1356,12 @@ def _verify_attention_metadata_kernel(
     compress_ratio: _ConstantInt,
     compressed_index_width: _ConstantInt,
     has_explicit_compressed_indices: _ConstantBool,
+    paged_cache: _ConstantBool,
+    parent_rows: _ConstantInt,
+    window_packing: _ConstantInt,
+    compressed_packing: _ConstantInt,
+    window_layer_offset: int,
+    compressed_layer_offset: int,
     block_length: _ConstantInt,
     tile_width: _ConstantInt,
 ):
@@ -1025,12 +1387,40 @@ def _verify_attention_metadata_kernel(
     block_index = ct.where(
         (columns >= history_count) & (columns < block_end), block_index, -1
     )
-    window_indices = ct.where(columns < history_count, old_index, block_index)
-    window_indices = ct.where(
-        window_indices >= 0,
-        window_indices + batch * window_capacity,
-        -1,
+    window_positions = ct.where(columns < history_count, old_position, block_position)
+    window_valid = (columns < history_count) | (
+        (columns >= history_count) & (columns < block_end)
     )
+    if paged_cache:
+        first_window = ct.load(window_first_blocks, (batch,), shape=(1,)).item()
+        window_columns = window_positions // 128 - first_window
+        window_pages_tile = ct.gather(
+            window_pages,
+            (
+                ct.full((tile_width,), batch, dtype=ct.int32),
+                window_columns,
+            ),
+            padding_value=0,
+        )
+        child_rows = parent_rows // window_packing
+        window_parents = (window_pages_tile - 1) // window_packing + 1
+        window_children = (window_pages_tile - 1) % window_packing
+        window_indices = (
+            window_parents * parent_rows
+            + window_children * child_rows
+            + window_layer_offset
+            + window_positions % 128
+        )
+        window_indices = ct.where(
+            window_valid & (window_pages_tile > 0), window_indices, -1
+        )
+    else:
+        window_indices = ct.where(columns < history_count, old_index, block_index)
+        window_indices = ct.where(
+            window_indices >= 0,
+            window_indices + batch * window_capacity,
+            -1,
+        )
 
     output = window_indices
     if compressed_index_width > 0:
@@ -1053,11 +1443,43 @@ def _verify_attention_metadata_kernel(
                 compressed_column,
                 -1,
             )
-        compressed = ct.where(
-            compressed >= 0,
-            compressed + batch * compressed_pool_width,
-            -1,
-        )
+        if paged_cache:
+            if not has_explicit_compressed_indices:
+                first_compressed = ct.load(
+                    compressed_first_blocks, (batch,), shape=(1,)
+                ).item()
+                compressed_positions = compressed * compress_ratio
+                compressed_columns = compressed_positions // 128 - first_compressed
+                compressed_pages_tile = ct.gather(
+                    compressed_pages,
+                    (
+                        ct.full((tile_width,), batch, dtype=ct.int32),
+                        compressed_columns,
+                    ),
+                    padding_value=0,
+                )
+                child_rows = parent_rows // compressed_packing
+                compressed_parents = (
+                    compressed_pages_tile - 1
+                ) // compressed_packing + 1
+                compressed_children = (compressed_pages_tile - 1) % compressed_packing
+                compressed_physical = (
+                    compressed_parents * parent_rows
+                    + compressed_children * child_rows
+                    + compressed_layer_offset
+                    + (compressed_positions % 128) // compress_ratio
+                )
+                compressed = ct.where(
+                    (compressed >= 0) & (compressed_pages_tile > 0),
+                    compressed_physical,
+                    -1,
+                )
+        else:
+            compressed = ct.where(
+                compressed >= 0,
+                compressed + batch * compressed_pool_width,
+                -1,
+            )
         output = ct.where(
             columns < block_end,
             output,
@@ -1102,6 +1524,9 @@ def verify_attention_metadata(
     compressed_pool_width: int,
     compress_ratio: int,
     generated_compressed_width: int = 0,
+    *,
+    window_mapping: DeviceMapping,
+    compressed_mapping: DeviceMapping | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Build all sparse-verification indices and lengths in one launch."""
 
@@ -1122,6 +1547,22 @@ def verify_attention_metadata(
         raise ValueError("compressed verification indices must match the token block")
     if (compressed_index_width > 0) != (compress_ratio > 0):
         raise ValueError("compressed index geometry requires a compression ratio")
+    if (
+        window_mapping.block_tokens != 128
+        or window_mapping.divisor != 1
+        or (
+            compressed_indices is None
+            and compressed_index_width > 0
+            and compressed_mapping is None
+        )
+    ):
+        raise ValueError("paged verification metadata has invalid cache mappings")
+    if compressed_mapping is not None and (
+        compressed_mapping.block_tokens != 128
+        or compressed_mapping.divisor != compress_ratio
+        or compressed_mapping.parent_rows != window_mapping.parent_rows
+    ):
+        raise ValueError("compressed verification mapping is incompatible")
     index_width = window_size + block_length + compressed_index_width
     tile_width = 1 << (index_width - 1).bit_length()
     indices = torch.empty(
@@ -1134,12 +1575,24 @@ def verify_attention_metadata(
     )
     sequence_lengths = torch.empty_like(sparse_lengths)
     compressed_input = indices if compressed_indices is None else compressed_indices
+    window_pages = window_mapping.pages
+    window_first_blocks = window_mapping.first_blocks
+    compressed_pages = (
+        indices if compressed_mapping is None else compressed_mapping.pages
+    )
+    compressed_first_blocks = (
+        position if compressed_mapping is None else compressed_mapping.first_blocks
+    )
     ct.launch(
         torch.cuda.current_stream(position.device),
         (block_length, batch_size),
         _verify_attention_metadata_kernel,
         (
             position,
+            window_pages,
+            window_first_blocks,
+            compressed_pages,
+            compressed_first_blocks,
             compressed_input,
             indices,
             sparse_lengths,
@@ -1150,6 +1603,12 @@ def verify_attention_metadata(
             compress_ratio,
             compressed_index_width,
             compressed_indices is not None,
+            True,
+            window_mapping.parent_rows,
+            window_mapping.packing,
+            compressed_mapping.packing if compressed_mapping is not None else 1,
+            window_mapping.layer_offset,
+            compressed_mapping.layer_offset if compressed_mapping is not None else 0,
             block_length,
             tile_width,
         ),
@@ -1160,6 +1619,8 @@ def verify_attention_metadata(
 @ct.kernel
 def _dspark_attention_metadata_kernel(
     position,
+    window_pages,
+    window_first_blocks,
     indices: _StaticLastDim,
     sparse_lengths,
     sequence_lengths,
@@ -1167,6 +1628,10 @@ def _dspark_attention_metadata_kernel(
     window_capacity: _ConstantInt,
     block_length: _ConstantInt,
     index_width: _ConstantInt,
+    paged_cache: _ConstantBool,
+    parent_rows: _ConstantInt,
+    packing: _ConstantInt,
+    layer_offset: int,
 ):
     """Build compact history-plus-draft indices for FlashInfer sparse MLA."""
 
@@ -1177,9 +1642,34 @@ def _dspark_attention_metadata_kernel(
     history_start = anchor - history_count
     for tile in ct.static_iter(range(index_width // 64)):
         columns = tile * 64 + ct.arange(64, dtype=ct.int32)
-        history = (history_start + columns) % window_capacity
-        history += batch * window_capacity
-        history = ct.where(columns < history_count, history, -1)
+        history_positions = history_start + columns
+        if paged_cache:
+            first = ct.load(window_first_blocks, (batch,), shape=(1,)).item()
+            page_columns = history_positions // 128 - first
+            selected_pages = ct.gather(
+                window_pages,
+                (
+                    ct.full((64,), batch, dtype=ct.int32),
+                    page_columns,
+                ),
+                padding_value=0,
+            )
+            child_rows = parent_rows // packing
+            parents = (selected_pages - 1) // packing + 1
+            children = (selected_pages - 1) % packing
+            history = (
+                parents * parent_rows
+                + children * child_rows
+                + layer_offset
+                + history_positions % 128
+            )
+            history = ct.where(
+                (columns < history_count) & (selected_pages > 0), history, -1
+            )
+        else:
+            history = history_positions % window_capacity
+            history += batch * window_capacity
+            history = ct.where(columns < history_count, history, -1)
         # FlashInfer reserves the first ``window_size`` columns for the SWA
         # pool even when a short sequence has fewer valid history tokens.
         draft_column = columns - window_size
@@ -1218,6 +1708,8 @@ def dspark_attention_metadata(
     block_length: int,
     window_size: int,
     window_capacity: int,
+    *,
+    window_mapping: DeviceMapping,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Build graph-safe sparse-MLA metadata for a parallel DSpark block."""
 
@@ -1239,12 +1731,16 @@ def dspark_attention_metadata(
         (batch_size, block_length), dtype=torch.int32, device=position.device
     )
     sequence_lengths = torch.empty_like(sparse_lengths)
+    if window_mapping.block_tokens != 128 or window_mapping.divisor != 1:
+        raise ValueError("DSpark window mapping must use 128-token pages")
     ct.launch(
         torch.cuda.current_stream(position.device),
         (block_length, batch_size),
         _dspark_attention_metadata_kernel,
         (
             position,
+            window_mapping.pages,
+            window_mapping.first_blocks,
             indices,
             sparse_lengths,
             sequence_lengths,
@@ -1252,6 +1748,10 @@ def dspark_attention_metadata(
             window_capacity,
             block_length,
             index_width,
+            True,
+            window_mapping.parent_rows,
+            window_mapping.packing,
+            window_mapping.layer_offset,
         ),
     )
     return indices, sparse_lengths, sequence_lengths
@@ -1264,12 +1764,17 @@ def _compress_ring_kernel(
     ape: _StaticLastDim,
     value_state: _StaticLastDim,
     score_state: _StaticLastDim,
+    state_page_table,
+    state_first_blocks,
     positions,
     ratio: _ConstantInt,
     dimension: _ConstantInt,
     block_length: _ConstantInt,
     ring_size: _ConstantInt,
     overlap: _ConstantBool,
+    direct_page_mapping: _ConstantBool,
+    state_block_tokens: _ConstantInt,
+    state_packing: _ConstantInt,
 ):
     """Append one token block to a padded ring and pool completed windows.
 
@@ -1283,24 +1788,84 @@ def _compress_ring_kernel(
     batch = ct.bid(1)
     rows = ct.arange(ring_size, dtype=ct.int32).reshape((1, ring_size, 1))
     if overlap:
-        first_values = ct.load(
-            value_state, (batch, 0, block), shape=(1, ring_size, 32)
-        ).astype(ct.float32)
-        first_scores = ct.load(
-            score_state, (batch, 0, block), shape=(1, ring_size, 32)
-        ).astype(ct.float32)
+        if direct_page_mapping:
+            end = ct.load(positions, (batch, block_length - 1), shape=(1, 1)).item()
+            slots = ct.arange(ring_size, dtype=ct.int32)
+            chronological = end - (end - slots) % ring_size
+            first = ct.load(state_first_blocks, (batch,), shape=(1,)).item()
+            columns = chronological // state_block_tokens - first
+            selected_pages = ct.gather(
+                state_page_table,
+                (
+                    ct.full((ring_size,), batch, dtype=ct.int32),
+                    columns,
+                ),
+                padding_value=0,
+            )
+            valid = chronological >= 0
+            pages = ct.where(
+                valid & (selected_pages > 0),
+                selected_pages + state_packing - 1,
+                -1,
+            ).reshape((ring_size, 1))
+            offsets = ct.where(valid, chronological % state_block_tokens, 0).reshape(
+                (ring_size, 1)
+            )
+        else:
+            pages = ct.full((ring_size, 1), batch, dtype=ct.int32)
+            offsets = ct.arange(ring_size, dtype=ct.int32).reshape((ring_size, 1))
+        dimensions = block * 32 + ct.arange(32, dtype=ct.int32).reshape((1, 32))
+        first_values = (
+            ct.gather(value_state, (pages, offsets, dimensions), padding_value=0)
+            .reshape((1, ring_size, 32))
+            .astype(ct.float32)
+        )
+        first_scores = (
+            ct.gather(
+                score_state, (pages, offsets, dimensions), padding_value=float("-inf")
+            )
+            .reshape((1, ring_size, 32))
+            .astype(ct.float32)
+        )
         second_block = block + dimension // 32
-        second_values = ct.load(
-            value_state, (batch, 0, second_block), shape=(1, ring_size, 32)
-        ).astype(ct.float32)
-        second_scores = ct.load(
-            score_state, (batch, 0, second_block), shape=(1, ring_size, 32)
-        ).astype(ct.float32)
+        second_dimensions = second_block * 32 + ct.arange(32, dtype=ct.int32).reshape(
+            (1, 32)
+        )
+        second_values = (
+            ct.gather(value_state, (pages, offsets, second_dimensions), padding_value=0)
+            .reshape((1, ring_size, 32))
+            .astype(ct.float32)
+        )
+        second_scores = (
+            ct.gather(
+                score_state,
+                (pages, offsets, second_dimensions),
+                padding_value=float("-inf"),
+            )
+            .reshape((1, ring_size, 32))
+            .astype(ct.float32)
+        )
 
     for token_index in ct.static_iter(range(block_length)):
         token = ct.load(positions, (batch, token_index), shape=(1, 1)).item()
         ape_slot = token % ratio
         ring_slot = token % ring_size
+        if direct_page_mapping:
+            first = ct.load(state_first_blocks, (batch,), shape=(1,)).item()
+            column = token // state_block_tokens - first
+            selected_page = ct.gather(
+                state_page_table,
+                (
+                    ct.full((1,), batch, dtype=ct.int32),
+                    ct.full((1,), column, dtype=ct.int32),
+                ),
+                padding_value=0,
+            ).item()
+            state_page = selected_page + state_packing - 1
+            state_offset = token % state_block_tokens
+        else:
+            state_page = batch
+            state_offset = ring_slot
         selected = rows == ring_slot
         current = ct.load(values, (batch, token_index, block), shape=(1, 1, 32)).astype(
             ct.float32
@@ -1309,8 +1874,8 @@ def _compress_ring_kernel(
             ct.float32
         )
         score += ct.load(ape, (ape_slot, block), shape=(1, 32)).reshape((1, 1, 32))
-        ct.store(value_state, (batch, ring_slot, block), current)
-        ct.store(score_state, (batch, ring_slot, block), score)
+        ct.store(value_state, (state_page, state_offset, block), current)
+        ct.store(score_state, (state_page, state_offset, block), score)
 
         if overlap:
             first_values = ct.where(
@@ -1338,8 +1903,12 @@ def _compress_ring_kernel(
                 ct.broadcast_to(second_score, second_scores.shape),
                 second_scores,
             )
-            ct.store(value_state, (batch, ring_slot, second_block), second_current)
-            ct.store(score_state, (batch, ring_slot, second_block), second_score)
+            ct.store(
+                value_state, (state_page, state_offset, second_block), second_current
+            )
+            ct.store(
+                score_state, (state_page, state_offset, second_block), second_score
+            )
 
         if (token + 1) % ratio == 0:
             age = (token - rows + ring_size) % ring_size
@@ -1355,17 +1924,51 @@ def _compress_ring_kernel(
                     axis=1,
                 )
             else:
-                window_start = (token + 1 - ratio) % ring_size
-                pooled_values = ct.load(
-                    value_state,
-                    (batch, window_start, block),
-                    shape=(1, ratio, 32),
-                ).astype(ct.float32)
-                pooled_scores = ct.load(
-                    score_state,
-                    (batch, window_start, block),
-                    shape=(1, ratio, 32),
-                ).astype(ct.float32)
+                if direct_page_mapping:
+                    pooled_positions = (
+                        token + 1 - ratio + ct.arange(ratio, dtype=ct.int32)
+                    )
+                    first = ct.load(state_first_blocks, (batch,), shape=(1,)).item()
+                    pooled_columns = pooled_positions // state_block_tokens - first
+                    selected_pages = ct.gather(
+                        state_page_table,
+                        (
+                            ct.full((ratio,), batch, dtype=ct.int32),
+                            pooled_columns,
+                        ),
+                        padding_value=0,
+                    )
+                    pooled_pages = (selected_pages + state_packing - 1).reshape(
+                        (ratio, 1)
+                    )
+                    pooled_offsets = (pooled_positions % state_block_tokens).reshape(
+                        (ratio, 1)
+                    )
+                else:
+                    window_start = (token + 1 - ratio) % ring_size
+                    pooled_offsets = (
+                        window_start + ct.arange(ratio, dtype=ct.int32)
+                    ).reshape((ratio, 1)) % ring_size
+                    pooled_pages = ct.full((ratio, 1), batch, dtype=ct.int32)
+                dimensions = block * 32 + ct.arange(32, dtype=ct.int32).reshape((1, 32))
+                pooled_values = (
+                    ct.gather(
+                        value_state,
+                        (pooled_pages, pooled_offsets, dimensions),
+                        padding_value=0,
+                    )
+                    .reshape((1, ratio, 32))
+                    .astype(ct.float32)
+                )
+                pooled_scores = (
+                    ct.gather(
+                        score_state,
+                        (pooled_pages, pooled_offsets, dimensions),
+                        padding_value=float("-inf"),
+                    )
+                    .reshape((1, ratio, 32))
+                    .astype(ct.float32)
+                )
             maximum = ct.max(pooled_scores, axis=1, keepdims=True)
             weights = ct.exp(pooled_scores - maximum)
             pooled = ct.sum(pooled_values * weights, axis=1, keepdims=True)
@@ -1377,10 +1980,15 @@ def _compress_ring_kernel(
 def _clear_rejected_ring_kernel(
     value_state: _StaticLastDim,
     score_state: _StaticLastDim,
+    state_page_table,
+    state_first_blocks,
     positions,
     processed_counts,
     block_length: _ConstantInt,
     ring_size: _ConstantInt,
+    direct_page_mapping: _ConstantBool,
+    state_block_tokens: _ConstantInt,
+    state_packing: _ConstantInt,
 ):
     """Clear the uncommitted tail of a c128 speculative write."""
 
@@ -1392,9 +2000,25 @@ def _clear_rejected_ring_kernel(
     empty_scores = ct.full((1, 1, 128), float("-inf"), dtype=ct.float32)
     for token_index in ct.static_iter(range(block_length)):
         if token_index >= processed:
-            slot = (start + token_index) % ring_size
-            ct.store(value_state, (batch, slot, block), zeros)
-            ct.store(score_state, (batch, slot, block), empty_scores)
+            token = start + token_index
+            if direct_page_mapping:
+                first = ct.load(state_first_blocks, (batch,), shape=(1,)).item()
+                column = token // state_block_tokens - first
+                selected_page = ct.gather(
+                    state_page_table,
+                    (
+                        ct.full((1,), batch, dtype=ct.int32),
+                        ct.full((1,), column, dtype=ct.int32),
+                    ),
+                    padding_value=0,
+                ).item()
+                page = selected_page + state_packing - 1
+                offset = token % state_block_tokens
+            else:
+                page = batch
+                offset = token % ring_size
+            ct.store(value_state, (page, offset, block), zeros)
+            ct.store(score_state, (page, offset, block), empty_scores)
 
 
 @ct.kernel
@@ -1403,11 +2027,17 @@ def _compress_verify_finalize_kernel(
     norm_weight: _StaticLastDim,
     frequencies: _StaticLastTwoDims,
     cache: _StaticLastDim,
+    cache_pages,
+    cache_first_blocks,
     positions,
     ratio: _ConstantInt,
     dimension: _ConstantInt,
     stages: _ConstantInt,
     rotate: _ConstantBool,
+    paged_cache: _ConstantBool,
+    parent_rows: _ConstantInt,
+    packing: _ConstantInt,
+    layer_offset: int,
     epsilon: float,
 ):
     token_index = ct.bid(0)
@@ -1488,11 +2118,37 @@ def _compress_verify_finalize_kernel(
             value = ct.where(
                 group_ids < dimension // 64 - 1, simulated, groups
             ).reshape((dimension,))
-        ct.store(
-            cache,
-            (batch, token // ratio, 0),
-            value.reshape((1, 1, dimension)).astype(cache.dtype),
-        )
+        if paged_cache:
+            first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
+            column = token // 128 - first
+            cache_page = ct.gather(
+                cache_pages,
+                (
+                    ct.full((1,), batch, dtype=ct.int32),
+                    ct.full((1,), column, dtype=ct.int32),
+                ),
+                padding_value=0,
+            ).item()
+            child_rows = parent_rows // packing
+            parent = (cache_page - 1) // packing + 1
+            child = (cache_page - 1) % packing
+            cache_row = (
+                parent * parent_rows
+                + child * child_rows
+                + layer_offset
+                + (token % 128) // ratio
+            )
+            ct.store(
+                cache,
+                (cache_row, 0),
+                value.reshape((1, dimension)).astype(cache.dtype),
+            )
+        else:
+            ct.store(
+                cache,
+                (batch, token // ratio, 0),
+                value.reshape((1, 1, dimension)).astype(cache.dtype),
+            )
 
 
 def _compress_block(
@@ -1508,26 +2164,33 @@ def _compress_block(
     ratio: int,
     rotate: bool,
     epsilon: float,
+    *,
+    cache_mapping: DeviceMapping,
+    state_mapping: DeviceMapping,
+    state_ring_size: int,
 ) -> None:
     """Append a decode/verify block to a padded compressor ring."""
 
     dimension = cache.shape[-1]
     width = values.shape[-1]
     batch_size, block_length = values.shape[:2]
-    ring_size = value_state.shape[1]
+    ring_size = state_ring_size
     logical_window = ratio * (2 if ratio == 4 else 1)
     if (
         block_length == 0
         or gates.shape != values.shape
         or positions.shape != (batch_size, block_length)
-        or value_state.shape[0] != batch_size
+        or value_state.ndim != 3
         or score_state.shape != value_state.shape
-        or cache.shape[0] != batch_size
         or width != dimension * (2 if ratio == 4 else 1)
         or ring_size < logical_window
         or ring_size % ratio
     ):
         raise ValueError("compression requires matching token blocks and a valid ring")
+    if cache_mapping.block_tokens != 128 or cache_mapping.divisor != ratio:
+        raise ValueError("compressed cache mapping has incompatible geometry")
+    if state_mapping.divisor != 1 or state_mapping.row_scale != 1:
+        raise ValueError("compressor state mapping has incompatible geometry")
     stream = torch.cuda.current_stream(values.device)
     ct.launch(
         stream,
@@ -1539,12 +2202,17 @@ def _compress_block(
             ape,
             value_state,
             score_state,
+            state_mapping.pages,
+            state_mapping.first_blocks,
             positions,
             ratio,
             dimension,
             block_length,
             ring_size,
             ratio == 4,
+            True,
+            state_mapping.block_tokens,
+            state_mapping.packing,
         ),
     )
     ct.launch(
@@ -1556,11 +2224,17 @@ def _compress_block(
             norm_weight,
             frequencies,
             cache,
+            cache_mapping.pages,
+            cache_mapping.first_blocks,
             positions,
             ratio,
             dimension,
             int(math.log2(dimension)),
             rotate,
+            True,
+            cache_mapping.parent_rows,
+            cache_mapping.packing,
+            cache_mapping.layer_offset,
             epsilon,
         ),
     )
@@ -1579,6 +2253,10 @@ def compress_verify(
     ratio: int,
     rotate: bool,
     epsilon: float,
+    *,
+    cache_mapping: DeviceMapping,
+    state_mapping: DeviceMapping,
+    state_ring_size: int,
 ) -> None:
     """Update one fixed verification block without materializing checkpoints."""
 
@@ -1595,6 +2273,9 @@ def compress_verify(
         ratio,
         rotate,
         epsilon,
+        cache_mapping=cache_mapping,
+        state_mapping=state_mapping,
+        state_ring_size=state_ring_size,
     )
 
 
@@ -1611,6 +2292,10 @@ def compress_decode(
     ratio: int,
     rotate: bool,
     epsilon: float,
+    *,
+    cache_mapping: DeviceMapping,
+    state_mapping: DeviceMapping,
+    state_ring_size: int,
 ) -> None:
     """Update one token through the same padded-ring path as verification."""
 
@@ -1632,6 +2317,9 @@ def compress_decode(
         ratio,
         rotate,
         epsilon,
+        cache_mapping=cache_mapping,
+        state_mapping=state_mapping,
+        state_ring_size=state_ring_size,
     )
 
 
@@ -1641,19 +2329,26 @@ def clear_rejected_compress_state(
     positions: Tensor,
     processed_counts: Tensor,
     block_length: int,
+    *,
+    state_mapping: DeviceMapping,
+    state_ring_size: int,
 ) -> None:
     """Discard rejected c128 rows without restoring the committed ring."""
 
-    batch_size, ring_size, dimension = value_state.shape
+    _, _, dimension = value_state.shape
+    batch_size = positions.shape[0]
+    ring_size = state_ring_size
     if (
         score_state.shape != value_state.shape
-        or positions.shape != (batch_size,)
+        or positions.ndim != 1
         or processed_counts.shape != (batch_size,)
         or block_length <= 0
         or ring_size < 128
         or dimension % 128
     ):
         raise ValueError("invalid speculative compressor cleanup")
+    if state_mapping.divisor != 1 or state_mapping.row_scale != 1:
+        raise ValueError("cleanup state mapping has incompatible geometry")
     ct.launch(
         torch.cuda.current_stream(value_state.device),
         (dimension // 128, batch_size),
@@ -1661,10 +2356,15 @@ def clear_rejected_compress_state(
         (
             value_state,
             score_state,
+            state_mapping.pages,
+            state_mapping.first_blocks,
             positions,
             processed_counts,
             block_length,
             ring_size,
+            True,
+            state_mapping.block_tokens,
+            state_mapping.packing,
         ),
     )
 
@@ -1812,7 +2512,10 @@ __all__ = [
     "hadamard_transform",
     "hash_sqrt_softplus",
     "index_scores",
+    "kv_norm_rope_store",
     "moe_act_quant",
+    "paged_cache_rows",
+    "paged_state_locations",
     "qk_norm_rope_store",
     "qk_norm_rope_block",
     "rope_last_block_inplace",
