@@ -1,4 +1,4 @@
-"""Run and benchmark DeepSeek-V4-Flash-DSpark on Modal B300 nodes."""
+"""Run DeepSeek-V4 checkpoints with DSpark on Modal B300 nodes."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import socket
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
@@ -28,6 +29,10 @@ from deploy.http import (
 )
 from deploy.modal_image import build_modal_image
 from resin import Engine, SamplingParams, SchedulerConfig
+from resin.backend.cuda.graphs import (
+    DEFAULT_MAX_NUM_SEQS,
+    default_decode_graph_shapes,
+)
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.server import HttpServer
 
@@ -38,7 +43,8 @@ KERNEL_CACHE_MOUNT = "/kernel-cache/.cache"
 KERNEL_CACHE_VOLUME_NAME = "resin-deepseek-v4-kernels-v1"
 PROFILE_MOUNT = "/profiles"
 PROFILE_VOLUME_NAME = "resin-deepseek-v4-profiles-v1"
-MODEL_KEY = "flash-0731"
+DEFAULT_MODEL_KEY = "flash-0731"
+PRO_MODEL_KEY = "pro-0813"
 DEFAULT_TP_SIZE = 4
 DSPARK_TOKENS = 5
 BENCHMARK_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
@@ -66,6 +72,7 @@ image = build_modal_image(
         # dump. Compiler commands appear only for an actual cache miss.
         "FLASHINFER_LOGGING_LEVEL": "INFO",
         "FLASHINFER_LOG_LEVEL": "INFO",
+        "FLASHINFER_JIT_VERBOSE": "1",
         "CUDA_TILE_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/cutile-python",
         "DG_JIT_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/deep_gemm",
         "DG_JIT_DEBUG": "0",
@@ -78,6 +85,25 @@ image = build_modal_image(
 
 with image.imports():
     from resin_models_cuda.deepseek_v4.checkpoint import DEFAULT_MODEL, DEFAULT_REVISION
+
+
+@dataclass(frozen=True, slots=True)
+class ModelSpec:
+    """Immutable identity and storage key for one published checkpoint."""
+
+    key: str
+    repo_id: str
+    revision: str
+
+
+MODEL_SPECS = {
+    DEFAULT_MODEL_KEY: ModelSpec(DEFAULT_MODEL_KEY, DEFAULT_MODEL, DEFAULT_REVISION),
+    PRO_MODEL_KEY: ModelSpec(
+        PRO_MODEL_KEY,
+        "deepseek-ai/DeepSeek-V4-Pro-0813",
+        "72e1d3230f6c080a530b0a1d46f8eb4602340597",
+    ),
+}
 
 model_cache_volume = modal.Volume.from_name(
     MODEL_CACHE_VOLUME_NAME, create_if_missing=True, version=1
@@ -101,18 +127,41 @@ app = modal.App(
 _http_server_processes: list[object] = []
 
 
-def _model_path() -> Path:
-    return Path(MODEL_CACHE_MOUNT) / MODEL_KEY / DEFAULT_REVISION
+def _model_spec(model_key: str) -> ModelSpec:
+    try:
+        return MODEL_SPECS[model_key]
+    except KeyError as error:
+        choices = ", ".join(sorted(MODEL_SPECS))
+        raise ValueError(f"model must be one of: {choices}") from error
 
 
-def _marker_path() -> Path:
-    return _model_path() / ".resin-checkpoint.json"
+def _model_path(model: ModelSpec) -> Path:
+    return Path(MODEL_CACHE_MOUNT) / model.key / model.revision
 
 
-def _checkpoint_inventory() -> dict[str, int]:
-    root = _model_path()
+def _marker_path(model: ModelSpec) -> Path:
+    return _model_path(model) / ".resin-checkpoint.json"
+
+
+def _checkpoint_inventory(model: ModelSpec) -> dict[str, int]:
+    root = _model_path(model)
     index = root / "model.safetensors.index.json"
-    weights = sorted(root.glob("model-*.safetensors"))
+    try:
+        index_data = json.loads(index.read_text())
+        weight_map = index_data["weight_map"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise RuntimeError("checkpoint has an invalid safetensor index") from error
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise RuntimeError("checkpoint safetensor index has no weights")
+    filenames = set(weight_map.values())
+    if not all(
+        isinstance(filename, str)
+        and Path(filename).name == filename
+        and filename.endswith(".safetensors")
+        for filename in filenames
+    ):
+        raise RuntimeError("checkpoint safetensor index has invalid shard paths")
+    weights = sorted(root / filename for filename in filenames)
     required = [
         root / "config.json",
         index,
@@ -121,8 +170,6 @@ def _checkpoint_inventory() -> dict[str, int]:
         root / "inference/config.json",
         root / "encoding/encoding_dsv4.py",
     ]
-    if len(weights) != 48:
-        raise RuntimeError(f"expected 48 checkpoint shards, found {len(weights)}")
     files = [*required, *weights]
     if missing := [str(path.relative_to(root)) for path in files if not path.is_file()]:
         raise RuntimeError(f"checkpoint is missing files: {missing}")
@@ -133,50 +180,50 @@ def _checkpoint_inventory() -> dict[str, int]:
     return {str(path.relative_to(root)): path.stat().st_size for path in sorted(files)}
 
 
-def _checkpoint_is_complete() -> bool:
+def _checkpoint_is_complete(model: ModelSpec) -> bool:
     try:
-        marker = json.loads(_marker_path().read_text())
-        inventory = _checkpoint_inventory()
+        marker = json.loads(_marker_path(model).read_text())
+        inventory = _checkpoint_inventory(model)
     except (OSError, RuntimeError, json.JSONDecodeError):
         return False
     return marker == {
         "schema": 1,
-        "repo_id": DEFAULT_MODEL,
-        "revision": DEFAULT_REVISION,
+        "repo_id": model.repo_id,
+        "revision": model.revision,
         "files": inventory,
     }
 
 
-def _download_checkpoint() -> dict[str, object]:
+def _download_checkpoint(model: ModelSpec) -> dict[str, object]:
     model_cache_volume.reload()
-    cache_hit = _checkpoint_is_complete()
+    cache_hit = _checkpoint_is_complete(model)
     start = time.perf_counter()
     if not cache_hit:
-        target = _model_path()
+        target = _model_path(model)
         target.mkdir(parents=True, exist_ok=True)
         snapshot_download(
-            repo_id=DEFAULT_MODEL,
-            revision=DEFAULT_REVISION,
+            repo_id=model.repo_id,
+            revision=model.revision,
             allow_patterns=list(CHECKPOINT_PATTERNS),
             local_dir=target,
         )
         marker = {
             "schema": 1,
-            "repo_id": DEFAULT_MODEL,
-            "revision": DEFAULT_REVISION,
-            "files": _checkpoint_inventory(),
+            "repo_id": model.repo_id,
+            "revision": model.revision,
+            "files": _checkpoint_inventory(model),
         }
         temporary = target / f".resin-checkpoint.{os.getpid()}.tmp"
         temporary.write_text(json.dumps(marker, sort_keys=True))
-        temporary.replace(_marker_path())
+        temporary.replace(_marker_path(model))
         model_cache_volume.commit()
-    if not _checkpoint_is_complete():
+    if not _checkpoint_is_complete(model):
         raise RuntimeError("checkpoint publication did not complete")
-    inventory = _checkpoint_inventory()
+    inventory = _checkpoint_inventory(model)
     return {
-        "repo_id": DEFAULT_MODEL,
-        "revision": DEFAULT_REVISION,
-        "path": str(_model_path()),
+        "repo_id": model.repo_id,
+        "revision": model.revision,
+        "path": str(_model_path(model)),
         "cache_hit": cache_hit,
         "files": len(inventory),
         "bytes": sum(inventory.values()),
@@ -184,17 +231,19 @@ def _download_checkpoint() -> dict[str, object]:
     }
 
 
-def _require_checkpoint() -> tuple[Path, dict[str, object]]:
+def _require_checkpoint(model: ModelSpec) -> tuple[Path, dict[str, object]]:
     model_cache_volume.reload()
-    if not _checkpoint_is_complete():
-        raise RuntimeError("run mode=download before requesting B300 inference")
+    if not _checkpoint_is_complete(model):
+        raise RuntimeError(
+            f"run mode=download --model={model.key} before requesting B300 inference"
+        )
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    inventory = _checkpoint_inventory()
-    return _model_path(), {
-        "repo_id": DEFAULT_MODEL,
-        "revision": DEFAULT_REVISION,
-        "path": str(_model_path()),
+    inventory = _checkpoint_inventory(model)
+    return _model_path(model), {
+        "repo_id": model.repo_id,
+        "revision": model.revision,
+        "path": str(_model_path(model)),
         "cache_hit": True,
         "files": len(inventory),
         "bytes": sum(inventory.values()),
@@ -327,7 +376,7 @@ def _run_rank_workload(
     profile_run_id: str | None,
     speculative_tokens: int,
 ) -> dict[str, object]:
-    from resin_models_cuda.deepseek_v4 import DeepSeekV4FlashCudaRunner
+    from resin_models_cuda.deepseek_v4 import DeepSeekV4CudaRunner
 
     if rank == 0:
         print(
@@ -339,7 +388,7 @@ def _run_rank_workload(
     graph_capacity = (
         max(len(row) for row in prompt_rows) + max_new_tokens + speculative_tokens + 1
     )
-    runner = DeepSeekV4FlashCudaRunner(
+    runner = DeepSeekV4CudaRunner(
         model_path,
         max_seq_len=context_length,
         max_batch_size=batch_size,
@@ -566,8 +615,8 @@ def _run_rank_workload(
         output_count = sum(map(len, output_rows))
 
         return {
-            "model": DEFAULT_MODEL,
-            "revision": DEFAULT_REVISION,
+            "model": checkpoint["repo_id"],
+            "revision": checkpoint["revision"],
             "device": torch.cuda.get_device_name(runner.device),
             "tensor_parallel_size": tensor_parallel.size,
             "allreduce_backend": runner.allreduce_backend,
@@ -786,7 +835,7 @@ def _run_rank_benchmark(
     batch_sizes: tuple[int, ...],
     use_cuda_graphs: bool,
 ) -> None:
-    from resin_models_cuda.deepseek_v4 import DeepSeekV4FlashCudaRunner
+    from resin_models_cuda.deepseek_v4 import DeepSeekV4CudaRunner
 
     tensor_parallel = _initialize_tensor_parallel(
         rank, master_port, tensor_parallel_size
@@ -800,7 +849,7 @@ def _run_rank_benchmark(
             flush=True,
         )
     load_start = time.perf_counter()
-    runner = DeepSeekV4FlashCudaRunner(
+    runner = DeepSeekV4CudaRunner(
         model_path,
         max_seq_len=context_length,
         max_batch_size=max_batch_size,
@@ -870,8 +919,8 @@ def _run_rank_benchmark(
     tensor_parallel.barrier()
     if rank == 0:
         report = {
-            "model": DEFAULT_MODEL,
-            "revision": DEFAULT_REVISION,
+            "model": checkpoint["repo_id"],
+            "revision": checkpoint["revision"],
             "device": torch.cuda.get_device_name(runner.device),
             "tensor_parallel_size": tensor_parallel_size,
             "allreduce_backend": runner.allreduce_backend,
@@ -928,6 +977,7 @@ def _launch_batch_benchmark(
 
 
 def _benchmark_remote(
+    model: ModelSpec,
     tensor_parallel_size: int,
     input_tokens: int = 8192,
     max_new_tokens: int = 1024,
@@ -936,7 +986,7 @@ def _benchmark_remote(
 ) -> dict[str, object]:
     if input_tokens <= 0 or max_new_tokens <= 1:
         raise ValueError("benchmark token counts must be positive")
-    model_path, checkpoint = _require_checkpoint()
+    model_path, checkpoint = _require_checkpoint(model)
     tokenizer = cast(
         PreTrainedTokenizerBase,
         AutoTokenizer.from_pretrained(
@@ -965,33 +1015,32 @@ def _benchmark_remote(
 
 
 @app.function(timeout=24 * 60 * 60, cpu=16, memory=32 * 1024)
-def cache_checkpoint() -> dict[str, object]:
-    return _download_checkpoint()
+def cache_checkpoint(model_key: str = DEFAULT_MODEL_KEY) -> dict[str, object]:
+    return _download_checkpoint(_model_spec(model_key))
 
 
 def _serve_http_rank(
     rank: int,
     master_port: int,
     model_path: Path,
+    model_name: str,
 ) -> None:
     """Run one TP rank; rank zero additionally owns the public HTTP listener."""
 
-    from resin_models_cuda.deepseek_v4 import DeepSeekV4FlashCudaRunner
+    from resin_models_cuda.deepseek_v4 import DeepSeekV4CudaRunner
 
     tensor_parallel = _initialize_tensor_parallel(rank, master_port, DEFAULT_TP_SIZE)
     control_group = dist.new_group(backend="gloo", timeout=timedelta(minutes=30))
-    runner = DeepSeekV4FlashCudaRunner(
+    runner = DeepSeekV4CudaRunner(
         model_path,
         max_seq_len=32768,
-        max_batch_size=128,
+        max_batch_size=DEFAULT_MAX_NUM_SEQS,
         tensor_parallel=tensor_parallel,
         device=f"cuda:{rank}",
-        cuda_graph_decode_shapes=tuple(
-            (
-                batch_size,
-                32768 + DSPARK_TOKENS + 1,
-            )
-            for batch_size in (1, 2, 4, 8, 16, 32, 64, 128)
+        cuda_graph_decode_shapes=default_decode_graph_shapes(
+            32768 + DSPARK_TOKENS + 1,
+            speculative=True,
+            max_batch_size=DEFAULT_MAX_NUM_SEQS,
         ),
         speculative_tokens=DSPARK_TOKENS,
     )
@@ -1016,11 +1065,11 @@ def _serve_http_rank(
     coordinated_runner = TensorParallelServerRunner(runner, control_group, dist)
     engine = Engine(
         coordinated_runner,
-        max_running_requests=128,
+        max_running_requests=DEFAULT_MAX_NUM_SEQS,
         context_length=32768,
         prefix_cache=True,
         scheduler_config=SchedulerConfig(
-            max_batch_tokens=128 * 32768,
+            max_batch_tokens=DEFAULT_MAX_NUM_SEQS * 32768,
             prefill_chunk_size=32768,
         ),
         eos_token_id=runner.eos_token_id,
@@ -1053,13 +1102,35 @@ def _serve_http_rank(
             f"{reasoning_effort}) in {time.perf_counter() - warmup_started:.2f}s",
             flush=True,
         )
+    continuation_prompt = "word " * 4096 + "continue briefly"
+    continuation_ids = _encode_prompt(
+        tokenizer,
+        encoding,
+        continuation_prompt,
+        "chat",
+        "low",
+    )
+    warmup_started = time.perf_counter()
+    warmup = engine.submit(
+        continuation_ids,
+        max_new_tokens=2,
+        sampling_params=SamplingParams(temperature=0.0),
+    )
+    while engine.has_work():
+        engine.step()
+    warmup.take_result()
+    print(
+        f"[continuation-warmup] {len(continuation_ids)} tokens in "
+        f"{time.perf_counter() - warmup_started:.2f}s",
+        flush=True,
+    )
     torch.cuda.synchronize(runner.device)
     kernel_cache_volume.commit()
     try:
         HttpServer(
             engine,
             codec=DeepSeekV4Codec(tokenizer, encoding),
-            model=DEFAULT_MODEL,
+            model=model_name,
         ).serve(host="0.0.0.0", port=8000)
     finally:
         if not engine.closed:
@@ -1077,7 +1148,10 @@ def _serve_http_rank(
     scaledown_window=15 * 60,
     max_containers=1,
 )
-@modal.concurrent(max_inputs=128, target_inputs=128)
+@modal.concurrent(
+    max_inputs=DEFAULT_MAX_NUM_SEQS,
+    target_inputs=DEFAULT_MAX_NUM_SEQS,
+)
 @modal.web_server(
     8000,
     startup_timeout=60 * 60,
@@ -1085,11 +1159,12 @@ def _serve_http_rank(
     requires_proxy_auth=False,
 )
 def serve_deepseek_v4() -> None:
-    model_path, _ = _require_checkpoint()
+    model = _model_spec(DEFAULT_MODEL_KEY)
+    model_path, _ = _require_checkpoint(model)
     kernel_cache_volume.reload()
     process_context = torch.multiprocessing.spawn(
         _serve_http_rank,
-        args=(_free_local_port(), model_path),
+        args=(_free_local_port(), model_path, model.repo_id),
         nprocs=DEFAULT_TP_SIZE,
         join=False,
     )
@@ -1105,7 +1180,7 @@ def serve_deepseek_v4() -> None:
     single_use_containers=True,
 )
 def benchmark_tp2() -> dict[str, object]:
-    return _benchmark_remote(2)
+    return _benchmark_remote(_model_spec(DEFAULT_MODEL_KEY), 2)
 
 
 @app.function(
@@ -1116,7 +1191,7 @@ def benchmark_tp2() -> dict[str, object]:
     single_use_containers=True,
 )
 def benchmark_tp4() -> dict[str, object]:
-    return _benchmark_remote(4)
+    return _benchmark_remote(_model_spec(DEFAULT_MODEL_KEY), 4)
 
 
 @app.function(
@@ -1140,6 +1215,7 @@ def run_model_tp4(
     batch_size: int = 1,
     profile_input_tokens: int | None = None,
     speculative_tokens: int = DSPARK_TOKENS,
+    model_key: str = DEFAULT_MODEL_KEY,
 ) -> dict[str, object]:
     if thinking_mode not in {"chat", "thinking"}:
         raise ValueError("thinking_mode must be 'chat' or 'thinking'")
@@ -1151,7 +1227,8 @@ def run_model_tp4(
         raise ValueError(f"speculative_tokens must be in [0, {DSPARK_TOKENS}]")
     if profile and max_new_tokens < 32:
         raise ValueError("profile runs require at least 32 output tokens")
-    model_path, checkpoint = _require_checkpoint()
+    model = _model_spec(model_key)
+    model_path, checkpoint = _require_checkpoint(model)
     tokenizer = cast(
         PreTrainedTokenizerBase,
         AutoTokenizer.from_pretrained(
@@ -1230,12 +1307,18 @@ def main(
     batch_size: int = 1,
     input_tokens: int = 8192,
     speculative_tokens: int = DSPARK_TOKENS,
+    model: str = DEFAULT_MODEL_KEY,
 ) -> None:
+    model_spec = _model_spec(model)
     if mode == "download":
-        report = cache_checkpoint.remote()
+        report = cache_checkpoint.remote(model_spec.key)
     elif mode == "bench-tp2":
+        if model_spec.key != DEFAULT_MODEL_KEY:
+            raise ValueError("bench-tp2 currently supports only flash-0731")
         report = benchmark_tp2.remote()
     elif mode == "bench-tp4":
+        if model_spec.key != DEFAULT_MODEL_KEY:
+            raise ValueError("bench-tp4 currently supports only flash-0731")
         report = benchmark_tp4.remote()
     elif mode in {"run", "real", "profile"}:
         capture_profile = profile or mode == "profile"
@@ -1253,6 +1336,7 @@ def main(
             batch_size,
             input_tokens if mode in {"real", "profile"} else None,
             speculative_tokens,
+            model_spec.key,
         )
     else:
         raise ValueError(

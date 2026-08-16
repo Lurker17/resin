@@ -723,6 +723,11 @@ class CacheArena:
         groups = []
         for index, group in enumerate(plan.groups):
             width = max(map(len, group.pages))
+            # Keep the dynamic width in one cuTile divisibility class. Merely
+            # rounding to 16 is insufficient: 128, 192, and 256 produce three
+            # progressively stronger JIT assumptions. Every value here is 16
+            # modulo 32, so its exact power-of-two divisor is always 16.
+            width = (width + 15) // 32 * 32 + 16
             padded = np.zeros((len(group.pages), width), dtype=np.uint32)
             for row_index, row in enumerate(group.pages):
                 padded[row_index, : len(row)] = row

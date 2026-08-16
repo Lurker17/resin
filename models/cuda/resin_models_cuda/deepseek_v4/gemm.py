@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterator
 
 import torch
 from deep_gemm import fp8_fp4_gemm_nt, transform_sf_into_required_layout
@@ -16,6 +19,18 @@ from flashinfer.tllm_enums import ActivationType
 from torch import Tensor
 
 _DEEP_GEMM_MAX_ROWS = 128
+_DYNAMIC_ROWS = ContextVar("deepseek_v4_dynamic_gemm_rows", default=False)
+
+
+@contextmanager
+def dynamic_gemm_rows() -> Iterator[None]:
+    """Select runtime-M GEMMs while processing an arbitrary-length prefill."""
+
+    token = _DYNAMIC_ROWS.set(True)
+    try:
+        yield
+    finally:
+        _DYNAMIC_ROWS.reset(token)
 
 
 def _cached_transform(
@@ -34,9 +49,9 @@ def _cached_transform(
 
 
 def fp8_gemm_uses_packed_scales(rows: int) -> bool:
-    """Keep captured decode buckets on DeepGEMM; use TRT-LLM for prefills."""
+    """Keep fixed decode buckets on DeepGEMM; use runtime-M prefill GEMMs."""
 
-    return rows <= _DEEP_GEMM_MAX_ROWS
+    return rows <= _DEEP_GEMM_MAX_ROWS and not _DYNAMIC_ROWS.get()
 
 
 def fp8_gemm(

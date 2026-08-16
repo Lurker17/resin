@@ -2,14 +2,15 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 from resin import BatchPhase, BatchPlan
-from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4FlashCudaRunner
+from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 
 
-def _validation_runner() -> DeepSeekV4FlashCudaRunner:
-    runner = DeepSeekV4FlashCudaRunner.__new__(DeepSeekV4FlashCudaRunner)
+def _validation_runner() -> DeepSeekV4CudaRunner:
+    runner = DeepSeekV4CudaRunner.__new__(DeepSeekV4CudaRunner)
     runner.vocab_size = 64
     runner.max_seq_len = 256
     runner.max_batch_size = 4
@@ -38,7 +39,7 @@ def test_managed_pages_allow_continuation_and_arbitrary_decode_rows() -> None:
 
 
 def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None:
-    runner = DeepSeekV4FlashCudaRunner.__new__(DeepSeekV4FlashCudaRunner)
+    runner = DeepSeekV4CudaRunner.__new__(DeepSeekV4CudaRunner)
     runner.vocab_size = 32
     runner.speculative_tokens = 0
     runner._dspark_phase_events = {}
@@ -85,11 +86,11 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
     runner._cache = Cache()
     plan = SimpleNamespace(
         num_sequences=3,
-        token_ids=[5, 6, 7],
         sequence_ids=[1, 2, 3],
         context_lengths=[11, 12, 13],
-        positions=torch.tensor([11, 12, 13]).numpy(),
+        token_ids=[5, 6, 7],
         token_indptr=[0, 1, 2, 3],
+        positions=np.array([11, 12, 13]),
     )
 
     assert runner._graph_forward(plan, "cache-plan") == [11, 12, 13]
@@ -126,13 +127,12 @@ def test_prefill_uses_fresh_prompt_then_replays_only_continuation_suffix() -> No
             ).float()
             return logits, None
 
-        def forward_decode_target(self, input_ids, position, graph_seq_len, *, cache):
+        def forward_prefill(self, input_ids, start_position, *, cache):
             self.calls.append(
                 (
                     "continue",
                     input_ids.tolist(),
-                    position.tolist(),
-                    graph_seq_len,
+                    start_position,
                     cache,
                 )
             )
@@ -162,6 +162,5 @@ def test_prefill_uses_fresh_prompt_then_replays_only_continuation_suffix() -> No
     assert logits.argmax(dim=-1).tolist() == [3, 9]
     assert runner._model.calls == [
         ("fresh", [[2, 3]], "cache-row-0"),
-        ("continue", [[8]], [128], 129, "cache-row-1"),
-        ("continue", [[9]], [129], 130, "cache-row-1"),
+        ("continue", [[8, 9]], 128, "cache-row-1"),
     ]

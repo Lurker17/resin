@@ -52,6 +52,7 @@ from resin_models_cuda.deepseek_v4.cutile import (
     verify_attention_metadata,
 )
 from resin_models_cuda.deepseek_v4.gemm import (
+    dynamic_gemm_rows,
     fp4_fused_moe,
     fp4_gemm,
     fp8_gemm,
@@ -582,6 +583,138 @@ class Compressor(nn.Module):
         )
         return kv
 
+    def forward_prefill(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        start_position: int,
+        cache_pool: torch.Tensor,
+        cache_rows: torch.Tensor,
+        cache: DeviceCache,
+        state_group: int,
+    ) -> None:
+        """Append an arbitrary prompt suffix with one vectorized cache update."""
+
+        batch_size, block_length, _ = x.shape
+        ratio = self.compress_ratio
+        if positions.shape != (batch_size, block_length):
+            raise ValueError("prefill compressor positions must match the token block")
+        if cache_rows.shape != positions.shape:
+            raise ValueError("prefill compressor rows must match the token block")
+
+        projected = bf16_linear_fp32(x, self._fused_projection_weight)
+        raw_values, raw_scores = projected.chunk(2, dim=-1)
+        adjusted_scores = raw_scores + self.ape[positions.remainder(ratio)]
+        state_pages, state_offsets = cache.state_locations(state_group, positions)
+        value_state, score_state = self._state_tensors()
+        flat_pages = state_pages.flatten().long()
+        flat_offsets = state_offsets.flatten().long()
+        valid = flat_pages >= 0
+        flat_pages = flat_pages[valid]
+        flat_offsets = flat_offsets[valid]
+        value_state[flat_pages, flat_offsets] = raw_values.flatten(0, 1)[valid]
+        score_state[flat_pages, flat_offsets] = adjusted_scores.flatten(0, 1)[valid]
+
+        first_complete = (ratio - 1 - start_position) % ratio
+        if first_complete >= block_length:
+            return
+        complete_offsets = torch.arange(
+            first_complete,
+            block_length,
+            ratio,
+            dtype=torch.long,
+            device=x.device,
+        )
+        if complete_offsets.numel() == 0:
+            return
+        complete_positions = positions.index_select(1, complete_offsets)
+        window = ratio * (2 if self.overlap else 1)
+        history_positions = complete_positions.unsqueeze(-1) - torch.arange(
+            window - 1,
+            -1,
+            -1,
+            dtype=positions.dtype,
+            device=positions.device,
+        )
+        history_pages, history_offsets = cache.state_locations(
+            state_group, history_positions
+        )
+        cached_values = value_state[
+            history_pages.clamp_min(0).long(), history_offsets.long()
+        ]
+        cached_scores = score_state[
+            history_pages.clamp_min(0).long(), history_offsets.long()
+        ]
+        current_indices = history_positions - start_position
+        from_current = (current_indices >= 0) & (current_indices < block_length)
+        current_indices = current_indices.clamp(0, block_length - 1).long()
+        gather_indices = current_indices.unsqueeze(-1).expand(
+            *current_indices.shape, raw_values.shape[-1]
+        )
+        current_values = torch.gather(
+            raw_values.unsqueeze(1).expand(-1, complete_offsets.numel(), -1, -1),
+            2,
+            gather_indices,
+        )
+        current_scores = torch.gather(
+            adjusted_scores.unsqueeze(1).expand(
+                -1, complete_offsets.numel(), -1, -1
+            ),
+            2,
+            gather_indices,
+        )
+        history_values = torch.where(
+            from_current.unsqueeze(-1), current_values, cached_values
+        ).float()
+        history_scores = torch.where(
+            from_current.unsqueeze(-1), current_scores, cached_scores
+        ).float()
+        if self.overlap:
+            dimension = self.head_dim
+            history_values = torch.cat(
+                (
+                    history_values[:, :, :ratio, :dimension],
+                    history_values[:, :, ratio:, dimension:],
+                ),
+                dim=2,
+            )
+            history_scores = torch.cat(
+                (
+                    history_scores[:, :, :ratio, :dimension],
+                    history_scores[:, :, ratio:, dimension:],
+                ),
+                dim=2,
+            )
+        pooled = (
+            history_values * history_scores.softmax(dim=2)
+        ).sum(dim=2)
+        pooled = self.norm(pooled.to(x.dtype))
+        rope_positions = complete_positions + 1 - ratio
+        if self.freqs_cis is None:
+            raise RuntimeError("compressor frequencies are not initialized")
+        apply_rotary_emb(
+            pooled[..., -self.rope_head_dim :],
+            self.freqs_cis[rope_positions],
+        )
+        if self.rotate:
+            pooled = rotate_activation(pooled)
+            fp4_act_quant(pooled, fp4_block_size, True)
+        else:
+            act_quant(
+                pooled[..., : -self.rope_head_dim],
+                64,
+                scale_fmt,
+                scale_dtype,
+                True,
+            )
+        complete_rows = cache_rows.index_select(1, complete_offsets)
+        cache_pool.index_copy_(
+            0,
+            complete_rows.flatten().long(),
+            pooled.flatten(0, 1).to(cache_pool.dtype),
+        )
+
     def forward_decode(
         self,
         x: torch.Tensor,
@@ -667,6 +800,13 @@ class Compressor(nn.Module):
                 state_mapping=state_mapping,
                 state_ring_size=self.ring_size,
             )
+
+
+def _compact_topk_indices(scores: torch.Tensor, width: int) -> torch.Tensor:
+    """Keep finite cache candidates ahead of graph-padding entries."""
+
+    _, indices = flashinfer_top_k(scores, width, sorted=True)
+    return indices
 
 
 class Indexer(torch.nn.Module):
@@ -784,8 +924,8 @@ class Indexer(torch.nn.Module):
         if world_size > 1:
             index_score = self.allreduce(index_score)
         topk_width = min(self.index_topk, width)
-        _, topk_idxs = flashinfer_top_k(
-            index_score.flatten(0, 1), topk_width, sorted=False
+        topk_idxs = _compact_topk_indices(
+            index_score.flatten(0, 1), topk_width
         )
         topk_idxs = topk_idxs.view(*index_score.shape[:2], topk_width)
         selected = finish_index_topk(
@@ -796,6 +936,73 @@ class Indexer(torch.nn.Module):
             cache_mapping=cache.compressed_mapping(self.layer_id, ratio),
         )
         return selected
+
+    def forward_prefill(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        positions: torch.Tensor,
+        start_position: int,
+        sequence_length: int,
+        *,
+        cache: DeviceCache,
+    ) -> torch.Tensor:
+        """Select compressed history for an arbitrary cached prompt suffix."""
+
+        batch_size, block_length, _ = x.shape
+        ratio, rope_dim = self.compress_ratio, self.rope_head_dim
+        if positions.shape != (batch_size, block_length):
+            raise ValueError("index prefill positions must match the token block")
+        if self.freqs_cis is None:
+            raise RuntimeError("index frequencies are not initialized")
+
+        self.compressor.forward_prefill(
+            x,
+            positions,
+            start_position=start_position,
+            cache_pool=cache.index_keys.view(-1, self.head_dim),
+            cache_rows=cache.index_rows(self.layer_id, positions),
+            cache=cache,
+            state_group=INDEX_STATE_GROUP,
+        )
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        apply_rotary_emb(q[..., -rope_dim:], self.freqs_cis[positions])
+        q = rotate_activation(q)
+        fp4_act_quant(q, fp4_block_size, True)
+        weights = self.weights_proj(x)
+        width = math.ceil(sequence_length / ratio / 64) * 64
+        if width == 0:
+            return torch.empty(
+                (batch_size, block_length, 0),
+                dtype=torch.int32,
+                device=x.device,
+            )
+        index_score = index_scores(
+            q,
+            cache.index_keys.view(-1, self.head_dim),
+            weights,
+            positions,
+            ratio,
+            self.softmax_scale * self.n_heads**-0.5,
+            cache_mapping=cache.index_mapping(self.layer_id),
+            cache_width=width,
+        )
+        if world_size > 1:
+            index_score = self.allreduce(index_score)
+        topk_width = min(self.index_topk, width)
+        topk_indices = torch.topk(
+            index_score, topk_width, dim=-1, sorted=True
+        ).indices
+        complete = (positions + 1).div(ratio, rounding_mode="floor")
+        logical = torch.where(
+            topk_indices < complete.unsqueeze(-1), topk_indices, -1
+        )
+        physical = cache.compressed_rows(
+            self.layer_id,
+            ratio,
+            logical.clamp_min(0) * ratio,
+        )
+        return torch.where(logical >= 0, physical, -1).to(torch.int32)
 
     def forward_verify(
         self,
@@ -840,8 +1047,8 @@ class Indexer(torch.nn.Module):
         if world_size > 1:
             index_score = self.allreduce(index_score)
         topk_width = min(self.index_topk, width)
-        _, topk_idxs = flashinfer_top_k(
-            index_score.flatten(0, 1), topk_width, sorted=False
+        topk_idxs = _compact_topk_indices(
+            index_score.flatten(0, 1), topk_width
         )
         topk_idxs = topk_idxs.view(*index_score.shape[:2], topk_width)
         selected = finish_index_topk(
@@ -1163,6 +1370,106 @@ class Attention(nn.Module):
         o = grouped_bf16_linear(o, wo_a)
         return self.wo_b(o.flatten(2))
 
+    def forward_prefill(
+        self,
+        x: torch.Tensor,
+        token_positions: torch.Tensor,
+        start_position: int,
+        sequence_length: int,
+        *,
+        cache: DeviceCache,
+    ) -> torch.Tensor:
+        """Prefill one cached suffix with paged sparse block attention."""
+
+        batch_size, block_length, _ = x.shape
+        ratio = self.compress_ratio
+        if token_positions.shape != (batch_size, block_length):
+            raise ValueError("prefill positions must match the token block")
+        if ratio and self.compressor.freqs_cis is None:
+            self.compressor.freqs_cis = self.freqs_cis
+            if self.indexer is not None:
+                self.indexer.freqs_cis = self.freqs_cis
+                self.indexer.compressor.freqs_cis = self.freqs_cis
+
+        if self._fused_wqkv:
+            qkv = linear(x, self._fused_wqkv_weight)
+            q_input, kv = qkv.split((self.q_lora_rank, self.head_dim), dim=-1)
+        else:
+            q_input, kv = self.wq_a(x), self.wkv(x)
+        qr = q = self.q_norm(q_input)
+
+        if ratio:
+            state_group = C4_STATE_GROUP if ratio == 4 else C128_STATE_GROUP
+            self.compressor.forward_prefill(
+                x,
+                token_positions,
+                start_position=start_position,
+                cache_pool=cache.latents.view(-1, self.head_dim),
+                cache_rows=cache.compressed_rows(
+                    self.layer_id, ratio, token_positions
+                ),
+                cache=cache,
+                state_group=state_group,
+            )
+
+        q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
+        compressed_indices = None
+        generated_compressed_width = 0
+        if ratio:
+            if self.indexer is not None:
+                compressed_indices = self.indexer.forward_prefill(
+                    x,
+                    qr,
+                    token_positions,
+                    start_position,
+                    sequence_length,
+                    cache=cache,
+                )
+            else:
+                generated_compressed_width = math.ceil(
+                    sequence_length / ratio / 4
+                ) * 4
+
+        qk_norm_rope_block(
+            q,
+            kv,
+            self.kv_norm.weight,
+            torch.view_as_real(self.freqs_cis),
+            cache.latents.view(-1, self.head_dim),
+            token_positions,
+            self.eps,
+            cache_mapping=cache.window_mapping(self.layer_id),
+        )
+        topk_indices, sparse_lengths, sequence_lengths = self._paged_attention_metadata(
+            cache,
+            token_positions,
+            compressed_indices,
+            generated_compressed_width,
+        )
+        if self.attention_workspace is None:
+            raise RuntimeError("attention workspace is not initialized")
+        o = sparse_verify_attention(
+            q,
+            cache.latents,
+            cache.latents,
+            self.attn_sink,
+            topk_indices,
+            sparse_lengths,
+            sequence_lengths,
+            self.attention_workspace,
+            self.softmax_scale,
+        )
+        rope_last_block_inplace(
+            o,
+            torch.view_as_real(self.freqs_cis),
+            token_positions,
+            inverse=True,
+        )
+        o = o.view(batch_size, block_length, self.n_local_groups, -1)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        o = grouped_bf16_linear(o, wo_a)
+        return self.wo_b(o.flatten(2))
+
     def forward_verify(
         self,
         x: torch.Tensor,
@@ -1337,7 +1644,7 @@ class Gate(nn.Module):
         if self.score_func != "softmax":
             weights /= weights.sum(dim=-1, keepdim=True)
         weights *= self.route_scale
-        return weights, indices
+        return weights.to(torch.bfloat16), indices.to(torch.int32)
 
 
 class Expert(nn.Module):
@@ -1779,6 +2086,30 @@ class Block(nn.Module):
             ),
         )
 
+    def forward_prefill(
+        self,
+        x: torch.Tensor,
+        token_positions: torch.Tensor,
+        input_ids: torch.Tensor,
+        start_position: int,
+        sequence_length: int,
+        *,
+        cache: DeviceCache,
+    ) -> torch.Tensor:
+        """Run one target layer over an arbitrary cached prompt suffix."""
+
+        return self._forward_graph(
+            x,
+            input_ids,
+            lambda layer_input: self.attn.forward_prefill(
+                layer_input,
+                token_positions,
+                start_position,
+                sequence_length,
+                cache=cache,
+            ),
+        )
+
     def forward_verify(
         self,
         x: torch.Tensor,
@@ -2141,11 +2472,12 @@ class Transformer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run target prefill and return the hidden states consumed by DSpark."""
 
-        h, main_hidden = self._forward_layers(
-            input_ids,
-            lambda layer, hidden: layer(hidden, input_ids, cache=cache),
-        )
-        return self._target_output(h, main_hidden)
+        with dynamic_gemm_rows():
+            h, main_hidden = self._forward_layers(
+                input_ids,
+                lambda layer, hidden: layer(hidden, input_ids, cache=cache),
+            )
+            return self._target_output(h, main_hidden)
 
     @torch.inference_mode()
     def forward_decode(
@@ -2181,6 +2513,34 @@ class Transformer(nn.Module):
             ),
         )
         return self._target_output(h, main_hidden)
+
+    @torch.inference_mode()
+    def forward_prefill(
+        self,
+        input_ids: torch.Tensor,
+        start_position: int,
+        *,
+        cache: DeviceCache,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Prefill one cached suffix and return only its final-token logits."""
+
+        token_positions = start_position + torch.arange(
+            input_ids.shape[1], device=input_ids.device
+        ).view(1, -1)
+        sequence_length = start_position + input_ids.shape[1]
+        with dynamic_gemm_rows():
+            h, main_hidden = self._forward_layers(
+                input_ids,
+                lambda layer, hidden: layer.forward_prefill(
+                    hidden,
+                    token_positions,
+                    input_ids,
+                    start_position,
+                    sequence_length,
+                    cache=cache,
+                ),
+            )
+            return self._target_output(h, main_hidden)
 
     @torch.inference_mode()
     def forward_verify(
@@ -2233,9 +2593,10 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill_dspark(self, main_hidden: torch.Tensor, *, cache: DeviceCache) -> None:
-        main_x = self._project_main(main_hidden)
-        for layer in self.mtp:
-            layer.attn.prefill_main(main_x, cache=cache)
+        with dynamic_gemm_rows():
+            main_x = self._project_main(main_hidden)
+            for layer in self.mtp:
+                layer.attn.prefill_main(main_x, cache=cache)
 
     @torch.inference_mode()
     def commit_dspark_main_block(

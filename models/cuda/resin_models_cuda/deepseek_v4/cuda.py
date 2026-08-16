@@ -62,7 +62,7 @@ def _default_dtype(dtype: Any) -> Iterator[None]:
         torch.set_default_dtype(previous)
 
 
-class DeepSeekV4FlashCudaRunner(SyncRunner):
+class DeepSeekV4CudaRunner(SyncRunner):
     """Dynamically batched runner over Resin's DeepSeek-V4 implementation."""
 
     def __init__(
@@ -97,7 +97,7 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         ):
             raise ValueError("speculative_tokens must be a non-negative integer")
         if not torch.cuda.is_available():
-            raise RuntimeError("DeepSeekV4FlashCudaRunner requires CUDA")
+            raise RuntimeError("DeepSeekV4CudaRunner requires CUDA")
         if not 0 < gpu_memory_utilization < 1:
             raise ValueError("gpu_memory_utilization must be between zero and one")
         if cache_parent_capacity is not None and (
@@ -112,10 +112,10 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         self.tensor_parallel_size = tensor_parallel.size
         self.device = torch.device(device or f"cuda:{tensor_parallel.rank}")
         if self.device.type != "cuda":
-            raise RuntimeError("DeepSeekV4FlashCudaRunner requires a CUDA device")
+            raise RuntimeError("DeepSeekV4CudaRunner requires a CUDA device")
         torch.cuda.set_device(self.device)
         if torch.cuda.get_device_capability(self.device)[0] < 10:
-            raise RuntimeError("the DeepSeek-V4 Flash runner requires Blackwell")
+            raise RuntimeError("the DeepSeek-V4 runner requires Blackwell")
         if self.tensor_parallel_size > 1:
             if not dist.is_initialized():
                 raise RuntimeError(
@@ -613,25 +613,21 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
                         )
                     self._model.prefill_dspark(main_hidden, cache=row_cache)
             else:
-                row_logits = None
-                for relative, token_id in enumerate(input_ids.unbind(dim=1)):
-                    position = positions[start + relative : start + relative + 1]
-                    row_logits, main_hidden = self._model.forward_decode_target(
-                        token_id[:, None],
-                        position,
-                        context + relative + 1,
+                row_logits, main_hidden = self._model.forward_prefill(
+                    input_ids,
+                    context,
+                    cache=row_cache,
+                )
+                if self.speculative_tokens:
+                    if main_hidden is None:
+                        raise RuntimeError(
+                            "target did not produce DSpark hidden states"
+                        )
+                    self._model.commit_dspark_main_block(
+                        main_hidden,
+                        positions[start : start + 1],
                         cache=row_cache,
                     )
-                    if self.speculative_tokens:
-                        if main_hidden is None:
-                            raise RuntimeError(
-                                "target did not produce DSpark hidden states"
-                            )
-                        self._model.commit_dspark_main_block(
-                            main_hidden, position, cache=row_cache
-                        )
-                if row_logits is None:
-                    raise ValueError("continuation prefill row cannot be empty")
             logits.append(row_logits)
         return torch.cat(logits, dim=0)
 
@@ -758,4 +754,4 @@ class DeepSeekV4FlashCudaRunner(SyncRunner):
         """Physical pages are retired by Engine after this callback returns."""
 
 
-__all__ = ["DeepSeekV4FlashCudaRunner"]
+__all__ = ["DeepSeekV4CudaRunner"]

@@ -1,4 +1,4 @@
-"""Validated configuration for the DeepSeek-V4 Flash release."""
+"""Validated configuration for native DeepSeek-V4 checkpoints."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ class DeepSeekV4Config:
 
     @classmethod
     def from_hugging_face(cls, values: dict[str, Any]) -> Self:
-        """Parse the public ``config.json`` naming used by the 0731 release."""
+        """Parse the public DeepSeek-V4 ``config.json`` naming."""
 
         config = cls(
             vocab_size=int(values["vocab_size"]),
@@ -98,7 +98,7 @@ class DeepSeekV4Config:
         if self.num_attention_heads % self.o_groups:
             raise ValueError("attention heads must be divisible by output groups")
         if self.expert_dtype != "fp4":
-            raise ValueError("the DeepSeek-V4 Flash runner requires FP4 experts")
+            raise ValueError("the DeepSeek-V4 runner requires FP4 experts")
         if self.dspark_block_size < 0 or self.dspark_markov_rank < 0:
             raise ValueError("DSpark sizes cannot be negative")
         if self.dspark_block_size:

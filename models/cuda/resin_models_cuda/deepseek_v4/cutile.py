@@ -26,7 +26,15 @@ _StaticLastTwoDims: TypeAlias = Annotated[
 _NEGATIVE = -3.402823466e38
 _MIN_WIDE_TILE_PROGRAMS = 64
 _INDEX_SCORE_TILE = 64
+_INDEX_SCORE_PROGRAMS = 64
 _CACHE_MAP_TILE = 64
+_DYNAMIC_SHAPE_ALIGNMENT = 16
+
+
+def _aligned_size(size: int, alignment: int = _DYNAMIC_SHAPE_ALIGNMENT) -> int:
+    """Pad a dynamic dimension into one stable cuTile divisibility class."""
+
+    return (size + alignment - 1) // (2 * alignment) * (2 * alignment) + alignment
 
 
 @ct.kernel
@@ -91,7 +99,11 @@ def paged_cache_rows(
     batch_size = positions.shape[0]
     if first_blocks.shape != (batch_size,) or pages.shape[0] != batch_size:
         raise ValueError("paged cache rows must share one batch dimension")
-    flat_positions = positions.reshape(batch_size, -1)
+    logical_width = positions.numel() // batch_size
+    padded_width = _aligned_size(logical_width)
+    flat_positions = positions.reshape(batch_size, logical_width)
+    if padded_width != logical_width:
+        flat_positions = F.pad(flat_positions, (0, padded_width - logical_width))
     output = torch.empty_like(flat_positions, dtype=torch.int32)
     ct.launch(
         torch.cuda.current_stream(positions.device),
@@ -110,7 +122,7 @@ def paged_cache_rows(
             layer_offset,
         ),
     )
-    return output.view(positions.shape)
+    return output[:, :logical_width].reshape(positions.shape)
 
 
 @ct.kernel
@@ -164,7 +176,11 @@ def paged_state_locations(
     batch_size = positions.shape[0]
     if first_blocks.shape != (batch_size,) or pages.shape[0] != batch_size:
         raise ValueError("paged state rows must share one batch dimension")
-    flat_positions = positions.reshape(batch_size, -1)
+    logical_width = positions.numel() // batch_size
+    padded_width = _aligned_size(logical_width)
+    flat_positions = positions.reshape(batch_size, logical_width)
+    if padded_width != logical_width:
+        flat_positions = F.pad(flat_positions, (0, padded_width - logical_width))
     output_pages = torch.empty_like(flat_positions, dtype=torch.int32)
     output_offsets = torch.empty_like(flat_positions, dtype=torch.int32)
     ct.launch(
@@ -181,7 +197,11 @@ def paged_state_locations(
             packing,
         ),
     )
-    return output_pages.view(positions.shape), output_offsets.view(positions.shape)
+    shape = positions.shape
+    return (
+        output_pages[:, :logical_width].reshape(shape),
+        output_offsets[:, :logical_width].reshape(shape),
+    )
 
 
 def _quant_groups_per_program(rows: int, group_count: int) -> int:
@@ -308,12 +328,17 @@ def _hash_sqrt_softplus_kernel(
     expert_indices: _StaticLastDim,
     expert_weights: _StaticLastDim,
     route_scale,
-    num_experts: _ConstantInt,
+    expert_tile: _ConstantInt,
 ):
     """Fuse hash lookup with the exact sqrt-softplus routing weights."""
 
     row = ct.bid(0)
-    logits_tile = ct.load(logits, (row, 0), shape=(1, num_experts)).astype(ct.float32)
+    logits_tile = ct.load(
+        logits,
+        (row, 0),
+        shape=(1, expert_tile),
+        padding_mode=ct.PaddingMode.ZERO,
+    ).astype(ct.float32)
     stable_softplus = ct.maximum(logits_tile, 0.0) + ct.log(
         1.0 + ct.exp(-ct.abs(logits_tile))
     )
@@ -322,7 +347,7 @@ def _hash_sqrt_softplus_kernel(
     indices01 = ct.load(token_to_experts, (token, 0), shape=(1, 2)).astype(ct.int32)
     indices23 = ct.load(token_to_experts, (token, 1), shape=(1, 2)).astype(ct.int32)
     indices45 = ct.load(token_to_experts, (token, 2), shape=(1, 2)).astype(ct.int32)
-    expert_ids = ct.arange(num_experts, dtype=ct.int32).reshape((1, num_experts))
+    expert_ids = ct.arange(expert_tile, dtype=ct.int32).reshape((1, expert_tile))
     weights0 = ct.sum(
         ct.where(
             expert_ids == ct.extract(indices01, (0, 0), shape=(1, 1)), original, 0.0
@@ -405,7 +430,7 @@ def hash_sqrt_softplus(
             expert_indices,
             expert_weights,
             route_scale,
-            num_experts,
+            1 << (num_experts - 1).bit_length(),
         ),
     )
     return expert_weights, expert_indices
@@ -431,61 +456,70 @@ def _index_score_kernel(
     layer_offset: int,
     weight_scale: float,
 ):
-    """Fuse index QK, activation, head reduction, and causal masking."""
+    """Persistently score only the compressed history visible to each token."""
 
-    tile = ct.bid(0)
+    program = ct.bid(0)
     sequence = ct.bid(1)
     batch = ct.bid(2)
-    q = ct.load(query, (batch, sequence, 0, 0), shape=(1, 1, heads, head_dim)).reshape(
-        (heads, head_dim)
-    )
-    if paged_cache:
-        logical_positions = (
-            tile * tile_width + ct.arange(tile_width, dtype=ct.int32)
-        ) * ratio
-        first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
-        page_columns = logical_positions // 128 - first
-        selected_pages = ct.gather(
-            cache_pages,
-            (
-                ct.full((tile_width,), batch, dtype=ct.int32),
-                page_columns,
-            ),
-            padding_value=0,
-        )
-        child_rows = parent_rows // packing
-        parents = (selected_pages - 1) // packing + 1
-        children = (selected_pages - 1) % packing
-        rows = (
-            (parents * parent_rows + children * child_rows) * row_scale
-            + layer_offset
-            + (logical_positions % 128) // ratio
-        ).reshape((tile_width, 1))
-        dimensions = ct.arange(head_dim, dtype=ct.int32).reshape((1, head_dim))
-        keys = ct.gather(cache, (rows, dimensions), padding_value=0)
-    else:
-        keys = ct.load(
-            cache, (batch, tile, 0), shape=(1, tile_width, head_dim)
-        ).reshape((tile_width, head_dim))
-    scores = ct.mma(
-        q,
-        keys.permute((1, 0)),
-        ct.full((heads, tile_width), 0.0, dtype=ct.float32),
-    )
+    token = ct.load(positions, (batch, sequence), shape=(1, 1)).item()
+    complete = (token + 1) // ratio
+    tile_count = ct.assume_divisible_by(output.shape[-1], tile_width) // tile_width
+    q = ct.load(
+        query,
+        (batch, sequence, 0, 0),
+        shape=(1, 1, heads, head_dim),
+    ).reshape((heads, head_dim))
     weights = (
         ct.load(head_weights, (batch, sequence, 0), shape=(1, 1, heads))
         .reshape((heads, 1))
         .astype(ct.float32)
     )
-    reduced = ct.sum(ct.maximum(scores, 0.0) * weights * weight_scale, axis=0)
-    token = ct.load(positions, (batch, sequence), shape=(1, 1)).item()
-    columns = tile * tile_width + ct.arange(tile_width, dtype=ct.int32)
-    reduced = ct.where(columns < (token + 1) // ratio, reduced, float("-inf"))
-    ct.store(
-        output,
-        (batch, sequence, tile),
-        reduced.reshape((1, 1, tile_width)).astype(output.dtype),
-    )
+    dimensions = ct.arange(head_dim, dtype=ct.int32).reshape((1, head_dim))
+    for tile in range(program, tile_count, _INDEX_SCORE_PROGRAMS):
+        columns = tile * tile_width + ct.arange(tile_width, dtype=ct.int32)
+        if tile * tile_width < complete:
+            if paged_cache:
+                logical_positions = columns * ratio
+                first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
+                page_columns = logical_positions // 128 - first
+                selected_pages = ct.gather(
+                    cache_pages,
+                    (
+                        ct.full((tile_width,), batch, dtype=ct.int32),
+                        page_columns,
+                    ),
+                    padding_value=0,
+                )
+                child_rows = parent_rows // packing
+                parents = (selected_pages - 1) // packing + 1
+                children = (selected_pages - 1) % packing
+                rows = (
+                    (parents * parent_rows + children * child_rows) * row_scale
+                    + layer_offset
+                    + (logical_positions % 128) // ratio
+                ).reshape((tile_width, 1))
+                keys = ct.gather(cache, (rows, dimensions), padding_value=0)
+            else:
+                keys = ct.load(
+                    cache, (batch, tile, 0), shape=(1, tile_width, head_dim)
+                ).reshape((tile_width, head_dim))
+            scores = ct.mma(
+                q,
+                keys.permute((1, 0)),
+                ct.full((heads, tile_width), 0.0, dtype=ct.float32),
+            )
+            reduced = ct.sum(
+                ct.maximum(scores, 0.0) * weights * weight_scale,
+                axis=0,
+            )
+            reduced = ct.where(columns < complete, reduced, float("-inf"))
+        else:
+            reduced = ct.full((tile_width,), float("-inf"), dtype=ct.float32)
+        ct.store(
+            output,
+            (batch, sequence, tile),
+            reduced.reshape((1, 1, tile_width)).astype(output.dtype),
+        )
 
 
 def index_scores(
@@ -526,7 +560,11 @@ def index_scores(
         raise ValueError("index score cache mapping has incompatible geometry")
     ct.launch(
         torch.cuda.current_stream(query.device),
-        (width // _INDEX_SCORE_TILE, block_length, batch_size),
+        (
+            min(width // _INDEX_SCORE_TILE, _INDEX_SCORE_PROGRAMS),
+            block_length,
+            batch_size,
+        ),
         _index_score_kernel,
         (
             query,
@@ -1346,15 +1384,16 @@ def _verify_attention_metadata_kernel(
     window_first_blocks,
     compressed_pages,
     compressed_first_blocks,
-    compressed_indices: _StaticLastDim,
-    indices: _StaticLastDim,
+    compressed_indices,
+    indices,
     sparse_lengths,
     sequence_lengths,
     window_size: _ConstantInt,
     window_capacity: _ConstantInt,
     compressed_pool_width: _ConstantInt,
     compress_ratio: _ConstantInt,
-    compressed_index_width: _ConstantInt,
+    compressed_index_width: int,
+    has_compression: _ConstantBool,
     has_explicit_compressed_indices: _ConstantBool,
     paged_cache: _ConstantBool,
     parent_rows: _ConstantInt,
@@ -1362,11 +1401,10 @@ def _verify_attention_metadata_kernel(
     compressed_packing: _ConstantInt,
     window_layer_offset: int,
     compressed_layer_offset: int,
-    block_length: _ConstantInt,
-    tile_width: _ConstantInt,
 ):
-    query = ct.bid(0)
-    batch = ct.bid(1)
+    tile = ct.bid(0)
+    query = ct.bid(1)
+    batch = ct.bid(2)
     start = ct.load(position, (batch,), shape=(1,)).item()
     token = start + query
     # The sliding-window width includes the current token. As the causal block
@@ -1376,7 +1414,7 @@ def _verify_attention_metadata_kernel(
     block_count = query + 1
     history_count = ct.minimum(start, ct.maximum(window_size - block_count, 0))
     block_end = history_count + query + 1
-    columns = ct.arange(tile_width, dtype=ct.int32)
+    columns = tile * 64 + ct.arange(64, dtype=ct.int32)
     old_column = ct.minimum(columns, ct.maximum(history_count - 1, 0))
     old_position = start - history_count + old_column
     old_index = old_position % window_capacity
@@ -1397,7 +1435,7 @@ def _verify_attention_metadata_kernel(
         window_pages_tile = ct.gather(
             window_pages,
             (
-                ct.full((tile_width,), batch, dtype=ct.int32),
+                ct.full((64,), batch, dtype=ct.int32),
                 window_columns,
             ),
             padding_value=0,
@@ -1423,7 +1461,7 @@ def _verify_attention_metadata_kernel(
         )
 
     output = window_indices
-    if compressed_index_width > 0:
+    if has_compression:
         compressed_column = columns - block_end
         if has_explicit_compressed_indices:
             compressed = ct.gather(
@@ -1453,7 +1491,7 @@ def _verify_attention_metadata_kernel(
                 compressed_pages_tile = ct.gather(
                     compressed_pages,
                     (
-                        ct.full((tile_width,), batch, dtype=ct.int32),
+                        ct.full((64,), batch, dtype=ct.int32),
                         compressed_columns,
                     ),
                     padding_value=0,
@@ -1487,31 +1525,25 @@ def _verify_attention_metadata_kernel(
         )
     else:
         output = ct.where(columns < block_end, output, -1)
-    ct.store(
-        indices,
-        (batch, query, 0),
-        output.reshape((1, 1, tile_width)).astype(ct.int32),
-    )
+    ct.store(indices, (batch, query, tile), output.reshape((1, 1, 64)).astype(ct.int32))
 
     compressed_complete = 0
-    if compressed_index_width > 0:
+    if has_compression:
         compressed_complete = ct.minimum(
             (token + 1) // compress_ratio,
             compressed_index_width,
         )
-    ct.store(
+    ct.scatter(
         sparse_lengths,
         (batch, query),
-        ct.full(
-            (1, 1),
-            block_end + compressed_complete,
-            dtype=ct.int32,
-        ),
+        (block_end + compressed_complete).astype(ct.int32),
+        mask=tile == 0,
     )
-    ct.store(
+    ct.scatter(
         sequence_lengths,
         (batch, query),
-        ct.full((1, 1), token + 1, dtype=ct.int32),
+        (token + 1).astype(ct.int32),
+        mask=tile == 0,
     )
 
 
@@ -1563,10 +1595,12 @@ def verify_attention_metadata(
         or compressed_mapping.parent_rows != window_mapping.parent_rows
     ):
         raise ValueError("compressed verification mapping is incompatible")
-    index_width = window_size + block_length + compressed_index_width
-    tile_width = 1 << (index_width - 1).bit_length()
+    index_width = _aligned_size(
+        window_size + block_length + compressed_index_width,
+        alignment=64,
+    )
     indices = torch.empty(
-        (batch_size, block_length, tile_width),
+        (batch_size, block_length, index_width),
         dtype=torch.int32,
         device=position.device,
     )
@@ -1585,7 +1619,7 @@ def verify_attention_metadata(
     )
     ct.launch(
         torch.cuda.current_stream(position.device),
-        (block_length, batch_size),
+        (index_width // 64, block_length, batch_size),
         _verify_attention_metadata_kernel,
         (
             position,
@@ -1602,6 +1636,7 @@ def verify_attention_metadata(
             compressed_pool_width,
             compress_ratio,
             compressed_index_width,
+            compress_ratio > 0,
             compressed_indices is not None,
             True,
             window_mapping.parent_rows,
@@ -1609,8 +1644,6 @@ def verify_attention_metadata(
             compressed_mapping.packing if compressed_mapping is not None else 1,
             window_mapping.layer_offset,
             compressed_mapping.layer_offset if compressed_mapping is not None else 0,
-            block_length,
-            tile_width,
         ),
     )
     return indices, sparse_lengths, sequence_lengths

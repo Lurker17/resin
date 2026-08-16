@@ -66,7 +66,7 @@ def load_deepseek_v4_weights(
     tensor_parallel_size: int,
     device: Any,
 ) -> dict[str, int]:
-    """Load one TP rank directly from the 48 original safetensor shards.
+    """Load one TP rank directly from the original safetensor shards.
 
     This avoids materializing DeepSeek's four converted checkpoint copies.
     Only the experts owned by ``model`` are read; replicated tensors and the

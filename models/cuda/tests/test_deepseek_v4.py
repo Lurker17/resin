@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from resin.backend.cuda.parallel import FlashInferAllReduce
-from resin_models_cuda.deepseek_v4 import DeepSeekV4FlashCudaRunner
+from resin_models_cuda.deepseek_v4 import DeepSeekV4CudaRunner
 from resin_models_cuda.deepseek_v4.checkpoint import resolve_model_path
 from resin_models_cuda.deepseek_v4.config import DeepSeekV4Config
 from resin_models_cuda.deepseek_v4.weights import (
@@ -52,6 +52,34 @@ class TestDeepSeekV4Config:
         assert config.compress_ratios[:6] == (0, 0, 4, 128, 4, 128)
         assert config.num_routed_experts // 4 == 64
         assert config.num_attention_heads // 4 == 16
+
+    def test_pro_geometry_supports_tp4(self) -> None:
+        values = _release_config()
+        values.update(
+            {
+                "hidden_size": 7168,
+                "num_hidden_layers": 61,
+                "num_attention_heads": 128,
+                "q_lora_rank": 1536,
+                "o_groups": 16,
+                "compress_ratios": [128, 128, *([4, 128] * 29), 4],
+                "index_topk": 1024,
+                "n_routed_experts": 384,
+                "moe_intermediate_size": 3072,
+                "dspark_block_size": 5,
+                "dspark_noise_token_id": 128799,
+                "dspark_target_layer_ids": [58, 59, 60],
+                "dspark_markov_rank": 512,
+            }
+        )
+
+        config = DeepSeekV4Config.from_hugging_face(values)
+
+        config.validate_tensor_parallel(4)
+        assert config.num_hidden_layers == 61
+        assert config.num_routed_experts // 4 == 96
+        assert config.num_attention_heads // 4 == 32
+        assert config.dspark_markov_rank == 512
 
     def test_rejects_mismatched_layer_compression(self) -> None:
         values = _release_config()
@@ -114,7 +142,7 @@ class TestDeepSeekV4Collectives:
         assert calls[0]["trigger_completion_at_end"]
 
     def test_runner_exposes_fast_allreduce_switch(self) -> None:
-        parameters = inspect.signature(DeepSeekV4FlashCudaRunner.__init__).parameters
+        parameters = inspect.signature(DeepSeekV4CudaRunner.__init__).parameters
 
         assert "fast_allreduce" in parameters
 
@@ -245,6 +273,7 @@ class TestDeepSeekV4Weights:
         deep_gemm.tf32_hc_prenorm_gemm = None
         gemm = ModuleType("resin_models_cuda.deepseek_v4.gemm")
         for name in (
+            "dynamic_gemm_rows",
             "fp4_fused_moe",
             "fp4_gemm",
             "fp8_gemm",
@@ -277,6 +306,16 @@ class TestDeepSeekV4Weights:
         native_model = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, spec.name, native_model)
         spec.loader.exec_module(native_model)
+        topk_call: dict[str, object] = {}
+
+        def top_k(scores: torch.Tensor, width: int, **kwargs: object):
+            topk_call.update(width=width, **kwargs)
+            return scores, torch.arange(width).view(1, width)
+
+        native_model.flashinfer_top_k = top_k
+        topk_indices = native_model._compact_topk_indices(torch.zeros(1, 8), 3)
+        assert topk_indices.tolist() == [[0, 1, 2]]
+        assert topk_call == {"width": 3, "sorted": True}
         frequencies = torch.polar(torch.ones(1, 5, 32), torch.randn(1, 5, 32))
         rank_three = torch.randn(1, 5, 64)
         rank_four = torch.randn(1, 5, 2, 64)
@@ -346,6 +385,18 @@ class TestDeepSeekV4Weights:
         with torch.no_grad():
             moe.experts[2].w1.weight.view(torch.uint8).fill_(17)
         assert torch.all(moe._fused_w13_weight[0, 128:].view(torch.uint8) == 17)
+
+        monkeypatch.setattr(
+            native_model,
+            "bf16_linear_fp32",
+            lambda inputs, weight: inputs.float() @ weight.float().T,
+        )
+        routing_weights, expert_ids = moe.gate(
+            torch.randn(3, args.dim, dtype=torch.bfloat16),
+            torch.arange(3),
+        )
+        assert routing_weights.dtype == torch.bfloat16
+        assert expert_ids.dtype == torch.int32
 
 
 class TestDeepSeekV4Gemms:
@@ -437,6 +488,16 @@ class TestDeepSeekV4Gemms:
             "recipe_b": (1, 128),
             "disable_ue8m0_cast": True,
         }
+
+    def test_arbitrary_prefill_rows_select_runtime_m_gemm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        deepseek_gemm = self._module(monkeypatch)
+
+        assert deepseek_gemm.fp8_gemm_uses_packed_scales(5)
+        with deepseek_gemm.dynamic_gemm_rows():
+            assert not deepseek_gemm.fp8_gemm_uses_packed_scales(5)
+        assert deepseek_gemm.fp8_gemm_uses_packed_scales(5)
 
     def test_fp8_prefill_uses_dynamic_trtllm_gemm_and_aligns_rows(
         self, monkeypatch: pytest.MonkeyPatch
@@ -779,18 +840,18 @@ class TestDeepSeekV4Attention:
 
 class TestDeepSeekV4Runner:
     def test_cuda_graphs_use_shared_static_lifecycle(self) -> None:
-        parameters = inspect.signature(DeepSeekV4FlashCudaRunner.__init__).parameters
-        source = inspect.getsource(DeepSeekV4FlashCudaRunner)
+        parameters = inspect.signature(DeepSeekV4CudaRunner.__init__).parameters
+        source = inspect.getsource(DeepSeekV4CudaRunner)
 
         assert "cuda_graph_decode_shapes" in parameters
-        assert hasattr(DeepSeekV4FlashCudaRunner, "cuda_graph_stats")
-        assert hasattr(DeepSeekV4FlashCudaRunner, "capture_cuda_graphs")
+        assert hasattr(DeepSeekV4CudaRunner, "cuda_graph_stats")
+        assert hasattr(DeepSeekV4CudaRunner, "capture_cuda_graphs")
         assert "CudaGraphCache(" in source
         assert "CUDAGraph" not in source
         assert ".replay()" not in source
 
     def test_graph_capture_inputs_stage_position_and_sampling(self) -> None:
-        inputs = DeepSeekV4FlashCudaRunner._graph_capture_inputs((3, 128), 256)
+        inputs = DeepSeekV4CudaRunner._graph_capture_inputs((3, 128), 256)
 
         assert inputs["token_ids"] == (0, 0, 0)
         assert inputs["positions"] == (1, 1, 1)
