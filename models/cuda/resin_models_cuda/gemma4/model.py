@@ -26,6 +26,10 @@ class RMSNorm(nn.Module):
             self.register_parameter("weight", None)
 
     def forward(self, hidden: Tensor) -> Tensor:
+        if hidden.is_cuda and self.weight is not None:
+            from quack import rmsnorm
+
+            return rmsnorm(hidden, self.weight, eps=self.eps)
         normalized = hidden.float()
         normalized *= torch.pow(
             normalized.square().mean(-1, keepdim=True) + self.eps, -0.5
