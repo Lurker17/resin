@@ -6,6 +6,7 @@ import torch
 
 from resin_models_cuda.gemma4.cuda import (
     _Gemma4KvArena,
+    _select_nvfp4_backend,
     plan_gemma4_kv_capacity,
 )
 from resin_models_cuda.gemma4.plan import PAGE_SIZE
@@ -21,6 +22,11 @@ def test_capacity_planner_accounts_for_fp8_shared_parent_bytes() -> None:
         int(total * 0.8) - model - 256 * 1024**2
     ) // plan.bytes_per_parent
     assert plan.allocation_bytes == plan.parent_capacity * plan.bytes_per_parent
+
+
+def test_fp4_backend_falls_back_when_cudnn_is_too_old() -> None:
+    assert _select_nvfp4_backend("auto", 92000) == "cute-dsl"
+    assert _select_nvfp4_backend("auto", 92301) == "cudnn"
 
 
 def test_local_and_global_cache_views_alias_one_physical_slab() -> None:
@@ -42,4 +48,3 @@ def test_local_and_global_cache_views_alias_one_physical_slab() -> None:
     )
     assert arena.local_keys.shape == (2, 3, PAGE_SIZE, 2, 4)
     assert arena.global_keys.shape == (1, 6, PAGE_SIZE, 1, 8)
-

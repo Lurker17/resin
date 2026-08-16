@@ -47,6 +47,14 @@ if TYPE_CHECKING:
 _WORKSPACE_BYTES = 128 * 1024 * 1024
 
 
+def _select_nvfp4_backend(requested: str, cudnn_version: int | None) -> str:
+    if requested not in {"auto", "cudnn", "cute-dsl"}:
+        raise ValueError("nvfp4_backend must be 'auto', 'cudnn', or 'cute-dsl'")
+    if requested == "auto":
+        return "cudnn" if (cudnn_version or 0) >= 92301 else "cute-dsl"
+    return requested
+
+
 @dataclass(frozen=True, slots=True)
 class Gemma4KvCapacityPlan:
     total_memory_bytes: int
@@ -146,7 +154,7 @@ class Gemma4CudaRunner(SyncRunner):
         cache_parent_capacity: int,
         revision: str | None = None,
         device: str | None = None,
-        nvfp4_backend: str = "cudnn",
+        nvfp4_backend: str = "auto",
     ) -> None:
         if cache_parent_capacity <= 0:
             raise ValueError("cache_parent_capacity must be positive")
@@ -159,8 +167,9 @@ class Gemma4CudaRunner(SyncRunner):
                 "Gemma 4 NVFP4 W4A16 requires Blackwell-class FP4 hardware, "
                 f"got sm{capability[0]}{capability[1]}"
             )
-        if nvfp4_backend not in {"cudnn", "cute-dsl"}:
-            raise ValueError("nvfp4_backend must be 'cudnn' or 'cute-dsl'")
+        nvfp4_backend = _select_nvfp4_backend(
+            nvfp4_backend, torch.backends.cudnn.version()
+        )
 
         self.model_path = resolve_model_path(model, revision)
         self._model, self.config, self.raw_config = load_model(
