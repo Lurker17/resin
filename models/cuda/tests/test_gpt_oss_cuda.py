@@ -5,6 +5,10 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+
+from resin import BatchPhase
+from resin.backend.resources import CachePoolBinding
+from resin.backend.sampling import TorchSampler
 from resin_models_cuda.gpt_oss.cuda import (
     GptOssCudaRunner,
     _route,
@@ -17,10 +21,6 @@ from resin_models_cuda.gpt_oss.plan import (
     WINDOW_TABLE_WIDTH,
     build_attention_batches,
 )
-
-from resin import BatchPhase
-from resin.backend.resources import CachePoolBinding
-from resin.backend.sampling import TorchSampler
 
 
 def _group_plan(group_index, rows, first_logical_blocks, positions, indptr):

@@ -9,6 +9,9 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+
+from resin import BatchPhase, BatchPlan
+from resin.backend.cuda.parallel import FlashInferAllReduce
 from resin_models_cuda.deepseek_v4 import DeepSeekV4FlashCudaRunner
 from resin_models_cuda.deepseek_v4.checkpoint import resolve_model_path
 from resin_models_cuda.deepseek_v4.config import DeepSeekV4Config
@@ -16,9 +19,6 @@ from resin_models_cuda.deepseek_v4.weights import (
     load_deepseek_v4_weights,
     tensor_parallel_axis,
 )
-
-from resin import BatchPhase, BatchPlan
-from resin.backend.cuda.parallel import FlashInferAllReduce
 
 
 def _release_config() -> dict[str, object]:

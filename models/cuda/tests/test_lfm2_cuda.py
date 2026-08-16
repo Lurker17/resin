@@ -1491,9 +1491,8 @@ class TestLfm2CudaAsyncStaticBoundary:
         assert "synchronize" not in source
 
     def test_dispatch_uses_private_stream_and_nonblocking_copies(self) -> None:
-        from resin_models_cuda.lfm2 import Lfm2CudaRunner
-
         from resin.backend.cuda.execution import CudaExecutor
+        from resin_models_cuda.lfm2 import Lfm2CudaRunner
 
         source = inspect.getsource(CudaExecutor.dispatch)
         assert "torch.cuda.stream(self.stream)" in source
@@ -1503,10 +1502,9 @@ class TestLfm2CudaAsyncStaticBoundary:
         assert "current_stream" not in inspect.getsource(Lfm2CudaRunner)
 
     def test_metadata_stages_decode_plan_on_pinned_cpu(self) -> None:
-        from resin_models_cuda.lfm2 import Lfm2CudaRunner
-
         from resin.backend.cuda.execution import CudaExecutor
         from resin.backend.cuda.staging import TensorStager
+        from resin_models_cuda.lfm2 import Lfm2CudaRunner
 
         metadata_source = inspect.getsource(Lfm2CudaRunner._metadata)
         staging_source = inspect.getsource(TensorStager)

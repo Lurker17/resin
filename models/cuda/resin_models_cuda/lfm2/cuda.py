@@ -12,12 +12,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
-from resin_models_torch.lfm2.reference import (
-    DEFAULT_MODEL,
-    DEFAULT_REVISION,
-    load_model,
-    resolve_model_path,
-)
 
 from resin import BatchPhase, CacheGroupLayout, CacheLayout, StateMappingConfig
 from resin.backend.checks import nonempty_plan
@@ -29,6 +23,12 @@ from resin.backend.cuda.paged_kv import PagedKvArena, PagedKvCsr
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
 from resin_models_cuda.lfm2.plan import CacheMetadata, build_cache_metadata
+from resin_models_torch.lfm2.reference import (
+    DEFAULT_MODEL,
+    DEFAULT_REVISION,
+    load_model,
+    resolve_model_path,
+)
 
 if TYPE_CHECKING:
     from resin import BatchPlan

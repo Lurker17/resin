@@ -55,6 +55,7 @@ for name in ('transformers', 'tokenizers', 'huggingface_hub', 'safetensors'):
 class TestLfm2Torch:
     def setup_method(self) -> None:
         import torch
+
         from resin_models_torch.lfm2.model import Lfm2ForCausalLM
 
         torch.manual_seed(7)
@@ -84,9 +85,8 @@ class TestLfm2Torch:
         assert not any(".operator." in key for key in keys)
 
     def test_runner_consumes_batch_plan_and_releases_per_request_cache(self) -> None:
-        from resin_models_torch.lfm2 import Lfm2TorchRunner
-
         from resin import BatchPhase, BatchPlan
+        from resin_models_torch.lfm2 import Lfm2TorchRunner
 
         runner = Lfm2TorchRunner.__new__(Lfm2TorchRunner)
         runner.device = self.torch.device("cpu")
@@ -130,8 +130,9 @@ class TestLfm2Torch:
     def test_direct_safetensors_loading_without_transformers(
         self, tmp_path: Path
     ) -> None:
-        from resin_models_torch.lfm2.reference import load_model
         from safetensors.torch import save_file
+
+        from resin_models_torch.lfm2.reference import load_model
 
         config = {
             "model_type": "lfm2",

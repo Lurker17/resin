@@ -13,6 +13,7 @@ from resin.moe_kernels import MoEKernelConfig
 class TestGptOssPackedBridge:
     def test_official_block_layout_is_flattened_and_installed(self) -> None:
         import torch
+
         from resin_models_cuda.gpt_oss.mxfp4 import (
             _install_expert_layer,
             _make_kernel_expert_factory,

@@ -127,6 +127,7 @@ class TestGptOssImport:
 class TestGptOssTorch:
     def setup_method(self) -> None:
         import torch
+
         from resin_models_cuda.gpt_oss.model import GptOssForCausalLM
 
         torch.manual_seed(11)
@@ -315,8 +316,9 @@ class TestGptOssTorch:
     def test_direct_dense_safetensors_loading_without_transformers(
         self, tmp_path: Path
     ) -> None:
-        from resin_models_cuda.gpt_oss.checkpoint import load_model
         from safetensors.torch import save_file
+
+        from resin_models_cuda.gpt_oss.checkpoint import load_model
 
         tokens = self.torch.tensor([[1, 2, 3]])
         with self.torch.inference_mode():
