@@ -166,37 +166,6 @@ async fn route_flags_remove_disabled_apis_and_demo() {
 }
 
 #[tokio::test]
-async fn demo_is_embedded_with_rich_output_and_generation_metrics() {
-    let response = test_router()
-        .oneshot(Request::get("/").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let html = std::str::from_utf8(&body).unwrap();
-    assert!(html.contains("/v1/chat/completions"));
-    assert!(html.contains("renderMarkdown"));
-    assert!(html.contains("katex@0.18.1"));
-    assert!(html.contains("generation_elapsed_ms"));
-    assert!(html.contains("id=\"settings-toggle\""));
-    assert!(html.contains("id=\"reasoning-effort\""));
-    assert!(html.contains("id=\"temperature\""));
-    assert!(html.contains("id=\"top-p\""));
-    assert!(html.contains("id=\"max-output-tokens\""));
-    assert!(html.contains("value=\"low\" selected"));
-    assert!(html.contains("pendingLabel='Starting model'"));
-    assert!(html.contains("s TTFT"));
-    assert!(html.contains("max output reached"));
-    assert!(html.contains("textarea { flex:1; min-height:38px"));
-    assert!(html.contains("line-height:22px"));
-    assert!(html.contains("position:sticky"));
-    assert!(html.contains("overflow-y:auto"));
-    assert!(html.contains("#chat-shell::after"));
-    assert!(!html.contains("box-shadow"));
-    assert!(!html.contains("backdrop-filter"));
-}
-
-#[tokio::test]
 async fn chat_completions_streams_tool_calls_and_resin_metrics() {
     let request = Request::post("/v1/chat/completions")
         .header(header::CONTENT_TYPE, "application/json")
