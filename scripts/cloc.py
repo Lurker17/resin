@@ -19,7 +19,7 @@ def source_files(path: Path, pattern: str, *, recursive: bool = True) -> list[Pa
 
 
 def python_package(path: Path) -> dict[str, object]:
-    groups: dict[str, object] = {"package": source_files(path, "*.py", recursive=False)}
+    groups: dict[str, object] = {"_self": source_files(path, "*.py", recursive=False)}
     for directory in sorted(path.iterdir()):
         if directory.is_dir() and not directory.name.startswith("__"):
             files = source_files(directory, "*.py")
@@ -130,16 +130,19 @@ def count(paths: list[Path], language: str) -> dict[str, int]:
 
 
 def count_tree(groups: dict[str, object], language: str) -> dict[str, object]:
+    own = count(groups.get("_self", []), language)
     children = {}
     for name, group in groups.items():
+        if name == "_self":
+            continue
         children[name] = (
             count(group, language)
             if isinstance(group, list)
             else count_tree(group, language)
         )
     return {
-        "files": sum(child["files"] for child in children.values()),
-        "code": sum(child["code"] for child in children.values()),
+        "files": own["files"] + sum(child["files"] for child in children.values()),
+        "code": own["code"] + sum(child["code"] for child in children.values()),
         "children": children,
     }
 
@@ -159,13 +162,8 @@ def report() -> dict[str, dict[str, object]]:
         },
         "python": {
             "resin": {
-                "package": source_files(ROOT / "resin", "*.py", recursive=False),
-                "backend": {
-                    "shared": source_files(
-                        ROOT / "resin/backend", "*.py", recursive=False
-                    ),
-                    "cuda": source_files(ROOT / "resin/backend/cuda", "*.py"),
-                },
+                "_self": source_files(ROOT / "resin", "*.py", recursive=False),
+                "backend": source_files(ROOT / "resin/backend", "*.py"),
             },
             "resin-models-cuda": python_package(ROOT / "models/cuda/resin_models_cuda"),
             "resin-models-torch": python_package(
