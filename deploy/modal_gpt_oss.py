@@ -97,7 +97,7 @@ image = (
     )
     .uv_sync(
         str(ROOT),
-        extras=["gpu", "demo"],
+        extras=["gpu", "dev"],
         extra_options="--no-default-groups",
     )
     # These accelerator-specific supplement wheels live outside PyPI, so the

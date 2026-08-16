@@ -70,7 +70,7 @@ image = (
     )
     .uv_sync(
         str(ROOT),
-        extras=["gpu", "demo"],
+        extras=["gpu", "dev"],
         extra_options="--no-default-groups",
     )
     .uv_pip_install(

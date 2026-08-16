@@ -1,17 +1,18 @@
 """Vibe-test Resin with external Hugging Face tokenization.
 
-`tokenizers` is an optional dependency in the `demo` group. This is the most
+`tokenizers` is an optional dependency in the `dev` group. This is the most
 basic example of using Resin with a Torch-based forward pass.
 """
 
-from resin_models_torch.lfm2.reference import DEFAULT_MODEL, Lfm2TorchRunner
+from resin_models_torch.lfm2 import DEFAULT_MODEL, Lfm2TorchRunner
 from tokenizers import Tokenizer
 
 from resin import Engine
 
 
 def main() -> None:
-    tokenizer = Tokenizer.from_pretrained("LiquidAI/LFM2.5-230M")
+    model = DEFAULT_MODEL
+    tokenizer = Tokenizer.from_pretrained(model)
     prompt = (
         "<|startoftext|><|im_start|>system\n"
         "You are a helpful assistant trained by Liquid AI.<|im_end|>\n"
@@ -20,7 +21,7 @@ def main() -> None:
     )
     input_ids = tokenizer.encode(prompt, add_special_tokens=False).ids
 
-    runner = Lfm2TorchRunner(DEFAULT_MODEL)
+    runner = Lfm2TorchRunner(model)
     engine = Engine(runner, eos_token_id=runner.eos_token_id)
     request = engine.submit(input_ids, max_new_tokens=256)
     while engine.has_work():

@@ -8,7 +8,12 @@ version = "0.1.0"
 description = "Reference LLM implementations for Resin, in PyTorch"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-dependencies = ["resin[torch]==0.1.0"]
+dependencies = [
+  "resin==0.1.0",
+  "torch>=2.7",
+  "huggingface-hub>=0.35",
+  "safetensors>=0.5",
+]
 
 [tool.uv.sources]
 resin = { workspace = true }

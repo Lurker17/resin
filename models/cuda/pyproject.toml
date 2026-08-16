@@ -11,6 +11,9 @@ license = "Apache-2.0"
 dependencies = [
   "resin[gpu]==0.1.0",
   "resin-models-torch==0.1.0",
+  "huggingface-hub==1.27.0",
+  "hf-xet==1.6.0",
+  "safetensors==0.8.0",
 ]
 
 [tool.uv.sources]

@@ -23,19 +23,36 @@ class TestImport:
     def test_accelerator_dependencies_are_optional(self) -> None:
         project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
         assert project["dependencies"] == ["blake3>=1.0,<2"]
-        gpu = project["optional-dependencies"]["gpu"]
+        optional_dependencies = project["optional-dependencies"]
+        assert "torch" not in optional_dependencies
+        assert "demo" not in optional_dependencies
+
+        gpu = optional_dependencies["gpu"]
         assert any(item.startswith("torch") for item in gpu)
         assert any(item.startswith("flashinfer-python") for item in gpu)
         assert any(item.startswith("quack-kernels==0.6.4") for item in gpu)
         assert any(item.startswith("nvidia-cutlass-dsl") for item in gpu)
         assert any(item.startswith("flash-attn-4") for item in gpu)
+        assert not any(item.startswith("numpy") for item in gpu)
+        assert not any(item.startswith("huggingface-hub") for item in gpu)
+        assert not any(item.startswith("safetensors") for item in gpu)
 
         cuda_models = tomllib.loads(Path("models/cuda/pyproject.toml").read_text())[
             "project"
         ]
         assert "resin[gpu]==0.1.0" in cuda_models["dependencies"]
+        assert "huggingface-hub==1.27.0" in cuda_models["dependencies"]
+        assert "safetensors==0.8.0" in cuda_models["dependencies"]
 
         torch_models = tomllib.loads(Path("models/torch/pyproject.toml").read_text())[
             "project"
         ]
-        assert torch_models["dependencies"] == ["resin[torch]==0.1.0"]
+        assert "resin==0.1.0" in torch_models["dependencies"]
+        assert any(item.startswith("torch>=") for item in torch_models["dependencies"])
+        assert any(
+            item.startswith("huggingface-hub>=")
+            for item in torch_models["dependencies"]
+        )
+        assert any(
+            item.startswith("safetensors>=") for item in torch_models["dependencies"]
+        )
