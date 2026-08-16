@@ -160,26 +160,23 @@ class TestGptOssCudaNativePlan:
         assert inputs["full_append_slots"] == (0, 0)
         assert inputs["sliding_append_slots"] == (0, 0)
 
-    def test_kv_capacity_plan_uses_static_fraction_and_swa_ratio(self) -> None:
+    def test_kv_capacity_plan_uses_post_load_free_memory(self) -> None:
         gib = 1024**3
         plan = plan_gpt_oss_kv_capacity(
             100 * gib,
-            55 * gib,
+            45 * gib,
             0.75,
-            swa_full_tokens_ratio=0.8,
         )
 
-        assert plan.static_memory_bytes == 75 * gib
-        assert plan.kv_budget_bytes == 20 * gib
+        assert plan.protected_free_bytes == 25 * gib
+        assert plan.cache_budget_bytes == 20 * gib
         assert plan.bytes_per_parent == 4_718_592
         assert plan.parent_capacity == 4_550
-        assert plan.full_parent_target + plan.swa_parent_target == plan.parent_capacity
-        assert plan.full_token_target == plan.full_parent_target * 128
-        assert plan.swa_token_target == plan.swa_parent_target * 128
+        assert plan.allocation_bytes <= plan.cache_budget_bytes
 
         tp4 = plan_gpt_oss_kv_capacity(
             100 * gib,
-            55 * gib,
+            45 * gib,
             0.75,
             tensor_parallel_size=4,
         )

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -69,8 +70,11 @@ def _select_nvfp4_backend(requested: str, cudnn_version: int | None) -> str:
 @dataclass(frozen=True, slots=True)
 class Gemma4KvCapacityPlan:
     total_memory_bytes: int
-    model_memory_bytes: int
+    free_memory_bytes: int
     static_memory_fraction: float
+    protected_free_bytes: int
+    workspace_bytes: int
+    cache_budget_bytes: int
     bytes_per_parent: int
     parent_capacity: int
     allocation_bytes: int
@@ -78,26 +82,35 @@ class Gemma4KvCapacityPlan:
 
 def plan_gemma4_kv_capacity(
     total_memory_bytes: int,
-    model_memory_bytes: int,
+    free_memory_bytes: int,
     static_memory_fraction: float,
     *,
     workspace_bytes: int = 2 * _WORKSPACE_BYTES,
 ) -> Gemma4KvCapacityPlan:
-    if not 0.0 < static_memory_fraction <= 1.0:
-        raise ValueError("static_memory_fraction must be in (0, 1]")
+    if total_memory_bytes <= 0 or not 0 < free_memory_bytes <= total_memory_bytes:
+        raise ValueError("CUDA memory totals must be positive and internally valid")
+    if not 0.0 < static_memory_fraction < 1.0:
+        raise ValueError("static_memory_fraction must be between zero and one")
+    if workspace_bytes < 0:
+        raise ValueError("workspace_bytes cannot be negative")
     # One FP8 parent holds all 50 local layers for one 64-token page.
     bytes_per_parent = 2 * 50 * PAGE_SIZE * 16 * 256
-    budget = int(total_memory_bytes * static_memory_fraction)
-    available = budget - model_memory_bytes - workspace_bytes
+    protected_free_bytes = math.ceil(
+        total_memory_bytes * (1.0 - static_memory_fraction)
+    )
+    cache_budget_bytes = free_memory_bytes - protected_free_bytes - workspace_bytes
     # Parent zero is a permanent graph-only null page. Native Engine page IDs
     # remain positive and map directly into the remaining physical slab.
-    parent_capacity = available // bytes_per_parent - 1
+    parent_capacity = cache_budget_bytes // bytes_per_parent - 1
     if parent_capacity <= 0:
         raise ValueError("GPU memory budget leaves no room for Gemma 4 KV cache")
     return Gemma4KvCapacityPlan(
         total_memory_bytes=total_memory_bytes,
-        model_memory_bytes=model_memory_bytes,
+        free_memory_bytes=free_memory_bytes,
         static_memory_fraction=static_memory_fraction,
+        protected_free_bytes=protected_free_bytes,
+        workspace_bytes=workspace_bytes,
+        cache_budget_bytes=cache_budget_bytes,
         bytes_per_parent=bytes_per_parent,
         parent_capacity=parent_capacity,
         allocation_bytes=(parent_capacity + 1) * bytes_per_parent,
@@ -163,14 +176,19 @@ class Gemma4CudaRunner(SyncRunner):
         self,
         model: str | Path = DEFAULT_MODEL,
         *,
-        cache_parent_capacity: int,
+        cache_parent_capacity: int | None = None,
         revision: str | None = None,
         device: str | None = None,
         nvfp4_backend: str = "auto",
         cuda_graph_decode_shapes: object | None = None,
+        static_memory_fraction: float = 0.95,
     ) -> None:
-        if cache_parent_capacity <= 0:
-            raise ValueError("cache_parent_capacity must be positive")
+        if cache_parent_capacity is not None and (
+            isinstance(cache_parent_capacity, bool)
+            or not isinstance(cache_parent_capacity, int)
+            or cache_parent_capacity <= 0
+        ):
+            raise ValueError("cache_parent_capacity must be a positive integer")
         self.device = torch.device(device or default_device(torch, require_cuda=True))
         if self.device.type != "cuda":
             raise RuntimeError("Gemma4CudaRunner requires CUDA")
@@ -192,6 +210,22 @@ class Gemma4CudaRunner(SyncRunner):
         prepare_nvfp4_modules(self._model, nvfp4_backend)
         self.nvfp4_backend = nvfp4_backend
         self._graph_attention: dict[GraphShape, tuple[Any, Any]] = {}
+        torch.cuda.synchronize(self.device)
+        free_memory, total_memory = torch.cuda.mem_get_info(self.device)
+        capacity_plan = plan_gemma4_kv_capacity(
+            total_memory,
+            free_memory,
+            static_memory_fraction,
+        )
+        local_capacity = capacity_plan.parent_capacity
+        if cache_parent_capacity is not None:
+            local_capacity = min(local_capacity, cache_parent_capacity)
+        self.cache_parent_capacity = local_capacity
+        self.cache_capacity_plan = replace(
+            capacity_plan,
+            parent_capacity=local_capacity,
+            allocation_bytes=(local_capacity + 1) * capacity_plan.bytes_per_parent,
+        )
 
         decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
         maximum_history_pages = (
@@ -209,9 +243,8 @@ class Gemma4CudaRunner(SyncRunner):
             synchronize_failure=lambda: torch.cuda.synchronize(self.device),
         )
 
-        self.cache_parent_capacity = cache_parent_capacity
         self.cache_layout = CacheLayout(
-            cache_parent_capacity,
+            self.cache_parent_capacity,
             [
                 CacheGroupLayout(
                     PAGE_SIZE,
@@ -232,7 +265,7 @@ class Gemma4CudaRunner(SyncRunner):
         )
         self._binding = CachePoolBinding(self.cache_layout, resource="Gemma 4 KV")
         self._cache = _Gemma4KvArena(
-            torch, self.device, self.config, cache_parent_capacity
+            torch, self.device, self.config, self.cache_parent_capacity
         )
         self._sampler = FlashInferSampler(torch)
         self._media_features: dict[int, _MediaFeatures] = {}

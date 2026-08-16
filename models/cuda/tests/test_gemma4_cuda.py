@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 from types import SimpleNamespace
 
 import torch
@@ -16,13 +17,15 @@ from resin_models_cuda.gemma4.plan import PAGE_SIZE
 
 def test_capacity_planner_accounts_for_fp8_shared_parent_bytes() -> None:
     total = 96 * 1024**3
-    model = 33 * 1024**3
-    plan = plan_gemma4_kv_capacity(total, model, 0.8)
+    free = 63 * 1024**3
+    plan = plan_gemma4_kv_capacity(total, free, 0.8)
 
     assert plan.bytes_per_parent == 25 * 1024**2
+    assert plan.protected_free_bytes == math.ceil(total * 0.2)
     assert (
         plan.parent_capacity
-        == (int(total * 0.8) - model - 256 * 1024**2) // plan.bytes_per_parent - 1
+        == (free - plan.protected_free_bytes - 256 * 1024**2) // plan.bytes_per_parent
+        - 1
     )
     assert plan.allocation_bytes == (plan.parent_capacity + 1) * plan.bytes_per_parent
 

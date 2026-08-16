@@ -11,12 +11,14 @@ The runner has no request-ID cache map and no Python page allocator.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from flashinfer.comm import (
     AllReduceFusionPattern,
     AllReduceFusionWorkspace,
@@ -118,45 +120,48 @@ class _PostAcceptCudaError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class GptOssKvCapacityPlan:
-    """Advisory shared-pool sizing from an SGLang-style static fraction."""
+    """One-rank cache budget measured after model/static allocations."""
 
     total_memory_bytes: int
-    model_memory_bytes: int
-    static_memory_fraction: float
-    static_memory_bytes: int
-    kv_budget_bytes: int
+    free_memory_bytes: int
+    gpu_memory_utilization: float
+    protected_free_bytes: int
+    cache_budget_bytes: int
     bytes_per_parent: int
     parent_capacity: int
     allocation_bytes: int
-    full_parent_target: int
-    swa_parent_target: int
-    full_token_target: int
-    swa_token_target: int
-    swa_full_tokens_ratio: float
 
 
 def plan_gpt_oss_kv_capacity(
     total_memory_bytes: int,
-    model_memory_bytes: int,
-    static_memory_fraction: float,
+    free_memory_bytes: int,
+    gpu_memory_utilization: float,
     *,
     attention_layers_per_group: int = 18,
-    swa_full_tokens_ratio: float = 0.8,
     tensor_parallel_size: int = 1,
 ) -> GptOssKvCapacityPlan:
-    """Calculate GPT-OSS KV capacity without imposing an allocation policy.
+    """Size the fungible KV pool from post-load free device memory.
 
-    ``static_memory_fraction`` follows SGLang's definition: model weights plus
-    KV cache divided by total GPU memory. Resin uses one fungible parent pool
-    for full and sliding-window attention, so the SWA ratio is returned as an
-    advisory token-capacity split rather than two physical allocations.
+    ``gpu_memory_utilization`` is the total model-plus-cache fraction. Model,
+    communication, and persistent kernel allocations have already been made,
+    so protecting ``(1 - utilization) * total`` from the current free memory
+    gives the exact remaining KV budget. History and sliding-window groups use
+    one shared physical parent pool and therefore need no capacity split.
     """
 
+    if total_memory_bytes <= 0 or not 0 < free_memory_bytes <= total_memory_bytes:
+        raise ValueError("CUDA memory totals must be positive and internally valid")
+    if not 0.0 < gpu_memory_utilization < 1.0:
+        raise ValueError("gpu_memory_utilization must be between zero and one")
+    if attention_layers_per_group <= 0:
+        raise ValueError("attention_layers_per_group must be positive")
     if _NUM_KV_HEADS % tensor_parallel_size:
         raise ValueError("tensor_parallel_size must divide GPT-OSS KV heads")
 
-    static_memory_bytes = int(total_memory_bytes * static_memory_fraction)
-    kv_budget_bytes = static_memory_bytes - model_memory_bytes
+    protected_free_bytes = math.ceil(
+        total_memory_bytes * (1.0 - gpu_memory_utilization)
+    )
+    cache_budget_bytes = free_memory_bytes - protected_free_bytes
     bytes_per_parent = (
         2
         * attention_layers_per_group
@@ -167,23 +172,18 @@ def plan_gpt_oss_kv_capacity(
     )
     # The device slab contains parent zero as a permanent null/graph-capture
     # page in addition to the positive parent IDs owned by the native pool.
-    parent_capacity = kv_budget_bytes // bytes_per_parent - 1
-    full_parent_target = max(1, int(parent_capacity / (1.0 + swa_full_tokens_ratio)))
-    swa_parent_target = parent_capacity - full_parent_target
+    parent_capacity = cache_budget_bytes // bytes_per_parent - 1
+    if parent_capacity <= 0:
+        raise MemoryError("GPT-OSS cache budget cannot hold its reserved parent")
     return GptOssKvCapacityPlan(
         total_memory_bytes=total_memory_bytes,
-        model_memory_bytes=model_memory_bytes,
-        static_memory_fraction=static_memory_fraction,
-        static_memory_bytes=static_memory_bytes,
-        kv_budget_bytes=kv_budget_bytes,
+        free_memory_bytes=free_memory_bytes,
+        gpu_memory_utilization=gpu_memory_utilization,
+        protected_free_bytes=protected_free_bytes,
+        cache_budget_bytes=cache_budget_bytes,
         bytes_per_parent=bytes_per_parent,
         parent_capacity=parent_capacity,
         allocation_bytes=(parent_capacity + 1) * bytes_per_parent,
-        full_parent_target=full_parent_target,
-        swa_parent_target=swa_parent_target,
-        full_token_target=full_parent_target * _PAGE_SIZE,
-        swa_token_target=swa_parent_target * _PAGE_SIZE,
-        swa_full_tokens_ratio=swa_full_tokens_ratio,
     )
 
 
@@ -212,7 +212,7 @@ class GptOssCudaRunner(SyncRunner):
         self,
         model: str | Path = DEFAULT_MODEL,
         *,
-        cache_parent_capacity: int,
+        cache_parent_capacity: int | None = None,
         revision: str | None = None,
         device: str | None = None,
         dtype=None,
@@ -220,32 +220,21 @@ class GptOssCudaRunner(SyncRunner):
         cuda_graph_decode_shapes: object = None,
         tensor_parallel: TensorParallelContext | None = None,
         fast_allreduce: bool = True,
+        gpu_memory_utilization: float = 0.95,
     ) -> None:
         from flash_attn.cute import flash_attn_varlen_func
 
+        if cache_parent_capacity is not None and (
+            isinstance(cache_parent_capacity, bool)
+            or not isinstance(cache_parent_capacity, int)
+            or cache_parent_capacity <= 0
+        ):
+            raise ValueError("cache_parent_capacity must be a positive integer")
+        if not 0.0 < gpu_memory_utilization < 1.0:
+            raise ValueError("gpu_memory_utilization must be between zero and one")
         self.tensor_parallel = tensor_parallel or TensorParallelContext()
         self.tensor_parallel_rank = self.tensor_parallel.rank
         self.tensor_parallel_size = self.tensor_parallel.size
-        self.cache_parent_capacity = cache_parent_capacity
-        self.cache_layout = CacheLayout(
-            self.cache_parent_capacity,
-            [
-                CacheGroupLayout(_PAGE_SIZE),
-                CacheGroupLayout(
-                    _PAGE_SIZE,
-                    retention=CacheRetention.WINDOW,
-                    window_tokens=WINDOW_RETENTION_TOKENS,
-                ),
-            ],
-        )
-        # Sparse native plans remain chronological; the runner only derives
-        # dense FA4 tables and page-aligned kernel rounds from each frozen plan.
-        self.runner_config = RunnerConfig(
-            max_batch_tokens=_PREFILL_CHUNK_SIZE,
-            prefill_chunk_size=_PREFILL_CHUNK_SIZE,
-            continuation_prefill=True,
-            cache_layout=self.cache_layout,
-        )
 
         self._torch = torch
         self._fa4 = flash_attn_varlen_func
@@ -256,15 +245,6 @@ class GptOssCudaRunner(SyncRunner):
         if torch.cuda.get_device_capability(self.device)[0] != 9:
             raise RuntimeError("the pinned GPT-OSS FA4 runner requires an SM90 GPU")
         decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
-        if any(width > self.cache_parent_capacity for _, width in decode_graph_shapes):
-            raise ValueError("CUDA graph table width exceeds cache capacity")
-        self._graphs = CudaGraphCache(
-            torch,
-            self.device,
-            decode_graph_shapes,
-            build=self._new_decode_graph_step,
-            synchronize_failure=self._synchronize_failed_eager_forward,
-        )
 
         resolved_dtype = torch.bfloat16 if dtype is None else dtype
         if isinstance(resolved_dtype, str):
@@ -358,6 +338,62 @@ class GptOssCudaRunner(SyncRunner):
             raise ValueError(
                 "GPT-OSS History and Window cache groups must have equal byte geometry"
             )
+        torch.cuda.synchronize(self.device)
+        free_memory, total_memory = torch.cuda.mem_get_info(self.device)
+        capacity_plan = plan_gpt_oss_kv_capacity(
+            total_memory,
+            free_memory,
+            gpu_memory_utilization,
+            attention_layers_per_group=len(self._full_layers),
+            tensor_parallel_size=self.tensor_parallel_size,
+        )
+        local_capacity = capacity_plan.parent_capacity
+        if cache_parent_capacity is not None:
+            local_capacity = min(local_capacity, cache_parent_capacity)
+        if self.tensor_parallel.enabled:
+            capacity_tensor = torch.tensor(
+                local_capacity, dtype=torch.int64, device=self.device
+            )
+            dist.all_reduce(
+                capacity_tensor,
+                op=dist.ReduceOp.MIN,
+                group=self.tensor_parallel.process_group,
+            )
+            local_capacity = int(capacity_tensor.item())
+        self.cache_parent_capacity = local_capacity
+        self.cache_capacity_plan = replace(
+            capacity_plan,
+            parent_capacity=local_capacity,
+            allocation_bytes=(local_capacity + 1) * capacity_plan.bytes_per_parent,
+        )
+        self.cache_layout = CacheLayout(
+            self.cache_parent_capacity,
+            [
+                CacheGroupLayout(_PAGE_SIZE),
+                CacheGroupLayout(
+                    _PAGE_SIZE,
+                    retention=CacheRetention.WINDOW,
+                    window_tokens=WINDOW_RETENTION_TOKENS,
+                ),
+            ],
+        )
+        # Sparse native plans remain chronological; the runner only derives
+        # dense FA4 tables and page-aligned kernel rounds from each frozen plan.
+        self.runner_config = RunnerConfig(
+            max_batch_tokens=_PREFILL_CHUNK_SIZE,
+            prefill_chunk_size=_PREFILL_CHUNK_SIZE,
+            continuation_prefill=True,
+            cache_layout=self.cache_layout,
+        )
+        if any(width > self.cache_parent_capacity for _, width in decode_graph_shapes):
+            raise ValueError("CUDA graph table width exceeds cache capacity")
+        self._graphs = CudaGraphCache(
+            torch,
+            self.device,
+            decode_graph_shapes,
+            build=self._new_decode_graph_step,
+            synchronize_failure=self._synchronize_failed_eager_forward,
+        )
         # FA4's SM90 TMA path can load a complete physical page even when
         # ``seqused_k`` masks its unused tail.  Keep unwritten rows finite so a
         # masked PV operation can never encounter uninitialized NaN/Inf data.

@@ -344,7 +344,7 @@ def _workload_name(model_key: str, protocol: str, tensor_parallel_size: int) -> 
 
 def _new_cuda_runner(
     model_path: Path,
-    cache_parent_capacity: int,
+    cache_parent_capacity: int | None,
     tensor_parallel: TensorParallelContext,
     cuda_graph_decode_shapes: tuple[tuple[int, int], ...] = (),
 ) -> GptOssCudaRunner:
@@ -1102,16 +1102,25 @@ def _serve_http_rank(
         else None
     )
     install_flashinfer_hash_cache()
-    per_request_capacity = _required_parent_capacity(131072, 1)
     runner = _new_cuda_runner(
         model_path,
-        8 * per_request_capacity,
+        None,
         tensor_parallel,
         cuda_graph_decode_shapes=tuple(
             (batch_size, _required_history_width(131072, 1))
             for batch_size in range(1, 9)
         ),
     )
+    if rank == 0:
+        cache = runner.cache_capacity_plan
+        print(
+            "[http-startup] fungible KV cache "
+            f"parents={runner.cache_parent_capacity:,}; "
+            f"parent={cache.bytes_per_parent / 2**20:.2f} MiB; "
+            f"allocation={cache.allocation_bytes / 2**30:.2f} GiB; "
+            f"gpu_memory_utilization={cache.gpu_memory_utilization:.2f}",
+            flush=True,
+        )
     _capture_cuda_graphs(runner)
 
     if rank != 0:

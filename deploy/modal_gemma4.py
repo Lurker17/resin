@@ -103,27 +103,21 @@ def download_model() -> dict[str, Any]:
     }
 
 
-def _build_runtime(*, static_memory_fraction: float = 0.72):
+def _build_runtime(*, static_memory_fraction: float = 0.95):
     import torch
     from transformers import AutoProcessor
 
     from resin import Engine, SchedulerConfig
     from resin_models_cuda.gemma4 import Gemma4CudaRunner
-    from resin_models_cuda.gemma4.cuda import plan_gemma4_kv_capacity
 
     _require_model()
-    total_memory = torch.cuda.get_device_properties(0).total_memory
-    capacity = plan_gemma4_kv_capacity(
-        total_memory,
-        _checkpoint_size(),
-        static_memory_fraction,
-    )
     load_started = time.perf_counter()
     runner = Gemma4CudaRunner(
         MODEL_PATH,
-        cache_parent_capacity=capacity.parent_capacity,
         cuda_graph_decode_shapes=CUDA_GRAPH_DECODE_SHAPES,
+        static_memory_fraction=static_memory_fraction,
     )
+    capacity = runner.cache_capacity_plan
     processor = AutoProcessor.from_pretrained(
         MODEL_PATH,
         local_files_only=True,
@@ -147,6 +141,7 @@ def _build_runtime(*, static_memory_fraction: float = 0.72):
     report = {
         "load_s": time.perf_counter() - load_started,
         "capacity": asdict(capacity),
+        "checkpoint_bytes": _checkpoint_size(),
         "actual_model_bytes": runner.model_memory_bytes,
         "device": torch.cuda.get_device_name(0),
         "capability": torch.cuda.get_device_capability(0),
