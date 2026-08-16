@@ -412,7 +412,8 @@ image = (
     )
     .uv_sync(
         str(ROOT),
-        extras=["gpu", "dev"],
+        extras=["gpu"],
+        groups=["dev"],
         extra_options="--no-default-groups",
     )
     .uv_pip_install(

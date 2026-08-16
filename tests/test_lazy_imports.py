@@ -27,6 +27,7 @@ class TestImport:
         optional_dependencies = project["optional-dependencies"]
         assert "torch" not in optional_dependencies
         assert "demo" not in optional_dependencies
+        assert "dev" not in optional_dependencies
 
         gpu = optional_dependencies["gpu"]
         assert any(item.startswith("torch") for item in gpu)
@@ -37,6 +38,11 @@ class TestImport:
         assert not any(item.startswith("numpy") for item in gpu)
         assert not any(item.startswith("huggingface-hub") for item in gpu)
         assert not any(item.startswith("safetensors") for item in gpu)
+
+        workspace = tomllib.loads(Path("pyproject.toml").read_text())
+        dev = workspace["dependency-groups"]["dev"]
+        assert "resin-models-torch==0.1.0" in dev
+        assert any(item.startswith("tokenizers") for item in dev)
 
         cuda_models = tomllib.loads(Path("models/cuda/pyproject.toml").read_text())[
             "project"

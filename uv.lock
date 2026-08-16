@@ -2388,19 +2388,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-dev = [
-    { name = "hf-xet" },
-    { name = "huggingface-hub" },
-    { name = "maturin" },
-    { name = "modal" },
-    { name = "pytest" },
-    { name = "renderers" },
-    { name = "ruff" },
-    { name = "safetensors" },
-    { name = "tokenizers" },
-    { name = "torch" },
-    { name = "transformers" },
-]
 gpu = [
     { name = "apache-tvm-ffi" },
     { name = "cuda-tile" },
@@ -2415,6 +2402,22 @@ gpu = [
     { name = "triton" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "hf-xet" },
+    { name = "huggingface-hub" },
+    { name = "maturin" },
+    { name = "modal" },
+    { name = "pytest" },
+    { name = "renderers" },
+    { name = "resin-models-torch" },
+    { name = "ruff" },
+    { name = "safetensors" },
+    { name = "tokenizers" },
+    { name = "torch" },
+    { name = "transformers" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "apache-tvm-ffi", marker = "extra == 'gpu'", specifier = "==0.1.11" },
@@ -2422,26 +2425,31 @@ requires-dist = [
     { name = "cuda-tile", marker = "extra == 'gpu'", specifier = "==1.5.0" },
     { name = "flash-attn-4", marker = "extra == 'gpu'", specifier = "==4.0.0b26" },
     { name = "flashinfer-python", marker = "extra == 'gpu'", specifier = "==0.6.15.post1" },
-    { name = "hf-xet", marker = "extra == 'dev'", specifier = "==1.6.0" },
-    { name = "huggingface-hub", marker = "extra == 'dev'", specifier = "==1.27.0" },
-    { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.9,<2" },
-    { name = "modal", marker = "extra == 'dev'", specifier = ">=1.5.3" },
     { name = "nvidia-cutlass-dsl", marker = "extra == 'gpu'", specifier = "==4.6.2" },
     { name = "nvidia-cutlass-dsl-libs-base", marker = "extra == 'gpu'", specifier = "==4.6.2" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<9" },
     { name = "quack-kernels", marker = "extra == 'gpu'", specifier = "==0.6.4" },
-    { name = "renderers", marker = "extra == 'dev'", specifier = "==0.1.9" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.16,<0.17" },
-    { name = "safetensors", marker = "extra == 'dev'", specifier = "==0.8.0" },
     { name = "sgl-deep-gemm", marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = "==0.1.5.post2" },
     { name = "tilelang", marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = "==0.1.11" },
-    { name = "tokenizers", marker = "extra == 'dev'", specifier = "==0.22.2" },
-    { name = "torch", marker = "extra == 'dev'", specifier = "==2.13.0" },
     { name = "torch", marker = "extra == 'gpu'", specifier = "==2.13.0" },
-    { name = "transformers", marker = "extra == 'dev'", specifier = "==5.14.1" },
     { name = "triton", marker = "extra == 'gpu'", specifier = "==3.7.1" },
 ]
-provides-extras = ["gpu", "dev"]
+provides-extras = ["gpu"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "hf-xet", specifier = "==1.6.0" },
+    { name = "huggingface-hub", specifier = "==1.27.0" },
+    { name = "maturin", specifier = ">=1.9,<2" },
+    { name = "modal", specifier = ">=1.5.3" },
+    { name = "pytest", specifier = ">=8,<9" },
+    { name = "renderers", specifier = "==0.1.9" },
+    { name = "resin-models-torch", editable = "models/torch" },
+    { name = "ruff", specifier = ">=0.16,<0.17" },
+    { name = "safetensors", specifier = "==0.8.0" },
+    { name = "tokenizers", specifier = "==0.22.2" },
+    { name = "torch", specifier = "==2.13.0" },
+    { name = "transformers", specifier = "==5.14.1" },
+]
 
 [[package]]
 name = "resin-models-cuda"

@@ -39,7 +39,7 @@ The focused contracts are:
 Resin requires Python 3.11+ and Rust.
 
 ```bash
-uv sync --extra dev
+uv sync
 uv run maturin develop --generate-stubs
 uv run python scripts/normalize_stubs.py
 uv run ruff format resin/_resin.pyi
@@ -62,7 +62,7 @@ development dependencies first, then authenticate with Modal once if this is a
 new machine:
 
 ```bash
-uv sync --extra dev
+uv sync
 uv run maturin develop --generate-stubs
 uv run python scripts/normalize_stubs.py
 uv run ruff format resin/_resin.pyi

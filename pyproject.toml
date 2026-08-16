@@ -31,7 +31,10 @@ gpu = [
   "quack-kernels==0.6.4",
   "sgl-deep-gemm==0.1.5.post2; sys_platform == 'linux'",
 ]
+
+[dependency-groups]
 dev = [
+  "resin-models-torch==0.1.0",
   "maturin>=1.9,<2",
   "modal>=1.5.3",
   "pytest>=8,<9",
@@ -71,6 +74,9 @@ override-dependencies = [
   "nvidia-cutlass-dsl==4.6.2",
   "nvidia-cutlass-dsl-libs-base==4.6.2",
 ]
+
+[tool.uv.sources]
+resin-models-torch = { workspace = true }
 
 [tool.uv.workspace]
 members = ["models/*"]
