@@ -6,6 +6,7 @@ from resin_models_cuda.gemma4.config import Gemma4Nvfp4Config
 from resin_models_cuda.gemma4.model import (
     Gemma4Attention,
     RotaryEmbedding,
+    ScaledEmbedding,
     apply_rotary,
 )
 
@@ -67,3 +68,14 @@ def test_attention_packs_checkpoint_projections_after_loading() -> None:
     assert query.shape == (3, 2, 8)
     assert key.shape == value.shape == (3, 1, 8)
     assert not hasattr(attention, "q_proj")
+
+
+def test_embedding_scale_is_materialized_outside_forward() -> None:
+    embedding = ScaledEmbedding(_small_config())
+    embedding.materialize_scale()
+
+    output = embedding(torch.tensor([1, 2]))
+
+    assert embedding.scale_tensor is not None
+    assert output.shape == (2, 16)
+    assert "scale_tensor" not in embedding.state_dict()

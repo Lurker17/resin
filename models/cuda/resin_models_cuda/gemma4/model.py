@@ -153,9 +153,7 @@ class Gemma4Attention(nn.Module):
         )
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
-        self.v_norm = RMSNorm(
-            self.head_dim, config.rms_norm_eps, with_scale=False
-        )
+        self.v_norm = RMSNorm(self.head_dim, config.rms_norm_eps, with_scale=False)
         self.qkv_proj: nn.Linear | None = None
 
     def pack_projections(self) -> None:
@@ -228,9 +226,7 @@ class Gemma4DecoderLayer(nn.Module):
         self.self_attn = Gemma4Attention(config, layer_index)
         self.mlp = Gemma4MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.pre_feedforward_layernorm = RMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
@@ -251,10 +247,15 @@ class ScaledEmbedding(nn.Embedding):
             dtype=torch.bfloat16,
         )
         self.scale = math.sqrt(config.hidden_size)
+        self.register_buffer("scale_tensor", None, persistent=False)
+
+    def materialize_scale(self) -> None:
+        self.scale_tensor = self.weight.new_tensor(self.scale)
 
     def forward(self, token_ids: Tensor) -> Tensor:
-        scale = torch.tensor(self.scale, dtype=self.weight.dtype, device=self.weight.device)
-        return super().forward(token_ids) * scale
+        if self.scale_tensor is None:
+            raise RuntimeError("embedding scale must be materialized before inference")
+        return super().forward(token_ids) * self.scale_tensor
 
 
 class Gemma4TextModel(nn.Module):
@@ -312,6 +313,7 @@ class Gemma4ForConditionalGeneration(nn.Module):
         ).to(device)
 
     def prepare_attention(self) -> None:
+        self.language_model.embed_tokens.materialize_scale()
         for layer in self.language_model.layers:
             layer.self_attn.pack_projections()
 
