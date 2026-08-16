@@ -191,6 +191,7 @@ class Gemma4CudaRunner(SyncRunner):
         self._model.prepare_attention()
         prepare_nvfp4_modules(self._model, nvfp4_backend)
         self.nvfp4_backend = nvfp4_backend
+        self._graph_attention: dict[GraphShape, tuple[Any, Any]] = {}
 
         decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
         maximum_history_pages = (
@@ -673,6 +674,7 @@ class Gemma4CudaRunner(SyncRunner):
 
         local_wrapper, local = attention(_LOCAL_GRAPH_PAGE_CAPACITY, local=True)
         global_wrapper, global_ = attention(history_width, local=False)
+        self._graph_attention[shape] = (local_wrapper, global_wrapper)
         token_ids = empty(torch.int64, batch_size)
         positions = empty(torch.int64, batch_size)
         output_ids = empty(torch.int64, batch_size)
@@ -707,6 +709,50 @@ class Gemma4CudaRunner(SyncRunner):
         }
         inputs.update(self._sampler.graph_inputs(sampling))
         return CudaGraphStep(inputs=inputs, output=output_ids, launch=launch)
+
+    def _prepare_graph_attention(
+        self, shape: GraphShape, inputs: dict[str, object]
+    ) -> None:
+        local_wrapper, global_wrapper = self._graph_attention[shape]
+
+        def plan(wrapper, name: str, *, local: bool) -> None:
+            host_indptr = inputs[f"{name}_kv_indptr"]
+            page_count = int(np.asarray(host_indptr)[-1])
+            indptr = torch.as_tensor(host_indptr, dtype=torch.int32, device=self.device)
+            indices = torch.as_tensor(
+                inputs[f"{name}_page_indices"],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            last = torch.as_tensor(
+                inputs[f"{name}_last_page_lengths"],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            wrapper.plan(
+                indptr,
+                indices[:page_count],
+                last,
+                self.config.num_attention_heads,
+                (
+                    self.config.num_key_value_heads
+                    if local
+                    else self.config.num_global_key_value_heads
+                ),
+                self.config.head_dim if local else self.config.global_head_dim,
+                PAGE_SIZE,
+                pos_encoding_mode="NONE",
+                q_data_type=torch.bfloat16,
+                kv_data_type=self._cache.dtype,
+                o_data_type=torch.bfloat16,
+                sm_scale=1.0,
+                window_left=SLIDING_WINDOW - 1 if local else -1,
+                disable_split_kv=True,
+                non_blocking=False,
+            )
+
+        plan(local_wrapper, "local", local=True)
+        plan(global_wrapper, "global", local=False)
 
     @staticmethod
     def _graph_page_inputs(
@@ -800,6 +846,7 @@ class Gemma4CudaRunner(SyncRunner):
         for name, default in padding_defaults.items():
             sampling[name] = (*sampling[name], *((default,) * padding_rows))
         inputs.update(sampling)
+        self._prepare_graph_attention(shape, inputs)
         return self._graphs.run(shape, inputs)[:active_rows]
 
     @torch.inference_mode()
