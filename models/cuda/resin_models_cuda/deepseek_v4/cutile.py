@@ -26,7 +26,6 @@ _StaticLastTwoDims: TypeAlias = Annotated[
 _NEGATIVE = -3.402823466e38
 _MIN_WIDE_TILE_PROGRAMS = 64
 _INDEX_SCORE_TILE = 64
-_INDEX_SCORE_PROGRAMS = 64
 _CACHE_MAP_TILE = 64
 _DYNAMIC_SHAPE_ALIGNMENT = 16
 
@@ -456,70 +455,68 @@ def _index_score_kernel(
     layer_offset: int,
     weight_scale: float,
 ):
-    """Persistently score only the compressed history visible to each token."""
+    """Score one cache tile, skipping tiles beyond the runtime sequence."""
 
-    program = ct.bid(0)
+    tile = ct.bid(0)
     sequence = ct.bid(1)
     batch = ct.bid(2)
     token = ct.load(positions, (batch, sequence), shape=(1, 1)).item()
     complete = (token + 1) // ratio
-    tile_count = ct.assume_divisible_by(output.shape[-1], tile_width) // tile_width
-    q = ct.load(
-        query,
-        (batch, sequence, 0, 0),
-        shape=(1, 1, heads, head_dim),
-    ).reshape((heads, head_dim))
-    weights = (
-        ct.load(head_weights, (batch, sequence, 0), shape=(1, 1, heads))
-        .reshape((heads, 1))
-        .astype(ct.float32)
-    )
-    dimensions = ct.arange(head_dim, dtype=ct.int32).reshape((1, head_dim))
-    for tile in range(program, tile_count, _INDEX_SCORE_PROGRAMS):
-        columns = tile * tile_width + ct.arange(tile_width, dtype=ct.int32)
-        if tile * tile_width < complete:
-            if paged_cache:
-                logical_positions = columns * ratio
-                first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
-                page_columns = logical_positions // 128 - first
-                selected_pages = ct.gather(
-                    cache_pages,
-                    (
-                        ct.full((tile_width,), batch, dtype=ct.int32),
-                        page_columns,
-                    ),
-                    padding_value=0,
-                )
-                child_rows = parent_rows // packing
-                parents = (selected_pages - 1) // packing + 1
-                children = (selected_pages - 1) % packing
-                rows = (
-                    (parents * parent_rows + children * child_rows) * row_scale
-                    + layer_offset
-                    + (logical_positions % 128) // ratio
-                ).reshape((tile_width, 1))
-                keys = ct.gather(cache, (rows, dimensions), padding_value=0)
-            else:
-                keys = ct.load(
-                    cache, (batch, tile, 0), shape=(1, tile_width, head_dim)
-                ).reshape((tile_width, head_dim))
-            scores = ct.mma(
-                q,
-                keys.permute((1, 0)),
-                ct.full((heads, tile_width), 0.0, dtype=ct.float32),
+    columns = tile * tile_width + ct.arange(tile_width, dtype=ct.int32)
+    if tile * tile_width < complete:
+        q = ct.load(
+            query,
+            (batch, sequence, 0, 0),
+            shape=(1, 1, heads, head_dim),
+        ).reshape((heads, head_dim))
+        if paged_cache:
+            logical_positions = columns * ratio
+            first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
+            page_columns = logical_positions // 128 - first
+            selected_pages = ct.gather(
+                cache_pages,
+                (
+                    ct.full((tile_width,), batch, dtype=ct.int32),
+                    page_columns,
+                ),
+                padding_value=0,
             )
-            reduced = ct.sum(
-                ct.maximum(scores, 0.0) * weights * weight_scale,
-                axis=0,
-            )
-            reduced = ct.where(columns < complete, reduced, float("-inf"))
+            child_rows = parent_rows // packing
+            parents = (selected_pages - 1) // packing + 1
+            children = (selected_pages - 1) % packing
+            rows = (
+                (parents * parent_rows + children * child_rows) * row_scale
+                + layer_offset
+                + (logical_positions % 128) // ratio
+            ).reshape((tile_width, 1))
+            dimensions = ct.arange(head_dim, dtype=ct.int32).reshape((1, head_dim))
+            keys = ct.gather(cache, (rows, dimensions), padding_value=0)
         else:
-            reduced = ct.full((tile_width,), float("-inf"), dtype=ct.float32)
-        ct.store(
-            output,
-            (batch, sequence, tile),
-            reduced.reshape((1, 1, tile_width)).astype(output.dtype),
+            keys = ct.load(
+                cache, (batch, tile, 0), shape=(1, tile_width, head_dim)
+            ).reshape((tile_width, head_dim))
+        scores = ct.mma(
+            q,
+            keys.permute((1, 0)),
+            ct.full((heads, tile_width), 0.0, dtype=ct.float32),
         )
+        weights = (
+            ct.load(head_weights, (batch, sequence, 0), shape=(1, 1, heads))
+            .reshape((heads, 1))
+            .astype(ct.float32)
+        )
+        reduced = ct.sum(
+            ct.maximum(scores, 0.0) * weights * weight_scale,
+            axis=0,
+        )
+        reduced = ct.where(columns < complete, reduced, float("-inf"))
+    else:
+        reduced = ct.full((tile_width,), float("-inf"), dtype=ct.float32)
+    ct.store(
+        output,
+        (batch, sequence, tile),
+        reduced.reshape((1, 1, tile_width)).astype(output.dtype),
+    )
 
 
 def index_scores(
@@ -560,11 +557,7 @@ def index_scores(
         raise ValueError("index score cache mapping has incompatible geometry")
     ct.launch(
         torch.cuda.current_stream(query.device),
-        (
-            min(width // _INDEX_SCORE_TILE, _INDEX_SCORE_PROGRAMS),
-            block_length,
-            batch_size,
-        ),
+        (width // _INDEX_SCORE_TILE, block_length, batch_size),
         _index_score_kernel,
         (
             query,
