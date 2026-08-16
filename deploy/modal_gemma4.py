@@ -297,6 +297,7 @@ def smoke_test(max_new_tokens: int = 16) -> dict[str, Any]:
                 "mean_tpot_ms": sum(decode_ms) / len(decode_ms) if decode_ms else 0.0,
                 "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                 "prefix_cache": engine.prefix_cache_stats,
+                "cuda_graphs": runner.cuda_graph_stats,
             }
         )
         return report
@@ -341,7 +342,7 @@ def shape_profile() -> dict[str, Any]:
     single_use_containers=True,
 )
 def perfetto_trace(max_new_tokens: int = 5, *, detailed: bool = True) -> dict[str, Any]:
-    torch, _, processor, engine, report = _build_runtime()
+    torch, runner, processor, engine, report = _build_runtime()
     try:
         # Populate every lazy kernel cache before profiling, then force the
         # measured request to recompute its complete multimodal prefix.
@@ -387,6 +388,7 @@ def perfetto_trace(max_new_tokens: int = 5, *, detailed: bool = True) -> dict[st
                 "output_tokens": token_ids,
                 "step_ms": steps,
                 "cuda_table": cuda_table,
+                "cuda_graphs": runner.cuda_graph_stats,
             }
         )
         return report
