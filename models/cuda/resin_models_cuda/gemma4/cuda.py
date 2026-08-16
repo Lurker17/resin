@@ -18,6 +18,14 @@ from resin import (
     ResourceBinding,
     RunnerConfig,
 )
+from resin.backend.cuda.graphs import (
+    CudaGraphCache,
+    CudaGraphStats,
+    CudaGraphStep,
+    GraphInputError,
+    GraphShape,
+    graph_shapes,
+)
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.loading import default_device
 from resin.backend.resources import CachePoolBinding
@@ -45,6 +53,9 @@ if TYPE_CHECKING:
     from resin import BatchPlan
 
 _WORKSPACE_BYTES = 128 * 1024 * 1024
+_LOCAL_GRAPH_PAGE_CAPACITY = (
+    1 + (WINDOW_RETENTION_TOKENS - 1 + PAGE_SIZE - 1) // PAGE_SIZE
+)
 
 
 def _select_nvfp4_backend(requested: str, cudnn_version: int | None) -> str:
@@ -78,7 +89,9 @@ def plan_gemma4_kv_capacity(
     bytes_per_parent = 2 * 50 * PAGE_SIZE * 16 * 256
     budget = int(total_memory_bytes * static_memory_fraction)
     available = budget - model_memory_bytes - workspace_bytes
-    parent_capacity = available // bytes_per_parent
+    # Parent zero is a permanent graph-only null page. Native Engine page IDs
+    # remain positive and map directly into the remaining physical slab.
+    parent_capacity = available // bytes_per_parent - 1
     if parent_capacity <= 0:
         raise ValueError("GPU memory budget leaves no room for Gemma 4 KV cache")
     return Gemma4KvCapacityPlan(
@@ -87,7 +100,7 @@ def plan_gemma4_kv_capacity(
         static_memory_fraction=static_memory_fraction,
         bytes_per_parent=bytes_per_parent,
         parent_capacity=parent_capacity,
-        allocation_bytes=parent_capacity * bytes_per_parent,
+        allocation_bytes=(parent_capacity + 1) * bytes_per_parent,
     )
 
 
@@ -95,23 +108,22 @@ class _Gemma4KvArena:
     def __init__(self, torch_module: Any, device, config, parent_capacity: int) -> None:
         self.dtype = torch_module.float8_e4m3fn
         self.parent_capacity = parent_capacity
+        physical_parent_capacity = parent_capacity + 1
         local_shape = (
-            parent_capacity,
+            physical_parent_capacity,
             2,
             config.local_layer_count,
             PAGE_SIZE,
             config.num_key_value_heads,
             config.head_dim,
         )
-        self.storage = torch_module.empty(
-            local_shape, dtype=self.dtype, device=device
-        )
+        self.storage = torch_module.empty(local_shape, dtype=self.dtype, device=device)
         local = self.storage.permute(1, 2, 0, 3, 4, 5)
         self.local_keys, self.local_values = local[0], local[1]
 
         packing = config.history_blocks_per_parent
         global_shape = (
-            parent_capacity * packing,
+            physical_parent_capacity * packing,
             2,
             config.global_layer_count,
             PAGE_SIZE,
@@ -155,6 +167,7 @@ class Gemma4CudaRunner(SyncRunner):
         revision: str | None = None,
         device: str | None = None,
         nvfp4_backend: str = "auto",
+        cuda_graph_decode_shapes: object | None = None,
     ) -> None:
         if cache_parent_capacity <= 0:
             raise ValueError("cache_parent_capacity must be positive")
@@ -178,6 +191,22 @@ class Gemma4CudaRunner(SyncRunner):
         self._model.prepare_attention()
         prepare_nvfp4_modules(self._model, nvfp4_backend)
         self.nvfp4_backend = nvfp4_backend
+
+        decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
+        maximum_history_pages = (
+            self.config.max_position_embeddings + PAGE_SIZE - 1
+        ) // PAGE_SIZE
+        if any(batch > 8 for batch, _ in decode_graph_shapes):
+            raise ValueError("Gemma 4 CUDA graph batch capacity exceeds 8")
+        if any(width > maximum_history_pages for _, width in decode_graph_shapes):
+            raise ValueError("Gemma 4 CUDA graph page width exceeds context length")
+        self._graphs = CudaGraphCache(
+            torch,
+            self.device,
+            decode_graph_shapes,
+            build=self._new_decode_graph_step,
+            synchronize_failure=lambda: torch.cuda.synchronize(self.device),
+        )
 
         self.cache_parent_capacity = cache_parent_capacity
         self.cache_layout = CacheLayout(
@@ -216,6 +245,10 @@ class Gemma4CudaRunner(SyncRunner):
     def model_memory_bytes(self) -> int:
         tensors = list(self._model.parameters()) + list(self._model.buffers())
         return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+    @property
+    def cuda_graph_stats(self) -> CudaGraphStats:
+        return self._graphs.stats
 
     def _build_attention_wrappers(self) -> None:
         from flashinfer import (
@@ -357,9 +390,7 @@ class Gemma4CudaRunner(SyncRunner):
             )
             video = (
                 self._model.get_video_features(
-                    media.pixel_values_videos.to(
-                        self.device, dtype=torch.bfloat16
-                    ),
+                    media.pixel_values_videos.to(self.device, dtype=torch.bfloat16),
                     media.video_position_ids.to(self.device),
                 )
                 if media.pixel_values_videos is not None
@@ -424,7 +455,9 @@ class Gemma4CudaRunner(SyncRunner):
                 if absolute < len(media.token_ids) and (
                     int(batch.token_ids[flat_index]) != media.token_ids[absolute]
                 ):
-                    raise ValueError("scheduled token does not match Gemma4Media prompt")
+                    raise ValueError(
+                        "scheduled token does not match Gemma4Media prompt"
+                    )
             vision_positions = set(media.image_positions + media.video_positions)
             if not any(int(position) in vision_positions for position in positions):
                 continue
@@ -478,28 +511,15 @@ class Gemma4CudaRunner(SyncRunner):
             np.concatenate(masks), dtype=torch.bool, device=self.device
         )
 
-    @torch.inference_mode()
-    def forward(self, plan: BatchPlan) -> list[int]:
-        batch = build_gemma4_batch_plan(
-            plan,
-            history_blocks_per_parent=self.config.history_blocks_per_parent,
-            parent_capacity=self.cache_parent_capacity,
-        )
-        token_ids = torch.as_tensor(
-            batch.token_ids, dtype=torch.int64, device=self.device
-        )
-        positions = torch.as_tensor(
-            batch.positions, dtype=torch.int64, device=self.device
-        )
-        hidden = self._model.embed_tokens(token_ids)
-        features = self._merge_media_embeddings(plan, batch, hidden)
-        local_mask = self._local_custom_mask(batch, features)
-        local = self._device_plan(batch.local)
-        global_ = self._device_plan(batch.global_)
-        local_wrapper, global_wrapper = self._plan_attention(
-            batch, local, global_, local_mask
-        )
-
+    def _run_transformer(
+        self,
+        hidden: Tensor,
+        positions: Tensor,
+        local: _DevicePagedPlan,
+        global_: _DevicePagedPlan,
+        local_wrapper: Any,
+        global_wrapper: Any,
+    ) -> Tensor:
         rotary = self._model.language_model.rotary_emb
         embeddings = {
             kind: rotary(positions, kind, hidden.dtype)
@@ -511,9 +531,7 @@ class Gemma4CudaRunner(SyncRunner):
             residual = hidden
             normalized = layer.input_layernorm(hidden)
             cos, sin = embeddings[layer.self_attn.layer_type]
-            query, key, value = layer.self_attn.project_qkv(
-                normalized, cos, sin
-            )
+            query, key, value = layer.self_attn.project_qkv(normalized, cos, sin)
             if layer.self_attn.layer_type == SLIDING_ATTENTION:
                 keys = self._cache.local_keys[local_layer]
                 values = self._cache.local_values[local_layer]
@@ -540,7 +558,287 @@ class Gemma4CudaRunner(SyncRunner):
             hidden = residual + layer.post_feedforward_layernorm(hidden)
             hidden *= layer.layer_scalar
 
-        hidden = self._model.language_model.norm(hidden)
+        return self._model.language_model.norm(hidden)
+
+    @staticmethod
+    def _graph_capture_inputs(
+        shape: GraphShape, vocab_size: int = 262_208
+    ) -> dict[str, tuple]:
+        """Synthetic decode rows backed only by graph-reserved parent zero."""
+
+        batch_size, history_width = shape
+        rows = tuple(range(batch_size))
+        zeros = (0,) * batch_size
+        inputs = {
+            "token_ids": zeros,
+            "positions": zeros,
+            "local_kv_indptr": tuple(range(batch_size + 1)),
+            "local_page_indices": (0,) * (batch_size * _LOCAL_GRAPH_PAGE_CAPACITY),
+            "local_last_page_lengths": (1,) * batch_size,
+            "local_append_pages": zeros,
+            "local_append_offsets": rows,
+            "global_kv_indptr": tuple(range(batch_size + 1)),
+            "global_page_indices": (0,) * (batch_size * history_width),
+            "global_last_page_lengths": (1,) * batch_size,
+            "global_append_pages": zeros,
+            "global_append_offsets": rows,
+            "sampling_temperatures": (1.0,) * batch_size,
+            "sampling_top_ps": (1.0,) * batch_size,
+            "sampling_top_ks": (vocab_size,) * batch_size,
+            "sampling_seeds": zeros,
+            "sampling_offsets": zeros,
+            "sampling_stochastic_mask": (False,) * batch_size,
+        }
+        return inputs
+
+    def capture_cuda_graphs(self) -> CudaGraphStats:
+        """Capture configured decode batch buckets before serving requests."""
+
+        captured = set(self._graphs.stats["captured_shapes"])
+        for shape in self._graphs.shapes:
+            if shape not in captured:
+                self._graphs.capture(
+                    shape, self._graph_capture_inputs(shape, self.config.vocab_size)
+                )
+        if self._graphs.shapes:
+            self._cache.storage[0].zero_()
+            torch.cuda.synchronize(self.device)
+        return self._graphs.stats
+
+    def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
+        from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+
+        batch_size, history_width = shape
+
+        def empty(dtype, *dimensions):
+            return torch.empty(dimensions, dtype=dtype, device=self.device)
+
+        def attention(width: int, *, local: bool):
+            workspace = torch.zeros(
+                _WORKSPACE_BYTES, dtype=torch.uint8, device=self.device
+            )
+            kv_indptr = empty(torch.int32, batch_size + 1)
+            page_indices = empty(torch.int32, batch_size * width)
+            last_page_lengths = empty(torch.int32, batch_size)
+            append_pages = empty(torch.int64, batch_size)
+            append_offsets = empty(torch.int64, batch_size)
+            wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                workspace,
+                "NHD",
+                use_cuda_graph=True,
+                paged_kv_indptr_buffer=kv_indptr,
+                paged_kv_indices_buffer=page_indices,
+                paged_kv_last_page_len_buffer=last_page_lengths,
+                backend="auto",
+            )
+            initial_indptr = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=self.device
+            )
+            initial_indices = torch.zeros(
+                batch_size, dtype=torch.int32, device=self.device
+            )
+            initial_last = torch.ones(batch_size, dtype=torch.int32, device=self.device)
+            wrapper.plan(
+                initial_indptr,
+                initial_indices,
+                initial_last,
+                self.config.num_attention_heads,
+                (
+                    self.config.num_key_value_heads
+                    if local
+                    else self.config.num_global_key_value_heads
+                ),
+                self.config.head_dim if local else self.config.global_head_dim,
+                PAGE_SIZE,
+                pos_encoding_mode="NONE",
+                q_data_type=torch.bfloat16,
+                kv_data_type=self._cache.dtype,
+                o_data_type=torch.bfloat16,
+                sm_scale=1.0,
+                window_left=SLIDING_WINDOW - 1 if local else -1,
+                disable_split_kv=True,
+                non_blocking=False,
+            )
+            plan = _DevicePagedPlan(
+                qo_indptr=torch.arange(
+                    batch_size + 1, dtype=torch.int32, device=self.device
+                ),
+                kv_indptr=kv_indptr,
+                page_indices=page_indices,
+                last_page_lengths=last_page_lengths,
+                append_pages=append_pages,
+                append_offsets=append_offsets,
+            )
+            return wrapper, plan
+
+        local_wrapper, local = attention(_LOCAL_GRAPH_PAGE_CAPACITY, local=True)
+        global_wrapper, global_ = attention(history_width, local=False)
+        token_ids = empty(torch.int64, batch_size)
+        positions = empty(torch.int64, batch_size)
+        output_ids = empty(torch.int64, batch_size)
+        sampling = self._sampler.empty(batch_size, self.device)
+
+        def launch() -> None:
+            hidden = self._model.embed_tokens(token_ids)
+            hidden = self._run_transformer(
+                hidden,
+                positions,
+                local,
+                global_,
+                local_wrapper,
+                global_wrapper,
+            )
+            logits = self._model.logits(hidden)
+            self._sampler.sample_tensors(logits, sampling, out=output_ids)
+
+        inputs = {
+            "token_ids": token_ids,
+            "positions": positions,
+            "local_kv_indptr": local.kv_indptr,
+            "local_page_indices": local.page_indices,
+            "local_last_page_lengths": local.last_page_lengths,
+            "local_append_pages": local.append_pages,
+            "local_append_offsets": local.append_offsets,
+            "global_kv_indptr": global_.kv_indptr,
+            "global_page_indices": global_.page_indices,
+            "global_last_page_lengths": global_.last_page_lengths,
+            "global_append_pages": global_.append_pages,
+            "global_append_offsets": global_.append_offsets,
+        }
+        inputs.update(self._sampler.graph_inputs(sampling))
+        return CudaGraphStep(inputs=inputs, output=output_ids, launch=launch)
+
+    @staticmethod
+    def _graph_page_inputs(
+        name: str,
+        plan: PagedAttentionPlan,
+        *,
+        active_rows: int,
+        graph_rows: int,
+        width: int,
+    ) -> dict[str, object]:
+        row_widths = np.diff(plan.kv_indptr)
+        if len(row_widths) != active_rows or np.any(row_widths > width):
+            raise GraphInputError(f"{name} page table exceeds CUDA graph shape")
+        indices = np.zeros(graph_rows * width, dtype=np.int32)
+        indptr = np.zeros(graph_rows + 1, dtype=np.int32)
+        cursor = 0
+        for row in range(graph_rows):
+            if row < active_rows:
+                start, end = map(int, plan.kv_indptr[row : row + 2])
+                count = end - start
+                indices[cursor : cursor + count] = plan.page_indices[start:end]
+            else:
+                count = 1
+            cursor += count
+            indptr[row + 1] = cursor
+        last_page_lengths = np.ones(graph_rows, dtype=np.int32)
+        last_page_lengths[:active_rows] = plan.last_page_lengths
+        append_pages = np.zeros(graph_rows, dtype=np.int64)
+        append_offsets = np.arange(graph_rows, dtype=np.int64)
+        append_pages[:active_rows] = plan.append_slots // PAGE_SIZE
+        append_offsets[:active_rows] = plan.append_slots % PAGE_SIZE
+        return {
+            f"{name}_kv_indptr": indptr,
+            f"{name}_page_indices": indices,
+            f"{name}_last_page_lengths": last_page_lengths,
+            f"{name}_append_pages": append_pages,
+            f"{name}_append_offsets": append_offsets,
+        }
+
+    def _graph_forward(
+        self, native: BatchPlan, batch: Gemma4BatchPlan
+    ) -> list[int] | None:
+        if not self._graphs.shapes:
+            return None
+        active_rows = native.num_sequences
+        history_width = int(np.diff(batch.global_.kv_indptr).max())
+        local_width = int(np.diff(batch.local.kv_indptr).max())
+        if local_width > _LOCAL_GRAPH_PAGE_CAPACITY:
+            raise GraphInputError("local page table exceeds CUDA graph shape")
+        shape = self._graphs.match(
+            lambda candidate: (
+                candidate[0] >= active_rows and candidate[1] >= history_width
+            )
+        )
+        if shape is None:
+            self._graphs.fallback("shape")
+            return None
+        graph_rows, graph_history_width = shape
+        padding_rows = graph_rows - active_rows
+        inputs: dict[str, object] = {
+            "token_ids": np.pad(batch.token_ids, (0, padding_rows)),
+            "positions": np.pad(batch.positions, (0, padding_rows)),
+        }
+        inputs.update(
+            self._graph_page_inputs(
+                "local",
+                batch.local,
+                active_rows=active_rows,
+                graph_rows=graph_rows,
+                width=_LOCAL_GRAPH_PAGE_CAPACITY,
+            )
+        )
+        inputs.update(
+            self._graph_page_inputs(
+                "global",
+                batch.global_,
+                active_rows=active_rows,
+                graph_rows=graph_rows,
+                width=graph_history_width,
+            )
+        )
+        sampling = self._sampler.host_inputs(native, self.config.vocab_size)
+        padding_defaults = {
+            "sampling_temperatures": 1.0,
+            "sampling_top_ps": 1.0,
+            "sampling_top_ks": self.config.vocab_size,
+            "sampling_seeds": 0,
+            "sampling_offsets": 0,
+            "sampling_stochastic_mask": False,
+        }
+        for name, default in padding_defaults.items():
+            sampling[name] = (*sampling[name], *((default,) * padding_rows))
+        inputs.update(sampling)
+        return self._graphs.run(shape, inputs)[:active_rows]
+
+    @torch.inference_mode()
+    def forward(self, plan: BatchPlan) -> list[int]:
+        self._graphs.check()
+        batch = build_gemma4_batch_plan(
+            plan,
+            history_blocks_per_parent=self.config.history_blocks_per_parent,
+            parent_capacity=self.cache_parent_capacity,
+        )
+        if batch.phase == BatchPhase.DECODE:
+            graph_output = self._graph_forward(plan, batch)
+            if graph_output is not None:
+                return graph_output
+        elif self._graphs.shapes:
+            self._graphs.fallback("prefill")
+        token_ids = torch.as_tensor(
+            batch.token_ids, dtype=torch.int64, device=self.device
+        )
+        positions = torch.as_tensor(
+            batch.positions, dtype=torch.int64, device=self.device
+        )
+        hidden = self._model.embed_tokens(token_ids)
+        features = self._merge_media_embeddings(plan, batch, hidden)
+        local_mask = self._local_custom_mask(batch, features)
+        local = self._device_plan(batch.local)
+        global_ = self._device_plan(batch.global_)
+        local_wrapper, global_wrapper = self._plan_attention(
+            batch, local, global_, local_mask
+        )
+
+        hidden = self._run_transformer(
+            hidden,
+            positions,
+            local,
+            global_,
+            local_wrapper,
+            global_wrapper,
+        )
         last = torch.as_tensor(
             batch.last_token_indices, dtype=torch.int64, device=self.device
         )

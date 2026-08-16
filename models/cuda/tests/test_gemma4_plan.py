@@ -11,7 +11,7 @@ def _append_metadata(pages: list[int], token_count: int) -> tuple[list[int], lis
     )
 
 
-def test_gemma4_plan_maps_group_specific_positive_ids_to_zero_based_slabs() -> None:
+def test_gemma4_plan_preserves_positive_ids_after_graph_null_page() -> None:
     tokens = list(range(70))
     history_pages = [11, 12]
     local_pages = [1, 2]
@@ -46,9 +46,9 @@ def test_gemma4_plan_maps_group_specific_positive_ids_to_zero_based_slabs() -> N
         plan, history_blocks_per_parent=10, parent_capacity=2
     )
 
-    assert batch.global_.page_indices.tolist() == [10, 11]
-    assert batch.local.page_indices.tolist() == [0, 1]
-    assert batch.global_.append_slots[[0, 64, 69]].tolist() == [640, 704, 709]
-    assert batch.local.append_slots[[0, 64, 69]].tolist() == [0, 64, 69]
+    assert batch.global_.page_indices.tolist() == [11, 12]
+    assert batch.local.page_indices.tolist() == [1, 2]
+    assert batch.global_.append_slots[[0, 64, 69]].tolist() == [704, 768, 773]
+    assert batch.local.append_slots[[0, 64, 69]].tolist() == [64, 128, 133]
     assert batch.global_.last_page_lengths.tolist() == [6]
     assert batch.last_token_indices.tolist() == [69]

@@ -32,6 +32,7 @@ MODEL_FILES = (
     "tokenizer.model",
     "tokenizer_config.json",
 )
+CUDA_GRAPH_DECODE_SHAPES = tuple((batch_size, 4096) for batch_size in (1, 2, 4, 8))
 
 image = build_modal_image(
     ROOT,
@@ -55,7 +56,9 @@ def _inventory() -> dict[str, int]:
     config = MODEL_PATH / "config.json"
     weights = sorted(MODEL_PATH.glob("model*.safetensors"))
     required = [index, config, *weights]
-    if not weights or any(not path.is_file() or path.stat().st_size <= 0 for path in required):
+    if not weights or any(
+        not path.is_file() or path.stat().st_size <= 0 for path in required
+    ):
         raise RuntimeError("the pinned Gemma 4 checkpoint is incomplete")
     return {path.name: path.stat().st_size for path in required}
 
@@ -119,12 +122,16 @@ def _build_runtime(*, static_memory_fraction: float = 0.72):
     runner = Gemma4CudaRunner(
         MODEL_PATH,
         cache_parent_capacity=capacity.parent_capacity,
+        cuda_graph_decode_shapes=CUDA_GRAPH_DECODE_SHAPES,
     )
     processor = AutoProcessor.from_pretrained(
         MODEL_PATH,
         local_files_only=True,
         trust_remote_code=False,
     )
+    graph_started = time.perf_counter()
+    graph_stats = runner.capture_cuda_graphs()
+    graph_capture_s = time.perf_counter() - graph_started
     engine = Engine(
         runner,
         max_running_requests=8,
@@ -143,6 +150,8 @@ def _build_runtime(*, static_memory_fraction: float = 0.72):
         "actual_model_bytes": runner.model_memory_bytes,
         "device": torch.cuda.get_device_name(0),
         "capability": torch.cuda.get_device_capability(0),
+        "cuda_graph_capture_s": graph_capture_s,
+        "cuda_graphs": graph_stats,
     }
     return torch, runner, processor, engine, report
 
@@ -184,9 +193,7 @@ def _generate(
         if profile_steps:
             import torch
 
-            with torch.profiler.record_function(
-                f"resin.engine.step.{len(steps)}"
-            ):
+            with torch.profiler.record_function(f"resin.engine.step.{len(steps)}"):
                 events = engine.step()
         else:
             events = engine.step()
@@ -200,7 +207,9 @@ def _generate(
     return media, token_ids, steps
 
 
-def _text_batch(engine, processor, batch_size: int, prompt_words: int) -> dict[str, Any]:
+def _text_batch(
+    engine, processor, batch_size: int, prompt_words: int
+) -> dict[str, Any]:
     from resin import SamplingParams
     from resin_models_cuda.gemma4 import Gemma4Media
 
@@ -336,7 +345,7 @@ def shape_profile() -> dict[str, Any]:
     timeout=8 * 60 * 60,
     single_use_containers=True,
 )
-def perfetto_trace(max_new_tokens: int = 5) -> dict[str, Any]:
+def perfetto_trace(max_new_tokens: int = 5, *, detailed: bool = True) -> dict[str, Any]:
     torch, _, processor, engine, report = _build_runtime()
     try:
         # Populate every lazy kernel cache before profiling, then force the
@@ -345,7 +354,8 @@ def perfetto_trace(max_new_tokens: int = 5) -> dict[str, Any]:
         engine.clear_prefix_cache()
         torch.cuda.synchronize()
 
-        trace_name = f"gemma4-sm120-{int(time.time())}.json.gz"
+        detail = "detailed" if detailed else "low-overhead"
+        trace_name = f"gemma4-sm120-{detail}-{int(time.time())}.json.gz"
         trace_path = Path(PROFILE_MOUNT) / trace_name
         activities = [
             torch.profiler.ProfilerActivity.CPU,
@@ -353,9 +363,9 @@ def perfetto_trace(max_new_tokens: int = 5) -> dict[str, Any]:
         ]
         with torch.profiler.profile(
             activities=activities,
-            record_shapes=True,
-            profile_memory=True,
-            with_flops=True,
+            record_shapes=detailed,
+            profile_memory=detailed,
+            with_flops=detailed,
         ) as profile:
             with torch.profiler.record_function("resin.gemma4.multimodal_request"):
                 media, token_ids, steps = _generate(
@@ -441,6 +451,14 @@ def main(mode: str = "smoke", max_new_tokens: int = 16) -> None:
     elif mode == "profile":
         print(json.dumps(shape_profile.remote(), indent=2))
     elif mode == "trace":
-        print(json.dumps(perfetto_trace.remote(max_new_tokens), indent=2))
+        print(
+            json.dumps(perfetto_trace.remote(max_new_tokens, detailed=True), indent=2)
+        )
+    elif mode == "trace-lite":
+        print(
+            json.dumps(perfetto_trace.remote(max_new_tokens, detailed=False), indent=2)
+        )
     else:
-        raise ValueError("mode must be 'download', 'smoke', 'profile', or 'trace'")
+        raise ValueError(
+            "mode must be 'download', 'smoke', 'profile', 'trace', or 'trace-lite'"
+        )

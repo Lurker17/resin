@@ -89,7 +89,10 @@ class _CacheGroup:
             or np.any(group.append_offsets >= PAGE_SIZE)
             or (
                 maximum is not None
-                and (np.any(group.pages > maximum) or np.any(group.append_pages > maximum))
+                and (
+                    np.any(group.pages > maximum)
+                    or np.any(group.append_pages > maximum)
+                )
             )
         ):
             raise ValueError("cache group addresses outside its physical slab")
@@ -130,7 +133,7 @@ def _paged_plan(
             raise ValueError("cache append targets do not match scheduled positions")
         first_position = first_block * PAGE_SIZE
         kv_length = post_length - first_position
-        page_rows.append(pages - 1)
+        page_rows.append(pages)
         last_page_lengths.append((post_length - 1) % PAGE_SIZE + 1)
         first_positions.append(first_position)
         kv_lengths.append(kv_length)
@@ -140,11 +143,13 @@ def _paged_plan(
     return PagedAttentionPlan(
         qo_indptr=token_indptr,
         kv_indptr=kv_indptr,
-        page_indices=np.concatenate(page_rows).astype(np.int32, copy=False),
+        # Physical parent zero is reserved for inactive CUDA-graph rows, so
+        # positive Engine page IDs map directly into the device slabs.
+        page_indices=(np.concatenate(page_rows)).astype(np.int32, copy=False),
         last_page_lengths=np.asarray(last_page_lengths, dtype=np.int32),
-        append_slots=(
-            (group.append_pages - 1) * PAGE_SIZE + group.append_offsets
-        ).astype(np.int64, copy=False),
+        append_slots=(group.append_pages * PAGE_SIZE + group.append_offsets).astype(
+            np.int64, copy=False
+        ),
         first_token_positions=tuple(first_positions),
         kv_lengths=tuple(kv_lengths),
     )
