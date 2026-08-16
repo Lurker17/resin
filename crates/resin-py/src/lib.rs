@@ -1166,25 +1166,41 @@ impl Engine {
             return Err(PyValueError::new_err("token_ids must be non-empty"));
         }
         let cache_prompt = match media.as_ref() {
-            Some(media) => match media.getattr(py, "cache_token_ids") {
-                Ok(identity) => {
-                    let identity: Vec<u32> = identity.extract(py)?;
-                    if identity.len() != token_ids.len() {
-                        return Err(PyValueError::new_err(
-                            "media cache_token_ids must match token_ids length",
-                        ));
+            Some(media) => match media.getattr(py, "cache_key") {
+                Ok(identity) => Some(identity.extract(py)?),
+                Err(error) if error.is_instance_of::<PyAttributeError>(py) => {
+                    match media.getattr(py, "cache_token_ids") {
+                        Ok(identity) => Some(identity.extract(py)?),
+                        Err(error) if error.is_instance_of::<PyAttributeError>(py) => None,
+                        Err(error) => return Err(error),
                     }
-                    Some(identity)
                 }
-                Err(error) if error.is_instance_of::<PyAttributeError>(py) => None,
                 Err(error) => return Err(error),
             },
             None => None,
         };
+        if cache_prompt
+            .as_ref()
+            .is_some_and(|identity| identity.len() != token_ids.len())
+        {
+            return Err(PyValueError::new_err(
+                "media cache_key must match token_ids length",
+            ));
+        }
         let atomic_prefill_spans = match media.as_ref() {
-            Some(media) => match media.getattr(py, "prefill_atomic_spans") {
-                Ok(spans) => spans.extract::<Vec<(u32, u32)>>(py)?,
-                Err(error) if error.is_instance_of::<PyAttributeError>(py) => Vec::new(),
+            Some(media) => match media.getattr(py, "token_spans") {
+                Ok(spans) => spans
+                    .extract::<Vec<(u32, u32)>>(py)?
+                    .into_iter()
+                    .map(|(position, length)| (position, position.saturating_add(length)))
+                    .collect(),
+                Err(error) if error.is_instance_of::<PyAttributeError>(py) => {
+                    match media.getattr(py, "prefill_atomic_spans") {
+                        Ok(spans) => spans.extract::<Vec<(u32, u32)>>(py)?,
+                        Err(error) if error.is_instance_of::<PyAttributeError>(py) => Vec::new(),
+                        Err(error) => return Err(error),
+                    }
+                }
                 Err(error) => return Err(error),
             },
             None => Vec::new(),
@@ -1207,7 +1223,7 @@ impl Engine {
                 || end - start > atomic_limit
             {
                 return Err(PyValueError::new_err(
-                    "media prefill_atomic_spans must be sorted, disjoint, within the prompt, and fit one prefill row",
+                    "media token_spans must be sorted, disjoint, within the prompt, and fit one prefill row",
                 ));
             }
             previous_end = end;

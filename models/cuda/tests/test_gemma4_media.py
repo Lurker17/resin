@@ -7,7 +7,7 @@ import pytest
 import torch
 from PIL import Image
 
-from resin import Engine
+from resin import Engine, MediaInput, MediaTokenSpan
 from resin_models_cuda.gemma4.media import Gemma4Media, decode_image
 
 
@@ -40,17 +40,22 @@ def test_media_owns_processor_tensors_and_absolute_placeholder_mapping() -> None
     media = Gemma4Media.from_processor_output(output)
     pixels.zero_()
 
+    assert isinstance(media, MediaInput)
     assert media.token_ids == (2, 8, 8, 3, 9, 9)
     assert media.image_positions == (1, 2)
     assert media.video_positions == (4, 5)
     assert media.block_ids == (-1, 0, 0, -1, 1, 1)
-    assert media.prefill_atomic_spans == ((1, 3), (4, 6))
+    assert media.token_spans == (
+        MediaTokenSpan(position=1, length=2),
+        MediaTokenSpan(position=4, length=2),
+    )
     assert media.pixel_values.sum().item() == 108
     media.validate_placeholder_tokens(image_token_id=8, video_token_id=9)
     assert len(media.digest) == 64
-    assert len(media.cache_token_ids) == len(media.token_ids)
-    assert media.cache_token_ids[0] == media.token_ids[0]
-    assert media.cache_token_ids[1] != media.token_ids[1]
+    assert len(media.cache_key) == len(media.token_ids)
+    assert isinstance(hash(media.cache_key), int)
+    assert media.cache_key[0] == media.token_ids[0]
+    assert media.cache_key[1] != media.token_ids[1]
 
 
 def test_canonical_normalized_arrays_are_copied_before_processing() -> None:

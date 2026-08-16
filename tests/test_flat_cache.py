@@ -234,7 +234,7 @@ class TestFlatCacheEngine:
             token_ids = [1, 2, 3, 4]
 
             def __init__(self, identity: list[int]) -> None:
-                self.cache_token_ids = identity
+                self.cache_key = identity
 
         layout = CacheLayout(4, [CacheGroupLayout(2)])
         runner = RecordingCachedRunner(layout)
@@ -260,8 +260,8 @@ class TestFlatCacheEngine:
     def test_media_atomic_prefill_span_is_not_cut_at_cache_alignment(self) -> None:
         class Media:
             token_ids = [1, 2, 3, 4, 5, 6]
-            cache_token_ids = [1, 20, 30, 40, 50, 6]
-            prefill_atomic_spans = [(1, 5)]
+            cache_key = (1, 20, 30, 40, 50, 6)
+            token_spans = ((1, 4),)
 
         runner = RecordingCachedRunner(CacheLayout(4, [CacheGroupLayout(4)]))
         engine = Engine(runner, prefix_cache=True)

@@ -11,6 +11,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from resin.protocols import MediaTokenSpan
+
 _IMAGE_MIME_TYPES = {
     "image/avif",
     "image/bmp",
@@ -63,7 +65,7 @@ class Gemma4Media:
     pixel_values_videos: Tensor | None = None
     video_position_ids: Tensor | None = None
     digest: str = field(init=False, repr=False)
-    cache_token_ids: tuple[int, ...] = field(init=False, repr=False)
+    cache_key: tuple[int, ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         token_ids = tuple(int(token) for token in self.token_ids)
@@ -120,7 +122,7 @@ class Gemma4Media:
             )
         digest = _media_digest(self)
         object.__setattr__(self, "digest", digest)
-        object.__setattr__(self, "cache_token_ids", _cache_identity(self, digest))
+        object.__setattr__(self, "cache_key", _cache_identity(self, digest))
 
     @property
     def image_positions(self) -> tuple[int, ...]:
@@ -154,8 +156,8 @@ class Gemma4Media:
         return tuple(result)
 
     @property
-    def prefill_atomic_spans(self) -> tuple[tuple[int, int], ...]:
-        """Contiguous vision ranges that require one bidirectional prefill row."""
+    def token_spans(self) -> tuple[MediaTokenSpan, ...]:
+        """Vision ranges that require one bidirectional prefill row."""
 
         spans = []
         start = None
@@ -163,7 +165,7 @@ class Gemma4Media:
             if token_type in {1, 2} and start is None:
                 start = index
             elif token_type not in {1, 2} and start is not None:
-                spans.append((start, index))
+                spans.append(MediaTokenSpan(position=start, length=index - start))
                 start = None
         return tuple(spans)
 

@@ -3,13 +3,45 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypeAlias, TypedDict
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    NamedTuple,
+    NotRequired,
+    Protocol,
+    TypeAlias,
+    TypedDict,
+    runtime_checkable,
+)
 
 if TYPE_CHECKING:
     from resin._resin import BatchPlan, ResourceBinding, RunnerConfig
 
 
 RunnerOutput: TypeAlias = Sequence[int] | Sequence[Sequence[int]]
+
+
+class MediaTokenSpan(NamedTuple):
+    """A half-open media range described by its prompt position and length."""
+
+    position: int
+    length: int
+
+
+@runtime_checkable
+class MediaInput(Protocol):
+    """Model-owned prompt payload understood by the generic Engine.
+
+    ``cache_key`` is a token-aligned, hashable identity. It normally equals
+    ``token_ids`` outside media spans and is digest-salted inside them, allowing
+    the Engine's ordinary prefix tree to distinguish equal placeholders backed
+    by different media. ``token_spans`` marks ranges that must remain intact in
+    one prefill row when a model uses bidirectional attention within media.
+    """
+
+    token_ids: Sequence[int]
+    cache_key: tuple[int, ...]
+    token_spans: tuple[MediaTokenSpan, ...]
 
 
 class RenderedPrompt(TypedDict):
@@ -73,6 +105,8 @@ Runner: TypeAlias = SyncRunner | AsyncRunner
 __all__ = [
     "AsyncRunner",
     "ConversationCodec",
+    "MediaInput",
+    "MediaTokenSpan",
     "ParserEvent",
     "RenderedPrompt",
     "ResourceRunner",
