@@ -43,7 +43,7 @@ class BatchPlan:
         cache_groups: Sequence[CacheGroupPlan] | None = None,
         sampling_mask: Sequence[bool] | npt.NDArray[np.bool_] | None = None,
         sampling_params: Sequence[SamplingParams] | None = None,
-        input_payloads: Sequence[object | None] | None = None,
+        media: Sequence[object | None] | None = None,
     ) -> BatchPlan: ...
     def __repr__(self, /) -> str: ...
     @property
@@ -71,8 +71,8 @@ class BatchPlan:
         """
 
     @property
-    def input_payloads(self, /) -> tuple[object | None, ...]:
-        """Opaque runner inputs, one per sequence."""
+    def media(self, /) -> tuple[object | None, ...]:
+        """Opaque media inputs, one per sequence."""
 
     @property
     def num_sequences(self, /) -> int:
@@ -394,7 +394,7 @@ class Engine:
         batch_key: int | None = None,
         sampling_params: SamplingParams | None = None,
         stop_token_ids: Sequence[int] | None = None,
-        input_payload: object | None = None,
+        media: object | None = None,
     ) -> RequestLease: ...
 
 @final

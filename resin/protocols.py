@@ -17,7 +17,7 @@ class RenderedPrompt(TypedDict):
 
     token_ids: list[int]
     stop_token_ids: list[int]
-    input_payload: NotRequired[object]
+    media: NotRequired[object]
 
 
 class ParserEvent(TypedDict, total=False):

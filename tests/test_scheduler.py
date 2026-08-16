@@ -304,28 +304,28 @@ class TestSchedulerConfigContract:
         with pytest.raises(AttributeError):
             plan.sampling_mask = [True, False, False]
 
-    def test_opaque_input_payloads_preserve_identity(self) -> None:
+    def test_opaque_media_preserves_identity(self) -> None:
         payload = object()
         plan = BatchPlan(
             [7, 8],
             [0, 0],
             [10, 20],
             [0, 1, 2],
-            input_payloads=[payload, None],
+            media=[payload, None],
         )
 
-        assert plan.input_payloads[0] is payload
-        assert plan.input_payloads[1] is None
+        assert plan.media[0] is payload
+        assert plan.media[1] is None
         with pytest.raises(ValueError, match="one item per sequence"):
             BatchPlan(
                 [7, 8],
                 [0, 0],
                 [10, 20],
                 [0, 1, 2],
-                input_payloads=[payload],
+                media=[payload],
             )
 
-    def test_engine_carries_input_payload_through_prefill_and_decode(self) -> None:
+    def test_engine_carries_media_through_prefill_and_decode(self) -> None:
         class ChunkedRunner(ContinuationRecordingRunner):
             runner_config = RunnerConfig(
                 continuation_prefill=True,
@@ -335,7 +335,7 @@ class TestSchedulerConfigContract:
         runner = ChunkedRunner()
         engine = Engine(runner)
         payload = {"image": object()}
-        engine.submit([1, 2, 3], max_new_tokens=2, input_payload=payload)
+        engine.submit([1, 2, 3], max_new_tokens=2, media=payload)
 
         while engine.has_work():
             engine.step()
@@ -345,7 +345,7 @@ class TestSchedulerConfigContract:
             BatchPhase.PREFILL,
             BatchPhase.DECODE,
         ]
-        assert all(plan.input_payloads == (payload,) for plan in runner.plans)
+        assert all(plan.media == (payload,) for plan in runner.plans)
 
     def test_batch_plan_phase_is_batch_homogeneous(self) -> None:
         prefill = BatchPlan(
