@@ -1078,7 +1078,9 @@ class Gemma4CudaRunner(SyncRunner):
             plan,
             history_blocks_per_parent=self.config.history_blocks_per_parent,
             parent_capacity=self.cache_parent_capacity,
-            decode_lookahead=self.speculative_tokens,
+            decode_lookahead=(
+                self.speculative_tokens if plan.phase == BatchPhase.DECODE else 0
+            ),
         )
         if batch.phase == BatchPhase.DECODE:
             if self.speculative_tokens:
