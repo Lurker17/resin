@@ -19,6 +19,8 @@ MODEL_REVISION = "4135a98a9b728a548947683219633b25682223ac"
 MODEL_VOLUME_NAME = "resin-gemma4-models-v1"
 MODEL_MOUNT = "/models/resin-gemma4"
 MODEL_PATH = Path(MODEL_MOUNT) / MODEL_REVISION
+PROFILE_VOLUME_NAME = "resin-gemma4-profiles-v1"
+PROFILE_MOUNT = "/profiles/resin-gemma4"
 MODEL_FILES = (
     "config.json",
     "model*.safetensors",
@@ -40,10 +42,11 @@ image = build_modal_image(
 )
 
 model_volume = modal.Volume.from_name(MODEL_VOLUME_NAME, create_if_missing=True)
+profile_volume = modal.Volume.from_name(PROFILE_VOLUME_NAME, create_if_missing=True)
 app = modal.App(
     "resin-gemma4-nvfp4",
     image=image,
-    volumes={MODEL_MOUNT: model_volume},
+    volumes={MODEL_MOUNT: model_volume, PROFILE_MOUNT: profile_volume},
 )
 
 
@@ -153,7 +156,14 @@ def _synthetic_image(size: int = 96):
     return np.stack((horizontal, vertical, 1.0 - horizontal), axis=-1).copy()
 
 
-def _generate(engine, processor, prompt: str, max_new_tokens: int):
+def _generate(
+    engine,
+    processor,
+    prompt: str,
+    max_new_tokens: int,
+    *,
+    profile_steps: bool = False,
+):
     from resin import SamplingParams
     from resin_models_cuda.gemma4 import Gemma4Media
 
@@ -171,7 +181,15 @@ def _generate(engine, processor, prompt: str, max_new_tokens: int):
     steps = []
     while engine.has_work():
         started = time.perf_counter()
-        events = engine.step()
+        if profile_steps:
+            import torch
+
+            with torch.profiler.record_function(
+                f"resin.engine.step.{len(steps)}"
+            ):
+                events = engine.step()
+        else:
+            events = engine.step()
         steps.append(
             {
                 "ms": (time.perf_counter() - started) * 1000,
@@ -311,6 +329,67 @@ def shape_profile() -> dict[str, Any]:
             engine.close()
 
 
+@app.function(
+    gpu="RTX-PRO-6000:1",
+    cpu=16,
+    memory=128 * 1024,
+    timeout=8 * 60 * 60,
+    single_use_containers=True,
+)
+def perfetto_trace(max_new_tokens: int = 5) -> dict[str, Any]:
+    torch, _, processor, engine, report = _build_runtime()
+    try:
+        # Populate every lazy kernel cache before profiling, then force the
+        # measured request to recompute its complete multimodal prefix.
+        _generate(engine, processor, "Name the main colors.", 2)
+        engine.clear_prefix_cache()
+        torch.cuda.synchronize()
+
+        trace_name = f"gemma4-sm120-{int(time.time())}.json.gz"
+        trace_path = Path(PROFILE_MOUNT) / trace_name
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+        with torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_flops=True,
+        ) as profile:
+            with torch.profiler.record_function("resin.gemma4.multimodal_request"):
+                media, token_ids, steps = _generate(
+                    engine,
+                    processor,
+                    "Describe the gradient and its dominant colors in one sentence.",
+                    max_new_tokens,
+                    profile_steps=True,
+                )
+            torch.cuda.synchronize()
+        profile.export_chrome_trace(str(trace_path))
+        profile_volume.commit()
+
+        cuda_table = profile.key_averages().table(
+            sort_by="self_cuda_time_total",
+            row_limit=40,
+        )
+        report.update(
+            {
+                "trace_volume": PROFILE_VOLUME_NAME,
+                "trace_file": trace_name,
+                "prompt_tokens": len(media.token_ids),
+                "vision_tokens": len(media.image_positions),
+                "output_tokens": token_ids,
+                "step_ms": steps,
+                "cuda_table": cuda_table,
+            }
+        )
+        return report
+    finally:
+        if not engine.closed:
+            engine.close()
+
+
 def _serve() -> None:
     from resin.server import HttpServer
     from resin_models_cuda.gemma4 import Gemma4Codec
@@ -360,5 +439,7 @@ def main(mode: str = "smoke", max_new_tokens: int = 16) -> None:
         print(json.dumps(smoke_test.remote(max_new_tokens), indent=2))
     elif mode == "profile":
         print(json.dumps(shape_profile.remote(), indent=2))
+    elif mode == "trace":
+        print(json.dumps(perfetto_trace.remote(max_new_tokens), indent=2))
     else:
-        raise ValueError("mode must be 'download', 'smoke', or 'profile'")
+        raise ValueError("mode must be 'download', 'smoke', 'profile', or 'trace'")
