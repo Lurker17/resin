@@ -399,6 +399,7 @@ def _serve() -> None:
         # Compile/load every exact kernel geometry before opening the socket.
         warmup, _, _ = _generate(engine, processor, "Name the main colors.", 2)
         del warmup
+        _text_batch(engine, processor, batch_size=1, prompt_words=8)
         torch.cuda.synchronize(runner.device)
         HttpServer(
             engine,
