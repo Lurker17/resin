@@ -13,7 +13,7 @@ def test_qwen38_cache_geometry_accounts_for_fp32_recurrent_state() -> None:
     geometry = CacheGeometry.from_config(config, include_mtp=True)
 
     assert geometry.recurrent_bytes == 144 * 1024**2
-    assert geometry.state_bytes == 153_944_064
+    assert geometry.state_bytes == 153_954_304
     assert geometry.slab_bytes == 152 * 1024**2
     assert geometry.slab_units == 304
     assert geometry.target_blocks_per_slab == 19
@@ -59,7 +59,10 @@ def test_mixed_dtype_state_views_share_the_byte_arena() -> None:
     assert arena.keys.dtype is torch.bfloat16
     assert arena.recurrent_states.dtype is torch.float32
     assert arena.convolution_states.dtype is torch.bfloat16
+    assert arena.target_hidden_states.dtype is torch.bfloat16
     arena.recurrent_states[1, 0, 0, 0, 0, 0] = 7.0
     arena.convolution_states[1, 0, 0, 0, 0] = 3.0
+    arena.target_hidden_states[1, 0, 0] = 5.0
     assert arena.recurrent_states[1, 0, 0, 0, 0, 0].item() == 7.0
     assert arena.convolution_states[1, 0, 0, 0, 0].item() == 3.0
+    assert arena.target_hidden_states[1, 0, 0].item() == 5.0

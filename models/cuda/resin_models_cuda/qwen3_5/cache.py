@@ -39,6 +39,7 @@ class CacheGeometry:
     linear_value_head_dim: int
     conv_dim: int
     conv_state_length: int
+    hidden_size: int
     include_mtp: bool
     slab_units: int
     target_blocks_per_slab: int
@@ -66,6 +67,7 @@ class CacheGeometry:
             * config.linear_conv_dim
             * conv_state_length
             * BF16_BYTES
+            + config.hidden_size * BF16_BYTES
         )
         slab_bytes = math.ceil(state_bytes / target_block_bytes) * target_block_bytes
         slab_units = slab_bytes // unit_bytes
@@ -79,6 +81,7 @@ class CacheGeometry:
             linear_value_head_dim=config.linear_value_head_dim,
             conv_dim=config.linear_conv_dim,
             conv_state_length=conv_state_length,
+            hidden_size=config.hidden_size,
             include_mtp=include_mtp,
             slab_units=slab_units,
             target_blocks_per_slab=slab_units // config.full_layer_count,
@@ -117,7 +120,11 @@ class CacheGeometry:
 
     @property
     def state_bytes(self) -> int:
-        return self.recurrent_bytes + self.convolution_elements * BF16_BYTES
+        return (
+            self.recurrent_bytes
+            + self.convolution_elements * BF16_BYTES
+            + self.hidden_size * BF16_BYTES
+        )
 
     def layout(self, slab_capacity: int) -> CacheLayout:
         groups = [
@@ -157,6 +164,7 @@ class DeviceCache:
     values: Tensor
     recurrent_states: Tensor
     convolution_states: Tensor
+    target_hidden_states: Tensor
 
     def row(self, index: int) -> DeviceCache:
         return DeviceCache(
@@ -174,6 +182,7 @@ class DeviceCache:
             self.values,
             self.recurrent_states,
             self.convolution_states,
+            self.target_hidden_states,
         )
 
     def locations(
@@ -216,15 +225,23 @@ class DeviceCache:
         pages = slabs * self.geometry.slab_units + slots * layer_count + layer
         return (pages * PAGE_TOKENS + offsets).long()
 
-    def state_at(self, positions: Tensor) -> tuple[Tensor, Tensor]:
+    def state_at(self, positions: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         slabs, slots, _ = self.locations(
             STATE_GROUP, positions, block_tokens=PREFILL_CHUNK_SIZE
         )
         indices = slabs.long(), slots.long()
-        return self.recurrent_states[indices], self.convolution_states[indices]
+        return (
+            self.recurrent_states[indices],
+            self.convolution_states[indices],
+            self.target_hidden_states[indices],
+        )
 
     def store_state(
-        self, positions: Tensor, recurrent: Tensor, convolution: Tensor
+        self,
+        positions: Tensor,
+        recurrent: Tensor,
+        convolution: Tensor,
+        target_hidden: Tensor,
     ) -> None:
         slabs, slots, _ = self.locations(
             STATE_GROUP, positions, block_tokens=PREFILL_CHUNK_SIZE
@@ -232,6 +249,7 @@ class DeviceCache:
         indices = slabs.long(), slots.long()
         self.recurrent_states[indices] = recurrent
         self.convolution_states[indices] = convolution
+        self.target_hidden_states[indices] = target_hidden
 
 
 class CacheArena:
@@ -319,6 +337,23 @@ class CacheArena:
             ),
             storage_offset=geometry.recurrent_bytes // BF16_BYTES,
         )
+        self.target_hidden_states = torch.as_strided(
+            bf16,
+            (
+                physical,
+                geometry.state_blocks_per_slab,
+                geometry.hidden_size,
+            ),
+            (
+                geometry.slab_bytes // BF16_BYTES,
+                geometry.state_bytes // BF16_BYTES,
+                1,
+            ),
+            storage_offset=(
+                geometry.recurrent_bytes // BF16_BYTES
+                + geometry.convolution_elements
+            ),
+        )
 
     def reset_null(self) -> None:
         self.storage[0].zero_()
@@ -353,6 +388,7 @@ class CacheArena:
             self.values,
             self.recurrent_states,
             self.convolution_states,
+            self.target_hidden_states,
         )
 
 
