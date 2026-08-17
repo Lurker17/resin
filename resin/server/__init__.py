@@ -32,10 +32,14 @@ class RendererCodec(ConversationCodec):
         *,
         tokenizer: Any | None = None,
         include_generation_prefix_in_parser: bool = False,
+        generation_prefix_parser_anchor_token_id: int | None = None,
     ) -> None:
         self.renderer = renderer
         self.tokenizer = tokenizer or getattr(renderer, "_tokenizer", None)
         self.include_generation_prefix_in_parser = include_generation_prefix_in_parser
+        self.generation_prefix_parser_anchor_token_id = (
+            generation_prefix_parser_anchor_token_id
+        )
 
     def render(self, request: dict[str, Any]) -> RenderedPrompt:
         tools = request.get("tools") or None
@@ -77,6 +81,14 @@ class RendererCodec(ConversationCodec):
                     "renderer generation prompt is not a conversation suffix"
                 )
             prefix_ids = list(prompt_ids[len(conversation_ids) :])
+            anchor = self.generation_prefix_parser_anchor_token_id
+            if anchor is not None:
+                try:
+                    prefix_ids = prefix_ids[prefix_ids.index(anchor) :]
+                except ValueError as error:
+                    raise ValueError(
+                        "renderer generation prompt is missing its parser anchor"
+                    ) from error
         return _RendererResponseParser(self.renderer, tools, prefix_ids=prefix_ids)
 
 

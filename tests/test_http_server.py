@@ -234,6 +234,31 @@ def test_renderer_codec_can_restore_generation_prefix_for_parser() -> None:
     assert parser.feed([3]) == [{"type": "text_delta", "delta": "c"}]
 
 
+def test_renderer_codec_can_anchor_generation_prefix_for_parser() -> None:
+    class AnchoredPrefixRenderer(FakeRenderer):
+        @staticmethod
+        def render_ids(messages, *, tools, add_generation_prompt):
+            del messages, tools
+            return [1, 2, 9, 10] if add_generation_prompt else [1, 2]
+
+        @staticmethod
+        def parse_response(token_ids, *, tools):
+            del tools
+            assert token_ids[0] == 10
+            return Parsed(content="".join(chr(96 + token) for token in token_ids[1:]))
+
+    codec = RendererCodec(
+        AnchoredPrefixRenderer(),
+        include_generation_prefix_in_parser=True,
+        generation_prefix_parser_anchor_token_id=10,
+    )
+    request = {"messages": [{"role": "user", "content": "hi"}], "tools": []}
+    rendered = codec.render(request)
+    parser = codec.create_parser(request, rendered["token_ids"])
+
+    assert parser.feed([3]) == [{"type": "text_delta", "delta": "c"}]
+
+
 def test_http_server_validates_route_configuration() -> None:
     with pytest.raises(ValueError, match="requires enable_openai"):
         HttpServer(

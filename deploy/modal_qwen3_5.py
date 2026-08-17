@@ -330,6 +330,9 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
                 renderer,
                 tokenizer=tokenizer,
                 include_generation_prefix_in_parser=True,
+                generation_prefix_parser_anchor_token_id=(
+                    tokenizer.convert_tokens_to_ids("<think>")
+                ),
             ),
             model=MODEL_ID,
         ).serve(host="0.0.0.0", port=8000)
