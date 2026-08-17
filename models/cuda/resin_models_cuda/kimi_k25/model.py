@@ -42,12 +42,18 @@ class RMSNorm(nn.Module):
 class ParallelEmbedding(nn.Module):
     """Vocabulary-sharded embedding with one TP reduction."""
 
-    def __init__(self, vocab_size: int, hidden_size: int, tp: TensorParallelContext):
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_size: int,
+        tp: TensorParallelContext,
+        reduce: Callable[[Tensor], Tensor],
+    ) -> None:
         super().__init__()
         shard = tp.layout.even_shard(vocab_size, name="vocab_size")
         self.vocab_start = shard.start
         self.vocab_stop = shard.stop
-        self.tp = tp
+        self.reduce = reduce
         self.weight = nn.Parameter(
             torch.empty(shard.size, hidden_size, dtype=torch.bfloat16)
         )
@@ -58,27 +64,46 @@ class ParallelEmbedding(nn.Module):
         local = local.masked_fill(masked, 0)
         hidden = F.embedding(local, self.weight)
         hidden.masked_fill_(masked[..., None], 0)
-        return self.tp.sum(hidden)
+        return self.reduce(hidden)
 
 
 class ParallelHead(nn.Module):
-    """Vocabulary-sharded BF16 head returning globally ordered FP32 logits."""
+    """Vocabulary-sharded BF16 head with compact distributed greedy decode."""
 
     def __init__(self, vocab_size: int, hidden_size: int, tp: TensorParallelContext):
         super().__init__()
         shard = tp.layout.even_shard(vocab_size, name="vocab_size")
+        self.vocab_start = shard.start
         self.tp = tp
         self.weight = nn.Parameter(
-            torch.empty(shard.size, hidden_size, dtype=torch.float32)
+            torch.empty(shard.size, hidden_size, dtype=torch.bfloat16)
         )
 
+    def local_logits(self, hidden: Tensor) -> Tensor:
+        return F.linear(hidden, self.weight)
+
     def forward(self, hidden: Tensor) -> Tensor:
-        local = F.linear(hidden.float(), self.weight)
+        local = self.local_logits(hidden)
         if not self.tp.enabled:
-            return local
+            return local.float()
         gathered = [torch.empty_like(local) for _ in range(self.tp.size)]
         dist.all_gather(gathered, local, group=self.tp.process_group)
-        return torch.cat(gathered, dim=-1)
+        return torch.cat(gathered, dim=-1).float()
+
+    def argmax(self, hidden: Tensor) -> Tensor:
+        """Return global token IDs without gathering the full vocabulary."""
+
+        values, indices = self.local_logits(hidden).max(dim=-1)
+        indices = indices + self.vocab_start
+        if not self.tp.enabled:
+            return indices
+        candidates = torch.stack((values.float(), indices.float()), dim=-1)
+        gathered = [torch.empty_like(candidates) for _ in range(self.tp.size)]
+        dist.all_gather(gathered, candidates, group=self.tp.process_group)
+        stacked = torch.stack(gathered, dim=0)
+        winning_rank = stacked[..., 0].argmax(dim=0, keepdim=True)
+        winning_ids = stacked[..., 1].gather(0, winning_rank).squeeze(0)
+        return winning_ids.to(torch.long)
 
 
 class ColumnParallelLinear(nn.Module):
@@ -406,13 +431,31 @@ class DenseMlp(nn.Module):
         reduce: Callable[[Tensor], Tensor],
     ) -> None:
         super().__init__()
-        self.gate_proj = ColumnParallelLinear(hidden_size, intermediate_size, tp)
-        self.up_proj = ColumnParallelLinear(hidden_size, intermediate_size, tp)
+        shard = tp.layout.even_shard(intermediate_size, name="MLP intermediate")
+        self.local_intermediate_size = shard.size
+        self.gate_up_proj = nn.Linear(
+            hidden_size,
+            2 * shard.size,
+            bias=False,
+            dtype=torch.bfloat16,
+        )
         self.down_proj = RowParallelLinear(intermediate_size, hidden_size, tp, reduce)
 
+    @property
+    def gate_weight(self) -> Tensor:
+        """Checkpoint destination for the packed SwiGLU gate projection."""
+
+        return self.gate_up_proj.weight[: self.local_intermediate_size]
+
+    @property
+    def up_weight(self) -> Tensor:
+        """Checkpoint destination for the packed SwiGLU up projection."""
+
+        return self.gate_up_proj.weight[self.local_intermediate_size :]
+
     def partial(self, hidden: Tensor) -> Tensor:
-        activated = F.silu(self.gate_proj(hidden)) * self.up_proj(hidden)
-        return self.down_proj.partial(activated)
+        gate, up = self.gate_up_proj(hidden).chunk(2, dim=-1)
+        return self.down_proj.partial(F.silu(gate) * up)
 
     def forward(self, hidden: Tensor) -> Tensor:
         return self.down_proj.reduce(self.partial(hidden))
@@ -651,7 +694,9 @@ class KimiTarget(nn.Module):
         super().__init__()
         self.config = config
         self.aux_layer_ids = aux_layer_ids
-        self.embed_tokens = ParallelEmbedding(config.vocab_size, config.hidden_size, tp)
+        self.embed_tokens = ParallelEmbedding(
+            config.vocab_size, config.hidden_size, tp, reduce
+        )
         frequencies = precompute_rope(
             config.qk_rope_head_dim, max_sequence_length, config.rope
         ).to(workspace.device)
@@ -733,7 +778,9 @@ class EagleDraft(nn.Module):
         super().__init__()
         self.config = config
         self.tp = tp
-        self.embed_tokens = ParallelEmbedding(config.vocab_size, config.hidden_size, tp)
+        self.embed_tokens = ParallelEmbedding(
+            config.vocab_size, config.hidden_size, tp, reduce
+        )
         self.fc_norm = (
             nn.ModuleList(
                 RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -794,8 +841,13 @@ class EagleDraft(nn.Module):
         max_sequence_length: int,
         *,
         return_logits: bool = True,
+        greedy: bool = False,
         prefill_length: int | None = None,
     ) -> tuple[Tensor | None, Tensor]:
+        if return_logits and greedy:
+            raise ValueError(
+                "Kimi draft cannot return logits and greedy tokens together"
+            )
         embeds = self.input_layernorm(self.embed_tokens(token_ids))
         normalized_hidden = self.hidden_norm(target_hidden)
         attention_input = torch.cat((embeds, normalized_hidden), dim=-1)
@@ -816,8 +868,13 @@ class EagleDraft(nn.Module):
         hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
         normalized = self.norm(hidden)
         auxiliary = normalized if self.config.norm_output else hidden
-        logits = self.lm_head(normalized) if return_logits else None
-        return logits, auxiliary
+        if return_logits:
+            output = self.lm_head(normalized)
+        elif greedy:
+            output = self.lm_head.argmax(normalized)
+        else:
+            output = None
+        return output, auxiliary
 
 
 class KimiForCausalLM(nn.Module):

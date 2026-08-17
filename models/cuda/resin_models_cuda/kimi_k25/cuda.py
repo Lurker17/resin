@@ -351,6 +351,36 @@ class KimiK25CudaRunner(SyncRunner):
         )
         return self._broadcast_tokens(self._sampler.sample_tensors(logits, tensors))
 
+    def _graph_sample_steps(
+        self,
+        logits: torch.Tensor,
+        sampling: SamplingTensors,
+    ) -> torch.Tensor:
+        """Sample every verification position with one kernel sequence."""
+
+        batch_size, steps, vocab_size = logits.shape
+
+        def repeat_rows(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor[:, None].expand(batch_size, steps).reshape(-1).contiguous()
+
+        offsets = (
+            sampling.offsets[:, None]
+            + torch.arange(steps, dtype=sampling.offsets.dtype, device=self.device)
+            * SAMPLING_OFFSET_STRIDE
+        )
+        tensors = SamplingTensors(
+            temperatures=repeat_rows(sampling.temperatures),
+            top_ps=repeat_rows(sampling.top_ps),
+            top_ks=repeat_rows(sampling.top_ks),
+            seeds=repeat_rows(sampling.seeds),
+            offsets=offsets.reshape(-1),
+            stochastic_mask=repeat_rows(sampling.stochastic_mask),
+        )
+        sampled = self._sampler.sample_tensors(
+            logits.reshape(batch_size * steps, vocab_size), tensors
+        ).view(batch_size, steps)
+        return self._broadcast_tokens(sampled)
+
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         (batch_size,) = shape
         graph_seq_len = self.physical_seq_len
@@ -386,19 +416,18 @@ class KimiK25CudaRunner(SyncRunner):
                 draft_hidden = cache.aux_at(positions - 1)[:, None]
                 for step in range(self.speculative_tokens):
                     draft_position = positions[:, None] + step - 1
-                    draft_logits, draft_hidden = self._model.draft(
+                    draft_token, draft_hidden = self._model.draft(
                         draft_token,
                         draft_hidden,
                         draft_position,
                         cache,
                         positions + step,
                         graph_seq_len,
+                        return_logits=False,
+                        greedy=True,
                     )
-                    if draft_logits is None:
-                        raise RuntimeError("Kimi draft did not return logits")
-                    draft_token = self._broadcast_tokens(
-                        draft_logits[:, -1].argmax(dim=-1)
-                    )[:, None]
+                    if draft_token is None:
+                        raise RuntimeError("Kimi draft did not return a greedy token")
                     draft_tokens.append(draft_token[:, 0])
 
                 drafts = torch.stack(draft_tokens, dim=1)
@@ -414,15 +443,7 @@ class KimiK25CudaRunner(SyncRunner):
                     graph_seq_len,
                     full_logits=True,
                 )
-                target_tokens = torch.stack(
-                    [
-                        self._graph_sample(
-                            verify_logits[:, step].contiguous(), sampling, step
-                        )
-                        for step in range(self.speculative_tokens + 1)
-                    ],
-                    dim=1,
-                )
+                target_tokens = self._graph_sample_steps(verify_logits, sampling)
                 self._model.draft(
                     target_tokens,
                     target_hidden,
@@ -696,19 +717,18 @@ class KimiK25CudaRunner(SyncRunner):
         draft_hidden = cache.aux_at(positions - 1)[:, None]
         for step in range(self.speculative_tokens):
             draft_position = positions[:, None] + step - 1
-            draft_logits, draft_hidden = self._model.draft(
+            draft_token, draft_hidden = self._model.draft(
                 draft_token,
                 draft_hidden,
                 draft_position,
                 cache,
                 positions + step,
                 self.physical_seq_len,
+                return_logits=False,
+                greedy=True,
             )
-            if draft_logits is None:
-                raise RuntimeError("Kimi draft did not return logits")
-            draft_token = self._broadcast_tokens(draft_logits[:, -1].argmax(dim=-1))[
-                :, None
-            ]
+            if draft_token is None:
+                raise RuntimeError("Kimi draft did not return a greedy token")
             drafts.append(draft_token[:, 0])
         draft_ids = torch.stack(drafts, dim=1)
         verify_ids = torch.cat((anchors, draft_ids), dim=1)

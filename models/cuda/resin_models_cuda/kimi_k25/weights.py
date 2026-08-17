@@ -126,8 +126,8 @@ def _target_destination(model: KimiForCausalLM, name: str):
         return direct[suffix]
     if not isinstance(layer.mlp, KimiMoE):
         dense = {
-            "mlp.gate_proj.weight": layer.mlp.gate_proj.weight,
-            "mlp.up_proj.weight": layer.mlp.up_proj.weight,
+            "mlp.gate_proj.weight": layer.mlp.gate_weight,
+            "mlp.up_proj.weight": layer.mlp.up_weight,
             "mlp.down_proj.weight": layer.mlp.down_proj.weight,
         }
         try:
@@ -138,8 +138,8 @@ def _target_destination(model: KimiForCausalLM, name: str):
     routed = {
         "mlp.gate.weight": moe.experts.gate.weight,
         "mlp.gate.e_score_correction_bias": (moe.experts.e_score_correction_bias),
-        "mlp.shared_experts.gate_proj.weight": moe.shared_experts.gate_proj.weight,
-        "mlp.shared_experts.up_proj.weight": moe.shared_experts.up_proj.weight,
+        "mlp.shared_experts.gate_proj.weight": moe.shared_experts.gate_weight,
+        "mlp.shared_experts.up_proj.weight": moe.shared_experts.up_weight,
         "mlp.shared_experts.down_proj.weight": moe.shared_experts.down_proj.weight,
     }
     if suffix in routed:
@@ -281,8 +281,8 @@ def _draft_destination(model: KimiForCausalLM, name: str):
         "layers.0.hidden_norm.weight": draft.hidden_norm.weight,
         "layers.0.input_layernorm.weight": draft.input_layernorm.weight,
         "layers.0.mlp.down_proj.weight": draft.mlp.down_proj.weight,
-        "layers.0.mlp.gate_proj.weight": draft.mlp.gate_proj.weight,
-        "layers.0.mlp.up_proj.weight": draft.mlp.up_proj.weight,
+        "layers.0.mlp.gate_proj.weight": draft.mlp.gate_weight,
+        "layers.0.mlp.up_proj.weight": draft.mlp.up_weight,
         "layers.0.post_attention_layernorm.weight": (
             draft.post_attention_layernorm.weight
         ),
