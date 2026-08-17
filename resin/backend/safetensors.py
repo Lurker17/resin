@@ -31,6 +31,7 @@ def indexed_tensor_files(root: Path, *, require_index: bool = False) -> dict[str
         raise ValueError(f"{index_path.name} must contain a non-empty weight_map")
 
     tensor_files = {}
+    validated_files: set[Path] = set()
     for key, filename in weight_map.items():
         if not isinstance(key, str) or not key:
             raise ValueError("checkpoint index contains an invalid tensor name")
@@ -45,8 +46,10 @@ def indexed_tensor_files(root: Path, *, require_index: bool = False) -> dict[str
         ):
             raise ValueError(f"invalid checkpoint shard name: {filename!r}")
         path = root / relative
-        if not path.is_file():
-            raise FileNotFoundError(f"missing checkpoint shard: {path}")
+        if path not in validated_files:
+            if not path.is_file():
+                raise FileNotFoundError(f"missing checkpoint shard: {path}")
+            validated_files.add(path)
         tensor_files[key] = path
     return tensor_files
 

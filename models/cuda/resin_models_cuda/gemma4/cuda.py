@@ -50,7 +50,6 @@ from resin_models_cuda.gemma4.checkpoint import (
 from resin_models_cuda.gemma4.config import SLIDING_ATTENTION
 from resin_models_cuda.gemma4.media import Gemma4Media
 from resin_models_cuda.gemma4.model import Gemma4ForConditionalGeneration
-from resin_models_cuda.gemma4.nvfp4 import prepare_nvfp4_modules
 from resin_models_cuda.gemma4.plan import (
     PAGE_SIZE,
     PREFILL_CHUNK_SIZE,
@@ -62,6 +61,7 @@ from resin_models_cuda.gemma4.plan import (
     expand_gemma4_decode_batch,
     gemma4_assistant_context,
 )
+from resin_models_cuda.nvfp4 import prepare_nvfp4_modules
 
 if TYPE_CHECKING:
     from resin import BatchPlan

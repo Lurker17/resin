@@ -128,6 +128,120 @@ class DeepSeekV4Codec:
         )
 
 
+class KimiK25Codec:
+    """Render Kimi K2.5-family chats and expand image patch placeholders."""
+
+    _THINKING_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max"})
+
+    def __init__(self, processor_or_tokenizer: Any) -> None:
+        from renderers import KimiK25Renderer, KimiK25RendererConfig
+
+        from resin.server import RendererCodec
+
+        processor = (
+            processor_or_tokenizer
+            if hasattr(processor_or_tokenizer, "tokenizer")
+            else None
+        )
+        tokenizer = (
+            processor_or_tokenizer.tokenizer
+            if processor is not None
+            else processor_or_tokenizer
+        )
+        self._tokenizer = tokenizer
+        self._processor = processor
+        self._renderers = {
+            thinking: KimiK25Renderer(
+                tokenizer,
+                KimiK25RendererConfig(thinking=thinking),
+                processor=processor,
+            )
+            for thinking in (False, True)
+        }
+        self._codecs = {
+            thinking: RendererCodec(
+                renderer,
+                tokenizer=tokenizer,
+                include_generation_prefix_in_parser=True,
+            )
+            for thinking, renderer in self._renderers.items()
+        }
+
+    @classmethod
+    def _thinking(cls, request: dict[str, Any]) -> bool:
+        effort = request.get("reasoning_effort")
+        if effort is None:
+            return False
+        if effort not in cls._THINKING_EFFORTS:
+            raise ValueError(f"unsupported reasoning_effort: {effort!r}")
+        return True
+
+    @staticmethod
+    def _messages(request: dict[str, Any]) -> list[dict[str, Any]]:
+        import numpy as np
+        from PIL import Image
+
+        from resin.server.media import normalize_image_messages
+
+        messages = normalize_image_messages(request["messages"])
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") in {"video", "video_url", "input_video"}:
+                    raise ValueError("Kimi video inputs are not supported yet")
+                image = block.get("image")
+                if isinstance(image, np.ndarray):
+                    pixels = np.rint(image * np.float32(255.0)).astype(np.uint8)
+                    block["image"] = Image.fromarray(pixels, mode="RGB")
+        return messages
+
+    def render(self, request: dict[str, Any]) -> dict[str, Any]:
+        from resin_models_cuda.kimi_k25.media import KimiK25Media
+
+        renderer = self._renderers[self._thinking(request)]
+        messages = self._messages(request)
+        rendered = renderer.render(
+            messages,
+            tools=request.get("tools") or None,
+            add_generation_prompt=True,
+        )
+        stop_token_ids = list(renderer.get_stop_token_ids())
+        for stop in request.get("stop") or []:
+            encoded = list(self._tokenizer.encode(stop, add_special_tokens=False))
+            if len(encoded) != 1:
+                raise ValueError(
+                    f"stop sequence {stop!r} encodes to {len(encoded)} tokens; "
+                    "multi-token stop sequences are not supported yet"
+                )
+            stop_token_ids.append(int(encoded[0]))
+        result: dict[str, Any] = {
+            "token_ids": list(rendered.token_ids),
+            "stop_token_ids": list(dict.fromkeys(stop_token_ids)),
+        }
+        if rendered.multi_modal_data is not None:
+            if self._processor is None:
+                raise ValueError("Kimi image requests require an AutoProcessor")
+            media = KimiK25Media.from_rendered(rendered)
+            result["token_ids"] = list(media.token_ids)
+            result["media"] = media
+        return result
+
+    def create_parser(self, request: dict[str, Any], prompt_ids: Sequence[int]) -> Any:
+        del prompt_ids
+        thinking = self._thinking(request)
+        delegated = {**request, "messages": self._messages(request)}
+        unexpanded = self._renderers[thinking].render_ids(
+            delegated["messages"],
+            tools=delegated.get("tools") or None,
+            add_generation_prompt=True,
+        )
+        return self._codecs[thinking].create_parser(delegated, unexpanded)
+
+
 class DeepSeekV4ResponseParser:
     """Incrementally parse text, reasoning, and complete DSML tool calls."""
 
@@ -277,6 +391,7 @@ def batch_plan_payload(plan: BatchPlan) -> dict[str, Any]:
             for params in plan.sampling_params
         ],
         "sampling_mask": plan.sampling_mask,
+        "media": plan.media,
         "cache_groups": [
             {
                 "group_index": group.group_index,
@@ -313,6 +428,7 @@ def batch_plan_from_payload(payload: dict[str, Any]) -> BatchPlan:
         cache_groups=cache_groups,
         sampling_mask=payload["sampling_mask"],
         sampling_params=sampling_params,
+        media=payload["media"],
     )
 
 
@@ -391,6 +507,7 @@ def follow_tensor_parallel_server(
 __all__ = [
     "DeepSeekV4Codec",
     "DeepSeekV4ResponseParser",
+    "KimiK25Codec",
     "TensorParallelServerRunner",
     "batch_plan_from_payload",
     "batch_plan_payload",

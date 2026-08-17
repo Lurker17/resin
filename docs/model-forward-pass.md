@@ -67,6 +67,11 @@ read the current positions and execute only the active attention/indexing work.
 Use graph variants only for a small number of measured execution regimes, not
 as a lookup table for sequence lengths.
 
+Never key a graph or graph-owned buffer layout by live sequence length. Replaying
+that graph with different cache metadata can violate the captured pointer and
+extent assumptions; the result may be silent KV/state corruption rather than a
+clean graph error.
+
 Test eager-versus-graph output parity, repeated replay, the largest supported
 shape, and transitions across any graph regime boundary. Do not validate only
 the synthetic positions used during capture: replay the same graph at short,
@@ -86,6 +91,13 @@ Consume each cache block's structured slab ID and slot number. Do not
 invent or decode a flattened kernel page ID independently in every runner or
 kernel. Validate the slab and slot bounds once at the runner boundary, then
 stage the structured address through graph-owned page tables.
+
+Initialize every newly allocated or reused cache block before a kernel can
+vector-load its padding. A logical length mask does not make uninitialized
+bytes safe if a fused attention kernel performs arithmetic before applying the
+mask: a NaN in an inactive page tail can poison valid output. Test attention
+with deliberately dirty and NaN-filled padding; kernels should mask before
+arithmetic, while the arena should still clear fresh blocks defensively.
 
 Include the runner's maximum uncommitted verification lookahead in every
 sliding-window retention budget. Verification may write the whole candidate

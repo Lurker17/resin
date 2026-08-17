@@ -1,0 +1,250 @@
+"""ModelOpt NVFP4 adapters shared by Blackwell model runners."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+import torch
+from torch import Tensor, nn
+
+
+def swizzle_block_scales(scales: Tensor) -> Tensor:
+    """Convert linear ModelOpt scales to the canonical 128x4 layout."""
+
+    if scales.ndim != 2:
+        raise ValueError("NVFP4 block scales must have shape [out, in / 16]")
+    if scales.dtype != torch.float8_e4m3fn:
+        raise TypeError("NVFP4 block scales must use float8_e4m3fn")
+    rows, columns = scales.shape
+    padded_rows = (rows + 127) // 128 * 128
+    padded_columns = (columns + 3) // 4 * 4
+    padded = torch.zeros(
+        (1, padded_rows, padded_columns), dtype=scales.dtype, device=scales.device
+    )
+    padded[:, :rows, :columns] = scales
+    return (
+        padded.reshape(1, padded_rows // 128, 4, 32, padded_columns // 4, 4)
+        .permute(0, 1, 4, 3, 2, 5)
+        .contiguous()
+        .reshape(padded_rows, padded_columns)
+    )
+
+
+class Nvfp4Linear(nn.Module):
+    """One checkpoint-shaped NVFP4 linear prepared once for BF16 activations."""
+
+    def __init__(self, in_features: int, out_features: int, group_size: int = 16):
+        super().__init__()
+        if in_features % group_size:
+            raise ValueError("NVFP4 input width must be divisible by group_size")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        self.backend: str | None = None
+        self._mm: Callable[..., Tensor] | None = None
+        self.register_buffer(
+            "weight", torch.empty(out_features, in_features // 2, dtype=torch.uint8)
+        )
+        self.register_buffer(
+            "weight_scale",
+            torch.empty(
+                out_features, in_features // group_size, dtype=torch.float8_e4m3fn
+            ),
+        )
+        self.register_buffer("input_scale", torch.empty((), dtype=torch.float32))
+        self.register_buffer("weight_scale_2", torch.empty((), dtype=torch.float32))
+
+    def prepare(
+        self,
+        backend: str,
+        *,
+        prepare: Callable[..., tuple[Tensor, Tensor, Tensor | None]] | None = None,
+        mm: Callable[..., Tensor] | None = None,
+    ) -> None:
+        if self.backend is not None:
+            raise RuntimeError("NVFP4 weights were already prepared")
+        if prepare is None or mm is None:
+            from flashinfer.gemm import mm_bf16_fp4, prepare_bf16_fp4_weights
+
+            prepare = prepare_bf16_fp4_weights
+            mm = mm_bf16_fp4
+        scales = swizzle_block_scales(self.weight_scale)
+        weight, scales, alpha = prepare(
+            self.weight,
+            scales,
+            self.weight_scale_2.float().reshape(1),
+            backend=backend,
+            block_size=self.group_size,
+        )
+        self.weight = weight
+        self.weight_scale = scales
+        self.weight_scale_2 = alpha
+        self.input_scale = None
+        self.backend = backend
+        self._mm = mm
+
+    def forward(self, hidden: Tensor, *, out: Tensor | None = None) -> Tensor:
+        if self._mm is None or self.backend is None:
+            raise RuntimeError("NVFP4 weights must be prepared before inference")
+        if hidden.dtype != torch.bfloat16:
+            raise TypeError("NVFP4 W4A16 linears require bfloat16 activations")
+        shape = (*hidden.shape[:-1], self.out_features)
+        flat = hidden.reshape(-1, self.in_features)
+        flat_out = None if out is None else out.reshape(-1, self.out_features)
+        result = self._mm(
+            flat,
+            self.weight,
+            self.weight_scale,
+            self.weight_scale_2,
+            backend=self.backend,
+            out_dtype=torch.bfloat16,
+            out=flat_out,
+            block_size=self.group_size,
+        )
+        return result.reshape(shape)
+
+
+def prepare_nvfp4_modules(model: nn.Module, backend: str) -> None:
+    """Prepare every dense NVFP4 module in a model exactly once."""
+
+    for module in model.modules():
+        if isinstance(module, Nvfp4Linear):
+            module.prepare(backend)
+
+
+def quantize_nvfp4(
+    hidden: Tensor,
+    input_scale_quant: Tensor,
+    *,
+    quantize: Callable[..., tuple[Tensor, Tensor]] | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Quantize BF16 rows into TRT-LLM's packed NVFP4 activation layout."""
+
+    if hidden.ndim != 2 or hidden.dtype != torch.bfloat16:
+        raise TypeError("NVFP4 MoE activations must be a BF16 matrix")
+    if hidden.shape[1] % 16:
+        raise ValueError("NVFP4 activation width must be divisible by 16")
+    if quantize is None:
+        from flashinfer import fp4_quantize
+
+        quantize = fp4_quantize
+    packed, scales = quantize(hidden, input_scale_quant, 16, False, False)
+    return (
+        packed.reshape(hidden.shape[0], hidden.shape[1] // 2),
+        scales.view(torch.float8_e4m3fn).reshape(
+            hidden.shape[0], hidden.shape[1] // 16
+        ),
+    )
+
+
+def prepare_nvfp4_moe_weights(
+    w13: Tensor,
+    w13_scales: Tensor,
+    w2: Tensor,
+    w2_scales: Tensor,
+    *,
+    reorder: Callable[[Tensor], Tensor] | None = None,
+    shuffle: Callable[[Tensor, int], Tensor] | None = None,
+    interleave: Callable[[Tensor], Tensor] | None = None,
+) -> None:
+    """Convert linear ModelOpt expert weights in place for TRT-LLM MoE."""
+
+    tensors = (w13, w13_scales, w2, w2_scales)
+    if all(getattr(tensor, "_resin_nvfp4_moe_layout", False) for tensor in tensors):
+        return
+    if w13.ndim != 3 or w2.ndim != 3 or w13.shape[0] != w2.shape[0]:
+        raise ValueError("NVFP4 MoE weights must have matching expert dimensions")
+    experts, doubled_intermediate, packed_hidden = w13.shape
+    hidden = packed_hidden * 2
+    if doubled_intermediate % 2 or w2.shape != (
+        experts,
+        hidden,
+        doubled_intermediate // 4,
+    ):
+        raise ValueError("NVFP4 MoE weights have incompatible hidden dimensions")
+    if w13.dtype != torch.uint8 or w2.dtype != torch.uint8:
+        raise TypeError("NVFP4 MoE weights must use packed uint8 storage")
+    if (
+        w13_scales.dtype != torch.float8_e4m3fn
+        or w2_scales.dtype != torch.float8_e4m3fn
+    ):
+        raise TypeError("NVFP4 MoE scales must use float8_e4m3fn")
+    if w13_scales.shape != (experts, doubled_intermediate, hidden // 16):
+        raise ValueError("NVFP4 W13 scales have the wrong shape")
+    if w2_scales.shape != (experts, hidden, doubled_intermediate // 32):
+        raise ValueError("NVFP4 W2 scales have the wrong shape")
+    if reorder is None and shuffle is None:
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+
+        permutation_cache = {}
+        w13_rows = _maybe_get_cached_w3_w1_permute_indices(
+            permutation_cache, w13[0], 128
+        )
+        w13_scale_rows = _maybe_get_cached_w3_w1_permute_indices(
+            permutation_cache,
+            w13_scales[0].view(torch.uint8),
+            128,
+            num_elts_per_sf=16,
+        )
+        w2_rows = get_w2_permute_indices_with_cache(permutation_cache, w2[0], 128)
+        w2_scale_rows = get_w2_permute_indices_with_cache(
+            permutation_cache,
+            w2_scales[0].view(torch.uint8),
+            128,
+            num_elts_per_sf=16,
+        )
+    elif reorder is not None and shuffle is not None:
+
+        def permutation(rows: int, *, gated: bool, device: torch.device) -> Tensor:
+            probe = torch.arange(rows, dtype=torch.long, device=device).view(rows, 1)
+            if gated:
+                probe = reorder(probe)
+            return shuffle(probe, 128).flatten()
+
+        w13_rows = permutation(doubled_intermediate, gated=True, device=w13.device)
+        w13_scale_rows = w13_rows
+        w2_rows = permutation(hidden, gated=False, device=w2.device)
+        w2_scale_rows = w2_rows
+    else:
+        raise ValueError("reorder and shuffle must be provided together")
+    if interleave is None:
+        from flashinfer import nvfp4_block_scale_interleave
+
+        interleave = nvfp4_block_scale_interleave
+    with torch.no_grad():
+        # Transform one expert at a time to avoid another multi-GB allocation.
+        for expert in range(experts):
+            w13[expert].copy_(w13[expert].index_select(0, w13_rows))
+            w2[expert].copy_(w2[expert].index_select(0, w2_rows))
+            w13_scale_bytes = w13_scales[expert].view(torch.uint8)
+            w2_scale_bytes = w2_scales[expert].view(torch.uint8)
+            w13_scale_bytes.copy_(
+                interleave(
+                    w13_scales[expert]
+                    .index_select(0, w13_scale_rows)
+                    .contiguous()
+                    .view(torch.uint8)
+                ).reshape_as(w13_scale_bytes)
+            )
+            w2_scale_bytes.copy_(
+                interleave(
+                    w2_scales[expert]
+                    .index_select(0, w2_scale_rows)
+                    .contiguous()
+                    .view(torch.uint8)
+                ).reshape_as(w2_scale_bytes)
+            )
+    for tensor in tensors:
+        setattr(tensor, "_resin_nvfp4_moe_layout", True)
+
+
+__all__ = [
+    "Nvfp4Linear",
+    "prepare_nvfp4_modules",
+    "prepare_nvfp4_moe_weights",
+    "quantize_nvfp4",
+    "swizzle_block_scales",
+]
