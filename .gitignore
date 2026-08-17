@@ -11,3 +11,4 @@ target/
 *.dSYM/
 *.so
 artifacts/
+profiles/
