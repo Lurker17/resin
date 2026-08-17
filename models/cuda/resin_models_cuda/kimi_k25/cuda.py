@@ -83,7 +83,7 @@ class KimiK25CudaRunner(SyncRunner):
         speculative_tokens: int = 3,
         prefill_chunk_size: int = 4096,
         eagle_version: EagleVersion | str | None = None,
-        gpu_memory_utilization: float = 0.95,
+        gpu_memory_utilization: float = 0.90,
         cache_parent_capacity: int | None = None,
     ) -> None:
         for name, value in (
