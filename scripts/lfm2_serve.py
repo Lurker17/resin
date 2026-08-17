@@ -23,7 +23,7 @@ def main() -> None:
     engine = Engine(runner, eos_token_id=runner.eos_token_id)
 
     print(f"Serving {model} at http://127.0.0.1:8000")
-    HttpServer(engine, renderer, model=model).serve()
+    HttpServer(engine, renderer=renderer, model=model).serve()
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from resin._resin import Engine, _HttpServer
 from resin.protocols import (
@@ -19,13 +19,16 @@ from resin.protocols import (
     ResponseParser,
 )
 
+if TYPE_CHECKING:
+    from renderers import Renderer
 
-class RendererCodec:
+
+class RendererCodec(ConversationCodec):
     """Adapt a ``renderers.Renderer`` to Resin's streaming server contract."""
 
     def __init__(
         self,
-        renderer: Any,
+        renderer: Renderer,
         *,
         tokenizer: Any | None = None,
         include_generation_prefix_in_parser: bool = False,
@@ -174,8 +177,8 @@ class HttpServer:
     def __init__(
         self,
         engine: Engine,
-        renderer: Any | None = None,
         *,
+        renderer: Renderer | None = None,
         codec: ConversationCodec | None = None,
         model: str | None = None,
         enable_openai: bool = True,

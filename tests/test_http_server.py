@@ -238,7 +238,7 @@ def test_http_server_validates_route_configuration() -> None:
     with pytest.raises(ValueError, match="requires enable_openai"):
         HttpServer(
             Engine(IncrementingRunner()),
-            FakeRenderer(),
+            renderer=FakeRenderer(),
             model="test",
             enable_openai=False,
             enable_demo=True,

@@ -222,6 +222,11 @@ HttpServer(engine, codec=my_codec, model="my-model").serve()
 reasoning, and tool-call deltas. `RendererCodec` supplies this contract for the
 optional `renderers` package.
 
+`resin.server.media` provides optional image decoding and OpenAI-style message
+normalization helpers for model bring-up, demos, and tests. Codecs do not have
+to use them. Security-sensitive servers should enforce their own input-size,
+MIME, codec, and fetching policy before constructing model media.
+
 ## Current shape
 
 The native layer currently provides:

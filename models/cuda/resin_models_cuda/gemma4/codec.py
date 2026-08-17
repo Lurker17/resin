@@ -2,81 +2,14 @@
 
 from __future__ import annotations
 
-import base64
-import copy
-import re
 from collections.abc import Sequence
 from typing import Any
 
-import numpy as np
-
-from resin_models_cuda.gemma4.media import (
-    Gemma4Media,
-    canonical_rgb_image,
-    decode_image,
+from resin.server.media import (
+    normalize_image_messages,
+    normalized_rgb_from_data_url,
 )
-
-_DATA_URL = re.compile(
-    r"^data:(?P<media_type>[-\w.+]+/[-\w.+]+);base64,(?P<payload>.*)$",
-    re.DOTALL,
-)
-
-
-def normalized_rgb_from_data_url(value: str) -> np.ndarray:
-    """Decode a data URL at the HTTP edge into canonical float32 RGB/HWC."""
-
-    match = _DATA_URL.fullmatch(value)
-    if match is None:
-        raise ValueError(
-            "Gemma 4 image URLs must be base64 data URLs; remote fetching is disabled"
-        )
-    try:
-        payload = base64.b64decode(match.group("payload"), validate=True)
-    except ValueError as error:
-        raise ValueError("image data URL contains invalid base64") from error
-    image = decode_image(payload, match.group("media_type"))
-    return canonical_rgb_image(
-        np.asarray(image, dtype=np.float32) / np.float32(255.0)
-    )
-
-
-def _image_value(block: dict[str, Any]) -> Any:
-    value = block.get("image")
-    if value is not None:
-        return value
-    value = block.get("image_url")
-    if isinstance(value, dict):
-        value = value.get("url")
-    return value
-
-
-def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    normalized = copy.deepcopy(messages)
-    for message in normalized:
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        blocks = []
-        for block in content:
-            if not isinstance(block, dict):
-                raise TypeError("message content blocks must be objects")
-            kind = block.get("type")
-            if kind in {"image", "image_url", "input_image"}:
-                value = _image_value(block)
-                if isinstance(value, str):
-                    value = normalized_rgb_from_data_url(value)
-                if not isinstance(value, np.ndarray):
-                    raise TypeError("image content must contain a NumPy array or data URL")
-                blocks.append({"type": "image", "image": canonical_rgb_image(value)})
-            elif kind in {"text", "input_text"}:
-                text = block.get("text")
-                if not isinstance(text, str):
-                    raise TypeError("text content blocks must contain text")
-                blocks.append({"type": "text", "text": text})
-            else:
-                blocks.append(block)
-        message["content"] = blocks
-    return normalized
+from resin_models_cuda.gemma4.media import Gemma4Media
 
 
 class Gemma4Codec:
@@ -88,7 +21,7 @@ class Gemma4Codec:
         self.eos_token_ids = tuple(int(token) for token in eos_token_ids)
 
     def render(self, request: dict[str, Any]) -> dict[str, Any]:
-        messages = _normalize_messages(request["messages"])
+        messages = normalize_image_messages(request["messages"])
         media = Gemma4Media.from_messages(
             self.processor,
             messages,

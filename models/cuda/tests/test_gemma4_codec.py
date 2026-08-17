@@ -8,7 +8,8 @@ import pytest
 import torch
 from PIL import Image
 
-from resin_models_cuda.gemma4.codec import Gemma4Codec, normalized_rgb_from_data_url
+from resin.server.media import normalized_rgb_from_data_url
+from resin_models_cuda.gemma4.codec import Gemma4Codec
 from resin_models_cuda.gemma4.media import Gemma4Media
 
 
@@ -83,4 +84,3 @@ def test_codec_attaches_media_and_keeps_codec_work_out_of_engine() -> None:
     parser = codec.create_parser({}, [])
     assert parser.feed([3]) == [{"type": "text_delta", "delta": "3"}]
     assert parser.feed([4]) == [{"type": "text_delta", "delta": "4"}]
-

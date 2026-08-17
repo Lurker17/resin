@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import io
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,31 +11,7 @@ import torch
 from torch import Tensor
 
 from resin.protocols import MediaTokenSpan
-
-_IMAGE_MIME_TYPES = {
-    "image/avif",
-    "image/bmp",
-    "image/gif",
-    "image/jpeg",
-    "image/png",
-    "image/tiff",
-    "image/webp",
-}
-
-
-def decode_image(data: bytes, media_type: str):
-    """Decode one explicitly typed image into an owned RGB PIL image."""
-
-    if media_type.lower() not in _IMAGE_MIME_TYPES:
-        raise ValueError(f"unsupported image media type: {media_type!r}")
-    if not data:
-        raise ValueError("image bytes must not be empty")
-    from PIL import Image
-
-    with Image.open(io.BytesIO(data)) as source:
-        source.verify()
-    with Image.open(io.BytesIO(data)) as source:
-        return source.convert("RGB").copy()
+from resin.server.media import canonical_rgb_image, decode_image
 
 
 def _owned_cpu_tensor(value: Any, name: str, *, ndim: int) -> Tensor:
@@ -273,22 +248,6 @@ def _single_row(value: Any, name: str) -> Tensor:
     if tensor.shape[0] != 1:
         raise ValueError(f"{name} must contain exactly one prompt")
     return tensor[0].to(torch.int64)
-
-
-def canonical_rgb_image(image: np.ndarray, *, index: int = 0) -> np.ndarray:
-    """Validate and own one float32 RGB/HWC image in ``[0, 1]``."""
-
-    if not isinstance(image, np.ndarray):
-        raise TypeError(f"images[{index}] must be a numpy array")
-    if image.dtype != np.float32:
-        raise TypeError(f"images[{index}] must have dtype float32")
-    if image.ndim != 3 or image.shape[-1] != 3:
-        raise ValueError(f"images[{index}] must have RGB/HWC shape [height, width, 3]")
-    if image.shape[0] == 0 or image.shape[1] == 0:
-        raise ValueError(f"images[{index}] height and width must be positive")
-    if not np.isfinite(image).all() or image.min() < 0.0 or image.max() > 1.0:
-        raise ValueError(f"images[{index}] values must be finite and in [0, 1]")
-    return np.ascontiguousarray(image).copy()
 
 
 def _media_digest(media: Gemma4Media) -> str:
