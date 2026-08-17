@@ -133,8 +133,6 @@ def append_kv(
 
 def paged_attention(
     queries: Tensor,
-    keys: Tensor | None,
-    values: Tensor | None,
     *,
     cache: DeviceCache,
     group_index: int,
@@ -148,25 +146,13 @@ def paged_attention(
     relative_logits: Tensor | None = None,
     prepared_batch: PagedAttentionBatch | None = None,
 ) -> Tensor:
-    """Append K/V and run causal paged FA4 for a uniform-width batch."""
+    """Run causal paged FA4 for a uniform-width batch."""
 
     from flash_attn.cute import flash_attn_varlen_func
 
     if queries.ndim != 4 or positions.shape != queries.shape[:2]:
         raise ValueError("Inkling attention expects [batch, tokens, heads, dim]")
     batch, tokens = positions.shape
-    if (keys is None) != (values is None):
-        raise ValueError("Inkling attention must provide both K and V or neither")
-    if keys is not None and values is not None:
-        append_kv(
-            cache,
-            group_index=group_index,
-            layer=layer,
-            layer_count=layer_count,
-            positions=positions,
-            keys=keys,
-            values=values,
-        )
     if prepared_batch is None:
         group = cache.groups[group_index]
         page_table = cache.pages(group_index, layer, layer_count)

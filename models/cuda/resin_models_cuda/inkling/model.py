@@ -78,35 +78,16 @@ def select_convolution_state(
 ) -> Tensor:
     """Select the width-three state after each row's accepted token count."""
 
-    if initial.ndim != 4 or inputs.ndim != 4:
-        raise ValueError("Inkling convolution histories must be rank four")
-    batch, layers, state_length, width = initial.shape
-    if (
-        state_length != STATE_LENGTH
-        or inputs.shape[0] != batch
-        or inputs.shape[2:] != (layers, width)
-        or processed.shape != (batch,)
-    ):
-        raise ValueError("Inkling convolution history geometry is malformed")
-    if out is None:
-        out = torch.empty_like(initial)
-    elif out.shape != initial.shape:
-        raise ValueError("Inkling convolution state output has the wrong shape")
-    rows = torch.arange(batch, device=initial.device)
-    initial_by_token = initial.transpose(1, 2)
-    max_input = inputs.shape[1] - 1
-    for offset in range(STATE_LENGTH):
-        source = processed + offset
-        from_initial = initial_by_token[rows, source.clamp(0, STATE_LENGTH - 1)]
-        from_inputs = inputs[rows, (source - STATE_LENGTH).clamp(0, max_input)]
-        out[:, :, offset].copy_(
-            torch.where(
-                (source < STATE_LENGTH)[:, None, None],
-                from_initial,
-                from_inputs,
-            )
-        )
-    return out
+    from resin_models_cuda.inkling.cutile import (
+        select_convolution_state as persistent_select_convolution_state,
+    )
+
+    return persistent_select_convolution_state(
+        initial,
+        inputs,
+        processed,
+        out=out,
+    )
 
 
 def _deinterleave_w13(weight: Tensor, *, up_first: bool) -> Tensor:
@@ -134,9 +115,10 @@ class DenseMlp(nn.Module):
         self.global_scale = nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
 
     def forward(self, hidden: Tensor) -> Tensor:
-        return F.linear(interleaved_swiglu(F.linear(hidden, self.w13)), self.w2) * (
-            self.global_scale
-        )
+        from resin_models_cuda.inkling.cutile import dense_swiglu
+
+        projected = F.linear(hidden, self.w13)
+        return F.linear(dense_swiglu(projected), self.w2) * self.global_scale
 
 
 class Router(nn.Module):
@@ -159,34 +141,21 @@ class Router(nn.Module):
         self.global_scale = nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
 
     def forward(self, hidden: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        flat = hidden.reshape(-1, hidden.shape[-1])
-        logits = F.linear(flat, self.weight).float()
-        routed_logits = logits[:, : self.routed_experts]
-        choice = torch.sigmoid(routed_logits) + self.bias.float()
-        indices = torch.topk(choice, self.top_k, dim=-1, sorted=False).indices
-        if hidden.is_cuda:
-            from resin_models_cuda.inkling.cutile import router_weights
+        from resin_models_cuda.inkling.cutile import router_choice, router_weights
 
-            weights, shared_weights = router_weights(
-                logits,
-                indices,
-                self.global_scale,
-                self.route_scale,
-                routed_experts=self.routed_experts,
-                shared_experts=self.shared_experts,
-            )
-            return indices, weights, shared_weights
-        chosen = routed_logits.gather(1, indices)
-        shared = logits[:, self.routed_experts :]
-        selected = torch.cat((chosen, shared), dim=-1)
-        log_prob = F.logsigmoid(selected)
-        weights = torch.softmax(log_prob, dim=-1)
-        weights *= self.route_scale * self.global_scale.float()
-        return (
+        flat = hidden.reshape(-1, hidden.shape[-1])
+        logits = F.linear(flat, self.weight)
+        choice = router_choice(logits, self.bias)
+        indices = torch.topk(choice, self.top_k, dim=-1, sorted=False).indices
+        weights, shared_weights = router_weights(
+            logits,
             indices,
-            weights[:, : self.top_k].to(torch.bfloat16),
-            weights[:, self.top_k :].to(torch.bfloat16),
+            self.global_scale,
+            self.route_scale,
+            routed_experts=self.routed_experts,
+            shared_experts=self.shared_experts,
         )
+        return indices, weights, shared_weights
 
 
 class SharedExperts(nn.Module):
@@ -203,15 +172,21 @@ class SharedExperts(nn.Module):
             torch.empty(experts, hidden, intermediate, dtype=torch.bfloat16)
         )
 
-    def forward(self, hidden: Tensor, gammas: Tensor) -> Tensor:
+    def forward(
+        self,
+        hidden: Tensor,
+        gammas: Tensor,
+        routed: Tensor,
+    ) -> Tensor:
+        from resin_models_cuda.inkling.cutile import shared_reduce_add, shared_swiglu
+
         shape = hidden.shape
         flat = hidden.reshape(-1, shape[-1])
         expanded = flat.unsqueeze(0).expand(self.experts, -1, -1)
         projected = torch.bmm(expanded, self.w13.transpose(1, 2))
-        activated = interleaved_swiglu(projected)
-        activated *= gammas.transpose(0, 1).unsqueeze(-1)
+        activated = shared_swiglu(projected, gammas)
         output = torch.bmm(activated, self.w2.transpose(1, 2))
-        return output.float().sum(0).to(hidden.dtype).view(shape)
+        return shared_reduce_add(output, routed).view(shape)
 
 
 class Bf16Experts(nn.Module):
@@ -419,7 +394,7 @@ class SparseMlp(nn.Module):
         flat = hidden.reshape(-1, shape[-1])
         ids, weights, gammas = self.router(flat)
         routed = self.routed(flat, ids, weights).view(shape)
-        return routed + self.shared(hidden, gammas)
+        return self.shared(hidden, gammas, routed.view(-1, shape[-1]))
 
 
 class InklingAttention(nn.Module):
@@ -475,40 +450,29 @@ class InklingAttention(nn.Module):
         q = self.wq(hidden).view(batch, tokens, self.heads, self.head_dim)
         k_input = self.wk(hidden)
         v_input = self.wv(hidden)
-        k: Tensor | None
-        v: Tensor | None
-        if hidden.is_cuda and tokens == 6:
-            from resin_models_cuda.inkling.cutile import kv_sconv_norm_store
+        from resin_models_cuda.inkling.cutile import kv_sconv_norm_store
 
-            group = cache.groups[self.group]
-            k_state, v_state = kv_sconv_norm_store(
-                k_input,
-                v_input,
-                k_state,
-                v_state,
-                self.k_sconv.weight,
-                self.v_sconv.weight,
-                self.k_norm.weight,
-                cache.keys,
-                cache.values,
-                group.slab_ids,
-                group.slotnums,
-                group.first_blocks,
-                positions,
-                page_tokens=cache.page_tokens,
-                slab_units=cache.slab_units,
-                layer_count=self.cache_layers,
-                layer=self.cache_layer,
-                epsilon=self.k_norm.eps,
-            )
-            k = None
-            v = None
-        else:
-            k, k_state = self.k_sconv(k_input, k_state)
-            v, v_state = self.v_sconv(v_input, v_state)
-            k = k.view(batch, tokens, self.kv_heads, self.head_dim)
-            v = v.view(batch, tokens, self.kv_heads, self.head_dim)
-            k = self.k_norm(k)
+        group = cache.groups[self.group]
+        k_state, v_state = kv_sconv_norm_store(
+            k_input,
+            v_input,
+            k_state,
+            v_state,
+            self.k_sconv.weight,
+            self.v_sconv.weight,
+            self.k_norm.weight,
+            cache.keys,
+            cache.values,
+            group.slab_ids,
+            group.slotnums,
+            group.first_blocks,
+            positions,
+            page_tokens=cache.page_tokens,
+            slab_units=cache.slab_units,
+            layer_count=self.cache_layers,
+            layer=self.cache_layer,
+            epsilon=self.k_norm.eps,
+        )
         q = self.q_norm(q)
         relative = self.wr(hidden).view(batch * tokens, self.heads, -1)
         relative = relative @ self.rel_proj
@@ -520,8 +484,6 @@ class InklingAttention(nn.Module):
             relative = (relative.float() * tau.reshape(-1, 1, 1)).to(relative.dtype)
         attended = paged_attention(
             q,
-            k,
-            v,
             cache=cache,
             group_index=self.group,
             layer=self.cache_layer,
@@ -589,32 +551,24 @@ class DecoderLayer(nn.Module):
             v_state,
         )
         attn_input = attended
-        if hidden.is_cuda and hidden.shape[1] == 6:
-            from resin_models_cuda.inkling.cutile import sconv_residual
+        from resin_models_cuda.inkling.cutile import sconv_residual
 
-            hidden, attn_state = sconv_residual(
-                attn_input,
-                attn_state,
-                self.attn_sconv.weight,
-                residual,
-            )
-        else:
-            attended, attn_state = self.attn_sconv(attn_input, attn_state)
-            hidden = residual + attended
+        hidden, attn_state = sconv_residual(
+            attn_input,
+            attn_state,
+            self.attn_sconv.weight,
+            residual,
+        )
         residual = hidden
         mlp_hidden = self.mlp(self.mlp_norm(hidden))
         tap = residual + mlp_hidden
         mlp_input = mlp_hidden
-        if hidden.is_cuda and hidden.shape[1] == 6:
-            hidden, mlp_state = sconv_residual(
-                mlp_input,
-                mlp_state,
-                self.mlp_sconv.weight,
-                residual,
-            )
-        else:
-            mlp_hidden, mlp_state = self.mlp_sconv(mlp_input, mlp_state)
-            hidden = residual + mlp_hidden
+        hidden, mlp_state = sconv_residual(
+            mlp_input,
+            mlp_state,
+            self.mlp_sconv.weight,
+            residual,
+        )
         new_state = torch.cat((k_state, v_state, attn_state, mlp_state), dim=-1)
         state_inputs = None
         if record_state_inputs:

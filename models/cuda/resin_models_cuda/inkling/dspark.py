@@ -129,10 +129,17 @@ class DSparkAttention(nn.Module):
         queries = self.q_proj(hidden).view(batch, tokens, self.heads, self.head_dim)
         queries = apply_neox_rope(self.q_norm(queries), positions, self.cos, self.sin)
         keys, values = self.project_kv(hidden, positions)
+        append_kv(
+            cache,
+            group_index=DRAFT_GROUP,
+            layer=self.layer_id,
+            layer_count=DRAFT_LAYERS,
+            positions=positions,
+            keys=keys,
+            values=values,
+        )
         output = paged_attention(
             queries,
-            keys,
-            values,
             cache=cache,
             group_index=DRAFT_GROUP,
             layer=self.layer_id,

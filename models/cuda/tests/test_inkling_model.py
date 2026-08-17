@@ -16,6 +16,20 @@ from resin_models_cuda.inkling.model import (
 from resin_models_cuda.inkling.weights import _indexed_target_files
 
 
+def _cutile_available() -> bool:
+    try:
+        import cuda.tile as ct
+    except ImportError:
+        return False
+    return torch.cuda.is_available() and hasattr(ct, "Array")
+
+
+requires_cutile = pytest.mark.skipif(
+    not _cutile_available(),
+    reason="requires CUDA and cuTile",
+)
+
+
 def test_short_convolution_split_matches_one_pass() -> None:
     torch.manual_seed(4)
     convolution = ShortConvolution(5)
@@ -32,10 +46,13 @@ def test_short_convolution_split_matches_one_pass() -> None:
     torch.testing.assert_close(actual_state, expected_state)
 
 
+@requires_cutile
 def test_accepted_prefix_selects_exact_convolution_window() -> None:
-    initial = torch.arange(2 * 3 * 3 * 4).reshape(2, 3, 3, 4)
-    inputs = 1_000 + torch.arange(2 * 6 * 3 * 4).reshape(2, 6, 3, 4)
-    processed = torch.tensor([1, 5])
+    initial = torch.arange(2 * 3 * 3 * 256, device="cuda", dtype=torch.bfloat16)
+    initial = initial.reshape(2, 3, 3, 256) % 128
+    inputs = torch.arange(2 * 6 * 3 * 256, device="cuda", dtype=torch.bfloat16)
+    inputs = 1_000 + inputs.reshape(2, 6, 3, 256) % 128
+    processed = torch.tensor([1, 5], device="cuda")
     actual = select_convolution_state(initial, inputs, processed)
 
     for row, count in enumerate(processed.tolist()):
@@ -44,12 +61,18 @@ def test_accepted_prefix_selects_exact_convolution_window() -> None:
         torch.testing.assert_close(actual[row], expected)
 
 
+@requires_cutile
 def test_all_six_verified_tokens_select_the_final_three_inputs() -> None:
-    initial = torch.full((1, 2, 3, 7), -1.0)
-    inputs = torch.arange(1 * 6 * 2 * 7).reshape(1, 6, 2, 7).float()
+    initial = torch.full((1, 2, 3, 256), -1.0, device="cuda")
+    inputs = torch.arange(1 * 6 * 2 * 256, device="cuda").reshape(1, 6, 2, 256)
     out = torch.empty_like(initial)
 
-    selected = select_convolution_state(initial, inputs, torch.tensor([6]), out=out)
+    selected = select_convolution_state(
+        initial,
+        inputs,
+        torch.tensor([6], device="cuda"),
+        out=out,
+    )
 
     assert selected.data_ptr() == out.data_ptr()
     torch.testing.assert_close(selected, inputs[:, -3:].transpose(1, 2))
