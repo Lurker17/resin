@@ -33,6 +33,7 @@ from resin.backend.cuda.sampling import (
     SamplingTensors,
 )
 from resin.backend.cuda.staging import TensorStager
+from resin.backend.plans import BatchView
 from resin.backend.speculative import accept_speculative_tokens
 from resin.protocols import SyncRunner
 from resin_models_cuda.deepseek_v4.cache import (
@@ -561,26 +562,20 @@ class DeepSeekV4CudaRunner(SyncRunner):
         )
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
-        row_count = plan.num_sequences
-        if row_count == 0 or row_count > self.max_batch_size:
+        batch = BatchView.from_plan(plan)
+        row_count = batch.num_sequences
+        if row_count > self.max_batch_size:
             raise ValueError("DeepSeek-V4 batch size is outside runner capacity")
-        indptr = plan.token_indptr
-        if (
-            len(indptr) != row_count + 1
-            or indptr[0] != 0
-            or indptr[-1] != len(plan.token_ids)
-            or np.any(indptr[1:] <= indptr[:-1])
-        ):
-            raise ValueError("DeepSeek-V4 sequence metadata is malformed")
-        if len(plan.context_lengths) != row_count:
-            raise ValueError("DeepSeek-V4 requires one context length per sequence")
-        if len(set(plan.sequence_ids)) != row_count:
+        if len(set(batch.sequence_ids)) != row_count:
             raise ValueError("DeepSeek-V4 sequence IDs must be unique within a batch")
-        rows = tuple((int(start), int(end)) for start, end in zip(indptr, indptr[1:]))
+        rows = tuple(
+            (int(start), int(end))
+            for start, end in zip(batch.token_indptr, batch.token_indptr[1:])
+        )
 
-        if plan.phase == BatchPhase.PREFILL:
+        if batch.phase == BatchPhase.PREFILL:
             pass
-        elif plan.phase == BatchPhase.DECODE:
+        elif batch.phase == BatchPhase.DECODE:
             if any(end - start != 1 for start, end in rows):
                 raise ValueError("DeepSeek-V4 decode rows must contain one token")
         else:

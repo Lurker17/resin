@@ -117,9 +117,12 @@ def test_plan_preserves_structured_parent_and_child_addresses() -> None:
     )
     plan = SimpleNamespace(
         num_sequences=1,
+        sequence_ids=np.array([1], dtype=np.uint64),
+        token_ids=np.array([7], dtype=np.uint32),
         token_indptr=np.array([0, 1], dtype=np.uint32),
         positions=np.array([0], dtype=np.uint32),
         context_lengths=np.array([0], dtype=np.uint32),
+        sampling_mask=np.array([True]),
         cache_groups=cache_groups,
         phase=BatchPhase.PREFILL,
     )

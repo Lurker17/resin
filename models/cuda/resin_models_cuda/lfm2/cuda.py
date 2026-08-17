@@ -23,6 +23,7 @@ from resin import (
 from resin.backend.cuda.paged_kv import PagedKvCsr
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
+from resin.backend.plans import BatchView, CacheGroupView
 from resin.protocols import SyncRunner
 from resin_models_cuda.lfm2.plan import CacheMetadata, build_cache_metadata
 from resin_models_torch.lfm2.reference import (
@@ -95,17 +96,6 @@ class _Lfm2CacheArena:
 
     def bind(self, pool_id: int, layout) -> int:
         return self.binding.bind(pool_id, layout)
-
-    def check_addresses(self, group: int, parents, child_slots) -> None:
-        packing = 1 if group == 0 else self.state_packing
-        if len(parents) != len(child_slots) or any(
-            parent <= 0
-            or parent > self.parent_capacity
-            or child_slot < 0
-            or child_slot >= packing
-            for parent, child_slot in zip(parents, child_slots)
-        ):
-            raise ValueError("BatchPlan cache address is outside the physical arena")
 
     def state(self, address: tuple[int, int]):
         parent, child_slot = address
@@ -271,36 +261,32 @@ class Lfm2CudaRunner(SyncRunner):
         groups = tuple(plan.cache_groups)
         if len(groups) != 2 or tuple(group.group_index for group in groups) != (0, 1):
             raise ValueError("BatchPlan does not contain LFM2 history and state groups")
-        derived = build_cache_metadata(plan, self.page_size)
-        self._cache.check_addresses(
-            0,
-            plan.cache_groups[0].block_slab_ids,
-            plan.cache_groups[0].block_slotnums,
+        return build_cache_metadata(
+            plan,
+            self.page_size,
+            parent_capacity=self._cache.parent_capacity,
         )
-        return derived
 
     def _state_rows(self, plan: BatchPlan) -> tuple[_StateRow, ...]:
-        group = plan.cache_groups[1]
-        if group.blocks_per_slab != self._cache.state_packing:
-            raise ValueError("LFM2 State packing does not match the physical arena")
+        batch = BatchView.from_plan(plan)
+        if len(batch.cache_groups) != 2:
+            raise ValueError("LFM2 requires History and State cache groups")
+        group = CacheGroupView.from_plan(
+            batch.cache_groups[1],
+            batch,
+            group_index=1,
+            blocks_per_slab=self._cache.state_packing,
+            parent_capacity=self._cache.parent_capacity,
+            block_tokens=_STATE_CHECKPOINT_TOKENS,
+        )
         block_indptr = group.block_indptr
         block_parents = group.block_slab_ids
         block_slotnums = group.block_slotnums
         first_blocks = group.block_table_start_indices
-        rows = plan.num_sequences
-        if (
-            len(block_indptr) != rows + 1
-            or block_indptr[0] != 0
-            or block_indptr[-1] != len(block_parents)
-            or len(block_parents) != len(block_slotnums)
-            or len(first_blocks) != rows
-        ):
-            raise ValueError("LFM2 state page table is malformed")
-        self._cache.check_addresses(1, block_parents, block_slotnums)
         result = []
-        for index, context in enumerate(plan.context_lengths):
+        for index, context in enumerate(batch.context_lengths):
             context = int(context)
-            token_start, token_end = map(int, plan.token_indptr[index : index + 2])
+            token_start, token_end = map(int, batch.token_indptr[index : index + 2])
             post_length = context + token_end - token_start
             first = int(first_blocks[index])
             page_start, page_end = map(int, block_indptr[index : index + 2])

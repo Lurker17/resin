@@ -8,6 +8,7 @@ import numpy as np
 import numpy.typing as npt
 
 from resin import BatchPhase
+from resin.backend.plans import BatchView, CacheGroupView
 
 PAGE_SIZE = 128
 SLIDING_WINDOW = 128
@@ -17,68 +18,6 @@ PREFILL_CHUNK_SIZE = 8192
 # ``SLIDING_WINDOW`` tokens; this wider physical suffix permits one 8K prefill.
 WINDOW_RETENTION_TOKENS = PREFILL_CHUNK_SIZE + SLIDING_WINDOW - 1
 WINDOW_TABLE_WIDTH = 1 + (WINDOW_RETENTION_TOKENS - 1 + PAGE_SIZE - 1) // PAGE_SIZE
-
-
-@dataclass(frozen=True, slots=True)
-class CacheGroup:
-    index: int
-    indptr: npt.NDArray[np.uint32]
-    pages: npt.NDArray[np.uint32]
-    first_blocks: npt.NDArray[np.uint32]
-    append_pages: npt.NDArray[np.uint32]
-    append_offsets: npt.NDArray[np.uint32]
-
-    @classmethod
-    def from_native(
-        cls, native, index: int, rows: int, tokens: int, capacity: int | None
-    ) -> CacheGroup:
-        if native.group_index != index:
-            raise ValueError("cache groups must be ordered History then Window")
-        if native.blocks_per_slab != 1:
-            raise ValueError("GPT-OSS cache groups require one block per parent")
-        block_parents = np.asarray(native.block_slab_ids, dtype=np.uint32)
-        block_slots = np.asarray(native.block_slotnums, dtype=np.uint32)
-        append_parents = np.asarray(native.append_slab_ids, dtype=np.uint32)
-        append_slots = np.asarray(native.append_slotnums, dtype=np.uint32)
-        group = cls(
-            index,
-            np.asarray(native.block_indptr, dtype=np.uint32),
-            block_parents,
-            np.asarray(native.block_table_start_indices, dtype=np.uint32),
-            append_parents,
-            np.asarray(native.append_block_offsets, dtype=np.uint32),
-        )
-        if (
-            len(group.indptr) != rows + 1
-            or group.indptr[0] != 0
-            or group.indptr[-1] != len(group.pages)
-            or np.any(group.indptr[1:] < group.indptr[:-1])
-            or len(block_parents) != len(block_slots)
-            or len(append_parents) != len(append_slots)
-        ):
-            raise ValueError("cache block_indptr is malformed")
-        if len(group.first_blocks) != rows:
-            raise ValueError("cache block_table_start_indices does not cover every row")
-        if len(group.append_pages) != tokens or len(group.append_offsets) != tokens:
-            raise ValueError("cache append metadata does not cover every token")
-        if (
-            np.any(group.pages == 0)
-            or np.any(group.append_pages == 0)
-            or np.any(block_slots != 0)
-            or np.any(append_slots != 0)
-        ):
-            raise ValueError("cache physical addresses are malformed")
-        if np.any(group.append_offsets >= PAGE_SIZE):
-            raise ValueError("cache append offset is outside its page")
-        if capacity is not None and (
-            np.any(group.pages > capacity) or np.any(group.append_pages > capacity)
-        ):
-            raise ValueError("cache page is outside the bound allocation")
-        return group
-
-    def row(self, index: int) -> npt.NDArray[np.uint32]:
-        start, end = map(int, self.indptr[index : index + 2])
-        return self.pages[start:end]
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,11 +73,11 @@ def _page_table(
 
 
 def _append_slots(
-    group: CacheGroup, token_indices: npt.NDArray[np.int64]
+    group: CacheGroupView, token_indices: npt.NDArray[np.int64]
 ) -> npt.NDArray[np.int64]:
     return (
-        group.append_pages[token_indices].astype(np.int64) * PAGE_SIZE
-        + group.append_offsets[token_indices]
+        group.append_slab_ids[token_indices].astype(np.int64) * PAGE_SIZE
+        + group.append_block_offsets[token_indices]
     )
 
 
@@ -147,36 +86,30 @@ def build_attention_batches(
 ) -> tuple[tuple[AttentionBatch, ...], AttentionBatch | None]:
     """Return one prefill batch or one decode batch from a homogeneous plan."""
 
-    tokens = np.asarray(plan.token_ids, dtype=np.uint32)
-    positions = np.asarray(plan.positions, dtype=np.uint32)
-    indptr = np.asarray(plan.token_indptr, dtype=np.uint32)
-    contexts = np.asarray(plan.context_lengths, dtype=np.uint32)
-    row_count = plan.num_sequences
-    if row_count == 0:
-        raise ValueError("GPT-OSS cannot execute an empty batch")
-    if (
-        len(positions) != len(tokens)
-        or len(indptr) != row_count + 1
-        or indptr[0] != 0
-        or indptr[-1] != len(tokens)
-        or np.any(indptr[1:] <= indptr[:-1])
-        or len(contexts) != row_count
-    ):
-        raise ValueError("sequence metadata does not describe nonempty token rows")
-    if plan.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
+    native = BatchView.from_plan(plan)
+    tokens = native.token_ids
+    positions = native.positions
+    indptr = native.token_indptr
+    contexts = native.context_lengths
+    row_count = native.num_sequences
+    if native.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
         raise ValueError("plan phase must be prefill or decode")
 
-    try:
-        native_groups = tuple(plan.cache_groups)
-    except (AttributeError, TypeError) as error:
-        raise ValueError("plan cache_groups must be iterable") from error
+    native_groups = native.cache_groups
     if len(native_groups) != 2:
         raise ValueError("GPT-OSS requires History and Window cache groups")
     history, window = tuple(
-        CacheGroup.from_native(group, index, row_count, len(tokens), parent_capacity)
+        CacheGroupView.from_plan(
+            group,
+            native,
+            group_index=index,
+            blocks_per_slab=1,
+            parent_capacity=parent_capacity,
+            block_tokens=PAGE_SIZE,
+        )
         for index, group in enumerate(native_groups)
     )
-    if np.intersect1d(history.pages, window.pages).size:
+    if np.intersect1d(history.block_slab_ids, window.block_slab_ids).size:
         raise ValueError("History and Window cannot address one parent in a batch")
 
     post_lengths = []
@@ -189,28 +122,32 @@ def build_attention_batches(
         last_block = (post_length - 1) // PAGE_SIZE
         expected_window_first = max(0, last_block + 1 - WINDOW_TABLE_WIDTH)
         if (
-            int(history.first_blocks[row]) != 0
-            or len(history.row(row)) != last_block + 1
+            int(history.block_table_start_indices[row]) != 0
+            or len(history.block_slabs(row)) != last_block + 1
         ):
             raise ValueError("History row is not the exact post-append prefix")
         if (
-            int(window.first_blocks[row]) != expected_window_first
-            or len(window.row(row)) != last_block - expected_window_first + 1
+            int(window.block_table_start_indices[row]) != expected_window_first
+            or len(window.block_slabs(row)) != last_block - expected_window_first + 1
         ):
             raise ValueError("Window row is not the exact active suffix")
         for group in (history, window):
-            pages = group.row(row)
+            pages = group.block_slabs(row)
             row_positions = positions[start:end]
-            relative = row_positions // PAGE_SIZE - group.first_blocks[row]
+            relative = (
+                row_positions // PAGE_SIZE - group.block_table_start_indices[row]
+            )
             if (
                 np.any(relative >= len(pages))
-                or not np.array_equal(group.append_pages[start:end], pages[relative])
                 or not np.array_equal(
-                    group.append_offsets[start:end], row_positions % PAGE_SIZE
+                    group.append_slab_ids[start:end], pages[relative]
+                )
+                or not np.array_equal(
+                    group.append_block_offsets[start:end], row_positions % PAGE_SIZE
                 )
             ):
                 raise ValueError("cache append destinations do not match the row")
-        if plan.phase == BatchPhase.PREFILL:
+        if native.phase == BatchPhase.PREFILL:
             if query_length > PREFILL_CHUNK_SIZE:
                 raise ValueError(
                     f"prefill query length exceeds {PREFILL_CHUNK_SIZE} tokens"
@@ -221,10 +158,12 @@ def build_attention_batches(
     rows = tuple(range(row_count))
     token_indices = np.arange(len(tokens), dtype=np.int64)
 
-    def group_view(group: CacheGroup):
-        page_rows = tuple(group.row(row) for row in rows)
+    def group_view(group: CacheGroupView):
+        page_rows = tuple(group.block_slabs(row) for row in rows)
         lengths = tuple(
-            post_lengths[row] - int(group.first_blocks[row]) * PAGE_SIZE for row in rows
+            post_lengths[row]
+            - int(group.block_table_start_indices[row]) * PAGE_SIZE
+            for row in rows
         )
         return page_rows, lengths
 
@@ -234,7 +173,7 @@ def build_attention_batches(
     sliding_width, sliding_table = _page_table(sliding_rows, WINDOW_TABLE_WIDTH)
     query_lengths = tuple(int(indptr[row + 1] - indptr[row]) for row in rows)
     batch = AttentionBatch(
-        phase=plan.phase,
+        phase=native.phase,
         token_indices=token_indices,
         sequence_indices=rows,
         query_lengths=query_lengths,
@@ -247,4 +186,4 @@ def build_attention_batches(
         full_append_slots=_append_slots(history, token_indices),
         sliding_append_slots=_append_slots(window, token_indices),
     )
-    return ((batch,), None) if plan.phase == BatchPhase.PREFILL else ((), batch)
+    return ((batch,), None) if native.phase == BatchPhase.PREFILL else ((), batch)

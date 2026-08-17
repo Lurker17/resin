@@ -22,6 +22,8 @@ the frozen native plan: `sequence_ids` is `uint64`; token, position, pointer,
 and sequence-index arrays are `uint32`. Repeated property access creates a new
 view, not a new data buffer. A runner should pass these arrays directly to its
 pinned host staging path rather than calling `list()` or `tuple()` first.
+`resin.backend.plans.BatchView` and `CacheGroupView` provide the shared row,
+packing, bounds, and append-coverage checks before model-specific lowering.
 
 `batch_id` is a monotonic tracing identifier for runner steps.
 `batch_key` is an optional caller-defined compatibility key; the scheduler does

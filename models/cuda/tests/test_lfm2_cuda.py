@@ -49,12 +49,7 @@ def _plan() -> BatchPlan:
 
 class _Cache:
     state_packing = 2
-
-    @staticmethod
-    def check_addresses(group, parents, child_slots):
-        assert group == 1
-        assert all(parent > 0 for parent in parents)
-        assert all(slot in (0, 1) for slot in child_slots)
+    parent_capacity = 32
 
 
 def test_attention_metadata_uses_only_the_history_group() -> None:

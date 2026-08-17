@@ -10,6 +10,7 @@ import numpy as np
 import numpy.typing as npt
 
 from resin import BatchPhase, CacheGroupLayout, CacheLayout, CacheRetention
+from resin.backend.plans import BatchView, CacheGroupView
 from resin.backend.resources import CachePoolBinding
 
 if TYPE_CHECKING:
@@ -544,54 +545,31 @@ class DeviceCache:
 def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> CachePlan:
     """Validate the six Engine-issued page tables before a CUDA launch."""
 
-    rows = plan.num_sequences
-    indptr = np.asarray(plan.token_indptr, dtype=np.uint32)
-    positions = np.asarray(plan.positions, dtype=np.uint32)
-    contexts = np.asarray(plan.context_lengths, dtype=np.uint32)
-    if (
-        rows == 0
-        or len(indptr) != rows + 1
-        or indptr[0] != 0
-        or indptr[-1] != len(positions)
-        or np.any(indptr[1:] <= indptr[:-1])
-        or len(contexts) != rows
-    ):
-        raise ValueError("DeepSeek sequence metadata is malformed")
-    native = tuple(plan.cache_groups)
+    batch = BatchView.from_plan(plan)
+    rows = batch.num_sequences
+    indptr = batch.token_indptr
+    positions = batch.positions
+    contexts = batch.context_lengths
+    native = batch.cache_groups
     if len(native) != GROUP_COUNT:
         raise ValueError(f"DeepSeek requires exactly {GROUP_COUNT} cache groups")
 
     groups = []
     for group_index, (source, descriptor) in enumerate(zip(native, layout.groups)):
-        block_indptr = np.asarray(source.block_indptr, dtype=np.uint32)
-        parent_ids = np.asarray(source.block_slab_ids, dtype=np.uint32)
-        child_slots = np.asarray(source.block_slotnums, dtype=np.uint32)
-        first = np.asarray(source.block_table_start_indices, dtype=np.uint32)
-        append_parents = np.asarray(source.append_slab_ids, dtype=np.uint32)
-        append_slots = np.asarray(source.append_slotnums, dtype=np.uint32)
-        append_offsets = np.asarray(source.append_block_offsets, dtype=np.uint32)
         block_tokens = descriptor.block_tokens
         packing = descriptor.blocks_per_slab
-        if (
-            source.group_index != group_index
-            or source.blocks_per_slab != packing
-            or len(block_indptr) != rows + 1
-            or block_indptr[0] != 0
-            or block_indptr[-1] != len(parent_ids)
-            or len(child_slots) != len(parent_ids)
-            or len(first) != rows
-            or len(append_parents) != len(positions)
-            or len(append_slots) != len(positions)
-            or len(append_offsets) != len(positions)
-            or np.any(parent_ids == 0)
-            or np.any(append_parents == 0)
-            or np.any(parent_ids > layout.parent_capacity)
-            or np.any(append_parents > layout.parent_capacity)
-            or np.any(child_slots >= packing)
-            or np.any(append_slots >= packing)
-            or np.any(append_offsets >= block_tokens)
-        ):
-            raise ValueError(f"DeepSeek cache group {group_index} is malformed")
+        group = CacheGroupView.from_plan(
+            source,
+            batch,
+            group_index=group_index,
+            blocks_per_slab=packing,
+            parent_capacity=layout.parent_capacity,
+            block_tokens=block_tokens,
+        )
+        first = group.block_table_start_indices
+        append_parents = group.append_slab_ids
+        append_slots = group.append_slotnums
+        append_offsets = group.append_block_offsets
         parent_rows = []
         slot_rows = []
         for row in range(rows):
@@ -600,7 +578,7 @@ def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> Cac
             end = int(end)
             context = int(contexts[row])
             leased = context + end - start
-            if plan.phase == BatchPhase.DECODE:
+            if batch.phase == BatchPhase.DECODE:
                 leased += decode_lookahead
             last = (leased - 1) // block_tokens
             if descriptor.retention is CacheRetention.WINDOW:
@@ -609,9 +587,8 @@ def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> Cac
                 )
             else:
                 expected_first = 0
-            page_start, page_end = map(int, block_indptr[row : row + 2])
-            row_parents = parent_ids[page_start:page_end]
-            row_slots = child_slots[page_start:page_end]
+            row_parents = group.block_slabs(row)
+            row_slots = group.block_slots(row)
             if (
                 int(first[row]) != expected_first
                 or len(row_parents) != last - expected_first + 1

@@ -8,6 +8,7 @@ import numpy as np
 import numpy.typing as npt
 
 from resin import BatchPhase
+from resin.backend.plans import BatchView, CacheGroupView
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,58 +40,36 @@ class CacheMetadata:
     prefill: PrefillMetadata
 
 
-def build_cache_metadata(plan, page_size: int) -> CacheMetadata:
+def build_cache_metadata(
+    plan, page_size: int, *, parent_capacity: int | None = None
+) -> CacheMetadata:
     """Derive kernel views from one homogeneous native History plan."""
 
     if page_size <= 0:
         raise ValueError("page_size must be positive")
-    rows = plan.num_sequences
-    indptr = plan.token_indptr
-    contexts = plan.context_lengths
-    positions = plan.positions
-    token_count = plan.num_tokens
-    if (
-        rows == 0
-        or len(indptr) != rows + 1
-        or indptr[0] != 0
-        or indptr[-1] != token_count
-        or np.any(indptr[1:] <= indptr[:-1])
-        or len(contexts) != rows
-        or len(positions) != token_count
-    ):
-        raise ValueError("sequence metadata does not describe nonempty token rows")
-    if plan.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
+    batch = BatchView.from_plan(plan)
+    rows = batch.num_sequences
+    indptr = batch.token_indptr
+    contexts = batch.context_lengths
+    positions = batch.positions
+    if batch.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
         raise ValueError("plan phase must be prefill or decode")
-    groups = tuple(plan.cache_groups)
+    groups = batch.cache_groups
     if len(groups) != 2 or tuple(group.group_index for group in groups) != (0, 1):
         raise ValueError("LFM2 requires History and State cache groups")
-    group = groups[0]
-    if group.blocks_per_slab != 1:
-        raise ValueError("LFM2 History requires one block per physical parent")
+    group = CacheGroupView.from_plan(
+        groups[0],
+        batch,
+        group_index=0,
+        blocks_per_slab=1,
+        parent_capacity=parent_capacity,
+        block_tokens=page_size,
+    )
     block_indptr = group.block_indptr
     page_indices = group.block_slab_ids
-    block_slotnums = group.block_slotnums
     first_blocks = group.block_table_start_indices
     append_pages = group.append_slab_ids
-    append_slotnums = group.append_slotnums
     append_offsets = group.append_block_offsets
-    if (
-        len(block_indptr) != rows + 1
-        or block_indptr[0] != 0
-        or block_indptr[-1] != len(page_indices)
-        or np.any(block_indptr[1:] < block_indptr[:-1])
-        or len(first_blocks) != rows
-        or len(append_pages) != token_count
-        or len(append_offsets) != token_count
-        or len(page_indices) != len(block_slotnums)
-        or len(append_pages) != len(append_slotnums)
-        or np.any(page_indices == 0)
-        or np.any(append_pages == 0)
-        or np.any(block_slotnums != 0)
-        or np.any(append_slotnums != 0)
-        or np.any(append_offsets >= page_size)
-    ):
-        raise ValueError("cache group metadata is malformed")
 
     dense_tokens: list[npt.NDArray[np.uint32]] = []
     dense_cu = [0]
@@ -125,7 +104,7 @@ def build_cache_metadata(plan, page_size: int) -> CacheMetadata:
 
         last_length = (post_length - 1) % page_size + 1
         last_lengths.append(last_length)
-        if plan.phase == BatchPhase.DECODE:
+        if batch.phase == BatchPhase.DECODE:
             if query_length != 1:
                 raise ValueError("decode rows must contain one token")
             decode_tokens.append(start)
