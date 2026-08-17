@@ -538,7 +538,7 @@ class Qwen35MTP(nn.Module):
         return self.norm(hidden)
 
 
-class Qwen35ForConditionalGeneration(nn.Module):
+class Qwen3_5ForConditionalGeneration(nn.Module):
     """Text-only target whose parameter names match the public checkpoint."""
 
     def __init__(self, config: Qwen35Config, *, include_mtp: bool) -> None:
@@ -558,7 +558,7 @@ class Qwen35ForConditionalGeneration(nn.Module):
 
 __all__ = [
     "Qwen35Attention",
-    "Qwen35ForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
     "Qwen35GatedDeltaNet",
     "Qwen35MTP",
     "Qwen35RMSNorm",

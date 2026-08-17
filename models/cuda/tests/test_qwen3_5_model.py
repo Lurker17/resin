@@ -6,7 +6,7 @@ from test_qwen3_5_config import _qwen38
 from resin_models_cuda.qwen3_5.checkpoint import _select_tensor_files
 from resin_models_cuda.qwen3_5.config import Qwen35Config
 from resin_models_cuda.qwen3_5.model import (
-    Qwen35ForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
     Qwen35GatedDeltaNet,
     Qwen35RMSNorm,
 )
@@ -67,7 +67,7 @@ def test_delta_net_chunk_matches_recurrent_steps() -> None:
 
 
 def test_target_and_optional_mtp_names_match_checkpoint() -> None:
-    model = Qwen35ForConditionalGeneration(_tiny_config(), include_mtp=True)
+    model = Qwen3_5ForConditionalGeneration(_tiny_config(), include_mtp=True)
     names = set(model.state_dict())
 
     assert "model.language_model.embed_tokens.weight" in names
@@ -110,7 +110,9 @@ def test_native_text_model_matches_transformers_reference() -> None:
         ],
     )
     config = Qwen35Config.from_hugging_face(values)  # type: ignore[arg-type]
-    native = Qwen35ForConditionalGeneration(config, include_mtp=False).language_model
+    native = Qwen3_5ForConditionalGeneration(
+        config, include_mtp=False
+    ).language_model
     reference = ReferenceModel(Qwen3_5TextConfig.from_dict(values))  # type: ignore[arg-type]
     reference.load_state_dict(native.state_dict())
     token_ids = torch.tensor([[1, 7, 12, 4]])

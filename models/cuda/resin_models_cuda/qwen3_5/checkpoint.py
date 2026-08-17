@@ -11,7 +11,7 @@ from resin.backend.loading import MODEL_FILES, read_config, resolve_model
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 from resin.backend.torch import use_default_dtype
 from resin_models_cuda.qwen3_5.config import Qwen35Config
-from resin_models_cuda.qwen3_5.model import Qwen35ForConditionalGeneration
+from resin_models_cuda.qwen3_5.model import Qwen3_5ForConditionalGeneration
 
 DEFAULT_MODEL = "Qwen/Qwen3.8-27B"
 DEFAULT_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
@@ -57,12 +57,12 @@ def load_config(model_path: str | Path) -> tuple[Qwen35Config, dict]:
 
 def build_meta_model(
     raw_config: dict[str, Any], *, include_mtp: bool
-) -> tuple[Qwen35ForConditionalGeneration, Qwen35Config]:
+) -> tuple[Qwen3_5ForConditionalGeneration, Qwen35Config]:
     config = Qwen35Config.from_hugging_face(raw_config)
     if include_mtp:
         config.require_mtp()
     with use_default_dtype(torch.bfloat16), torch.device("meta"):
-        model = Qwen35ForConditionalGeneration(config, include_mtp=include_mtp)
+        model = Qwen3_5ForConditionalGeneration(config, include_mtp=include_mtp)
     return model, config
 
 
@@ -109,7 +109,7 @@ def load_model(
     *,
     device: str | torch.device,
     include_mtp: bool,
-) -> tuple[Qwen35ForConditionalGeneration, Qwen35Config, dict[str, Any]]:
+) -> tuple[Qwen3_5ForConditionalGeneration, Qwen35Config, dict[str, Any]]:
     """Stream the text target and, when selected, its bundled MTP weights."""
 
     root = Path(model_path).expanduser().resolve()
