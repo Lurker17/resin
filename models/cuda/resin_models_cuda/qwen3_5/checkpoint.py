@@ -13,8 +13,8 @@ from resin.backend.torch import use_default_dtype
 from resin_models_cuda.qwen3_5.config import Qwen35Config
 from resin_models_cuda.qwen3_5.model import Qwen3_5ForConditionalGeneration
 
-DEFAULT_MODEL = "Qwen/Qwen3.8-27B"
-DEFAULT_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+DEFAULT_MODEL = "RadixArk/Qwen3.8-27B-NVFP4"
+DEFAULT_REVISION = "554ebba9b5f1b79dc11246341960360e6ef05ef4"
 
 TOKENIZER_FILES = (
     "chat_template.jinja",
@@ -55,14 +55,39 @@ def load_config(model_path: str | Path) -> tuple[Qwen35Config, dict]:
     return Qwen35Config.from_hugging_face(raw_config), raw_config
 
 
+def is_modelopt_nvfp4(raw_config: dict[str, Any]) -> bool:
+    """Recognize RadixArk's mixed FP8-projection/NVFP4-MLP contract."""
+
+    quantization = raw_config.get("quantization_config") or {}
+    groups = quantization.get("config_groups") or {}
+    fp8 = groups.get("group_0") or {}
+    nvfp4 = groups.get("group_1") or {}
+    fp8_weights = fp8.get("weights") or {}
+    nvfp4_weights = nvfp4.get("weights") or {}
+    return (
+        quantization.get("quant_method") == "modelopt"
+        and quantization.get("quant_algo") == "MIXED_PRECISION"
+        and fp8_weights.get("num_bits") == 8
+        and fp8_weights.get("type") == "float"
+        and nvfp4_weights.get("num_bits") == 4
+        and nvfp4_weights.get("type") == "float"
+        and nvfp4_weights.get("group_size") == 16
+    )
+
+
 def build_meta_model(
     raw_config: dict[str, Any], *, include_mtp: bool
 ) -> tuple[Qwen3_5ForConditionalGeneration, Qwen35Config]:
     config = Qwen35Config.from_hugging_face(raw_config)
     if include_mtp:
         config.require_mtp()
+    quantized = is_modelopt_nvfp4(raw_config)
+    if raw_config.get("quantization_config") and not quantized:
+        raise ValueError("unsupported Qwen3.5 checkpoint quantization contract")
     with use_default_dtype(torch.bfloat16), torch.device("meta"):
-        model = Qwen3_5ForConditionalGeneration(config, include_mtp=include_mtp)
+        model = Qwen3_5ForConditionalGeneration(
+            config, include_mtp=include_mtp, quantized=quantized
+        )
     return model, config
 
 
@@ -74,17 +99,24 @@ def _assign_tensor(
         module = model.get_submodule(module_path)
     except AttributeError as error:
         raise ValueError(f"checkpoint tensor has no model target: {key!r}") from error
-    parameter = module._parameters.get(name)
-    if parameter is None:
+    if name in module._parameters and module._parameters[name] is not None:
+        existing = module._parameters[name]
+        is_parameter = True
+    elif name in module._buffers and module._buffers[name] is not None:
+        existing = module._buffers[name]
+        is_parameter = False
+    else:
         raise ValueError(f"checkpoint tensor has no model target: {key!r}")
-    if tuple(parameter.shape) != tuple(tensor.shape):
+    if tuple(existing.shape) != tuple(tensor.shape):
         raise ValueError(
             f"shape mismatch for {key!r}: checkpoint {tuple(tensor.shape)}, "
-            f"model {tuple(parameter.shape)}"
+            f"model {tuple(existing.shape)}"
         )
-    module._parameters[name] = torch.nn.Parameter(
-        tensor.to(device=device), requires_grad=False
-    )
+    moved = tensor.to(device=device)
+    if is_parameter:
+        module._parameters[name] = torch.nn.Parameter(moved, requires_grad=False)
+    else:
+        module._buffers[name] = moved
 
 
 def _select_tensor_files(
@@ -138,6 +170,7 @@ __all__ = [
     "DEFAULT_MODEL",
     "DEFAULT_REVISION",
     "build_meta_model",
+    "is_modelopt_nvfp4",
     "load_config",
     "load_model",
     "resolve_model_path",

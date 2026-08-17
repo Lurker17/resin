@@ -83,6 +83,24 @@ def test_target_and_optional_mtp_names_match_checkpoint() -> None:
     assert not any("mtp.embed_tokens" in name for name in names)
 
 
+def test_radixark_quantized_target_keeps_mtp_bfloat16() -> None:
+    model = Qwen3_5ForConditionalGeneration(
+        _tiny_config(), include_mtp=True, quantized=True
+    )
+    state = model.state_dict()
+
+    projection = "model.language_model.layers.3.self_attn.q_proj"
+    assert state[f"{projection}.weight"].dtype is torch.float8_e4m3fn
+    assert state[f"{projection}.input_scale"].shape == ()
+    assert state[f"{projection}.weight_scale"].shape == ()
+    mlp = "model.language_model.layers.3.mlp.gate_proj"
+    assert state[f"{mlp}.weight"].dtype is torch.uint8
+    assert state[f"{mlp}.weight_scale"].dtype is torch.float8_e4m3fn
+    assert f"{mlp}.weight_scale_2" in state
+    assert state["mtp.layers.0.self_attn.q_proj.weight"].dtype is torch.float32
+    assert "mtp.layers.0.self_attn.q_proj.input_scale" not in state
+
+
 def _assert_native_text_model_matches_transformers_reference() -> None:
     from transformers.models.qwen3_5.configuration_qwen3_5 import (
         Qwen3_5TextConfig,

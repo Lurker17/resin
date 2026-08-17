@@ -19,6 +19,7 @@ from resin.backend.plans import PagedCachePlan
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
 from resin.protocols import Runner
+from resin_models_cuda.nvfp4 import prepare_nvfp4_modules
 from resin_models_cuda.qwen3_5.attention import PagedAttentionRuntime
 from resin_models_cuda.qwen3_5.cache import (
     PREFILL_CHUNK_SIZE,
@@ -28,6 +29,7 @@ from resin_models_cuda.qwen3_5.cache import (
 )
 from resin_models_cuda.qwen3_5.checkpoint import (
     DEFAULT_MODEL,
+    is_modelopt_nvfp4,
     load_model,
     resolve_model_path,
 )
@@ -56,6 +58,7 @@ class Qwen3_5CudaRunner(Runner):
         gpu_memory_utilization: float = 0.90,
         cache_slab_capacity: int | None = None,
         kv_cache_dtype: str = "fp8",
+        nvfp4_backend: str = "auto",
     ) -> None:
         if (
             isinstance(speculative_tokens, bool)
@@ -79,6 +82,8 @@ class Qwen3_5CudaRunner(Runner):
             raise ValueError("cache_slab_capacity must be a positive integer")
         if kv_cache_dtype not in {"fp8", "bfloat16"}:
             raise ValueError("kv_cache_dtype must be 'fp8' or 'bfloat16'")
+        if nvfp4_backend not in {"auto", "cudnn", "cute-dsl"}:
+            raise ValueError("nvfp4_backend must be 'auto', 'cudnn', or 'cute-dsl'")
 
         self.device = torch.device(device or default_device(torch, require_cuda=True))
         if self.device.type != "cuda":
@@ -108,6 +113,25 @@ class Qwen3_5CudaRunner(Runner):
             device=self.device,
             include_mtp=speculative_tokens > 0,
         )
+        self.weight_quantization = (
+            "modelopt-fp8-nvfp4" if is_modelopt_nvfp4(self.raw_config) else "bfloat16"
+        )
+        self.nvfp4_backend: str | None = None
+        if self.weight_quantization != "bfloat16":
+            capability = torch.cuda.get_device_capability(self.device)
+            if capability not in {(10, 0), (10, 3), (11, 0), (12, 0), (12, 1)}:
+                raise RuntimeError(
+                    "Qwen3.5 NVFP4 weights require Blackwell-class FP4 hardware, "
+                    f"got sm{capability[0]}{capability[1]}"
+                )
+            if nvfp4_backend == "auto":
+                nvfp4_backend = (
+                    "cudnn"
+                    if (torch.backends.cudnn.version() or 0) >= 92301
+                    else "cute-dsl"
+                )
+            prepare_nvfp4_modules(self._model, nvfp4_backend)
+            self.nvfp4_backend = nvfp4_backend
         selected_max_seq_len = (
             self.config.max_position_embeddings if max_seq_len is None else max_seq_len
         )

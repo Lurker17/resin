@@ -76,7 +76,10 @@ class PagedAttentionRuntime:
             self.workspace, "NHD", backend="auto"
         )
         self.decode = BatchDecodeWithPagedKVCacheWrapper(
-            self.workspace, "NHD", backend="auto"
+            self.workspace,
+            "NHD",
+            use_tensor_cores=True,
+            backend="auto",
         )
 
     def prepare(

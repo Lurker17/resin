@@ -66,8 +66,8 @@ def test_qwen38_27b_geometry() -> None:
 
 
 def test_qwen38_is_the_pinned_family_default() -> None:
-    assert DEFAULT_MODEL == "Qwen/Qwen3.8-27B"
-    assert DEFAULT_REVISION == "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+    assert DEFAULT_MODEL == "RadixArk/Qwen3.8-27B-NVFP4"
+    assert DEFAULT_REVISION == "554ebba9b5f1b79dc11246341960360e6ef05ef4"
 
 
 def test_qwen35_parser_accepts_text_config_directly() -> None:

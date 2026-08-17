@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from resin_models_cuda.nvfp4 import Nvfp4Linear
 from resin_models_cuda.qwen3_5.attention import (
     PagedAttentionRuntime,
     PreparedPagedAttention,
@@ -15,6 +16,19 @@ from resin_models_cuda.qwen3_5.attention import (
 )
 from resin_models_cuda.qwen3_5.cache import MTP_GROUP, TARGET_GROUP, DeviceCache
 from resin_models_cuda.qwen3_5.config import Qwen35Config
+from resin_models_cuda.qwen3_5.quantization import ModelOptFp8Linear
+
+
+def _projection(in_features: int, out_features: int, *, quantized: bool) -> nn.Module:
+    if quantized:
+        return ModelOptFp8Linear(in_features, out_features)
+    return nn.Linear(in_features, out_features, bias=False)
+
+
+def _feed_forward(in_features: int, out_features: int, *, quantized: bool) -> nn.Module:
+    if quantized:
+        return Nvfp4Linear(in_features, out_features)
+    return nn.Linear(in_features, out_features, bias=False)
 
 
 def _fla_kernels():
@@ -89,14 +103,18 @@ def _reference_delta_rule(
 
 
 class Qwen35GatedDeltaNet(nn.Module):
-    def __init__(self, config: Qwen35Config) -> None:
+    def __init__(self, config: Qwen35Config, *, quantized: bool = False) -> None:
         super().__init__()
         self.config = config
         self.key_dim = config.linear_key_dim
         self.value_dim = config.linear_value_dim
         self.conv_dim = config.linear_conv_dim
-        self.in_proj_qkv = nn.Linear(config.hidden_size, self.conv_dim, bias=False)
-        self.in_proj_z = nn.Linear(config.hidden_size, self.value_dim, bias=False)
+        self.in_proj_qkv = _projection(
+            config.hidden_size, self.conv_dim, quantized=quantized
+        )
+        self.in_proj_z = _projection(
+            config.hidden_size, self.value_dim, quantized=quantized
+        )
         self.in_proj_b = nn.Linear(
             config.hidden_size, config.linear_num_value_heads, bias=False
         )
@@ -115,7 +133,9 @@ class Qwen35GatedDeltaNet(nn.Module):
         self.norm = Qwen35GatedRMSNorm(
             config.linear_value_head_dim, config.rms_norm_eps
         )
-        self.out_proj = nn.Linear(self.value_dim, config.hidden_size, bias=False)
+        self.out_proj = _projection(
+            self.value_dim, config.hidden_size, quantized=quantized
+        )
 
     def forward(
         self,
@@ -222,6 +242,7 @@ class Qwen35Attention(nn.Module):
         cache_group: int,
         cache_layer: int,
         cache_layer_count: int,
+        quantized: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -229,25 +250,25 @@ class Qwen35Attention(nn.Module):
         self.cache_layer = cache_layer
         self.cache_layer_count = cache_layer_count
         self.scaling = config.head_dim**-0.5
-        self.q_proj = nn.Linear(
+        self.q_proj = _projection(
             config.hidden_size,
             config.num_attention_heads * config.head_dim * 2,
-            bias=False,
+            quantized=quantized,
         )
-        self.k_proj = nn.Linear(
+        self.k_proj = _projection(
             config.hidden_size,
             config.num_key_value_heads * config.head_dim,
-            bias=False,
+            quantized=quantized,
         )
-        self.v_proj = nn.Linear(
+        self.v_proj = _projection(
             config.hidden_size,
             config.num_key_value_heads * config.head_dim,
-            bias=False,
+            quantized=quantized,
         )
-        self.o_proj = nn.Linear(
+        self.o_proj = _projection(
             config.num_attention_heads * config.head_dim,
             config.hidden_size,
-            bias=False,
+            quantized=quantized,
         )
         self.q_norm = Qwen35RMSNorm(config.head_dim, config.rms_norm_eps)
         self.k_norm = Qwen35RMSNorm(config.head_dim, config.rms_norm_eps)
@@ -310,16 +331,16 @@ class Qwen35Attention(nn.Module):
 
 
 class Qwen35MLP(nn.Module):
-    def __init__(self, config: Qwen35Config) -> None:
+    def __init__(self, config: Qwen35Config, *, quantized: bool = False) -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
+        self.gate_proj = _feed_forward(
+            config.hidden_size, config.intermediate_size, quantized=quantized
         )
-        self.up_proj = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
+        self.up_proj = _feed_forward(
+            config.hidden_size, config.intermediate_size, quantized=quantized
         )
-        self.down_proj = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=False
+        self.down_proj = _feed_forward(
+            config.intermediate_size, config.hidden_size, quantized=quantized
         )
 
     def forward(self, hidden: Tensor) -> Tensor:
@@ -335,11 +356,12 @@ class Qwen35DecoderLayer(nn.Module):
         full_layer_index: int | None = None,
         cache_group: int = TARGET_GROUP,
         cache_layer_count: int | None = None,
+        quantized: bool = False,
     ) -> None:
         super().__init__()
         self.block_type = config.layer_types[layer_index]
         if self.block_type == "linear_attention":
-            self.linear_attn = Qwen35GatedDeltaNet(config)
+            self.linear_attn = Qwen35GatedDeltaNet(config, quantized=quantized)
         else:
             if full_layer_index is None:
                 raise ValueError("full Qwen3.5 layer requires its cache-layer index")
@@ -348,8 +370,9 @@ class Qwen35DecoderLayer(nn.Module):
                 cache_group=cache_group,
                 cache_layer=full_layer_index,
                 cache_layer_count=cache_layer_count or config.full_layer_count,
+                quantized=quantized,
             )
-        self.mlp = Qwen35MLP(config)
+        self.mlp = Qwen35MLP(config, quantized=quantized)
         self.input_layernorm = Qwen35RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = Qwen35RMSNorm(
             config.hidden_size, config.rms_norm_eps
@@ -357,7 +380,7 @@ class Qwen35DecoderLayer(nn.Module):
 
 
 class Qwen35TextModel(nn.Module):
-    def __init__(self, config: Qwen35Config) -> None:
+    def __init__(self, config: Qwen35Config, *, quantized: bool = False) -> None:
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -369,6 +392,7 @@ class Qwen35TextModel(nn.Module):
                 config,
                 layer,
                 full_layer_index=full_indices.get(layer),
+                quantized=quantized,
             )
             for layer in range(config.num_hidden_layers)
         )
@@ -482,9 +506,9 @@ class Qwen35TextModel(nn.Module):
 
 
 class _Qwen35Backbone(nn.Module):
-    def __init__(self, config: Qwen35Config) -> None:
+    def __init__(self, config: Qwen35Config, *, quantized: bool = False) -> None:
         super().__init__()
-        self.language_model = Qwen35TextModel(config)
+        self.language_model = Qwen35TextModel(config, quantized=quantized)
 
 
 class Qwen35MTP(nn.Module):
@@ -567,11 +591,15 @@ class Qwen35MTP(nn.Module):
 class Qwen3_5ForConditionalGeneration(nn.Module):
     """Text-only target whose parameter names match the public checkpoint."""
 
-    def __init__(self, config: Qwen35Config, *, include_mtp: bool) -> None:
+    def __init__(
+        self, config: Qwen35Config, *, include_mtp: bool, quantized: bool = False
+    ) -> None:
         super().__init__()
         self.config = config
-        self.model = _Qwen35Backbone(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model = _Qwen35Backbone(config, quantized=quantized)
+        self.lm_head = _feed_forward(
+            config.hidden_size, config.vocab_size, quantized=quantized
+        )
         self.mtp = Qwen35MTP(config) if include_mtp else None
 
     @property

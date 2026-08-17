@@ -11,9 +11,10 @@ from resin_models_cuda.qwen3_5 import DEFAULT_MODEL, Qwen3_5CudaRunner
 def test_qwen38_is_runner_default_and_public_name_is_consistent() -> None:
     parameters = inspect.signature(Qwen3_5CudaRunner.__init__).parameters
 
-    assert parameters["model"].default == DEFAULT_MODEL == "Qwen/Qwen3.8-27B"
+    assert parameters["model"].default == DEFAULT_MODEL == "RadixArk/Qwen3.8-27B-NVFP4"
     assert parameters["speculative_tokens"].default == 0
     assert parameters["kv_cache_dtype"].default == "fp8"
+    assert parameters["nvfp4_backend"].default == "auto"
     assert Qwen3_5CudaRunner.__name__ == "Qwen3_5CudaRunner"
 
 
