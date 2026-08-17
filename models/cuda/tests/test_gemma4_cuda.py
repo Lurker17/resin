@@ -94,6 +94,7 @@ def test_cuda_graphs_use_shared_static_step_lifecycle() -> None:
     parameters = inspect.signature(Gemma4CudaRunner.__init__).parameters
     source = inspect.getsource(Gemma4CudaRunner)
     assert "cuda_graph_decode_shapes" in parameters
+    assert "speculative_tokens" in parameters
     assert "CudaGraphCache(" in source
     assert "CUDAGraph" not in source
     assert ".replay()" not in source

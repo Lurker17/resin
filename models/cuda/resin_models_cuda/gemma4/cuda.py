@@ -39,6 +39,7 @@ from resin.backend.sampling import SAMPLING_OFFSET_STRIDE
 from resin.backend.speculative import SpeculativeStats
 from resin.protocols import Runner
 from resin_models_cuda.gemma4.assistant_checkpoint import (
+    DEFAULT_ASSISTANT,
     load_assistant,
     resolve_assistant_path,
 )
@@ -166,7 +167,6 @@ class Gemma4CudaRunner(Runner):
     page_size = PAGE_SIZE
     prefill_chunk_size = PREFILL_CHUNK_SIZE
     sliding_window = SLIDING_WINDOW
-    assistant_speculative_tokens = 3
 
     def __init__(
         self,
@@ -176,6 +176,7 @@ class Gemma4CudaRunner(Runner):
         revision: str | None = None,
         assistant_model: str | Path | None = None,
         assistant_revision: str | None = None,
+        speculative_tokens: int = 0,
         device: str | None = None,
         nvfp4_backend: str = "auto",
         kv_cache_dtype: str = "fp8",
@@ -188,11 +189,12 @@ class Gemma4CudaRunner(Runner):
             or cache_parent_capacity <= 0
         ):
             raise ValueError("cache_parent_capacity must be a positive integer")
-        if assistant_model is None and assistant_revision is not None:
-            raise ValueError("assistant_revision requires assistant_model")
-        speculative_tokens = (
-            self.assistant_speculative_tokens if assistant_model is not None else 0
-        )
+        if (
+            isinstance(speculative_tokens, bool)
+            or not isinstance(speculative_tokens, int)
+            or speculative_tokens < 0
+        ):
+            raise ValueError("speculative_tokens must be a non-negative integer")
         self.device = torch.device(device or default_device(torch, require_cuda=True))
         if self.device.type != "cuda":
             raise RuntimeError("Gemma4CudaRunner requires CUDA")
@@ -223,9 +225,10 @@ class Gemma4CudaRunner(Runner):
         self.speculative_tokens = speculative_tokens
         self._assistant = None
         self.assistant_path: Path | None = None
-        if assistant_model is not None:
+        if speculative_tokens:
+            selected_assistant = assistant_model or DEFAULT_ASSISTANT
             self.assistant_path = resolve_assistant_path(
-                assistant_model, assistant_revision
+                selected_assistant, assistant_revision
             )
             self._assistant, assistant_config = load_assistant(
                 self.assistant_path, device=self.device

@@ -40,6 +40,7 @@ MODEL_FILES = (
 )
 ASSISTANT_FILES = ("config.json", "model.safetensors")
 CUDA_GRAPH_HISTORY_PAGES = 4096
+PRODUCTION_SPECULATIVE_TOKENS = 3
 _http_server_processes: list[object] = []
 
 image = build_modal_image(
@@ -89,9 +90,9 @@ def _checkpoint_size() -> int:
     return int(index["metadata"]["total_size"])
 
 
-def _require_model(*, speculative: bool) -> None:
+def _require_model(*, speculative_tokens: int) -> None:
     model_volume.reload()
-    _inventory(include_assistant=speculative)
+    _inventory(include_assistant=bool(speculative_tokens))
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
@@ -131,21 +132,22 @@ def download_model() -> dict[str, Any]:
     }
 
 
-def _build_runtime(*, speculative: bool):
+def _build_runtime(*, speculative_tokens: int):
     import torch
     from transformers import AutoProcessor
 
     from resin import Engine, SchedulerConfig
     from resin_models_cuda.gemma4 import Gemma4CudaRunner
 
-    _require_model(speculative=speculative)
+    _require_model(speculative_tokens=speculative_tokens)
     load_started = time.perf_counter()
     runner = Gemma4CudaRunner(
         MODEL_PATH,
-        assistant_model=ASSISTANT_PATH if speculative else None,
+        assistant_model=ASSISTANT_PATH if speculative_tokens else None,
+        speculative_tokens=speculative_tokens,
         cuda_graph_decode_shapes=default_decode_graph_shapes(
             CUDA_GRAPH_HISTORY_PAGES,
-            speculative=speculative,
+            speculative=bool(speculative_tokens),
             max_batch_size=DEFAULT_MAX_NUM_SEQS,
         ),
         static_memory_fraction=0.95,
@@ -182,7 +184,7 @@ def _build_runtime(*, speculative: bool):
     torch.cuda.synchronize()
     report = {
         "load_s": time.perf_counter() - load_started,
-        "speculative_enabled": speculative,
+        "speculative_tokens": speculative_tokens,
         "capacity": asdict(capacity),
         "checkpoint_bytes": _checkpoint_size(),
         "actual_model_bytes": runner.model_memory_bytes,
@@ -191,7 +193,7 @@ def _build_runtime(*, speculative: bool):
         "cuda_graph_capture_s": graph_capture_s,
         "cuda_graphs": graph_stats,
     }
-    if speculative:
+    if speculative_tokens:
         report["assistant_checkpoint_bytes"] = (
             (ASSISTANT_PATH / "model.safetensors").stat().st_size
         )
@@ -264,9 +266,11 @@ def _warmup_text(engine, processor) -> None:
 def smoke_test(
     max_new_tokens: int = 16,
     *,
-    speculative: bool,
+    speculative_tokens: int,
 ) -> dict[str, Any]:
-    torch, runner, processor, engine, report = _build_runtime(speculative=speculative)
+    torch, runner, processor, engine, report = _build_runtime(
+        speculative_tokens=speculative_tokens
+    )
     try:
         warmup_started = time.perf_counter()
         _, _, warmup_steps = _generate(
@@ -323,7 +327,9 @@ def _serve(_: int) -> None:
     from resin.server import HttpServer
     from resin_models_cuda.gemma4 import Gemma4Codec
 
-    torch, runner, processor, engine, _ = _build_runtime(speculative=True)
+    torch, runner, processor, engine, _ = _build_runtime(
+        speculative_tokens=PRODUCTION_SPECULATIVE_TOKENS
+    )
     try:
         # Compile/load every exact kernel geometry before opening the socket.
         warmup, _, _ = _generate(engine, processor, "Name the main colors.", 2)
@@ -373,18 +379,22 @@ def serve_gemma4() -> None:
 
 
 @app.local_entrypoint()
-def main(mode: str = "speculative", max_new_tokens: int = 16) -> None:
+def main(
+    mode: str = "smoke",
+    max_new_tokens: int = 16,
+    speculative_tokens: int = PRODUCTION_SPECULATIVE_TOKENS,
+) -> None:
     if mode == "download":
         print(json.dumps(download_model.remote(), indent=2))
-    elif mode in {"nonspec", "speculative"}:
+    elif mode == "smoke":
         print(
             json.dumps(
                 smoke_test.remote(
                     max_new_tokens,
-                    speculative=mode == "speculative",
+                    speculative_tokens=speculative_tokens,
                 ),
                 indent=2,
             )
         )
     else:
-        raise ValueError("mode must be 'download', 'nonspec', or 'speculative'")
+        raise ValueError("mode must be 'download' or 'smoke'")
