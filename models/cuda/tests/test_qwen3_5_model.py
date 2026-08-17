@@ -125,7 +125,7 @@ def test_target_and_optional_mtp_names_match_checkpoint() -> None:
     assert not any("mtp.embed_tokens" in name for name in names)
 
 
-def test_optional_visual_tower_uses_checkpoint_names() -> None:
+def _assert_optional_visual_tower_uses_checkpoint_names() -> None:
     vision_config = {
         "depth": 1,
         "hidden_size": 16,
@@ -145,6 +145,26 @@ def test_optional_visual_tower_uses_checkpoint_names() -> None:
     assert "model.visual.patch_embed.proj.weight" in names
     assert "model.visual.blocks.0.attn.qkv.weight" in names
     assert "model.visual.merger.linear_fc2.weight" in names
+
+
+def test_optional_visual_tower_uses_checkpoint_names() -> None:
+    tests = Path(__file__).resolve().parent
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                f"sys.path.insert(0, {str(tests)!r}); "
+                "from test_qwen3_5_model import "
+                "_assert_optional_visual_tower_uses_checkpoint_names as check; "
+                "check()"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_radixark_quantized_target_keeps_mtp_bfloat16() -> None:
