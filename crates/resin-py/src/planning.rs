@@ -1,5 +1,6 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use std::borrow::Borrow;
 use std::sync::OnceLock;
 
 use crate::cache::CacheGroupPlan;
@@ -10,23 +11,7 @@ use resin_core::{
     schedule_ready_prefix as schedule_core_ready_prefix,
 };
 
-pub(super) trait RequestLike {
-    fn as_request(&self) -> &Request;
-}
-
-impl RequestLike for Request {
-    fn as_request(&self) -> &Request {
-        self
-    }
-}
-
-impl RequestLike for &Request {
-    fn as_request(&self) -> &Request {
-        self
-    }
-}
-
-pub(super) fn schedule_ready_prefix<R: RequestLike>(
+pub(super) fn schedule_ready_prefix<R: Borrow<Request>>(
     scheduled: &[R],
     config: SchedulerConfig,
     checkpoint_alignment: Option<std::num::NonZeroU32>,
@@ -34,7 +19,7 @@ pub(super) fn schedule_ready_prefix<R: RequestLike>(
     let requests = scheduled
         .iter()
         .map(|item| {
-            let request = item.as_request();
+            let request = item.borrow();
             Ok(RequestProgress {
                 phase: request.phase(),
                 prefill_length: request.prefill_length()?,
@@ -63,7 +48,7 @@ pub(super) fn schedule_ready_prefix<R: RequestLike>(
 }
 
 #[cfg(test)]
-pub(super) fn build_plan<R: RequestLike>(
+pub(super) fn build_plan<R: Borrow<Request>>(
     batch_id: u64,
     scheduled_requests: &[R],
     scheduled_rows: &[ScheduledRow],
@@ -72,7 +57,7 @@ pub(super) fn build_plan<R: RequestLike>(
     build_plan_for_engine(batch_id, scheduled_requests, scheduled_rows, kv_view)
 }
 
-pub(super) fn build_plan_for_engine<R: RequestLike>(
+pub(super) fn build_plan_for_engine<R: Borrow<Request>>(
     batch_id: u64,
     scheduled_requests: &[R],
     scheduled_rows: &[ScheduledRow],
@@ -80,7 +65,7 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
 ) -> PyResult<BatchPlan> {
     let requests = scheduled_requests
         .iter()
-        .map(RequestLike::as_request)
+        .map(Borrow::borrow)
         .collect::<Vec<_>>();
     if requests.len() != scheduled_rows.len() {
         return Err(PyRuntimeError::new_err(
@@ -92,7 +77,7 @@ pub(super) fn build_plan_for_engine<R: RequestLike>(
     }
     if requests
         .iter()
-        .any(|request| request.resources.cache.is_some() != kv_view.is_some())
+        .any(|request| request.cache.is_some() != kv_view.is_some())
     {
         return Err(PyRuntimeError::new_err(
             "scheduled request and KV resource view ownership disagree",

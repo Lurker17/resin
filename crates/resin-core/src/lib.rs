@@ -5,8 +5,6 @@
 //! - [`schedule_ready_prefix`] freezes each row's current token range.
 //! - [`resources`] owns allocator state and just-in-time batch leases.
 //!
-//! [`resources::WithResources`] attaches cache state directly to the request
-//! or accepted batch that owns it.
 //! The KV coordinator is deliberately single-dispatch, so it cannot plan or
 //! lock a future batch before the current lease is released.
 

@@ -16,9 +16,9 @@ mod runner;
 
 use cache::{CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention};
 use planning::{build_plan_for_engine, schedule_ready_prefix};
+use resin_core::resources::RequestResourceRef;
 use resin_core::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
 use resin_core::resources::paged_kv::{PagedKvError, PagedKvResources};
-use resin_core::resources::{RequestResourceRef, WithResources};
 use resin_core::{Phase, RequestId, Schedulable, Scheduler, SequenceStep};
 use runner::{
     ResourceBinding, RunnerConfig, bind_runner_resources, resolve_runner_config,
@@ -853,7 +853,7 @@ impl TokenEvent {
 }
 
 #[derive(Debug)]
-struct RequestData {
+struct Request {
     id: u64,
     lease: Arc<Mutex<RequestLeaseState>>,
     priority: i32,
@@ -870,16 +870,10 @@ struct RequestData {
     sampling_params: SamplingParams,
     media: Option<Arc<Py<PyAny>>>,
     cancel_pending: bool,
-}
-
-#[derive(Debug)]
-struct RequestResources {
     cache: Option<RequestPages>,
 }
 
-type Request = WithResources<RequestData, RequestResources>;
-
-impl RequestData {
+impl Request {
     fn prompt_length(&self) -> u32 {
         u32::try_from(self.prompt.len()).expect("submit bounds prompt length to u32")
     }
@@ -914,7 +908,7 @@ impl RequestData {
     }
 }
 
-impl Schedulable for RequestData {
+impl Schedulable for Request {
     fn priority(&self) -> i32 {
         self.priority
     }
@@ -1305,25 +1299,23 @@ impl Engine {
             .cached_tokens = resident_tokens;
         self.next_request_id = next_request_id;
         self.scheduler.enqueue(Request {
-            inner: RequestData {
-                id: request_id,
-                lease: lease_state,
-                priority,
-                batch_key,
-                turn_ordinal: 0,
-                running: false,
-                prompt: token_ids,
-                cache_prompt,
-                atomic_prefill_spans,
-                resident_tokens,
-                generated: Vec::new(),
-                max_new_tokens,
-                stop_token_ids,
-                sampling_params,
-                media: media.map(Arc::new),
-                cancel_pending: false,
-            },
-            resources: RequestResources { cache: pages },
+            id: request_id,
+            lease: lease_state,
+            priority,
+            batch_key,
+            turn_ordinal: 0,
+            running: false,
+            prompt: token_ids,
+            cache_prompt,
+            atomic_prefill_spans,
+            resident_tokens,
+            generated: Vec::new(),
+            max_new_tokens,
+            stop_token_ids,
+            sampling_params,
+            media: media.map(Arc::new),
+            cancel_pending: false,
+            cache: pages,
         });
         Ok(lease)
     }
@@ -1395,7 +1387,6 @@ impl Engine {
                     scheduled_end
                 };
                 let pages = request
-                    .resources
                     .cache
                     .as_mut()
                     .expect("managed requests keep their cache state");
@@ -1425,7 +1416,6 @@ impl Engine {
                     .map(|request| RequestResourceRef {
                         request_id: core_request_id(request.id),
                         state: request
-                            .resources
                             .cache
                             .as_ref()
                             .expect("managed requests keep their cache state"),
@@ -1444,10 +1434,7 @@ impl Engine {
                 }
             }
             None => {
-                if scheduled
-                    .iter()
-                    .any(|request| request.resources.cache.is_some())
-                {
+                if scheduled.iter().any(|request| request.cache.is_some()) {
                     self.scheduler.restore_rejected(scheduled);
                     return Err(PyRuntimeError::new_err(
                         "unmanaged Engine request unexpectedly owns KV resource state",
@@ -1590,10 +1577,7 @@ impl Engine {
             if !*retire {
                 continue;
             }
-            match (
-                self.kv_resources.as_ref(),
-                row.request.resources.cache.as_ref(),
-            ) {
+            match (self.kv_resources.as_ref(), row.request.cache.as_ref()) {
                 (Some(resources), Some(pages)) => {
                     if let Err(error) = resources.pool().validate_request(pages) {
                         return self.quarantine(
@@ -1639,7 +1623,7 @@ impl Engine {
             if !retire {
                 continue;
             }
-            let Some(pages) = batch.rows[row_index].request.resources.cache.take() else {
+            let Some(pages) = batch.rows[row_index].request.cache.take() else {
                 continue;
             };
             let resources = self
@@ -1647,7 +1631,7 @@ impl Engine {
                 .as_mut()
                 .expect("request KV pages keep their resources");
             if let Err(failure) = resources.retire(pages) {
-                batch.rows[row_index].request.resources.cache = Some(failure.request);
+                batch.rows[row_index].request.cache = Some(failure.request);
                 return self.quarantine(
                     batch,
                     "native cache retirement failed after preflight",
@@ -1662,12 +1646,12 @@ impl Engine {
         for (row, retire) in batch.rows.drain(..).zip(retired) {
             let request = row.request;
             if retire {
-                let RequestData {
+                let Request {
                     lease,
                     generated,
                     cancel_pending,
                     ..
-                } = request.inner;
+                } = request;
                 complete_request_lease(&lease, generated, cancel_pending);
             } else {
                 survivors.push(request);
@@ -1690,7 +1674,7 @@ impl Engine {
         let request_id = request.request_id;
         if let Some(index) = self.scheduler.position(|request| request.id == request_id) {
             let mut request = self.scheduler.remove(index);
-            match (self.kv_resources.as_ref(), request.resources.cache.as_ref()) {
+            match (self.kv_resources.as_ref(), request.cache.as_ref()) {
                 (Some(resources), Some(pages)) => {
                     if let Err(error) = resources.pool().validate_request(pages) {
                         self.scheduler.restore(index, request);
@@ -1716,14 +1700,14 @@ impl Engine {
                 self.poison("runner release failed during ready cancellation", &error);
                 return Err(error);
             }
-            if let Some(pages) = request.resources.cache.take()
+            if let Some(pages) = request.cache.take()
                 && let Err(failure) = self
                     .kv_resources
                     .as_mut()
                     .expect("request KV pages keep their resources")
                     .retire(pages)
             {
-                request.resources.cache = Some(failure.request);
+                request.cache = Some(failure.request);
                 self.scheduler.restore(index, request);
                 let error = cache_pool_error(failure.error);
                 self.poison(
@@ -1732,7 +1716,7 @@ impl Engine {
                 );
                 return Err(error);
             }
-            let generated = std::mem::take(&mut request.inner.generated);
+            let generated = std::mem::take(&mut request.generated);
             complete_request_lease(&request.lease, generated, true);
             return Ok(true);
         }
@@ -1936,7 +1920,6 @@ impl Engine {
                 .expect("prefix alignment requires managed cache resources");
             let pages = row
                 .request
-                .resources
                 .cache
                 .as_mut()
                 .expect("prefix-enabled requests own managed cache pages");
@@ -2037,7 +2020,7 @@ impl Engine {
         let Some(request_id) = self
             .scheduler
             .iter()
-            .filter(|request| request.is_running() && request.resources.cache.is_some())
+            .filter(|request| request.is_running() && request.cache.is_some())
             .min_by_key(|request| (request.generated.len(), Reverse(request.prompt.len())))
             .map(|request| request.id)
         else {
@@ -2057,7 +2040,6 @@ impl Engine {
             return Err(error);
         }
         let pages = request
-            .resources
             .cache
             .as_mut()
             .expect("retraction victim owns managed cache state");
@@ -2134,7 +2116,7 @@ impl Engine {
             .map(|request| request.id)
             .collect::<Vec<_>>();
         let retirement_validation = self.scheduler.iter().try_for_each(|request| {
-            match (self.kv_resources.as_ref(), request.resources.cache.as_ref()) {
+            match (self.kv_resources.as_ref(), request.cache.as_ref()) {
                 (Some(resources), Some(pages)) => resources
                     .pool()
                     .validate_request(pages)
@@ -2162,7 +2144,7 @@ impl Engine {
         }
         retired.extend(self.scheduler.drain());
         for mut request in retired {
-            if let Some(pages) = request.resources.cache.take()
+            if let Some(pages) = request.cache.take()
                 && let Err(failure) = self
                     .kv_resources
                     .as_mut()
@@ -2176,7 +2158,7 @@ impl Engine {
                 );
                 return Err(error);
             }
-            let generated = std::mem::take(&mut request.inner.generated);
+            let generated = std::mem::take(&mut request.generated);
             complete_request_lease(&request.lease, generated, true);
         }
         Ok(())
@@ -2239,7 +2221,7 @@ impl Engine {
                     "speculative token rows are only supported during decode",
                 ));
             }
-            if token_ids.len() > 1 && request.resources.cache.is_some() {
+            if token_ids.len() > 1 && request.cache.is_some() {
                 let maximum = usize::try_from(self.runner_config.cache_write_lookahead_tokens)
                     .unwrap_or(usize::MAX)
                     .saturating_add(1);
@@ -2355,32 +2337,30 @@ mod tests {
 
     fn request(id: u64, prompt: &[u32], generated: &[u32], pages: Option<RequestPages>) -> Request {
         Request {
-            inner: RequestData {
-                id,
-                lease: Arc::new(Mutex::new(RequestLeaseState::default())),
-                priority: 0,
-                batch_key: None,
-                turn_ordinal: 0,
-                running: false,
-                prompt: prompt.to_vec(),
-                cache_prompt: None,
-                atomic_prefill_spans: Vec::new(),
-                resident_tokens: if generated.is_empty() {
-                    0
-                } else {
-                    (prompt.len() + generated.len() - 1) as u32
-                },
-                generated: generated.to_vec(),
-                max_new_tokens: 8,
-                stop_token_ids: Vec::new(),
-                sampling_params: SamplingParams {
-                    seed: Some(default_sampling_seed(0, id)),
-                    ..SamplingParams::default()
-                },
-                media: None,
-                cancel_pending: false,
+            id,
+            lease: Arc::new(Mutex::new(RequestLeaseState::default())),
+            priority: 0,
+            batch_key: None,
+            turn_ordinal: 0,
+            running: false,
+            prompt: prompt.to_vec(),
+            cache_prompt: None,
+            atomic_prefill_spans: Vec::new(),
+            resident_tokens: if generated.is_empty() {
+                0
+            } else {
+                (prompt.len() + generated.len() - 1) as u32
             },
-            resources: RequestResources { cache: pages },
+            generated: generated.to_vec(),
+            max_new_tokens: 8,
+            stop_token_ids: Vec::new(),
+            sampling_params: SamplingParams {
+                seed: Some(default_sampling_seed(0, id)),
+                ..SamplingParams::default()
+            },
+            media: None,
+            cancel_pending: false,
+            cache: pages,
         }
     }
 
@@ -2452,7 +2432,7 @@ mod tests {
         let rows = schedule_ready_prefix(&scheduled, SchedulerConfig::default(), None).unwrap();
         let resource_refs = [RequestResourceRef {
             request_id: core_request_id(41),
-            state: managed.resources.cache.as_ref().unwrap(),
+            state: managed.cache.as_ref().unwrap(),
         }];
         let acquired = resources.acquire(&resource_refs, &rows, 0).unwrap();
         let plan = build_plan(9, &scheduled, &rows, Some(&acquired.view)).unwrap();
@@ -2473,7 +2453,7 @@ mod tests {
         assert_eq!(acquired.lease.len(), 5);
         resources.release(acquired.lease);
 
-        let pages = managed.resources.cache.take().unwrap();
+        let pages = managed.cache.take().unwrap();
         resources.pool().validate_request(&pages).unwrap();
         resources.retire(pages).unwrap();
         assert_eq!(resources.pool().occupied_block_count(), 0);
@@ -2504,7 +2484,7 @@ mod tests {
 
         let resource_refs = [RequestResourceRef {
             request_id: core_request_id(51),
-            state: managed.resources.cache.as_ref().unwrap(),
+            state: managed.cache.as_ref().unwrap(),
         }];
         let acquired = resources.acquire(&resource_refs, &rows, 0).unwrap();
         let plan = build_plan(10, &scheduled, &rows, Some(&acquired.view)).unwrap();
@@ -2532,9 +2512,7 @@ mod tests {
         assert_eq!(acquired.lease.len(), 2);
         resources.release(acquired.lease);
 
-        resources
-            .retire(managed.resources.cache.take().unwrap())
-            .unwrap();
+        resources.retire(managed.cache.take().unwrap()).unwrap();
         assert_eq!(resources.pool().occupied_block_count(), 0);
     }
 
