@@ -2,11 +2,34 @@
 
 from __future__ import annotations
 
+import os
+import threading
+import traceback
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
 
 from resin import BatchPhase, BatchPlan, CacheGroupPlan, SamplingParams
+
+
+def monitor_process_context(process_context: Any, label: str) -> None:
+    """Report a spawned worker failure and terminate its hosting process."""
+
+    def monitor() -> None:
+        try:
+            process_context.join()
+        except BaseException:
+            print(f"[{label}] worker process failed:", flush=True)
+            traceback.print_exc()
+        else:
+            print(f"[{label}] worker process exited unexpectedly", flush=True)
+        os._exit(1)
+
+    threading.Thread(
+        target=monitor,
+        name=f"{label}-process-monitor",
+        daemon=True,
+    ).start()
 
 
 def batch_plan_payload(plan: BatchPlan) -> dict[str, Any]:
@@ -146,4 +169,5 @@ __all__ = [
     "batch_plan_from_payload",
     "batch_plan_payload",
     "follow_tensor_parallel_runner",
+    "monitor_process_context",
 ]

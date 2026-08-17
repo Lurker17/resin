@@ -21,10 +21,6 @@ import torch.distributed as dist
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from deploy.http import (
-    DeepSeekV4Codec,
-    monitor_spawned_server,
-)
 from deploy.modal_image import build_modal_image
 from resin import Engine, SamplingParams, SchedulerConfig
 from resin.backend.cuda.graphs import (
@@ -32,8 +28,13 @@ from resin.backend.cuda.graphs import (
     default_decode_graph_shapes,
 )
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
-from resin.backend.parallel import TensorParallelRunner, follow_tensor_parallel_runner
+from resin.backend.parallel import (
+    TensorParallelRunner,
+    follow_tensor_parallel_runner,
+    monitor_process_context,
+)
 from resin.server import HttpServer
+from resin_models_cuda.deepseek_v4.codec import DeepSeekV4Codec
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_CACHE_MOUNT = "/models/resin-deepseek-v4"
@@ -1187,7 +1188,7 @@ def serve_deepseek_v4() -> None:
         join=False,
     )
     _http_server_processes.append(process_context)
-    monitor_spawned_server(process_context, "deepseek-v4-http")
+    monitor_process_context(process_context, "deepseek-v4-http")
 
 
 @app.function(

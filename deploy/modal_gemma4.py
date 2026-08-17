@@ -11,12 +11,12 @@ from typing import Any
 
 import modal
 
-from deploy.http import monitor_spawned_server
 from deploy.modal_image import build_modal_image
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
     default_decode_graph_shapes,
 )
+from resin.backend.parallel import monitor_process_context
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_ID = "nvidia/Gemma-4-31B-IT-NVFP4"
@@ -807,7 +807,7 @@ def serve_gemma4() -> None:
         join=False,
     )
     _http_server_processes.append(process_context)
-    monitor_spawned_server(process_context, "gemma4-http")
+    monitor_process_context(process_context, "gemma4-http")
 
 
 @app.local_entrypoint()

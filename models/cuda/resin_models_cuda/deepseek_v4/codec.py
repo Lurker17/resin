@@ -1,34 +1,11 @@
-"""Shared HTTP-serving adapters for Resin's Modal deployments."""
+"""DeepSeek-V4 conversation rendering and incremental response parsing."""
 
 from __future__ import annotations
 
 import copy
 import json
-import os
-import threading
-import traceback
 from collections.abc import Sequence
 from typing import Any
-
-
-def monitor_spawned_server(process_context: Any, label: str) -> None:
-    """Supervise spawned ranks without blocking Modal's web-server handshake."""
-
-    def monitor() -> None:
-        try:
-            process_context.join()
-        except BaseException:
-            print(f"[{label}] worker process failed:", flush=True)
-            traceback.print_exc()
-        else:
-            print(f"[{label}] worker process exited unexpectedly", flush=True)
-        os._exit(1)
-
-    threading.Thread(
-        target=monitor,
-        name=f"{label}-process-monitor",
-        daemon=True,
-    ).start()
 
 
 def _thinking_settings(request: dict[str, Any]) -> tuple[str, str]:
@@ -252,8 +229,4 @@ class DeepSeekV4ResponseParser:
         return events
 
 
-__all__ = [
-    "DeepSeekV4Codec",
-    "DeepSeekV4ResponseParser",
-    "monitor_spawned_server",
-]
+__all__ = ["DeepSeekV4Codec", "DeepSeekV4ResponseParser"]

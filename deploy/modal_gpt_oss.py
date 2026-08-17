@@ -19,9 +19,6 @@ from huggingface_hub import snapshot_download
 from renderers import GptOssRendererConfig, Message, Renderer, create_renderer
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from deploy.http import (
-    monitor_spawned_server,
-)
 from deploy.jit_cache import (
     KERNEL_CACHE_ENV,
     KERNEL_CACHE_MOUNT,
@@ -43,7 +40,11 @@ from resin.backend.cuda.graphs import (
     default_decode_graph_shapes,
 )
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
-from resin.backend.parallel import TensorParallelRunner, follow_tensor_parallel_runner
+from resin.backend.parallel import (
+    TensorParallelRunner,
+    follow_tensor_parallel_runner,
+    monitor_process_context,
+)
 from resin.server import HttpServer, RendererCodec
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1195,7 +1196,7 @@ def _start_http_server(model_key: str) -> None:
         join=False,
     )
     _http_server_processes.append(process_context)
-    monitor_spawned_server(process_context, f"gpt-oss-{model_key}-http")
+    monitor_process_context(process_context, f"gpt-oss-{model_key}-http")
 
 
 @app.function(
