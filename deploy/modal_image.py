@@ -79,7 +79,6 @@ def build_modal_image(
         .add_local_file(
             root / "deploy/__init__.py", "/root/deploy/__init__.py", copy=True
         )
-        .add_local_file(root / "deploy/http.py", "/root/deploy/http.py", copy=True)
         .add_local_file(
             root / "deploy/jit_cache.py", "/root/deploy/jit_cache.py", copy=True
         )
