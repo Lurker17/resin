@@ -8,7 +8,7 @@ import numpy as np
 import numpy.typing as npt
 
 from resin import BatchPhase
-from resin.backend.plans import BatchView, CacheGroupView
+from resin.backend.plans import CacheGroupView, PagedCachePlan
 
 PAGE_SIZE = 64
 PREFILL_CHUNK_SIZE = 4096
@@ -55,22 +55,8 @@ def _paged_plan(
         start, end = map(int, token_indptr[row : row + 2])
         post_length = int(positions[end - 1]) + 1
         leased_length = post_length + decode_lookahead
-        last_block = (leased_length - 1) // PAGE_SIZE
         first_block = int(group.block_table_start_indices[row])
         pages = packed_blocks[group.block_slice(row)]
-        if first_block + len(pages) != last_block + 1:
-            raise ValueError("cache row is not the exact active logical range")
-        row_positions = positions[start:end]
-        relative = row_positions // PAGE_SIZE - first_block
-        if (
-            np.any(relative < 0)
-            or np.any(relative >= len(pages))
-            or not np.array_equal(packed_appends[start:end], pages[relative])
-            or not np.array_equal(
-                group.append_block_offsets[start:end], row_positions % PAGE_SIZE
-            )
-        ):
-            raise ValueError("cache append targets do not match scheduled positions")
         first_position = first_block * PAGE_SIZE
         kv_length = leased_length - first_position
         page_rows.append(pages)
@@ -97,16 +83,17 @@ def _paged_plan(
 
 def build_gemma4_batch_plan(
     plan,
+    cache_layout,
     *,
-    history_blocks_per_parent: int,
-    parent_capacity: int | None = None,
     decode_lookahead: int = 0,
 ) -> Gemma4BatchPlan:
-    batch = BatchView.from_plan(plan)
+    cache = PagedCachePlan.from_plan(
+        plan, cache_layout, decode_lookahead=decode_lookahead
+    )
+    batch = cache.batch
     token_ids = batch.token_ids.astype(np.int64, copy=False)
     positions = batch.positions.astype(np.int64, copy=False)
     token_indptr = batch.token_indptr.astype(np.int32, copy=False)
-    rows = batch.num_sequences
     if batch.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
         raise ValueError("plan phase must be prefill or decode")
     if decode_lookahead < 0:
@@ -121,39 +108,7 @@ def build_gemma4_batch_plan(
     if batch.phase == BatchPhase.DECODE and np.any(query_lengths != 1):
         raise ValueError("decode rows must contain one token")
 
-    groups = batch.cache_groups
-    if len(groups) != 2:
-        raise ValueError("Gemma 4 requires global History and local Window groups")
-    history = CacheGroupView.from_plan(
-        groups[0],
-        batch,
-        group_index=0,
-        blocks_per_slab=history_blocks_per_parent,
-        parent_capacity=parent_capacity,
-        block_tokens=PAGE_SIZE,
-    )
-    local = CacheGroupView.from_plan(
-        groups[1],
-        batch,
-        group_index=1,
-        blocks_per_slab=1,
-        parent_capacity=parent_capacity,
-        block_tokens=PAGE_SIZE,
-    )
-    for row in range(rows):
-        post_length = int(positions[int(token_indptr[row + 1]) - 1]) + 1
-        leased_length = post_length + decode_lookahead
-        last_block = (leased_length - 1) // PAGE_SIZE
-        expected_local_first = max(
-            0,
-            last_block
-            + 1
-            - (1 + (WINDOW_RETENTION_TOKENS - 1 + PAGE_SIZE - 1) // PAGE_SIZE),
-        )
-        if history.block_table_start_indices[row] != 0:
-            raise ValueError("global History cache must begin at logical block zero")
-        if local.block_table_start_indices[row] != expected_local_first:
-            raise ValueError("local Window cache does not expose the required suffix")
+    history, local = cache.groups
 
     return Gemma4BatchPlan(
         phase=batch.phase,

@@ -799,7 +799,7 @@ class GptOssCudaRunner(Runner):
         host_positions = plan.positions
 
         prefill_batches, decode_batch = build_attention_batches(
-            plan, parent_capacity=self.cache_parent_capacity
+            plan, self.cache_layout
         )
         host_batches = prefill_batches + (
             () if decode_batch is None else (decode_batch,)

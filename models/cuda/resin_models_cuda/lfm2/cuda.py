@@ -24,7 +24,7 @@ from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.paged_kv import PagedKvCsr
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
-from resin.backend.plans import BatchView, CacheGroupView
+from resin.backend.plans import PagedCachePlan
 from resin.protocols import Runner
 from resin_models_cuda.lfm2.plan import CacheMetadata, build_cache_metadata
 from resin_models_torch.lfm2.reference import (
@@ -253,60 +253,29 @@ class Lfm2CudaRunner(Runner):
             raise ValueError("LFM2 requires managed cache resources")
         self._cache.bind(binding.cache_pool_id, binding.cache_layout)
 
-    def _preflight_cache(self, plan: BatchPlan) -> CacheMetadata:
-        """Validate and derive the complete cache launch before CUDA acceptance."""
+    def _preflight_cache(self, plan: BatchPlan) -> PagedCachePlan:
+        """Validate the complete cache launch before CUDA acceptance."""
 
-        groups = tuple(plan.cache_groups)
-        if len(groups) != 2 or tuple(group.group_index for group in groups) != (0, 1):
-            raise ValueError("BatchPlan does not contain LFM2 history and state groups")
-        return build_cache_metadata(
-            plan,
-            self.page_size,
-            parent_capacity=self._cache.parent_capacity,
-        )
+        return PagedCachePlan.from_plan(plan, self.cache_layout)
 
-    def _state_rows(self, plan: BatchPlan) -> tuple[_StateRow, ...]:
-        batch = BatchView.from_plan(plan)
-        if len(batch.cache_groups) != 2:
-            raise ValueError("LFM2 requires History and State cache groups")
-        group = CacheGroupView.from_plan(
-            batch.cache_groups[1],
-            batch,
-            group_index=1,
-            blocks_per_slab=self._cache.state_packing,
-            parent_capacity=self._cache.parent_capacity,
-            block_tokens=_STATE_CHECKPOINT_TOKENS,
-        )
-        block_indptr = group.block_indptr
-        block_parents = group.block_slab_ids
-        block_slotnums = group.block_slotnums
-        first_blocks = group.block_table_start_indices
+    def _state_rows(self, cache: PagedCachePlan) -> tuple[_StateRow, ...]:
+        batch = cache.batch
+        group = cache.groups[1]
         result = []
         for index, context in enumerate(batch.context_lengths):
             context = int(context)
             token_start, token_end = map(int, batch.token_indptr[index : index + 2])
             post_length = context + token_end - token_start
-            first = int(first_blocks[index])
-            page_start, page_end = map(int, block_indptr[index : index + 2])
-            addresses = tuple(
-                zip(
-                    map(int, block_parents[page_start:page_end]),
-                    map(int, block_slotnums[page_start:page_end]),
-                )
-            )
-
-            def address(logical: int) -> tuple[int, int]:
-                column = logical - first
-                if column < 0 or column >= len(addresses):
-                    raise ValueError("LFM2 state table does not cover a checkpoint")
-                return addresses[column]
-
             input_address = (
                 None
                 if context == 0
-                else address((context - 1) // _STATE_CHECKPOINT_TOKENS)
+                else group.address(
+                    index, (context - 1) // _STATE_CHECKPOINT_TOKENS
+                )
             )
-            output_address = address((post_length - 1) // _STATE_CHECKPOINT_TOKENS)
+            output_address = group.address(
+                index, (post_length - 1) // _STATE_CHECKPOINT_TOKENS
+            )
             result.append(_StateRow(input_address, output_address))
         return tuple(result)
 
@@ -326,7 +295,7 @@ class Lfm2CudaRunner(Runner):
     ):
         torch = self._torch
         if derived is None:
-            derived = self._preflight_cache(plan)
+            derived = build_cache_metadata(self._preflight_cache(plan))
         prefill = derived.prefill
 
         if staging is None:
@@ -599,8 +568,9 @@ class Lfm2CudaRunner(Runner):
     def forward(self, plan: BatchPlan) -> list[int]:
         """Execute one immutable Engine plan to completion."""
 
-        cache_metadata = self._preflight_cache(plan)
-        recurrent_rows = self._state_rows(plan)
+        cache_plan = self._preflight_cache(plan)
+        cache_metadata = build_cache_metadata(cache_plan)
+        recurrent_rows = self._state_rows(cache_plan)
         torch = self._torch
         staging = TensorStager(self.device)
         ephemeral = []

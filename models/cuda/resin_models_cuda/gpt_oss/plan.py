@@ -8,7 +8,7 @@ import numpy as np
 import numpy.typing as npt
 
 from resin import BatchPhase
-from resin.backend.plans import BatchView, CacheGroupView
+from resin.backend.plans import CacheGroupView, PagedCachePlan
 
 PAGE_SIZE = 128
 SLIDING_WINDOW = 128
@@ -82,71 +82,23 @@ def _append_slots(
 
 
 def build_attention_batches(
-    plan, *, parent_capacity: int | None = None
+    plan, cache_layout
 ) -> tuple[tuple[AttentionBatch, ...], AttentionBatch | None]:
     """Return one prefill batch or one decode batch from a homogeneous plan."""
 
-    native = BatchView.from_plan(plan)
+    cache = PagedCachePlan.from_plan(plan, cache_layout)
+    native = cache.batch
     tokens = native.token_ids
-    positions = native.positions
     indptr = native.token_indptr
-    contexts = native.context_lengths
     row_count = native.num_sequences
-    if native.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
-        raise ValueError("plan phase must be prefill or decode")
-
-    native_groups = native.cache_groups
-    if len(native_groups) != 2:
-        raise ValueError("GPT-OSS requires History and Window cache groups")
-    history, window = tuple(
-        CacheGroupView.from_plan(
-            group,
-            native,
-            group_index=index,
-            blocks_per_slab=1,
-            parent_capacity=parent_capacity,
-            block_tokens=PAGE_SIZE,
-        )
-        for index, group in enumerate(native_groups)
-    )
+    history, window = cache.groups
     if np.intersect1d(history.block_slab_ids, window.block_slab_ids).size:
         raise ValueError("History and Window cannot address one parent in a batch")
 
-    post_lengths = []
+    post_lengths = [int(length) for length in native.post_lengths]
     for row in range(row_count):
         start, end = map(int, indptr[row : row + 2])
         query_length = end - start
-        context = int(contexts[row])
-        post_length = context + query_length
-        post_lengths.append(post_length)
-        last_block = (post_length - 1) // PAGE_SIZE
-        expected_window_first = max(0, last_block + 1 - WINDOW_TABLE_WIDTH)
-        if (
-            int(history.block_table_start_indices[row]) != 0
-            or len(history.block_slabs(row)) != last_block + 1
-        ):
-            raise ValueError("History row is not the exact post-append prefix")
-        if (
-            int(window.block_table_start_indices[row]) != expected_window_first
-            or len(window.block_slabs(row)) != last_block - expected_window_first + 1
-        ):
-            raise ValueError("Window row is not the exact active suffix")
-        for group in (history, window):
-            pages = group.block_slabs(row)
-            row_positions = positions[start:end]
-            relative = (
-                row_positions // PAGE_SIZE - group.block_table_start_indices[row]
-            )
-            if (
-                np.any(relative >= len(pages))
-                or not np.array_equal(
-                    group.append_slab_ids[start:end], pages[relative]
-                )
-                or not np.array_equal(
-                    group.append_block_offsets[start:end], row_positions % PAGE_SIZE
-                )
-            ):
-                raise ValueError("cache append destinations do not match the row")
         if native.phase == BatchPhase.PREFILL:
             if query_length > PREFILL_CHUNK_SIZE:
                 raise ValueError(

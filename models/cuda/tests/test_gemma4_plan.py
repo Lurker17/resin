@@ -1,12 +1,47 @@
 from __future__ import annotations
 
-from resin import BatchPhase, BatchPlan, CacheGroupPlan
+from resin import (
+    BatchPhase,
+    BatchPlan,
+    CacheGroupLayout,
+    CacheGroupPlan,
+    CacheLayout,
+    CacheRetention,
+)
 from resin_models_cuda.gemma4.plan import (
     PAGE_SIZE,
-    build_gemma4_batch_plan,
+    WINDOW_RETENTION_TOKENS,
     expand_gemma4_decode_batch,
     gemma4_assistant_context,
 )
+from resin_models_cuda.gemma4.plan import (
+    build_gemma4_batch_plan as _build_gemma4_batch_plan,
+)
+
+
+def build_gemma4_batch_plan(
+    plan,
+    *,
+    history_blocks_per_parent: int,
+    parent_capacity: int,
+    decode_lookahead: int = 0,
+):
+    layout = CacheLayout(
+        parent_capacity,
+        [
+            CacheGroupLayout(
+                PAGE_SIZE, blocks_per_slab=history_blocks_per_parent
+            ),
+            CacheGroupLayout(
+                PAGE_SIZE,
+                retention=CacheRetention.WINDOW,
+                window_tokens=WINDOW_RETENTION_TOKENS,
+            ),
+        ],
+    )
+    return _build_gemma4_batch_plan(
+        plan, layout, decode_lookahead=decode_lookahead
+    )
 
 
 def _append_metadata(pages: list[int], token_count: int) -> tuple[list[int], list[int]]:
@@ -81,7 +116,7 @@ def test_gemma4_plan_preserves_positive_ids_after_graph_null_page() -> None:
     )
 
     batch = build_gemma4_batch_plan(
-        plan, history_blocks_per_parent=10, parent_capacity=2
+        plan, history_blocks_per_parent=10, parent_capacity=128
     )
 
     assert batch.global_.page_indices.tolist() == [20, 21]
@@ -108,7 +143,7 @@ def test_decode_lookahead_expands_verify_but_not_assistant_context() -> None:
     batch = build_gemma4_batch_plan(
         plan,
         history_blocks_per_parent=10,
-        parent_capacity=22,
+        parent_capacity=128,
         decode_lookahead=3,
     )
     assistant = gemma4_assistant_context(batch)
@@ -146,7 +181,7 @@ def test_five_drafts_reserve_the_local_page_beyond_a_full_window() -> None:
     batch = build_gemma4_batch_plan(
         plan,
         history_blocks_per_parent=10,
-        parent_capacity=17,
+        parent_capacity=128,
         decode_lookahead=5,
     )
     assistant = gemma4_assistant_context(batch)

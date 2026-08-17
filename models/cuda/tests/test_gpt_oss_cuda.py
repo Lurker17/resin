@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from resin import BatchPhase
+from resin import BatchPhase, CacheGroupLayout, CacheLayout, CacheRetention
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import TorchSampler
 from resin_models_cuda.gpt_oss.cuda import (
@@ -17,10 +17,29 @@ from resin_models_cuda.gpt_oss.cuda import (
 )
 from resin_models_cuda.gpt_oss.model import Attention
 from resin_models_cuda.gpt_oss.plan import (
+    PAGE_SIZE,
     PREFILL_CHUNK_SIZE,
+    WINDOW_RETENTION_TOKENS,
     WINDOW_TABLE_WIDTH,
-    build_attention_batches,
 )
+from resin_models_cuda.gpt_oss.plan import (
+    build_attention_batches as _build_attention_batches,
+)
+
+
+def build_attention_batches(plan, *, parent_capacity: int = 2048):
+    layout = CacheLayout(
+        parent_capacity,
+        [
+            CacheGroupLayout(PAGE_SIZE),
+            CacheGroupLayout(
+                PAGE_SIZE,
+                retention=CacheRetention.WINDOW,
+                window_tokens=WINDOW_RETENTION_TOKENS,
+            ),
+        ],
+    )
+    return _build_attention_batches(plan, layout)
 
 
 def _group_plan(group_index, rows, block_table_start_indices, positions, indptr):
@@ -296,7 +315,7 @@ class TestGptOssCudaNativePlan:
     def test_frozen_append_destinations_are_a_validation_oracle(self) -> None:
         plan = _prefill_plan()
         plan.cache_groups[1].append_slab_ids[0] += 1
-        with pytest.raises(ValueError, match="append destinations"):
+        with pytest.raises(ValueError, match="append target"):
             build_attention_batches(plan)
 
     def test_group_order_suffix_and_parent_ownership_fail_closed(self) -> None:
@@ -307,7 +326,7 @@ class TestGptOssCudaNativePlan:
 
         plan = _flat_plan([9000], [1])
         plan.cache_groups[1].block_table_start_indices[0] = 0
-        with pytest.raises(ValueError, match="active suffix"):
+        with pytest.raises(ValueError, match="active range"):
             build_attention_batches(plan)
 
         plan = _flat_plan([0], [1])
@@ -318,7 +337,7 @@ class TestGptOssCudaNativePlan:
 
         plan = _flat_plan([0], [1])
         with pytest.raises(ValueError, match="outside"):
-            build_attention_batches(plan, parent_capacity=64)
+            build_attention_batches(plan, parent_capacity=128)
 
     def test_multi_page_prefill_is_validated_before_device_work(self) -> None:
         prefill, decode = build_attention_batches(_flat_plan([0], [PREFILL_CHUNK_SIZE]))

@@ -235,6 +235,7 @@ class PagedCachePlan:
     """Validated exact active cache tables for one native batch plan."""
 
     batch: BatchView
+    layout: CacheLayout
     groups: tuple[CacheGroupView, ...]
 
     @classmethod
@@ -247,7 +248,7 @@ class PagedCachePlan:
     ) -> PagedCachePlan:
         """Validate group order, physical bounds, extents, and append ownership."""
 
-        from resin._resin import BatchPhase
+        from resin._resin import BatchPhase, CacheGroupFamily
 
         if decode_lookahead < 0:
             raise ValueError("decode_lookahead cannot be negative")
@@ -278,11 +279,12 @@ class PagedCachePlan:
                 if batch.phase == BatchPhase.DECODE:
                     leased += decode_lookahead
                 last_block = (leased - 1) // block_tokens
-                expected_first = (
-                    max(0, last_block + 1 - window_blocks)
-                    if window_blocks is not None
-                    else 0
-                )
+                if descriptor.family == CacheGroupFamily.STATE:
+                    expected_first = max(0, last_block - 1)
+                elif window_blocks is not None:
+                    expected_first = max(0, last_block + 1 - window_blocks)
+                else:
+                    expected_first = 0
                 slabs = group.block_slabs(row)
                 slots = group.block_slots(row)
                 if (
@@ -313,7 +315,7 @@ class PagedCachePlan:
                         f"cache group {index} row {row} append target is not row-owned"
                     )
             groups.append(group)
-        return cls(batch, tuple(groups))
+        return cls(batch, layout, tuple(groups))
 
     @property
     def phase(self) -> Any:

@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import inspect
 
-from resin import BatchPhase, BatchPlan, CacheGroupPlan
+from resin import (
+    BatchPhase,
+    BatchPlan,
+    CacheGroupFamily,
+    CacheGroupLayout,
+    CacheGroupPlan,
+    CacheLayout,
+)
+from resin.backend.plans import PagedCachePlan
 from resin_models_cuda.lfm2.cuda import Lfm2CudaRunner
 from resin_models_cuda.lfm2.plan import build_cache_metadata
 
@@ -47,13 +55,25 @@ def _plan() -> BatchPlan:
     )
 
 
-class _Cache:
-    state_packing = 2
-    parent_capacity = 32
+def _cache_plan(plan: BatchPlan) -> PagedCachePlan:
+    return PagedCachePlan.from_plan(
+        plan,
+        CacheLayout(
+            32,
+            [
+                CacheGroupLayout(16),
+                CacheGroupLayout(
+                    128,
+                    blocks_per_slab=2,
+                    family=CacheGroupFamily.STATE,
+                ),
+            ],
+        ),
+    )
 
 
 def test_attention_metadata_uses_only_the_history_group() -> None:
-    metadata = build_cache_metadata(_plan(), 16)
+    metadata = build_cache_metadata(_cache_plan(_plan()))
     assert metadata.page_indices.tolist() == [5, 3, 7]
     assert metadata.append_positions.tolist() == [0, 1, 16]
     assert metadata.prefill.dense_token_indices.tolist() == [0, 1]
@@ -62,8 +82,7 @@ def test_attention_metadata_uses_only_the_history_group() -> None:
 
 def test_recurrent_rows_are_derived_from_the_state_page_table() -> None:
     runner = Lfm2CudaRunner.__new__(Lfm2CudaRunner)
-    runner._cache = _Cache()
-    rows = runner._state_rows(_plan())
+    rows = runner._state_rows(_cache_plan(_plan()))
     assert [(row.input_address, row.output_address) for row in rows] == [
         (None, (6, 0)),
         ((7, 0), (7, 0)),
@@ -83,8 +102,7 @@ def test_prefix_boundary_uses_distinct_input_and_output_state_pages() -> None:
         ],
     )
     runner = Lfm2CudaRunner.__new__(Lfm2CudaRunner)
-    runner._cache = _Cache()
-    [row] = runner._state_rows(plan)
+    [row] = runner._state_rows(_cache_plan(plan))
     assert (row.input_address, row.output_address) == ((6, 0), (6, 1))
 
 

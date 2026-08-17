@@ -1639,8 +1639,7 @@ class Gemma4CudaRunner(Runner):
         self._graphs.check()
         batch = build_gemma4_batch_plan(
             plan,
-            history_blocks_per_parent=self.config.history_blocks_per_parent,
-            parent_capacity=self.cache_parent_capacity,
+            self.cache_layout,
             decode_lookahead=(
                 self.speculative_tokens if plan.phase == BatchPhase.DECODE else 0
             ),

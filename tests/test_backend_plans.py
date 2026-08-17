@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 
-from resin import BatchPhase, BatchPlan, CacheGroupLayout, CacheGroupPlan, CacheLayout
+from resin import (
+    BatchPhase,
+    BatchPlan,
+    CacheGroupFamily,
+    CacheGroupLayout,
+    CacheGroupPlan,
+    CacheLayout,
+)
 from resin.backend.plans import BatchView, CacheGroupView, PagedCachePlan
 
 
@@ -81,3 +88,29 @@ def test_paged_cache_plan_validates_exact_leased_tables() -> None:
     cache = PagedCachePlan.from_plan(plan, layout, decode_lookahead=1)
     assert cache.rows == 1
     assert cache.groups[0].address(0, 1) == (2, 0)
+
+
+def test_paged_cache_plan_accepts_the_two_checkpoint_state_ring() -> None:
+    layout = CacheLayout(
+        2, [CacheGroupLayout(4, family=CacheGroupFamily.STATE)]
+    )
+    plan = BatchPlan(
+        [10],
+        [11],
+        [3],
+        [0, 1],
+        cache_groups=[
+            CacheGroupPlan(
+                0,
+                [0, 2],
+                [1, 2],
+                [0, 0],
+                [1],
+                [2],
+                [0],
+                [3],
+            )
+        ],
+    )
+    cache = PagedCachePlan.from_plan(plan, layout)
+    assert cache.groups[0].address(0, 2) == (2, 0)

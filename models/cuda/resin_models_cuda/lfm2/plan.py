@@ -8,7 +8,7 @@ import numpy as np
 import numpy.typing as npt
 
 from resin import BatchPhase
-from resin.backend.plans import BatchView, CacheGroupView
+from resin.backend.plans import PagedCachePlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,36 +40,18 @@ class CacheMetadata:
     prefill: PrefillMetadata
 
 
-def build_cache_metadata(
-    plan, page_size: int, *, parent_capacity: int | None = None
-) -> CacheMetadata:
+def build_cache_metadata(cache: PagedCachePlan) -> CacheMetadata:
     """Derive kernel views from one homogeneous native History plan."""
 
-    if page_size <= 0:
-        raise ValueError("page_size must be positive")
-    batch = BatchView.from_plan(plan)
+    batch = cache.batch
+    page_size = cache.layout.groups[0].block_tokens
     rows = batch.num_sequences
     indptr = batch.token_indptr
     contexts = batch.context_lengths
     positions = batch.positions
-    if batch.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
-        raise ValueError("plan phase must be prefill or decode")
-    groups = batch.cache_groups
-    if len(groups) != 2 or tuple(group.group_index for group in groups) != (0, 1):
-        raise ValueError("LFM2 requires History and State cache groups")
-    group = CacheGroupView.from_plan(
-        groups[0],
-        batch,
-        group_index=0,
-        blocks_per_slab=1,
-        parent_capacity=parent_capacity,
-        block_tokens=page_size,
-    )
+    group = cache.groups[0]
     block_indptr = group.block_indptr
     page_indices = group.block_slab_ids
-    first_blocks = group.block_table_start_indices
-    append_pages = group.append_slab_ids
-    append_offsets = group.append_block_offsets
 
     dense_tokens: list[npt.NDArray[np.uint32]] = []
     dense_cu = [0]
@@ -91,17 +73,6 @@ def build_cache_metadata(
         page_start, page_end = map(int, block_indptr[row : row + 2])
         pages = page_indices[page_start:page_end]
         post_length = context + query_length
-        expected_pages = (post_length + page_size - 1) // page_size
-        if int(first_blocks[row]) != 0 or len(pages) != expected_pages:
-            raise ValueError("History row is not the exact post-append prefix")
-        if len(pages) == 0:
-            raise ValueError("cache page IDs must be positive")
-        row_positions = positions[start:end]
-        if not np.array_equal(
-            append_pages[start:end], pages[row_positions // page_size]
-        ) or not np.array_equal(append_offsets[start:end], row_positions % page_size):
-            raise ValueError("cache append destinations do not match the row")
-
         last_length = (post_length - 1) % page_size + 1
         last_lengths.append(last_length)
         if batch.phase == BatchPhase.DECODE:
