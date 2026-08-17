@@ -20,7 +20,3 @@ print(
     "import PyTorch backend module: "
     f"{measure('import resin_models_torch.lfm2.reference'):.2f} ms"
 )
-print(
-    "import managed CUDA model backend: "
-    f"{measure('import resin_models_cuda.lfm2.cuda'):.2f} ms"
-)

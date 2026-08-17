@@ -237,18 +237,13 @@ class TestSchedulerConfigContract:
 
     def test_builtin_runner_continuation_capabilities_are_explicit(self) -> None:
         from resin_models_cuda.gpt_oss import GptOssCudaRunner
-        from resin_models_cuda.lfm2 import Lfm2CudaRunner
         from resin_models_torch.lfm2 import Lfm2TorchRunner
 
         gpt_source = inspect.getsource(GptOssCudaRunner.__init__)
-        lfm_source = inspect.getsource(Lfm2CudaRunner.__init__)
         assert (
             "RunnerConfig(" in gpt_source and "continuation_prefill=True" in gpt_source
         )
         assert "max_batch_tokens=_PREFILL_CHUNK_SIZE" in gpt_source
-        assert (
-            "RunnerConfig(" in lfm_source and "continuation_prefill=True" in lfm_source
-        )
         assert Lfm2TorchRunner.runner_config.continuation_prefill is True
 
     def test_engine_freezes_a_copy_of_the_effective_config(self) -> None:
