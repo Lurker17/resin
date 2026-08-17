@@ -280,13 +280,13 @@ def batch_plan_payload(plan: BatchPlan) -> dict[str, Any]:
         "cache_groups": [
             {
                 "group_index": group.group_index,
-                "blocks_per_parent": group.blocks_per_parent,
+                "blocks_per_slab": group.blocks_per_slab,
                 "block_indptr": group.block_indptr,
-                "block_parent_ids": group.block_parent_ids,
-                "block_child_slots": group.block_child_slots,
-                "first_logical_blocks": group.first_logical_blocks,
-                "append_parent_ids": group.append_parent_ids,
-                "append_child_slots": group.append_child_slots,
+                "block_slab_ids": group.block_slab_ids,
+                "block_slotnums": group.block_slotnums,
+                "block_table_start_indices": group.block_table_start_indices,
+                "append_slab_ids": group.append_slab_ids,
+                "append_slotnums": group.append_slotnums,
                 "append_block_offsets": group.append_block_offsets,
             }
             for group in plan.cache_groups

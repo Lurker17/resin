@@ -319,7 +319,7 @@ class Gemma4CudaRunner(SyncRunner):
             [
                 CacheGroupLayout(
                     PAGE_SIZE,
-                    blocks_per_parent=self.config.history_blocks_per_parent,
+                    blocks_per_slab=self.config.history_blocks_per_parent,
                 ),
                 CacheGroupLayout(
                     PAGE_SIZE,

@@ -33,7 +33,7 @@ def _cache_group(
         )
 
     parents, child_slots = addresses(compact_pages)
-    append_parents, append_child_slots = addresses(compact_append_pages)
+    append_parents, append_slotnums = addresses(compact_append_pages)
     return CacheGroupPlan(
         index,
         indptr,
@@ -41,9 +41,9 @@ def _cache_group(
         child_slots,
         first_blocks,
         append_parents,
-        append_child_slots,
+        append_slotnums,
         append_offsets,
-        blocks_per_parent=packing,
+        blocks_per_slab=packing,
     )
 
 

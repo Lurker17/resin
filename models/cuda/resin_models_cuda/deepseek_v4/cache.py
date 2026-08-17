@@ -205,26 +205,26 @@ class CacheGeometry:
                     window_tokens=self.window_tokens,
                 ),
                 CacheGroupLayout(
-                    PAGE_TOKENS, blocks_per_parent=self.packings[C4_KV_GROUP]
+                    PAGE_TOKENS, blocks_per_slab=self.packings[C4_KV_GROUP]
                 ),
                 CacheGroupLayout(
                     _GROUP_BLOCK_TOKENS[C4_STATE_GROUP],
-                    blocks_per_parent=self.packings[C4_STATE_GROUP],
+                    blocks_per_slab=self.packings[C4_STATE_GROUP],
                     retention=CacheRetention.WINDOW,
                     window_tokens=self.c4_state_tokens,
                 ),
                 CacheGroupLayout(
-                    PAGE_TOKENS, blocks_per_parent=self.packings[C128_KV_GROUP]
+                    PAGE_TOKENS, blocks_per_slab=self.packings[C128_KV_GROUP]
                 ),
                 CacheGroupLayout(
                     _GROUP_BLOCK_TOKENS[C128_STATE_GROUP],
-                    blocks_per_parent=self.packings[C128_STATE_GROUP],
+                    blocks_per_slab=self.packings[C128_STATE_GROUP],
                     retention=CacheRetention.WINDOW,
                     window_tokens=128,
                 ),
                 CacheGroupLayout(
                     _GROUP_BLOCK_TOKENS[INDEX_STATE_GROUP],
-                    blocks_per_parent=self.packings[INDEX_STATE_GROUP],
+                    blocks_per_slab=self.packings[INDEX_STATE_GROUP],
                     retention=CacheRetention.WINDOW,
                     window_tokens=12,
                 ),
@@ -564,17 +564,17 @@ def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> Cac
     groups = []
     for group_index, (source, descriptor) in enumerate(zip(native, layout.groups)):
         block_indptr = np.asarray(source.block_indptr, dtype=np.uint32)
-        parent_ids = np.asarray(source.block_parent_ids, dtype=np.uint32)
-        child_slots = np.asarray(source.block_child_slots, dtype=np.uint32)
-        first = np.asarray(source.first_logical_blocks, dtype=np.uint32)
-        append_parents = np.asarray(source.append_parent_ids, dtype=np.uint32)
-        append_slots = np.asarray(source.append_child_slots, dtype=np.uint32)
+        parent_ids = np.asarray(source.block_slab_ids, dtype=np.uint32)
+        child_slots = np.asarray(source.block_slotnums, dtype=np.uint32)
+        first = np.asarray(source.block_table_start_indices, dtype=np.uint32)
+        append_parents = np.asarray(source.append_slab_ids, dtype=np.uint32)
+        append_slots = np.asarray(source.append_slotnums, dtype=np.uint32)
         append_offsets = np.asarray(source.append_block_offsets, dtype=np.uint32)
         block_tokens = descriptor.block_tokens
-        packing = descriptor.blocks_per_parent
+        packing = descriptor.blocks_per_slab
         if (
             source.group_index != group_index
-            or source.blocks_per_parent != packing
+            or source.blocks_per_slab != packing
             or len(block_indptr) != rows + 1
             or block_indptr[0] != 0
             or block_indptr[-1] != len(parent_ids)

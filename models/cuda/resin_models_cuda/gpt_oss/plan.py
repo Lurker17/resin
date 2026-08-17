@@ -34,17 +34,17 @@ class CacheGroup:
     ) -> CacheGroup:
         if native.group_index != index:
             raise ValueError("cache groups must be ordered History then Window")
-        if native.blocks_per_parent != 1:
+        if native.blocks_per_slab != 1:
             raise ValueError("GPT-OSS cache groups require one block per parent")
-        block_parents = np.asarray(native.block_parent_ids, dtype=np.uint32)
-        block_slots = np.asarray(native.block_child_slots, dtype=np.uint32)
-        append_parents = np.asarray(native.append_parent_ids, dtype=np.uint32)
-        append_slots = np.asarray(native.append_child_slots, dtype=np.uint32)
+        block_parents = np.asarray(native.block_slab_ids, dtype=np.uint32)
+        block_slots = np.asarray(native.block_slotnums, dtype=np.uint32)
+        append_parents = np.asarray(native.append_slab_ids, dtype=np.uint32)
+        append_slots = np.asarray(native.append_slotnums, dtype=np.uint32)
         group = cls(
             index,
             np.asarray(native.block_indptr, dtype=np.uint32),
             block_parents,
-            np.asarray(native.first_logical_blocks, dtype=np.uint32),
+            np.asarray(native.block_table_start_indices, dtype=np.uint32),
             append_parents,
             np.asarray(native.append_block_offsets, dtype=np.uint32),
         )
@@ -58,7 +58,7 @@ class CacheGroup:
         ):
             raise ValueError("cache block_indptr is malformed")
         if len(group.first_blocks) != rows:
-            raise ValueError("cache first_logical_blocks does not cover every row")
+            raise ValueError("cache block_table_start_indices does not cover every row")
         if len(group.append_pages) != tokens or len(group.append_offsets) != tokens:
             raise ValueError("cache append metadata does not cover every token")
         if (

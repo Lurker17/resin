@@ -128,8 +128,8 @@ def test_tensor_parallel_plan_round_trip_preserves_native_contract() -> None:
     assert restored.batch_id == plan.batch_id
     assert restored.batch_key == plan.batch_key
     assert restored.sampling_mask.tolist() == [False, True]
-    assert restored.cache_groups[0].block_parent_ids.tolist() == [3, 4]
-    assert restored.cache_groups[0].block_child_slots.tolist() == [0, 0]
+    assert restored.cache_groups[0].block_slab_ids.tolist() == [3, 4]
+    assert restored.cache_groups[0].block_slotnums.tolist() == [0, 0]
     assert restored.sampling_params[0].temperature == 0.5
     assert restored.sampling_params[1].top_p == 0.9
 

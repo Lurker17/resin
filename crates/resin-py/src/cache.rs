@@ -21,9 +21,9 @@ fn plan_error(error: KvPlanError) -> PyErr {
 
 /// Cache-block lifetime policy.
 ///
-/// For history groups, ``HISTORY`` retains every logical block and ``WINDOW``
-/// retains the suffix selected by ``CacheGroupLayout.window_tokens``. Recurrent
-/// state groups use ``HISTORY`` and retain their two-page checkpoint ring.
+/// For history groups, `HISTORY` retains every logical block and `WINDOW`
+/// retains the suffix selected by `CacheGroupLayout.window_tokens`. Recurrent
+/// state groups use `HISTORY` and retain their two-page checkpoint ring.
 #[pyclass(
     frozen,
     eq,
@@ -60,22 +60,22 @@ fn group_repr(group: KvGroupLayout) -> String {
     };
     match group.retention() {
         KvRetention::FullContext => format!(
-            "CacheGroupLayout(block_tokens={}, blocks_per_parent={}, retention=CacheRetention.HISTORY{family})",
+            "CacheGroupLayout(block_tokens={}, blocks_per_slab={}, retention=CacheRetention.HISTORY{family})",
             group.block_tokens(),
-            group.blocks_per_parent()
+            group.blocks_per_slab()
         ),
         KvRetention::SlidingWindow { tokens } => format!(
-            "CacheGroupLayout(block_tokens={}, blocks_per_parent={}, retention=CacheRetention.WINDOW, window_tokens={tokens}{family})",
+            "CacheGroupLayout(block_tokens={}, blocks_per_slab={}, retention=CacheRetention.WINDOW, window_tokens={tokens}{family})",
             group.block_tokens(),
-            group.blocks_per_parent()
+            group.blocks_per_slab()
         ),
     }
 }
 
-/// Geometry and retention policy for one logical cache group.
+/// Geometry and retention policy for one type of cache.
 ///
-/// Groups with different tensor layouts share the parent pool. A group packs
-/// ``blocks_per_parent`` logical blocks into each equally-sized parent.
+/// Cache groups share a pool of equal-sized slabs. `blocks_per_slab` is how
+/// many of this group's blocks fit in one slab.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CacheGroupLayout {
@@ -85,7 +85,7 @@ pub(crate) struct CacheGroupLayout {
 impl CacheGroupLayout {
     pub(crate) fn from_parts(
         block_tokens: u32,
-        blocks_per_parent: u32,
+        blocks_per_slab: u32,
         retention: CacheRetention,
         window_tokens: Option<u32>,
         family: CacheGroupFamily,
@@ -113,13 +113,8 @@ impl CacheGroupLayout {
             CacheGroupFamily::State => KvGroupFamily::State,
         };
         Ok(Self {
-            inner: KvGroupLayout::new_with_family(
-                block_tokens,
-                blocks_per_parent,
-                retention,
-                family,
-            )
-            .map_err(layout_error)?,
+            inner: KvGroupLayout::new_with_family(block_tokens, blocks_per_slab, retention, family)
+                .map_err(layout_error)?,
         })
     }
 
@@ -143,21 +138,21 @@ impl CacheGroupLayout {
     #[pyo3(signature = (
         block_tokens,
         *,
-        blocks_per_parent = 1,
+        blocks_per_slab = 1,
         retention = CacheRetention::History,
         window_tokens = None,
         family = CacheGroupFamily::History
     ))]
     fn new(
         block_tokens: u32,
-        blocks_per_parent: u32,
+        blocks_per_slab: u32,
         retention: CacheRetention,
         window_tokens: Option<u32>,
         family: CacheGroupFamily,
     ) -> PyResult<Self> {
         Self::from_parts(
             block_tokens,
-            blocks_per_parent,
+            blocks_per_slab,
             retention,
             window_tokens,
             family,
@@ -170,10 +165,10 @@ impl CacheGroupLayout {
         self.inner.block_tokens().get()
     }
 
-    /// Number of this group's logical blocks packed into one parent allocation.
+    /// Number of this group's blocks packed into one slab.
     #[getter]
-    fn blocks_per_parent(&self) -> u32 {
-        self.inner.blocks_per_parent().get()
+    fn blocks_per_slab(&self) -> u32 {
+        self.inner.blocks_per_slab().get()
     }
 
     /// Lifetime policy for logical blocks in this group.
@@ -194,7 +189,7 @@ impl CacheGroupLayout {
         }
     }
 
-    /// Retained suffix length for ``WINDOW`` groups, otherwise ``None``.
+    /// Retained suffix length for `WINDOW` groups, otherwise `None`.
     #[getter]
     fn window_tokens(&self) -> Option<u32> {
         self.inner.retention().window_tokens().map(NonZeroU32::get)
@@ -213,8 +208,8 @@ impl CacheGroupLayout {
 
 /// Immutable grouped-cache geometry owned by one Engine.
 ///
-/// ``parent_capacity`` is the number of fungible physical parents shared by
-/// every group. Group order is stable and identifies each group in BatchPlan.
+/// `parent_capacity` is the number of fungible physical slabs shared by every
+/// group. Group order is stable and identifies each group in BatchPlan.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CacheLayout {
@@ -272,7 +267,7 @@ impl CacheLayout {
         Self::from_groups(parent_capacity, groups)
     }
 
-    /// Number of fungible physical parent allocations in the pool.
+    /// Number of fungible physical slabs in the pool.
     #[getter]
     fn parent_capacity(&self) -> u32 {
         self.inner.parent_capacity().get()
@@ -319,26 +314,25 @@ impl CacheLayout {
 ///
 /// A model can have one or more types of cache, such as full attention,
 /// sliding-window attention, or recurrent state, each described by one
-/// ``CacheGroupLayout``. Cache memory is organized into fungible slabs. Each
-/// slab is assigned to one cache group and holds ``blocks_per_parent`` blocks.
+/// `CacheGroupLayout`. Cache memory is organized into fungible slabs. Each
+/// slab is assigned to one cache group and holds `blocks_per_slab` blocks.
 ///
-/// A block is indexed by ``(slab_id, slotnum)``. The parallel
-/// ``block_parent_ids`` and ``block_child_slots`` arrays contain these values:
-/// a parent ID is a one-based slab ID, and a child slot is a zero-based slot
-/// number. A cached token location is ``(block, block_offset)``, equivalently
-/// ``(slab_id, slotnum, block_offset)``.
+/// A block is indexed by `(slab_id, slotnum)`: `block_slab_ids` contains
+/// one-based slab IDs and `block_slotnums` contains zero-based slot numbers. A
+/// cached token location is `(block, block_offset)`, equivalently
+/// `(slab_id, slotnum, block_offset)`.
 ///
-/// The plan covers every sequence in the batch. Adjacent ``block_indptr``
+/// The plan covers every sequence in the batch. Adjacent `block_indptr`
 /// values select each sequence's chronological block-table row.
-/// ``first_logical_blocks[i]`` is sequence ``i``'s block-table start index, so
-/// row entry ``j`` represents block ``first_logical_blocks[i] + j``; block
-/// ``b`` begins at token position ``b * CacheGroupLayout.block_tokens``. Full-
+/// `block_table_start_indices[i]` is sequence `i`'s block-table start index, so
+/// row entry `j` represents block `block_table_start_indices[i] + j`; block
+/// `b` begins at token position `b * CacheGroupLayout.block_tokens`. Full-
 /// attention tables start at zero; sliding-window and recurrent tables advance
 /// as old blocks leave their resident rings.
 ///
-/// For flattened batch token ``k``, the ``append_*`` arrays supply exactly that
-/// cached-token location: ``(append_parent_ids[k], append_child_slots[k],
-/// append_block_offsets[k])``.
+/// For flattened batch token `k`, the `append_*` arrays supply exactly that
+/// cached-token location: `(append_slab_ids[k], append_slotnums[k],
+/// append_block_offsets[k])`.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CacheGroupPlan {
@@ -355,28 +349,28 @@ impl CacheGroupPlan {
     pub(crate) fn from_parts(
         group_index: u32,
         block_indptr: Vec<u32>,
-        block_parent_ids: Vec<u32>,
-        block_child_slots: Vec<u32>,
-        first_logical_blocks: Vec<u32>,
-        append_parent_ids: Vec<u32>,
-        append_child_slots: Vec<u32>,
+        block_slab_ids: Vec<u32>,
+        block_slotnums: Vec<u32>,
+        block_table_start_indices: Vec<u32>,
+        append_slab_ids: Vec<u32>,
+        append_slotnums: Vec<u32>,
         append_block_offsets: Vec<u32>,
-        blocks_per_parent: u32,
+        blocks_per_slab: u32,
     ) -> PyResult<Self> {
-        let blocks_per_parent = NonZeroU32::new(blocks_per_parent)
-            .ok_or_else(|| PyValueError::new_err("blocks_per_parent must be positive"))?;
+        let blocks_per_slab = NonZeroU32::new(blocks_per_slab)
+            .ok_or_else(|| PyValueError::new_err("blocks_per_slab must be positive"))?;
         Ok(Self {
             inner: Arc::new(
                 KvGroupPlan::new(
                     group_index,
                     block_indptr,
-                    block_parent_ids,
-                    block_child_slots,
-                    first_logical_blocks,
-                    append_parent_ids,
-                    append_child_slots,
+                    block_slab_ids,
+                    block_slotnums,
+                    block_table_start_indices,
+                    append_slab_ids,
+                    append_slotnums,
                     append_block_offsets,
-                    blocks_per_parent,
+                    blocks_per_slab,
                 )
                 .map_err(plan_error)?,
             ),
@@ -393,12 +387,12 @@ impl CacheGroupPlan {
 
     fn repr_string(&self) -> String {
         format!(
-            "CacheGroupPlan(group_index={}, blocks_per_parent={}, sequences={}, blocks={}, appends={})",
+            "CacheGroupPlan(group_index={}, blocks_per_slab={}, sequences={}, blocks={}, appends={})",
             self.inner.group_index,
-            self.inner.blocks_per_parent,
-            self.inner.first_logical_blocks.len(),
-            self.inner.block_parent_ids.len(),
-            self.inner.append_parent_ids.len()
+            self.inner.blocks_per_slab,
+            self.inner.block_table_start_indices.len(),
+            self.inner.block_slab_ids.len(),
+            self.inner.append_slab_ids.len()
         )
     }
 }
@@ -409,36 +403,36 @@ impl CacheGroupPlan {
     #[pyo3(signature = (
         group_index,
         block_indptr,
-        block_parent_ids,
-        block_child_slots,
-        first_logical_blocks,
-        append_parent_ids,
-        append_child_slots,
+        block_slab_ids,
+        block_slotnums,
+        block_table_start_indices,
+        append_slab_ids,
+        append_slotnums,
         append_block_offsets,
         *,
-        blocks_per_parent = 1
+        blocks_per_slab = 1
     ))]
     fn new(
         group_index: u32,
         block_indptr: PyArrayLike1<'_, u32>,
-        block_parent_ids: PyArrayLike1<'_, u32>,
-        block_child_slots: PyArrayLike1<'_, u32>,
-        first_logical_blocks: PyArrayLike1<'_, u32>,
-        append_parent_ids: PyArrayLike1<'_, u32>,
-        append_child_slots: PyArrayLike1<'_, u32>,
+        block_slab_ids: PyArrayLike1<'_, u32>,
+        block_slotnums: PyArrayLike1<'_, u32>,
+        block_table_start_indices: PyArrayLike1<'_, u32>,
+        append_slab_ids: PyArrayLike1<'_, u32>,
+        append_slotnums: PyArrayLike1<'_, u32>,
         append_block_offsets: PyArrayLike1<'_, u32>,
-        blocks_per_parent: u32,
+        blocks_per_slab: u32,
     ) -> PyResult<Self> {
         Self::from_parts(
             group_index,
             crate::arrays::owned_vec(block_indptr),
-            crate::arrays::owned_vec(block_parent_ids),
-            crate::arrays::owned_vec(block_child_slots),
-            crate::arrays::owned_vec(first_logical_blocks),
-            crate::arrays::owned_vec(append_parent_ids),
-            crate::arrays::owned_vec(append_child_slots),
+            crate::arrays::owned_vec(block_slab_ids),
+            crate::arrays::owned_vec(block_slotnums),
+            crate::arrays::owned_vec(block_table_start_indices),
+            crate::arrays::owned_vec(append_slab_ids),
+            crate::arrays::owned_vec(append_slotnums),
             crate::arrays::owned_vec(append_block_offsets),
-            blocks_per_parent,
+            blocks_per_slab,
         )
     }
 
@@ -449,11 +443,11 @@ impl CacheGroupPlan {
         self.inner.group_index
     }
 
-    /// Number of this group's physical cache blocks packed into one parent.
-    /// Valid child slots are ``0 <= slot < blocks_per_parent``.
+    /// Number of this group's blocks packed into one slab. Valid slot numbers
+    /// are `0 <= slotnum < blocks_per_slab`.
     #[getter]
-    fn blocks_per_parent(&self) -> u32 {
-        self.inner.blocks_per_parent
+    fn blocks_per_slab(&self) -> u32 {
+        self.inner.blocks_per_slab
     }
 
     /// CSR row pointer into the block-address arrays. Its length is one more
@@ -463,18 +457,18 @@ impl CacheGroupPlan {
         crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_indptr)
     }
 
-    /// One-based physical parent ID for each flattened block-table entry.
-    /// Pair with ``block_child_slots``; parent zero is reserved as null.
+    /// One-based slab ID for each flattened block-table entry. Pair with
+    /// `block_slotnums`; slab zero is reserved as null.
     #[getter]
-    fn block_parent_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_parent_ids)
+    fn block_slab_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_slab_ids)
     }
 
-    /// Child-block slot for each flattened block-table entry. Pair with
-    /// ``block_parent_ids``.
+    /// Zero-based slot number for each flattened block-table entry. Pair with
+    /// `block_slab_ids`.
     #[getter]
-    fn block_child_slots<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_child_slots)
+    fn block_slotnums<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_slotnums)
     }
 
     /// Absolute logical-block index at which each sequence's table row starts.
@@ -482,33 +476,30 @@ impl CacheGroupPlan {
     /// and recurrent rings. It has one entry per sequence and is unrelated to
     /// the physical slab ID.
     #[getter]
-    fn first_logical_blocks<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+    fn block_table_start_indices<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
         crate::arrays::readonly_view(
             this.clone().into_any(),
-            &this.get().inner.first_logical_blocks,
+            &this.get().inner.block_table_start_indices,
         )
     }
 
-    /// One-based physical parent ID of each token's write target. Entry ``k``
-    /// corresponds to ``BatchPlan.token_ids[k]``.
+    /// One-based slab ID of each token's write target. Entry `k`
+    /// corresponds to `BatchPlan.token_ids[k]`.
     #[getter]
-    fn append_parent_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.append_parent_ids)
+    fn append_slab_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.append_slab_ids)
     }
 
-    /// Child-block slot of each token's write target. Entry ``k`` corresponds
-    /// to ``BatchPlan.token_ids[k]``.
+    /// Zero-based slot number of each token's write target. Entry `k`
+    /// corresponds to `BatchPlan.token_ids[k]`.
     #[getter]
-    fn append_child_slots<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(
-            this.clone().into_any(),
-            &this.get().inner.append_child_slots,
-        )
+    fn append_slotnums<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.append_slotnums)
     }
 
-    /// Token offset within each token's destination block. Entry ``k``
-    /// corresponds to ``BatchPlan.token_ids[k]`` and is less than the matching
-    /// ``CacheGroupLayout.block_tokens``.
+    /// Token offset within each token's destination block. Entry `k`
+    /// corresponds to `BatchPlan.token_ids[k]` and is less than the matching
+    /// `CacheGroupLayout.block_tokens`.
     #[getter]
     fn append_block_offsets<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
         crate::arrays::readonly_view(
@@ -563,7 +554,7 @@ mod tests {
         let layout = CacheLayout::from_groups(8, vec![history, window]).unwrap();
         assert_eq!(
             layout.repr_string(),
-            "CacheLayout(parent_capacity=8, groups=[CacheGroupLayout(block_tokens=128, blocks_per_parent=1, retention=CacheRetention.HISTORY), CacheGroupLayout(block_tokens=128, blocks_per_parent=1, retention=CacheRetention.WINDOW, window_tokens=128)])"
+            "CacheLayout(parent_capacity=8, groups=[CacheGroupLayout(block_tokens=128, blocks_per_slab=1, retention=CacheRetention.HISTORY), CacheGroupLayout(block_tokens=128, blocks_per_slab=1, retention=CacheRetention.WINDOW, window_tokens=128)])"
         );
     }
 }

@@ -289,15 +289,15 @@ impl SchedulerConfig {
 
 /// Immutable execution plan for one prefill or decode step.
 ///
-/// This runs one forward pass on a batch of sequences. ``token_ids`` contains
+/// This runs one forward pass on a batch of sequences. `token_ids` contains
 /// the newly scheduled input tokens, packed by sequence into one flat array;
-/// ``token_indptr`` is the CSR row pointer, so sequence ``i`` owns
-/// ``token_ids[token_indptr[i]:token_indptr[i + 1]]``.
+/// `token_indptr` is the CSR row pointer, so sequence `i` owns
+/// `token_ids[token_indptr[i]:token_indptr[i + 1]]`.
 ///
-/// ``context_lengths[i]`` is the number of tokens processed before this step,
+/// `context_lengths[i]` is the number of tokens processed before this step,
 /// so that sequence's new tokens occupy consecutive absolute positions
-/// beginning there. ``cache_groups`` contains one placement plan per declared
-/// ``CacheLayout`` group, and every group plan covers every sequence.
+/// beginning there. `cache_groups` contains one placement plan per declared
+/// `CacheLayout` group, and every group plan covers every sequence.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug)]
 struct BatchPlan {
@@ -420,13 +420,13 @@ impl BatchPlan {
                     "cache_groups must be ordered by contiguous group_index",
                 ));
             }
-            if group.first_logical_blocks.len() != self.sequence_ids.len() {
+            if group.block_table_start_indices.len() != self.sequence_ids.len() {
                 return Err(PyValueError::new_err(
                     "each cache group must contain one block-table segment per sequence",
                 ));
             }
-            if group.append_parent_ids.len() != self.token_ids.len()
-                || group.append_child_slots.len() != self.token_ids.len()
+            if group.append_slab_ids.len() != self.token_ids.len()
+                || group.append_slotnums.len() != self.token_ids.len()
             {
                 return Err(PyValueError::new_err(
                     "each cache group must contain one append target per batch token",
@@ -435,18 +435,18 @@ impl BatchPlan {
             for sequence_index in 0..self.sequence_ids.len() {
                 let block_start = group.block_indptr[sequence_index] as usize;
                 let block_end = group.block_indptr[sequence_index + 1] as usize;
-                let row_parents = &group.block_parent_ids[block_start..block_end];
-                let row_slots = &group.block_child_slots[block_start..block_end];
+                let row_slabs = &group.block_slab_ids[block_start..block_end];
+                let row_slotnums = &group.block_slotnums[block_start..block_end];
                 let token_start = self.token_indptr[sequence_index] as usize;
                 let token_end = self.token_indptr[sequence_index + 1] as usize;
-                if group.append_parent_ids[token_start..token_end]
+                if group.append_slab_ids[token_start..token_end]
                     .iter()
-                    .zip(&group.append_child_slots[token_start..token_end])
-                    .any(|(append_parent, append_slot)| {
-                        !row_parents
+                    .zip(&group.append_slotnums[token_start..token_end])
+                    .any(|(append_slab, append_slotnum)| {
+                        !row_slabs
                             .iter()
-                            .zip(row_slots)
-                            .any(|(parent, slot)| parent == append_parent && slot == append_slot)
+                            .zip(row_slotnums)
+                            .any(|(slab, slotnum)| slab == append_slab && slotnum == append_slotnum)
                     })
                 {
                     return Err(PyValueError::new_err(
@@ -555,7 +555,7 @@ impl BatchPlan {
         arrays::readonly_view(this.clone().into_any(), &this.get().token_ids)
     }
 
-    /// Offsets into ``token_ids`` for each sequence.
+    /// Offsets into `token_ids` for each sequence.
     #[getter]
     fn token_indptr<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
         arrays::readonly_view(this.clone().into_any(), &this.get().token_indptr)
@@ -657,7 +657,7 @@ impl BatchPlan {
         self.token_ids.len()
     }
 
-    /// Return the half-open range in ``token_ids`` for one sequence.
+    /// Return the half-open range in `token_ids` for one sequence.
     fn token_range(&self, sequence_index: usize) -> PyResult<(usize, usize)> {
         if sequence_index >= self.sequence_ids.len() {
             return Err(PyValueError::new_err("sequence index is out of range"));
@@ -1981,7 +1981,7 @@ impl Engine {
             .map(|resources| resources.pool().occupied_block_count())
     }
 
-    /// ``(entries, hits, misses, evictions)`` when prefix caching is enabled.
+    /// `(entries, hits, misses, evictions)` when prefix caching is enabled.
     #[getter]
     fn prefix_cache_stats(&self) -> Option<(usize, u64, u64, u64)> {
         self.kv_resources
@@ -2620,12 +2620,12 @@ mod tests {
         assert_eq!(plan.cache_groups.len(), 2);
         let full = &plan.cache_groups[0];
         assert_eq!(full.inner_native().block_indptr, [0, 2]);
-        assert_eq!(full.inner_native().block_parent_ids.len(), 2);
-        assert_eq!(full.inner_native().first_logical_blocks, [0]);
+        assert_eq!(full.inner_native().block_slab_ids.len(), 2);
+        assert_eq!(full.inner_native().block_table_start_indices, [0]);
         assert_eq!(full.inner_native().append_block_offsets, [0, 1]);
         let fine = &plan.cache_groups[1];
         assert_eq!(fine.inner_native().block_indptr, [0, 3]);
-        assert_eq!(fine.inner_native().block_parent_ids.len(), 3);
+        assert_eq!(fine.inner_native().block_slab_ids.len(), 3);
         assert_eq!(fine.inner_native().append_block_offsets, [0, 1]);
 
         assert_eq!(acquired.lease.len(), 5);
@@ -2667,22 +2667,22 @@ mod tests {
         let acquired = resources.acquire(&resource_refs, &rows, 0).unwrap();
         let plan = build_plan(10, &scheduled, &rows, Some(&acquired.view)).unwrap();
         let window = &plan.cache_groups[0];
-        assert_eq!(window.inner_native().first_logical_blocks, [1]);
+        assert_eq!(window.inner_native().block_table_start_indices, [1]);
         assert_eq!(window.inner_native().block_indptr, [0, 2]);
         assert_eq!(
-            window.inner_native().block_parent_ids,
+            window.inner_native().block_slab_ids,
             [physical[1].0, physical[0].0]
         );
         assert_eq!(
-            window.inner_native().block_child_slots,
+            window.inner_native().block_slotnums,
             [physical[1].1, physical[0].1]
         );
         assert_eq!(
-            window.inner_native().append_parent_ids,
+            window.inner_native().append_slab_ids,
             [physical[0].0, physical[0].0, physical[0].0, physical[0].0]
         );
         assert_eq!(
-            window.inner_native().append_child_slots,
+            window.inner_native().append_slotnums,
             [physical[0].1, physical[0].1, physical[0].1, physical[0].1]
         );
         assert_eq!(window.inner_native().append_block_offsets, [0, 1, 2, 3]);

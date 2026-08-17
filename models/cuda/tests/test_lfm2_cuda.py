@@ -11,7 +11,7 @@ def _group(index, indptr, pages, first, append_pages, append_offsets, *, packing
     parents = [(page - 1) // packing + 1 for page in pages]
     child_slots = [(page - 1) % packing for page in pages]
     append_parents = [(page - 1) // packing + 1 for page in append_pages]
-    append_child_slots = [(page - 1) % packing for page in append_pages]
+    append_slotnums = [(page - 1) % packing for page in append_pages]
     return CacheGroupPlan(
         index,
         indptr,
@@ -19,9 +19,9 @@ def _group(index, indptr, pages, first, append_pages, append_offsets, *, packing
         child_slots,
         first,
         append_parents,
-        append_child_slots,
+        append_slotnums,
         append_offsets,
-        blocks_per_parent=packing,
+        blocks_per_slab=packing,
     )
 
 

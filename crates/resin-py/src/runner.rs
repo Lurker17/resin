@@ -17,7 +17,7 @@ fn positive_u32(name: &str, value: Option<u32>) -> PyResult<Option<NonZeroU32>> 
 
 /// Frozen scheduling limits and persistent-resource declarations for a runner.
 ///
-/// Runners without special requirements may omit ``runner_config`` entirely.
+/// Runners without special requirements may omit `runner_config` entirely.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Default)]
 pub(crate) struct RunnerConfig {
@@ -115,7 +115,7 @@ impl RunnerConfig {
     }
 }
 
-/// Concrete Engine-owned resource identities passed to ``bind_resources``.
+/// Concrete Engine-owned resource identities passed to `bind_resources`.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 pub(crate) struct ResourceBinding {
     cache_pool_id: Option<u64>,

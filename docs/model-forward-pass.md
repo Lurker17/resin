@@ -82,9 +82,9 @@ recurrent checkpoints. The Engine allocates the pages and passes their physical
 IDs in `BatchPlan.cache_groups`; the model only maps those IDs to its device
 arena. Do not keep a second request-to-page allocator in Python.
 
-Consume each cache block's structured physical parent ID and child slot. Do not
+Consume each cache block's structured slab ID and slot number. Do not
 invent or decode a flattened kernel page ID independently in every runner or
-kernel. Validate the parent and slot bounds once at the runner boundary, then
+kernel. Validate the slab and slot bounds once at the runner boundary, then
 stage the structured address through graph-owned page tables.
 
 Include the runner's maximum uncommitted verification lookahead in every

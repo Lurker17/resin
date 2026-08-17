@@ -53,11 +53,11 @@ class RecordingCachedRunner:
 
 
 def _block_addresses(group: CacheGroupPlan) -> list[tuple[int, int]]:
-    return list(zip(group.block_parent_ids, group.block_child_slots, strict=True))
+    return list(zip(group.block_slab_ids, group.block_slotnums, strict=True))
 
 
 def _append_addresses(group: CacheGroupPlan) -> list[tuple[int, int]]:
-    return list(zip(group.append_parent_ids, group.append_child_slots, strict=True))
+    return list(zip(group.append_slab_ids, group.append_slotnums, strict=True))
 
 
 class TestFlatCacheApi:
@@ -68,13 +68,13 @@ class TestFlatCacheApi:
 
     def test_layout_is_frozen_ordered_and_derives_kernel_geometry(self) -> None:
         coarse = CacheGroupLayout(4)
-        fine = CacheGroupLayout(2, blocks_per_parent=2)
+        fine = CacheGroupLayout(2, blocks_per_slab=2)
         source = [coarse, fine]
         layout = CacheLayout(3, source)
         source.reverse()
 
         assert [
-            (group.block_tokens, group.blocks_per_parent) for group in layout.groups
+            (group.block_tokens, group.blocks_per_slab) for group in layout.groups
         ] == [(4, 1), (2, 2)]
         assert layout.group_count == 2
         assert layout.group_kernel_page_capacity(0) == 3
@@ -122,11 +122,11 @@ class TestFlatCacheApi:
         frozen = plan.cache_groups[0]
         assert frozen.group_index == group.group_index
         assert frozen.block_indptr.tolist() == [0, 2]
-        assert frozen.block_parent_ids.tolist() == [3, 4]
-        assert frozen.block_child_slots.tolist() == [0, 0]
-        assert frozen.first_logical_blocks.tolist() == [0]
-        assert frozen.append_parent_ids.tolist() == [3, 4]
-        assert frozen.append_child_slots.tolist() == [0, 0]
+        assert frozen.block_slab_ids.tolist() == [3, 4]
+        assert frozen.block_slotnums.tolist() == [0, 0]
+        assert frozen.block_table_start_indices.tolist() == [0]
+        assert frozen.append_slab_ids.tolist() == [3, 4]
+        assert frozen.append_slotnums.tolist() == [0, 0]
         assert frozen.append_block_offsets.tolist() == [1, 0]
 
     def test_cache_group_numeric_metadata_is_read_only_zero_copy_numpy(self) -> None:
@@ -142,11 +142,11 @@ class TestFlatCacheApi:
         )
         for name in (
             "block_indptr",
-            "block_parent_ids",
-            "block_child_slots",
-            "first_logical_blocks",
-            "append_parent_ids",
-            "append_child_slots",
+            "block_slab_ids",
+            "block_slotnums",
+            "block_table_start_indices",
+            "append_slab_ids",
+            "append_slotnums",
             "append_block_offsets",
         ):
             array = getattr(group, name)
@@ -313,10 +313,10 @@ class TestFlatCacheEngine:
         group = prefill.cache_groups[0]
         assert group.group_index == 0
         assert group.block_indptr.tolist() == [0, 2]
-        assert group.first_logical_blocks.tolist() == [0]
-        assert len(group.block_parent_ids) == 2
-        assert all(parent > 0 for parent in group.block_parent_ids)
-        assert group.block_child_slots.tolist() == [0, 0]
+        assert group.block_table_start_indices.tolist() == [0]
+        assert len(group.block_slab_ids) == 2
+        assert all(parent > 0 for parent in group.block_slab_ids)
+        assert group.block_slotnums.tolist() == [0, 0]
         assert _append_addresses(group) == [
             _block_addresses(group)[0],
             _block_addresses(group)[0],
@@ -339,7 +339,7 @@ class TestFlatCacheEngine:
             3,
             [
                 CacheGroupLayout(4),
-                CacheGroupLayout(2, blocks_per_parent=2),
+                CacheGroupLayout(2, blocks_per_slab=2),
             ],
         )
         runner = RecordingCachedRunner(layout)
@@ -354,12 +354,12 @@ class TestFlatCacheEngine:
 
         coarse, fine = plan.cache_groups
         assert coarse.block_indptr.tolist() == [0, 1]
-        assert coarse.first_logical_blocks.tolist() == [0]
+        assert coarse.block_table_start_indices.tolist() == [0]
         assert coarse.append_block_offsets.tolist() == [0, 1, 2]
         assert _append_addresses(coarse) == [_block_addresses(coarse)[0]] * 3
 
         assert fine.block_indptr.tolist() == [0, 2]
-        assert fine.first_logical_blocks.tolist() == [0]
+        assert fine.block_table_start_indices.tolist() == [0]
         assert fine.append_block_offsets.tolist() == [0, 1, 0]
         assert _append_addresses(fine) == [
             _block_addresses(fine)[0],
@@ -411,8 +411,8 @@ class TestFlatCacheEngine:
         events = engine.step()
         assert len(events) == 1
         prefill = runner.plans[-1].cache_groups[0]
-        assert prefill.first_logical_blocks.tolist() == [0]
-        assert len(prefill.block_parent_ids) == 3
+        assert prefill.block_table_start_indices.tolist() == [0]
+        assert len(prefill.block_slab_ids) == 3
         assert _append_addresses(prefill) == [
             address for address in _block_addresses(prefill) for _ in range(4)
         ]

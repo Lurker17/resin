@@ -19,11 +19,11 @@ PARAMETERS = {
         name: U32_INPUT
         for name in (
             "block_indptr",
-            "block_parent_ids",
-            "block_child_slots",
-            "first_logical_blocks",
-            "append_parent_ids",
-            "append_child_slots",
+            "block_slab_ids",
+            "block_slotnums",
+            "block_table_start_indices",
+            "append_slab_ids",
+            "append_slotnums",
             "append_block_offsets",
         )
     },
@@ -51,11 +51,11 @@ RETURNS = {
                 "CacheGroupPlan",
                 (
                     "block_indptr",
-                    "block_parent_ids",
-                    "block_child_slots",
-                    "first_logical_blocks",
-                    "append_parent_ids",
-                    "append_child_slots",
+                    "block_slab_ids",
+                    "block_slotnums",
+                    "block_table_start_indices",
+                    "append_slab_ids",
+                    "append_slotnums",
                     "append_block_offsets",
                 ),
             ),

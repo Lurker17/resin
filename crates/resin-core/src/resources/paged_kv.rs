@@ -199,11 +199,7 @@ impl PagedKvResources {
                     .checked_add(u64::from(blocks))
                     .ok_or(CachePoolError::DemandOverflow)
             })?;
-            let packing = u64::from(
-                self.pool
-                    .blocks_per_parent(GroupId::new(index as u32))?
-                    .get(),
-            );
+            let packing = u64::from(self.pool.blocks_per_slab(GroupId::new(index as u32))?.get());
             parents = parents
                 .checked_add(blocks.div_ceil(packing))
                 .ok_or(CachePoolError::DemandOverflow)?;
@@ -287,11 +283,11 @@ impl PagedKvResources {
         let mut claims = Vec::<PageAccessClaim>::new();
         for (group_index, group) in self.layout.groups().iter().copied().enumerate() {
             let mut indptr = Vec::with_capacity(requests.len() + 1);
-            let mut block_parent_ids = Vec::new();
-            let mut block_child_slots = Vec::new();
+            let mut block_slab_ids = Vec::new();
+            let mut block_slotnums = Vec::new();
             let mut first_blocks = Vec::with_capacity(requests.len());
-            let mut append_parent_ids = Vec::with_capacity(append_count);
-            let mut append_child_slots = Vec::with_capacity(append_count);
+            let mut append_slab_ids = Vec::with_capacity(append_count);
+            let mut append_slotnums = Vec::with_capacity(append_count);
             let mut append_offsets = Vec::with_capacity(append_count);
             indptr.push(0);
 
@@ -325,13 +321,13 @@ impl PagedKvResources {
                             request.request_id.get()
                         ))
                     })?;
-                    let (parent, child_slot) = self.pool.physical_address(page.handle())?;
-                    block_parent_ids.push(parent);
-                    block_child_slots.push(child_slot);
+                    let (slab_id, slotnum) = self.pool.physical_address(page.handle())?;
+                    block_slab_ids.push(slab_id);
+                    block_slotnums.push(slotnum);
                     claims.push(request.state.access_claim(page));
                 }
                 indptr.push(
-                    u32::try_from(block_parent_ids.len()).map_err(|_| {
+                    u32::try_from(block_slab_ids.len()).map_err(|_| {
                         Self::invalid("cache block table exceeds the u32 CSR range")
                     })?,
                 );
@@ -344,22 +340,22 @@ impl PagedKvResources {
                             request.request_id.get()
                         ))
                     })?;
-                    let (parent, child_slot) = self.pool.physical_address(page.handle())?;
-                    append_parent_ids.push(parent);
-                    append_child_slots.push(child_slot);
+                    let (slab_id, slotnum) = self.pool.physical_address(page.handle())?;
+                    append_slab_ids.push(slab_id);
+                    append_slotnums.push(slotnum);
                     append_offsets.push(position % group.block_tokens().get());
                 }
             }
             groups.push(KvGroupPlan::new(
                 group_index as u32,
                 indptr,
-                block_parent_ids,
-                block_child_slots,
+                block_slab_ids,
+                block_slotnums,
                 first_blocks,
-                append_parent_ids,
-                append_child_slots,
+                append_slab_ids,
+                append_slotnums,
                 append_offsets,
-                group.blocks_per_parent(),
+                group.blocks_per_slab(),
             )?);
         }
 
@@ -559,10 +555,10 @@ mod tests {
             )
             .unwrap();
         let group = &access.view.groups[0];
-        assert_eq!(group.block_parent_ids.len(), 2);
-        assert_eq!(group.block_child_slots.len(), 2);
-        assert_eq!(group.append_parent_ids, vec![group.block_parent_ids[1]]);
-        assert_eq!(group.append_child_slots, vec![group.block_child_slots[1]]);
+        assert_eq!(group.block_slab_ids.len(), 2);
+        assert_eq!(group.block_slotnums.len(), 2);
+        assert_eq!(group.append_slab_ids, vec![group.block_slab_ids[1]]);
+        assert_eq!(group.append_slotnums, vec![group.block_slotnums[1]]);
         assert_eq!(group.append_block_offsets, vec![0]);
         resources.release(access.lease);
         resources.retire(state).unwrap();
@@ -631,7 +627,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert_eq!(access.view.groups[0].block_parent_ids.len(), 3);
+        assert_eq!(access.view.groups[0].block_slab_ids.len(), 3);
         resources.release(access.lease);
         assert_eq!(resources.prefix_cache_metrics(), Some((1, 1, 0, 0)));
         resources.retire(second).unwrap();
@@ -779,10 +775,10 @@ mod tests {
             )
             .unwrap();
         let state = &access.view.groups[1];
-        assert_eq!(state.block_parent_ids.len(), 2);
-        assert_eq!(state.block_child_slots.len(), 2);
-        assert_eq!(state.append_parent_ids, vec![state.block_parent_ids[1]]);
-        assert_eq!(state.append_child_slots, vec![state.block_child_slots[1]]);
+        assert_eq!(state.block_slab_ids.len(), 2);
+        assert_eq!(state.block_slotnums.len(), 2);
+        assert_eq!(state.append_slab_ids, vec![state.block_slab_ids[1]]);
+        assert_eq!(state.append_slotnums, vec![state.block_slotnums[1]]);
         resources.release(access.lease);
         resources.retire(second).unwrap();
     }

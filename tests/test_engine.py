@@ -172,8 +172,8 @@ class TestEngine:
 
         assert [event.token_id for event in events] == [3, 4, 5]
         decode = runner.plans[1]
-        assert len(decode.cache_groups[0].block_parent_ids) == 2
-        assert len(decode.cache_groups[0].append_parent_ids) == 1
+        assert len(decode.cache_groups[0].block_slab_ids) == 2
+        assert len(decode.cache_groups[0].append_slab_ids) == 1
         assert request.take_result() == [2, 3, 4, 5]
 
     def test_verified_block_stops_at_eos_and_discards_its_suffix(self) -> None:
@@ -311,10 +311,10 @@ class TestEngine:
         group = prefill.cache_groups[0]
         assert group.group_index == 0
         assert group.block_indptr.tolist() == [0, 2]
-        assert group.first_logical_blocks.tolist() == [0]
-        blocks = list(zip(group.block_parent_ids, group.block_child_slots, strict=True))
+        assert group.block_table_start_indices.tolist() == [0]
+        blocks = list(zip(group.block_slab_ids, group.block_slotnums, strict=True))
         appends = list(
-            zip(group.append_parent_ids, group.append_child_slots, strict=True)
+            zip(group.append_slab_ids, group.append_slotnums, strict=True)
         )
         assert appends == [
             blocks[0],
@@ -329,15 +329,15 @@ class TestEngine:
         decode_group = decode.cache_groups[0]
         decode_blocks = list(
             zip(
-                decode_group.block_parent_ids,
-                decode_group.block_child_slots,
+                decode_group.block_slab_ids,
+                decode_group.block_slotnums,
                 strict=True,
             )
         )
         decode_appends = list(
             zip(
-                decode_group.append_parent_ids,
-                decode_group.append_child_slots,
+                decode_group.append_slab_ids,
+                decode_group.append_slotnums,
                 strict=True,
             )
         )

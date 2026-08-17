@@ -34,7 +34,7 @@ impl KvRetention {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KvGroupLayout {
     block_tokens: NonZeroU32,
-    blocks_per_parent: NonZeroU32,
+    blocks_per_slab: NonZeroU32,
     retention: KvRetention,
     family: KvGroupFamily,
 }
@@ -42,12 +42,12 @@ pub struct KvGroupLayout {
 impl KvGroupLayout {
     pub fn new(
         block_tokens: u32,
-        blocks_per_parent: u32,
+        blocks_per_slab: u32,
         retention: KvRetention,
     ) -> Result<Self, KvLayoutError> {
         Self::new_with_family(
             block_tokens,
-            blocks_per_parent,
+            blocks_per_slab,
             retention,
             KvGroupFamily::History,
         )
@@ -55,7 +55,7 @@ impl KvGroupLayout {
 
     pub fn new_with_family(
         block_tokens: u32,
-        blocks_per_parent: u32,
+        blocks_per_slab: u32,
         retention: KvRetention,
         family: KvGroupFamily,
     ) -> Result<Self, KvLayoutError> {
@@ -66,8 +66,8 @@ impl KvGroupLayout {
                 "block_tokens exceeds the signed int32 kernel metadata range",
             ));
         }
-        let blocks_per_parent = NonZeroU32::new(blocks_per_parent)
-            .ok_or_else(|| KvLayoutError::new("blocks_per_parent must be positive"))?;
+        let blocks_per_slab = NonZeroU32::new(blocks_per_slab)
+            .ok_or_else(|| KvLayoutError::new("blocks_per_slab must be positive"))?;
         if retention
             .window_tokens()
             .is_some_and(|tokens| tokens.get() > MAX_KERNEL_VALUE)
@@ -85,7 +85,7 @@ impl KvGroupLayout {
         }
         Ok(Self {
             block_tokens,
-            blocks_per_parent,
+            blocks_per_slab,
             retention,
             family,
         })
@@ -95,8 +95,8 @@ impl KvGroupLayout {
         self.block_tokens
     }
 
-    pub const fn blocks_per_parent(self) -> NonZeroU32 {
-        self.blocks_per_parent
+    pub const fn blocks_per_slab(self) -> NonZeroU32 {
+        self.blocks_per_slab
     }
 
     pub const fn retention(self) -> KvRetention {
@@ -147,7 +147,7 @@ impl KvLayout {
         }
         for (group_index, group) in groups.iter().copied().enumerate() {
             let kernel_page_capacity =
-                u64::from(parent_capacity.get()) * u64::from(group.blocks_per_parent().get());
+                u64::from(parent_capacity.get()) * u64::from(group.blocks_per_slab().get());
             if kernel_page_capacity > u64::from(MAX_KERNEL_VALUE) {
                 return Err(KvLayoutError::new(format!(
                     "cache group {group_index} page capacity exceeds the signed int32 kernel page-id range"
@@ -194,11 +194,11 @@ impl KvLayout {
         self.groups
             .iter()
             .copied()
-            .map(KvGroupLayout::blocks_per_parent)
+            .map(KvGroupLayout::blocks_per_slab)
     }
 
     pub fn kernel_page_capacity(&self, group_index: u32) -> Option<u32> {
-        let packing = self.group(group_index)?.blocks_per_parent().get();
+        let packing = self.group(group_index)?.blocks_per_slab().get();
         Some(
             self.parent_capacity
                 .get()
@@ -235,13 +235,13 @@ impl std::error::Error for KvLayoutError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KvGroupPlan {
     pub group_index: u32,
-    pub blocks_per_parent: u32,
+    pub blocks_per_slab: u32,
     pub block_indptr: Vec<u32>,
-    pub block_parent_ids: Vec<u32>,
-    pub block_child_slots: Vec<u32>,
-    pub first_logical_blocks: Vec<u32>,
-    pub append_parent_ids: Vec<u32>,
-    pub append_child_slots: Vec<u32>,
+    pub block_slab_ids: Vec<u32>,
+    pub block_slotnums: Vec<u32>,
+    pub block_table_start_indices: Vec<u32>,
+    pub append_slab_ids: Vec<u32>,
+    pub append_slotnums: Vec<u32>,
     pub append_block_offsets: Vec<u32>,
 }
 
@@ -249,24 +249,24 @@ impl KvGroupPlan {
     pub fn new(
         group_index: u32,
         block_indptr: Vec<u32>,
-        block_parent_ids: Vec<u32>,
-        block_child_slots: Vec<u32>,
-        first_logical_blocks: Vec<u32>,
-        append_parent_ids: Vec<u32>,
-        append_child_slots: Vec<u32>,
+        block_slab_ids: Vec<u32>,
+        block_slotnums: Vec<u32>,
+        block_table_start_indices: Vec<u32>,
+        append_slab_ids: Vec<u32>,
+        append_slotnums: Vec<u32>,
         append_block_offsets: Vec<u32>,
-        blocks_per_parent: NonZeroU32,
+        blocks_per_slab: NonZeroU32,
     ) -> Result<Self, KvPlanError> {
-        let packing = blocks_per_parent.get();
+        let packing = blocks_per_slab.get();
         let plan = Self {
             group_index,
-            blocks_per_parent: packing,
+            blocks_per_slab: packing,
             block_indptr,
-            block_parent_ids,
-            block_child_slots,
-            first_logical_blocks,
-            append_parent_ids,
-            append_child_slots,
+            block_slab_ids,
+            block_slotnums,
+            block_table_start_indices,
+            append_slab_ids,
+            append_slotnums,
             append_block_offsets,
         };
         plan.validate()?;
@@ -274,20 +274,20 @@ impl KvGroupPlan {
     }
 
     pub fn validate(&self) -> Result<(), KvPlanError> {
-        if self.block_parent_ids.len() > u32::MAX as usize {
+        if self.block_slab_ids.len() > u32::MAX as usize {
             return Err(KvPlanError(
                 "block address length exceeds the u32 CSR range",
             ));
         }
-        if self.block_indptr.len() != self.first_logical_blocks.len() + 1 {
+        if self.block_indptr.len() != self.block_table_start_indices.len() + 1 {
             return Err(KvPlanError(
-                "block_indptr must contain one more item than first_logical_blocks",
+                "block_indptr must contain one more item than block_table_start_indices",
             ));
         }
         if self.block_indptr.first() != Some(&0) {
             return Err(KvPlanError("block_indptr must start at zero"));
         }
-        if self.block_indptr.last().copied() != Some(self.block_parent_ids.len() as u32) {
+        if self.block_indptr.last().copied() != Some(self.block_slab_ids.len() as u32) {
             return Err(KvPlanError(
                 "block_indptr must end at the block address length",
             ));
@@ -297,26 +297,26 @@ impl KvGroupPlan {
                 "block_indptr must be monotonically nondecreasing",
             ));
         }
-        if self.block_parent_ids.len() != self.block_child_slots.len()
+        if self.block_slab_ids.len() != self.block_slotnums.len()
             || self
-                .block_parent_ids
+                .block_slab_ids
                 .iter()
-                .zip(&self.block_child_slots)
-                .any(|(&parent, &slot)| parent == 0 || slot >= self.blocks_per_parent)
+                .zip(&self.block_slotnums)
+                .any(|(&slab, &slotnum)| slab == 0 || slotnum >= self.blocks_per_slab)
         {
             return Err(KvPlanError("block physical addresses are malformed"));
         }
-        if self.append_parent_ids.len() != self.append_block_offsets.len() {
+        if self.append_slab_ids.len() != self.append_block_offsets.len() {
             return Err(KvPlanError(
                 "append addresses and append_block_offsets must have equal length",
             ));
         }
-        if self.append_parent_ids.len() != self.append_child_slots.len()
+        if self.append_slab_ids.len() != self.append_slotnums.len()
             || self
-                .append_parent_ids
+                .append_slab_ids
                 .iter()
-                .zip(&self.append_child_slots)
-                .any(|(&parent, &slot)| parent == 0 || slot >= self.blocks_per_parent)
+                .zip(&self.append_slotnums)
+                .any(|(&slab, &slotnum)| slab == 0 || slotnum >= self.blocks_per_slab)
         {
             return Err(KvPlanError("append physical addresses are malformed"));
         }

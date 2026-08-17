@@ -62,7 +62,7 @@ class _Lfm2CacheArena:
 
         self.binding = CachePoolBinding(layout, resource="LFM2 cache")
         self.parent_capacity = layout.parent_capacity
-        self.state_packing = layout.groups[1].blocks_per_parent
+        self.state_packing = layout.groups[1].blocks_per_slab
         kv_elements = 2 * attention_layers * page_size * num_kv_heads * head_dim
         state_elements = conv_layers * hidden_size * state_length
         if kv_elements != self.state_packing * state_elements:
@@ -219,7 +219,7 @@ class Lfm2CudaRunner(AsyncRunner):
                     CacheGroupLayout(page_size),
                     CacheGroupLayout(
                         _STATE_CHECKPOINT_TOKENS,
-                        blocks_per_parent=state_packing,
+                        blocks_per_slab=state_packing,
                         family=CacheGroupFamily.STATE,
                     ),
                 ],
@@ -275,29 +275,29 @@ class Lfm2CudaRunner(AsyncRunner):
         derived = build_cache_metadata(plan, self.page_size)
         self._cache.check_addresses(
             0,
-            plan.cache_groups[0].block_parent_ids,
-            plan.cache_groups[0].block_child_slots,
+            plan.cache_groups[0].block_slab_ids,
+            plan.cache_groups[0].block_slotnums,
         )
         return derived
 
     def _state_rows(self, plan: BatchPlan) -> tuple[_StateRow, ...]:
         group = plan.cache_groups[1]
-        if group.blocks_per_parent != self._cache.state_packing:
+        if group.blocks_per_slab != self._cache.state_packing:
             raise ValueError("LFM2 State packing does not match the physical arena")
         block_indptr = group.block_indptr
-        block_parents = group.block_parent_ids
-        block_child_slots = group.block_child_slots
-        first_blocks = group.first_logical_blocks
+        block_parents = group.block_slab_ids
+        block_slotnums = group.block_slotnums
+        first_blocks = group.block_table_start_indices
         rows = plan.num_sequences
         if (
             len(block_indptr) != rows + 1
             or block_indptr[0] != 0
             or block_indptr[-1] != len(block_parents)
-            or len(block_parents) != len(block_child_slots)
+            or len(block_parents) != len(block_slotnums)
             or len(first_blocks) != rows
         ):
             raise ValueError("LFM2 state page table is malformed")
-        self._cache.check_addresses(1, block_parents, block_child_slots)
+        self._cache.check_addresses(1, block_parents, block_slotnums)
         result = []
         for index, context in enumerate(plan.context_lengths):
             context = int(context)
@@ -308,7 +308,7 @@ class Lfm2CudaRunner(AsyncRunner):
             addresses = tuple(
                 zip(
                     map(int, block_parents[page_start:page_end]),
-                    map(int, block_child_slots[page_start:page_end]),
+                    map(int, block_slotnums[page_start:page_end]),
                 )
             )
 

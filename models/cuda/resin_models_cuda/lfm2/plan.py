@@ -65,14 +65,14 @@ def build_cache_metadata(plan, page_size: int) -> CacheMetadata:
     if len(groups) != 2 or tuple(group.group_index for group in groups) != (0, 1):
         raise ValueError("LFM2 requires History and State cache groups")
     group = groups[0]
-    if group.blocks_per_parent != 1:
+    if group.blocks_per_slab != 1:
         raise ValueError("LFM2 History requires one block per physical parent")
     block_indptr = group.block_indptr
-    page_indices = group.block_parent_ids
-    block_child_slots = group.block_child_slots
-    first_blocks = group.first_logical_blocks
-    append_pages = group.append_parent_ids
-    append_child_slots = group.append_child_slots
+    page_indices = group.block_slab_ids
+    block_slotnums = group.block_slotnums
+    first_blocks = group.block_table_start_indices
+    append_pages = group.append_slab_ids
+    append_slotnums = group.append_slotnums
     append_offsets = group.append_block_offsets
     if (
         len(block_indptr) != rows + 1
@@ -82,12 +82,12 @@ def build_cache_metadata(plan, page_size: int) -> CacheMetadata:
         or len(first_blocks) != rows
         or len(append_pages) != token_count
         or len(append_offsets) != token_count
-        or len(page_indices) != len(block_child_slots)
-        or len(append_pages) != len(append_child_slots)
+        or len(page_indices) != len(block_slotnums)
+        or len(append_pages) != len(append_slotnums)
         or np.any(page_indices == 0)
         or np.any(append_pages == 0)
-        or np.any(block_child_slots != 0)
-        or np.any(append_child_slots != 0)
+        or np.any(block_slotnums != 0)
+        or np.any(append_slotnums != 0)
         or np.any(append_offsets >= page_size)
     ):
         raise ValueError("cache group metadata is malformed")

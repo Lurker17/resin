@@ -45,8 +45,8 @@ batch execute continuously and may decode concurrently.
 
 ## Cache geometry
 
-Every group uses equal-sized physical parents. `blocks_per_parent` lets smaller
-states share one parent, while the allocator remains free to assign each parent
+Every group uses equal-sized physical slabs. `blocks_per_slab` lets smaller
+states share one slab, while the allocator remains free to assign each slab
 to whichever group needs it. There is no fixed VRAM percentage for recurrent
 state versus attention history.
 
@@ -54,9 +54,9 @@ state versus attention history.
 `CacheGroupFamily.STATE` covers recurrent checkpoints and retains a two-page
 ring per live sequence. See [unified paged cache](cache-pool.md).
 
-CUDA runners normally determine parent capacity after loading weights and
+CUDA runners normally determine slab capacity after loading weights and
 capturing graphs: they reserve the configured model/static memory fraction,
-measure remaining VRAM, divide by bytes per parent, and construct the final
+measure remaining VRAM, divide by bytes per slab, and construct the final
 layout. This mirrors TokenSpeed's geometry-first sizing rather than guessing
 separate cache ratios.
 

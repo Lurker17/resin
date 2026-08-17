@@ -695,7 +695,7 @@ impl CachePool {
         self.id
     }
 
-    pub fn blocks_per_parent(&self, group: GroupId) -> Result<NonZeroU32, CachePoolError> {
+    pub fn blocks_per_slab(&self, group: GroupId) -> Result<NonZeroU32, CachePoolError> {
         self.group_packings
             .get(group.index() as usize)
             .copied()
@@ -739,7 +739,7 @@ impl CachePool {
         );
         let mut total_blocks = 0usize;
         for demand in demands {
-            self.blocks_per_parent(demand.group)?;
+            self.blocks_per_slab(demand.group)?;
             total_blocks = total_blocks
                 .checked_add(demand.blocks)
                 .ok_or(CachePoolError::DemandOverflow)?;
@@ -1273,7 +1273,7 @@ impl CachePool {
         demand: GroupDemand,
         pages: &mut Vec<PageRef>,
     ) -> Result<(), CachePoolError> {
-        let packing = self.blocks_per_parent(demand.group)?.get();
+        let packing = self.blocks_per_slab(demand.group)?.get();
         let PlacementPlan {
             parents,
             group_states,

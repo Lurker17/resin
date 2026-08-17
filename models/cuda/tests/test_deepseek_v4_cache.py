@@ -46,7 +46,7 @@ def test_deepseek_groups_use_tokenspeed_power_of_two_packing() -> None:
         CacheRetention.WINDOW,
         CacheRetention.WINDOW,
     )
-    assert tuple(group.blocks_per_parent for group in groups) == geometry.packings
+    assert tuple(group.blocks_per_slab for group in groups) == geometry.packings
     assert groups[0].window_tokens == 133
     assert groups[0].window_resident_block_count == 3
 
@@ -100,16 +100,16 @@ def test_plan_preserves_structured_parent_and_child_addresses() -> None:
     cache_groups = tuple(
         SimpleNamespace(
             group_index=index,
-            blocks_per_parent=descriptor.blocks_per_parent,
+            blocks_per_slab=descriptor.blocks_per_slab,
             block_indptr=np.array([0, 1], dtype=np.uint32),
-            block_parent_ids=np.array([index + 1], dtype=np.uint32),
-            block_child_slots=np.array(
-                [min(index, descriptor.blocks_per_parent - 1)], dtype=np.uint32
+            block_slab_ids=np.array([index + 1], dtype=np.uint32),
+            block_slotnums=np.array(
+                [min(index, descriptor.blocks_per_slab - 1)], dtype=np.uint32
             ),
-            first_logical_blocks=np.array([0], dtype=np.uint32),
-            append_parent_ids=np.array([index + 1], dtype=np.uint32),
-            append_child_slots=np.array(
-                [min(index, descriptor.blocks_per_parent - 1)], dtype=np.uint32
+            block_table_start_indices=np.array([0], dtype=np.uint32),
+            append_slab_ids=np.array([index + 1], dtype=np.uint32),
+            append_slotnums=np.array(
+                [min(index, descriptor.blocks_per_slab - 1)], dtype=np.uint32
             ),
             append_block_offsets=np.array([0], dtype=np.uint32),
         )
@@ -131,5 +131,5 @@ def test_plan_preserves_structured_parent_and_child_addresses() -> None:
     ):
         assert group.parent_ids[0].tolist() == [index + 1]
         assert group.child_slots[0].tolist() == [
-            min(index, descriptor.blocks_per_parent - 1)
+            min(index, descriptor.blocks_per_slab - 1)
         ]

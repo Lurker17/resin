@@ -59,17 +59,17 @@ class _CacheGroup:
         packing: int,
         parent_capacity: int | None,
     ) -> _CacheGroup:
-        if native.blocks_per_parent != packing:
+        if native.blocks_per_slab != packing:
             raise ValueError("cache group packing does not match Gemma 4 layout")
-        block_parents = np.asarray(native.block_parent_ids, dtype=np.int64)
-        block_slots = np.asarray(native.block_child_slots, dtype=np.int64)
-        append_parents = np.asarray(native.append_parent_ids, dtype=np.int64)
-        append_slots = np.asarray(native.append_child_slots, dtype=np.int64)
+        block_parents = np.asarray(native.block_slab_ids, dtype=np.int64)
+        block_slots = np.asarray(native.block_slotnums, dtype=np.int64)
+        append_parents = np.asarray(native.append_slab_ids, dtype=np.int64)
+        append_slots = np.asarray(native.append_slotnums, dtype=np.int64)
         group = cls(
             index=index,
             indptr=np.asarray(native.block_indptr, dtype=np.int64),
             pages=block_parents * packing + block_slots,
-            first_blocks=np.asarray(native.first_logical_blocks, dtype=np.int64),
+            first_blocks=np.asarray(native.block_table_start_indices, dtype=np.int64),
             append_pages=append_parents * packing + append_slots,
             append_offsets=np.asarray(native.append_block_offsets, dtype=np.int64),
             packing=packing,
