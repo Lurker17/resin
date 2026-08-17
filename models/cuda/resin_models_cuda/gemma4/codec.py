@@ -5,10 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from resin.server.media import (
-    normalize_image_messages,
-    normalized_rgb_from_data_url,
-)
+from resin.server.media import normalize_image_messages
 from resin_models_cuda.gemma4.media import Gemma4Media
 
 
@@ -67,4 +64,4 @@ class Gemma4ResponseParser:
         return [] if not delta else [{"type": "text_delta", "delta": delta}]
 
 
-__all__ = ["Gemma4Codec", "Gemma4ResponseParser", "normalized_rgb_from_data_url"]
+__all__ = ["Gemma4Codec", "Gemma4ResponseParser"]
