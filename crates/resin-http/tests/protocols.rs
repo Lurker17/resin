@@ -24,6 +24,7 @@ fn test_router() -> axum::Router {
             let _ = job.events.send(GenerationEvent::Finished {
                 reason: FinishReason::Stop,
                 input_tokens: 3,
+                cached_tokens: 2,
                 output_tokens: 2,
                 elapsed_ms: 20.0,
                 generation_elapsed_ms: 10.0,
@@ -56,6 +57,7 @@ fn tool_router() -> axum::Router {
             let _ = job.events.send(GenerationEvent::Finished {
                 reason: FinishReason::Stop,
                 input_tokens: 7,
+                cached_tokens: 4,
                 output_tokens: 4,
                 elapsed_ms: 30.0,
                 generation_elapsed_ms: 20.0,
@@ -95,6 +97,7 @@ async fn chat_completions_returns_reasoning_text_and_usage() {
         "brief thought"
     );
     assert_eq!(body["usage"]["total_tokens"], 5);
+    assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
 }
 
 #[tokio::test]
@@ -113,6 +116,7 @@ async fn responses_api_returns_reasoning_and_message_items() {
     assert_eq!(body["output"][0]["type"], "reasoning");
     assert_eq!(body["output"][1]["type"], "message");
     assert_eq!(body["output"][1]["content"][0]["text"], "hello");
+    assert_eq!(body["usage"]["input_tokens_details"]["cached_tokens"], 2);
 }
 
 #[tokio::test]
@@ -192,6 +196,7 @@ async fn chat_completions_streams_tool_calls_and_resin_metrics() {
     assert!(events.contains(r#""name":"weather""#));
     assert!(events.contains(r#""finish_reason":"tool_calls""#));
     assert!(events.contains(r#""generation_elapsed_ms":20.0"#));
+    assert!(events.contains(r#""cached_tokens":4"#));
     assert!(events.contains(r#""tokens_per_second":200.0"#));
     assert!(events.contains("data: [DONE]"));
 }

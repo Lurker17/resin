@@ -72,6 +72,7 @@ pub enum GenerationEvent {
     Finished {
         reason: FinishReason,
         input_tokens: usize,
+        cached_tokens: usize,
         output_tokens: usize,
         elapsed_ms: f64,
         generation_elapsed_ms: f64,
@@ -91,6 +92,7 @@ pub struct GenerationJob {
 #[derive(Debug, Default)]
 pub(crate) struct ResponseAccumulator {
     pub input_tokens: usize,
+    pub cached_tokens: usize,
     pub output_tokens: usize,
     pub reasoning: String,
     pub text: String,
@@ -130,6 +132,7 @@ impl ResponseAccumulator {
             GenerationEvent::Finished {
                 reason,
                 input_tokens,
+                cached_tokens,
                 output_tokens,
                 elapsed_ms,
                 generation_elapsed_ms,
@@ -137,6 +140,7 @@ impl ResponseAccumulator {
             } => {
                 self.reason = Some(*reason);
                 self.input_tokens = *input_tokens;
+                self.cached_tokens = *cached_tokens;
                 self.output_tokens = *output_tokens;
                 self.elapsed_ms = *elapsed_ms;
                 self.generation_elapsed_ms = *generation_elapsed_ms;

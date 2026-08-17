@@ -230,10 +230,12 @@ class TestFlatCacheEngine:
         while engine.has_work():
             engine.step()
         assert first.done
+        assert first.cached_tokens == 0
         assert engine.prefix_cache_stats == (2, 0, 1, 0)
         assert engine.cache_occupied_block_count == 2
 
         second = engine.submit([1, 2, 3, 4, 5], max_new_tokens=1)
+        assert second.cached_tokens == 4
         assert engine.prefix_cache_stats == (2, 1, 1, 0)
         engine.step()
         reused = runner.plans[-1]

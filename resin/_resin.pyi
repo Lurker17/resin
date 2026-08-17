@@ -435,6 +435,11 @@ class RequestLease:
     @property
     def cancelled(self, /) -> bool: ...
     @property
+    def cached_tokens(self, /) -> int:
+        """
+        Number of prompt tokens restored from the prefix cache at admission.
+        """
+    @property
     def done(self, /) -> bool: ...
     @property
     def id(self, /) -> int: ...

@@ -709,6 +709,7 @@ impl CompletionReason {
 struct RequestLeaseState {
     done: bool,
     cancelled: bool,
+    cached_tokens: u32,
     result: Option<Vec<u32>>,
 }
 
@@ -751,6 +752,15 @@ impl RequestLease {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cancelled
+    }
+
+    /// Number of prompt tokens restored from the prefix cache at admission.
+    #[getter]
+    fn cached_tokens(&self) -> u32 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cached_tokens
     }
 
     /// Consume the completed token buffer exactly once.
@@ -1310,6 +1320,10 @@ impl Engine {
                 .map_err(cache_pool_error)?,
             _ => 0,
         };
+        lease_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cached_tokens = resident_tokens;
         self.next_request_id = next_request_id;
         self.scheduler.enqueue(Request {
             inner: RequestData {

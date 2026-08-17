@@ -230,7 +230,7 @@ async fn chat_response(
             "finish_reason": reason.openai(!response.tool_calls.is_empty()),
             "logprobs": null,
         }],
-        "usage": usage(response.input_tokens, response.output_tokens),
+        "usage": usage(response.input_tokens, response.cached_tokens, response.output_tokens),
     }))
     .into_response()
 }
@@ -258,11 +258,12 @@ fn chat_stream(
                 GenerationEvent::ToolCallArgumentsDelta { index, delta } => chat_chunk(&request, created, json!({"tool_calls": [{
                     "index": index, "function": {"arguments": delta}
                 }]}), None),
-                GenerationEvent::Finished { reason, input_tokens, output_tokens, elapsed_ms, generation_elapsed_ms, time_to_first_token_ms } => {
+                GenerationEvent::Finished { reason, input_tokens, cached_tokens, output_tokens, elapsed_ms, generation_elapsed_ms, time_to_first_token_ms } => {
                     let mut chunk = chat_chunk(&request, created, json!({}), Some(reason.openai(has_tool_calls)));
                     let tokens_per_second = if generation_elapsed_ms > 0.0 { output_tokens as f64 * 1000.0 / generation_elapsed_ms } else { 0.0 };
                     chunk["resin"] = json!({
                         "prompt_tokens": input_tokens,
+                        "cached_tokens": cached_tokens,
                         "completion_tokens": output_tokens,
                         "elapsed_ms": elapsed_ms,
                         "generation_elapsed_ms": generation_elapsed_ms,
@@ -277,7 +278,7 @@ fn chat_stream(
                             "created": created,
                             "model": request.model,
                             "choices": [],
-                            "usage": usage(input_tokens, output_tokens),
+                            "usage": usage(input_tokens, cached_tokens, output_tokens),
                         }).to_string()));
                     }
                     break;
@@ -476,7 +477,7 @@ fn response_object(request: &ConversationRequest, response: &ResponseAccumulator
         "truncation": "disabled",
         "usage": {
             "input_tokens": response.input_tokens,
-            "input_tokens_details": {"cached_tokens": 0},
+            "input_tokens_details": {"cached_tokens": response.cached_tokens},
             "output_tokens": response.output_tokens,
             "output_tokens_details": {"reasoning_tokens": 0},
             "total_tokens": response.input_tokens + response.output_tokens,
@@ -642,12 +643,12 @@ fn internal_error(message: impl Into<String>) -> Response {
         .into_response()
 }
 
-fn usage(input_tokens: usize, output_tokens: usize) -> Value {
+fn usage(input_tokens: usize, cached_tokens: usize, output_tokens: usize) -> Value {
     json!({
         "prompt_tokens": input_tokens,
         "completion_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
-        "prompt_tokens_details": {"cached_tokens": 0},
+        "prompt_tokens_details": {"cached_tokens": cached_tokens},
         "completion_tokens_details": {"reasoning_tokens": 0},
     })
 }

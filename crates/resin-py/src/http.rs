@@ -67,6 +67,7 @@ struct ActiveRequest {
     started: Instant,
     first_token_at: Option<Instant>,
     input_tokens: usize,
+    cached_tokens: usize,
     output_tokens: usize,
 }
 
@@ -291,6 +292,7 @@ fn engine_actor(
                 let _ = request.events.send(GenerationEvent::Finished {
                     reason,
                     input_tokens: request.input_tokens,
+                    cached_tokens: request.cached_tokens,
                     output_tokens: request.output_tokens,
                     elapsed_ms: request.started.elapsed().as_secs_f64() * 1000.0,
                     generation_elapsed_ms: request
@@ -355,11 +357,14 @@ fn admit(
             Some(rendered.stop_token_ids),
             media,
         )?;
-        let request_id = lease.bind(py).borrow().request_id;
-        Ok::<_, PyErr>((request_id, lease, parser, input_tokens))
+        let lease_ref = lease.bind(py).borrow();
+        let request_id = lease_ref.request_id;
+        let cached_tokens = lease_ref.cached_tokens() as usize;
+        drop(lease_ref);
+        Ok::<_, PyErr>((request_id, lease, parser, input_tokens, cached_tokens))
     });
     match result {
-        Ok((request_id, lease, parser, input_tokens)) => {
+        Ok((request_id, lease, parser, input_tokens, cached_tokens)) => {
             let _ = job.events.send(GenerationEvent::Started { input_tokens });
             active.insert(
                 request_id,
@@ -370,6 +375,7 @@ fn admit(
                     started: Instant::now(),
                     first_token_at: None,
                     input_tokens,
+                    cached_tokens,
                     output_tokens: 0,
                 },
             );
