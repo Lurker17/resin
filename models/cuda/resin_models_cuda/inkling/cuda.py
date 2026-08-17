@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -28,6 +27,7 @@ from resin.backend.cuda.sampling import (
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
 from resin.backend.speculative import SpeculativeStats
+from resin.backend.torch import use_default_dtype
 from resin.protocols import Runner
 from resin_models_cuda.inkling.cache import (
     PREFILL_CHUNK_SIZE,
@@ -52,16 +52,6 @@ from resin_models_cuda.inkling.weights import load_draft_weights, load_target_we
 
 if TYPE_CHECKING:
     from resin import BatchPlan
-
-
-@contextmanager
-def _default_dtype(dtype: Any) -> Iterator[None]:
-    previous = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(previous)
 
 
 class InklingCudaRunner(Runner):
@@ -134,7 +124,7 @@ class InklingCudaRunner(Runner):
         self._graph_device_caches: dict[GraphShape, DeviceCache] = {}
         self._media_features: dict[int, tuple[InklingMedia, torch.Tensor]] = {}
 
-        with _default_dtype(torch.bfloat16), torch.device(self.device):
+        with use_default_dtype(torch.bfloat16), torch.device(self.device):
             self._model = InklingForCausalLM(
                 self.config, self.draft_config.target_layer_ids
             )
@@ -278,7 +268,7 @@ class InklingCudaRunner(Runner):
         )
 
         def launch() -> None:
-            with _default_dtype(torch.bfloat16), torch.device(self.device):
+            with use_default_dtype(torch.bfloat16), torch.device(self.device):
                 initial_state = self._initial_state(cache, positions)
                 state_inputs = self._graph_state_inputs[:batch_size]
                 drafts, _ = self._draft.propose(
@@ -605,7 +595,7 @@ class InklingCudaRunner(Runner):
             positions = staging.device("positions", plan.positions, torch.long)
             with (
                 torch.inference_mode(),
-                _default_dtype(torch.bfloat16),
+                use_default_dtype(torch.bfloat16),
                 torch.device(self.device),
             ):
                 if plan.phase == BatchPhase.PREFILL:

@@ -9,6 +9,7 @@ import torch
 
 from resin.backend.loading import MODEL_FILES, read_config, resolve_model
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
+from resin.backend.torch import use_default_dtype
 from resin_models_cuda.gemma4.config import Gemma4Nvfp4Config
 from resin_models_cuda.gemma4.model import Gemma4ForConditionalGeneration
 
@@ -39,11 +40,17 @@ def _download_model(repo_id: str, revision: str | None) -> Path:
 
 
 def resolve_model_path(model: str | Path, revision: str | None = None) -> Path:
-    selected = DEFAULT_REVISION if revision is None and str(model) == DEFAULT_MODEL else revision
+    selected = (
+        DEFAULT_REVISION
+        if revision is None and str(model) == DEFAULT_MODEL
+        else revision
+    )
     return resolve_model(model, selected, _download_model)
 
 
-def _assign_tensor(model: torch.nn.Module, key: str, tensor: torch.Tensor, device) -> None:
+def _assign_tensor(
+    model: torch.nn.Module, key: str, tensor: torch.Tensor, device
+) -> None:
     module_path, name = key.rsplit(".", 1)
     try:
         module = model.get_submodule(module_path)
@@ -77,13 +84,9 @@ def build_meta_model(
     config = Gemma4Nvfp4Config.from_dict(raw_config)
     transformers_config = Gemma4Config.from_dict(raw_config)
     transformers_config.vision_config._attn_implementation = "sdpa"
-    previous_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(torch.bfloat16)
-    try:
+    with use_default_dtype(torch.bfloat16):
         with torch.device("meta"):
             model = Gemma4ForConditionalGeneration(config, transformers_config)
-    finally:
-        torch.set_default_dtype(previous_dtype)
     return model, config
 
 

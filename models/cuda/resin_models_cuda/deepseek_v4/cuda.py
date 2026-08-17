@@ -8,10 +8,9 @@ logical cache groups backed by one fungible Engine-owned parent pool.
 from __future__ import annotations
 
 import json
-from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -36,6 +35,7 @@ from resin.backend.cuda.sampling import (
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import BatchView, PagedCachePlan
 from resin.backend.speculative import SpeculativeStats
+from resin.backend.torch import use_default_dtype
 from resin.protocols import Runner
 from resin_models_cuda.deepseek_v4.cache import (
     GRAPH_SCRATCH_PARENTS,
@@ -51,16 +51,6 @@ from resin_models_cuda.deepseek_v4.weights import load_deepseek_v4_weights
 
 if TYPE_CHECKING:
     from resin import BatchPlan
-
-
-@contextmanager
-def _default_dtype(dtype: Any) -> Iterator[None]:
-    previous = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(previous)
 
 
 class DeepSeekV4CudaRunner(Runner):
@@ -201,7 +191,7 @@ class DeepSeekV4CudaRunner(Runner):
                 if name in model_fields
             }
         )
-        with _default_dtype(torch.bfloat16), torch.device(self.device):
+        with use_default_dtype(torch.bfloat16), torch.device(self.device):
             self._model = native_model.Transformer(args)
         self._allreduce = FlashInferAllReduce(
             self.tensor_parallel,
@@ -388,7 +378,7 @@ class DeepSeekV4CudaRunner(Runner):
         sampling = self._sampler.empty(batch_size, self.device)
 
         def launch() -> None:
-            with _default_dtype(torch.bfloat16), torch.device(self.device):
+            with use_default_dtype(torch.bfloat16), torch.device(self.device):
                 logits = self._model.forward_decode(
                     token_ids,
                     positions,
@@ -447,7 +437,7 @@ class DeepSeekV4CudaRunner(Runner):
             )
 
         def launch() -> None:
-            with _default_dtype(torch.bfloat16), torch.device(self.device):
+            with use_default_dtype(torch.bfloat16), torch.device(self.device):
                 if phase_events is not None:
                     phase_events[0].record()
                 drafts = self._broadcast_tokens(
@@ -705,7 +695,7 @@ class DeepSeekV4CudaRunner(Runner):
             positions = staging.device("positions", plan.positions, torch.long)
             with (
                 torch.inference_mode(),
-                _default_dtype(torch.bfloat16),
+                use_default_dtype(torch.bfloat16),
                 torch.device(self.device),
             ):
                 if plan.phase == BatchPhase.PREFILL:
@@ -722,5 +712,6 @@ class DeepSeekV4CudaRunner(Runner):
                     )
                 output = self._sample_target(logits, plan, 0)
             return output.tolist()
+
 
 __all__ = ["DeepSeekV4CudaRunner"]

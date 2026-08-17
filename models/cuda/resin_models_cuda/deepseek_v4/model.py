@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import math
-from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable, Literal
@@ -18,6 +17,7 @@ from flashinfer.topk import top_k as flashinfer_top_k
 from quack import rmsnorm as quack_rmsnorm
 from torch import nn
 
+from resin.backend.torch import use_default_dtype
 from resin_models_cuda.deepseek_v4.attention import (
     sparse_decode_attention,
     sparse_verify_attention,
@@ -77,17 +77,6 @@ def _distributed_sum(tensor: torch.Tensor) -> torch.Tensor:
     if world_size > 1:
         dist.all_reduce(tensor)
     return tensor
-
-
-@contextmanager
-def set_dtype(dtype):
-    """Temporarily override torch default dtype, restoring it on exit (even if an exception occurs)."""
-    prev = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(prev)
 
 
 @dataclass
@@ -658,9 +647,7 @@ class Compressor(nn.Module):
             gather_indices,
         )
         current_scores = torch.gather(
-            adjusted_scores.unsqueeze(1).expand(
-                -1, complete_offsets.numel(), -1, -1
-            ),
+            adjusted_scores.unsqueeze(1).expand(-1, complete_offsets.numel(), -1, -1),
             2,
             gather_indices,
         )
@@ -686,9 +673,7 @@ class Compressor(nn.Module):
                 ),
                 dim=2,
             )
-        pooled = (
-            history_values * history_scores.softmax(dim=2)
-        ).sum(dim=2)
+        pooled = (history_values * history_scores.softmax(dim=2)).sum(dim=2)
         pooled = self.norm(pooled.to(x.dtype))
         rope_positions = complete_positions + 1 - ratio
         if self.freqs_cis is None:
@@ -924,9 +909,7 @@ class Indexer(torch.nn.Module):
         if world_size > 1:
             index_score = self.allreduce(index_score)
         topk_width = min(self.index_topk, width)
-        topk_idxs = _compact_topk_indices(
-            index_score.flatten(0, 1), topk_width
-        )
+        topk_idxs = _compact_topk_indices(index_score.flatten(0, 1), topk_width)
         topk_idxs = topk_idxs.view(*index_score.shape[:2], topk_width)
         selected = finish_index_topk(
             topk_idxs,
@@ -990,13 +973,9 @@ class Indexer(torch.nn.Module):
         if world_size > 1:
             index_score = self.allreduce(index_score)
         topk_width = min(self.index_topk, width)
-        topk_indices = torch.topk(
-            index_score, topk_width, dim=-1, sorted=True
-        ).indices
+        topk_indices = torch.topk(index_score, topk_width, dim=-1, sorted=True).indices
         complete = (positions + 1).div(ratio, rounding_mode="floor")
-        logical = torch.where(
-            topk_indices < complete.unsqueeze(-1), topk_indices, -1
-        )
+        logical = torch.where(topk_indices < complete.unsqueeze(-1), topk_indices, -1)
         physical = cache.compressed_rows(
             self.layer_id,
             ratio,
@@ -1047,9 +1026,7 @@ class Indexer(torch.nn.Module):
         if world_size > 1:
             index_score = self.allreduce(index_score)
         topk_width = min(self.index_topk, width)
-        topk_idxs = _compact_topk_indices(
-            index_score.flatten(0, 1), topk_width
-        )
+        topk_idxs = _compact_topk_indices(index_score.flatten(0, 1), topk_width)
         topk_idxs = topk_idxs.view(*index_score.shape[:2], topk_width)
         selected = finish_index_topk(
             topk_idxs,
@@ -1405,9 +1382,7 @@ class Attention(nn.Module):
                 token_positions,
                 start_position=start_position,
                 cache_pool=cache.latents.view(-1, self.head_dim),
-                cache_rows=cache.compressed_rows(
-                    self.layer_id, ratio, token_positions
-                ),
+                cache_rows=cache.compressed_rows(self.layer_id, ratio, token_positions),
                 cache=cache,
                 state_group=state_group,
             )
@@ -1426,9 +1401,7 @@ class Attention(nn.Module):
                     cache=cache,
                 )
             else:
-                generated_compressed_width = math.ceil(
-                    sequence_length / ratio / 4
-                ) * 4
+                generated_compressed_width = math.ceil(sequence_length / ratio / 4) * 4
 
         qk_norm_rope_block(
             q,
@@ -1952,7 +1925,7 @@ class Block(nn.Module):
         self.hc_eps = args.hc_eps
         mix_hc = (2 + hc_mult) * hc_mult
         hc_dim = hc_mult * args.dim
-        with set_dtype(torch.float32):
+        with use_default_dtype(torch.float32):
             self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim))
             self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim))
             self.hc_attn_base = nn.Parameter(torch.empty(mix_hc))
@@ -2328,7 +2301,7 @@ class DSparkBlock(Block):
                 args.vocab_size, args.dspark_markov_rank
             )
             hc_dim = self.hc_mult * args.dim
-            with set_dtype(torch.float32):
+            with use_default_dtype(torch.float32):
                 self.hc_head_fn = nn.Parameter(torch.empty(self.hc_mult, hc_dim))
                 self.hc_head_base = nn.Parameter(torch.empty(self.hc_mult))
                 self.hc_head_scale = nn.Parameter(torch.empty(1))
@@ -2389,7 +2362,7 @@ class Transformer(nn.Module):
         self.head = ParallelHead(args.vocab_size, args.dim)
         self.hc_mult = hc_mult = args.hc_mult
         hc_dim = hc_mult * args.dim
-        with set_dtype(torch.float32):
+        with use_default_dtype(torch.float32):
             self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim))
             self.hc_head_base = nn.Parameter(torch.empty(hc_mult))
             self.hc_head_scale = nn.Parameter(torch.empty(1))
