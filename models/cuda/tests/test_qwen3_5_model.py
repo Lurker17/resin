@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
+
 import torch
 from test_qwen3_5_config import _qwen38
 
@@ -79,7 +83,7 @@ def test_target_and_optional_mtp_names_match_checkpoint() -> None:
     assert not any("mtp.embed_tokens" in name for name in names)
 
 
-def test_native_text_model_matches_transformers_reference() -> None:
+def _assert_native_text_model_matches_transformers_reference() -> None:
     from transformers.models.qwen3_5.configuration_qwen3_5 import (
         Qwen3_5TextConfig,
     )
@@ -110,9 +114,7 @@ def test_native_text_model_matches_transformers_reference() -> None:
         ],
     )
     config = Qwen35Config.from_hugging_face(values)  # type: ignore[arg-type]
-    native = Qwen3_5ForConditionalGeneration(
-        config, include_mtp=False
-    ).language_model
+    native = Qwen3_5ForConditionalGeneration(config, include_mtp=False).language_model
     reference = ReferenceModel(Qwen3_5TextConfig.from_dict(values))  # type: ignore[arg-type]
     reference.load_state_dict(native.state_dict())
     token_ids = torch.tensor([[1, 7, 12, 4]])
@@ -127,6 +129,26 @@ def test_native_text_model_matches_transformers_reference() -> None:
         ).last_hidden_state
 
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+
+
+def test_native_text_model_matches_transformers_reference() -> None:
+    tests = Path(__file__).resolve().parent
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                f"sys.path.insert(0, {str(tests)!r}); "
+                "from test_qwen3_5_model import "
+                "_assert_native_text_model_matches_transformers_reference as check; "
+                "check()"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_text_loader_ignores_vision_and_optionally_mtp() -> None:
