@@ -227,9 +227,6 @@ class CacheArena:
             ),
         )
 
-    def bind(self, pool_id: int, layout: CacheLayout) -> int:
-        return self.binding.bind(pool_id, layout)
-
     @staticmethod
     def unit_page(slab_id: int, slotnum: int, layers: int, layer: int) -> int:
         if not 0 <= layer < layers:

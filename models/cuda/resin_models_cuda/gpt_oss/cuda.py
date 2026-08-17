@@ -434,11 +434,7 @@ class GptOssCudaRunner(Runner):
         return self._graphs.stats
 
     def bind_resources(self, binding: ResourceBinding) -> None:
-        """Permanently bind the Engine-owned cache identity."""
-
-        if binding.cache_pool_id is None or binding.cache_layout is None:
-            raise ValueError("GPT-OSS requires a cache resource binding")
-        self._kv.bind(binding.cache_pool_id, binding.cache_layout)
+        self._kv.binding.bind_resources(binding)
 
     def _tensorize(
         self, batch: AttentionBatch, staging: TensorStager, prefix: str
@@ -827,7 +823,7 @@ class GptOssCudaRunner(Runner):
             dtype=torch.bfloat16,
             device=self.device,
         )
-        try:
+        with self._cuda_failure:
             with torch.inference_mode():
                 for index, host_batch in enumerate(prefill_batches):
                     batch = self._tensorize(host_batch, staging, f"prefill.{index}")
@@ -840,8 +836,5 @@ class GptOssCudaRunner(Runner):
                 logits = self._model.lm_head(final_hidden)
 
             return self._sampler(logits, plan).tolist()
-        except BaseException:
-            self._cuda_failure()
-            raise
 
 __all__ = ["GptOssCudaRunner"]

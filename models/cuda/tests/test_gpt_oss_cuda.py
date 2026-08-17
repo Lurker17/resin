@@ -150,9 +150,7 @@ class TestGptOssCudaNativePlan:
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
         runner.cache_layout = object()
         binding = CachePoolBinding(runner.cache_layout, resource="GPT-OSS KV")
-        runner._kv = SimpleNamespace(
-            bind=binding.bind,
-        )
+        runner._kv = SimpleNamespace(binding=binding)
         return runner
 
     @staticmethod

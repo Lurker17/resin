@@ -517,9 +517,6 @@ class CacheArena:
         self.index_keys = self.storage.view(-1, PAGE_TOKENS, 128)
         self.reset_scratch()
 
-    def bind(self, pool_id: int, layout) -> int:
-        return self.binding.bind(pool_id, layout)
-
     def reset_scratch(self) -> None:
         self.storage[0].zero_()
         self.storage[-GRAPH_SCRATCH_PARENTS:].zero_()

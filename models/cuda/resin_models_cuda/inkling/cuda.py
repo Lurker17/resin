@@ -224,9 +224,7 @@ class InklingCudaRunner(Runner):
         return self._speculation.snapshot()
 
     def bind_resources(self, binding: ResourceBinding) -> None:
-        if binding.cache_pool_id is None or binding.cache_layout is None:
-            raise ValueError("Inkling requires managed cache resources")
-        self._cache.bind(binding.cache_pool_id, binding.cache_layout)
+        self._cache.binding.bind_resources(binding)
 
     @staticmethod
     def _capture_inputs(shape: GraphShape, vocab_size: int) -> dict[str, object]:
@@ -647,7 +645,7 @@ class InklingCudaRunner(Runner):
                 self.speculative_tokens if plan.phase == BatchPhase.DECODE else 0
             ),
         )
-        try:
+        with self._cuda_failure:
             if plan.phase == BatchPhase.DECODE:
                 graph_output = self._graph_forward(plan, cache_plan)
                 if graph_output is not None:
@@ -666,9 +664,6 @@ class InklingCudaRunner(Runner):
                 if self.speculative_tokens:
                     return self._speculative_decode(plan, cache, token_ids, positions)
                 return self._ordinary_decode(plan, cache, token_ids, positions)
-        except BaseException:
-            self._cuda_failure()
-            raise
 
     def release(self, sequence_ids: list[int]) -> None:
         """The Engine retires each sequence's slabs after this callback."""

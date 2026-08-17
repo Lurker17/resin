@@ -26,3 +26,11 @@ class CudaFailureGuard:
                 f"{self._label} failed after launch and CUDA quiescence could "
                 "not be established; resources must remain quarantined"
             ) from synchronization_error
+
+    def __enter__(self) -> CudaFailureGuard:
+        return self
+
+    def __exit__(self, _type, error, _traceback) -> bool:
+        if error is not None:
+            self()
+        return False

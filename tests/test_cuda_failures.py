@@ -14,6 +14,19 @@ def test_cuda_failure_guard_allows_retry_after_successful_quiescence() -> None:
     assert synchronized == [True]
 
 
+def test_cuda_failure_guard_quiesces_only_when_the_guarded_step_fails() -> None:
+    synchronized = []
+    guard = CudaFailureGuard(lambda: synchronized.append(True), label="runner")
+
+    with guard:
+        pass
+    with pytest.raises(ValueError, match="forward failed"):
+        with guard:
+            raise ValueError("forward failed")
+
+    assert synchronized == [True]
+
+
 def test_cuda_failure_guard_marks_an_unquiesced_launch_post_accept() -> None:
     def fail() -> None:
         raise RuntimeError("synchronize failed")

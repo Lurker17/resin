@@ -325,11 +325,7 @@ class DeepSeekV4CudaRunner(Runner):
         return dict(self._last_dspark_phase_ms)
 
     def bind_resources(self, binding: ResourceBinding) -> None:
-        """Permanently bind the packed allocation to the Engine cache pool."""
-
-        if binding.cache_pool_id is None or binding.cache_layout is None:
-            raise ValueError("DeepSeek-V4 requires managed cache resources")
-        self._cache.bind(binding.cache_pool_id, binding.cache_layout)
+        self._cache.binding.bind_resources(binding)
 
     def _cache_plan(self, plan: BatchPlan):
         return PagedCachePlan.from_plan(
@@ -702,7 +698,7 @@ class DeepSeekV4CudaRunner(Runner):
                 return graph_output
         elif self._graphs.shapes:
             self._graphs.fallback("prefill")
-        try:
+        with self._cuda_failure:
             staging = TensorStager(self.device)
             cache = self._cache.tensorize(cache_plan, staging)
             token_ids = staging.device("token_ids", plan.token_ids, torch.long)
@@ -726,8 +722,5 @@ class DeepSeekV4CudaRunner(Runner):
                     )
                 output = self._sample_target(logits, plan, 0)
             return output.tolist()
-        except BaseException:
-            self._cuda_failure()
-            raise
 
 __all__ = ["DeepSeekV4CudaRunner"]

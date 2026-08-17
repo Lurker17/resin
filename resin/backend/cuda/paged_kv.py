@@ -32,9 +32,6 @@ class PagedKvArena:
         self.keys = self.storage[0]
         self.values = self.storage[1]
 
-    def bind(self, pool_id: int, layout) -> int:
-        return self.binding.bind(pool_id, layout)
-
     def check_pages(self, page_ids) -> None:
         if any(page < 0 or page > self.capacity for page in page_ids):
             raise ValueError("BatchPlan cache block ID is outside the physical slab")

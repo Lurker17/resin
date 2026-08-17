@@ -378,9 +378,7 @@ class Gemma4CudaRunner(Runner):
         )
 
     def bind_resources(self, binding: ResourceBinding) -> None:
-        if binding.cache_pool_id is None or binding.cache_layout is None:
-            raise ValueError("Gemma 4 requires an Engine-owned cache pool")
-        self._binding.bind(binding.cache_pool_id, binding.cache_layout)
+        self._binding.bind_resources(binding)
 
     def release(self, request_ids: list[int]) -> None:
         for request_id in request_ids:
@@ -1636,7 +1634,7 @@ class Gemma4CudaRunner(Runner):
                 return graph_output
         elif self._graphs.shapes:
             self._graphs.fallback("prefill")
-        try:
+        with self._cuda_failure:
             hidden = self._eager_transformer(plan, batch)
             self._store_last_hidden(plan, batch, hidden)
             last = torch.as_tensor(
@@ -1644,9 +1642,6 @@ class Gemma4CudaRunner(Runner):
             )
             logits = self._model.logits(hidden[last])
             return self._sample_target(logits, plan, 0).tolist()
-        except BaseException:
-            self._cuda_failure()
-            raise
 
 
 __all__ = [

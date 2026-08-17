@@ -31,3 +31,10 @@ class CachePoolBinding:
 
     def bind(self, pool_id: int, layout) -> int:
         return self.commit(self.validate(pool_id, layout))
+
+    def bind_resources(self, binding) -> None:
+        """Consume the native Engine binding exposed by the runner contract."""
+
+        if binding.cache_pool_id is None or binding.cache_layout is None:
+            raise ValueError(f"{self.resource} requires managed cache resources")
+        self.bind(binding.cache_pool_id, binding.cache_layout)

@@ -89,9 +89,6 @@ class _Lfm2CacheArena:
             state_length,
         )
 
-    def bind(self, pool_id: int, layout) -> int:
-        return self.binding.bind(pool_id, layout)
-
     def state(self, address: tuple[int, int]):
         parent, child_slot = address
         return self._state[parent - 1, child_slot]
@@ -247,11 +244,7 @@ class Lfm2CudaRunner(Runner):
             )
 
     def bind_resources(self, binding: ResourceBinding) -> None:
-        """Bind the unified physical arena to its Engine cache pool."""
-
-        if binding.cache_pool_id is None or binding.cache_layout is None:
-            raise ValueError("LFM2 requires managed cache resources")
-        self._cache.bind(binding.cache_pool_id, binding.cache_layout)
+        self._cache.binding.bind_resources(binding)
 
     def _preflight_cache(self, plan: BatchPlan) -> PagedCachePlan:
         """Validate the complete cache launch before CUDA acceptance."""
@@ -574,7 +567,7 @@ class Lfm2CudaRunner(Runner):
         torch = self._torch
         staging = TensorStager(self.device)
         ephemeral = []
-        try:
+        with self._cuda_failure:
             with torch.cuda.stream(self._stream), torch.inference_mode():
                 self._prepare_state_rows(recurrent_rows)
                 metadata = self._metadata(plan, cache_metadata, staging)
@@ -601,6 +594,3 @@ class Lfm2CudaRunner(Runner):
                 ephemeral.append(output)
             self._stream.synchronize()
             return output.tolist()
-        except BaseException:
-            self._cuda_failure()
-            raise
