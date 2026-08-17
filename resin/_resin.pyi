@@ -19,13 +19,17 @@ class BatchPhase:
 @final
 class BatchPlan:
     """
-    Immutable Engine-issued execution plan for one homogeneous batch phase.
+    Immutable execution plan for one prefill or decode step.
 
-    ``token_ids`` contains every sequence's new tokens in one flat array.
-    Adjacent values in ``token_indptr`` select each sequence's tokens.
-    ``context_lengths[i]`` is the number of tokens already processed for
-    sequence ``i``; positions are therefore implicit and start at that value.
-    ``cache_groups`` supplies the pages used by those sequences.
+    This runs one forward pass on a batch of sequences. ``token_ids`` contains
+    the newly scheduled input tokens, packed by sequence into one flat array;
+    ``token_indptr`` is the CSR row pointer, so sequence ``i`` owns
+    ``token_ids[token_indptr[i]:token_indptr[i + 1]]``.
+
+    ``context_lengths[i]`` is the number of tokens processed before this step,
+    so that sequence's new tokens occupy consecutive absolute positions
+    beginning there. ``cache_groups`` contains one placement plan per declared
+    ``CacheLayout`` group, and every group plan covers every sequence.
     """
     def __new__(
         cls,
@@ -58,6 +62,8 @@ class BatchPlan:
     def cache_groups(self, /) -> tuple[CacheGroupPlan, ...]:
         """
         Ordered physical placement plans corresponding to CacheLayout groups.
+        There is one plan per layout group, not one plan per sequence; each plan
+        contains one block-table row for every sequence in this batch.
         """
     @property
     def context_lengths(self, /) -> npt.NDArray[np.uint32]:
@@ -187,13 +193,30 @@ class CacheGroupLayout:
 @final
 class CacheGroupPlan:
     """
-    Physical page placement for one cache group in a BatchPlan.
+    Plan for one type of cache in a BatchPlan.
 
-    Adjacent ``block_indptr`` values select each sequence's physical addresses
-    from the parallel ``block_parent_ids`` and ``block_child_slots`` arrays.
-    ``first_logical_blocks`` gives the logical number represented by each
-    sequence's first physical block. The parallel ``append_parent_ids`` and
-    ``append_child_slots`` arrays contain one write target per flattened token.
+    A model can have one or more types of cache, such as full attention,
+    sliding-window attention, or recurrent state, each described by one
+    ``CacheGroupLayout``. Cache memory is organized into fungible slabs. Each
+    slab is assigned to one cache group and holds ``blocks_per_parent`` blocks.
+
+    A block is indexed by ``(slab_id, slotnum)``. The parallel
+    ``block_parent_ids`` and ``block_child_slots`` arrays contain these values:
+    a parent ID is a one-based slab ID, and a child slot is a zero-based slot
+    number. A cached token location is ``(block, block_offset)``, equivalently
+    ``(slab_id, slotnum, block_offset)``.
+
+    The plan covers every sequence in the batch. Adjacent ``block_indptr``
+    values select each sequence's chronological block-table row.
+    ``first_logical_blocks[i]`` is sequence ``i``'s block-table start index, so
+    row entry ``j`` represents block ``first_logical_blocks[i] + j``; block
+    ``b`` begins at token position ``b * CacheGroupLayout.block_tokens``. Full-
+    attention tables start at zero; sliding-window and recurrent tables advance
+    as old blocks leave their resident rings.
+
+    For flattened batch token ``k``, the ``append_*`` arrays supply exactly that
+    cached-token location: ``(append_parent_ids[k], append_child_slots[k],
+    append_block_offsets[k])``.
     """
     def __new__(
         cls,
@@ -213,47 +236,59 @@ class CacheGroupPlan:
     @property
     def append_block_offsets(self, /) -> npt.NDArray[np.uint32]:
         """
-        In-block destination offset for every flattened batch token.
+        Token offset within each token's destination block. Entry ``k``
+        corresponds to ``BatchPlan.token_ids[k]`` and is less than the matching
+        ``CacheGroupLayout.block_tokens``.
         """
     @property
     def append_child_slots(self, /) -> npt.NDArray[np.uint32]:
         """
-        Child slot within its physical parent for every write target.
+        Child-block slot of each token's write target. Entry ``k`` corresponds
+        to ``BatchPlan.token_ids[k]``.
         """
     @property
     def append_parent_ids(self, /) -> npt.NDArray[np.uint32]:
         """
-        Physical parent for every flattened batch-token write target.
+        One-based physical parent ID of each token's write target. Entry ``k``
+        corresponds to ``BatchPlan.token_ids[k]``.
         """
     @property
     def block_child_slots(self, /) -> npt.NDArray[np.uint32]:
         """
-        Child slot within its physical parent for each block-table entry.
+        Child-block slot for each flattened block-table entry. Pair with
+        ``block_parent_ids``.
         """
     @property
     def block_indptr(self, /) -> npt.NDArray[np.uint32]:
         """
-        Offsets into the parallel block-address arrays for each sequence.
+        CSR row pointer into the block-address arrays. Its length is one more
+        than the batch sequence count.
         """
     @property
     def block_parent_ids(self, /) -> npt.NDArray[np.uint32]:
         """
-        Physical parent for each flattened block-table entry.
+        One-based physical parent ID for each flattened block-table entry.
+        Pair with ``block_child_slots``; parent zero is reserved as null.
         """
     @property
     def blocks_per_parent(self, /) -> int:
         """
-        Number of logical child blocks packed into each physical parent.
+        Number of this group's physical cache blocks packed into one parent.
+        Valid child slots are ``0 <= slot < blocks_per_parent``.
         """
     @property
     def first_logical_blocks(self, /) -> npt.NDArray[np.uint32]:
         """
-        Logical block number corresponding to each sequence's first block.
+        Absolute logical-block index at which each sequence's table row starts.
+        This is zero for full-attention history and advances for sliding-window
+        and recurrent rings. It has one entry per sequence and is unrelated to
+        the physical slab ID.
         """
     @property
     def group_index(self, /) -> int:
         """
-        Zero-based index into the Engine's CacheLayout groups.
+        Zero-based index of this plan's matching CacheGroupLayout. BatchPlan
+        orders group plans by this index and rejects gaps or reordering.
         """
 
 @final

@@ -287,13 +287,17 @@ impl SchedulerConfig {
     }
 }
 
-/// Immutable Engine-issued execution plan for one homogeneous batch phase.
+/// Immutable execution plan for one prefill or decode step.
 ///
-/// ``token_ids`` contains every sequence's new tokens in one flat array.
-/// Adjacent values in ``token_indptr`` select each sequence's tokens.
-/// ``context_lengths[i]`` is the number of tokens already processed for
-/// sequence ``i``; positions are therefore implicit and start at that value.
-/// ``cache_groups`` supplies the pages used by those sequences.
+/// This runs one forward pass on a batch of sequences. ``token_ids`` contains
+/// the newly scheduled input tokens, packed by sequence into one flat array;
+/// ``token_indptr`` is the CSR row pointer, so sequence ``i`` owns
+/// ``token_ids[token_indptr[i]:token_indptr[i + 1]]``.
+///
+/// ``context_lengths[i]`` is the number of tokens processed before this step,
+/// so that sequence's new tokens occupy consecutive absolute positions
+/// beginning there. ``cache_groups`` contains one placement plan per declared
+/// ``CacheLayout`` group, and every group plan covers every sequence.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug)]
 struct BatchPlan {
@@ -594,6 +598,8 @@ impl BatchPlan {
     }
 
     /// Ordered physical placement plans corresponding to CacheLayout groups.
+    /// There is one plan per layout group, not one plan per sequence; each plan
+    /// contains one block-table row for every sequence in this batch.
     #[getter]
     fn cache_groups(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         let groups = self

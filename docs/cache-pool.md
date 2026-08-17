@@ -23,13 +23,23 @@ physical addresses refer to the already-bound arena.
 
 ## Batch plans
 
-Each group plan has one CSR page table:
+`BatchPlan.cache_groups` has one plan per declared block type—such as full
+attention, sliding-window attention, or recurrent state—not one per sequence.
+The cache is a pool of equally sized physical slabs. Each slab in use is
+assigned to one cache group and fits that group's `blocks_per_parent` blocks.
+A physical block is identified by `(slab_id, slotnum)`; the API exposes those
+components as a parent ID and child slot. A cached token location is
+`(block, block_offset)`, equivalently `(slab_id, slotnum, block_offset)`. Each
+group plan covers every batch sequence and has one CSR block table:
 
 - `block_indptr` slices the parallel `block_parent_ids` and
   `block_child_slots` arrays by sequence.
-- `first_logical_blocks` names the first logical block in each sequence table.
+- `first_logical_blocks[i]` is the absolute chunk index represented by sequence
+  `i`'s first table entry. For a group with 64-token blocks, logical block 37
+  covers token positions 2368 through 2431. Full-history rows begin at zero;
+  sliding-window rows advance when earlier chunks are evicted.
 - `append_parent_ids`, `append_child_slots`, and `append_block_offsets` give one
-  write destination per scheduled token.
+  exact cached-token write location per scheduled token.
 
 The Engine allocates pages, performs copy-on-write decisions, and holds the
 reader/writer lease until asynchronous execution is terminal. Model code only

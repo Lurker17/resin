@@ -35,10 +35,23 @@ position rather than transported separately.
 
 ## Cache metadata
 
-`cache_groups` has the same order as the runner's bound `CacheLayout`. Each
-`CacheGroupPlan` contains a CSR physical page table and exact append locations.
-The Engine has already allocated, retained, and leased those pages. The runner
-must not allocate pages or keep a request-ID cache map.
+`cache_groups` has the same order as the runner's bound `CacheLayout`: there is
+one `CacheGroupPlan` per declared cache-block type, and each plan has one CSR
+block-table row per batch sequence. Every equally sized physical slab in the
+cache is assigned to one block type while in use and holds that group's
+`blocks_per_parent` blocks. A block address is `(slab_id, slotnum)`, exposed by
+the API as `(physical parent, child slot)`. A cached token location is
+`(block, block_offset)`, equivalently `(slab_id, slotnum, block_offset)`.
+Each flattened scheduled token also has an exact append triple: parent, child
+slot, and in-block token offset. The Engine has already allocated, retained,
+and leased those blocks. The runner must not allocate blocks or keep a
+request-ID cache map.
+
+`first_logical_blocks[i]` aligns sequence `i`'s possibly cropped table row with
+absolute token positions. Logical block `b` begins at
+`b * CacheGroupLayout.block_tokens`; full-history rows begin at zero, while a
+sliding-window row advances as old blocks are evicted. Logical block numbers
+are sequence positions, not physical parent IDs.
 
 Its pointer, block, and append fields are likewise read-only, zero-copy
 `uint32` arrays. Constructors accept ordinary integer sequences or arrays with

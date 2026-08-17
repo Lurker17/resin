@@ -315,13 +315,30 @@ impl CacheLayout {
     }
 }
 
-/// Physical page placement for one cache group in a BatchPlan.
+/// Plan for one type of cache in a BatchPlan.
 ///
-/// Adjacent ``block_indptr`` values select each sequence's physical addresses
-/// from the parallel ``block_parent_ids`` and ``block_child_slots`` arrays.
-/// ``first_logical_blocks`` gives the logical number represented by each
-/// sequence's first physical block. The parallel ``append_parent_ids`` and
-/// ``append_child_slots`` arrays contain one write target per flattened token.
+/// A model can have one or more types of cache, such as full attention,
+/// sliding-window attention, or recurrent state, each described by one
+/// ``CacheGroupLayout``. Cache memory is organized into fungible slabs. Each
+/// slab is assigned to one cache group and holds ``blocks_per_parent`` blocks.
+///
+/// A block is indexed by ``(slab_id, slotnum)``. The parallel
+/// ``block_parent_ids`` and ``block_child_slots`` arrays contain these values:
+/// a parent ID is a one-based slab ID, and a child slot is a zero-based slot
+/// number. A cached token location is ``(block, block_offset)``, equivalently
+/// ``(slab_id, slotnum, block_offset)``.
+///
+/// The plan covers every sequence in the batch. Adjacent ``block_indptr``
+/// values select each sequence's chronological block-table row.
+/// ``first_logical_blocks[i]`` is sequence ``i``'s block-table start index, so
+/// row entry ``j`` represents block ``first_logical_blocks[i] + j``; block
+/// ``b`` begins at token position ``b * CacheGroupLayout.block_tokens``. Full-
+/// attention tables start at zero; sliding-window and recurrent tables advance
+/// as old blocks leave their resident rings.
+///
+/// For flattened batch token ``k``, the ``append_*`` arrays supply exactly that
+/// cached-token location: ``(append_parent_ids[k], append_child_slots[k],
+/// append_block_offsets[k])``.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CacheGroupPlan {
@@ -425,37 +442,45 @@ impl CacheGroupPlan {
         )
     }
 
-    /// Zero-based index into the Engine's CacheLayout groups.
+    /// Zero-based index of this plan's matching CacheGroupLayout. BatchPlan
+    /// orders group plans by this index and rejects gaps or reordering.
     #[getter]
     fn group_index(&self) -> u32 {
         self.inner.group_index
     }
 
-    /// Number of logical child blocks packed into each physical parent.
+    /// Number of this group's physical cache blocks packed into one parent.
+    /// Valid child slots are ``0 <= slot < blocks_per_parent``.
     #[getter]
     fn blocks_per_parent(&self) -> u32 {
         self.inner.blocks_per_parent
     }
 
-    /// Offsets into the parallel block-address arrays for each sequence.
+    /// CSR row pointer into the block-address arrays. Its length is one more
+    /// than the batch sequence count.
     #[getter]
     fn block_indptr<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
         crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_indptr)
     }
 
-    /// Physical parent for each flattened block-table entry.
+    /// One-based physical parent ID for each flattened block-table entry.
+    /// Pair with ``block_child_slots``; parent zero is reserved as null.
     #[getter]
     fn block_parent_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
         crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_parent_ids)
     }
 
-    /// Child slot within its physical parent for each block-table entry.
+    /// Child-block slot for each flattened block-table entry. Pair with
+    /// ``block_parent_ids``.
     #[getter]
     fn block_child_slots<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
         crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_child_slots)
     }
 
-    /// Logical block number corresponding to each sequence's first block.
+    /// Absolute logical-block index at which each sequence's table row starts.
+    /// This is zero for full-attention history and advances for sliding-window
+    /// and recurrent rings. It has one entry per sequence and is unrelated to
+    /// the physical slab ID.
     #[getter]
     fn first_logical_blocks<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
         crate::arrays::readonly_view(
@@ -464,13 +489,15 @@ impl CacheGroupPlan {
         )
     }
 
-    /// Physical parent for every flattened batch-token write target.
+    /// One-based physical parent ID of each token's write target. Entry ``k``
+    /// corresponds to ``BatchPlan.token_ids[k]``.
     #[getter]
     fn append_parent_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
         crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.append_parent_ids)
     }
 
-    /// Child slot within its physical parent for every write target.
+    /// Child-block slot of each token's write target. Entry ``k`` corresponds
+    /// to ``BatchPlan.token_ids[k]``.
     #[getter]
     fn append_child_slots<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
         crate::arrays::readonly_view(
@@ -479,7 +506,9 @@ impl CacheGroupPlan {
         )
     }
 
-    /// In-block destination offset for every flattened batch token.
+    /// Token offset within each token's destination block. Entry ``k``
+    /// corresponds to ``BatchPlan.token_ids[k]`` and is less than the matching
+    /// ``CacheGroupLayout.block_tokens``.
     #[getter]
     fn append_block_offsets<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
         crate::arrays::readonly_view(
