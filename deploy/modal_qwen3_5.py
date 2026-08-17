@@ -25,6 +25,7 @@ MODEL_PATH = Path(MODEL_MOUNT) / MODEL_REVISION
 DEFAULT_CONTEXT_LENGTH = 32_768
 DEFAULT_SPECULATIVE_TOKENS = 2
 MAX_RUNNING_REQUESTS = 32
+CUDA_GRAPH_BATCH_SIZES = (1, 2, 4, 8)
 MODEL_PATTERNS = (
     "config.json",
     "generation_config.json",
@@ -37,6 +38,8 @@ MODEL_PATTERNS = (
     "tokenizer.json",
     "tokenizer_config.json",
     "vocab.json",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
 )
 _http_server_processes: list[object] = []
 
@@ -45,9 +48,15 @@ image = build_modal_image(
     env={
         "TORCH_CUDA_ARCH_LIST": "10.0a",
         "FLASHINFER_CUDA_ARCH_LIST": "10.0a",
+        "FLASHINFER_WORKSPACE_BASE": f"{KERNEL_MOUNT}/flashinfer",
         "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",
         "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": f"{KERNEL_MOUNT}/flash-attention-4",
         "FLASH_ATTENTION_ARCH": "sm_100a",
+        "CUTE_DSL_CACHE_DIR": f"{KERNEL_MOUNT}/cute-dsl",
+        "CUDA_CACHE_PATH": f"{KERNEL_MOUNT}/cuda",
+        "CUDA_TILE_CACHE_DIR": f"{KERNEL_MOUNT}/cuda-tile",
+        "QUACK_CACHE_DIR": f"{KERNEL_MOUNT}/quack",
+        "TORCHINDUCTOR_CACHE_DIR": f"{KERNEL_MOUNT}/torchinductor",
         "TRITON_CACHE_DIR": f"{KERNEL_MOUNT}/triton",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     },
@@ -83,6 +92,8 @@ def _inventory() -> dict[str, int]:
         MODEL_PATH / "hf_quant_config.json",
         MODEL_PATH / "tokenizer.json",
         MODEL_PATH / "tokenizer_config.json",
+        MODEL_PATH / "preprocessor_config.json",
+        MODEL_PATH / "video_preprocessor_config.json",
         index_path,
         *(MODEL_PATH / filename for filename in sorted(filenames)),
     ]
@@ -101,10 +112,21 @@ def _inventory() -> dict[str, int]:
 
 def _require_model() -> dict[str, int]:
     model_volume.reload()
+    kernel_volume.reload()
     inventory = _inventory()
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    Path(KERNEL_MOUNT).mkdir(parents=True, exist_ok=True)
+    for directory in (
+        "flashinfer",
+        "flash-attention-4",
+        "cute-dsl",
+        "cuda",
+        "cuda-tile",
+        "quack",
+        "torchinductor",
+        "triton",
+    ):
+        (Path(KERNEL_MOUNT) / directory).mkdir(parents=True, exist_ok=True)
     return inventory
 
 
@@ -149,8 +171,8 @@ def download_model() -> dict[str, Any]:
 
 def _build_runtime(*, context_length: int, speculative_tokens: int):
     import torch
-    from renderers import Qwen35RendererConfig, create_renderer
-    from transformers import AutoTokenizer
+    from renderers import Qwen35Renderer, Qwen35RendererConfig
+    from transformers import AutoProcessor
 
     from resin import Engine, SchedulerConfig
     from resin_models_cuda.qwen3_5 import Qwen3_5CudaRunner
@@ -163,13 +185,31 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
         max_seq_len=context_length,
         max_batch_size=MAX_RUNNING_REQUESTS,
         speculative_tokens=speculative_tokens,
-        gpu_memory_utilization=0.90,
+        gpu_memory_utilization=0.80,
         kv_cache_dtype="fp8",
+        cuda_graph_decode_shapes=tuple(
+            (batch_size, context_length) for batch_size in CUDA_GRAPH_BATCH_SIZES
+        ),
     )
-    tokenizer = AutoTokenizer.from_pretrained(
+    processor = AutoProcessor.from_pretrained(
         MODEL_PATH, local_files_only=True, trust_remote_code=False
     )
-    renderer = create_renderer(tokenizer, Qwen35RendererConfig(enable_thinking=True))
+    tokenizer = processor.tokenizer
+    renderer = Qwen35Renderer(
+        tokenizer,
+        Qwen35RendererConfig(enable_thinking=True),
+        processor=processor,
+    )
+    shapes = runner.cuda_graph_stats["configured_shapes"]
+    print(f"[cuda-graphs] capturing {len(shapes)} decode shapes: {shapes}", flush=True)
+    graph_started = time.perf_counter()
+    graph_stats = runner.capture_cuda_graphs()
+    graph_capture_s = time.perf_counter() - graph_started
+    print(
+        f"[cuda-graphs] captured {graph_stats['capture_count']} shapes in "
+        f"{graph_capture_s:.2f}s",
+        flush=True,
+    )
     engine = Engine(
         runner,
         max_running_requests=MAX_RUNNING_REQUESTS,
@@ -196,7 +236,8 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
         "weight_quantization": runner.weight_quantization,
         "nvfp4_backend": runner.nvfp4_backend,
         "kv_cache_dtype": runner.kv_cache_dtype,
-        "cuda_graphs": False,
+        "cuda_graph_capture_s": graph_capture_s,
+        "cuda_graphs": graph_stats,
         "cache": asdict(runner.cache_capacity_plan),
         "device": torch.cuda.get_device_name(runner.device),
         "capability": torch.cuda.get_device_capability(runner.device),
@@ -211,7 +252,7 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
     return (
         torch,
         runner,
-        tokenizer,
+        processor,
         renderer,
         engine,
         report,
@@ -226,6 +267,27 @@ def _prompt_ids(renderer: Any, prompt: str) -> list[int]:
     if not token_ids:
         raise ValueError("Qwen3.8 chat template produced no tokens")
     return [int(token_id) for token_id in token_ids]
+
+
+def _synthetic_image(size: int = 64):
+    import numpy as np
+
+    axis = np.linspace(0.0, 1.0, size, dtype=np.float32)
+    horizontal = np.broadcast_to(axis[None], (size, size))
+    vertical = horizontal.T
+    return np.stack((horizontal, vertical, 1.0 - horizontal), axis=-1).copy()
+
+
+def _drain(engine: Any) -> tuple[list[float], list[float]]:
+    step_durations = []
+    event_times = []
+    while engine.has_work():
+        step_started = time.perf_counter()
+        events = engine.step()
+        event_at = time.perf_counter()
+        step_durations.append(event_at - step_started)
+        event_times.extend([event_at] * len(events))
+    return step_durations, event_times
 
 
 @app.function(
@@ -247,7 +309,7 @@ def smoke_test(
     (
         torch,
         runner,
-        tokenizer,
+        processor,
         renderer,
         engine,
         report,
@@ -256,6 +318,7 @@ def smoke_test(
         context_length=context_length,
         speculative_tokens=speculative_tokens,
     )
+    tokenizer = processor.tokenizer
     try:
         prompt_ids = _prompt_ids(
             renderer,
@@ -268,20 +331,40 @@ def smoke_test(
             sampling_params=SamplingParams(temperature=0.0),
         )
         started = time.perf_counter()
-        step_durations = []
-        event_times = []
-        while engine.has_work():
-            step_started = time.perf_counter()
-            events = engine.step()
-            event_at = time.perf_counter()
-            step_durations.append(event_at - step_started)
-            event_times.extend([event_at] * len(events))
+        step_durations, event_times = _drain(engine)
         torch.cuda.synchronize(runner.device)
         finished = time.perf_counter()
         output_ids = request.take_result()
         first_token_s = event_times[0] - started if event_times else None
         timed_tokens = max(0, len(event_times) - 1)
         steady_s = event_times[-1] - event_times[0] if timed_tokens else 0.0
+        from resin_models_cuda.qwen3_5 import Qwen35Codec
+
+        codec = Qwen35Codec(renderer, processor)
+        image_prompt = codec.render(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": _synthetic_image()},
+                            {"type": "text", "text": "Describe this image briefly."},
+                        ],
+                    }
+                ]
+            }
+        )
+        image_request = engine.submit(
+            media=image_prompt["media"],
+            max_new_tokens=16,
+            stop_token_ids=image_prompt["stop_token_ids"],
+            sampling_params=SamplingParams(temperature=0.0),
+        )
+        image_started = time.perf_counter()
+        _, image_events = _drain(engine)
+        torch.cuda.synchronize(runner.device)
+        image_output_ids = image_request.take_result()
+        image_finished = time.perf_counter()
         kernel_files_after_run = _kernel_inventory()
         kernel_cache = report["kernel_cache"]
         kernel_cache.update(
@@ -309,6 +392,18 @@ def smoke_test(
                 "output_tokens": len(output_ids),
                 "text": tokenizer.decode(output_ids, skip_special_tokens=True),
                 "speculative": runner.speculative_stats,
+                "cuda_graphs": runner.cuda_graph_stats,
+                "image": {
+                    "prompt_tokens": len(image_prompt["token_ids"]),
+                    "output_tokens": len(image_output_ids),
+                    "ttft_s": (
+                        image_events[0] - image_started if image_events else None
+                    ),
+                    "elapsed_s": image_finished - image_started,
+                    "text": tokenizer.decode(
+                        image_output_ids, skip_special_tokens=True
+                    ),
+                },
             }
         )
         return report
@@ -317,23 +412,72 @@ def smoke_test(
 
 
 def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
-    from resin.server import HttpServer, RendererCodec
+    import torch
 
-    _, _, tokenizer, renderer, engine, _, _ = _build_runtime(
-        context_length=context_length,
-        speculative_tokens=speculative_tokens,
+    from resin import SamplingParams
+    from resin.server import HttpServer
+    from resin_models_cuda.qwen3_5 import Qwen35Codec
+
+    _, runner, processor, renderer, engine, report, kernels_before_warmup = (
+        _build_runtime(
+            context_length=context_length,
+            speculative_tokens=speculative_tokens,
+        )
     )
+    codec = Qwen35Codec(renderer, processor)
     try:
+        text_prompt = codec.render(
+            {"messages": [{"role": "user", "content": "Reply with the word ready."}]}
+        )
+        text_request = engine.submit(
+            text_prompt["token_ids"],
+            max_new_tokens=4,
+            stop_token_ids=text_prompt["stop_token_ids"],
+            sampling_params=SamplingParams(temperature=0.0),
+        )
+        _drain(engine)
+        text_request.take_result()
+
+        image_prompt = codec.render(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": _synthetic_image()},
+                            {"type": "text", "text": "Name one visible color."},
+                        ],
+                    }
+                ]
+            }
+        )
+        image_request = engine.submit(
+            media=image_prompt["media"],
+            max_new_tokens=2,
+            stop_token_ids=image_prompt["stop_token_ids"],
+            sampling_params=SamplingParams(temperature=0.0),
+        )
+        _drain(engine)
+        image_request.take_result()
+        torch.cuda.synchronize(runner.device)
+
+        kernels_after_warmup = _kernel_inventory()
+        kernel_volume.commit()
+        report["cuda_graphs"] = runner.cuda_graph_stats
+        report["kernel_cache"].update(
+            {
+                "files_after_warmup": len(kernels_after_warmup),
+                "bytes_after_warmup": sum(kernels_after_warmup.values()),
+                "new_files_during_warmup": len(
+                    kernels_after_warmup.keys() - kernels_before_warmup.keys()
+                ),
+                "committed": True,
+            }
+        )
+        print(f"[startup] {json.dumps(report, sort_keys=True)}", flush=True)
         HttpServer(
             engine,
-            codec=RendererCodec(
-                renderer,
-                tokenizer=tokenizer,
-                include_generation_prefix_in_parser=True,
-                generation_prefix_parser_anchor_token_id=(
-                    tokenizer.convert_tokens_to_ids("<think>")
-                ),
-            ),
+            codec=codec,
             model=MODEL_ID,
         ).serve(host="0.0.0.0", port=8000)
     finally:
