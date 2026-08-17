@@ -406,6 +406,101 @@ class CacheArena:
             self.target_hidden_states,
         )
 
+    def _graph_group_widths(self, sequence_capacity: int) -> tuple[int, ...]:
+        if sequence_capacity <= 0:
+            raise ValueError("Qwen3.5 graph sequence capacity must be positive")
+        widths = []
+        for descriptor in self.layout.groups:
+            total = math.ceil(sequence_capacity / descriptor.block_tokens)
+            if descriptor.family is CacheGroupFamily.STATE:
+                total = min(total, 2)
+            widths.append(max(total, 1))
+        return tuple(widths)
+
+    def graph_cache(self, batch_size: int, sequence_capacity: int) -> DeviceCache:
+        """Allocate fixed cache tables for one padded CUDA graph bucket."""
+
+        groups = tuple(
+            DeviceGroup(
+                self.torch.empty(
+                    (batch_size, width),
+                    dtype=self.torch.int32,
+                    device=self.device,
+                ),
+                self.torch.empty(
+                    (batch_size, width),
+                    dtype=self.torch.int32,
+                    device=self.device,
+                ),
+                self.torch.empty(
+                    batch_size,
+                    dtype=self.torch.int32,
+                    device=self.device,
+                ),
+            )
+            for width in self._graph_group_widths(sequence_capacity)
+        )
+        return DeviceCache(
+            self.torch,
+            self.geometry,
+            groups,
+            self.keys,
+            self.values,
+            self.recurrent_states,
+            self.convolution_states,
+            self.target_hidden_states,
+        )
+
+    @staticmethod
+    def graph_device_inputs(cache: DeviceCache) -> dict[str, object]:
+        inputs: dict[str, object] = {}
+        for index, group in enumerate(cache.groups):
+            inputs[f"cache.{index}.slabs"] = group.slab_ids
+            inputs[f"cache.{index}.slots"] = group.slotnums
+            inputs[f"cache.{index}.first"] = group.first_blocks
+        return inputs
+
+    def graph_shape_capture_inputs(
+        self, batch_size: int, sequence_capacity: int
+    ) -> dict[str, object]:
+        """Return null-slab tables used only to warm and capture a graph."""
+
+        inputs: dict[str, object] = {}
+        for index, width in enumerate(self._graph_group_widths(sequence_capacity)):
+            inputs[f"cache.{index}.slabs"] = (0,) * (batch_size * width)
+            inputs[f"cache.{index}.slots"] = (0,) * (batch_size * width)
+            inputs[f"cache.{index}.first"] = (0,) * batch_size
+        return inputs
+
+    @staticmethod
+    def graph_plan_inputs(
+        cache: DeviceCache, plan: PagedCachePlan
+    ) -> dict[str, object]:
+        """Pad an Engine cache plan into fixed graph-owned tables."""
+
+        inputs: dict[str, object] = {}
+        for index, (target, source) in enumerate(
+            zip(cache.groups, plan.groups, strict=True)
+        ):
+            shape = tuple(target.slab_ids.shape)
+            slabs = np.zeros(shape, dtype=np.uint32)
+            slots = np.zeros(shape, dtype=np.uint32)
+            if plan.rows > shape[0]:
+                raise ValueError("Qwen3.5 cache batch exceeds CUDA graph capacity")
+            for row in range(plan.rows):
+                row_slabs = source.block_slabs(row)
+                row_slots = source.block_slots(row)
+                if len(row_slabs) > shape[1]:
+                    raise ValueError("Qwen3.5 cache table exceeds CUDA graph capacity")
+                slabs[row, : len(row_slabs)] = row_slabs
+                slots[row, : len(row_slots)] = row_slots
+            first = np.zeros(shape[0], dtype=np.uint32)
+            first[: plan.rows] = source.block_table_start_indices
+            inputs[f"cache.{index}.slabs"] = slabs
+            inputs[f"cache.{index}.slots"] = slots
+            inputs[f"cache.{index}.first"] = first
+        return inputs
+
 
 __all__ = [
     "CacheArena",

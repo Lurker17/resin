@@ -12,7 +12,18 @@ import torch
 from resin import BatchPhase, ResourceBinding, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
 from resin.backend.cuda.failures import CudaFailureGuard
-from resin.backend.cuda.sampling import SAMPLING_OFFSET_STRIDE, FlashInferSampler
+from resin.backend.cuda.graphs import (
+    CudaGraphCache,
+    CudaGraphStats,
+    CudaGraphStep,
+    GraphShape,
+    graph_shapes,
+)
+from resin.backend.cuda.sampling import (
+    SAMPLING_OFFSET_STRIDE,
+    FlashInferSampler,
+    SamplingTensors,
+)
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.loading import default_device
 from resin.backend.plans import PagedCachePlan
@@ -20,7 +31,11 @@ from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
 from resin.protocols import Runner
 from resin_models_cuda.nvfp4 import prepare_nvfp4_modules
-from resin_models_cuda.qwen3_5.attention import PagedAttentionRuntime
+from resin_models_cuda.qwen3_5.attention import (
+    GraphAttentionSpec,
+    GraphPagedAttentionRuntime,
+    PagedAttentionRuntime,
+)
 from resin_models_cuda.qwen3_5.cache import (
     PREFILL_CHUNK_SIZE,
     CacheArena,
@@ -38,6 +53,7 @@ if TYPE_CHECKING:
     from resin import BatchPlan
 
 _CACHE_WORKSPACE_BYTES = 512 * 1024**2
+_GRAPH_WORKSPACE_BYTES = 128 * 1024**2
 
 
 class Qwen3_5CudaRunner(Runner):
@@ -59,6 +75,7 @@ class Qwen3_5CudaRunner(Runner):
         cache_slab_capacity: int | None = None,
         kv_cache_dtype: str = "fp8",
         nvfp4_backend: str = "auto",
+        cuda_graph_decode_shapes: object | None = None,
     ) -> None:
         if (
             isinstance(speculative_tokens, bool)
@@ -149,6 +166,8 @@ class Qwen3_5CudaRunner(Runner):
         self.eos_token_id = self.config.eos_token_id
         self._sampler = FlashInferSampler(torch)
         self._speculation = SpeculativeStats(speculative_tokens)
+        self._graph_device_caches: dict[GraphShape, DeviceCache] = {}
+        self._graph_attention: dict[GraphShape, GraphPagedAttentionRuntime] = {}
         self.kv_cache_dtype = kv_cache_dtype
         cache_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8" else torch.bfloat16
 
@@ -190,6 +209,23 @@ class Qwen3_5CudaRunner(Runner):
             head_dim=self.config.head_dim,
             workspace_bytes=_CACHE_WORKSPACE_BYTES,
         )
+        decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
+        if any(shape[0] > max_batch_size for shape in decode_graph_shapes):
+            raise ValueError("Qwen3.5 CUDA graph batch capacity exceeds max_batch_size")
+        if any(shape[1] > self.max_seq_len for shape in decode_graph_shapes):
+            raise ValueError("Qwen3.5 CUDA graph sequence capacity exceeds max_seq_len")
+        if any(shape[1] <= speculative_tokens + 1 for shape in decode_graph_shapes):
+            raise ValueError("Qwen3.5 CUDA graph sequence capacity is too small")
+        self._graph_workspace = torch.empty(
+            _GRAPH_WORKSPACE_BYTES, dtype=torch.uint8, device=self.device
+        )
+        self._graphs = CudaGraphCache(
+            torch,
+            self.device,
+            decode_graph_shapes,
+            build=self._new_decode_graph_step,
+            synchronize_failure=self._cuda_failure,
+        )
         lookahead = speculative_tokens + 1 if speculative_tokens else 0
         self.runner_config = RunnerConfig(
             max_batch_tokens=PREFILL_CHUNK_SIZE,
@@ -200,11 +236,306 @@ class Qwen3_5CudaRunner(Runner):
         )
 
     @property
+    def cuda_graph_stats(self) -> CudaGraphStats:
+        return self._graphs.stats
+
+    @property
     def speculative_stats(self) -> dict[str, int | float]:
         return self._speculation.snapshot(include_draft_tokens=True)
 
     def bind_resources(self, binding: ResourceBinding) -> None:
         self._cache.binding.bind_resources(binding)
+
+    @staticmethod
+    def _capture_inputs(shape: GraphShape, vocab_size: int) -> dict[str, object]:
+        batch_size, _ = shape
+        return {
+            "token_ids": (0,) * batch_size,
+            "positions": (1,) * batch_size,
+            "sampling_temperatures": (1.0,) * batch_size,
+            "sampling_top_ps": (1.0,) * batch_size,
+            "sampling_top_ks": (vocab_size,) * batch_size,
+            "sampling_seeds": tuple(range(batch_size)),
+            "sampling_offsets": (0,) * batch_size,
+            "sampling_stochastic_mask": (False,) * batch_size,
+        }
+
+    def capture_cuda_graphs(self) -> CudaGraphStats:
+        """Capture every configured Qwen decode bucket before serving."""
+
+        captured = set(self._graphs.stats["captured_shapes"])
+        for shape in self._graphs.shapes:
+            if shape in captured:
+                continue
+            inputs = self._capture_inputs(shape, self.vocab_size)
+            inputs.update(self._cache.graph_shape_capture_inputs(*shape))
+            for index, call in enumerate(self._graph_attention_for(shape).calls):
+                inputs[f"attention.{index}.logical_pages"] = (0,) * len(
+                    call.prepared.logical_pages
+                )
+            self._graphs.capture(shape, inputs)
+        if self._graphs.shapes:
+            self._cache.reset_null()
+            torch.cuda.synchronize(self.device)
+        return self._graphs.stats
+
+    def _graph_sample(
+        self,
+        logits: torch.Tensor,
+        sampling: SamplingTensors,
+        step: int,
+    ) -> torch.Tensor:
+        tensors = SamplingTensors(
+            temperatures=sampling.temperatures,
+            top_ps=sampling.top_ps,
+            top_ks=sampling.top_ks,
+            seeds=sampling.seeds,
+            offsets=sampling.offsets + step * SAMPLING_OFFSET_STRIDE,
+            stochastic_mask=sampling.stochastic_mask,
+        )
+        return self._sampler.sample_tensors(logits.float(), tensors)
+
+    def _graph_specs(self) -> tuple[GraphAttentionSpec, ...]:
+        target = self.config.full_layer_count
+        if not self.speculative_tokens:
+            return (GraphAttentionSpec(0, target, 1, 1),)
+        width = self.speculative_tokens + 1
+        return (
+            GraphAttentionSpec(0, target, 1, 1),
+            *(
+                GraphAttentionSpec(2, 1, 1, step + 1)
+                for step in range(self.speculative_tokens)
+            ),
+            *(GraphAttentionSpec(0, target, 1, step + 2) for step in range(width)),
+            GraphAttentionSpec(2, 1, width, width + 1),
+        )
+
+    def _graph_attention_for(self, shape: GraphShape) -> GraphPagedAttentionRuntime:
+        runtime = self._graph_attention.get(shape)
+        if runtime is None:
+            cache = self._graph_device_caches.get(shape)
+            if cache is None:
+                cache = self._cache.graph_cache(*shape)
+                self._graph_device_caches[shape] = cache
+            runtime = GraphPagedAttentionRuntime(
+                self.device,
+                cache,
+                self._graph_specs(),
+                num_attention_heads=self.config.num_attention_heads,
+                num_key_value_heads=self.config.num_key_value_heads,
+                head_dim=self.config.head_dim,
+                workspace=self._graph_workspace,
+            )
+            self._graph_attention[shape] = runtime
+        return runtime
+
+    def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
+        batch_size, graph_seq_len = shape
+        attention = self._graph_attention_for(shape)
+        cache = self._graph_device_caches[shape]
+        token_ids = torch.empty(batch_size, dtype=torch.long, device=self.device)
+        positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
+        sampling = self._sampler.empty(batch_size, self.device)
+        output_width = 2 * self.speculative_tokens + 2 if self.speculative_tokens else 1
+        output_ids = torch.empty(
+            (batch_size, output_width), dtype=torch.long, device=self.device
+        )
+
+        def ordinary_launch() -> None:
+            attention.reset()
+            recurrent, convolution, _ = self._initial_state(cache, positions)
+            hidden, recurrent, convolution = self._model.language_model(
+                token_ids[:, None],
+                positions[:, None],
+                cache=cache,
+                recurrent_states=recurrent,
+                convolution_states=convolution,
+                sequence_lengths=positions + 1,
+                max_sequence_length=graph_seq_len,
+                attention_runtime=attention,
+            )
+            self._store_state(cache, positions, recurrent, convolution, hidden[:, -1])
+            output_ids[:, 0].copy_(
+                self._graph_sample(self._model.logits(hidden[:, -1]), sampling, 0)
+            )
+
+        def speculative_launch() -> None:
+            attention.reset()
+            recurrent, convolution, _ = self._initial_state(cache, positions)
+            anchor_hidden, recurrent, convolution = self._model.language_model(
+                token_ids[:, None],
+                positions[:, None],
+                cache=cache,
+                recurrent_states=recurrent,
+                convolution_states=convolution,
+                sequence_lengths=positions + 1,
+                max_sequence_length=graph_seq_len,
+                attention_runtime=attention,
+            )
+            first = self._graph_sample(
+                self._model.logits(anchor_hidden[:, -1]), sampling, 0
+            )
+
+            draft_columns = []
+            draft_input = first
+            draft_hidden = anchor_hidden[:, -1:]
+            for step in range(self.speculative_tokens):
+                draft_position = positions + step
+                draft_hidden = self._mtp_forward(
+                    cache,
+                    draft_input[:, None],
+                    draft_hidden,
+                    draft_position[:, None],
+                    attention_runtime=attention,
+                    max_sequence_length=graph_seq_len,
+                )
+                draft_input = self._graph_sample(
+                    self._model.logits(draft_hidden[:, -1]), sampling, step + 1
+                )
+                draft_columns.append(draft_input)
+            drafts = torch.stack(draft_columns, dim=1)
+            verify_ids = torch.cat((first[:, None], drafts), dim=1)
+
+            active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
+            selected_recurrent = recurrent
+            selected_convolution = convolution
+            selected_hidden = anchor_hidden[:, -1]
+            verify_hidden = []
+            target_columns = []
+            work_recurrent = recurrent
+            work_convolution = convolution
+            for step in range(self.speculative_tokens + 1):
+                verify_position = positions + step + 1
+                hidden, work_recurrent, work_convolution = self._model.language_model(
+                    verify_ids[:, step : step + 1],
+                    verify_position[:, None],
+                    cache=cache,
+                    recurrent_states=work_recurrent,
+                    convolution_states=work_convolution,
+                    sequence_lengths=verify_position + 1,
+                    max_sequence_length=graph_seq_len,
+                    attention_runtime=attention,
+                )
+                current_hidden = hidden[:, -1]
+                selected_recurrent = torch.where(
+                    active[:, None, None, None, None],
+                    work_recurrent,
+                    selected_recurrent,
+                )
+                selected_convolution = torch.where(
+                    active[:, None, None, None],
+                    work_convolution,
+                    selected_convolution,
+                )
+                selected_hidden = torch.where(
+                    active[:, None], current_hidden, selected_hidden
+                )
+                verify_hidden.append(current_hidden)
+                target = self._graph_sample(
+                    self._model.logits(current_hidden), sampling, step + 1
+                )
+                target_columns.append(target)
+                if step < self.speculative_tokens:
+                    active = active & (drafts[:, step] == target)
+            targets = torch.stack(target_columns, dim=1)
+            matches = drafts == targets[:, : self.speculative_tokens]
+            accepted = torch.cumprod(matches.to(torch.int64), dim=1).sum(1)
+            processed = accepted + 1
+
+            repair_ids = torch.cat((drafts, targets[:, -1:]), dim=1)
+            correction = targets.gather(1, accepted[:, None])
+            repair_ids = repair_ids.scatter(1, accepted[:, None], correction)
+            repair_positions = positions[:, None] + torch.arange(
+                1,
+                self.speculative_tokens + 2,
+                dtype=torch.long,
+                device=self.device,
+            )
+            self._mtp_forward(
+                cache,
+                repair_ids,
+                torch.stack(verify_hidden, dim=1),
+                repair_positions,
+                attention_runtime=attention,
+                max_sequence_length=graph_seq_len,
+            )
+            self._store_state(
+                cache,
+                positions + processed,
+                selected_recurrent,
+                selected_convolution,
+                selected_hidden,
+            )
+            output_ids[:, 0].copy_(first)
+            output_ids[:, 1 : self.speculative_tokens + 1].copy_(drafts)
+            output_ids[:, self.speculative_tokens + 1 :].copy_(targets)
+
+        launch = speculative_launch if self.speculative_tokens else ordinary_launch
+        inputs = {"token_ids": token_ids, "positions": positions}
+        inputs.update(self._cache.graph_device_inputs(cache))
+        inputs.update(attention.graph_inputs())
+        inputs.update(self._sampler.graph_inputs(sampling))
+        return CudaGraphStep(
+            inputs=inputs,
+            output=output_ids,
+            launch=launch,
+            prepare=attention.reset,
+            validate_eager_output=False,
+        )
+
+    def _graph_forward(
+        self, plan: BatchPlan, cache_plan: PagedCachePlan
+    ) -> list[int] | list[list[int]] | None:
+        if not self._graphs.shapes:
+            return None
+        batch_size = plan.num_sequences
+        required_length = int(plan.positions.max()) + self.speculative_tokens + 2
+        if not self.speculative_tokens:
+            required_length = int(plan.positions.max()) + 1
+        shape = self._graphs.match(
+            lambda candidate: (
+                candidate[0] >= batch_size and candidate[1] >= required_length
+            )
+        )
+        if shape is None:
+            self._graphs.fallback("shape")
+            return None
+        padding = shape[0] - batch_size
+        inputs: dict[str, object] = {
+            "token_ids": np.pad(plan.token_ids, (0, padding)),
+            "positions": np.pad(plan.positions, (0, padding), constant_values=1),
+        }
+        inputs.update(
+            self._cache.graph_plan_inputs(self._graph_device_caches[shape], cache_plan)
+        )
+        inputs.update(
+            self._graph_attention[shape].plan(cache_plan, np.asarray(plan.positions))
+        )
+        sampling_inputs = self._sampler.host_inputs(plan, self.vocab_size)
+        defaults = {
+            "sampling_temperatures": 1.0,
+            "sampling_top_ps": 1.0,
+            "sampling_top_ks": self.vocab_size,
+            "sampling_seeds": 0,
+            "sampling_offsets": 0,
+            "sampling_stochastic_mask": False,
+        }
+        for name, default in defaults.items():
+            sampling_inputs[name] = (
+                *sampling_inputs[name],
+                *((default,) * padding),
+            )
+        inputs.update(sampling_inputs)
+        output = self._graphs.run(shape, inputs)[:batch_size]
+        if not self.speculative_tokens:
+            return [int(row[0]) for row in output]
+        drafts = [row[1 : self.speculative_tokens + 1] for row in output]
+        targets = [row[self.speculative_tokens + 1 :] for row in output]
+        accepted = self._speculation.accept(drafts, targets)
+        return [
+            [int(row[0]), *tokens]
+            for row, tokens in zip(output, accepted.token_rows, strict=True)
+        ]
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
         rows = plan.num_sequences
@@ -284,6 +615,9 @@ class Qwen3_5CudaRunner(Runner):
         input_ids: torch.Tensor,
         previous_hidden: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        attention_runtime: object | None = None,
+        max_sequence_length: int | None = None,
     ) -> torch.Tensor:
         mtp = self._model.mtp
         if mtp is None:
@@ -291,6 +625,8 @@ class Qwen3_5CudaRunner(Runner):
         embeddings = self._model.language_model.embed_tokens(input_ids)
         rotary = self._model.language_model.rotary(positions, embeddings.dtype)
         sequence_lengths = positions[:, -1] + 1
+        if max_sequence_length is None:
+            max_sequence_length = int(sequence_lengths.max().item())
         return mtp(
             embeddings,
             previous_hidden,
@@ -298,8 +634,8 @@ class Qwen3_5CudaRunner(Runner):
             rotary=rotary,
             cache=cache,
             sequence_lengths=sequence_lengths,
-            max_sequence_length=int(sequence_lengths.max().item()),
-            attention_runtime=self._attention,
+            max_sequence_length=max_sequence_length,
+            attention_runtime=attention_runtime or self._attention,
         )
 
     def _prefill_mtp(
@@ -554,6 +890,10 @@ class Qwen3_5CudaRunner(Runner):
             plan, self.cache_layout, decode_lookahead=lookahead
         )
         with self._cuda_failure:
+            if plan.phase == BatchPhase.DECODE:
+                graph_output = self._graph_forward(plan, cache_plan)
+                if graph_output is not None:
+                    return graph_output
             staging = TensorStager(self.device)
             cache = self._cache.tensorize(cache_plan, staging)
             token_ids = staging.device("token_ids", plan.token_ids, torch.long)

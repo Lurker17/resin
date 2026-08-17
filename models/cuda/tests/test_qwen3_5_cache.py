@@ -76,3 +76,40 @@ def test_mixed_dtype_state_views_share_the_byte_arena() -> None:
     assert arena.recurrent_states[1, 0, 0, 0, 0, 0].item() == 7.0
     assert arena.convolution_states[1, 0, 0, 0, 0].item() == 3.0
     assert arena.target_hidden_states[1, 0, 0].item() == 5.0
+
+
+def test_graph_cache_uses_fixed_tables_and_null_capture_inputs() -> None:
+    values = _qwen38()
+    text = values["text_config"]  # type: ignore[assignment]
+    text.update(  # type: ignore[union-attr]
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        layer_types=[
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ],
+    )
+    config = Qwen35Config.from_hugging_face(values)
+    geometry = CacheGeometry.from_config(config, include_mtp=True)
+    arena = CacheArena(torch, torch.device("cpu"), geometry.layout(2), geometry)
+
+    cache = arena.graph_cache(batch_size=3, sequence_capacity=257)
+    assert [tuple(group.slab_ids.shape) for group in cache.groups] == [
+        (3, 3),
+        (3, 1),
+        (3, 3),
+    ]
+    inputs = arena.graph_shape_capture_inputs(3, 257)
+    assert len(inputs["cache.0.slabs"]) == 9
+    assert len(inputs["cache.1.slabs"]) == 3
+    assert set(inputs.values()) == {(0,) * 9, (0,) * 3}
