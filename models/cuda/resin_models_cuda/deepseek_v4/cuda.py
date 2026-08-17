@@ -35,7 +35,7 @@ from resin.backend.cuda.sampling import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import BatchView, PagedCachePlan
-from resin.backend.speculative import accept_speculative_tokens
+from resin.backend.speculative import SpeculativeStats
 from resin.protocols import Runner
 from resin_models_cuda.deepseek_v4.cache import (
     GRAPH_SCRATCH_PARENTS,
@@ -153,10 +153,7 @@ class DeepSeekV4CudaRunner(Runner):
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = 1
         self._sampler = FlashInferSampler(torch)
-        self._speculative_blocks = 0
-        self._speculative_drafts = 0
-        self._speculative_accepted = 0
-        self._speculative_emitted = 0
+        self._speculation = SpeculativeStats(speculative_tokens)
         decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
         if any(shape[0] > max_batch_size for shape in decode_graph_shapes):
             raise ValueError("CUDA graph batch capacity exceeds max_batch_size")
@@ -317,18 +314,7 @@ class DeepSeekV4CudaRunner(Runner):
 
     @property
     def speculative_stats(self) -> dict[str, int | float]:
-        acceptance = (
-            self._speculative_accepted / self._speculative_drafts
-            if self._speculative_drafts
-            else 0.0
-        )
-        return {
-            "blocks": self._speculative_blocks,
-            "drafts": self._speculative_drafts,
-            "accepted": self._speculative_accepted,
-            "emitted": self._speculative_emitted,
-            "acceptance_rate": acceptance,
-        }
+        return self._speculation.snapshot()
 
     @property
     def last_dspark_phase_ms(self) -> dict[str, float] | None:
@@ -657,8 +643,7 @@ class DeepSeekV4CudaRunner(Runner):
         positions: torch.Tensor,
         cache,
     ) -> list[list[int]]:
-        batch_size = len(draft_rows)
-        acceptance = accept_speculative_tokens(draft_rows, target_rows)
+        acceptance = self._speculation.accept(draft_rows, target_rows)
         processed_counts = torch.tensor(
             acceptance.processed_counts,
             dtype=torch.int32,
@@ -670,10 +655,6 @@ class DeepSeekV4CudaRunner(Runner):
             self.speculative_tokens + 1,
             cache=cache,
         )
-        self._speculative_blocks += batch_size
-        self._speculative_drafts += batch_size * self.speculative_tokens
-        self._speculative_accepted += sum(acceptance.accepted_counts)
-        self._speculative_emitted += sum(map(len, acceptance.token_rows))
         return acceptance.token_rows
 
     def _speculative_decode(

@@ -27,7 +27,7 @@ from resin.backend.cuda.sampling import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
-from resin.backend.speculative import accept_speculative_tokens
+from resin.backend.speculative import SpeculativeStats
 from resin.protocols import Runner
 from resin_models_cuda.inkling.cache import (
     PREFILL_CHUNK_SIZE,
@@ -132,10 +132,7 @@ class InklingCudaRunner(Runner):
         self.vocab_size = self.config.unpadded_vocab_size
         self.eos_token_id = self.config.eos_token_id
         self._sampler = FlashInferSampler(torch)
-        self._speculative_blocks = 0
-        self._speculative_drafts = 0
-        self._speculative_accepted = 0
-        self._speculative_emitted = 0
+        self._speculation = SpeculativeStats(speculative_tokens)
         self._graph_device_caches: dict[GraphShape, DeviceCache] = {}
         self._media_features: dict[int, tuple[InklingMedia, torch.Tensor]] = {}
 
@@ -224,18 +221,7 @@ class InklingCudaRunner(Runner):
 
     @property
     def speculative_stats(self) -> dict[str, int | float]:
-        rate = (
-            self._speculative_accepted / self._speculative_drafts
-            if self._speculative_drafts
-            else 0.0
-        )
-        return {
-            "blocks": self._speculative_blocks,
-            "drafts": self._speculative_drafts,
-            "accepted": self._speculative_accepted,
-            "emitted": self._speculative_emitted,
-            "acceptance_rate": rate,
-        }
+        return self._speculation.snapshot()
 
     def bind_resources(self, binding: ResourceBinding) -> None:
         if binding.cache_pool_id is None or binding.cache_layout is None:
@@ -375,17 +361,6 @@ class InklingCudaRunner(Runner):
             prepare=self._cache.reset_null,
         )
 
-    def _accept_speculative(
-        self, draft_rows: list[list[int]], target_rows: list[list[int]]
-    ) -> list[list[int]]:
-        acceptance = accept_speculative_tokens(draft_rows, target_rows)
-        batch_size = len(draft_rows)
-        self._speculative_blocks += batch_size
-        self._speculative_drafts += batch_size * self.speculative_tokens
-        self._speculative_accepted += sum(acceptance.accepted_counts)
-        self._speculative_emitted += sum(map(len, acceptance.token_rows))
-        return acceptance.token_rows
-
     def _graph_forward(self, plan: BatchPlan, cache_plan: Any):
         if not self._graphs.shapes:
             return None
@@ -426,10 +401,10 @@ class InklingCudaRunner(Runner):
         if not self.speculative_tokens:
             return [row[0] for row in output]
         width = self.speculative_tokens
-        return self._accept_speculative(
+        return self._speculation.accept(
             [row[:width] for row in output],
             [row[width:] for row in output],
-        )
+        ).token_rows
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
         rows = plan.num_sequences
@@ -647,7 +622,7 @@ class InklingCudaRunner(Runner):
             ],
             dim=1,
         )
-        acceptance = accept_speculative_tokens(drafts.tolist(), targets.tolist())
+        acceptance = self._speculation.accept(drafts.tolist(), targets.tolist())
         processed = torch.tensor(
             [count + 1 for count in acceptance.accepted_counts],
             dtype=torch.long,
@@ -661,7 +636,7 @@ class InklingCudaRunner(Runner):
         )
         self._store_state(cache, positions + processed - 1, final_state)
         self._draft.inject_target(taps, verify_positions, cache)
-        return self._accept_speculative(drafts.tolist(), targets.tolist())
+        return acceptance.token_rows
 
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
         rows = self._validate_plan(plan)

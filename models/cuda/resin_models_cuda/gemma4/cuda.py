@@ -36,7 +36,7 @@ from resin.backend.cuda.sampling import (
 from resin.backend.loading import default_device
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import SAMPLING_OFFSET_STRIDE
-from resin.backend.speculative import accept_speculative_tokens
+from resin.backend.speculative import SpeculativeStats
 from resin.protocols import Runner
 from resin_models_cuda.gemma4.assistant_checkpoint import (
     DEFAULT_ASSISTANT,
@@ -240,10 +240,7 @@ class Gemma4CudaRunner(Runner):
                 )
             if assistant_config.vocab_size != self.config.vocab_size:
                 raise ValueError("assistant vocabulary does not match Gemma 4 target")
-        self._speculative_blocks = 0
-        self._speculative_drafts = 0
-        self._speculative_accepted = 0
-        self._speculative_emitted = 0
+        self._speculation = SpeculativeStats(speculative_tokens)
         self._graph_attention: dict[GraphShape, tuple[Any, Any]] = {}
         self._graph_spec_attention: dict[GraphShape, tuple[Any, Any, Any, Any]] = {}
         self._graph_verify_hidden: dict[GraphShape, Tensor] = {}
@@ -343,19 +340,7 @@ class Gemma4CudaRunner(Runner):
 
     @property
     def speculative_stats(self) -> dict[str, int | float]:
-        acceptance_rate = (
-            self._speculative_accepted / self._speculative_drafts
-            if self._speculative_drafts
-            else 0.0
-        )
-        return {
-            "draft_tokens": self.speculative_tokens,
-            "blocks": self._speculative_blocks,
-            "drafts": self._speculative_drafts,
-            "accepted": self._speculative_accepted,
-            "emitted": self._speculative_emitted,
-            "acceptance_rate": acceptance_rate,
-        }
+        return self._speculation.snapshot(include_draft_tokens=True)
 
     @property
     def cuda_graph_stats(self) -> CudaGraphStats:
@@ -1553,17 +1538,13 @@ class Gemma4CudaRunner(Runner):
         target_rows: list[list[int]],
         verify_hidden: Tensor,
     ) -> list[list[int]]:
-        acceptance = accept_speculative_tokens(draft_rows, target_rows)
+        acceptance = self._speculation.accept(draft_rows, target_rows)
         for row, (sequence_id, accepted) in enumerate(
             zip(sequence_ids, acceptance.accepted_counts, strict=True)
         ):
             self._target_hidden[sequence_id] = (
                 verify_hidden[row, accepted].detach().clone()
             )
-        self._speculative_blocks += len(sequence_ids)
-        self._speculative_drafts += len(sequence_ids) * self.speculative_tokens
-        self._speculative_accepted += sum(acceptance.accepted_counts)
-        self._speculative_emitted += sum(map(len, acceptance.token_rows))
         return acceptance.token_rows
 
     def _speculative_decode(

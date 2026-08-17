@@ -20,6 +20,45 @@ class SpeculativeAcceptance:
         return [count + 1 for count in self.accepted_counts]
 
 
+@dataclass(slots=True)
+class SpeculativeStats:
+    """Mutable acceptance counters shared by speculative model runners."""
+
+    draft_tokens: int
+    blocks: int = 0
+    drafts: int = 0
+    accepted: int = 0
+    emitted: int = 0
+
+    def __post_init__(self) -> None:
+        if self.draft_tokens < 0:
+            raise ValueError("draft_tokens cannot be negative")
+
+    def accept(
+        self,
+        draft_rows: Sequence[Sequence[int]],
+        target_rows: Sequence[Sequence[int]],
+    ) -> SpeculativeAcceptance:
+        acceptance = accept_speculative_tokens(draft_rows, target_rows)
+        self.blocks += len(draft_rows)
+        self.drafts += sum(map(len, draft_rows))
+        self.accepted += sum(acceptance.accepted_counts)
+        self.emitted += sum(map(len, acceptance.token_rows))
+        return acceptance
+
+    def snapshot(self, *, include_draft_tokens: bool = False) -> dict[str, int | float]:
+        values: dict[str, int | float] = {
+            "blocks": self.blocks,
+            "drafts": self.drafts,
+            "accepted": self.accepted,
+            "emitted": self.emitted,
+            "acceptance_rate": self.accepted / self.drafts if self.drafts else 0.0,
+        }
+        if include_draft_tokens:
+            values = {"draft_tokens": self.draft_tokens, **values}
+        return values
+
+
 def accept_speculative_tokens(
     draft_rows: Sequence[Sequence[int]],
     target_rows: Sequence[Sequence[int]],
@@ -49,4 +88,4 @@ def accept_speculative_tokens(
     return SpeculativeAcceptance(token_rows, accepted_counts)
 
 
-__all__ = ["SpeculativeAcceptance", "accept_speculative_tokens"]
+__all__ = ["SpeculativeAcceptance", "SpeculativeStats", "accept_speculative_tokens"]

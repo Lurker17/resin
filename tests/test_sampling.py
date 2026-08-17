@@ -7,7 +7,7 @@ import resin
 from resin import BatchPlan, Engine, SamplingParams
 from resin.backend.cuda.sampling import FlashInferSampler, SamplingTensors
 from resin.backend.sampling import TorchSampler, batch_sampling_inputs
-from resin.backend.speculative import accept_speculative_tokens
+from resin.backend.speculative import SpeculativeStats, accept_speculative_tokens
 
 
 class RecordingRunner:
@@ -29,6 +29,20 @@ class TestSamplingContract:
         assert acceptance.token_rows == [[10, 11, 13], [31]]
         assert acceptance.accepted_counts == [2, 0]
         assert acceptance.processed_counts == [3, 1]
+
+    def test_speculative_stats_own_shared_runner_bookkeeping(self) -> None:
+        stats = SpeculativeStats(3)
+        acceptance = stats.accept([[10, 11, 12]], [[10, 21, 22, 23]])
+
+        assert acceptance.token_rows == [[10, 21]]
+        assert stats.snapshot(include_draft_tokens=True) == {
+            "draft_tokens": 3,
+            "blocks": 1,
+            "drafts": 3,
+            "accepted": 1,
+            "emitted": 2,
+            "acceptance_rate": 1 / 3,
+        }
 
     def test_sampling_params_validate_defaults_and_preserve_extra_identity(
         self,
