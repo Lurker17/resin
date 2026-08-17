@@ -407,7 +407,19 @@ class Qwen35TextModel(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def rotary(self, positions: Tensor, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        frequencies = positions.float().unsqueeze(-1) * self.inv_freq
+        if positions.ndim == 2:
+            frequencies = positions.float().unsqueeze(-1) * self.inv_freq
+        elif positions.ndim == 3 and positions.shape[0] == 3:
+            section = self.config.mrope_section
+            if section is None:
+                raise ValueError("3-D Qwen positions require mrope_section")
+            axes = positions.float().unsqueeze(-1) * self.inv_freq
+            frequencies = axes[0].clone()
+            for dimension, offset in enumerate((1, 2), start=1):
+                indices = slice(offset, section[dimension] * 3, 3)
+                frequencies[..., indices] = axes[dimension, ..., indices]
+        else:
+            raise ValueError("Qwen positions must have shape [B, T] or [3, B, T]")
         embeddings = torch.cat((frequencies, frequencies), dim=-1)
         return embeddings.cos().to(dtype), embeddings.sin().to(dtype)
 
@@ -439,6 +451,7 @@ class Qwen35TextModel(nn.Module):
         max_sequence_length: int | None = None,
         input_embeddings: Tensor | None = None,
         attention_runtime: PagedAttentionRuntime | None = None,
+        rotary_positions: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         hidden = (
             self.embed_tokens(token_ids)
@@ -449,7 +462,10 @@ class Qwen35TextModel(nn.Module):
             sequence_lengths = positions[:, -1] + 1
         if max_sequence_length is None:
             max_sequence_length = int(sequence_lengths.max().item())
-        cos, sin = self.rotary(positions, hidden.dtype)
+        cos, sin = self.rotary(
+            positions if rotary_positions is None else rotary_positions,
+            hidden.dtype,
+        )
         attention = (
             attention_runtime.prepare(
                 cache,
@@ -506,9 +522,23 @@ class Qwen35TextModel(nn.Module):
 
 
 class _Qwen35Backbone(nn.Module):
-    def __init__(self, config: Qwen35Config, *, quantized: bool = False) -> None:
+    def __init__(
+        self,
+        config: Qwen35Config,
+        *,
+        vision_config: dict | None = None,
+        quantized: bool = False,
+    ) -> None:
         super().__init__()
         self.language_model = Qwen35TextModel(config, quantized=quantized)
+        if vision_config is None:
+            self.visual = None
+        else:
+            from transformers import Qwen3_5VisionConfig, Qwen3_5VisionModel
+
+            self.visual = Qwen3_5VisionModel(
+                Qwen3_5VisionConfig.from_dict(vision_config)
+            )
 
 
 class Qwen35MTP(nn.Module):
@@ -592,11 +622,18 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
     """Text-only target whose parameter names match the public checkpoint."""
 
     def __init__(
-        self, config: Qwen35Config, *, include_mtp: bool, quantized: bool = False
+        self,
+        config: Qwen35Config,
+        *,
+        include_mtp: bool,
+        vision_config: dict | None = None,
+        quantized: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
-        self.model = _Qwen35Backbone(config, quantized=quantized)
+        self.model = _Qwen35Backbone(
+            config, vision_config=vision_config, quantized=quantized
+        )
         self.lm_head = _feed_forward(
             config.hidden_size, config.vocab_size, quantized=quantized
         )
@@ -605,6 +642,10 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
     @property
     def language_model(self) -> Qwen35TextModel:
         return self.model.language_model
+
+    @property
+    def visual(self) -> nn.Module | None:
+        return self.model.visual
 
     def logits(self, hidden: Tensor) -> Tensor:
         return self.lm_head(hidden)

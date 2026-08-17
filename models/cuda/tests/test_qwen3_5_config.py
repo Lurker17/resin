@@ -65,6 +65,15 @@ def test_qwen38_27b_geometry() -> None:
     config.require_mtp()
 
 
+def test_qwen38_accepts_interleaved_multimodal_rope_sections() -> None:
+    values = copy.deepcopy(_qwen38())
+    values["text_config"]["rope_parameters"]["mrope_section"] = [11, 11, 10]  # type: ignore[index]
+
+    config = Qwen35Config.from_hugging_face(values)
+
+    assert config.mrope_section == (11, 11, 10)
+
+
 def test_qwen38_is_the_pinned_family_default() -> None:
     assert DEFAULT_MODEL == "RadixArk/Qwen3.8-27B-NVFP4"
     assert DEFAULT_REVISION == "554ebba9b5f1b79dc11246341960360e6ef05ef4"

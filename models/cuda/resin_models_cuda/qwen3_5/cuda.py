@@ -48,6 +48,7 @@ from resin_models_cuda.qwen3_5.checkpoint import (
     load_model,
     resolve_model_path,
 )
+from resin_models_cuda.qwen3_5.media import Qwen35Media
 
 if TYPE_CHECKING:
     from resin import BatchPlan
@@ -129,7 +130,12 @@ class Qwen3_5CudaRunner(Runner):
             self.model_path,
             device=self.device,
             include_mtp=speculative_tokens > 0,
+            include_vision=True,
         )
+        self.image_token_id = self.raw_config.get("image_token_id")
+        vision_config = self.raw_config.get("vision_config") or {}
+        self.spatial_merge_size = int(vision_config.get("spatial_merge_size", 1))
+        self._media_features: dict[int, tuple[Qwen35Media, torch.Tensor]] = {}
         self.weight_quantization = (
             "modelopt-fp8-nvfp4" if is_modelopt_nvfp4(self.raw_config) else "bfloat16"
         )
@@ -247,11 +253,107 @@ class Qwen3_5CudaRunner(Runner):
         self._cache.binding.bind_resources(binding)
 
     @staticmethod
+    def _media_at(plan: BatchPlan, row: int) -> Qwen35Media | None:
+        media = plan.media[row]
+        if media is None:
+            return None
+        if not isinstance(media, Qwen35Media):
+            raise TypeError("Qwen3_5CudaRunner media must be Qwen35Media")
+        return media
+
+    def _rope_deltas(self, plan: BatchPlan) -> torch.Tensor:
+        return torch.tensor(
+            [
+                media.rope_delta if (media := self._media_at(plan, row)) else 0
+                for row in range(plan.num_sequences)
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+    def _decode_rotary_positions(
+        self, plan: BatchPlan, positions: torch.Tensor
+    ) -> torch.Tensor:
+        adjusted = positions + self._rope_deltas(plan)
+        return adjusted[None, :, None].expand(3, -1, -1)
+
+    def _prefill_rotary_positions(
+        self,
+        media: Qwen35Media | None,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        if media is None:
+            return positions[None].expand(3, -1, -1)
+        columns = []
+        for position in positions[0].tolist():
+            absolute = int(position)
+            if absolute < len(media.token_ids):
+                columns.append(media.position_ids[:, absolute])
+            else:
+                columns.append(
+                    torch.full((3,), absolute + media.rope_delta, dtype=torch.int64)
+                )
+        return torch.stack(columns, dim=1).to(self.device)[:, None]
+
+    def _features_for(self, sequence_id: int, media: Qwen35Media) -> torch.Tensor:
+        existing = self._media_features.get(sequence_id)
+        if existing is not None:
+            if existing[0] is not media:
+                raise ValueError("a live Qwen sequence changed its media object")
+            return existing[1]
+        visual = self._model.visual
+        if visual is None:
+            raise RuntimeError("Qwen checkpoint did not load a visual tower")
+        with torch.inference_mode():
+            output = visual(
+                media.pixel_values.to(self.device, dtype=torch.bfloat16),
+                media.image_grid_thw.to(self.device),
+            )
+            features = output.pooler_output.detach()
+        if features.shape != (len(media.image_positions), self.config.hidden_size):
+            raise ValueError("Qwen vision features do not match image placeholders")
+        self._media_features[sequence_id] = (media, features)
+        return features
+
+    def _merge_media_embeddings(
+        self,
+        plan: BatchPlan,
+        row: int,
+        token_ids: torch.Tensor,
+        positions: torch.Tensor,
+        embeddings: torch.Tensor,
+    ) -> Qwen35Media | None:
+        media = self._media_at(plan, row)
+        if media is None:
+            return None
+        position_list = [int(position) for position in positions[0].tolist()]
+        for token_id, position in zip(
+            token_ids[0].tolist(), position_list, strict=True
+        ):
+            if (
+                position < len(media.token_ids)
+                and int(token_id) != media.token_ids[position]
+            ):
+                raise ValueError("scheduled token does not match Qwen35Media prompt")
+        feature_indices = {
+            position: index for index, position in enumerate(media.image_positions)
+        }
+        if not any(position in feature_indices for position in position_list):
+            return media
+        features = self._features_for(int(plan.sequence_ids[row]), media)
+        for query_index, position in enumerate(position_list):
+            feature_index = feature_indices.get(position)
+            if feature_index is not None:
+                embeddings[0, query_index].copy_(features[feature_index])
+        return media
+
+    @staticmethod
     def _capture_inputs(shape: GraphShape, vocab_size: int) -> dict[str, object]:
         batch_size, _ = shape
         return {
             "token_ids": (0,) * batch_size,
             "positions": (1,) * batch_size,
+            "rope_deltas": (0,) * batch_size,
             "sampling_temperatures": (1.0,) * batch_size,
             "sampling_top_ps": (1.0,) * batch_size,
             "sampling_top_ks": (vocab_size,) * batch_size,
@@ -335,6 +437,7 @@ class Qwen3_5CudaRunner(Runner):
         cache = self._graph_device_caches[shape]
         token_ids = torch.empty(batch_size, dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
+        rope_deltas = torch.empty(batch_size, dtype=torch.long, device=self.device)
         sampling = self._sampler.empty(batch_size, self.device)
         output_width = 2 * self.speculative_tokens + 2 if self.speculative_tokens else 1
         output_ids = torch.empty(
@@ -353,6 +456,9 @@ class Qwen3_5CudaRunner(Runner):
                 sequence_lengths=positions + 1,
                 max_sequence_length=graph_seq_len,
                 attention_runtime=attention,
+                rotary_positions=(positions + rope_deltas)[None, :, None].expand(
+                    3, -1, -1
+                ),
             )
             self._store_state(cache, positions, recurrent, convolution, hidden[:, -1])
             output_ids[:, 0].copy_(
@@ -371,6 +477,9 @@ class Qwen3_5CudaRunner(Runner):
                 sequence_lengths=positions + 1,
                 max_sequence_length=graph_seq_len,
                 attention_runtime=attention,
+                rotary_positions=(positions + rope_deltas)[None, :, None].expand(
+                    3, -1, -1
+                ),
             )
             first = self._graph_sample(
                 self._model.logits(anchor_hidden[:, -1]), sampling, 0
@@ -388,6 +497,7 @@ class Qwen3_5CudaRunner(Runner):
                     draft_position[:, None],
                     attention_runtime=attention,
                     max_sequence_length=graph_seq_len,
+                    rope_deltas=rope_deltas,
                 )
                 draft_input = self._graph_sample(
                     self._model.logits(draft_hidden[:, -1]), sampling, step + 1
@@ -415,6 +525,9 @@ class Qwen3_5CudaRunner(Runner):
                     sequence_lengths=verify_position + 1,
                     max_sequence_length=graph_seq_len,
                     attention_runtime=attention,
+                    rotary_positions=(verify_position + rope_deltas)[
+                        None, :, None
+                    ].expand(3, -1, -1),
                 )
                 current_hidden = hidden[:, -1]
                 selected_recurrent = torch.where(
@@ -458,6 +571,7 @@ class Qwen3_5CudaRunner(Runner):
                 repair_positions,
                 attention_runtime=attention,
                 max_sequence_length=graph_seq_len,
+                rope_deltas=rope_deltas,
             )
             self._store_state(
                 cache,
@@ -471,7 +585,11 @@ class Qwen3_5CudaRunner(Runner):
             output_ids[:, self.speculative_tokens + 1 :].copy_(targets)
 
         launch = speculative_launch if self.speculative_tokens else ordinary_launch
-        inputs = {"token_ids": token_ids, "positions": positions}
+        inputs = {
+            "token_ids": token_ids,
+            "positions": positions,
+            "rope_deltas": rope_deltas,
+        }
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(attention.graph_inputs())
         inputs.update(self._sampler.graph_inputs(sampling))
@@ -504,6 +622,7 @@ class Qwen3_5CudaRunner(Runner):
         inputs: dict[str, object] = {
             "token_ids": np.pad(plan.token_ids, (0, padding)),
             "positions": np.pad(plan.positions, (0, padding), constant_values=1),
+            "rope_deltas": np.pad(self._rope_deltas(plan).cpu().numpy(), (0, padding)),
         }
         inputs.update(
             self._cache.graph_plan_inputs(self._graph_device_caches[shape], cache_plan)
@@ -618,12 +737,23 @@ class Qwen3_5CudaRunner(Runner):
         *,
         attention_runtime: object | None = None,
         max_sequence_length: int | None = None,
+        rope_deltas: torch.Tensor | None = None,
+        rotary_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         mtp = self._model.mtp
         if mtp is None:
             raise RuntimeError("Qwen3.5 MTP was not loaded")
         embeddings = self._model.language_model.embed_tokens(input_ids)
-        rotary = self._model.language_model.rotary(positions, embeddings.dtype)
+        selected_rotary_positions = positions
+        if rotary_positions is not None:
+            selected_rotary_positions = rotary_positions
+        elif rope_deltas is not None:
+            selected_rotary_positions = (positions + rope_deltas[:, None])[None].expand(
+                3, -1, -1
+            )
+        rotary = self._model.language_model.rotary(
+            selected_rotary_positions, embeddings.dtype
+        )
         sequence_lengths = positions[:, -1] + 1
         if max_sequence_length is None:
             max_sequence_length = int(sequence_lengths.max().item())
@@ -647,6 +777,7 @@ class Qwen3_5CudaRunner(Runner):
         previous_hidden: torch.Tensor,
         context: int,
         sampled_token: torch.Tensor | None,
+        media: Qwen35Media | None,
     ) -> None:
         if self._model.mtp is None:
             return
@@ -656,6 +787,9 @@ class Qwen3_5CudaRunner(Runner):
                 token_ids[:, :1],
                 previous_hidden[:, None],
                 positions[:, :1] - 1,
+                rotary_positions=self._prefill_rotary_positions(
+                    media, positions[:, :1] - 1
+                ),
             )
         if token_ids.shape[1] > 1:
             self._mtp_forward(
@@ -663,6 +797,9 @@ class Qwen3_5CudaRunner(Runner):
                 token_ids[:, 1:],
                 target_hidden[:, :-1],
                 positions[:, :-1],
+                rotary_positions=self._prefill_rotary_positions(
+                    media, positions[:, :-1]
+                ),
             )
         if sampled_token is not None:
             self._mtp_forward(
@@ -670,6 +807,9 @@ class Qwen3_5CudaRunner(Runner):
                 sampled_token[:, None],
                 target_hidden[:, -1:],
                 positions[:, -1:],
+                rotary_positions=self._prefill_rotary_positions(
+                    media, positions[:, -1:]
+                ),
             )
 
     def _prefill(
@@ -692,6 +832,10 @@ class Qwen3_5CudaRunner(Runner):
             recurrent, convolution, previous_hidden = self._initial_state(
                 row_cache, contexts
             )
+            embeddings = self._model.language_model.embed_tokens(row_ids)
+            media = self._merge_media_embeddings(
+                plan, row, row_ids, row_positions, embeddings
+            )
             hidden, recurrent, convolution = self._model.language_model(
                 row_ids,
                 row_positions,
@@ -701,6 +845,8 @@ class Qwen3_5CudaRunner(Runner):
                 sequence_lengths=row_positions[:, -1] + 1,
                 max_sequence_length=context + end - start,
                 attention_runtime=self._attention,
+                input_embeddings=embeddings,
+                rotary_positions=self._prefill_rotary_positions(media, row_positions),
             )
             final_logits.append(self._model.logits(hidden[:, -1]))
             states.append(
@@ -728,6 +874,7 @@ class Qwen3_5CudaRunner(Runner):
                 context,
             ) = state
             sampled_token = sampled[row : row + 1] if plan.sampling_mask[row] else None
+            media = self._media_at(plan, row)
             self._prefill_mtp(
                 row_cache,
                 row_ids,
@@ -736,6 +883,7 @@ class Qwen3_5CudaRunner(Runner):
                 previous_hidden,
                 context,
                 sampled_token,
+                media,
             )
             self._store_state(
                 row_cache,
@@ -767,6 +915,7 @@ class Qwen3_5CudaRunner(Runner):
             sequence_lengths=positions + 1,
             max_sequence_length=int(positions.max().item()) + 1,
             attention_runtime=self._attention,
+            rotary_positions=self._decode_rotary_positions(plan, positions),
         )
         self._store_state(cache, positions, recurrent, convolution, hidden[:, -1])
         return self._sample(self._model.logits(hidden[:, -1]), plan).tolist()
@@ -781,6 +930,7 @@ class Qwen3_5CudaRunner(Runner):
         contexts = torch.as_tensor(
             plan.context_lengths, dtype=torch.long, device=self.device
         )
+        rope_deltas = self._rope_deltas(plan)
         initial_recurrent, initial_convolution, _ = self._initial_state(cache, contexts)
         anchor_hidden, anchor_recurrent, anchor_convolution = (
             self._model.language_model(
@@ -792,6 +942,9 @@ class Qwen3_5CudaRunner(Runner):
                 sequence_lengths=positions + 1,
                 max_sequence_length=int(positions.max().item()) + 1,
                 attention_runtime=self._attention,
+                rotary_positions=(positions + rope_deltas)[None, :, None].expand(
+                    3, -1, -1
+                ),
             )
         )
         first = self._sample(self._model.logits(anchor_hidden[:, -1]), plan, 0)
@@ -806,6 +959,7 @@ class Qwen3_5CudaRunner(Runner):
                 draft_input[:, None],
                 draft_hidden,
                 draft_position[:, None],
+                rope_deltas=rope_deltas,
             )
             draft_input = self._sample(
                 self._model.logits(draft_hidden[:, -1]), plan, step + 1
@@ -827,6 +981,9 @@ class Qwen3_5CudaRunner(Runner):
                 sequence_lengths=verify_positions[:, -1] + 1,
                 max_sequence_length=int(verify_positions.max().item()) + 1,
                 attention_runtime=self._attention,
+                rotary_positions=(verify_positions + rope_deltas[:, None])[None].expand(
+                    3, -1, -1
+                ),
             )
         )
         verify_logits = self._model.logits(verify_hidden)
@@ -858,6 +1015,10 @@ class Qwen3_5CudaRunner(Runner):
                     max_sequence_length=int(verify_positions[row, processed - 1].item())
                     + 1,
                     attention_runtime=self._attention,
+                    rotary_positions=(
+                        verify_positions[row : row + 1, :processed]
+                        + rope_deltas[row : row + 1, None]
+                    )[None].expand(3, -1, -1),
                 )
             correction = targets[row, accepted : accepted + 1]
             repair_ids = torch.cat((draft_ids[row, :accepted], correction))[None]
@@ -867,6 +1028,7 @@ class Qwen3_5CudaRunner(Runner):
                 repair_ids,
                 committed_hidden[:, :processed],
                 repair_positions,
+                rope_deltas=rope_deltas[row : row + 1],
             )
             commit_position = positions[row : row + 1] + processed
             self._store_state(
@@ -908,6 +1070,12 @@ class Qwen3_5CudaRunner(Runner):
                 if self.speculative_tokens:
                     return self._speculative_decode(plan, cache, token_ids, positions)
                 return self._ordinary_decode(plan, cache, token_ids, positions)
+
+    def release(self, sequence_ids: list[int]) -> None:
+        """Release request-local image embeddings after Engine retirement."""
+
+        for sequence_id in sequence_ids:
+            self._media_features.pop(sequence_id, None)
 
 
 __all__ = ["Qwen3_5CudaRunner"]

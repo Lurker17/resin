@@ -26,6 +26,7 @@ class Qwen35Config:
     rms_norm_eps: float
     rope_theta: float
     partial_rotary_factor: float
+    mrope_section: tuple[int, int, int] | None
     layer_types: tuple[str, ...]
     mtp_num_hidden_layers: int
     mtp_use_dedicated_embeddings: bool
@@ -80,6 +81,11 @@ class Qwen35Config:
                     "partial_rotary_factor",
                     text.get("partial_rotary_factor", 1.0),
                 )
+            ),
+            mrope_section=(
+                tuple(int(section) for section in rope["mrope_section"])
+                if "mrope_section" in rope
+                else None
             ),
             layer_types=tuple(str(kind) for kind in text["layer_types"]),
             mtp_num_hidden_layers=int(text.get("mtp_num_hidden_layers", 0)),
@@ -139,6 +145,12 @@ class Qwen35Config:
         rotary_dim = self.rotary_dim
         if rotary_dim <= 0 or rotary_dim > self.head_dim or rotary_dim % 2:
             raise ValueError("partial rotary dimension must be positive and even")
+        if self.mrope_section is not None and (
+            len(self.mrope_section) != 3
+            or any(section <= 0 for section in self.mrope_section)
+            or sum(self.mrope_section) != rotary_dim // 2
+        ):
+            raise ValueError("mrope_section must partition half the rotary dimension")
         if self.rms_norm_eps <= 0 or self.rope_theta <= 0:
             raise ValueError("Qwen3.5 norm epsilon and RoPE theta must be positive")
 
@@ -170,7 +182,9 @@ class Qwen35Config:
     @property
     def full_layer_ids(self) -> tuple[int, ...]:
         return tuple(
-            index for index, kind in enumerate(self.layer_types) if kind == "full_attention"
+            index
+            for index, kind in enumerate(self.layer_types)
+            if kind == "full_attention"
         )
 
     @property

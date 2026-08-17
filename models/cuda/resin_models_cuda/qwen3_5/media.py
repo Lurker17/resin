@@ -1,0 +1,176 @@
+"""Prepared Qwen3.5 image inputs and multimodal rotary positions."""
+
+from __future__ import annotations
+
+import hashlib
+import itertools
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+import torch
+from torch import Tensor
+
+from resin.protocols import MediaTokenSpan
+
+
+def _owned_cpu_tensor(value: Any, name: str, *, ndim: int) -> Tensor:
+    tensor = value if isinstance(value, Tensor) else torch.as_tensor(value)
+    if tensor.device.type != "cpu":
+        raise ValueError(f"{name} must be CPU-resident")
+    if tensor.ndim != ndim:
+        raise ValueError(f"{name} must have rank {ndim}, got {tensor.ndim}")
+    return tensor.detach().contiguous().clone()
+
+
+def _mrope_positions(
+    token_types: tuple[int, ...],
+    image_grid_thw: Tensor,
+    *,
+    spatial_merge_size: int,
+) -> tuple[Tensor, int]:
+    positions = []
+    current = 0
+    image_index = 0
+    for token_type, values in itertools.groupby(token_types):
+        length = sum(1 for _ in values)
+        if token_type == 0:
+            positions.append(
+                torch.arange(current, current + length, dtype=torch.int64)
+                .view(1, -1)
+                .expand(3, -1)
+            )
+            current += length
+            continue
+        if token_type != 1 or image_index >= len(image_grid_thw):
+            raise ValueError("Qwen media token types do not match image grids")
+        grid_t, grid_h, grid_w = map(int, image_grid_thw[image_index])
+        image_index += 1
+        grid_h //= spatial_merge_size
+        grid_w //= spatial_merge_size
+        if min(grid_t, grid_h, grid_w) <= 0 or grid_t * grid_h * grid_w != length:
+            raise ValueError("Qwen image grid does not match its placeholder range")
+        temporal = torch.arange(grid_t, dtype=torch.int64) + current
+        height = torch.arange(grid_h, dtype=torch.int64) + current
+        width = torch.arange(grid_w, dtype=torch.int64) + current
+        axes = torch.meshgrid(temporal, height, width, indexing="ij")
+        positions.append(torch.stack(axes).reshape(3, -1))
+        current += max(grid_h, grid_w)
+    if image_index != len(image_grid_thw):
+        raise ValueError("Qwen image grids outnumber placeholder ranges")
+    result = torch.cat(positions, dim=1)
+    return result, int(result.max()) + 1 - len(token_types)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Qwen35Media:
+    """One rendered Qwen prompt plus its processor-owned image tensors."""
+
+    token_ids: tuple[int, ...]
+    image_positions: tuple[int, ...]
+    pixel_values: Tensor
+    image_grid_thw: Tensor
+    spatial_merge_size: int
+    image_token_id: int
+    position_ids: Tensor = field(init=False, repr=False)
+    rope_delta: int = field(init=False)
+    digest: str = field(init=False, repr=False)
+    cache_key: tuple[int, ...] = field(init=False, repr=False)
+    token_spans: tuple[MediaTokenSpan, ...] = field(init=False, default=())
+
+    def __post_init__(self) -> None:
+        token_ids = tuple(int(token) for token in self.token_ids)
+        image_positions = tuple(int(position) for position in self.image_positions)
+        if not token_ids or not image_positions:
+            raise ValueError("Qwen image media requires tokens and placeholders")
+        if any(
+            position < 0
+            or position >= len(token_ids)
+            or token_ids[position] != self.image_token_id
+            for position in image_positions
+        ):
+            raise ValueError("Qwen image placeholders do not match image token IDs")
+        pixels = _owned_cpu_tensor(self.pixel_values, "pixel_values", ndim=2).float()
+        grids = _owned_cpu_tensor(self.image_grid_thw, "image_grid_thw", ndim=2).to(
+            torch.int64
+        )
+        if grids.shape[1] != 3 or self.spatial_merge_size <= 0:
+            raise ValueError("Qwen image grids or spatial merge size are invalid")
+        token_types = [0] * len(token_ids)
+        for position in image_positions:
+            token_types[position] = 1
+        position_ids, rope_delta = _mrope_positions(
+            tuple(token_types),
+            grids,
+            spatial_merge_size=self.spatial_merge_size,
+        )
+        object.__setattr__(self, "token_ids", token_ids)
+        object.__setattr__(self, "image_positions", image_positions)
+        object.__setattr__(self, "pixel_values", pixels)
+        object.__setattr__(self, "image_grid_thw", grids)
+        object.__setattr__(self, "position_ids", position_ids)
+        object.__setattr__(self, "rope_delta", rope_delta)
+        digest = _media_digest(pixels, grids)
+        object.__setattr__(self, "digest", digest)
+        identity = list(token_ids)
+        salt = hashlib.shake_256(bytes.fromhex(digest)).digest(4 * len(image_positions))
+        for index, position in enumerate(image_positions):
+            identity[position] = int.from_bytes(
+                salt[index * 4 : index * 4 + 4], "little"
+            )
+        object.__setattr__(self, "cache_key", tuple(identity))
+
+    @classmethod
+    def from_rendered(
+        cls,
+        rendered: Any,
+        *,
+        spatial_merge_size: int,
+        image_token_id: int,
+    ) -> Qwen35Media:
+        data = rendered.multi_modal_data
+        if data is None or data.is_empty():
+            raise ValueError("rendered Qwen prompt contains no image data")
+        if set(data.mm_items) - {"image"} or set(data.mm_placeholders) - {"image"}:
+            raise ValueError("Qwen35Media currently supports image input only")
+        items = data.mm_items.get("image") or []
+        placeholders = data.mm_placeholders.get("image") or []
+        if len(items) != len(placeholders) or not items:
+            raise ValueError("Qwen image items and placeholders do not align")
+        pixels = []
+        grids = []
+        image_positions = []
+        for item, placeholder in zip(items, placeholders, strict=True):
+            pixels.append(torch.as_tensor(item["pixel_values"]))
+            grid = torch.as_tensor(item["image_grid_thw"])
+            grids.append(grid)
+            image_positions.extend(
+                range(
+                    int(placeholder.offset),
+                    int(placeholder.offset + placeholder.length),
+                )
+            )
+        return cls(
+            token_ids=tuple(rendered.token_ids),
+            image_positions=tuple(image_positions),
+            pixel_values=torch.cat(pixels, dim=0),
+            image_grid_thw=torch.cat(grids, dim=0),
+            spatial_merge_size=spatial_merge_size,
+            image_token_id=image_token_id,
+        )
+
+
+def _media_digest(pixel_values: Tensor, image_grid_thw: Tensor) -> str:
+    digest = hashlib.sha256(b"resin-qwen35-media-v1\0")
+    for name, tensor in (
+        ("pixel_values", pixel_values),
+        ("image_grid_thw", image_grid_thw),
+    ):
+        digest.update(name.encode())
+        digest.update(str(tensor.dtype).encode())
+        digest.update(np.asarray(tensor.shape, dtype=np.int64).tobytes())
+        digest.update(tensor.numpy().tobytes(order="C"))
+    return digest.hexdigest()
+
+
+__all__ = ["Qwen35Media"]

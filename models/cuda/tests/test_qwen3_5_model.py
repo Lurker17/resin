@@ -70,6 +70,48 @@ def test_delta_net_chunk_matches_recurrent_steps() -> None:
     torch.testing.assert_close(convolution, expected_convolution)
 
 
+def test_interleaved_mrope_selects_temporal_height_and_width_axes() -> None:
+    values = _qwen38()
+    text = values["text_config"]  # type: ignore[assignment]
+    text.update(  # type: ignore[union-attr]
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        partial_rotary_factor=1.0,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        layer_types=[
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ],
+    )
+    text["rope_parameters"] = {  # type: ignore[index]
+        "rope_type": "default",
+        "rope_theta": 10_000.0,
+        "partial_rotary_factor": 1.0,
+        "mrope_section": [1, 1, 2],
+    }
+    model = Qwen3_5ForConditionalGeneration(
+        Qwen35Config.from_hugging_face(values), include_mtp=False
+    ).language_model
+    positions = torch.tensor([[[2, 3]], [[5, 7]], [[11, 13]]])
+    cos, _ = model.rotary(positions, torch.float32)
+    axes = positions.float().unsqueeze(-1) * model.inv_freq
+    expected = axes[0].clone()
+    expected[..., 1] = axes[1, ..., 1]
+    expected[..., 2] = axes[2, ..., 2]
+
+    torch.testing.assert_close(cos[..., :4], expected.cos())
+
+
 def test_target_and_optional_mtp_names_match_checkpoint() -> None:
     model = Qwen3_5ForConditionalGeneration(_tiny_config(), include_mtp=True)
     names = set(model.state_dict())
@@ -81,6 +123,28 @@ def test_target_and_optional_mtp_names_match_checkpoint() -> None:
     assert "mtp.fc.weight" in names
     assert "mtp.layers.0.self_attn.q_proj.weight" in names
     assert not any("mtp.embed_tokens" in name for name in names)
+
+
+def test_optional_visual_tower_uses_checkpoint_names() -> None:
+    vision_config = {
+        "depth": 1,
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_heads": 2,
+        "out_hidden_size": 32,
+        "patch_size": 2,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+        "num_position_embeddings": 16,
+    }
+    model = Qwen3_5ForConditionalGeneration(
+        _tiny_config(), include_mtp=False, vision_config=vision_config
+    )
+    names = set(model.state_dict())
+
+    assert "model.visual.patch_embed.proj.weight" in names
+    assert "model.visual.blocks.0.attn.qkv.weight" in names
+    assert "model.visual.merger.linear_fc2.weight" in names
 
 
 def test_radixark_quantized_target_keeps_mtp_bfloat16() -> None:
@@ -185,3 +249,18 @@ def test_text_loader_ignores_vision_and_optionally_mtp() -> None:
         "model.language_model.embed_tokens.weight",
         "lm_head.weight",
     }
+
+
+def test_multimodal_loader_selects_visual_tensors() -> None:
+    target = {
+        "model.language_model.embed_tokens.weight": __file__,
+        "lm_head.weight": __file__,
+        "model.visual.blocks.0.attn.qkv.weight": __file__,
+    }
+    selected = _select_tensor_files(
+        target,  # type: ignore[arg-type]
+        set(target),
+        include_mtp=False,
+        include_vision=True,
+    )
+    assert set(selected) == set(target)

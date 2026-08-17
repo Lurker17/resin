@@ -1,4 +1,4 @@
-"""Resolve Qwen3.5-family checkpoints without loading their vision tower."""
+"""Resolve and stream Qwen3.5-family multimodal checkpoints."""
 
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ TOKENIZER_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
     "vocab.json",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
 )
 
 
@@ -76,7 +78,7 @@ def is_modelopt_nvfp4(raw_config: dict[str, Any]) -> bool:
 
 
 def build_meta_model(
-    raw_config: dict[str, Any], *, include_mtp: bool
+    raw_config: dict[str, Any], *, include_mtp: bool, include_vision: bool = False
 ) -> tuple[Qwen3_5ForConditionalGeneration, Qwen35Config]:
     config = Qwen35Config.from_hugging_face(raw_config)
     if include_mtp:
@@ -86,7 +88,10 @@ def build_meta_model(
         raise ValueError("unsupported Qwen3.5 checkpoint quantization contract")
     with use_default_dtype(torch.bfloat16), torch.device("meta"):
         model = Qwen3_5ForConditionalGeneration(
-            config, include_mtp=include_mtp, quantized=quantized
+            config,
+            include_mtp=include_mtp,
+            vision_config=raw_config.get("vision_config") if include_vision else None,
+            quantized=quantized,
         )
     return model, config
 
@@ -120,7 +125,11 @@ def _assign_tensor(
 
 
 def _select_tensor_files(
-    tensor_files: dict[str, Path], expected: set[str], *, include_mtp: bool
+    tensor_files: dict[str, Path],
+    expected: set[str],
+    *,
+    include_mtp: bool,
+    include_vision: bool = False,
 ) -> dict[str, Path]:
     checkpoint_scope = {
         key
@@ -128,6 +137,7 @@ def _select_tensor_files(
         if key.startswith("model.language_model.")
         or key.startswith("lm_head.")
         or (include_mtp and key.startswith("mtp."))
+        or (include_vision and key.startswith("model.visual."))
     }
     if missing := expected - checkpoint_scope:
         raise ValueError(f"checkpoint is missing tensors: {sorted(missing)[:8]}")
@@ -141,12 +151,15 @@ def load_model(
     *,
     device: str | torch.device,
     include_mtp: bool,
+    include_vision: bool = True,
 ) -> tuple[Qwen3_5ForConditionalGeneration, Qwen35Config, dict[str, Any]]:
-    """Stream the text target and, when selected, its bundled MTP weights."""
+    """Stream the target, visual tower, and optional bundled MTP weights."""
 
     root = Path(model_path).expanduser().resolve()
     raw_config = read_config(root)
-    model, config = build_meta_model(raw_config, include_mtp=include_mtp)
+    model, config = build_meta_model(
+        raw_config, include_mtp=include_mtp, include_vision=include_vision
+    )
     target = torch.device(device)
     if target.type != "cuda":
         raise ValueError("the Qwen3.5 CUDA runner can only load weights on CUDA")
@@ -157,11 +170,21 @@ def load_model(
         indexed_tensor_files(root, require_index=True),
         expected,
         include_mtp=include_mtp,
+        include_vision=include_vision,
     )
     with SafetensorReader() as reader:
         for key, path in tensor_files.items():
             _assign_tensor(model, key, reader.read(path, key), target)
     model.language_model.materialize_buffers(target)
+    if model.visual is not None:
+        rotary = model.visual.rotary_pos_emb
+        rotary.inv_freq = 1.0 / (
+            rotary.theta
+            ** (
+                torch.arange(0, rotary.dim, 2, dtype=torch.float32, device=target)
+                / rotary.dim
+            )
+        )
     model.eval()
     return model, config, raw_config
 
