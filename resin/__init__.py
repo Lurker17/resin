@@ -26,9 +26,7 @@ from resin.protocols import (
     ConversationCodec,
     MediaInput,
     MediaTokenSpan,
-    ResourceRunner,
     Runner,
-    SyncRunner,
 )
 
 __all__ = [
@@ -49,9 +47,7 @@ __all__ = [
     "SamplingParams",
     "SchedulerConfig",
     "TokenEvent",
-    "ResourceRunner",
     "Runner",
-    "SyncRunner",
     "__version__",
     "server",
 ]

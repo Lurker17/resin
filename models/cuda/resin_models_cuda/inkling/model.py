@@ -101,10 +101,6 @@ def _deinterleave_w13(weight: Tensor, *, up_first: bool) -> Tensor:
     return grouped.transpose(-3, -2).reshape_as(weight).contiguous()
 
 
-def interleaved_swiglu(projected: Tensor) -> Tensor:
-    return F.silu(projected[..., ::2]) * projected[..., 1::2]
-
-
 class DenseMlp(nn.Module):
     def __init__(self, hidden: int, intermediate: int) -> None:
         super().__init__()
@@ -801,6 +797,5 @@ __all__ = [
     "Router",
     "ShortConvolution",
     "SparseMlp",
-    "interleaved_swiglu",
     "select_convolution_state",
 ]

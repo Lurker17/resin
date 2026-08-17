@@ -36,7 +36,7 @@ from resin.backend.cuda.sampling import (
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import BatchView, PagedCachePlan
 from resin.backend.speculative import accept_speculative_tokens
-from resin.protocols import SyncRunner
+from resin.protocols import Runner
 from resin_models_cuda.deepseek_v4.cache import (
     GRAPH_SCRATCH_PARENTS,
     CacheArena,
@@ -63,7 +63,7 @@ def _default_dtype(dtype: Any) -> Iterator[None]:
         torch.set_default_dtype(previous)
 
 
-class DeepSeekV4CudaRunner(SyncRunner):
+class DeepSeekV4CudaRunner(Runner):
     """Dynamically batched runner over Resin's DeepSeek-V4 implementation."""
 
     def __init__(
@@ -748,9 +748,5 @@ class DeepSeekV4CudaRunner(SyncRunner):
         except BaseException:
             self._cuda_failure()
             raise
-
-    def release(self, sequence_ids: list[int]) -> None:
-        """Physical pages are retired by Engine after this callback returns."""
-
 
 __all__ = ["DeepSeekV4CudaRunner"]

@@ -53,7 +53,7 @@ from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.loading import default_device
-from resin.protocols import SyncRunner
+from resin.protocols import Runner
 from resin_models_cuda.gpt_oss.checkpoint import (
     DEFAULT_MODEL,
     load_model,
@@ -169,7 +169,7 @@ class _DeviceAttentionBatch:
     sliding: PagedKvTable
 
 
-class GptOssCudaRunner(SyncRunner):
+class GptOssCudaRunner(Runner):
     """GPT-OSS BF16 attention on FA4 over one flat native cache pool."""
 
     page_size = _PAGE_SIZE
@@ -843,11 +843,5 @@ class GptOssCudaRunner(SyncRunner):
         except BaseException:
             self._cuda_failure()
             raise
-
-    def release(self, sequence_ids: list[int]) -> None:
-        """Physical page reuse is entirely controlled by the native pool."""
-
-        del sequence_ids
-
 
 __all__ = ["GptOssCudaRunner"]

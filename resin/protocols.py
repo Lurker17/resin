@@ -9,16 +9,12 @@ from typing import (
     NamedTuple,
     NotRequired,
     Protocol,
-    TypeAlias,
     TypedDict,
     runtime_checkable,
 )
 
 if TYPE_CHECKING:
-    from resin._resin import BatchPlan, ResourceBinding, RunnerConfig
-
-
-RunnerOutput: TypeAlias = Sequence[int] | Sequence[Sequence[int]]
+    from resin._resin import BatchPlan
 
 
 class MediaTokenSpan(NamedTuple):
@@ -78,21 +74,12 @@ class ConversationCodec(Protocol):
     ) -> ResponseParser: ...
 
 
-class SyncRunner(Protocol):
-    """Runner which executes one Engine-owned immutable plan synchronously."""
+class Runner(Protocol):
+    """Execute one Engine-owned immutable plan synchronously."""
 
-    def forward(self, plan: BatchPlan) -> RunnerOutput: ...
-
-
-class ResourceRunner(Protocol):
-    """Optional persistent-resource declaration for a runner."""
-
-    runner_config: RunnerConfig
-
-    def bind_resources(self, binding: ResourceBinding) -> None: ...
-
-
-Runner: TypeAlias = SyncRunner
+    def forward(
+        self, plan: BatchPlan
+    ) -> Sequence[int] | Sequence[Sequence[int]]: ...
 
 __all__ = [
     "ConversationCodec",
@@ -100,9 +87,6 @@ __all__ = [
     "MediaTokenSpan",
     "ParserEvent",
     "RenderedPrompt",
-    "ResourceRunner",
     "ResponseParser",
     "Runner",
-    "RunnerOutput",
-    "SyncRunner",
 ]

@@ -28,7 +28,7 @@ from resin.backend.cuda.sampling import (
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
 from resin.backend.speculative import accept_speculative_tokens
-from resin.protocols import SyncRunner
+from resin.protocols import Runner
 from resin_models_cuda.inkling.cache import (
     PREFILL_CHUNK_SIZE,
     STATE_WIDTH_PER_LAYER,
@@ -64,7 +64,7 @@ def _default_dtype(dtype: Any) -> Iterator[None]:
         torch.set_default_dtype(previous)
 
 
-class InklingCudaRunner(SyncRunner):
+class InklingCudaRunner(Runner):
     """Inkling-Small NVFP4 runner with image input and DSpark speculation."""
 
     def __init__(

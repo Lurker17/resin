@@ -25,7 +25,7 @@ from resin.backend.cuda.paged_kv import PagedKvCsr
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import BatchView, CacheGroupView
-from resin.protocols import SyncRunner
+from resin.protocols import Runner
 from resin_models_cuda.lfm2.plan import CacheMetadata, build_cache_metadata
 from resin_models_torch.lfm2.reference import (
     DEFAULT_MODEL,
@@ -126,7 +126,7 @@ class _InPlaceRecurrentState:
         self._state.copy_(value)
 
 
-class Lfm2CudaRunner(SyncRunner):
+class Lfm2CudaRunner(Runner):
     """BF16 LFM2 runner with FA4 prefill and FlashInfer paged decode."""
 
     def __init__(

@@ -284,7 +284,6 @@ Top-level imports are limited to native control-plane types:
 ```python
 Engine
 Runner
-SyncRunner
 BatchPlan
 BatchPhase
 TokenEvent
@@ -293,7 +292,6 @@ SamplingParams
 SchedulerConfig
 RunnerConfig
 ResourceBinding
-ResourceRunner
 CacheGroupLayout
 CacheGroupFamily
 CacheLayout

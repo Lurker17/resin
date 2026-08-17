@@ -37,7 +37,7 @@ from resin.backend.loading import default_device
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import SAMPLING_OFFSET_STRIDE
 from resin.backend.speculative import accept_speculative_tokens
-from resin.protocols import SyncRunner
+from resin.protocols import Runner
 from resin_models_cuda.gemma4.assistant_checkpoint import (
     DEFAULT_ASSISTANT,
     load_assistant,
@@ -161,7 +161,7 @@ class _MediaFeatures:
     positions: dict[int, tuple[str, int]]
 
 
-class Gemma4CudaRunner(SyncRunner):
+class Gemma4CudaRunner(Runner):
     """Dynamic paged forward pass with FP8 KV and W4A16 NVFP4 MLPs."""
 
     page_size = PAGE_SIZE

@@ -18,7 +18,7 @@ from resin.backend.loading import (
 )
 from resin.backend.plans import plan_rows
 from resin.backend.sampling import TorchSampler
-from resin.protocols import SyncRunner
+from resin.protocols import Runner
 from resin_models_torch.lfm2.config import Lfm2Config
 from resin_models_torch.lfm2.model import Lfm2ForCausalLM, Lfm2State
 
@@ -65,7 +65,7 @@ def load_model(model_path: Path, *, device, dtype=None):
     return torch, model, config
 
 
-class Lfm2TorchRunner(SyncRunner):
+class Lfm2TorchRunner(Runner):
     """LFM2 runner consuming Rust-built integer-token batches."""
 
     runner_config = RunnerConfig(continuation_prefill=True)
