@@ -79,6 +79,8 @@ class Qwen3_5CudaRunner(Runner):
         self.device = torch.device(device or default_device(torch, require_cuda=True))
         if self.device.type != "cuda":
             raise RuntimeError("Qwen3_5CudaRunner requires CUDA")
+        if self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
         torch.cuda.set_device(self.device)
         if torch.cuda.get_device_capability(self.device)[0] < 9:
             raise RuntimeError("Qwen3_5CudaRunner requires Hopper or newer CUDA")

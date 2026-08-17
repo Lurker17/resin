@@ -23,6 +23,7 @@ def test_qwen_runner_uses_optional_bundled_mtp_and_engine_cache() -> None:
     assert "CacheGeometry.from_config" in source
     assert "cache_write_lookahead_tokens=lookahead" in source
     assert "self._model.mtp" in source
+    assert 'torch.device("cuda", torch.cuda.current_device())' in source
 
 
 def test_speculative_decode_capacity_includes_mtp_verification_lookahead() -> None:
