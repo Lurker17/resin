@@ -25,7 +25,7 @@ MODEL_PATH = Path(MODEL_MOUNT) / MODEL_REVISION
 DEFAULT_CONTEXT_LENGTH = 32_768
 DEFAULT_SPECULATIVE_TOKENS = 2
 MAX_RUNNING_REQUESTS = 32
-CUDA_GRAPH_BATCH_SIZES = (1, 2, 4, 8)
+CUDA_GRAPH_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
 MODEL_PATTERNS = (
     "config.json",
     "generation_config.json",
@@ -185,7 +185,7 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
         max_seq_len=context_length,
         max_batch_size=MAX_RUNNING_REQUESTS,
         speculative_tokens=speculative_tokens,
-        gpu_memory_utilization=0.80,
+        gpu_memory_utilization=0.70,
         kv_cache_dtype="fp8",
         cuda_graph_decode_shapes=tuple(
             (batch_size, context_length) for batch_size in CUDA_GRAPH_BATCH_SIZES
