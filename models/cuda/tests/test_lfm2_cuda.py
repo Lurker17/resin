@@ -98,3 +98,11 @@ def test_lfm2_has_no_separate_state_pool_route() -> None:
     assert "StatePool" not in source
     assert "state_slots" not in source
     assert "MappedStateArena" not in source
+
+
+def test_lfm2_uses_the_synchronous_runner_contract() -> None:
+    source = inspect.getsource(Lfm2CudaRunner)
+    assert "def forward(" in source
+    assert "def dispatch(" not in source
+    assert "def poll(" not in source
+    assert "CudaExecutor" not in source

@@ -20,11 +20,10 @@ from resin import (
     ResourceBinding,
     RunnerConfig,
 )
-from resin.backend.cuda.execution import CudaCompletion, CudaExecutor
 from resin.backend.cuda.paged_kv import PagedKvCsr
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
-from resin.protocols import AsyncRunner
+from resin.protocols import SyncRunner
 from resin_models_cuda.lfm2.plan import CacheMetadata, build_cache_metadata
 from resin_models_torch.lfm2.reference import (
     DEFAULT_MODEL,
@@ -38,6 +37,12 @@ if TYPE_CHECKING:
 
 
 _STATE_CHECKPOINT_TOKENS = 128
+
+
+class _PostAcceptCudaError(RuntimeError):
+    """Tell the Engine that launched CUDA work could not be quiesced."""
+
+    _resin_post_accept = True
 
 
 class _Lfm2CacheArena:
@@ -136,7 +141,7 @@ class _InPlaceRecurrentState:
         self._state.copy_(value)
 
 
-class Lfm2CudaRunner(AsyncRunner):
+class Lfm2CudaRunner(SyncRunner):
     """BF16 LFM2 runner with FA4 prefill and FlashInfer paged decode."""
 
     def __init__(
@@ -168,7 +173,7 @@ class Lfm2CudaRunner(AsyncRunner):
         self.max_pages = max_pages
         self.model_path = resolve_model_path(model, revision)
         # Persistent CUDA state is created on the same private stream used for
-        # every launch, so dispatch never needs an implicit default-stream handoff.
+        # every forward call, avoiding an implicit default-stream handoff.
         with torch.cuda.stream(self._stream):
             self._torch, self._model, self.config = load_model(
                 self.model_path, device=self.device
@@ -252,12 +257,6 @@ class Lfm2CudaRunner(AsyncRunner):
             self._decode = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
                 self._decode_workspace, "NHD"
             )
-        self._executor = CudaExecutor(
-            torch,
-            self.device,
-            self._stream,
-            resources=self._completion_resources,
-        )
 
     def bind_resources(self, binding: ResourceBinding) -> None:
         """Bind the unified physical arena to its Engine cache pool."""
@@ -613,62 +612,52 @@ class Lfm2CudaRunner(AsyncRunner):
         ephemeral.extend((hidden, logits))
         return output
 
-    def _completion_resources(self):
-        """Return the persistent CUDA objects one accepted launch must lease."""
+    def _synchronize_failed_forward(self) -> None:
+        """Make a failed launch quiescent or force the Engine to quarantine it."""
 
-        return (
-            self._torch,
-            self._flashinfer,
-            self._fa4,
-            self._model,
-            self._cache,
-            self._cache.storage,
-            self._cache.keys,
-            self._cache.values,
-            self._decode_workspace,
-            self._decode,
-            self._stream,
-        )
+        try:
+            self._stream.synchronize()
+        except BaseException as synchronization_error:
+            raise _PostAcceptCudaError(
+                "LFM2 execution failed after launch and its CUDA stream could "
+                "not be quiesced; resources must remain quarantined"
+            ) from synchronization_error
 
-    def dispatch(self, plan: BatchPlan):
-        """Enqueue one model step on the private stream and return its capsule."""
+    def forward(self, plan: BatchPlan) -> list[int]:
+        """Execute one immutable Engine plan to completion."""
 
-        if self._executor.inflight is not None:
-            raise RuntimeError("Lfm2CudaRunner already has an in-flight batch")
         cache_metadata = self._preflight_cache(plan)
         recurrent_rows = self._state_rows(plan)
-
         torch = self._torch
-
-        def launch(completion: CudaCompletion):
-            self._prepare_state_rows(recurrent_rows)
-            metadata = self._metadata(plan, cache_metadata, completion.staging)
-            completion.retain(metadata, recurrent_rows)
-            tokens = completion.staging.device("tokens", plan.token_ids, torch.long)
-            positions = completion.staging.device(
-                "positions", plan.positions, torch.long
-            )
-            final_indices = completion.staging.device(
-                "final_indices",
-                plan.token_indptr[1:] - 1,
-                torch.long,
-            )
-            completion.retain(tokens, positions, final_indices)
-            decode = self._plan_decode(plan, metadata)
-            return self._run_model(
-                plan,
-                tokens,
-                positions,
-                final_indices,
-                metadata,
-                decode,
-                recurrent_rows,
-                completion.ephemeral,
-            )
-
-        return self._executor.dispatch(plan, launch)
-
-    def poll(self, completion) -> list[int] | None:
-        """Return None while pending, then retire and return one token per row."""
-
-        return self._executor.poll(completion)
+        staging = TensorStager(self.device)
+        ephemeral = []
+        try:
+            with torch.cuda.stream(self._stream), torch.inference_mode():
+                self._prepare_state_rows(recurrent_rows)
+                metadata = self._metadata(plan, cache_metadata, staging)
+                ephemeral.extend((metadata, recurrent_rows))
+                tokens = staging.device("tokens", plan.token_ids, torch.long)
+                positions = staging.device("positions", plan.positions, torch.long)
+                final_indices = staging.device(
+                    "final_indices",
+                    plan.token_indptr[1:] - 1,
+                    torch.long,
+                )
+                ephemeral.extend((tokens, positions, final_indices))
+                decode = self._plan_decode(plan, metadata)
+                output = self._run_model(
+                    plan,
+                    tokens,
+                    positions,
+                    final_indices,
+                    metadata,
+                    decode,
+                    recurrent_rows,
+                    ephemeral,
+                )
+                ephemeral.append(output)
+            self._stream.synchronize()
+            return output.tolist()
+        except BaseException:
+            self._synchronize_failed_forward()
+            raise
