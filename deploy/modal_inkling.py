@@ -39,6 +39,14 @@ _http_server_processes: list[object] = []
 
 image = build_modal_image(
     ROOT,
+    cuda_source_ignore=(
+        "resin_models_cuda/deepseek_v4",
+        "resin_models_cuda/gemma4",
+        "resin_models_cuda/gpt_oss",
+        "resin_models_cuda/kimi_k25",
+        "resin_models_cuda/lfm2",
+        "resin_models_cuda/qwen3_5",
+    ),
     env={
         "TORCH_CUDA_ARCH_LIST": "10.3a",
         "FLASHINFER_CUDA_ARCH_LIST": "10.3a",

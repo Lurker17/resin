@@ -15,6 +15,7 @@ def build_modal_image(
     root: Path,
     *,
     env: dict[str, str] | None = None,
+    cuda_source_ignore: tuple[str, ...] = (),
 ) -> modal.Image:
     """Build the common CUDA image and install one deployment's source tree.
 
@@ -108,7 +109,7 @@ def build_modal_image(
             root / "models/cuda",
             f"{_SOURCE_ROOT}/models/cuda",
             copy=True,
-            ignore=["tests", "**/__pycache__"],
+            ignore=["tests", "**/__pycache__", *cuda_source_ignore],
         )
         .uv_pip_install(_SOURCE_ROOT, extra_options="--no-deps")
         .uv_pip_install(f"{_SOURCE_ROOT}/models/torch", extra_options="--no-deps")
