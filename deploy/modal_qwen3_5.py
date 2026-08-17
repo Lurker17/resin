@@ -136,7 +136,7 @@ def download_model() -> dict[str, Any]:
 
 def _build_runtime(*, context_length: int, speculative_tokens: int):
     import torch
-    from renderers import DefaultRendererConfig, create_renderer
+    from renderers import Qwen35RendererConfig, create_renderer
     from transformers import AutoTokenizer
 
     from resin import Engine, SchedulerConfig
@@ -150,11 +150,12 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
         max_batch_size=MAX_RUNNING_REQUESTS,
         speculative_tokens=speculative_tokens,
         gpu_memory_utilization=0.90,
+        kv_cache_dtype="fp8",
     )
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL_PATH, local_files_only=True, trust_remote_code=False
     )
-    renderer = create_renderer(tokenizer, DefaultRendererConfig())
+    renderer = create_renderer(tokenizer, Qwen35RendererConfig(enable_thinking=True))
     engine = Engine(
         runner,
         max_running_requests=MAX_RUNNING_REQUESTS,
@@ -175,6 +176,11 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
         "load_s": time.perf_counter() - started,
         "context_length": context_length,
         "speculative_tokens": speculative_tokens,
+        "reasoning_parser": "qwen3.5",
+        "tool_call_parser": "qwen3.5",
+        "weight_dtype": "bfloat16",
+        "kv_cache_dtype": runner.kv_cache_dtype,
+        "cuda_graphs": False,
         "cache": asdict(runner.cache_capacity_plan),
         "device": torch.cuda.get_device_name(runner.device),
         "capability": torch.cuda.get_device_capability(runner.device),
