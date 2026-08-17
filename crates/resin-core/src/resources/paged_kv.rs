@@ -87,10 +87,13 @@ impl PagedKvResources {
             let table = &state.groups()[group_index];
             for position in token_start..context {
                 let logical = position / group.block_tokens().get();
-                let index = match group.retention() {
-                    KvRetention::FullContext => logical as usize,
-                    KvRetention::SlidingWindow { .. } => logical as usize % table.pages().len(),
-                };
+                let index = page_index(group, table.pages().len(), logical).ok_or(
+                    CachePoolError::InsufficientCapacity {
+                        group: GroupId::new(group_index as u32),
+                        requested: logical as usize + 1,
+                        available: table.pages().len(),
+                    },
+                )?;
                 let page = &table.pages()[index];
                 if !page.is_writable() {
                     if group.retention() == KvRetention::FullContext && !group.is_recurrent() {
@@ -437,15 +440,21 @@ fn active_blocks(group: KvGroupLayout, post_length: u32) -> (u32, u32) {
 }
 
 fn page_for<R>(group: KvGroupLayout, pages: &[R], logical: u32) -> Option<&R> {
-    let index = if group.is_recurrent() {
-        logical as usize % pages.len()
-    } else {
-        match group.retention() {
-            KvRetention::FullContext => logical as usize,
-            KvRetention::SlidingWindow { .. } => logical as usize % pages.len(),
-        }
-    };
-    pages.get(index)
+    page_index(group, pages.len(), logical).and_then(|index| pages.get(index))
+}
+
+fn page_index(group: KvGroupLayout, page_count: usize, logical: u32) -> Option<usize> {
+    if page_count == 0 {
+        return None;
+    }
+    let logical = logical as usize;
+    let index =
+        if group.is_recurrent() || matches!(group.retention(), KvRetention::SlidingWindow { .. }) {
+            logical % page_count
+        } else {
+            logical
+        };
+    (index < page_count).then_some(index)
 }
 
 #[cfg(test)]
@@ -781,5 +790,36 @@ mod tests {
         assert_eq!(state.append_slotnums, vec![state.block_slotnums[1]]);
         resources.release(access.lease);
         resources.retire(second).unwrap();
+    }
+
+    #[test]
+    fn recurrent_context_wraps_across_the_third_logical_block() {
+        let layout = KvLayout::new(
+            2,
+            vec![
+                KvGroupLayout::new_with_family(
+                    128,
+                    6,
+                    KvRetention::FullContext,
+                    crate::resources::kv::KvGroupFamily::State,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::new(layout).unwrap();
+        let id = RequestId::new(NonZeroU64::new(1).unwrap());
+        let mut state = resources.attach(id, 0).unwrap();
+
+        resources.ensure_context(&mut state, 0, 257).unwrap();
+
+        assert_eq!(state.groups()[0].pages().len(), 2);
+        assert!(
+            state.groups()[0]
+                .pages()
+                .iter()
+                .all(|page| page.is_writable())
+        );
+        resources.retire(state).unwrap();
     }
 }
