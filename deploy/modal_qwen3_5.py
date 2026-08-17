@@ -108,6 +108,17 @@ def _require_model() -> dict[str, int]:
     return inventory
 
 
+def _kernel_inventory() -> dict[str, int]:
+    root = Path(KERNEL_MOUNT)
+    if not root.is_dir():
+        return {}
+    return {
+        str(path.relative_to(root)): path.stat().st_size
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
 @app.function(cpu=16, memory=32 * 1024, timeout=24 * 60 * 60)
 def download_model() -> dict[str, Any]:
     from huggingface_hub import snapshot_download
@@ -145,6 +156,7 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
     from resin_models_cuda.qwen3_5 import Qwen3_5CudaRunner
 
     inventory = _require_model()
+    kernel_files_before_load = _kernel_inventory()
     started = time.perf_counter()
     runner = Qwen3_5CudaRunner(
         MODEL_PATH,
@@ -170,6 +182,7 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
         prefix_cache=True,
     )
     torch.cuda.synchronize(runner.device)
+    kernel_files_after_load = _kernel_inventory()
     report = {
         "model": MODEL_ID,
         "revision": MODEL_REVISION,
@@ -187,8 +200,23 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
         "cache": asdict(runner.cache_capacity_plan),
         "device": torch.cuda.get_device_name(runner.device),
         "capability": torch.cuda.get_device_capability(runner.device),
+        "kernel_cache": {
+            "files_before_load": len(kernel_files_before_load),
+            "bytes_before_load": sum(kernel_files_before_load.values()),
+            "new_files_during_load": len(
+                kernel_files_after_load.keys() - kernel_files_before_load.keys()
+            ),
+        },
     }
-    return torch, runner, tokenizer, renderer, engine, report
+    return (
+        torch,
+        runner,
+        tokenizer,
+        renderer,
+        engine,
+        report,
+        kernel_files_after_load,
+    )
 
 
 def _prompt_ids(renderer: Any, prompt: str) -> list[int]:
@@ -216,7 +244,15 @@ def smoke_test(
 ) -> dict[str, Any]:
     from resin import SamplingParams
 
-    torch, runner, tokenizer, renderer, engine, report = _build_runtime(
+    (
+        torch,
+        runner,
+        tokenizer,
+        renderer,
+        engine,
+        report,
+        kernel_files_after_load,
+    ) = _build_runtime(
         context_length=context_length,
         speculative_tokens=speculative_tokens,
     )
@@ -232,13 +268,43 @@ def smoke_test(
             sampling_params=SamplingParams(temperature=0.0),
         )
         started = time.perf_counter()
+        step_durations = []
+        event_times = []
         while engine.has_work():
-            engine.step()
+            step_started = time.perf_counter()
+            events = engine.step()
+            event_at = time.perf_counter()
+            step_durations.append(event_at - step_started)
+            event_times.extend([event_at] * len(events))
         torch.cuda.synchronize(runner.device)
+        finished = time.perf_counter()
         output_ids = request.take_result()
+        first_token_s = event_times[0] - started if event_times else None
+        timed_tokens = max(0, len(event_times) - 1)
+        steady_s = event_times[-1] - event_times[0] if timed_tokens else 0.0
+        kernel_files_after_run = _kernel_inventory()
+        kernel_cache = report["kernel_cache"]
+        kernel_cache.update(
+            {
+                "files_after_run": len(kernel_files_after_run),
+                "bytes_after_run": sum(kernel_files_after_run.values()),
+                "new_files_during_run": len(
+                    kernel_files_after_run.keys() - kernel_files_after_load.keys()
+                ),
+            }
+        )
+        kernel_volume.commit()
+        kernel_cache["committed"] = True
         report.update(
             {
-                "elapsed_s": time.perf_counter() - started,
+                "elapsed_s": finished - started,
+                "ttft_s": first_token_s,
+                "tpot_s": steady_s / timed_tokens if timed_tokens else None,
+                "tokens_per_s": timed_tokens / steady_s if steady_s else None,
+                "engine_steps": len(step_durations),
+                "first_step_s": step_durations[0] if step_durations else None,
+                "max_step_s": max(step_durations, default=None),
+                "event_tokens": len(event_times),
                 "prompt_tokens": len(prompt_ids),
                 "output_tokens": len(output_ids),
                 "text": tokenizer.decode(output_ids, skip_special_tokens=True),
@@ -253,7 +319,7 @@ def smoke_test(
 def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
     from resin.server import HttpServer, RendererCodec
 
-    _, _, tokenizer, renderer, engine, _ = _build_runtime(
+    _, _, tokenizer, renderer, engine, _, _ = _build_runtime(
         context_length=context_length,
         speculative_tokens=speculative_tokens,
     )
