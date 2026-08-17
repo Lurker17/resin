@@ -60,7 +60,7 @@ class PagedAttentionRuntime:
         num_attention_heads: int,
         num_key_value_heads: int,
         head_dim: int,
-        workspace: Tensor,
+        workspace_bytes: int,
     ) -> None:
         from flashinfer import (
             BatchDecodeWithPagedKVCacheWrapper,
@@ -71,7 +71,7 @@ class PagedAttentionRuntime:
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
-        self.workspace = workspace
+        self.workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
         self.prefill = BatchPrefillWithPagedKVCacheWrapper(
             self.workspace, "NHD", backend="auto"
         )
@@ -198,7 +198,7 @@ class GraphPagedAttentionRuntime:
         num_attention_heads: int,
         num_key_value_heads: int,
         head_dim: int,
-        workspace_bytes: int,
+        workspace: Tensor,
     ) -> None:
         from flashinfer import (
             BatchDecodeWithPagedKVCacheWrapper,
@@ -212,7 +212,7 @@ class GraphPagedAttentionRuntime:
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
         self.softmax_scale = head_dim**-0.5
-        self.workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
+        self.workspace = workspace
         self._cursor = 0
         calls = []
         batch_size = cache.groups[0].slab_ids.shape[0]
