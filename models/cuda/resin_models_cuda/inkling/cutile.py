@@ -59,8 +59,9 @@ def _program_count(
     override: int | None,
     *,
     programs_per_sm: int = _PERSISTENT_OCCUPANCY,
-    work_count: int | None = None,
 ) -> int:
+    """Return a device-fixed persistent grid, independent of request geometry."""
+
     if override is not None:
         if isinstance(override, bool) or override <= 0:
             raise ValueError("persistent program count must be positive")
@@ -70,7 +71,7 @@ def _program_count(
         if index is None:
             index = torch.cuda.current_device()
         programs = programs_per_sm * _device_sm_count(tensor.device.type, index)
-    return programs if work_count is None else min(programs, work_count)
+    return programs
 
 
 @ct.kernel(occupancy=8)
@@ -301,7 +302,6 @@ def kv_sconv_norm_store(
         key_input,
         program_count,
         programs_per_sm=_KV_SCONV_PROGRAMS_PER_SM,
-        work_count=batch * kv_heads,
     )
     ct.launch(
         torch.cuda.current_stream(key_input.device),
@@ -444,7 +444,6 @@ def sconv_residual(
         inputs,
         program_count,
         programs_per_sm=_SCONV_PROGRAMS_PER_SM,
-        work_count=batch * (width // _VALUE_TILE),
     )
     ct.launch(
         torch.cuda.current_stream(inputs.device),
@@ -527,7 +526,6 @@ def dense_swiglu(
         projected,
         program_count,
         programs_per_sm=_DENSE_SWIGLU_PROGRAMS_PER_SM,
-        work_count=flat.shape[0] * (output.shape[1] // tile_size),
     )
     ct.launch(
         torch.cuda.current_stream(projected.device),
@@ -614,7 +612,6 @@ def select_convolution_state(
         initial,
         program_count,
         programs_per_sm=_STATE_SELECT_OCCUPANCY,
-        work_count=batch * layers * state_length * (width // _STATE_SELECT_TILE),
     )
     ct.launch(
         torch.cuda.current_stream(initial.device),
@@ -710,7 +707,6 @@ def shared_swiglu(
         projected,
         program_count,
         programs_per_sm=_SHARED_SWIGLU_PROGRAMS_PER_SM,
-        work_count=experts * rows * (width // tile_size),
     )
     ct.launch(
         torch.cuda.current_stream(projected.device),
@@ -788,7 +784,6 @@ def shared_reduce_add(
         shared,
         program_count,
         programs_per_sm=_SHARED_REDUCE_PROGRAMS_PER_SM,
-        work_count=rows * (width // tile_size),
     )
     ct.launch(
         torch.cuda.current_stream(shared.device),
@@ -910,7 +905,7 @@ def router_choice(
         dtype=torch.float32,
         device=logits.device,
     )
-    programs = _program_count(logits, program_count, work_count=logits.shape[0])
+    programs = _program_count(logits, program_count)
     ct.launch(
         torch.cuda.current_stream(logits.device),
         (programs,),
@@ -951,7 +946,7 @@ def router_weights(
     shared = torch.empty(
         (rows, shared_experts), dtype=torch.bfloat16, device=logits.device
     )
-    programs = _program_count(logits, program_count, work_count=rows)
+    programs = _program_count(logits, program_count)
     ct.launch(
         torch.cuda.current_stream(logits.device),
         (programs,),
