@@ -10,6 +10,7 @@ use std::sync::{
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{get, post},
 };
 use tokio::sync::mpsc;
@@ -70,7 +71,9 @@ pub fn router(
     if routes.enable_anthropic {
         router = router.route("/v1/messages", post(anthropic::messages));
     }
-    router.with_state(state)
+    router
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+        .with_state(state)
 }
 
 pub async fn serve(

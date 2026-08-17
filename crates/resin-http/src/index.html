@@ -48,6 +48,14 @@
     .assistant:empty { display:none }
     footer { min-width:0; position:sticky; bottom:0; z-index:2; margin-bottom:-18px; padding:9px 0 18px; background:Canvas }
     #stats { min-height:24px; margin:0 3px 8px; font-size:13px }
+    #attachments { display:flex; gap:8px; overflow-x:auto; margin:0 3px 8px; padding:2px }
+    #attachments[hidden] { display:none }
+    .attachment { position:relative; flex:0 0 76px; height:76px; border:1px solid var(--line); border-radius:12px; overflow:hidden; background:var(--soft) }
+    .attachment img { width:100%; height:100%; display:block; object-fit:cover }
+    .attachment button { position:absolute; top:4px; right:4px; width:22px; height:22px; border:1px solid #fff8; border-radius:50%; padding:0; background:#111b; color:white; font:16px/18px system-ui }
+    .user-media { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:9px }
+    .user-media img { display:block; width:min(180px,100%); max-height:240px; border-radius:10px; object-fit:cover }
+    .user-text:empty { display:none }
     #settings { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:8px; padding:11px 13px 12px; border:1px solid var(--line); border-radius:14px }
     #settings[hidden] { display:none }
     #settings label { display:grid; gap:4px; color:var(--muted); font-size:12px; font-weight:600 }
@@ -55,7 +63,7 @@
     form { display:flex; align-items:flex-end; gap:8px; padding:7px 7px 7px 13px; border:1px solid var(--line); border-radius:17px; background:Canvas }
     textarea { flex:1; min-height:38px; min-width:0; max-height:160px; resize:none; border:0; outline:0; padding:8px 2px; background:transparent; color:inherit; font:inherit; line-height:22px }
     button { flex:0 0 38px; width:38px; height:38px; border:0; border-radius:11px; background:var(--accent); color:white; font:700 20px/1 system-ui; cursor:pointer }
-    #settings-toggle { background:var(--soft); color:CanvasText; font-size:20px; font-weight:400 }
+    #attach,#settings-toggle { background:var(--soft); color:CanvasText; font-size:20px; font-weight:400 }
     #settings-toggle[aria-expanded="true"] { color:var(--accent) }
     button:hover { filter:brightness(1.08) } button:disabled { opacity:.45; cursor:wait }
     @keyframes pulse { 50% { opacity:.5 } }
@@ -70,6 +78,7 @@
   </div></main></div>
   <footer>
     <div id="stats"></div>
+    <div id="attachments" aria-label="Attached images" hidden></div>
     <section id="settings" aria-label="Generation settings" hidden>
       <label>Reasoning
         <select id="reasoning-effort">
@@ -92,6 +101,8 @@
       </label>
     </section>
     <form id="form">
+      <input id="image-input" type="file" accept="image/avif,image/bmp,image/gif,image/jpeg,image/png,image/tiff,image/webp" multiple hidden>
+      <button id="attach" type="button" title="Add images" aria-label="Add images">＋</button>
       <textarea id="prompt" rows="1" autofocus placeholder="Message the model…"></textarea>
       <button id="settings-toggle" type="button" title="Generation settings" aria-label="Generation settings" aria-controls="settings" aria-expanded="false">⚙</button>
       <button id="send" type="submit" title="Send" aria-label="Send">↑</button>
@@ -104,13 +115,18 @@ const stats=document.querySelector('#stats'),modelEl=document.querySelector('#mo
 const settings=document.querySelector('#settings'),settingsToggle=document.querySelector('#settings-toggle');
 const reasoningEffort=document.querySelector('#reasoning-effort'),temperature=document.querySelector('#temperature');
 const topP=document.querySelector('#top-p'),maxOutputTokens=document.querySelector('#max-output-tokens');
-let history=[];
+const attach=document.querySelector('#attach'),imageInput=document.querySelector('#image-input'),attachments=document.querySelector('#attachments');
+const supportedImageTypes=new Set(['image/avif','image/bmp','image/gif','image/jpeg','image/png','image/tiff','image/webp']);
+const maxImages=4,maxImageBytes=8*1024*1024;let history=[],pendingImages=[];
 fetch('/v1/models').then(r=>r.json()).then(x=>modelEl.textContent=x.data?.[0]?.id||'');
 function chatViewportBottom(){return window.innerHeight-footerEl.offsetHeight}
 function atChatBottom(){return chat.getBoundingClientRect().bottom-chatViewportBottom()<48}
 function scrollChat(follow=true){requestAnimationFrame(()=>{if(follow)window.scrollTo({top:window.scrollY+chat.getBoundingClientRect().bottom-chatViewportBottom()})})}
 function updateScrollFades(){const max=document.documentElement.scrollHeight-window.innerHeight;document.body.classList.toggle('can-scroll-up',window.scrollY>1);document.body.classList.toggle('can-scroll-down',max>1&&window.scrollY<max-1)}
 function turn(role,text=''){const follow=atChatBottom(),e=document.createElement('div');emptyState?.remove();e.className='turn '+role;if(role==='assistant')e.classList.add('markdown');else e.textContent=text;chat.append(e);scrollChat(follow);return e}
+function userTurn(text,images){const e=turn('user');e.textContent='';if(images.length){const media=document.createElement('div');media.className='user-media';for(const image of images){const preview=document.createElement('img');preview.src=image.url;preview.alt=image.name;media.append(preview)}e.append(media)}const content=document.createElement('div');content.className='user-text';content.textContent=text;e.append(content);return e}
+function renderAttachments(){attachments.replaceChildren();attachments.hidden=!pendingImages.length;pendingImages.forEach((image,index)=>{const item=document.createElement('div'),preview=document.createElement('img'),remove=document.createElement('button');item.className='attachment';preview.src=image.url;preview.alt=image.name;remove.type='button';remove.textContent='×';remove.title=`Remove ${image.name}`;remove.setAttribute('aria-label',remove.title);remove.addEventListener('click',()=>{pendingImages.splice(index,1);renderAttachments()});item.append(preview,remove);attachments.append(item)})}
+function readDataUrl(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(reader.error||new Error(`Could not read ${file.name}`));reader.readAsDataURL(file)})}
 function escapeHtml(s){return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;')}
 function inlineMarkdown(source){
   const held=[]; let value=escapeHtml(source);
@@ -158,10 +174,13 @@ window.addEventListener('resize',updateScrollFades);
 new ResizeObserver(updateScrollFades).observe(document.body);
 updateScrollFades();
 settingsToggle.addEventListener('click',()=>{settings.hidden=!settings.hidden;settingsToggle.setAttribute('aria-expanded',String(!settings.hidden))});
+attach.addEventListener('click',()=>imageInput.click());
+imageInput.addEventListener('change',async()=>{const files=[...imageInput.files];imageInput.value='';let error='';for(const file of files){if(pendingImages.length>=maxImages){error=`Attach at most ${maxImages} images`;break}if(!supportedImageTypes.has(file.type)){error=`Unsupported image type: ${file.type||file.name}`;continue}if(file.size>maxImageBytes){error=`${file.name} is larger than 8 MiB`;continue}if(pendingImages.reduce((total,image)=>total+image.size,0)+file.size>maxImageBytes){error='Attached images total more than 8 MiB';break}try{pendingImages.push({name:file.name,size:file.size,url:await readDataUrl(file)})}catch(err){error=err.message}}renderAttachments();stats.textContent=error});
 form.addEventListener('submit',async e=>{
-  e.preventDefault();const text=prompt.value.trim();if(!text)return;
-  prompt.value='';resizePrompt();send.disabled=true;stats.textContent='';turn('user',text);
-  history.push({role:'user',content:text});
+  e.preventDefault();const text=prompt.value.trim(),images=pendingImages;if(!text&&!images.length)return;
+  pendingImages=[];renderAttachments();prompt.value='';resizePrompt();send.disabled=true;attach.disabled=true;stats.textContent='';userTurn(text,images);
+  const content=images.length?[...images.map(image=>({type:'image_url',image_url:{url:image.url}})),...(text?[{type:'text',text}]:[])]:text;
+  history.push({role:'user',content});
   const box=turn('assistant'),thinking=document.createElement('details'),summary=document.createElement('summary'),reasonBox=document.createElement('div');
   reasonBox.className='markdown';thinking.className='pending';thinking.open=true;thinking.append(summary,reasonBox);box.before(thinking);
   const requestStartedAt=performance.now();let pendingLabel='Starting model';
@@ -185,7 +204,7 @@ form.addEventListener('submit',async e=>{
     });if(done)break}
     history.push({role:'assistant',content:answer,...(reason?{reasoning_content:reason}:{})});
   } catch(err) {if(!reason)thinking.remove();box.textContent='Error: '+err.message}
-  finally {clearInterval(statusTimer);send.disabled=false;prompt.focus()}
+  finally {clearInterval(statusTimer);send.disabled=false;attach.disabled=false;prompt.focus()}
 });
 prompt.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit()}});
 </script>
