@@ -85,16 +85,8 @@ def _run_cuda() -> dict[str, object]:
     loaded = time.perf_counter()
 
     request = engine.submit(PROMPT, max_new_tokens=8)
-    batch_ids = []
-    pending_polls = 0
     while engine.has_work():
-        if not engine.in_flight_batch_count:
-            batch_ids.append(engine.dispatch())
-        events = engine.poll()
-        if engine.in_flight_batch_count:
-            if events:
-                raise AssertionError("pending poll returned token events")
-            pending_polls += 1
+        engine.step()
     torch.cuda.synchronize()
     finished = time.perf_counter()
     output = request.take_result()
@@ -103,8 +95,6 @@ def _run_cuda() -> dict[str, object]:
         "model_load_seconds": loaded - started,
         "generation_seconds": finished - loaded,
         "output_ids": output,
-        "batch_ids": batch_ids,
-        "pending_polls": pending_polls,
         "cache_parent_capacity": engine.cache_parent_capacity,
         "cache_free_parent_count": engine.cache_free_parent_count,
         "prefix_cache_stats": engine.prefix_cache_stats,

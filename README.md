@@ -72,8 +72,7 @@ uv run modal setup
 `modal setup` is interactive and only needs to be repeated when the local
 Modal credentials change.
 
-Run the local LFM2 harness on an H100 with the native Engine and asynchronous
-dispatch/poll path:
+Run the local LFM2 harness on an H100 with the native Engine:
 
 ```bash
 uv run modal run deploy/modal_lfm2.py --mode run
@@ -90,8 +89,7 @@ uv run modal run deploy/modal_lfm2.py --mode prewarm
 uv run modal run deploy/modal_lfm2.py --mode verify
 uv run modal run deploy/modal_lfm2.py --mode probe
 
-# Exercise asynchronous completion and native continuation scheduling.
-uv run modal run deploy/modal_lfm2.py --mode async
+# Exercise native continuation scheduling.
 uv run modal run deploy/modal_lfm2.py --mode native-continuation-probe
 ```
 
@@ -161,14 +159,13 @@ class Runner:
         return [0] * len(plan.sequence_ids)
 ```
 
-An asynchronous runner supplies `dispatch(plan)` and `poll(completion)` instead.
 Managed history and recurrent state are cache groups declared through a frozen
 `RunnerConfig`. The Engine binds their one physical arena during construction.
 Pass `prefix_cache=True` to reuse aligned prefixes across requests.
 
 ## Local HTTP server
 
-The optional server exposes one Engine through OpenAI Chat Completions and
+The built-in native server exposes one Engine through OpenAI Chat Completions and
 Responses, Anthropic Messages, and a small streaming chat page. Model-specific
 prompt rendering and response parsing stay in Python so they can follow model
 formats without coupling them to the native scheduler.
@@ -264,7 +261,7 @@ parallel attention and expert outputs are reduced through one NCCL group.
 The LFM2 CUDA runner stores attention history and 128-token convolution-state
 checkpoints in the same fungible parent allocation. One KV page occupies a
 whole parent; six recurrent checkpoints fit in one parent. Its only execution
-route is asynchronous dispatch/poll over native Engine plans.
+route is synchronous `forward(plan)` over native Engine plans.
 
 DeepSeek-V4 uses six logical groups over one fungible physical parent pool:
 sliding attention KV, c4 compressed history, the c4 compressor tail, c128
@@ -275,10 +272,10 @@ tails are cache-like rolling token rows rather than whole-request checkpoints,
 so aligned prefix snapshots share them exactly like attention pages. The Modal
 web deployment enables the native exact-token LRU prefix cache.
 
-Current limits include one in-flight batch per Engine, no prefill/decode
-disaggregation, no expert parallel or data-parallel attention, and no
-multi-node serving. Tensor parallelism remains a model-backend concern rather
-than part of the native scheduler.
+Current limits include synchronous runner steps, no prefill/decode
+disaggregation, no expert parallel or data-parallel attention, and no multi-node
+serving. Tensor parallelism remains a model-backend concern rather than part of
+the native scheduler.
 
 ## Public surface
 
@@ -288,7 +285,6 @@ Top-level imports are limited to native control-plane types:
 Engine
 Runner
 SyncRunner
-AsyncRunner
 BatchPlan
 BatchPhase
 TokenEvent

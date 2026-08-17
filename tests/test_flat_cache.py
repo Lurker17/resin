@@ -382,15 +382,13 @@ class TestFlatCacheEngine:
         request = engine.submit([1], max_new_tokens=1)
 
         with pytest.raises(RuntimeError, match="rejected the batch"):
-            engine.dispatch()
+            engine.step()
         assert not engine.poisoned
         assert engine.ready_request_count == 1
-        assert engine.in_flight_request_count == 0
         assert engine.cache_free_parent_count == 0
         assert engine.cache_occupied_block_count == 1
 
-        assert engine.dispatch() == 2
-        events = engine.poll()
+        events = engine.step()
         assert [event.request_id for event in events] == [request]
         assert (
             _block_addresses(runner.plans[0].cache_groups[0])

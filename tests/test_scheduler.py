@@ -39,43 +39,30 @@ class ContinuationRecordingRunner(RecordingRunner):
     runner_config = RunnerConfig(continuation_prefill=True)
 
 
-class ControlledAsyncRunner:
+class ControlledRunner:
     def __init__(
         self,
-        poll_results: list[list[int] | None] | None = None,
+        results: list[list[int]] | None = None,
         *,
-        dispatch_failures: int = 0,
+        forward_failures: int = 0,
     ) -> None:
-        self.poll_results = list(poll_results or [])
-        self.dispatch_failures = dispatch_failures
-        self.dispatch_plans: list[BatchPlan] = []
+        self.results = list(results or [])
+        self.forward_failures = forward_failures
+        self.plans: list[BatchPlan] = []
         self.released: list[int] = []
-        self._accepted: set[object] = set()
 
-    def dispatch(self, plan: BatchPlan) -> object:
-        self.dispatch_plans.append(plan)
-        if self.dispatch_failures:
-            self.dispatch_failures -= 1
-            raise RuntimeError("dispatch rejected")
-        handle = object()
-        self._accepted.add(handle)
-        return handle
-
-    def poll(self, handle: object) -> list[int] | None:
-        if handle not in self._accepted:
-            raise ValueError("foreign completion")
-        if not self.poll_results:
-            return None
-        result = self.poll_results.pop(0)
-        if result is not None:
-            self._accepted.remove(handle)
-        return result
+    def forward(self, plan: BatchPlan) -> list[int]:
+        self.plans.append(plan)
+        if self.forward_failures:
+            self.forward_failures -= 1
+            raise RuntimeError("forward rejected")
+        return self.results.pop(0)
 
     def release(self, request_ids: list[int]) -> None:
         self.released.extend(request_ids)
 
 
-class ContinuationControlledAsyncRunner(ControlledAsyncRunner):
+class ContinuationControlledRunner(ControlledRunner):
     runner_config = RunnerConfig(continuation_prefill=True)
 
 
@@ -215,7 +202,7 @@ class TestSchedulerConfigContract:
             with pytest.raises(
                 ValueError, match="runner_config.continuation_prefill is false"
             ):
-                engine.dispatch()
+                engine.step()
             engine.close()
 
         engine = Engine(
@@ -505,39 +492,34 @@ class TestNativePolicyIntegration:
         assert runner.plans[-1].sequence_ids.tolist() == [decode]
         assert runner.plans[-1].phase == BatchPhase.DECODE
 
-    def test_survivors_stay_ahead_of_inflight_submissions(self) -> None:
-        runner = ControlledAsyncRunner([None, [11, 21], [12, 22]])
+    def test_survivors_stay_ahead_of_later_submissions(self) -> None:
+        runner = ControlledRunner([[11, 21], [12, 22]])
         engine = Engine(runner, max_running_requests=2)
         first = engine.submit([10], 3)
         second = engine.submit([20], 3)
-        engine.dispatch()
+        engine.step()
         engine.submit([30], 1)
         engine.submit([40], 1)
-        assert engine.poll() == []
-        engine.poll()
 
-        engine.dispatch()
-        assert runner.dispatch_plans[-1].sequence_ids.tolist() == [first, second]
-        engine.poll()
+        engine.step()
+        assert runner.plans[-1].sequence_ids.tolist() == [first, second]
         engine.close()
 
-    def test_noncontiguous_async_rejection_restores_exact_cohort_and_age(
-        self,
-    ) -> None:
-        runner = ControlledAsyncRunner([[11, 31], [21]], dispatch_failures=1)
+    def test_noncontiguous_rejection_restores_exact_cohort_and_age(self) -> None:
+        runner = ControlledRunner([[11, 31], [21]], forward_failures=1)
         engine = Engine(runner, max_running_requests=2)
         first = engine.submit([10], 1, priority=3, batch_key=7)
         other_key = engine.submit([20], 1, priority=3)
         third = engine.submit([30], 1, priority=3, batch_key=7)
         lower = engine.submit([40], 1, priority=2, batch_key=7)
 
-        with pytest.raises(RuntimeError, match="dispatch rejected"):
-            engine.dispatch()
+        with pytest.raises(RuntimeError, match="forward rejected"):
+            engine.step()
         assert not engine.poisoned
         assert engine.ready_request_count == 4
 
-        assert engine.dispatch() == 2
-        failed, retry = runner.dispatch_plans[:2]
+        engine.step()
+        failed, retry = runner.plans[:2]
         assert (failed.batch_id, retry.batch_id) == (1, 2)
         assert failed.sequence_ids.tolist() == [first, third]
         assert retry.sequence_ids.tolist() == [first, third]
@@ -556,16 +538,13 @@ class TestNativePolicyIntegration:
                 if hasattr(left, "tolist")
                 else left == right
             ), field
-        engine.poll()
-
-        engine.dispatch()
-        assert runner.dispatch_plans[-1].sequence_ids.tolist() == [other_key]
-        engine.poll()
+        engine.step()
+        assert runner.plans[-1].sequence_ids.tolist() == [other_key]
         engine.close()
         assert lower.done
         assert lower.take_result() == []
 
-    def test_ready_and_inflight_cancellation_preserve_selected_row_order(self) -> None:
+    def test_ready_cancellation_preserves_selected_row_order(self) -> None:
         ready_runner = RecordingRunner()
         ready_engine = Engine(ready_runner, max_running_requests=3)
         first = ready_engine.submit([10], 1)
@@ -574,22 +553,6 @@ class TestNativePolicyIntegration:
         assert ready_engine.cancel(middle)
         ready_engine.step()
         assert ready_runner.plans[-1].sequence_ids.tolist() == [first, third]
-
-        async_runner = ControlledAsyncRunner([[101, 301], [201]])
-        async_engine = Engine(async_runner, max_running_requests=2)
-        first = async_engine.submit([100], 1, priority=2, batch_key=7)
-        other_key = async_engine.submit([200], 1, priority=2)
-        third = async_engine.submit([300], 1, priority=2, batch_key=7)
-        async_engine.dispatch()
-        assert async_runner.dispatch_plans[-1].sequence_ids.tolist() == [first, third]
-        assert async_engine.cancel(third)
-        events = async_engine.poll()
-        assert [event.request_id for event in events] == [first]
-        assert async_runner.released == [first, third]
-
-        async_engine.dispatch()
-        assert async_runner.dispatch_plans[-1].sequence_ids.tolist() == [other_key]
-        async_engine.poll()
 
     def test_decode_and_partial_prefill_are_dispatched_separately(
         self,
@@ -652,33 +615,15 @@ class TestNativePolicyIntegration:
         assert (first.take_result(), second.take_result()) == ([3], [12])
         assert [plan.sequence_ids[0] for plan in runner.plans] == [1, 1, 2, 2]
 
-    def test_async_partial_cancel_discards_dense_output_and_compact_output_poisoned(
-        self,
-    ) -> None:
-        runner = ContinuationControlledAsyncRunner([None, [99]])
-        engine = Engine(
-            runner,
-            scheduler_config=SchedulerConfig(prefill_chunk_size=2),
-        )
-        request = engine.submit([1, 2, 3], 1)
-        engine.dispatch()
-        assert runner.dispatch_plans[-1].sampling_mask.tolist() == [False]
-        assert engine.poll() == []
-        assert engine.cancel(request)
-        assert engine.poll() == []
-        assert request.done
-        assert request.take_result() == []
-        assert runner.released == [request]
-
-        compact = ContinuationControlledAsyncRunner([[]])
+    def test_compact_partial_prefill_output_is_quarantined(self) -> None:
+        compact = ContinuationControlledRunner([[]])
         poisoned = Engine(
             compact,
             scheduler_config=SchedulerConfig(prefill_chunk_size=1),
         )
         poisoned.submit([1, 2], 1)
-        poisoned.dispatch()
         with pytest.raises(RuntimeError, match="1 sequences"):
-            poisoned.poll()
+            poisoned.step()
         assert poisoned.poisoned
 
     def test_cleanup_failure_does_not_publish_a_sampled_token(self) -> None:

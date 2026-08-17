@@ -9,7 +9,7 @@ The Rust Engine owns:
 - one unified paged cache allocator;
 - full-history, sliding-window, and recurrent-state retention;
 - exact-token LRU prefix reuse;
-- cache reader/writer leases across asynchronous execution;
+- cache reader/writer leases across runner execution and commit;
 - retry or quarantine decisions after runner failures.
 
 The Python runner owns:
@@ -17,7 +17,7 @@ The Python runner owns:
 - model weights and device allocations;
 - conversion of `BatchPlan` page indices into kernel metadata;
 - attention, recurrent, collective, sampling, and speculative-decode kernels;
-- CUDA graphs and completion polling.
+- CUDA graphs and execution synchronization.
 
 The boundary is intentionally asymmetric: scheduling complexity belongs in the
 Engine, while a forward pass receives immutable token and page metadata and can
@@ -35,13 +35,13 @@ execute straightforwardly.
    and cache capacity.
 5. The cache coordinator grows each request, creates ordered group page tables,
    and acquires one batch lease.
-6. The Engine emits a `BatchPlan` and calls `forward()` or `dispatch()`.
-7. Once execution is terminal, generated tokens are committed, aligned prefixes
+6. The Engine emits a `BatchPlan` and calls `forward()` synchronously.
+7. Once `forward()` returns, generated tokens are committed, aligned prefixes
    may be published, retired pages return to the common pool, and requests are
    requeued or completed.
 
-Only one batch may be in flight per Engine today. Multiple requests within that
-batch execute continuously and may decode concurrently.
+One batch is selected per `step()`. Multiple requests within that batch execute
+together and may decode concurrently.
 
 ## Cache geometry
 
@@ -85,7 +85,7 @@ quarantined. This keeps allocator reuse conservative.
 
 ## Current limits
 
-- one in-flight batch per Engine;
+- one synchronous batch per Engine step;
 - no prefill/decode disaggregation;
 - no expert parallel or data-parallel attention;
 - no multi-node serving;

@@ -41,7 +41,7 @@ group plan covers every batch sequence and has one CSR block table:
   exact cached-token write location per scheduled token.
 
 The Engine allocates blocks, performs copy-on-write decisions, and holds the
-reader/writer lease until asynchronous execution is terminal. Model code maps
+reader/writer lease through synchronous execution and native commit. Model code maps
 each `(slab_id, slotnum)` pair into its model-specific tensor row. Slab zero is
 reserved for inactive/null rows; live slab IDs are one-based. Keeping the
 address structured prevents runners from assuming a different packing than the

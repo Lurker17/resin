@@ -84,8 +84,8 @@ overlap scheduling. Prefill and unconfigured decode shapes use the eager path.
 The runner implements synchronous `forward(plan)`. It materializes the dense
 token-ID result before returning; CUDA failures establish device
 quiescence before reporting a retryable exception, or mark the exception
-post-accept when quiescence cannot be proven. Resin retains the accepted result
-and ownership leases until `Engine.poll()` commits it.
+post-accept when quiescence cannot be proven. Resin retains ownership leases
+through the synchronous native commit.
 
 ## Capacity and shapes
 

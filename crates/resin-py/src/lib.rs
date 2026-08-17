@@ -2,14 +2,11 @@ use std::cmp::Reverse;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 use numpy::{PyArray1, PyArrayLike1};
-use pyo3::exceptions::{
-    PyAttributeError, PyMemoryError, PyRuntimeError, PyTypeError, PyValueError,
-};
+use pyo3::exceptions::{PyAttributeError, PyMemoryError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::PyTuple;
 
 mod arrays;
 mod cache;
@@ -24,7 +21,7 @@ use resin_core::resources::paged_kv::{PagedKvError, PagedKvResources};
 use resin_core::resources::{RequestResourceRef, WithResources};
 use resin_core::{Phase, RequestId, Schedulable, Scheduler, SequenceStep};
 use runner::{
-    ResourceBinding, RunnerConfig, RunnerExecution, bind_runner_resources, resolve_runner_config,
+    ResourceBinding, RunnerConfig, bind_runner_resources, resolve_runner_config,
     resolve_runner_contract, runner_error_is_post_accept,
 };
 
@@ -952,21 +949,9 @@ impl Schedulable for RequestData {
     }
 }
 
-enum InFlightExecution {
-    SyncComplete(Vec<Vec<u32>>),
-    FailedAfterAcceptance,
-    AsyncHandle(Py<PyAny>),
-}
-
-enum RunnerCallOutcome {
-    Accepted(InFlightExecution),
-    Rejected(PyErr),
-    FailedAfterAcceptance { stage: &'static str, error: PyErr },
-}
-
 type ScheduledRow = SequenceStep;
 
-struct InFlightRow {
+struct BatchRow {
     request: Request,
     scheduled: ScheduledRow,
 }
@@ -1012,22 +997,19 @@ fn extract_runner_token_rows(
     Ok(token_rows)
 }
 
-struct InFlightData {
-    batch_id: u64,
-    rows: Vec<InFlightRow>,
-    execution: InFlightExecution,
+struct Batch {
+    rows: Vec<BatchRow>,
+    resources: BatchResources,
 }
 
 type BatchResources = Option<WriterAccessLease>;
-type InFlightBatch = WithResources<InFlightData, BatchResources>;
 
 #[pyclass(module = "resin._resin")]
 struct Engine {
-    // Accepted work must be destroyed before the bound runner callables which
-    // keep its execution-plane owner alive. This also makes fail-stop teardown
-    // safe for runner completion handles whose destructor waits for work.
-    in_flight: Option<InFlightBatch>,
-    runner_execution: RunnerExecution,
+    // A post-accept failure keeps the exact requests and writer capability
+    // unreachable until the poisoned Engine itself is destroyed.
+    quarantined: Option<Batch>,
+    runner_forward: Py<PyAny>,
     runner_release: Option<Py<PyAny>>,
     runner_config: RunnerConfig,
     scheduler: Scheduler<Request>,
@@ -1044,9 +1026,6 @@ struct Engine {
     poisoned_error: Option<String>,
     closed: bool,
 }
-
-const DROP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
-const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 fn cache_pool_error(error: CachePoolError) -> PyErr {
     match error {
@@ -1104,7 +1083,7 @@ impl Engine {
         let minimum_new_token_ratio = new_token_ratio * MIN_NEW_TOKEN_RATIO_FACTOR;
         let new_token_ratio_decay =
             (new_token_ratio - minimum_new_token_ratio) / NEW_TOKEN_RATIO_DECAY_STEPS;
-        let (runner_execution, runner_release) = resolve_runner_contract(py, runner.bind(py))?;
+        let (runner_forward, runner_release) = resolve_runner_contract(py, runner.bind(py))?;
         let runner_config = resolve_runner_config(py, runner.bind(py))?;
         let kv_resources = runner_config
             .config
@@ -1130,8 +1109,8 @@ impl Engine {
         )?;
 
         Ok(Self {
-            in_flight: None,
-            runner_execution,
+            quarantined: None,
+            runner_forward,
             runner_release,
             runner_config,
             scheduler: Scheduler::new(
@@ -1349,10 +1328,10 @@ impl Engine {
         Ok(lease)
     }
 
-    fn dispatch(&mut self, py: Python<'_>) -> PyResult<Option<u64>> {
+    fn step(&mut self, py: Python<'_>) -> PyResult<Vec<Py<TokenEvent>>> {
         self.raise_if_open()?;
-        if self.in_flight.is_some() || self.scheduler.is_empty() {
-            return Ok(None);
+        if self.scheduler.is_empty() {
+            return Ok(Vec::new());
         }
 
         let (scheduled_rows, selection) = {
@@ -1365,7 +1344,7 @@ impl Engine {
                 selection.truncate(admitted);
             }
             if selected_requests.is_empty() {
-                return Ok(None);
+                return Ok(Vec::new());
             }
             let scheduled_rows = schedule_ready_prefix(
                 &selected_requests,
@@ -1434,7 +1413,7 @@ impl Engine {
             if matches!(error, CachePoolError::InsufficientCapacity { .. })
                 && self.retract_one(py)?
             {
-                return self.dispatch(py);
+                return self.step(py);
             }
             return Err(cache_pool_error(error));
         }
@@ -1499,126 +1478,37 @@ impl Engine {
                 return Err(error);
             }
         };
-        let mut batch_resources = acquired_kv.map(|access| access.lease);
-
-        // The lease spans runner acceptance and every pending poll. A
-        // post-accept error therefore quarantines the exact writer capability.
-        let outcome = match &self.runner_execution {
-            RunnerExecution::Sync { forward } => {
-                match forward.bind(py).call1((plan.clone_ref(py),)) {
-                    Err(error) if runner_error_is_post_accept(py, &error) => {
-                        RunnerCallOutcome::FailedAfterAcceptance {
-                            stage: "runner forward failed after accepting work",
-                            error,
-                        }
-                    }
-                    Err(error) => RunnerCallOutcome::Rejected(error),
-                    Ok(output) => match extract_runner_token_rows(&output, selected) {
-                        Err(error) => RunnerCallOutcome::FailedAfterAcceptance {
-                            stage: "runner forward protocol failure after accepting work",
-                            error,
-                        },
-                        Ok(output) => {
-                            RunnerCallOutcome::Accepted(InFlightExecution::SyncComplete(output))
-                        }
-                    },
-                }
-            }
-            RunnerExecution::Async { dispatch, .. } => {
-                match dispatch.bind(py).call1((plan.clone_ref(py),)) {
-                    Ok(handle) => {
-                        RunnerCallOutcome::Accepted(InFlightExecution::AsyncHandle(handle.unbind()))
-                    }
-                    Err(error) if runner_error_is_post_accept(py, &error) => {
-                        RunnerCallOutcome::FailedAfterAcceptance {
-                            stage: "runner dispatch failed after accepting work",
-                            error,
-                        }
-                    }
-                    Err(error) => RunnerCallOutcome::Rejected(error),
-                }
-            }
+        let mut batch = Batch {
+            rows: scheduled
+                .into_iter()
+                .zip(scheduled_rows)
+                .map(|(request, scheduled)| BatchRow { request, scheduled })
+                .collect(),
+            resources: acquired_kv.map(|access| access.lease),
         };
-        let execution = match outcome {
-            RunnerCallOutcome::Accepted(execution) => execution,
-            RunnerCallOutcome::FailedAfterAcceptance { stage, error } => {
-                let batch = InFlightBatch {
-                    inner: InFlightData {
-                        batch_id,
-                        rows: scheduled
-                            .into_iter()
-                            .zip(scheduled_rows)
-                            .map(|(request, scheduled)| InFlightRow { request, scheduled })
-                            .collect(),
-                        execution: InFlightExecution::FailedAfterAcceptance,
-                    },
-                    resources: batch_resources,
-                };
-                return self.quarantine(batch, stage, error);
+
+        // The lease spans runner execution and native progress commit. A
+        // post-accept error therefore quarantines the exact writer capability.
+        let output = match self.runner_forward.bind(py).call1((plan.clone_ref(py),)) {
+            Err(error) if runner_error_is_post_accept(py, &error) => {
+                return self.quarantine(batch, "runner forward failed after accepting work", error);
             }
-            RunnerCallOutcome::Rejected(error) => {
-                self.rollback_batch_resources(py, &mut batch_resources);
-                self.scheduler.restore_rejected(scheduled);
+            Err(error) => {
+                self.rollback_batch_resources(py, &mut batch.resources);
+                self.scheduler
+                    .restore_rejected(batch.rows.into_iter().map(|row| row.request).collect());
                 return Err(error);
             }
+            Ok(output) => output,
         };
-
-        self.in_flight = Some(InFlightBatch {
-            inner: InFlightData {
-                batch_id,
-                rows: scheduled
-                    .into_iter()
-                    .zip(scheduled_rows)
-                    .map(|(request, scheduled)| InFlightRow { request, scheduled })
-                    .collect(),
-                execution,
-            },
-            resources: batch_resources,
-        });
-        Ok(Some(batch_id))
-    }
-
-    fn poll(&mut self, py: Python<'_>) -> PyResult<Vec<Py<TokenEvent>>> {
-        self.raise_if_poisoned()?;
-        let Some(mut batch) = self.in_flight.take() else {
-            return Ok(Vec::new());
-        };
-
-        let output_token_ids = match &batch.execution {
-            InFlightExecution::SyncComplete(output) => output.clone(),
-            InFlightExecution::FailedAfterAcceptance => {
-                let error = PyRuntimeError::new_err(
-                    "a failed accepted batch exists without a poisoned Engine",
+        let output_token_ids = match extract_runner_token_rows(&output, selected) {
+            Ok(output) => output,
+            Err(error) => {
+                return self.quarantine(
+                    batch,
+                    "runner forward protocol failure after accepting work",
+                    error,
                 );
-                return self.quarantine(batch, "native acceptance protocol failure", error);
-            }
-            InFlightExecution::AsyncHandle(handle) => {
-                let RunnerExecution::Async { poll, .. } = &self.runner_execution else {
-                    let error = PyRuntimeError::new_err(
-                        "an asynchronous batch exists on a synchronous runner",
-                    );
-                    return self.quarantine(batch, "native async protocol failure", error);
-                };
-                let result = match poll.bind(py).call1((handle.clone_ref(py),)) {
-                    Ok(result) => result,
-                    Err(error) => return self.quarantine(batch, "runner poll failed", error),
-                };
-                if result.is_none() {
-                    self.in_flight = Some(batch);
-                    return Ok(Vec::new());
-                }
-                if !result.is_instance_of::<PyList>() {
-                    let error = PyTypeError::new_err(
-                        "runner.poll must return None or a Python list of token IDs",
-                    );
-                    return self.quarantine(batch, "runner poll protocol failure", error);
-                }
-                match extract_runner_token_rows(&result, batch.rows.len()) {
-                    Ok(output) => output,
-                    Err(error) => {
-                        return self.quarantine(batch, "runner poll protocol failure", error);
-                    }
-                }
             }
         };
         let decoded_batch = batch
@@ -1790,12 +1680,6 @@ impl Engine {
         Ok(events)
     }
 
-    fn step(&mut self, py: Python<'_>) -> PyResult<Vec<Py<TokenEvent>>> {
-        self.raise_if_open()?;
-        self.dispatch(py)?;
-        self.poll(py)
-    }
-
     fn cancel(&mut self, py: Python<'_>, request: PyRef<'_, RequestLease>) -> PyResult<bool> {
         self.raise_if_open()?;
         if request.engine_id != self.engine_id {
@@ -1853,15 +1737,6 @@ impl Engine {
             return Ok(true);
         }
 
-        if let Some(batch) = &mut self.in_flight
-            && let Some(row) = batch
-                .rows
-                .iter_mut()
-                .find(|row| row.request.id == request_id)
-        {
-            row.request.cancel_pending = true;
-            return Ok(true);
-        }
         Ok(false)
     }
 
@@ -1870,7 +1745,7 @@ impl Engine {
             return Ok(());
         }
         self.raise_if_poisoned()?;
-        self.close_healthy(py, None)
+        self.close_healthy(py)
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
@@ -1890,12 +1765,12 @@ impl Engine {
     }
 
     fn has_work(&self) -> bool {
-        !self.scheduler.is_empty() || self.in_flight.is_some()
+        !self.scheduler.is_empty()
     }
 
     #[getter]
     fn active_request_count(&self) -> usize {
-        self.scheduler.len() + self.in_flight.as_ref().map_or(0, |batch| batch.rows.len())
+        self.scheduler.len()
     }
 
     #[getter]
@@ -1904,28 +1779,8 @@ impl Engine {
     }
 
     #[getter]
-    fn in_flight_request_count(&self) -> usize {
-        self.in_flight.as_ref().map_or(0, |batch| batch.rows.len())
-    }
-
-    #[getter]
-    fn in_flight_batch_count(&self) -> usize {
-        usize::from(self.in_flight.is_some())
-    }
-
-    #[getter]
-    fn in_flight_batch_id(&self) -> Option<u64> {
-        self.in_flight.as_ref().map(|batch| batch.batch_id)
-    }
-
-    #[getter]
     fn max_running_requests(&self) -> usize {
         self.scheduler.max_running_requests()
-    }
-
-    #[getter]
-    fn asynchronous(&self) -> bool {
-        self.runner_execution.is_async()
     }
 
     #[getter]
@@ -2013,9 +1868,8 @@ impl Engine {
 
     fn __repr__(&self) -> String {
         format!(
-            "Engine(ready_requests={}, in_flight_requests={}, max_running_requests={}, context_length={}, closed={}, poisoned={}, cache_blocks={})",
+            "Engine(ready_requests={}, max_running_requests={}, context_length={}, closed={}, poisoned={}, cache_blocks={})",
             self.ready_request_count(),
-            self.in_flight_request_count(),
             self.max_running_requests(),
             self.context_length(),
             self.closed,
@@ -2037,7 +1891,7 @@ impl Engine {
     fn publish_batch_prefixes(
         &mut self,
         _py: Python<'_>,
-        batch: &mut InFlightBatch,
+        batch: &mut Batch,
         progress: &[PreparedProgress],
     ) -> PyResult<()> {
         let Some(alignment) = self.prefix_alignment() else {
@@ -2255,38 +2109,13 @@ impl Engine {
         }
     }
 
-    fn quarantine<T>(&mut self, batch: InFlightBatch, stage: &str, error: PyErr) -> PyResult<T> {
-        self.in_flight = Some(batch);
+    fn quarantine<T>(&mut self, batch: Batch, stage: &str, error: PyErr) -> PyResult<T> {
+        self.quarantined = Some(batch);
         self.poison(stage, &error);
         Err(error)
     }
 
-    fn close_healthy(&mut self, py: Python<'_>, deadline: Option<Instant>) -> PyResult<()> {
-        if let Some(batch) = &mut self.in_flight {
-            for row in &mut batch.rows {
-                row.request.cancel_pending = true;
-            }
-        }
-
-        while self.in_flight.is_some() {
-            self.poll(py)?;
-            if self.in_flight.is_none() {
-                break;
-            }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                let message = format!(
-                    "Engine destructor could not drain accepted work within {} ms; resources remain quarantined",
-                    DROP_DRAIN_TIMEOUT.as_millis()
-                );
-                self.poison_message(message.clone());
-                return Err(PyRuntimeError::new_err(message));
-            }
-            if deadline.is_none() {
-                py.check_signals()?;
-            }
-            py.detach(|| std::thread::sleep(CLOSE_POLL_INTERVAL));
-        }
-
+    fn close_healthy(&mut self, py: Python<'_>) -> PyResult<()> {
         self.retire_ready(py)?;
         if let Some(resources) = self.kv_resources.as_mut() {
             resources.clear_prefix_cache().map_err(cache_pool_error)?;
@@ -2355,7 +2184,7 @@ impl Engine {
 
     fn prepare_scheduled_progress(
         &self,
-        rows: &mut [InFlightRow],
+        rows: &mut [BatchRow],
         output_token_ids: &[Vec<u32>],
     ) -> PyResult<Vec<PreparedProgress>> {
         if rows.len() != output_token_ids.len() {
@@ -2370,7 +2199,7 @@ impl Engine {
             let context = request.logical_context()?;
             if scheduled.phase != request.phase() || scheduled.token_start() != context {
                 return Err(PyRuntimeError::new_err(format!(
-                    "request {} progress changed while its batch was in flight",
+                    "request {} progress changed during its runner step",
                     request.id
                 )));
             }
@@ -2459,7 +2288,7 @@ impl Engine {
         Ok(prepared)
     }
 
-    fn apply_scheduled_progress(rows: &mut [InFlightRow], prepared: Vec<PreparedProgress>) {
+    fn apply_scheduled_progress(rows: &mut [BatchRow], prepared: Vec<PreparedProgress>) {
         assert_eq!(rows.len(), prepared.len());
         for (row, progress) in rows.iter_mut().zip(prepared) {
             if !progress.apply {
@@ -2490,8 +2319,7 @@ impl Drop for Engine {
             return;
         }
 
-        let deadline = Instant::now() + DROP_DRAIN_TIMEOUT;
-        match Python::try_attach(|py| self.close_healthy(py, Some(deadline))) {
+        match Python::try_attach(|py| self.close_healthy(py)) {
             Some(Ok(())) => {}
             Some(Err(error)) => {
                 self.poison("Engine destructor cleanup failed", &error);

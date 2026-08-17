@@ -141,22 +141,6 @@ impl ResourceBinding {
     }
 }
 
-pub(super) enum RunnerExecution {
-    Sync {
-        forward: Py<PyAny>,
-    },
-    Async {
-        dispatch: Py<PyAny>,
-        poll: Py<PyAny>,
-    },
-}
-
-impl RunnerExecution {
-    pub(super) fn is_async(&self) -> bool {
-        matches!(self, Self::Async { .. })
-    }
-}
-
 pub(super) struct ResolvedRunnerConfig {
     pub(super) config: RunnerConfig,
     binder: Option<Py<PyAny>>,
@@ -190,26 +174,10 @@ pub(super) fn runner_error_is_post_accept(py: Python<'_>, error: &PyErr) -> bool
 pub(super) fn resolve_runner_contract(
     py: Python<'_>,
     runner: &Bound<'_, PyAny>,
-) -> PyResult<(RunnerExecution, Option<Py<PyAny>>)> {
-    let dispatch = optional_runner_callable(py, runner, "dispatch")?;
-    let poll = optional_runner_callable(py, runner, "poll")?;
-    let execution = match (dispatch, poll) {
-        (Some(dispatch), Some(poll)) => RunnerExecution::Async { dispatch, poll },
-        (None, None) => {
-            let forward = optional_runner_callable(py, runner, "forward")?.ok_or_else(|| {
-                PyTypeError::new_err(
-                    "runner must define callable forward or callable dispatch and poll",
-                )
-            })?;
-            RunnerExecution::Sync { forward }
-        }
-        _ => {
-            return Err(PyTypeError::new_err(
-                "runner.dispatch and runner.poll must be supplied together",
-            ));
-        }
-    };
-    Ok((execution, optional_runner_callable(py, runner, "release")?))
+) -> PyResult<(Py<PyAny>, Option<Py<PyAny>>)> {
+    let forward = optional_runner_callable(py, runner, "forward")?
+        .ok_or_else(|| PyTypeError::new_err("runner must define callable forward"))?;
+    Ok((forward, optional_runner_callable(py, runner, "release")?))
 }
 
 pub(super) fn resolve_runner_config(

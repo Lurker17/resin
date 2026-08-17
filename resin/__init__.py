@@ -23,7 +23,6 @@ from resin._resin import (
     __version__,
 )
 from resin.protocols import (
-    AsyncRunner,
     ConversationCodec,
     MediaInput,
     MediaTokenSpan,
@@ -50,7 +49,6 @@ __all__ = [
     "SamplingParams",
     "SchedulerConfig",
     "TokenEvent",
-    "AsyncRunner",
     "ResourceRunner",
     "Runner",
     "SyncRunner",

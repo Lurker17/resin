@@ -138,13 +138,11 @@ requests can share a batch without sharing a random stream. The optional
 it but does not inspect it. Shared Torch and FlashInfer backend samplers consume
 the standard fields.
 
-## Dispatch and completion
+## Step and completion
 
-One Engine currently accepts at most one in-flight batch. `dispatch()` returns
-the new batch ID, or `None` when work cannot be dispatched because the queue is
-empty or a batch is already in flight. `poll()` returns an empty list while an
-asynchronous completion is pending. `step()` performs one dispatch attempt and
-then one poll.
+`step()` selects at most one batch, calls the runner synchronously, commits its
+result, and returns token events. It returns an empty list when the queue is
+empty or when a continuation-prefill step advances cache state without sampling.
 
 On successful completion Resin:
 
@@ -156,16 +154,15 @@ On successful completion Resin:
 6. returns survivors to the sticky admitted set;
 7. emits events for sampled rows.
 
-EOS and `max_new_tokens` are terminal conditions. A ready cancellation completes
-without dispatch. In-flight cancellation records intent and retires only after
-the accepted batch finishes.
+EOS and `max_new_tokens` are terminal conditions. Cancellation completes a ready
+request without running another model step.
 
 ## Failure semantics
 
 Failures before runner acceptance are transactional: temporary access is
 released and selected requests return to their original positions. Once the
-runner may have addressed cache or state storage, a protocol, polling, cleanup,
-or commit failure poisons the Engine. The accepted batch and its capabilities are
+runner may have addressed cache or state storage, a protocol, cleanup, or commit
+failure poisons the Engine. The accepted batch and its capabilities are
 quarantined rather than retried against reusable memory.
 
 This distinction is the scheduler's central safety rule: logical retry is only
@@ -176,5 +173,5 @@ allowed while Resin can prove that physical execution did not begin.
 Scheduling does not choose CUDA graph buckets, kernel shapes, or sampling
 kernels. Those remain runner concerns. Cache admission and request progress are
 Engine concerns; sampling offsets are derived from absolute sequence progress.
-The native scheduler is deliberately single-in-flight. Resin does not yet plan
-the next batch ahead or overlap prefill and decode dispatches.
+The native scheduler deliberately executes one synchronous step at a time.
+Resin does not yet plan the next batch ahead or overlap prefill and decode.

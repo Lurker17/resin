@@ -84,26 +84,17 @@ class SyncRunner(Protocol):
     def forward(self, plan: BatchPlan) -> RunnerOutput: ...
 
 
-class AsyncRunner(Protocol):
-    """Runner which schedules kernels and exposes an opaque completion."""
-
-    def dispatch(self, plan: BatchPlan) -> object: ...
-
-    def poll(self, completion: object) -> RunnerOutput | None: ...
-
-
 class ResourceRunner(Protocol):
-    """Optional persistent-resource declaration shared by either runner form."""
+    """Optional persistent-resource declaration for a runner."""
 
     runner_config: RunnerConfig
 
     def bind_resources(self, binding: ResourceBinding) -> None: ...
 
 
-Runner: TypeAlias = SyncRunner | AsyncRunner
+Runner: TypeAlias = SyncRunner
 
 __all__ = [
-    "AsyncRunner",
     "ConversationCodec",
     "MediaInput",
     "MediaTokenSpan",
