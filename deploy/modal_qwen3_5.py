@@ -15,10 +15,10 @@ from deploy.modal_image import build_modal_image
 from resin.backend.parallel import monitor_process_context
 
 ROOT = Path(__file__).resolve().parents[1]
-MODEL_ID = "Qwen/Qwen3.8-27B"
-MODEL_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+MODEL_ID = "RadixArk/Qwen3.8-27B-NVFP4"
+MODEL_REVISION = "554ebba9b5f1b79dc11246341960360e6ef05ef4"
 MODEL_MOUNT = "/models/resin-qwen3-5"
-MODEL_VOLUME_NAME = "resin-qwen3-5-models-v1"
+MODEL_VOLUME_NAME = "resin-qwen3-5-nvfp4-models-v1"
 KERNEL_MOUNT = "/kernel-cache/resin-qwen3-5"
 KERNEL_VOLUME_NAME = "resin-qwen3-5-kernels-v1"
 MODEL_PATH = Path(MODEL_MOUNT) / MODEL_REVISION
@@ -28,6 +28,7 @@ MAX_RUNNING_REQUESTS = 32
 MODEL_PATTERNS = (
     "config.json",
     "generation_config.json",
+    "hf_quant_config.json",
     "model*.safetensors",
     "model.safetensors.index.json",
     "chat_template.jinja",
@@ -79,6 +80,7 @@ def _inventory() -> dict[str, int]:
     required = [
         MODEL_PATH / "config.json",
         MODEL_PATH / "generation_config.json",
+        MODEL_PATH / "hf_quant_config.json",
         MODEL_PATH / "tokenizer.json",
         MODEL_PATH / "tokenizer_config.json",
         index_path,
@@ -178,7 +180,8 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
         "speculative_tokens": speculative_tokens,
         "reasoning_parser": "qwen3.5",
         "tool_call_parser": "qwen3.5",
-        "weight_dtype": "bfloat16",
+        "weight_quantization": runner.weight_quantization,
+        "nvfp4_backend": runner.nvfp4_backend,
         "kv_cache_dtype": runner.kv_cache_dtype,
         "cuda_graphs": False,
         "cache": asdict(runner.cache_capacity_plan),
