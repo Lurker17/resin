@@ -2518,7 +2518,6 @@ dependencies = [
     { name = "safetensors" },
     { name = "sgl-deep-gemm", marker = "sys_platform == 'linux'" },
     { name = "tilelang", marker = "sys_platform == 'linux'" },
-    { name = "tokenspeed-mla", marker = "sys_platform == 'linux'" },
     { name = "torch" },
     { name = "torchvision" },
     { name = "transformers" },
@@ -2541,7 +2540,6 @@ requires-dist = [
     { name = "safetensors", specifier = ">=0.5" },
     { name = "sgl-deep-gemm", marker = "sys_platform == 'linux'", specifier = "==0.1.5.post2" },
     { name = "tilelang", marker = "sys_platform == 'linux'", specifier = "==0.1.11" },
-    { name = "tokenspeed-mla", marker = "sys_platform == 'linux'", specifier = "==0.2.5" },
     { name = "torch", specifier = "==2.13.0" },
     { name = "torchvision", specifier = "==0.28.0" },
     { name = "transformers", specifier = ">=5.14.1" },
@@ -2802,32 +2800,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/fd/18/a545c4ea42af3df6effd7d13d250ba77a0a86fb20393143bbb9a92e434d4/tokenizers-0.22.2-cp39-abi3-win32.whl", hash = "sha256:a6bf3f88c554a2b653af81f3204491c818ae2ac6fbc09e76ef4773351292bc92", size = 2502363, upload-time = "2026-01-05T10:45:20.593Z" },
     { url = "https://files.pythonhosted.org/packages/65/71/0670843133a43d43070abeb1949abfdef12a86d490bea9cd9e18e37c5ff7/tokenizers-0.22.2-cp39-abi3-win_amd64.whl", hash = "sha256:c9ea31edff2968b44a88f97d784c2f16dc0729b8b143ed004699ebca91f05c48", size = 2747786, upload-time = "2026-01-05T10:45:18.411Z" },
     { url = "https://files.pythonhosted.org/packages/72/f4/0de46cfa12cdcbcd464cc59fde36912af405696f687e53a091fb432f694c/tokenizers-0.22.2-cp39-abi3-win_arm64.whl", hash = "sha256:9ce725d22864a1e965217204946f830c37876eee3b2ba6fc6255e8e903d5fcbc", size = 2612133, upload-time = "2026-01-05T10:45:17.232Z" },
-]
-
-[[package]]
-name = "tokenspeed-mla"
-version = "0.2.5"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "apache-tvm-ffi", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cutlass-dsl", marker = "sys_platform == 'linux'" },
-    { name = "tokenspeed-triton", marker = "sys_platform != 'darwin'" },
-    { name = "torch", marker = "sys_platform != 'darwin'" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b7/5b/8067395f415bebac92f909983b90137ba7b2fa89c045d3323f0577db63f5/tokenspeed_mla-0.2.5-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:c8bc6bd2fee8ed9369ae3129d9e1bf3067fae0b009e67d9908129b8a6a947672", size = 752462, upload-time = "2026-08-09T00:50:37.305Z" },
-    { url = "https://files.pythonhosted.org/packages/68/50/de595f2df20d52d2e12df5c2032a715a5ee07ae32f120b96e231b67dcbee/tokenspeed_mla-0.2.5-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:d112b0b4ffe84c0b396346d7c023aded906d3c2001619e1a1a87673121e43c70", size = 755951, upload-time = "2026-08-09T00:50:39.495Z" },
-]
-
-[[package]]
-name = "tokenspeed-triton"
-version = "3.8.10.post20260721"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/6b/ad/748a3b1b3e6559e3008c2dbfa4160c4356e5ff80d427e8eb25881bf42873/tokenspeed_triton-3.8.10.post20260721-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0868b11dc177a44e37cf052f4cf00b55a503672d6bf559689b71f58ebb1fd19d", size = 82963642, upload-time = "2026-07-21T17:14:31.324Z" },
-    { url = "https://files.pythonhosted.org/packages/a2/28/f96a19c3c09a9f39a3f86eeb7f64aeed3793bdfa033e406a5f5b1a90b606/tokenspeed_triton-3.8.10.post20260721-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c0b66e0587b925e4bfacaf56dd1edbaa149fd6456880387287bb8cda8cdadfbb", size = 87207488, upload-time = "2026-07-21T17:14:34.953Z" },
-    { url = "https://files.pythonhosted.org/packages/1d/44/89740db8951918c9acd8731243eef8b44d0eb92ea423552639265c46018e/tokenspeed_triton-3.8.10.post20260721-cp312-abi3-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d793ad0eaebb1d08272c97a2b8f2c31304231748b03de9a08e70a362de92a6e0", size = 82966664, upload-time = "2026-07-21T17:14:38.568Z" },
-    { url = "https://files.pythonhosted.org/packages/91/53/f46b401e8ec8998f5b9c39cff0614b796bf49113a09f588cfdfa342789a3/tokenspeed_triton-3.8.10.post20260721-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:66cba8d32a1539afd0ff3eec1782b082d01b4db6824d68017d1d789a03d0be37", size = 87210295, upload-time = "2026-07-21T17:14:42.173Z" },
 ]
 
 [[package]]

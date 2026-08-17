@@ -21,7 +21,6 @@ dependencies = [
   "triton==3.7.1; sys_platform == 'linux'",
   "tilelang==0.1.11; sys_platform == 'linux'",
   "flashinfer-python==0.6.15.post1; sys_platform == 'linux'",
-  "tokenspeed-mla==0.2.5; sys_platform == 'linux'",
   "flash-attn-4==4.0.0b26; sys_platform == 'linux'",
   "nvidia-cutlass-dsl==4.6.2; sys_platform == 'linux'",
   "nvidia-cutlass-dsl-libs-base==4.6.2; sys_platform == 'linux'",
