@@ -72,27 +72,6 @@ uv run modal setup
 `modal setup` is interactive and only needs to be repeated when the local
 Modal credentials change.
 
-Run the local LFM2 harness on an H100 with the native Engine:
-
-```bash
-uv run modal run deploy/modal_lfm2.py --mode run
-```
-
-Useful LFM2 validation modes are:
-
-```bash
-# Compare the eager baseline.
-uv run modal run deploy/modal_lfm2.py --mode baseline
-
-# Populate, then verify, the persistent FlashInfer kernel cache.
-uv run modal run deploy/modal_lfm2.py --mode prewarm
-uv run modal run deploy/modal_lfm2.py --mode verify
-uv run modal run deploy/modal_lfm2.py --mode probe
-
-# Exercise native continuation scheduling.
-uv run modal run deploy/modal_lfm2.py --mode native-continuation-probe
-```
-
 Run GPT-OSS from the flat-cache path as follows. The checkpoint step is
 explicit: GPU modes fail closed if the pinned model and tokenizer are not
 already in the Modal volume.
@@ -171,6 +150,10 @@ prompt rendering and response parsing stay in Python so they can follow model
 formats without coupling them to the native scheduler.
 
 ```bash
+# Run one LFM2 prompt in the terminal.
+uv run python scripts/lfm2_chat.py
+
+# Serve LFM2 locally over HTTP.
 uv sync --extra server
 uv run python scripts/lfm2_serve.py
 ```
@@ -178,6 +161,8 @@ uv run python scripts/lfm2_serve.py
 Then open <http://127.0.0.1:8000>. The page reports prompt and generated token
 counts, elapsed generation time, and output tokens per second. The same process
 serves `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, and `/v1/models`.
+Both scripts use PyTorch's automatically selected local device, falling back to
+the CPU when no accelerator is available.
 
 ## Modal HTTP endpoints
 
@@ -250,18 +235,14 @@ aligned prefix hit, the input checkpoint stays immutable while the next page is
 writable; the runner copies only when input and output pages differ. LRU entries
 use spare capacity in the same pool and are evicted when live requests need it.
 
-Implemented runner modules include a synchronous LFM2 reference and local CUDA
-implementations for LFM2, GPT-OSS, and DeepSeek-V4-Flash. The GPT-OSS CUDA path uses one
-History group and one Window group over the flat pool. Its deployment harness
-supports intra-container tensor parallel sizes 1, 2, 4, and 8, with matching
-multi-H200 allocations and reusable distributed decode CUDA graphs. Attention
-heads, KV storage, and MXFP4 expert intermediate dimensions are sharded; row
-parallel attention and expert outputs are reduced through one NCCL group.
-
-The LFM2 CUDA runner stores attention history and 128-token convolution-state
-checkpoints in the same fungible parent allocation. One KV page occupies a
-whole parent; six recurrent checkpoints fit in one parent. Its only execution
-route is synchronous `forward(plan)` over native Engine plans.
+Implemented runner modules include a synchronous PyTorch LFM2 reference and
+local CUDA implementations for GPT-OSS and DeepSeek-V4-Flash. The GPT-OSS CUDA
+path uses one History group and one Window group over the flat pool. Its
+deployment harness supports intra-container tensor parallel sizes 1, 2, 4, and
+8, with matching multi-H200 allocations and reusable distributed decode CUDA
+graphs. Attention heads, KV storage, and MXFP4 expert intermediate dimensions
+are sharded; row-parallel attention and expert outputs are reduced through one
+NCCL group.
 
 DeepSeek-V4 uses six logical groups over one fungible physical parent pool:
 sliding attention KV, c4 compressed history, the c4 compressor tail, c128

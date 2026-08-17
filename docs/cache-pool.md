@@ -59,12 +59,11 @@ slabs, the least-recently-used prefix is evicted. Advancing a shared Window or
 State ring uses copy-on-write so one request cannot overwrite another request's
 prefix.
 
-State groups use two checkpoint pages per live sequence. LFM2 checkpoints every
-128 tokens and caps each prefill chunk to the same interval. At a restored
-boundary, the cached input page remains read-only and the next checkpoint page
-is private and writable. Within a checkpoint interval, decode updates the
-private page in place. This keeps recurrent state prefix-compatible without a
-second slot allocator.
+State groups use two checkpoint pages per live sequence. At a restored boundary,
+the cached input page remains read-only and the next checkpoint page is private
+and writable. Within a checkpoint interval, decode updates the private page in
+place. This keeps recurrent state prefix-compatible without a second slot
+allocator.
 
 ## Physical sizing
 
@@ -74,12 +73,9 @@ target. Other runners may supply a fixed capacity. The slab byte size is the
 largest group allocation. Smaller groups set `blocks_per_slab` from their
 exact byte ratio, so the allocator can compare all demand in slab units.
 
-For LFM2, one BF16 attention KV page is 98,304 elements and one recurrent
-checkpoint is 16,384 elements, so six state checkpoints fit in one slab. The
-ratio is derived from model geometry rather than reserved as a fixed percentage
-of VRAM. DeepSeek-V4 similarly packs its smaller compressed-history and rolling
-state groups into the same slab size. GPT-OSS uses full-history and sliding
-attention groups with equal-sized pages.
+DeepSeek-V4 packs its smaller compressed-history and rolling state groups into
+the same slab size. GPT-OSS uses full-history and sliding attention groups with
+equal-sized pages.
 
 Slab zero is reserved as the device null target. Positive slab IDs are stable for
 the lifetime of the Engine-issued lease.
