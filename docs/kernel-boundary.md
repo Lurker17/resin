@@ -86,3 +86,5 @@ details rather than fields in the generic plan.
 An exception before work is accepted is retryable. An exception marked
 `_resin_post_accept = True` or a malformed result after execution quarantines
 the batch resources because GPU use may still exist.
+CUDA runners use `resin.backend.cuda.failures.CudaFailureGuard` to establish
+quiescence after an eager failure or apply that post-accept marker consistently.

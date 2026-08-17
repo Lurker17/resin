@@ -11,7 +11,6 @@ The runner has no request-ID cache map and no Python page allocator.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -39,6 +38,8 @@ from resin import (
     ResourceBinding,
     RunnerConfig,
 )
+from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
+from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
     CudaGraphCache,
     CudaGraphStats,
@@ -112,24 +113,7 @@ def _route(router: TopKRouter, logits: Tensor) -> tuple[Tensor, Tensor]:
     return indices, torch.softmax(values, dim=-1)
 
 
-class _PostAcceptCudaError(RuntimeError):
-    """Tell the native Engine that accepted CUDA work is not safely retryable."""
-
-    _resin_post_accept = True
-
-
-@dataclass(frozen=True, slots=True)
-class GptOssKvCapacityPlan:
-    """One-rank cache budget measured after model/static allocations."""
-
-    total_memory_bytes: int
-    free_memory_bytes: int
-    gpu_memory_utilization: float
-    protected_free_bytes: int
-    cache_budget_bytes: int
-    bytes_per_parent: int
-    parent_capacity: int
-    allocation_bytes: int
+GptOssKvCapacityPlan = CacheCapacityPlan
 
 
 def plan_gpt_oss_kv_capacity(
@@ -149,19 +133,11 @@ def plan_gpt_oss_kv_capacity(
     one shared physical parent pool and therefore need no capacity split.
     """
 
-    if total_memory_bytes <= 0 or not 0 < free_memory_bytes <= total_memory_bytes:
-        raise ValueError("CUDA memory totals must be positive and internally valid")
-    if not 0.0 < gpu_memory_utilization < 1.0:
-        raise ValueError("gpu_memory_utilization must be between zero and one")
     if attention_layers_per_group <= 0:
         raise ValueError("attention_layers_per_group must be positive")
     if _NUM_KV_HEADS % tensor_parallel_size:
         raise ValueError("tensor_parallel_size must divide GPT-OSS KV heads")
 
-    protected_free_bytes = math.ceil(
-        total_memory_bytes * (1.0 - gpu_memory_utilization)
-    )
-    cache_budget_bytes = free_memory_bytes - protected_free_bytes
     bytes_per_parent = (
         2
         * attention_layers_per_group
@@ -170,20 +146,11 @@ def plan_gpt_oss_kv_capacity(
         * _HEAD_DIM
         * _BF16_BYTES
     )
-    # The device slab contains parent zero as a permanent null/graph-capture
-    # page in addition to the positive parent IDs owned by the native pool.
-    parent_capacity = cache_budget_bytes // bytes_per_parent - 1
-    if parent_capacity <= 0:
-        raise MemoryError("GPT-OSS cache budget cannot hold its reserved parent")
-    return GptOssKvCapacityPlan(
-        total_memory_bytes=total_memory_bytes,
-        free_memory_bytes=free_memory_bytes,
-        gpu_memory_utilization=gpu_memory_utilization,
-        protected_free_bytes=protected_free_bytes,
-        cache_budget_bytes=cache_budget_bytes,
-        bytes_per_parent=bytes_per_parent,
-        parent_capacity=parent_capacity,
-        allocation_bytes=(parent_capacity + 1) * bytes_per_parent,
+    return plan_cache_capacity(
+        total_memory_bytes,
+        free_memory_bytes,
+        gpu_memory_utilization,
+        bytes_per_parent,
     )
 
 
@@ -242,6 +209,10 @@ class GptOssCudaRunner(SyncRunner):
         self.device = torch.device(device or default_device(torch, require_cuda=True))
         if self.device.type != "cuda":
             raise RuntimeError("GptOssCudaRunner requires CUDA")
+        self._cuda_failure = CudaFailureGuard(
+            lambda: torch.cuda.synchronize(self.device),
+            label="GPT-OSS eager execution",
+        )
         if torch.cuda.get_device_capability(self.device)[0] != 9:
             raise RuntimeError("the pinned GPT-OSS FA4 runner requires an SM90 GPU")
         decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
@@ -392,7 +363,7 @@ class GptOssCudaRunner(SyncRunner):
             self.device,
             decode_graph_shapes,
             build=self._new_decode_graph_step,
-            synchronize_failure=self._synchronize_failed_eager_forward,
+            synchronize_failure=self._cuda_failure,
         )
         # FA4's SM90 TMA path can load a complete physical page even when
         # ``seqused_k`` masks its unused tail.  Keep unwritten rows finite so a
@@ -468,21 +439,6 @@ class GptOssCudaRunner(SyncRunner):
         if binding.cache_pool_id is None or binding.cache_layout is None:
             raise ValueError("GPT-OSS requires a cache resource binding")
         self._kv.bind(binding.cache_pool_id, binding.cache_layout)
-
-    def _synchronize_failed_eager_forward(self) -> None:
-        """Make a launched eager failure quiescent or mark it post-accept."""
-
-        try:
-            # Every eager kernel is enqueued on PyTorch's current CUDA stream.
-            # Successful synchronization makes the shared parent allocation
-            # safe for exact retry or immediate native page retirement.
-            self._torch.cuda.synchronize(self.device)
-        except BaseException as synchronization_error:
-            raise _PostAcceptCudaError(
-                "GPT-OSS eager execution failed after launch and CUDA "
-                "quiescence could not be established; resources must remain "
-                "quarantined"
-            ) from synchronization_error
 
     def _tensorize(
         self, batch: AttentionBatch, staging: TensorStager, prefix: str
@@ -885,7 +841,7 @@ class GptOssCudaRunner(SyncRunner):
 
             return self._sampler(logits, plan).tolist()
         except BaseException:
-            self._synchronize_failed_eager_forward()
+            self._cuda_failure()
             raise
 
     def release(self, sequence_ids: list[int]) -> None:

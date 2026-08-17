@@ -20,6 +20,7 @@ from resin import (
     ResourceBinding,
     RunnerConfig,
 )
+from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.paged_kv import PagedKvCsr
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.cuda.staging import TensorStager
@@ -38,12 +39,6 @@ if TYPE_CHECKING:
 
 
 _STATE_CHECKPOINT_TOKENS = 128
-
-
-class _PostAcceptCudaError(RuntimeError):
-    """Tell the Engine that launched CUDA work could not be quiesced."""
-
-    _resin_post_accept = True
 
 
 class _Lfm2CacheArena:
@@ -159,6 +154,9 @@ class Lfm2CudaRunner(SyncRunner):
         self._sampler = FlashInferSampler(torch)
         self.device = torch.device("cuda")
         self._stream = torch.cuda.Stream(device=self.device)
+        self._cuda_failure = CudaFailureGuard(
+            self._stream.synchronize, label="LFM2 execution"
+        )
         self.page_size = page_size
         self.max_pages = max_pages
         self.model_path = resolve_model_path(model, revision)
@@ -598,17 +596,6 @@ class Lfm2CudaRunner(SyncRunner):
         ephemeral.extend((hidden, logits))
         return output
 
-    def _synchronize_failed_forward(self) -> None:
-        """Make a failed launch quiescent or force the Engine to quarantine it."""
-
-        try:
-            self._stream.synchronize()
-        except BaseException as synchronization_error:
-            raise _PostAcceptCudaError(
-                "LFM2 execution failed after launch and its CUDA stream could "
-                "not be quiesced; resources must remain quarantined"
-            ) from synchronization_error
-
     def forward(self, plan: BatchPlan) -> list[int]:
         """Execute one immutable Engine plan to completion."""
 
@@ -645,5 +632,5 @@ class Lfm2CudaRunner(SyncRunner):
             self._stream.synchronize()
             return output.tolist()
         except BaseException:
-            self._synchronize_failed_forward()
+            self._cuda_failure()
             raise

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -19,6 +18,8 @@ from resin import (
     ResourceBinding,
     RunnerConfig,
 )
+from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
+from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
     CudaGraphCache,
@@ -85,17 +86,7 @@ def _select_nvfp4_backend(requested: str, cudnn_version: int | None) -> str:
     return requested
 
 
-@dataclass(frozen=True, slots=True)
-class Gemma4KvCapacityPlan:
-    total_memory_bytes: int
-    free_memory_bytes: int
-    static_memory_fraction: float
-    protected_free_bytes: int
-    workspace_bytes: int
-    cache_budget_bytes: int
-    bytes_per_parent: int
-    parent_capacity: int
-    allocation_bytes: int
+Gemma4KvCapacityPlan = CacheCapacityPlan
 
 
 def plan_gemma4_kv_capacity(
@@ -106,36 +97,17 @@ def plan_gemma4_kv_capacity(
     workspace_bytes: int = _DEFAULT_WORKSPACE_BYTES,
     cache_element_bytes: int = 1,
 ) -> Gemma4KvCapacityPlan:
-    if total_memory_bytes <= 0 or not 0 < free_memory_bytes <= total_memory_bytes:
-        raise ValueError("CUDA memory totals must be positive and internally valid")
-    if not 0.0 < static_memory_fraction < 1.0:
-        raise ValueError("static_memory_fraction must be between zero and one")
-    if workspace_bytes < 0:
-        raise ValueError("workspace_bytes cannot be negative")
     if cache_element_bytes not in {1, 2}:
         raise ValueError("cache_element_bytes must be one or two")
     # One parent holds all 50 local layers for one 64-token page. Global
     # history pages use an equal-sized, differently shaped view of a parent.
     bytes_per_parent = 2 * 50 * PAGE_SIZE * 16 * 256 * cache_element_bytes
-    protected_free_bytes = math.ceil(
-        total_memory_bytes * (1.0 - static_memory_fraction)
-    )
-    cache_budget_bytes = free_memory_bytes - protected_free_bytes - workspace_bytes
-    # Parent zero is a permanent graph-only null page. Native Engine page IDs
-    # remain positive and map directly into the remaining physical slab.
-    parent_capacity = cache_budget_bytes // bytes_per_parent - 1
-    if parent_capacity <= 0:
-        raise ValueError("GPU memory budget leaves no room for Gemma 4 KV cache")
-    return Gemma4KvCapacityPlan(
-        total_memory_bytes=total_memory_bytes,
-        free_memory_bytes=free_memory_bytes,
-        static_memory_fraction=static_memory_fraction,
-        protected_free_bytes=protected_free_bytes,
-        workspace_bytes=workspace_bytes,
-        cache_budget_bytes=cache_budget_bytes,
-        bytes_per_parent=bytes_per_parent,
-        parent_capacity=parent_capacity,
-        allocation_bytes=(parent_capacity + 1) * bytes_per_parent,
+    return plan_cache_capacity(
+        total_memory_bytes,
+        free_memory_bytes,
+        static_memory_fraction,
+        bytes_per_parent,
+        overhead_bytes=workspace_bytes,
     )
 
 
@@ -227,6 +199,10 @@ class Gemma4CudaRunner(SyncRunner):
         self.device = torch.device(device or default_device(torch, require_cuda=True))
         if self.device.type != "cuda":
             raise RuntimeError("Gemma4CudaRunner requires CUDA")
+        self._cuda_failure = CudaFailureGuard(
+            lambda: torch.cuda.synchronize(self.device),
+            label="Gemma 4 eager execution",
+        )
         capability = torch.cuda.get_device_capability(self.device)
         if capability not in {(10, 0), (10, 3), (11, 0), (12, 0), (12, 1)}:
             raise RuntimeError(
@@ -311,7 +287,7 @@ class Gemma4CudaRunner(SyncRunner):
             self.device,
             decode_graph_shapes,
             build=self._new_decode_graph_step,
-            synchronize_failure=lambda: torch.cuda.synchronize(self.device),
+            synchronize_failure=self._cuda_failure,
         )
 
         self.cache_layout = CacheLayout(
@@ -1680,13 +1656,17 @@ class Gemma4CudaRunner(SyncRunner):
                 return graph_output
         elif self._graphs.shapes:
             self._graphs.fallback("prefill")
-        hidden = self._eager_transformer(plan, batch)
-        self._store_last_hidden(plan, batch, hidden)
-        last = torch.as_tensor(
-            batch.last_token_indices, dtype=torch.int64, device=self.device
-        )
-        logits = self._model.logits(hidden[last])
-        return self._sample_target(logits, plan, 0).tolist()
+        try:
+            hidden = self._eager_transformer(plan, batch)
+            self._store_last_hidden(plan, batch, hidden)
+            last = torch.as_tensor(
+                batch.last_token_indices, dtype=torch.int64, device=self.device
+            )
+            logits = self._model.logits(hidden[last])
+            return self._sample_target(logits, plan, 0).tolist()
+        except BaseException:
+            self._cuda_failure()
+            raise
 
 
 __all__ = [

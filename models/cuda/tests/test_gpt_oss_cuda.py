@@ -332,23 +332,6 @@ class TestGptOssCudaNativePlan:
         with pytest.raises(ValueError, match="exceeds 8192"):
             build_attention_batches(_flat_plan([0], [PREFILL_CHUNK_SIZE + 1]))
 
-    def test_failed_eager_work_must_quiesce_or_be_post_accept(self) -> None:
-        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        synchronized = []
-        runner.device = "cuda:0"
-        runner._torch = SimpleNamespace(
-            cuda=SimpleNamespace(synchronize=lambda device: synchronized.append(device))
-        )
-        runner._synchronize_failed_eager_forward()
-        assert synchronized == ["cuda:0"]
-
-        runner._torch.cuda.synchronize = lambda device: (_ for _ in ()).throw(
-            RuntimeError(f"{device} synchronize failed")
-        )
-        with pytest.raises(RuntimeError, match="quarantined") as caught:
-            runner._synchronize_failed_eager_forward()
-        assert getattr(caught.value, "_resin_post_accept", None) is True
-
     def test_cuda_attention_has_no_fp32_promotion_or_kv_head_expansion(self) -> None:
         source = inspect.getsource(GptOssCudaRunner._attention)
         assert ".float(" not in source

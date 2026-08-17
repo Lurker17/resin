@@ -19,6 +19,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from resin import BatchPhase, ResourceBinding, RunnerConfig
+from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
     CudaGraphCache,
     CudaGraphStats,
@@ -114,6 +115,10 @@ class DeepSeekV4CudaRunner(SyncRunner):
         self.device = torch.device(device or f"cuda:{tensor_parallel.rank}")
         if self.device.type != "cuda":
             raise RuntimeError("DeepSeekV4CudaRunner requires a CUDA device")
+        self._cuda_failure = CudaFailureGuard(
+            lambda: torch.cuda.synchronize(self.device),
+            label="DeepSeek-V4 eager execution",
+        )
         torch.cuda.set_device(self.device)
         if torch.cuda.get_device_capability(self.device)[0] < 10:
             raise RuntimeError("the DeepSeek-V4 runner requires Blackwell")
@@ -166,7 +171,7 @@ class DeepSeekV4CudaRunner(SyncRunner):
             self.device,
             decode_graph_shapes,
             build=self._new_decode_graph_step,
-            synchronize_failure=lambda: torch.cuda.synchronize(self.device),
+            synchronize_failure=self._cuda_failure,
         )
         # Import only after CUDA validation: importing this module initializes
         # cuTile and is intentionally not part of Resin's CPU package path.
@@ -742,7 +747,7 @@ class DeepSeekV4CudaRunner(SyncRunner):
                 output = self._sample_target(logits, plan, 0)
             return output.tolist()
         except BaseException:
-            torch.cuda.synchronize(self.device)
+            self._cuda_failure()
             raise
 
     def release(self, sequence_ids: list[int]) -> None:

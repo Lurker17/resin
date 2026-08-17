@@ -10,6 +10,8 @@ import numpy as np
 import numpy.typing as npt
 
 from resin import BatchPhase, CacheGroupLayout, CacheLayout, CacheRetention
+from resin.backend.capacity import CacheCapacityPlan
+from resin.backend.capacity import plan_cache_capacity as plan_capacity
 from resin.backend.plans import BatchView, CacheGroupView
 from resin.backend.resources import CachePoolBinding
 
@@ -238,22 +240,6 @@ class CacheGeometry:
 
         return self.parent_rows * 512 * 2
 
-@dataclass(frozen=True, slots=True)
-class CacheCapacityPlan:
-    """One-rank cache budget measured after model/static allocations."""
-
-    total_memory_bytes: int
-    free_memory_bytes: int
-    gpu_memory_utilization: float
-    protected_free_bytes: int
-    cache_budget_bytes: int
-    bytes_per_parent: int
-    reserved_parent_count: int
-    parent_capacity: int
-    allocation_bytes: int
-    packings: tuple[int, ...]
-
-
 def plan_cache_capacity(
     total_memory_bytes: int,
     free_memory_bytes: int,
@@ -264,32 +250,12 @@ def plan_cache_capacity(
 ) -> CacheCapacityPlan:
     """Apply TokenSpeed's post-load free-memory budget to Resin's parent pool."""
 
-    if total_memory_bytes <= 0 or not 0 < free_memory_bytes <= total_memory_bytes:
-        raise ValueError("CUDA memory totals must be positive and internally valid")
-    if not 0 < gpu_memory_utilization < 1:
-        raise ValueError("gpu_memory_utilization must be between zero and one")
-    if reserved_parent_count <= 0:
-        raise ValueError("reserved_parent_count must include at least the null parent")
-    protected = math.ceil(total_memory_bytes * (1.0 - gpu_memory_utilization))
-    budget = free_memory_bytes - protected
-    physical_parents = budget // geometry.bytes_per_parent
-    parent_capacity = physical_parents - reserved_parent_count
-    if parent_capacity <= 0:
-        raise MemoryError(
-            "DeepSeek cache budget cannot hold its reserved and usable parents"
-        )
-    allocation = (parent_capacity + reserved_parent_count) * geometry.bytes_per_parent
-    return CacheCapacityPlan(
+    return plan_capacity(
         total_memory_bytes,
         free_memory_bytes,
         gpu_memory_utilization,
-        protected,
-        budget,
         geometry.bytes_per_parent,
-        reserved_parent_count,
-        parent_capacity,
-        allocation,
-        geometry.packings,
+        reserved_parent_count=reserved_parent_count,
     )
 
 
