@@ -5,9 +5,12 @@ import pytest
 
 from resin.backend.cuda import staging
 from resin.backend.cuda.graphs import (
+    DEFAULT_DECODE_GRAPH_MAX_BATCH_SIZE,
+    DEFAULT_MAX_NUM_SEQS,
     CudaGraphCache,
     CudaGraphStep,
     GraphInputError,
+    default_decode_graph_shapes,
     graph_shapes,
 )
 
@@ -133,6 +136,42 @@ def _cache(torch, shapes, build, synchronize_failure=lambda: None):
 
 
 class TestCudaGraph:
+    def test_shared_decode_defaults_use_one_history_capacity(self) -> None:
+        assert DEFAULT_MAX_NUM_SEQS == 128
+        assert DEFAULT_DECODE_GRAPH_MAX_BATCH_SIZE == 1024
+        assert default_decode_graph_shapes(4096, speculative=True) == tuple(
+            (batch_size, 4096)
+            for batch_size in (
+                *range(1, 9),
+                *range(12, 33, 4),
+                *range(40, 65, 8),
+                *range(96, 257, 32),
+                *range(384, 1025, 128),
+            )
+        )
+        assert default_decode_graph_shapes(4096, speculative=False) == tuple(
+            (batch_size, 4096)
+            for batch_size in (
+                1,
+                2,
+                4,
+                8,
+                *range(12, 17, 4),
+                *range(24, 33, 8),
+                *range(64, 129, 32),
+                *range(256, 1025, 128),
+            )
+        )
+
+    def test_shared_decode_defaults_respect_lower_sequence_limit(self) -> None:
+        assert default_decode_graph_shapes(
+            128, speculative=True, max_batch_size=16
+        ) == tuple((batch_size, 128) for batch_size in (*range(1, 9), 12, 16))
+        for name, value in (("width", 0), ("max_batch_size", True)):
+            arguments = {"width": 8, "max_batch_size": 128, name: value}
+            with pytest.raises(ValueError, match=name):
+                default_decode_graph_shapes(speculative=True, **arguments)
+
     def test_shapes_are_frozen_sorted_and_validated(self) -> None:
         assert graph_shapes(None, dimensions=2) == ()
         assert graph_shapes({2: 8, 1: 4}, dimensions=2) == ((1, 4), (2, 8))

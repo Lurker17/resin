@@ -252,9 +252,6 @@ pub enum CachePoolError {
     InvalidParentCapacity,
     EmptyGroupLayout,
     TooManyGroups,
-    KernelPageIdOverflow {
-        group: GroupId,
-    },
     PoolIdExhausted,
     WriterIdExhausted,
     MetadataAllocation,
@@ -299,11 +296,6 @@ impl fmt::Display for CachePoolError {
                 formatter.write_str("cache pool requires at least one cache group")
             }
             Self::TooManyGroups => formatter.write_str("cache pool has too many groups"),
-            Self::KernelPageIdOverflow { group } => write!(
-                formatter,
-                "cache group {} exceeds the signed int32 kernel page-id range",
-                group.index()
-            ),
             Self::PoolIdExhausted => formatter.write_str("cache pool id space is exhausted"),
             Self::WriterIdExhausted => {
                 formatter.write_str("cache pool writer id space is exhausted")
@@ -657,14 +649,6 @@ impl CachePool {
         if group_packings.len() > u32::MAX as usize {
             return Err(CachePoolError::TooManyGroups);
         }
-        for (index, packing) in group_packings.iter().enumerate() {
-            let max_page_id = u64::from(parent_capacity) * u64::from(packing.get());
-            if max_page_id > i32::MAX as u64 {
-                return Err(CachePoolError::KernelPageIdOverflow {
-                    group: GroupId::new(index as u32),
-                });
-            }
-        }
         let id = NEXT_POOL_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
@@ -724,6 +708,13 @@ impl CachePool {
 
     pub const fn occupied_block_count(&self) -> usize {
         self.occupied_blocks
+    }
+
+    /// Resolve a live page capability into its device-facing physical address.
+    /// Parent zero remains reserved for each runner's null page.
+    pub fn physical_address(&self, handle: PageHandle) -> Result<(u32, u32), CachePoolError> {
+        self.validate_live_handle(handle)?;
+        Ok((handle.parent, handle.slot))
     }
 
     #[cfg(test)]
@@ -1275,18 +1266,6 @@ impl CachePool {
         }
     }
 
-    /// Translate a pool handle into the dense page id consumed by one group's
-    /// device view.  Page zero remains the null page.
-    pub fn kernel_page_id(&self, handle: PageHandle) -> Result<u32, CachePoolError> {
-        self.validate_live_handle(handle)?;
-        let packing = self.blocks_per_parent(handle.group)?.get();
-        let page_id =
-            1u64 + u64::from(handle.parent - 1) * u64::from(packing) + u64::from(handle.slot);
-        u32::try_from(page_id).map_err(|_| CachePoolError::KernelPageIdOverflow {
-            group: handle.group,
-        })
-    }
-
     fn plan_partition(
         &self,
         plan: &mut PlacementPlan,
@@ -1694,17 +1673,17 @@ mod tests {
     }
 
     #[test]
-    fn group_packing_maps_children_to_dense_kernel_page_ids() {
+    fn group_packing_exposes_physical_parent_and_child_slots() {
         let mut pool = CachePool::new(2, &[nz(3)]).unwrap();
         let pending = pool
             .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 4)])
             .unwrap();
-        let page_ids = pending.groups()[0]
+        let addresses = pending.groups()[0]
             .pages()
             .iter()
-            .map(|page| pool.kernel_page_id(page.handle()).unwrap())
+            .map(|page| pool.physical_address(page.handle()).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(page_ids, vec![1, 2, 3, 4]);
+        assert_eq!(addresses, vec![(1, 0), (1, 1), (1, 2), (2, 0)]);
         assert_eq!(pool.free_parent_count(), 0);
         assert_eq!(pool.occupied_block_count(), 4);
         pool.abort_request(pending);
@@ -1938,7 +1917,7 @@ mod tests {
         assert_eq!(fresh.slot(), stale.slot());
         assert!(fresh.generation() > stale.generation());
         assert_eq!(
-            pool.kernel_page_id(stale).unwrap_err(),
+            pool.physical_address(stale).unwrap_err(),
             CachePoolError::StaleHandle
         );
         pool.abort_request(replacement);
@@ -2030,18 +2009,18 @@ mod tests {
         let mut foreign_handle = live;
         foreign_handle.pool_id = foreign.id();
         assert_eq!(
-            foreign.kernel_page_id(live).unwrap_err(),
+            foreign.physical_address(live).unwrap_err(),
             CachePoolError::ForeignPool
         );
         assert_eq!(
-            pool.kernel_page_id(foreign_handle).unwrap_err(),
+            pool.physical_address(foreign_handle).unwrap_err(),
             CachePoolError::ForeignPool
         );
 
         let mut wrong_group = live;
         wrong_group.group = GroupId::new(1);
         assert_eq!(
-            pool.kernel_page_id(wrong_group).unwrap_err(),
+            pool.physical_address(wrong_group).unwrap_err(),
             CachePoolError::ParentGroupMismatch {
                 handle_group: GroupId::new(1),
                 bound_group: GroupId::new(0),
@@ -2053,7 +2032,7 @@ mod tests {
             .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
         assert_eq!(
-            pool.kernel_page_id(live).unwrap_err(),
+            pool.physical_address(live).unwrap_err(),
             CachePoolError::StaleHandle
         );
         pool.abort_request(replacement);

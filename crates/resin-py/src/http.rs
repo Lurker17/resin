@@ -177,7 +177,13 @@ fn run_server(
     let (jobs, receiver) = mpsc::unbounded_channel();
     let actor = thread::Builder::new()
         .name("resin-http-engine".to_owned())
-        .spawn(move || engine_actor(engine, codec, receiver))
+        .spawn(move || {
+            let result = engine_actor(engine, codec, receiver);
+            if let Err(error) = &result {
+                eprintln!("[resin-http] inference actor failed: {error}");
+            }
+            result
+        })
         .map_err(|error| format!("failed to start the inference thread: {error}"))?;
     let server_result = runtime.block_on(resin_http::serve(listener, model, jobs, routes));
     let actor_result = actor

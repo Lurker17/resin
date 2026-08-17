@@ -172,8 +172,8 @@ class TestEngine:
 
         assert [event.token_id for event in events] == [3, 4, 5]
         decode = runner.plans[1]
-        assert len(decode.cache_groups[0].block_ids) == 2
-        assert len(decode.cache_groups[0].append_block_ids) == 1
+        assert len(decode.cache_groups[0].block_parent_ids) == 2
+        assert len(decode.cache_groups[0].append_parent_ids) == 1
         assert request.take_result() == [2, 3, 4, 5]
 
     def test_verified_block_stops_at_eos_and_discards_its_suffix(self) -> None:
@@ -312,10 +312,14 @@ class TestEngine:
         assert group.group_index == 0
         assert group.block_indptr.tolist() == [0, 2]
         assert group.first_logical_blocks.tolist() == [0]
-        assert group.append_block_ids.tolist() == [
-            int(group.block_ids[0]),
-            int(group.block_ids[0]),
-            int(group.block_ids[1]),
+        blocks = list(zip(group.block_parent_ids, group.block_child_slots, strict=True))
+        appends = list(
+            zip(group.append_parent_ids, group.append_child_slots, strict=True)
+        )
+        assert appends == [
+            blocks[0],
+            blocks[0],
+            blocks[1],
         ]
         assert group.append_block_offsets.tolist() == [0, 1, 0]
 
@@ -323,8 +327,22 @@ class TestEngine:
         decode = runner.plans[1]
         assert decode.context_lengths.tolist() == [3]
         decode_group = decode.cache_groups[0]
-        assert decode_group.block_ids.tolist() == group.block_ids.tolist()
-        assert decode_group.append_block_ids.tolist() == [int(group.block_ids[1])]
+        decode_blocks = list(
+            zip(
+                decode_group.block_parent_ids,
+                decode_group.block_child_slots,
+                strict=True,
+            )
+        )
+        decode_appends = list(
+            zip(
+                decode_group.append_parent_ids,
+                decode_group.append_child_slots,
+                strict=True,
+            )
+        )
+        assert decode_blocks == blocks
+        assert decode_appends == [blocks[1]]
         assert decode_group.append_block_offsets.tolist() == [1]
 
         assert runner.released == [request]

@@ -25,23 +25,26 @@ from resin_models_cuda.gpt_oss.plan import (
 
 def _group_plan(group_index, rows, first_logical_blocks, positions, indptr):
     block_indptr = [0]
-    block_ids = []
-    append_block_ids = []
+    block_parent_ids = []
+    append_parent_ids = []
     append_block_offsets = []
     for sequence_index, row in enumerate(rows):
-        block_ids.extend(row)
-        block_indptr.append(len(block_ids))
+        block_parent_ids.extend(row)
+        block_indptr.append(len(block_parent_ids))
         first = first_logical_blocks[sequence_index]
         token_start, token_end = indptr[sequence_index : sequence_index + 2]
         for position in positions[token_start:token_end]:
-            append_block_ids.append(row[position // 128 - first])
+            append_parent_ids.append(row[position // 128 - first])
             append_block_offsets.append(position % 128)
     return SimpleNamespace(
         group_index=group_index,
+        blocks_per_parent=1,
         block_indptr=block_indptr,
-        block_ids=block_ids,
+        block_parent_ids=block_parent_ids,
+        block_child_slots=[0] * len(block_parent_ids),
         first_logical_blocks=list(first_logical_blocks),
-        append_block_ids=append_block_ids,
+        append_parent_ids=append_parent_ids,
+        append_child_slots=[0] * len(append_parent_ids),
         append_block_offsets=append_block_offsets,
     )
 
@@ -292,7 +295,7 @@ class TestGptOssCudaNativePlan:
 
     def test_frozen_append_destinations_are_a_validation_oracle(self) -> None:
         plan = _prefill_plan()
-        plan.cache_groups[1].append_block_ids[0] += 1
+        plan.cache_groups[1].append_parent_ids[0] += 1
         with pytest.raises(ValueError, match="append destinations"):
             build_attention_batches(plan)
 
@@ -308,8 +311,8 @@ class TestGptOssCudaNativePlan:
             build_attention_batches(plan)
 
         plan = _flat_plan([0], [1])
-        plan.cache_groups[1].block_ids[0] = plan.cache_groups[0].block_ids[0]
-        plan.cache_groups[1].append_block_ids[0] = plan.cache_groups[0].block_ids[0]
+        plan.cache_groups[1].block_parent_ids[0] = plan.cache_groups[0].block_parent_ids[0]
+        plan.cache_groups[1].append_parent_ids[0] = plan.cache_groups[0].block_parent_ids[0]
         with pytest.raises(ValueError, match="cannot address"):
             build_attention_batches(plan)
 

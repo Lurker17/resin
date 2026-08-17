@@ -91,22 +91,30 @@ class _Lfm2CacheArena:
     def bind(self, pool_id: int, layout) -> int:
         return self.binding.bind(pool_id, layout)
 
-    def check_pages(self, group: int, page_ids) -> None:
-        capacity = self.parent_capacity * (1 if group == 0 else self.state_packing)
-        if any(page <= 0 or page > capacity for page in page_ids):
-            raise ValueError("BatchPlan cache page is outside the physical arena")
+    def check_addresses(self, group: int, parents, child_slots) -> None:
+        packing = 1 if group == 0 else self.state_packing
+        if len(parents) != len(child_slots) or any(
+            parent <= 0
+            or parent > self.parent_capacity
+            or child_slot < 0
+            or child_slot >= packing
+            for parent, child_slot in zip(parents, child_slots)
+        ):
+            raise ValueError("BatchPlan cache address is outside the physical arena")
 
-    def state(self, page_id: int):
-        index = page_id - 1
-        return self._state[index // self.state_packing, index % self.state_packing]
+    def state(self, address: tuple[int, int]):
+        parent, child_slot = address
+        return self._state[parent - 1, child_slot]
 
 
 class _StateRow:
-    __slots__ = ("input_page", "output_page")
+    __slots__ = ("input_address", "output_address")
 
-    def __init__(self, input_page: int | None, output_page: int) -> None:
-        self.input_page = input_page
-        self.output_page = output_page
+    def __init__(
+        self, input_address: tuple[int, int] | None, output_address: tuple[int, int]
+    ) -> None:
+        self.input_address = input_address
+        self.output_address = output_address
 
 
 class _InPlaceRecurrentState:
@@ -265,23 +273,31 @@ class Lfm2CudaRunner(AsyncRunner):
         if len(groups) != 2 or tuple(group.group_index for group in groups) != (0, 1):
             raise ValueError("BatchPlan does not contain LFM2 history and state groups")
         derived = build_cache_metadata(plan, self.page_size)
-        self._cache.check_pages(0, derived.block_ids)
+        self._cache.check_addresses(
+            0,
+            plan.cache_groups[0].block_parent_ids,
+            plan.cache_groups[0].block_child_slots,
+        )
         return derived
 
     def _state_rows(self, plan: BatchPlan) -> tuple[_StateRow, ...]:
         group = plan.cache_groups[1]
+        if group.blocks_per_parent != self._cache.state_packing:
+            raise ValueError("LFM2 State packing does not match the physical arena")
         block_indptr = group.block_indptr
-        block_ids = group.block_ids
+        block_parents = group.block_parent_ids
+        block_child_slots = group.block_child_slots
         first_blocks = group.first_logical_blocks
         rows = plan.num_sequences
         if (
             len(block_indptr) != rows + 1
             or block_indptr[0] != 0
-            or block_indptr[-1] != len(block_ids)
+            or block_indptr[-1] != len(block_parents)
+            or len(block_parents) != len(block_child_slots)
             or len(first_blocks) != rows
         ):
             raise ValueError("LFM2 state page table is malformed")
-        self._cache.check_pages(1, block_ids)
+        self._cache.check_addresses(1, block_parents, block_child_slots)
         result = []
         for index, context in enumerate(plan.context_lengths):
             context = int(context)
@@ -289,30 +305,35 @@ class Lfm2CudaRunner(AsyncRunner):
             post_length = context + token_end - token_start
             first = int(first_blocks[index])
             page_start, page_end = map(int, block_indptr[index : index + 2])
-            pages = block_ids[page_start:page_end]
+            addresses = tuple(
+                zip(
+                    map(int, block_parents[page_start:page_end]),
+                    map(int, block_child_slots[page_start:page_end]),
+                )
+            )
 
-            def page(logical: int) -> int:
+            def address(logical: int) -> tuple[int, int]:
                 column = logical - first
-                if column < 0 or column >= len(pages):
+                if column < 0 or column >= len(addresses):
                     raise ValueError("LFM2 state table does not cover a checkpoint")
-                return int(pages[column])
+                return addresses[column]
 
-            input_page = (
+            input_address = (
                 None
                 if context == 0
-                else page((context - 1) // _STATE_CHECKPOINT_TOKENS)
+                else address((context - 1) // _STATE_CHECKPOINT_TOKENS)
             )
-            output_page = page((post_length - 1) // _STATE_CHECKPOINT_TOKENS)
-            result.append(_StateRow(input_page, output_page))
+            output_address = address((post_length - 1) // _STATE_CHECKPOINT_TOKENS)
+            result.append(_StateRow(input_address, output_address))
         return tuple(result)
 
     def _prepare_state_rows(self, rows: tuple[_StateRow, ...]) -> None:
         for row in rows:
-            output = self._cache.state(row.output_page)
-            if row.input_page is None:
+            output = self._cache.state(row.output_address)
+            if row.input_address is None:
                 output.zero_()
-            elif row.input_page != row.output_page:
-                output.copy_(self._cache.state(row.input_page))
+            elif row.input_address != row.output_address:
+                output.copy_(self._cache.state(row.input_address))
 
     def _metadata(
         self,
@@ -332,7 +353,7 @@ class Lfm2CudaRunner(AsyncRunner):
             staging.tensors(
                 {
                     "block_indptr": (derived.block_indptr, torch.int32),
-                    "block_ids": (derived.block_ids, torch.int32),
+                    "page_indices": (derived.page_indices, torch.int32),
                     "last_block_lengths": (derived.last_block_lengths, torch.int32),
                     "append_batch_indices": (
                         derived.append_batch_indices,
@@ -403,7 +424,7 @@ class Lfm2CudaRunner(AsyncRunner):
                         derived.decode_block_indptr,
                         torch.int32,
                     ),
-                    "decode_block_ids": (derived.decode_block_ids, torch.int32),
+                    "decode_page_indices": (derived.decode_page_indices, torch.int32),
                     "decode_last_block_lengths": (
                         derived.decode_last_block_lengths,
                         torch.int32,
@@ -414,7 +435,7 @@ class Lfm2CudaRunner(AsyncRunner):
         )
         metadata["paged_kv"] = PagedKvCsr(
             metadata["block_indptr"],
-            metadata["block_ids"],
+            metadata["page_indices"],
             metadata["last_block_lengths"],
             metadata["append_batch_indices"],
             metadata["append_positions"],
@@ -427,7 +448,7 @@ class Lfm2CudaRunner(AsyncRunner):
             return False
         self._decode.plan(
             metadata["decode_block_indptr"],
-            metadata["decode_block_ids"],
+            metadata["decode_page_indices"],
             metadata["decode_last_block_lengths"],
             self.num_query_heads,
             self.num_kv_heads,
@@ -536,7 +557,7 @@ class Lfm2CudaRunner(AsyncRunner):
         outputs = []
         for index, row in enumerate(recurrent_rows):
             start, end = map(int, plan.token_indptr[index : index + 2])
-            state = self._cache.state(row.output_page)[conv_slot].unsqueeze(0)
+            state = self._cache.state(row.output_address)[conv_slot].unsqueeze(0)
             cache = _InPlaceRecurrentState(state)
             # The facade turns ShortConv's ``state.value = next_state`` into an
             # in-place copy and therefore cannot detach this generation from its

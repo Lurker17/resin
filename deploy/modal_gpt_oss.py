@@ -39,7 +39,11 @@ from deploy.jit_cache import (
 )
 from deploy.modal_image import build_modal_image
 from resin import Engine, SamplingParams, SchedulerConfig, TokenEvent
-from resin.backend.cuda.graphs import CudaGraphStats
+from resin.backend.cuda.graphs import (
+    DEFAULT_MAX_NUM_SEQS,
+    CudaGraphStats,
+    default_decode_graph_shapes,
+)
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.server import HttpServer, RendererCodec
 
@@ -1106,9 +1110,10 @@ def _serve_http_rank(
         model_path,
         None,
         tensor_parallel,
-        cuda_graph_decode_shapes=tuple(
-            (batch_size, _required_history_width(131072, 1))
-            for batch_size in range(1, 9)
+        cuda_graph_decode_shapes=default_decode_graph_shapes(
+            _required_history_width(131072, 1),
+            speculative=False,
+            max_batch_size=DEFAULT_MAX_NUM_SEQS,
         ),
     )
     if rank == 0:
@@ -1141,7 +1146,7 @@ def _serve_http_rank(
     print("[http-startup] creating engine and binding shared cache...", flush=True)
     engine = Engine(
         engine_runner,
-        max_running_requests=8,
+        max_running_requests=DEFAULT_MAX_NUM_SEQS,
         context_length=131072,
         eos_token_id=runner.eos_token_id,
         prefix_cache=True,
@@ -1203,7 +1208,10 @@ def _start_http_server(model_key: str) -> None:
     scaledown_window=15 * 60,
     max_containers=1,
 )
-@modal.concurrent(max_inputs=32, target_inputs=8)
+@modal.concurrent(
+    max_inputs=DEFAULT_MAX_NUM_SEQS,
+    target_inputs=DEFAULT_MAX_NUM_SEQS,
+)
 @modal.web_server(
     8000,
     startup_timeout=60 * 60,
@@ -1223,7 +1231,10 @@ def serve_gpt_oss_20b() -> None:
     scaledown_window=15 * 60,
     max_containers=1,
 )
-@modal.concurrent(max_inputs=32, target_inputs=8)
+@modal.concurrent(
+    max_inputs=DEFAULT_MAX_NUM_SEQS,
+    target_inputs=DEFAULT_MAX_NUM_SEQS,
+)
 @modal.web_server(
     8000,
     startup_timeout=60 * 60,

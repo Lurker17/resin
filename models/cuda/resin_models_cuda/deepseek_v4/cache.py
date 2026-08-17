@@ -171,9 +171,13 @@ class CacheGeometry:
             )
             * alignment
         )
+        # Verification writes the anchor plus every draft before acceptance is
+        # known. Keep the ordinary attention window and that uncommitted tail
+        # resident together, even when their union straddles three pages.
+        window_tokens = window_size + decode_input_tokens - 1
         return cls(
             attention_layers,
-            window_size,
+            window_tokens,
             c4_state_tokens,
             compressed_cursors[4],
             tuple(compressed_offsets),
@@ -233,36 +237,6 @@ class CacheGeometry:
 
         return self.parent_rows * 512 * 2
 
-    def child_base(self, group: int, page: int) -> int:
-        packing = self.packings[group]
-        child_rows = self.parent_rows // packing
-        parent = (page - 1) // packing + 1
-        child = (page - 1) % packing
-        return parent * self.parent_rows + child * child_rows
-
-    def window_row(self, page: int, layer: int, offset: int) -> int:
-        return self.child_base(WINDOW_GROUP, page) + layer * PAGE_TOKENS + offset
-
-    def compressed_row(self, page: int, layer: int, offset: int, ratio: int) -> int:
-        base = self.compressed_offsets[layer]
-        if base is None:
-            raise ValueError("layer has no compressed cache")
-        group = C4_KV_GROUP if ratio == 4 else C128_KV_GROUP
-        return self.child_base(group, page) + base + offset // ratio
-
-    def index_row(self, page: int, layer: int, offset: int) -> int:
-        base = self.index_offsets[layer]
-        if base is None:
-            raise ValueError("layer has no index cache")
-        # The index pool views each 512D parent row as four contiguous 128D rows.
-        return (
-            self.child_base(C4_KV_GROUP, page) * 4
-            + self.index_base_rows * 4
-            + base
-            + offset // 4
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class CacheCapacityPlan:
     """One-rank cache budget measured after model/static allocations."""
@@ -320,7 +294,8 @@ def plan_cache_capacity(
 
 @dataclass(frozen=True, slots=True)
 class GroupPlan:
-    pages: tuple[npt.NDArray[np.uint32], ...]
+    parent_ids: tuple[npt.NDArray[np.uint32], ...]
+    child_slots: tuple[npt.NDArray[np.uint32], ...]
     first_blocks: npt.NDArray[np.uint32]
 
 
@@ -331,7 +306,8 @@ class CachePlan:
 
 @dataclass(frozen=True, slots=True)
 class DeviceGroup:
-    pages: object
+    parent_ids: object
+    child_slots: object
     first_blocks: object
 
 
@@ -339,7 +315,8 @@ class DeviceGroup:
 class DeviceMapping:
     """Raw page-table geometry consumed directly by CUDA kernels."""
 
-    pages: object
+    parent_ids: object
+    child_slots: object
     first_blocks: object
     block_tokens: int
     divisor: int
@@ -367,7 +344,8 @@ class DeviceCache:
             self.geometry,
             tuple(
                 DeviceGroup(
-                    group.pages[index : index + 1],
+                    group.parent_ids[index : index + 1],
+                    group.child_slots[index : index + 1],
                     group.first_blocks[index : index + 1],
                 )
                 for group in self.groups
@@ -397,7 +375,8 @@ class DeviceCache:
                 row_scale=row_scale,
             )
             return paged_cache_rows(
-                mapping.pages,
+                mapping.parent_ids,
+                mapping.child_slots,
                 mapping.first_blocks,
                 positions,
                 block_tokens=mapping.block_tokens,
@@ -412,22 +391,21 @@ class DeviceCache:
         columns = logical_blocks - table.first_blocks.view(
             (-1,) + (1,) * (positions.ndim - 1)
         )
-        flat = columns.flatten(1).clamp(0, table.pages.shape[1] - 1)
-        pages = self.torch.gather(table.pages, 1, flat).view_as(columns)
+        flat = columns.flatten(1).clamp(0, table.parent_ids.shape[1] - 1)
+        parents = self.torch.gather(table.parent_ids, 1, flat).view_as(columns)
+        children = self.torch.gather(table.child_slots, 1, flat).view_as(columns)
         packing = self.geometry.packings[group]
         child_rows = self.geometry.parent_rows // packing
-        parents = (pages - 1).div(packing, rounding_mode="floor") + 1
-        children = (pages - 1).remainder(packing)
         offsets = positions.remainder(block_tokens).div(divisor, rounding_mode="floor")
         physical = (
             parents * self.geometry.parent_rows + children * child_rows
         ) * row_scale
         physical = physical + layer_offset + offsets
-        in_table = (columns >= 0) & (columns < table.pages.shape[1])
+        in_table = (columns >= 0) & (columns < table.parent_ids.shape[1])
         # Parent/page zero is a real, permanently zeroed graph-padding target.
         # It maps to physical row zero; out-of-table logical positions remain
         # sparse-index sentinels.
-        physical = self.torch.where(pages > 0, physical, 0)
+        physical = self.torch.where(parents > 0, physical, 0)
         return self.torch.where(in_table, physical, -1).to(self.torch.int32)
 
     def mapping(
@@ -443,7 +421,8 @@ class DeviceCache:
 
         table = self.groups[group]
         return DeviceMapping(
-            table.pages,
+            table.parent_ids,
+            table.child_slots,
             table.first_blocks,
             block_tokens,
             divisor,
@@ -538,7 +517,8 @@ class DeviceCache:
             from resin_models_cuda.deepseek_v4.cutile import paged_state_locations
 
             return paged_state_locations(
-                table.pages,
+                table.parent_ids,
+                table.child_slots,
                 table.first_blocks,
                 positions,
                 block_tokens=block_tokens,
@@ -548,11 +528,14 @@ class DeviceCache:
         columns = logical_blocks - table.first_blocks.view(
             (-1,) + (1,) * (positions.ndim - 1)
         )
-        flat = columns.flatten(1).clamp(0, table.pages.shape[1] - 1)
-        pages = self.torch.gather(table.pages, 1, flat).view_as(columns)
+        flat = columns.flatten(1).clamp(0, table.parent_ids.shape[1] - 1)
+        parents = self.torch.gather(table.parent_ids, 1, flat).view_as(columns)
+        children = self.torch.gather(table.child_slots, 1, flat).view_as(columns)
         packing = self.geometry.packings[group]
-        physical_children = self.torch.where(pages > 0, pages + packing - 1, 0)
-        valid = (columns >= 0) & (columns < table.pages.shape[1])
+        physical_children = self.torch.where(
+            parents > 0, parents * packing + children, 0
+        )
+        valid = (columns >= 0) & (columns < table.parent_ids.shape[1])
         physical_children = self.torch.where(valid, physical_children, -1)
         offsets = self.torch.where(valid, positions.remainder(block_tokens), 0)
         return physical_children.to(self.torch.int32), offsets.to(self.torch.int32)
@@ -581,28 +564,36 @@ def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> Cac
     groups = []
     for group_index, (source, descriptor) in enumerate(zip(native, layout.groups)):
         block_indptr = np.asarray(source.block_indptr, dtype=np.uint32)
-        block_ids = np.asarray(source.block_ids, dtype=np.uint32)
+        parent_ids = np.asarray(source.block_parent_ids, dtype=np.uint32)
+        child_slots = np.asarray(source.block_child_slots, dtype=np.uint32)
         first = np.asarray(source.first_logical_blocks, dtype=np.uint32)
-        append_pages = np.asarray(source.append_block_ids, dtype=np.uint32)
+        append_parents = np.asarray(source.append_parent_ids, dtype=np.uint32)
+        append_slots = np.asarray(source.append_child_slots, dtype=np.uint32)
         append_offsets = np.asarray(source.append_block_offsets, dtype=np.uint32)
         block_tokens = descriptor.block_tokens
-        capacity = layout.group_kernel_page_capacity(group_index)
+        packing = descriptor.blocks_per_parent
         if (
             source.group_index != group_index
+            or source.blocks_per_parent != packing
             or len(block_indptr) != rows + 1
             or block_indptr[0] != 0
-            or block_indptr[-1] != len(block_ids)
+            or block_indptr[-1] != len(parent_ids)
+            or len(child_slots) != len(parent_ids)
             or len(first) != rows
-            or len(append_pages) != len(positions)
+            or len(append_parents) != len(positions)
+            or len(append_slots) != len(positions)
             or len(append_offsets) != len(positions)
-            or np.any(block_ids == 0)
-            or np.any(append_pages == 0)
-            or np.any(block_ids > capacity)
-            or np.any(append_pages > capacity)
+            or np.any(parent_ids == 0)
+            or np.any(append_parents == 0)
+            or np.any(parent_ids > layout.parent_capacity)
+            or np.any(append_parents > layout.parent_capacity)
+            or np.any(child_slots >= packing)
+            or np.any(append_slots >= packing)
             or np.any(append_offsets >= block_tokens)
         ):
             raise ValueError(f"DeepSeek cache group {group_index} is malformed")
-        page_rows = []
+        parent_rows = []
+        slot_rows = []
         for row in range(rows):
             start, end = indptr[row : row + 2]
             start = int(start)
@@ -619,10 +610,11 @@ def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> Cac
             else:
                 expected_first = 0
             page_start, page_end = map(int, block_indptr[row : row + 2])
-            row_pages = block_ids[page_start:page_end]
+            row_parents = parent_ids[page_start:page_end]
+            row_slots = child_slots[page_start:page_end]
             if (
                 int(first[row]) != expected_first
-                or len(row_pages) != last - expected_first + 1
+                or len(row_parents) != last - expected_first + 1
             ):
                 raise ValueError("DeepSeek cache row has the wrong logical extent")
             row_positions = positions[start:end]
@@ -632,14 +624,17 @@ def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> Cac
             # a large prefill; only their retained tail is materialized.
             relative = logical[retained] - expected_first
             if not np.array_equal(
-                append_pages[start:end][retained], row_pages[relative]
+                append_parents[start:end][retained], row_parents[relative]
+            ) or not np.array_equal(
+                append_slots[start:end][retained], row_slots[relative]
             ) or not np.array_equal(
                 append_offsets[start:end][retained],
                 row_positions[retained] % block_tokens,
             ):
                 raise ValueError("DeepSeek cache append target is not row-owned")
-            page_rows.append(row_pages)
-        groups.append(GroupPlan(tuple(page_rows), first))
+            parent_rows.append(row_parents)
+            slot_rows.append(row_slots)
+        groups.append(GroupPlan(tuple(parent_rows), tuple(slot_rows), first))
     return CachePlan(tuple(groups))
 
 
@@ -722,18 +717,27 @@ class CacheArena:
         torch = self.torch
         groups = []
         for index, group in enumerate(plan.groups):
-            width = max(map(len, group.pages))
+            width = max(map(len, group.parent_ids))
             # Keep the dynamic width in one cuTile divisibility class. Merely
             # rounding to 16 is insufficient: 128, 192, and 256 produce three
             # progressively stronger JIT assumptions. Every value here is 16
             # modulo 32, so its exact power-of-two divisor is always 16.
             width = (width + 15) // 32 * 32 + 16
-            padded = np.zeros((len(group.pages), width), dtype=np.uint32)
-            for row_index, row in enumerate(group.pages):
-                padded[row_index, : len(row)] = row
+            parents = np.zeros((len(group.parent_ids), width), dtype=np.uint32)
+            slots = np.zeros_like(parents)
+            for row_index, (row_parents, row_slots) in enumerate(
+                zip(group.parent_ids, group.child_slots, strict=True)
+            ):
+                parents[row_index, : len(row_parents)] = row_parents
+                slots[row_index, : len(row_slots)] = row_slots
             groups.append(
                 DeviceGroup(
-                    staging.device(f"cache.{index}.pages", padded, torch.int32),
+                    staging.device(
+                        f"cache.{index}.parent_ids", parents, torch.int32
+                    ),
+                    staging.device(
+                        f"cache.{index}.child_slots", slots, torch.int32
+                    ),
                     staging.device(
                         f"cache.{index}.first_blocks",
                         group.first_blocks,
@@ -770,6 +774,11 @@ class CacheArena:
                         device=self.storage.device,
                     ),
                     self.torch.empty(
+                        (batch_size, width),
+                        dtype=self.torch.int32,
+                        device=self.storage.device,
+                    ),
+                    self.torch.empty(
                         batch_size,
                         dtype=self.torch.int32,
                         device=self.storage.device,
@@ -788,7 +797,8 @@ class CacheArena:
     def graph_device_inputs(cache: DeviceCache) -> dict[str, object]:
         inputs = {}
         for index, group in enumerate(cache.groups):
-            inputs[f"cache.{index}.pages"] = group.pages
+            inputs[f"cache.{index}.parent_ids"] = group.parent_ids
+            inputs[f"cache.{index}.child_slots"] = group.child_slots
             inputs[f"cache.{index}.first_blocks"] = group.first_blocks
         return inputs
 
@@ -797,10 +807,11 @@ class CacheArena:
     ) -> dict[str, object]:
         inputs = {}
         for index, width in enumerate(self._graph_widths(sequence_capacity)):
-            packing = self.geometry.packings[index]
             parent = self.binding.layout.parent_capacity + index + 1
-            page = (parent - 1) * packing + 1
-            inputs[f"cache.{index}.pages"] = (page,) * (batch_size * width)
+            inputs[f"cache.{index}.parent_ids"] = (parent,) * (
+                batch_size * width
+            )
+            inputs[f"cache.{index}.child_slots"] = (0,) * (batch_size * width)
             inputs[f"cache.{index}.first_blocks"] = (0,) * batch_size
         return inputs
 
@@ -808,16 +819,21 @@ class CacheArena:
     def graph_plan_inputs(cache: DeviceCache, plan: CachePlan) -> dict[str, object]:
         inputs = {}
         for index, (target, source) in enumerate(zip(cache.groups, plan.groups)):
-            width = target.pages.shape[1]
-            padding_rows = target.pages.shape[0] - len(source.pages)
+            width = target.parent_ids.shape[1]
+            padding_rows = target.parent_ids.shape[0] - len(source.parent_ids)
             if padding_rows < 0:
                 raise ValueError("DeepSeek cache batch exceeds CUDA graph capacity")
-            if any(len(row) > width for row in source.pages):
+            if any(len(row) > width for row in source.parent_ids):
                 raise ValueError("DeepSeek cache table exceeds CUDA graph capacity")
-            padded = np.zeros(target.pages.shape, dtype=np.uint32)
-            for row_index, row in enumerate(source.pages):
-                padded[row_index, : len(row)] = row
-            inputs[f"cache.{index}.pages"] = padded
+            parents = np.zeros(target.parent_ids.shape, dtype=np.uint32)
+            slots = np.zeros_like(parents)
+            for row_index, (row_parents, row_slots) in enumerate(
+                zip(source.parent_ids, source.child_slots, strict=True)
+            ):
+                parents[row_index, : len(row_parents)] = row_parents
+                slots[row_index, : len(row_slots)] = row_slots
+            inputs[f"cache.{index}.parent_ids"] = parents
+            inputs[f"cache.{index}.child_slots"] = slots
             inputs[f"cache.{index}.first_blocks"] = np.pad(
                 source.first_blocks, (0, padding_rows)
             )

@@ -59,12 +59,18 @@ class _CacheGroup:
         packing: int,
         parent_capacity: int | None,
     ) -> _CacheGroup:
+        if native.blocks_per_parent != packing:
+            raise ValueError("cache group packing does not match Gemma 4 layout")
+        block_parents = np.asarray(native.block_parent_ids, dtype=np.int64)
+        block_slots = np.asarray(native.block_child_slots, dtype=np.int64)
+        append_parents = np.asarray(native.append_parent_ids, dtype=np.int64)
+        append_slots = np.asarray(native.append_child_slots, dtype=np.int64)
         group = cls(
             index=index,
             indptr=np.asarray(native.block_indptr, dtype=np.int64),
-            pages=np.asarray(native.block_ids, dtype=np.int64),
+            pages=block_parents * packing + block_slots,
             first_blocks=np.asarray(native.first_logical_blocks, dtype=np.int64),
-            append_pages=np.asarray(native.append_block_ids, dtype=np.int64),
+            append_pages=append_parents * packing + append_slots,
             append_offsets=np.asarray(native.append_block_offsets, dtype=np.int64),
             packing=packing,
             parent_capacity=parent_capacity,
@@ -77,21 +83,26 @@ class _CacheGroup:
             or group.indptr[-1] != len(group.pages)
             or np.any(group.indptr[1:] < group.indptr[:-1])
             or len(group.first_blocks) != rows
+            or len(block_parents) != len(block_slots)
+            or len(append_parents) != len(append_slots)
         ):
             raise ValueError("cache group CSR metadata is malformed")
         if len(group.append_pages) != tokens or len(group.append_offsets) != tokens:
             raise ValueError("cache append metadata does not cover every token")
-        maximum = None if parent_capacity is None else parent_capacity * packing
         if (
-            np.any(group.pages <= 0)
-            or np.any(group.append_pages <= 0)
+            np.any(block_parents <= 0)
+            or np.any(append_parents <= 0)
+            or np.any(block_slots < 0)
+            or np.any(block_slots >= packing)
+            or np.any(append_slots < 0)
+            or np.any(append_slots >= packing)
             or np.any(group.append_offsets < 0)
             or np.any(group.append_offsets >= PAGE_SIZE)
             or (
-                maximum is not None
+                parent_capacity is not None
                 and (
-                    np.any(group.pages > maximum)
-                    or np.any(group.append_pages > maximum)
+                    np.any(block_parents > parent_capacity)
+                    or np.any(append_parents > parent_capacity)
                 )
             )
         ):

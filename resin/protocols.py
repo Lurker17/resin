@@ -49,7 +49,7 @@ class RenderedPrompt(TypedDict):
 
     token_ids: list[int]
     stop_token_ids: list[int]
-    media: NotRequired[object]
+    media: NotRequired[MediaInput]
 
 
 class ParserEvent(TypedDict, total=False):

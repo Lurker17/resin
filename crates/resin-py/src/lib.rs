@@ -421,7 +421,9 @@ impl BatchPlan {
                     "each cache group must contain one block-table segment per sequence",
                 ));
             }
-            if group.append_block_ids.len() != self.token_ids.len() {
+            if group.append_parent_ids.len() != self.token_ids.len()
+                || group.append_child_slots.len() != self.token_ids.len()
+            {
                 return Err(PyValueError::new_err(
                     "each cache group must contain one append target per batch token",
                 ));
@@ -429,12 +431,19 @@ impl BatchPlan {
             for sequence_index in 0..self.sequence_ids.len() {
                 let block_start = group.block_indptr[sequence_index] as usize;
                 let block_end = group.block_indptr[sequence_index + 1] as usize;
-                let row_blocks = &group.block_ids[block_start..block_end];
+                let row_parents = &group.block_parent_ids[block_start..block_end];
+                let row_slots = &group.block_child_slots[block_start..block_end];
                 let token_start = self.token_indptr[sequence_index] as usize;
                 let token_end = self.token_indptr[sequence_index + 1] as usize;
-                if group.append_block_ids[token_start..token_end]
+                if group.append_parent_ids[token_start..token_end]
                     .iter()
-                    .any(|page_id| !row_blocks.contains(page_id))
+                    .zip(&group.append_child_slots[token_start..token_end])
+                    .any(|(append_parent, append_slot)| {
+                        !row_parents
+                            .iter()
+                            .zip(row_slots)
+                            .any(|(parent, slot)| parent == append_parent && slot == append_slot)
+                    })
                 {
                     return Err(PyValueError::new_err(
                         "cache append targets must belong to their sequence's block table",
@@ -2605,12 +2614,12 @@ mod tests {
         assert_eq!(plan.cache_groups.len(), 2);
         let full = &plan.cache_groups[0];
         assert_eq!(full.inner_native().block_indptr, [0, 2]);
-        assert_eq!(full.inner_native().block_ids.len(), 2);
+        assert_eq!(full.inner_native().block_parent_ids.len(), 2);
         assert_eq!(full.inner_native().first_logical_blocks, [0]);
         assert_eq!(full.inner_native().append_block_offsets, [0, 1]);
         let fine = &plan.cache_groups[1];
         assert_eq!(fine.inner_native().block_indptr, [0, 3]);
-        assert_eq!(fine.inner_native().block_ids.len(), 3);
+        assert_eq!(fine.inner_native().block_parent_ids.len(), 3);
         assert_eq!(fine.inner_native().append_block_offsets, [0, 1]);
 
         assert_eq!(acquired.lease.len(), 5);
@@ -2631,7 +2640,7 @@ mod tests {
         let physical = pages.groups()[0]
             .pages()
             .iter()
-            .map(|page| resources.pool().kernel_page_id(page.handle()).unwrap())
+            .map(|page| resources.pool().physical_address(page.handle()).unwrap())
             .collect::<Vec<_>>();
         let mut managed = request(
             51,
@@ -2654,10 +2663,21 @@ mod tests {
         let window = &plan.cache_groups[0];
         assert_eq!(window.inner_native().first_logical_blocks, [1]);
         assert_eq!(window.inner_native().block_indptr, [0, 2]);
-        assert_eq!(window.inner_native().block_ids, [physical[1], physical[0]]);
         assert_eq!(
-            window.inner_native().append_block_ids,
-            [physical[0], physical[0], physical[0], physical[0]]
+            window.inner_native().block_parent_ids,
+            [physical[1].0, physical[0].0]
+        );
+        assert_eq!(
+            window.inner_native().block_child_slots,
+            [physical[1].1, physical[0].1]
+        );
+        assert_eq!(
+            window.inner_native().append_parent_ids,
+            [physical[0].0, physical[0].0, physical[0].0, physical[0].0]
+        );
+        assert_eq!(
+            window.inner_native().append_child_slots,
+            [physical[0].1, physical[0].1, physical[0].1, physical[0].1]
         );
         assert_eq!(window.inner_native().append_block_offsets, [0, 1, 2, 3]);
 
@@ -2688,8 +2708,18 @@ mod tests {
         let rows = schedule_ready_prefix(&scheduled, SchedulerConfig::default(), None).unwrap();
         let mut plan = build_plan(1, &scheduled, &rows, None).unwrap();
         plan.cache_groups = vec![
-            CacheGroupPlan::from_parts(1, vec![0, 1], vec![7], vec![0], vec![7, 7], vec![0, 1])
-                .unwrap(),
+            CacheGroupPlan::from_parts(
+                1,
+                vec![0, 1],
+                vec![7],
+                vec![0],
+                vec![0],
+                vec![7, 7],
+                vec![0, 0],
+                vec![0, 1],
+                1,
+            )
+            .unwrap(),
         ];
         assert!(BatchPlan::checked(plan).is_err());
     }

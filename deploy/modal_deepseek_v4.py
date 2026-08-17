@@ -511,19 +511,24 @@ def _run_rank_workload(
                     sort_by="self_cuda_time_total",
                     row_limit=30,
                 )
-            for request in profile_requests:
-                while engine.has_work():
-                    engine.step()
-                request.take_result()
+            while engine.has_work():
+                engine.step()
+            profile_outputs = [request.take_result() for request in profile_requests]
             tensor_parallel.barrier()
             before_prefix = engine.prefix_cache_stats
+            continuation_rows = [
+                [*row, *output_ids, 0]
+                for row, output_ids in zip(
+                    prompt_rows, profile_outputs, strict=True
+                )
+            ]
             probes = [
                 engine.submit(
-                    [*row, 0],
+                    row,
                     max_new_tokens=1,
                     sampling_params=SamplingParams(temperature=0.0),
                 )
-                for row in prompt_rows
+                for row in continuation_rows
             ]
             while engine.has_work():
                 engine.step()
@@ -535,12 +540,28 @@ def _run_rank_workload(
                 or after_prefix[1] <= before_prefix[1]
             ):
                 raise RuntimeError("DeepSeek prefix-cache continuation did not hit")
+            engine.clear_prefix_cache()
+            fresh_probes = [
+                engine.submit(
+                    row,
+                    max_new_tokens=1,
+                    sampling_params=SamplingParams(temperature=0.0),
+                )
+                for row in continuation_rows
+            ]
+            while engine.has_work():
+                engine.step()
+            fresh_outputs = [probe.take_result() for probe in fresh_probes]
+            if probe_outputs != fresh_outputs:
+                raise RuntimeError(
+                    "DeepSeek prefix-cache continuation differs from full prefill"
+                )
             prefix_cache_validation = {
                 "before": before_prefix,
                 "after": after_prefix,
                 "output_tokens": tuple(map(len, probe_outputs)),
+                "fresh_parity": True,
             }
-            engine.clear_prefix_cache()
             if rank == 0:
                 print(
                     f"[deepseek-v4] prefix continuation passed: {prefix_cache_validation}",

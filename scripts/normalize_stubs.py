@@ -13,19 +13,23 @@ PARAMETERS = {
         "token_ids": U32_INPUT,
         "token_indptr": U32_INPUT,
         "sampling_mask": "Sequence[bool] | npt.NDArray[np.bool_] | None",
+        "media": "Sequence[MediaInput | None] | None",
     },
     ("CacheGroupPlan", "__new__"): {
         name: U32_INPUT
         for name in (
             "block_indptr",
-            "block_ids",
+            "block_parent_ids",
+            "block_child_slots",
             "first_logical_blocks",
-            "append_block_ids",
+            "append_parent_ids",
+            "append_child_slots",
             "append_block_offsets",
         )
     },
     ("Engine", "__new__"): {"runner": "Runner"},
     ("Engine", "cancel"): {"request": "RequestLease"},
+    ("Engine", "submit"): {"media": "MediaInput | None"},
     ("_HttpServer", "__new__"): {"codec": "ConversationCodec"},
 }
 
@@ -47,9 +51,11 @@ RETURNS = {
                 "CacheGroupPlan",
                 (
                     "block_indptr",
-                    "block_ids",
+                    "block_parent_ids",
+                    "block_child_slots",
                     "first_logical_blocks",
-                    "append_block_ids",
+                    "append_parent_ids",
+                    "append_child_slots",
                     "append_block_offsets",
                 ),
             ),
@@ -59,6 +65,7 @@ RETURNS = {
     ("BatchPlan", "sampling_mask"): "npt.NDArray[np.bool_]",
     ("BatchPlan", "cache_groups"): "tuple[CacheGroupPlan, ...]",
     ("BatchPlan", "sampling_params"): "tuple[SamplingParams, ...]",
+    ("BatchPlan", "media"): "tuple[MediaInput | None, ...]",
     ("CacheLayout", "groups"): "tuple[CacheGroupLayout, ...]",
 }
 
@@ -185,7 +192,7 @@ def import_edits(
         additions.append("import numpy as np")
     if not has_numpy_typing:
         additions.append("import numpy.typing as npt")
-    missing_protocols = {"ConversationCodec", "Runner"} - protocol_names
+    missing_protocols = {"ConversationCodec", "MediaInput", "Runner"} - protocol_names
     if missing_protocols:
         additions.append(
             f"from resin.protocols import {', '.join(sorted(missing_protocols))}"

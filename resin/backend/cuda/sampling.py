@@ -84,7 +84,7 @@ class FlashInferSampler:
     def sample_tensors(self, logits, tensors: SamplingTensors, *, out=None):
         greedy = logits.argmax(dim=-1)
         probabilities = self._softmax(logits, temperature=tensors.temperatures)
-        sampled = self._sample(
+        sampled, valid = self._sample(
             probabilities,
             tensors.top_ks,
             tensors.top_ps,
@@ -92,7 +92,12 @@ class FlashInferSampler:
             deterministic=True,
             seed=tensors.seeds,
             offset=tensors.offsets,
-        ).to(dtype=greedy.dtype)
+            return_valid=True,
+        )
+        sampled = sampled.to(dtype=greedy.dtype)
+        in_range = (sampled >= 0) & (sampled < logits.shape[-1])
+        safe_sampled = sampled.clamp(0, logits.shape[-1] - 1)
+        sampled = self.torch.where(valid & in_range, safe_sampled, greedy)
         result = self.torch.where(tensors.stochastic_mask, sampled, greedy)
         if out is None:
             return result

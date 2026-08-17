@@ -18,21 +18,25 @@ demand for every request and group, including packing, before admitting work.
 
 The runner allocates the matching device arena once and receives its pool ID and
 frozen layout through `bind_resources`. A `BatchPlan` does not repeat that
-identity. It contains only the ordered `CacheGroupPlan`s whose page IDs address
-the already-bound arena.
+identity. It contains only the ordered `CacheGroupPlan`s whose structured
+physical addresses refer to the already-bound arena.
 
 ## Batch plans
 
 Each group plan has one CSR page table:
 
-- `block_indptr` slices `block_ids` by sequence.
+- `block_indptr` slices the parallel `block_parent_ids` and
+  `block_child_slots` arrays by sequence.
 - `first_logical_blocks` names the first logical block in each sequence table.
-- `append_block_ids` and `append_block_offsets` give one write destination per
-  scheduled token.
+- `append_parent_ids`, `append_child_slots`, and `append_block_offsets` give one
+  write destination per scheduled token.
 
 The Engine allocates pages, performs copy-on-write decisions, and holds the
 reader/writer lease until asynchronous execution is terminal. Model code only
-turns the supplied indices into kernel metadata.
+turns each `(physical_parent, child_slot)` pair into its model-specific tensor
+row. Parent zero remains reserved for inactive/null rows; live parent IDs are
+one-based. Keeping the address structured prevents runners from silently
+assuming a different child packing than the allocator.
 
 ## Prefix caching
 

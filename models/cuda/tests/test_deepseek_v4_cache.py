@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
+import numpy as np
 import torch
 
-from resin import CacheRetention
+from resin import BatchPhase, CacheRetention
 from resin_models_cuda.deepseek_v4.cache import (
     C4_STATE_GROUP,
     CacheArena,
     CacheGeometry,
+    build_cache_plan,
     plan_cache_capacity,
 )
 
@@ -27,6 +30,7 @@ def test_deepseek_groups_use_tokenspeed_power_of_two_packing() -> None:
     geometry = _geometry()
 
     assert geometry.attention_layers == 46
+    assert geometry.window_tokens == 133
     assert geometry.c4_state_tokens == 12
     assert geometry.packings == (1, 4, 8, 256, 8, 32)
     assert geometry.parent_rows == 5_888
@@ -43,12 +47,16 @@ def test_deepseek_groups_use_tokenspeed_power_of_two_packing() -> None:
         CacheRetention.WINDOW,
     )
     assert tuple(group.blocks_per_parent for group in groups) == geometry.packings
+    assert groups[0].window_tokens == 133
+    assert groups[0].window_resident_block_count == 3
 
 
 def test_non_speculative_c4_tail_only_retains_its_logical_window() -> None:
     geometry = _geometry(decode_input_tokens=1)
 
+    assert geometry.window_tokens == 128
     assert geometry.c4_state_tokens == 8
+    assert geometry.layout(10).groups[0].window_resident_block_count == 2
     assert geometry.layout(10).groups[C4_STATE_GROUP].window_tokens == 8
 
 
@@ -81,6 +89,47 @@ def test_graph_capture_uses_group_private_scratch_parents() -> None:
     inputs = arena.graph_shape_capture_inputs(2, 256)
 
     assert arena.storage.shape[0] == layout.parent_capacity + 7
-    for group, packing in enumerate(geometry.packings):
-        expected_page = (layout.parent_capacity + group) * packing + 1
-        assert set(inputs[f"cache.{group}.pages"]) == {expected_page}
+    for group in range(len(geometry.packings)):
+        expected_parent = layout.parent_capacity + group + 1
+        assert set(inputs[f"cache.{group}.parent_ids"]) == {expected_parent}
+        assert set(inputs[f"cache.{group}.child_slots"]) == {0}
+
+
+def test_plan_preserves_structured_parent_and_child_addresses() -> None:
+    layout = _geometry().layout(10)
+    cache_groups = tuple(
+        SimpleNamespace(
+            group_index=index,
+            blocks_per_parent=descriptor.blocks_per_parent,
+            block_indptr=np.array([0, 1], dtype=np.uint32),
+            block_parent_ids=np.array([index + 1], dtype=np.uint32),
+            block_child_slots=np.array(
+                [min(index, descriptor.blocks_per_parent - 1)], dtype=np.uint32
+            ),
+            first_logical_blocks=np.array([0], dtype=np.uint32),
+            append_parent_ids=np.array([index + 1], dtype=np.uint32),
+            append_child_slots=np.array(
+                [min(index, descriptor.blocks_per_parent - 1)], dtype=np.uint32
+            ),
+            append_block_offsets=np.array([0], dtype=np.uint32),
+        )
+        for index, descriptor in enumerate(layout.groups)
+    )
+    plan = SimpleNamespace(
+        num_sequences=1,
+        token_indptr=np.array([0, 1], dtype=np.uint32),
+        positions=np.array([0], dtype=np.uint32),
+        context_lengths=np.array([0], dtype=np.uint32),
+        cache_groups=cache_groups,
+        phase=BatchPhase.PREFILL,
+    )
+
+    cache_plan = build_cache_plan(plan, layout, decode_lookahead=5)
+
+    for index, (group, descriptor) in enumerate(
+        zip(cache_plan.groups, layout.groups, strict=True)
+    ):
+        assert group.parent_ids[0].tolist() == [index + 1]
+        assert group.child_slots[0].tolist() == [
+            min(index, descriptor.blocks_per_parent - 1)
+        ]

@@ -11,7 +11,12 @@ from typing import Any
 
 import modal
 
+from deploy.http import monitor_spawned_server
 from deploy.modal_image import build_modal_image
+from resin.backend.cuda.graphs import (
+    DEFAULT_MAX_NUM_SEQS,
+    default_decode_graph_shapes,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_ID = "nvidia/Gemma-4-31B-IT-NVFP4"
@@ -36,7 +41,8 @@ MODEL_FILES = (
     "tokenizer_config.json",
 )
 ASSISTANT_FILES = ("config.json", "model.safetensors")
-CUDA_GRAPH_DECODE_SHAPES = tuple((batch_size, 4096) for batch_size in (1, 2, 4, 8))
+CUDA_GRAPH_HISTORY_PAGES = 4096
+_http_server_processes: list[object] = []
 
 image = build_modal_image(
     ROOT,
@@ -124,7 +130,11 @@ def download_model() -> dict[str, Any]:
 
 
 def _build_runtime(
-    *, static_memory_fraction: float = 0.95, speculative_tokens: int = 0
+    *,
+    static_memory_fraction: float = 0.95,
+    speculative_tokens: int = 0,
+    cuda_graphs: bool = True,
+    kv_cache_dtype: str = "fp8",
 ):
     import torch
     from transformers import AutoProcessor
@@ -138,7 +148,16 @@ def _build_runtime(
         MODEL_PATH,
         assistant_model=ASSISTANT_PATH if speculative_tokens else None,
         speculative_tokens=speculative_tokens,
-        cuda_graph_decode_shapes=CUDA_GRAPH_DECODE_SHAPES,
+        kv_cache_dtype=kv_cache_dtype,
+        cuda_graph_decode_shapes=(
+            default_decode_graph_shapes(
+                CUDA_GRAPH_HISTORY_PAGES,
+                speculative=bool(speculative_tokens),
+                max_batch_size=DEFAULT_MAX_NUM_SEQS,
+            )
+            if cuda_graphs
+            else ()
+        ),
         static_memory_fraction=static_memory_fraction,
     )
     capacity = runner.cache_capacity_plan
@@ -147,12 +166,19 @@ def _build_runtime(
         local_files_only=True,
         trust_remote_code=False,
     )
+    shapes = runner.cuda_graph_stats["configured_shapes"]
+    print(f"[cuda-graphs] capturing {len(shapes)} decode shapes: {shapes}", flush=True)
     graph_started = time.perf_counter()
     graph_stats = runner.capture_cuda_graphs()
     graph_capture_s = time.perf_counter() - graph_started
+    print(
+        f"[cuda-graphs] captured {graph_stats['capture_count']} shapes in "
+        f"{graph_capture_s:.2f}s",
+        flush=True,
+    )
     engine = Engine(
         runner,
-        max_running_requests=8,
+        max_running_requests=DEFAULT_MAX_NUM_SEQS,
         context_length=runner.config.max_position_embeddings,
         scheduler_config=SchedulerConfig(
             max_batch_tokens=runner.prefill_chunk_size,
@@ -277,6 +303,101 @@ def _text_batch(
     }
 
 
+def _sample_text(
+    engine,
+    processor,
+    prompt: str,
+    max_new_tokens: int,
+    *,
+    seed: int,
+):
+    from resin import SamplingParams
+    from resin_models_cuda.gemma4 import Gemma4Media
+
+    media = Gemma4Media.from_messages(
+        processor,
+        [{"role": "user", "content": prompt}],
+    )
+    lease = engine.submit(
+        media=media,
+        max_new_tokens=max_new_tokens,
+        stop_token_ids=(1, 106),
+        sampling_params=SamplingParams(
+            temperature=1.0,
+            top_p=0.95,
+            top_k=64,
+            seed=seed,
+        ),
+    )
+    while engine.has_work():
+        engine.step()
+    token_ids = lease.take_result()
+    return token_ids, processor.tokenizer.decode(token_ids, skip_special_tokens=True)
+
+
+class _TracingSampler:
+    """Record sampled-token probability diagnostics for one-row eager tests."""
+
+    def __init__(self, base) -> None:
+        self.base = base
+        self.trace: list[dict[str, int | float | bool]] = []
+
+    def __call__(self, logits, plan=None, *, out=None, offset_delta: int = 0):
+        import torch
+
+        result = self.base(logits, plan, out=out, offset_delta=offset_delta)
+        if logits.shape[0] != 1:
+            raise RuntimeError("sampling diagnostics require a single sequence")
+        probabilities = torch.softmax(logits[0].float(), dim=-1)
+        token_id = int(result[0].item())
+        selected = probabilities[token_id]
+        top = probabilities.topk(64)
+        top_values = top.values
+        nonzero = probabilities[probabilities > 0]
+        self.trace.append(
+            {
+                "token_id": token_id,
+                "top1_token_id": int(top.indices[0].item()),
+                "rank": int((probabilities > selected).sum().item()) + 1,
+                "probability": float(selected.item()),
+                "top1_probability": float(top_values[0].item()),
+                "top64_mass": float(top_values.sum().item()),
+                "entropy": float((-(nonzero * nonzero.log()).sum()).item()),
+                "logits_finite": bool(torch.isfinite(logits).all().item()),
+                "max_abs_logit": float(logits.abs().max().item()),
+            }
+        )
+        return result
+
+
+def _teacher_forced_next_token(engine, runner, media, output_ids, length: int):
+    from resin import SamplingParams
+    from resin_models_cuda.gemma4 import Gemma4Media
+
+    engine.clear_prefix_cache()
+    forced = Gemma4Media(
+        token_ids=(*media.token_ids, *output_ids[:length]),
+        mm_token_type_ids=(*media.mm_token_type_ids, *((0,) * length)),
+        pixel_values=media.pixel_values,
+        image_position_ids=media.image_position_ids,
+        pixel_values_videos=media.pixel_values_videos,
+        video_position_ids=media.video_position_ids,
+    )
+    trace_start = len(runner._sampler.trace)
+    lease = engine.submit(
+        media=forced,
+        max_new_tokens=1,
+        stop_token_ids=(1, 106),
+        sampling_params=SamplingParams(temperature=0.0),
+    )
+    while engine.has_work():
+        engine.step()
+    token_ids = lease.take_result()
+    if len(runner._sampler.trace) <= trace_start:
+        raise RuntimeError("teacher-forced request did not produce a logit row")
+    return token_ids[0], runner._sampler.trace[-1]
+
+
 @app.function(
     gpu="RTX-PRO-6000:1",
     cpu=16,
@@ -335,6 +456,199 @@ def smoke_test(
                 "speculative": runner.speculative_stats,
             }
         )
+        return report
+    finally:
+        if not engine.closed:
+            engine.close()
+
+
+@app.function(
+    gpu="RTX-PRO-6000:1",
+    cpu=16,
+    memory=128 * 1024,
+    timeout=8 * 60 * 60,
+    single_use_containers=True,
+)
+def sampled_text_test(
+    max_new_tokens: int = 768,
+    *,
+    eager: bool = False,
+    seed: int = 7,
+    bf16_kv: bool = False,
+    trace_sampling: bool = False,
+) -> dict[str, Any]:
+    torch, runner, processor, engine, report = _build_runtime(
+        cuda_graphs=not eager,
+        kv_cache_dtype="bfloat16" if bf16_kv else "fp8",
+    )
+    try:
+        tracing_sampler = None
+        if trace_sampling:
+            if not eager:
+                raise ValueError("sampling diagnostics require --eager")
+            tracing_sampler = _TracingSampler(runner._sampler)
+            runner._sampler = tracing_sampler
+        token_ids, output_text = _sample_text(
+            engine,
+            processor,
+            "Explain how large language models work to a curious high school "
+            "student. Be clear, detailed, and accurate.",
+            max_new_tokens,
+            seed=seed,
+        )
+        torch.cuda.synchronize()
+        report.update(
+            {
+                "eager": eager,
+                "seed": seed,
+                "bf16_kv": bf16_kv,
+                "sampling_trace": (
+                    tracing_sampler.trace if tracing_sampler is not None else None
+                ),
+                "output_tokens": token_ids,
+                "output_text": output_text,
+                "cuda_graphs": runner.cuda_graph_stats,
+            }
+        )
+        print(
+            "[sampled-text] "
+            + json.dumps(
+                {
+                    "eager": eager,
+                    "seed": seed,
+                    "bf16_kv": bf16_kv,
+                    "sampling_trace": (
+                        tracing_sampler.trace[-320:]
+                        if tracing_sampler is not None
+                        else None
+                    ),
+                    "output_tokens": len(token_ids),
+                    "output_text": output_text,
+                }
+            ),
+            flush=True,
+        )
+        return report
+    finally:
+        if not engine.closed:
+            engine.close()
+
+
+@app.function(
+    gpu="RTX-PRO-6000:1",
+    cpu=16,
+    memory=128 * 1024,
+    timeout=8 * 60 * 60,
+    single_use_containers=True,
+)
+def repeated_sampled_text_test(
+    max_new_tokens: int = 1024, *, eager: bool = False
+) -> dict[str, Any]:
+    import torch
+
+    _, runner, processor, engine, _ = _build_runtime(cuda_graphs=not eager)
+    try:
+        runs = []
+        for seed in (7, 8, 9):
+            engine.clear_prefix_cache()
+            token_ids, output_text = _sample_text(
+                engine,
+                processor,
+                "Explain how large language models work to a curious high school "
+                "student. Be clear, detailed, and accurate.",
+                max_new_tokens,
+                seed=seed,
+            )
+            torch.cuda.synchronize()
+            runs.append(
+                {
+                    "seed": seed,
+                    "output_tokens": len(token_ids),
+                    "output_text": output_text,
+                }
+            )
+        report = {
+            "eager": eager,
+            "runs": runs,
+            "cuda_graphs": runner.cuda_graph_stats,
+        }
+        print("[repeated-sampled-text] " + json.dumps(report), flush=True)
+        return report
+    finally:
+        if not engine.closed:
+            engine.close()
+
+
+@app.function(
+    gpu="RTX-PRO-6000:1",
+    cpu=16,
+    memory=128 * 1024,
+    timeout=8 * 60 * 60,
+    single_use_containers=True,
+)
+def decode_prefill_parity(max_new_tokens: int = 900, *, seed: int = 7):
+    import torch
+
+    from resin import SamplingParams
+    from resin_models_cuda.gemma4 import Gemma4Media
+
+    _, runner, processor, engine, _ = _build_runtime(cuda_graphs=False)
+    tracer = _TracingSampler(runner._sampler)
+    runner._sampler = tracer
+    try:
+        media = Gemma4Media.from_messages(
+            processor,
+            [
+                {
+                    "role": "user",
+                    "content": "Explain how large language models work to a curious high "
+                    "school student. Be clear, detailed, and accurate.",
+                }
+            ],
+        )
+        lease = engine.submit(
+            media=media,
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=(1, 106),
+            sampling_params=SamplingParams(
+                temperature=1.0,
+                top_p=0.95,
+                top_k=64,
+                seed=seed,
+            ),
+        )
+        while engine.has_work():
+            engine.step()
+        output_ids = lease.take_result()
+        decode_trace = list(tracer.trace)
+        checkpoints = list(range(512, min(len(output_ids), 896) + 1, 32))
+        if len(output_ids) > 1024:
+            checkpoints.append(len(output_ids) - 1)
+        parity = []
+        for length in checkpoints:
+            token_id, prefill = _teacher_forced_next_token(
+                engine, runner, media, output_ids, length
+            )
+            decode = decode_trace[length]
+            parity.append(
+                {
+                    "length": length,
+                    "position": len(media.token_ids) + length,
+                    "decode_top1": decode["top1_token_id"],
+                    "prefill_top1": prefill["top1_token_id"],
+                    "decode_top1_probability": decode["top1_probability"],
+                    "prefill_top1_probability": prefill["top1_probability"],
+                    "same_top1": decode["top1_token_id"] == prefill["top1_token_id"],
+                    "teacher_token": token_id,
+                }
+            )
+        torch.cuda.synchronize()
+        report = {
+            "prompt_tokens": len(media.token_ids),
+            "output_tokens": len(output_ids),
+            "parity": parity,
+        }
+        print("[decode-prefill-parity] " + json.dumps(report), flush=True)
         return report
     finally:
         if not engine.closed:
@@ -432,11 +746,13 @@ def perfetto_trace(max_new_tokens: int = 5, *, detailed: bool = True) -> dict[st
             engine.close()
 
 
-def _serve() -> None:
+def _serve(_: int) -> None:
     from resin.server import HttpServer
     from resin_models_cuda.gemma4 import Gemma4Codec
 
-    torch, runner, processor, engine, _ = _build_runtime(speculative_tokens=3)
+    # Keep production on ordinary graph-backed decode while long-generation
+    # parity for the speculative path remains under investigation.
+    torch, runner, processor, engine, _ = _build_runtime(speculative_tokens=0)
     try:
         # Compile/load every exact kernel geometry before opening the socket.
         warmup, _, _ = _generate(engine, processor, "Name the main colors.", 2)
@@ -463,15 +779,26 @@ def _serve() -> None:
     scaledown_window=15 * 60,
     max_containers=1,
 )
-@modal.concurrent(max_inputs=32, target_inputs=8)
+@modal.concurrent(
+    max_inputs=DEFAULT_MAX_NUM_SEQS,
+    target_inputs=DEFAULT_MAX_NUM_SEQS,
+)
 @modal.web_server(
     8000,
     startup_timeout=60 * 60,
-    label="gemma4-nvfp4",
+    label="gemma4-31b",
     requires_proxy_auth=False,
 )
 def serve_gemma4() -> None:
-    _serve()
+    import torch
+
+    process_context = torch.multiprocessing.spawn(
+        _serve,
+        nprocs=1,
+        join=False,
+    )
+    _http_server_processes.append(process_context)
+    monitor_spawned_server(process_context, "gemma4-http")
 
 
 @app.local_entrypoint()

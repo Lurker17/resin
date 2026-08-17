@@ -11,6 +11,26 @@ from typing import Any, TypedDict
 from resin.backend.cuda.staging import StagingError, TensorStager
 
 GraphShape = tuple[int, ...]
+DEFAULT_MAX_NUM_SEQS = 128
+DEFAULT_DECODE_GRAPH_MAX_BATCH_SIZE = 1024
+
+_SPECULATIVE_DECODE_BATCH_SIZES = (
+    *range(1, 9),
+    *range(12, 33, 4),
+    *range(40, 65, 8),
+    *range(96, 257, 32),
+    *range(384, 1025, 128),
+)
+_DECODE_BATCH_SIZES = (
+    1,
+    2,
+    4,
+    8,
+    *range(12, 17, 4),
+    *range(24, 33, 8),
+    *range(64, 129, 32),
+    *range(256, 1025, 128),
+)
 
 
 class CudaGraphShapeStats(TypedDict):
@@ -68,6 +88,35 @@ def graph_shapes(value: object, *, dimensions: int) -> tuple[GraphShape, ...]:
     return tuple(sorted(shapes))
 
 
+def default_decode_graph_shapes(
+    width: int,
+    *,
+    speculative: bool,
+    max_batch_size: int = DEFAULT_DECODE_GRAPH_MAX_BATCH_SIZE,
+) -> tuple[GraphShape, ...]:
+    """Return shared decode graph buckets with one dynamic-history capacity.
+
+    Speculative decode uses denser batch buckets because padding repeats the
+    whole draft-and-verify path. Ordinary decode uses power-of-two buckets.
+    The shared catalog extends through 1024 rows. Deployments should cap it at
+    their scheduler's maximum number of sequences so every admitted decode
+    batch has a compatible graph bucket.
+    """
+
+    for name, value in (("width", width), ("max_batch_size", max_batch_size)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    batch_sizes = (
+        _SPECULATIVE_DECODE_BATCH_SIZES if speculative else _DECODE_BATCH_SIZES
+    )
+    selected = tuple(
+        batch_size for batch_size in batch_sizes if batch_size <= max_batch_size
+    )
+    if selected[-1] != max_batch_size:
+        selected = (*selected, max_batch_size)
+    return tuple((batch_size, width) for batch_size in selected)
+
+
 @dataclass(frozen=True, slots=True)
 class CudaGraphStep:
     """One fixed-address device operation that can be captured automatically."""
@@ -76,6 +125,7 @@ class CudaGraphStep:
     output: Any
     launch: Callable[[], None]
     prepare: Callable[[], None] | None = None
+    validate_eager_output: bool = True
 
 
 @dataclass(slots=True)
@@ -228,11 +278,22 @@ class CudaGraphCache:
                 step.prepare()
             graph.replay()
         torch.cuda.synchronize(self.device)
-        if not torch.equal(expected, step.output):
-            raise RuntimeError(
-                "CUDA graph replay differs from eager warmup "
-                f"(expected={expected.tolist()}, actual={step.output.tolist()})"
-            )
+        if step.validate_eager_output:
+            if not torch.equal(expected, step.output):
+                raise RuntimeError(
+                    "CUDA graph replay differs from eager warmup "
+                    f"(expected={expected.tolist()}, actual={step.output.tolist()})"
+                )
+        else:
+            expected_replay = step.output.clone()
+            graph.replay()
+            torch.cuda.synchronize(self.device)
+            if not torch.equal(expected_replay, step.output):
+                raise RuntimeError(
+                    "CUDA graph replays are not deterministic "
+                    f"(expected={expected_replay.tolist()}, "
+                    f"actual={step.output.tolist()})"
+                )
         entry.graph = graph
         entry.captures = 1
         entry.capture_ms = (perf_counter() - started) * 1000

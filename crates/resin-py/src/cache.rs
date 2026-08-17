@@ -317,10 +317,11 @@ impl CacheLayout {
 
 /// Physical page placement for one cache group in a BatchPlan.
 ///
-/// Adjacent ``block_indptr`` values select each sequence's physical pages from
-/// ``block_ids``. ``first_logical_blocks`` gives the logical number represented
-/// by each sequence's first physical block. The two ``append_*`` arrays contain
-/// one write target per flattened batch token.
+/// Adjacent ``block_indptr`` values select each sequence's physical addresses
+/// from the parallel ``block_parent_ids`` and ``block_child_slots`` arrays.
+/// ``first_logical_blocks`` gives the logical number represented by each
+/// sequence's first physical block. The parallel ``append_parent_ids`` and
+/// ``append_child_slots`` arrays contain one write target per flattened token.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CacheGroupPlan {
@@ -337,20 +338,28 @@ impl CacheGroupPlan {
     pub(crate) fn from_parts(
         group_index: u32,
         block_indptr: Vec<u32>,
-        block_ids: Vec<u32>,
+        block_parent_ids: Vec<u32>,
+        block_child_slots: Vec<u32>,
         first_logical_blocks: Vec<u32>,
-        append_block_ids: Vec<u32>,
+        append_parent_ids: Vec<u32>,
+        append_child_slots: Vec<u32>,
         append_block_offsets: Vec<u32>,
+        blocks_per_parent: u32,
     ) -> PyResult<Self> {
+        let blocks_per_parent = NonZeroU32::new(blocks_per_parent)
+            .ok_or_else(|| PyValueError::new_err("blocks_per_parent must be positive"))?;
         Ok(Self {
             inner: Arc::new(
                 KvGroupPlan::new(
                     group_index,
                     block_indptr,
-                    block_ids,
+                    block_parent_ids,
+                    block_child_slots,
                     first_logical_blocks,
-                    append_block_ids,
+                    append_parent_ids,
+                    append_child_slots,
                     append_block_offsets,
+                    blocks_per_parent,
                 )
                 .map_err(plan_error)?,
             ),
@@ -367,11 +376,12 @@ impl CacheGroupPlan {
 
     fn repr_string(&self) -> String {
         format!(
-            "CacheGroupPlan(group_index={}, sequences={}, blocks={}, appends={})",
+            "CacheGroupPlan(group_index={}, blocks_per_parent={}, sequences={}, blocks={}, appends={})",
             self.inner.group_index,
+            self.inner.blocks_per_parent,
             self.inner.first_logical_blocks.len(),
-            self.inner.block_ids.len(),
-            self.inner.append_block_ids.len()
+            self.inner.block_parent_ids.len(),
+            self.inner.append_parent_ids.len()
         )
     }
 }
@@ -379,21 +389,39 @@ impl CacheGroupPlan {
 #[pymethods]
 impl CacheGroupPlan {
     #[new]
+    #[pyo3(signature = (
+        group_index,
+        block_indptr,
+        block_parent_ids,
+        block_child_slots,
+        first_logical_blocks,
+        append_parent_ids,
+        append_child_slots,
+        append_block_offsets,
+        *,
+        blocks_per_parent = 1
+    ))]
     fn new(
         group_index: u32,
         block_indptr: PyArrayLike1<'_, u32>,
-        block_ids: PyArrayLike1<'_, u32>,
+        block_parent_ids: PyArrayLike1<'_, u32>,
+        block_child_slots: PyArrayLike1<'_, u32>,
         first_logical_blocks: PyArrayLike1<'_, u32>,
-        append_block_ids: PyArrayLike1<'_, u32>,
+        append_parent_ids: PyArrayLike1<'_, u32>,
+        append_child_slots: PyArrayLike1<'_, u32>,
         append_block_offsets: PyArrayLike1<'_, u32>,
+        blocks_per_parent: u32,
     ) -> PyResult<Self> {
         Self::from_parts(
             group_index,
             crate::arrays::owned_vec(block_indptr),
-            crate::arrays::owned_vec(block_ids),
+            crate::arrays::owned_vec(block_parent_ids),
+            crate::arrays::owned_vec(block_child_slots),
             crate::arrays::owned_vec(first_logical_blocks),
-            crate::arrays::owned_vec(append_block_ids),
+            crate::arrays::owned_vec(append_parent_ids),
+            crate::arrays::owned_vec(append_child_slots),
             crate::arrays::owned_vec(append_block_offsets),
+            blocks_per_parent,
         )
     }
 
@@ -403,16 +431,28 @@ impl CacheGroupPlan {
         self.inner.group_index
     }
 
-    /// Offsets into ``block_ids`` for each sequence.
+    /// Number of logical child blocks packed into each physical parent.
+    #[getter]
+    fn blocks_per_parent(&self) -> u32 {
+        self.inner.blocks_per_parent
+    }
+
+    /// Offsets into the parallel block-address arrays for each sequence.
     #[getter]
     fn block_indptr<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
         crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_indptr)
     }
 
-    /// Flattened physical block IDs, grouped chronologically by sequence.
+    /// Physical parent for each flattened block-table entry.
     #[getter]
-    fn block_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_ids)
+    fn block_parent_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_parent_ids)
+    }
+
+    /// Child slot within its physical parent for each block-table entry.
+    #[getter]
+    fn block_child_slots<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_child_slots)
     }
 
     /// Logical block number corresponding to each sequence's first block.
@@ -424,10 +464,19 @@ impl CacheGroupPlan {
         )
     }
 
-    /// Physical destination block for every flattened batch token.
+    /// Physical parent for every flattened batch-token write target.
     #[getter]
-    fn append_block_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.append_block_ids)
+    fn append_parent_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.append_parent_ids)
+    }
+
+    /// Child slot within its physical parent for every write target.
+    #[getter]
+    fn append_child_slots<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(
+            this.clone().into_any(),
+            &this.get().inner.append_child_slots,
+        )
     }
 
     /// In-block destination offset for every flattened batch token.

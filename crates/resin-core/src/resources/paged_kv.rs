@@ -287,9 +287,11 @@ impl PagedKvResources {
         let mut claims = Vec::<PageAccessClaim>::new();
         for (group_index, group) in self.layout.groups().iter().copied().enumerate() {
             let mut indptr = Vec::with_capacity(requests.len() + 1);
-            let mut block_ids = Vec::new();
+            let mut block_parent_ids = Vec::new();
+            let mut block_child_slots = Vec::new();
             let mut first_blocks = Vec::with_capacity(requests.len());
-            let mut append_ids = Vec::with_capacity(append_count);
+            let mut append_parent_ids = Vec::with_capacity(append_count);
+            let mut append_child_slots = Vec::with_capacity(append_count);
             let mut append_offsets = Vec::with_capacity(append_count);
             indptr.push(0);
 
@@ -323,11 +325,13 @@ impl PagedKvResources {
                             request.request_id.get()
                         ))
                     })?;
-                    block_ids.push(self.pool.kernel_page_id(page.handle())?);
+                    let (parent, child_slot) = self.pool.physical_address(page.handle())?;
+                    block_parent_ids.push(parent);
+                    block_child_slots.push(child_slot);
                     claims.push(request.state.access_claim(page));
                 }
                 indptr.push(
-                    u32::try_from(block_ids.len()).map_err(|_| {
+                    u32::try_from(block_parent_ids.len()).map_err(|_| {
                         Self::invalid("cache block table exceeds the u32 CSR range")
                     })?,
                 );
@@ -340,17 +344,22 @@ impl PagedKvResources {
                             request.request_id.get()
                         ))
                     })?;
-                    append_ids.push(self.pool.kernel_page_id(page.handle())?);
+                    let (parent, child_slot) = self.pool.physical_address(page.handle())?;
+                    append_parent_ids.push(parent);
+                    append_child_slots.push(child_slot);
                     append_offsets.push(position % group.block_tokens().get());
                 }
             }
             groups.push(KvGroupPlan::new(
                 group_index as u32,
                 indptr,
-                block_ids,
+                block_parent_ids,
+                block_child_slots,
                 first_blocks,
-                append_ids,
+                append_parent_ids,
+                append_child_slots,
                 append_offsets,
+                group.blocks_per_parent(),
             )?);
         }
 
@@ -550,8 +559,10 @@ mod tests {
             )
             .unwrap();
         let group = &access.view.groups[0];
-        assert_eq!(group.block_ids.len(), 2);
-        assert_eq!(group.append_block_ids, vec![group.block_ids[1]]);
+        assert_eq!(group.block_parent_ids.len(), 2);
+        assert_eq!(group.block_child_slots.len(), 2);
+        assert_eq!(group.append_parent_ids, vec![group.block_parent_ids[1]]);
+        assert_eq!(group.append_child_slots, vec![group.block_child_slots[1]]);
         assert_eq!(group.append_block_offsets, vec![0]);
         resources.release(access.lease);
         resources.retire(state).unwrap();
@@ -620,7 +631,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert_eq!(access.view.groups[0].block_ids.len(), 3);
+        assert_eq!(access.view.groups[0].block_parent_ids.len(), 3);
         resources.release(access.lease);
         assert_eq!(resources.prefix_cache_metrics(), Some((1, 1, 0, 0)));
         resources.retire(second).unwrap();
@@ -768,8 +779,10 @@ mod tests {
             )
             .unwrap();
         let state = &access.view.groups[1];
-        assert_eq!(state.block_ids.len(), 2);
-        assert_eq!(state.append_block_ids, vec![state.block_ids[1]]);
+        assert_eq!(state.block_parent_ids.len(), 2);
+        assert_eq!(state.block_child_slots.len(), 2);
+        assert_eq!(state.append_parent_ids, vec![state.block_parent_ids[1]]);
+        assert_eq!(state.append_child_slots, vec![state.block_child_slots[1]]);
         resources.release(access.lease);
         resources.retire(second).unwrap();
     }

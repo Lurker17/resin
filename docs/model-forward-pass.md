@@ -82,6 +82,18 @@ recurrent checkpoints. The Engine allocates the pages and passes their physical
 IDs in `BatchPlan.cache_groups`; the model only maps those IDs to its device
 arena. Do not keep a second request-to-page allocator in Python.
 
+Consume each cache block's structured physical parent ID and child slot. Do not
+invent or decode a flattened kernel page ID independently in every runner or
+kernel. Validate the parent and slot bounds once at the runner boundary, then
+stage the structured address through graph-owned page tables.
+
+Include the runner's maximum uncommitted verification lookahead in every
+sliding-window retention budget. Verification may write the whole candidate
+block before acceptance; the Engine must keep the logical attention history and
+that future tail resident simultaneously, including when their union straddles
+an extra page. Leasing write destinations without extending retention can drop
+a still-readable history page near a block boundary.
+
 Test prefix caching with real continuation requests. A hit must prefill the
 uncached suffix as one chunk, restore recurrent and sliding-window state at the
 same checkpoint, and copy on write before mutating shared pages. Cover:

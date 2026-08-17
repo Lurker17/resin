@@ -235,10 +235,13 @@ impl std::error::Error for KvLayoutError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KvGroupPlan {
     pub group_index: u32,
+    pub blocks_per_parent: u32,
     pub block_indptr: Vec<u32>,
-    pub block_ids: Vec<u32>,
+    pub block_parent_ids: Vec<u32>,
+    pub block_child_slots: Vec<u32>,
     pub first_logical_blocks: Vec<u32>,
-    pub append_block_ids: Vec<u32>,
+    pub append_parent_ids: Vec<u32>,
+    pub append_child_slots: Vec<u32>,
     pub append_block_offsets: Vec<u32>,
 }
 
@@ -246,17 +249,24 @@ impl KvGroupPlan {
     pub fn new(
         group_index: u32,
         block_indptr: Vec<u32>,
-        block_ids: Vec<u32>,
+        block_parent_ids: Vec<u32>,
+        block_child_slots: Vec<u32>,
         first_logical_blocks: Vec<u32>,
-        append_block_ids: Vec<u32>,
+        append_parent_ids: Vec<u32>,
+        append_child_slots: Vec<u32>,
         append_block_offsets: Vec<u32>,
+        blocks_per_parent: NonZeroU32,
     ) -> Result<Self, KvPlanError> {
+        let packing = blocks_per_parent.get();
         let plan = Self {
             group_index,
+            blocks_per_parent: packing,
             block_indptr,
-            block_ids,
+            block_parent_ids,
+            block_child_slots,
             first_logical_blocks,
-            append_block_ids,
+            append_parent_ids,
+            append_child_slots,
             append_block_offsets,
         };
         plan.validate()?;
@@ -264,8 +274,10 @@ impl KvGroupPlan {
     }
 
     pub fn validate(&self) -> Result<(), KvPlanError> {
-        if self.block_ids.len() > u32::MAX as usize {
-            return Err(KvPlanError("block_ids length exceeds the u32 CSR range"));
+        if self.block_parent_ids.len() > u32::MAX as usize {
+            return Err(KvPlanError(
+                "block address length exceeds the u32 CSR range",
+            ));
         }
         if self.block_indptr.len() != self.first_logical_blocks.len() + 1 {
             return Err(KvPlanError(
@@ -275,28 +287,38 @@ impl KvGroupPlan {
         if self.block_indptr.first() != Some(&0) {
             return Err(KvPlanError("block_indptr must start at zero"));
         }
-        if self.block_indptr.last().copied() != Some(self.block_ids.len() as u32) {
-            return Err(KvPlanError("block_indptr must end at the block_ids length"));
+        if self.block_indptr.last().copied() != Some(self.block_parent_ids.len() as u32) {
+            return Err(KvPlanError(
+                "block_indptr must end at the block address length",
+            ));
         }
         if self.block_indptr.windows(2).any(|pair| pair[0] > pair[1]) {
             return Err(KvPlanError(
                 "block_indptr must be monotonically nondecreasing",
             ));
         }
-        if self.block_ids.contains(&0) {
+        if self.block_parent_ids.len() != self.block_child_slots.len()
+            || self
+                .block_parent_ids
+                .iter()
+                .zip(&self.block_child_slots)
+                .any(|(&parent, &slot)| parent == 0 || slot >= self.blocks_per_parent)
+        {
+            return Err(KvPlanError("block physical addresses are malformed"));
+        }
+        if self.append_parent_ids.len() != self.append_block_offsets.len() {
             return Err(KvPlanError(
-                "block_ids must contain only positive kernel page IDs",
+                "append addresses and append_block_offsets must have equal length",
             ));
         }
-        if self.append_block_ids.len() != self.append_block_offsets.len() {
-            return Err(KvPlanError(
-                "append_block_ids and append_block_offsets must have equal length",
-            ));
-        }
-        if self.append_block_ids.contains(&0) {
-            return Err(KvPlanError(
-                "append_block_ids must contain only positive kernel page IDs",
-            ));
+        if self.append_parent_ids.len() != self.append_child_slots.len()
+            || self
+                .append_parent_ids
+                .iter()
+                .zip(&self.append_child_slots)
+                .any(|(&parent, &slot)| parent == 0 || slot >= self.blocks_per_parent)
+        {
+            return Err(KvPlanError("append physical addresses are malformed"));
         }
         Ok(())
     }
@@ -366,12 +388,28 @@ mod tests {
             1,
             vec![0, 2, 3],
             vec![7, 8, 11],
+            vec![0, 0, 0],
             vec![0, 5],
             vec![8, 11],
+            vec![0, 0],
             vec![3, 0],
+            NonZeroU32::new(1).unwrap(),
         )
         .unwrap();
         assert_eq!(plan.group_index, 1);
-        assert!(KvGroupPlan::new(0, vec![0, 1], vec![0], vec![0], Vec::new(), Vec::new()).is_err());
+        assert!(
+            KvGroupPlan::new(
+                0,
+                vec![0, 1],
+                vec![0],
+                vec![0],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                NonZeroU32::new(1).unwrap(),
+            )
+            .is_err()
+        );
     }
 }

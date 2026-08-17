@@ -79,7 +79,10 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
         def graph_plan_inputs(cache, plan):
             assert cache is graph_cache
             assert plan == "cache-plan"
-            return {"cache.0.pages": (7, 8, 9, 0)}
+            return {
+                "cache.0.parent_ids": (7, 8, 9, 0),
+                "cache.0.child_slots": (0, 1, 0, 0),
+            }
 
     runner._graphs = Graphs()
     runner._sampler = Sampler()
@@ -98,7 +101,8 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
     assert shape == (4, 128)
     assert inputs["token_ids"].tolist() == [5, 6, 7, 0]
     assert inputs["positions"].tolist() == [11, 12, 13, 1]
-    assert inputs["cache.0.pages"] == (7, 8, 9, 0)
+    assert inputs["cache.0.parent_ids"] == (7, 8, 9, 0)
+    assert inputs["cache.0.child_slots"] == (0, 1, 0, 0)
     assert inputs["sampling_top_ks"] == (32, 32, 32, 32)
 
 

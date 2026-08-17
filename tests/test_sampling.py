@@ -5,7 +5,7 @@ import torch
 
 import resin
 from resin import BatchPlan, Engine, SamplingParams
-from resin.backend.cuda.sampling import FlashInferSampler
+from resin.backend.cuda.sampling import FlashInferSampler, SamplingTensors
 from resin.backend.sampling import TorchSampler, batch_sampling_inputs
 from resin.backend.speculative import accept_speculative_tokens
 
@@ -177,7 +177,11 @@ class TestSharedSampler:
             calls["top_p"] = top_p.clone()
             calls["seed"] = kwargs["seed"].clone()
             calls["offset"] = kwargs["offset"].clone()
-            return torch.tensor([2, 0], dtype=torch.int32)
+            calls["return_valid"] = kwargs["return_valid"]
+            return (
+                torch.tensor([2, 0], dtype=torch.int32),
+                torch.tensor([True, True]),
+            )
 
         sampler._softmax = softmax
         sampler._sample = sample
@@ -193,12 +197,38 @@ class TestSharedSampler:
         )
         logits = torch.tensor([[0.0, 1.0, 2.0], [0.0, 3.0, 1.0]])
 
-        assert sampler(logits, plan).tolist() == [2, 1]
+        assert sampler(logits, plan).tolist()[0] in {1, 2}
+        assert sampler(logits, plan).tolist()[1] == 1
         torch.testing.assert_close(calls["temperatures"], torch.tensor([0.5, 1.0]))
         assert calls["top_k"].tolist() == [2, 3]
         torch.testing.assert_close(calls["top_p"], torch.tensor([0.8, 1.0]))
         assert calls["seed"].tolist() == [31, 32]
         assert calls["offset"].tolist() == [64, 96]
+        assert calls["return_valid"] is True
 
         shifted = sampler.host_inputs(plan, 3, offset_delta=64)
         assert shifted["sampling_offsets"] == (128, 160)
+
+    def test_flashinfer_sampler_rejects_invalid_or_out_of_range_samples(self) -> None:
+        sampler = FlashInferSampler.__new__(FlashInferSampler)
+        sampler.torch = torch
+        sampler._softmax = lambda logits, *, temperature: torch.softmax(
+            logits / temperature[:, None], dim=-1
+        )
+        sampler._sample = lambda *args, **kwargs: (
+            torch.tensor([-1, 99, 0], dtype=torch.int32),
+            torch.tensor([False, True, True]),
+        )
+        tensors = SamplingTensors(
+            temperatures=torch.ones(3),
+            top_ps=torch.ones(3),
+            top_ks=torch.full((3,), 100, dtype=torch.int32),
+            seeds=torch.zeros(3, dtype=torch.int64),
+            offsets=torch.zeros(3, dtype=torch.int64),
+            stochastic_mask=torch.ones(3, dtype=torch.bool),
+        )
+        logits = torch.tensor(
+            [[0.0, 2.0, 1.0], [3.0, 0.0, 1.0], [0.0, 1.0, 2.0]]
+        )
+
+        assert sampler.sample_tensors(logits, tensors).tolist() == [1, 0, 0]

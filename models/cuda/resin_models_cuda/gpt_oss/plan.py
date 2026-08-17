@@ -34,12 +34,18 @@ class CacheGroup:
     ) -> CacheGroup:
         if native.group_index != index:
             raise ValueError("cache groups must be ordered History then Window")
+        if native.blocks_per_parent != 1:
+            raise ValueError("GPT-OSS cache groups require one block per parent")
+        block_parents = np.asarray(native.block_parent_ids, dtype=np.uint32)
+        block_slots = np.asarray(native.block_child_slots, dtype=np.uint32)
+        append_parents = np.asarray(native.append_parent_ids, dtype=np.uint32)
+        append_slots = np.asarray(native.append_child_slots, dtype=np.uint32)
         group = cls(
             index,
             np.asarray(native.block_indptr, dtype=np.uint32),
-            np.asarray(native.block_ids, dtype=np.uint32),
+            block_parents,
             np.asarray(native.first_logical_blocks, dtype=np.uint32),
-            np.asarray(native.append_block_ids, dtype=np.uint32),
+            append_parents,
             np.asarray(native.append_block_offsets, dtype=np.uint32),
         )
         if (
@@ -47,14 +53,21 @@ class CacheGroup:
             or group.indptr[0] != 0
             or group.indptr[-1] != len(group.pages)
             or np.any(group.indptr[1:] < group.indptr[:-1])
+            or len(block_parents) != len(block_slots)
+            or len(append_parents) != len(append_slots)
         ):
             raise ValueError("cache block_indptr is malformed")
         if len(group.first_blocks) != rows:
             raise ValueError("cache first_logical_blocks does not cover every row")
         if len(group.append_pages) != tokens or len(group.append_offsets) != tokens:
             raise ValueError("cache append metadata does not cover every token")
-        if np.any(group.pages == 0) or np.any(group.append_pages == 0):
-            raise ValueError("cache page IDs must be positive")
+        if (
+            np.any(group.pages == 0)
+            or np.any(group.append_pages == 0)
+            or np.any(block_slots != 0)
+            or np.any(append_slots != 0)
+        ):
+            raise ValueError("cache physical addresses are malformed")
         if np.any(group.append_offsets >= PAGE_SIZE):
             raise ValueError("cache append offset is outside its page")
         if capacity is not None and (

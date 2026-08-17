@@ -16,6 +16,37 @@ def _append_metadata(pages: list[int], token_count: int) -> tuple[list[int], lis
     )
 
 
+def _cache_group(
+    index: int,
+    indptr: list[int],
+    compact_pages: list[int],
+    first_blocks: list[int],
+    compact_append_pages: list[int],
+    append_offsets: list[int],
+    *,
+    packing: int,
+) -> CacheGroupPlan:
+    def addresses(pages: list[int]) -> tuple[list[int], list[int]]:
+        return (
+            [(page - 1) // packing + 1 for page in pages],
+            [(page - 1) % packing for page in pages],
+        )
+
+    parents, child_slots = addresses(compact_pages)
+    append_parents, append_child_slots = addresses(compact_append_pages)
+    return CacheGroupPlan(
+        index,
+        indptr,
+        parents,
+        child_slots,
+        first_blocks,
+        append_parents,
+        append_child_slots,
+        append_offsets,
+        blocks_per_parent=packing,
+    )
+
+
 def test_gemma4_plan_preserves_positive_ids_after_graph_null_page() -> None:
     tokens = list(range(70))
     history_pages = [11, 12]
@@ -28,21 +59,23 @@ def test_gemma4_plan_preserves_positive_ids_after_graph_null_page() -> None:
         tokens,
         [0, len(tokens)],
         cache_groups=[
-            CacheGroupPlan(
+            _cache_group(
                 0,
                 [0, 2],
                 history_pages,
                 [0],
                 history_append,
                 offsets,
+                packing=10,
             ),
-            CacheGroupPlan(
+            _cache_group(
                 1,
                 [0, 2],
                 local_pages,
                 [0],
                 local_append,
                 offsets,
+                packing=1,
             ),
         ],
     )
@@ -51,9 +84,9 @@ def test_gemma4_plan_preserves_positive_ids_after_graph_null_page() -> None:
         plan, history_blocks_per_parent=10, parent_capacity=2
     )
 
-    assert batch.global_.page_indices.tolist() == [11, 12]
+    assert batch.global_.page_indices.tolist() == [20, 21]
     assert batch.local.page_indices.tolist() == [1, 2]
-    assert batch.global_.append_slots[[0, 64, 69]].tolist() == [704, 768, 773]
+    assert batch.global_.append_slots[[0, 64, 69]].tolist() == [1280, 1344, 1349]
     assert batch.local.append_slots[[0, 64, 69]].tolist() == [64, 128, 133]
     assert batch.global_.last_page_lengths.tolist() == [6]
     assert batch.last_token_indices.tolist() == [69]
@@ -67,8 +100,8 @@ def test_decode_lookahead_expands_verify_but_not_assistant_context() -> None:
         [0, 1],
         phase=BatchPhase.DECODE,
         cache_groups=[
-            CacheGroupPlan(0, [0, 2], [11, 12], [0], [12], [0]),
-            CacheGroupPlan(1, [0, 2], [21, 22], [0], [22], [0]),
+            _cache_group(0, [0, 2], [11, 12], [0], [12], [0], packing=10),
+            _cache_group(1, [0, 2], [21, 22], [0], [22], [0], packing=1),
         ],
     )
 
@@ -84,13 +117,43 @@ def test_decode_lookahead_expands_verify_but_not_assistant_context() -> None:
         [[201, 202, 203]],
     )
 
-    assert assistant.global_.page_indices.tolist() == [11]
+    assert assistant.global_.page_indices.tolist() == [20]
     assert assistant.local.page_indices.tolist() == [21]
     assert assistant.global_.last_page_lengths.tolist() == [64]
     assert assistant.global_.append_slots.tolist() == []
     assert verify.token_ids.tolist() == [123, 201, 202, 203]
     assert verify.positions.tolist() == [64, 65, 66, 67]
-    assert verify.global_.page_indices.tolist() == [11, 12]
-    assert verify.global_.append_slots.tolist() == [768, 769, 770, 771]
+    assert verify.global_.page_indices.tolist() == [20, 21]
+    assert verify.global_.append_slots.tolist() == [1344, 1345, 1346, 1347]
     assert verify.local.append_slots.tolist() == [1408, 1409, 1410, 1411]
     assert verify.global_.last_page_lengths.tolist() == [4]
+
+
+def test_five_drafts_reserve_the_local_page_beyond_a_full_window() -> None:
+    pages = list(range(1, 18))
+    plan = BatchPlan(
+        [9],
+        [1024],
+        [123],
+        [0, 1],
+        phase=BatchPhase.DECODE,
+        cache_groups=[
+            _cache_group(0, [0, 17], pages, [0], [17], [0], packing=10),
+            _cache_group(1, [0, 17], pages, [0], [17], [0], packing=1),
+        ],
+    )
+
+    batch = build_gemma4_batch_plan(
+        plan,
+        history_blocks_per_parent=10,
+        parent_capacity=17,
+        decode_lookahead=5,
+    )
+    assistant = gemma4_assistant_context(batch)
+    verify = expand_gemma4_decode_batch(batch, [[201, 202, 203, 204, 205]])
+
+    assert len(assistant.local.page_indices) == 16
+    assert assistant.local.last_page_lengths.tolist() == [64]
+    assert len(verify.local.page_indices) == 17
+    assert verify.local.kv_lengths == (1030,)
+    assert verify.local.append_slots.tolist() == [1088, 1089, 1090, 1091, 1092, 1093]

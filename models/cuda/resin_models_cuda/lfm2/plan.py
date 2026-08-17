@@ -28,13 +28,13 @@ class PrefillMetadata:
 @dataclass(frozen=True, slots=True)
 class CacheMetadata:
     block_indptr: npt.NDArray[np.uint32]
-    block_ids: npt.NDArray[np.uint32]
+    page_indices: npt.NDArray[np.uint32]
     last_block_lengths: npt.NDArray[np.uint32]
     append_batch_indices: npt.NDArray[np.uint32]
     append_positions: npt.NDArray[np.uint32]
     decode_token_indices: npt.NDArray[np.uint32]
     decode_block_indptr: npt.NDArray[np.uint32]
-    decode_block_ids: npt.NDArray[np.uint32]
+    decode_page_indices: npt.NDArray[np.uint32]
     decode_last_block_lengths: npt.NDArray[np.uint32]
     prefill: PrefillMetadata
 
@@ -65,21 +65,29 @@ def build_cache_metadata(plan, page_size: int) -> CacheMetadata:
     if len(groups) != 2 or tuple(group.group_index for group in groups) != (0, 1):
         raise ValueError("LFM2 requires History and State cache groups")
     group = groups[0]
+    if group.blocks_per_parent != 1:
+        raise ValueError("LFM2 History requires one block per physical parent")
     block_indptr = group.block_indptr
-    block_ids = group.block_ids
+    page_indices = group.block_parent_ids
+    block_child_slots = group.block_child_slots
     first_blocks = group.first_logical_blocks
-    append_pages = group.append_block_ids
+    append_pages = group.append_parent_ids
+    append_child_slots = group.append_child_slots
     append_offsets = group.append_block_offsets
     if (
         len(block_indptr) != rows + 1
         or block_indptr[0] != 0
-        or block_indptr[-1] != len(block_ids)
+        or block_indptr[-1] != len(page_indices)
         or np.any(block_indptr[1:] < block_indptr[:-1])
         or len(first_blocks) != rows
         or len(append_pages) != token_count
         or len(append_offsets) != token_count
-        or np.any(block_ids == 0)
+        or len(page_indices) != len(block_child_slots)
+        or len(append_pages) != len(append_child_slots)
+        or np.any(page_indices == 0)
         or np.any(append_pages == 0)
+        or np.any(block_child_slots != 0)
+        or np.any(append_child_slots != 0)
         or np.any(append_offsets >= page_size)
     ):
         raise ValueError("cache group metadata is malformed")
@@ -102,7 +110,7 @@ def build_cache_metadata(plan, page_size: int) -> CacheMetadata:
         query_length = end - start
         context = int(contexts[row])
         page_start, page_end = map(int, block_indptr[row : row + 2])
-        pages = block_ids[page_start:page_end]
+        pages = page_indices[page_start:page_end]
         post_length = context + query_length
         expected_pages = (post_length + page_size - 1) // page_size
         if int(first_blocks[row]) != 0 or len(pages) != expected_pages:
@@ -148,7 +156,7 @@ def build_cache_metadata(plan, page_size: int) -> CacheMetadata:
 
     return CacheMetadata(
         block_indptr,
-        block_ids,
+        page_indices,
         np.asarray(last_lengths, dtype=np.uint32),
         np.repeat(np.arange(rows, dtype=np.uint32), np.diff(indptr).astype(np.intp)),
         positions,
