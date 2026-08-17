@@ -34,14 +34,13 @@ from resin.backend.cuda.sampling import (
     SamplingTensors,
 )
 from resin.backend.cuda.staging import TensorStager
-from resin.backend.plans import BatchView
+from resin.backend.plans import BatchView, PagedCachePlan
 from resin.backend.speculative import accept_speculative_tokens
 from resin.protocols import SyncRunner
 from resin_models_cuda.deepseek_v4.cache import (
     GRAPH_SCRATCH_PARENTS,
     CacheArena,
     CacheGeometry,
-    build_cache_plan,
     plan_cache_capacity,
 )
 from resin_models_cuda.deepseek_v4.checkpoint import (
@@ -347,7 +346,7 @@ class DeepSeekV4CudaRunner(SyncRunner):
         self._cache.bind(binding.cache_pool_id, binding.cache_layout)
 
     def _cache_plan(self, plan: BatchPlan):
-        return build_cache_plan(
+        return PagedCachePlan.from_plan(
             plan,
             self.cache_layout,
             decode_lookahead=self.speculative_tokens,

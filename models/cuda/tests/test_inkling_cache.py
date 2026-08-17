@@ -7,6 +7,7 @@ from resin import (
     CacheGroupPlan,
     CacheRetention,
 )
+from resin.backend.plans import PagedCachePlan
 from resin_models_cuda.inkling.cache import (
     DRAFT_BLOCKS_PER_SLAB,
     GLOBAL_BLOCKS_PER_SLAB,
@@ -16,7 +17,6 @@ from resin_models_cuda.inkling.cache import (
     STATE_BLOCKS_PER_SLAB,
     CacheArena,
     CacheGeometry,
-    build_cache_plan,
 )
 
 
@@ -101,7 +101,7 @@ def test_decode_lookahead_leases_the_second_attention_block() -> None:
             ),
         ],
     )
-    cache = build_cache_plan(plan, layout, decode_lookahead=5)
+    cache = PagedCachePlan.from_plan(plan, layout, decode_lookahead=5)
     assert cache.groups[0].address(0, 1) == (1, 1)
     assert cache.groups[1].address(0, 1) == (2, 1)
     assert cache.groups[2].address(0, 1) == (3, 1)

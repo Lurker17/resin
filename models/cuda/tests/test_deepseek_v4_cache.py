@@ -7,11 +7,11 @@ import numpy as np
 import torch
 
 from resin import BatchPhase, CacheRetention
+from resin.backend.plans import PagedCachePlan
 from resin_models_cuda.deepseek_v4.cache import (
     C4_STATE_GROUP,
     CacheArena,
     CacheGeometry,
-    build_cache_plan,
     plan_cache_capacity,
 )
 
@@ -127,12 +127,12 @@ def test_plan_preserves_structured_parent_and_child_addresses() -> None:
         phase=BatchPhase.PREFILL,
     )
 
-    cache_plan = build_cache_plan(plan, layout, decode_lookahead=5)
+    cache_plan = PagedCachePlan.from_plan(plan, layout, decode_lookahead=5)
 
     for index, (group, descriptor) in enumerate(
         zip(cache_plan.groups, layout.groups, strict=True)
     ):
-        assert group.parent_ids[0].tolist() == [index + 1]
-        assert group.child_slots[0].tolist() == [
+        assert group.block_slabs(0).tolist() == [index + 1]
+        assert group.block_slots(0).tolist() == [
             min(index, descriptor.blocks_per_slab - 1)
         ]

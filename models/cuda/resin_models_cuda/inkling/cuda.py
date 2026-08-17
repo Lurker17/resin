@@ -11,6 +11,8 @@ import numpy as np
 import torch
 
 from resin import BatchPhase, ResourceBinding, RunnerConfig
+from resin.backend.capacity import plan_cache_capacity
+from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
     CudaGraphCache,
     CudaGraphStats,
@@ -24,6 +26,7 @@ from resin.backend.cuda.sampling import (
     SamplingTensors,
 )
 from resin.backend.cuda.staging import TensorStager
+from resin.backend.plans import PagedCachePlan
 from resin.backend.speculative import accept_speculative_tokens
 from resin.protocols import SyncRunner
 from resin_models_cuda.inkling.cache import (
@@ -32,8 +35,6 @@ from resin_models_cuda.inkling.cache import (
     CacheArena,
     CacheGeometry,
     DeviceCache,
-    build_cache_plan,
-    plan_cache_capacity,
 )
 from resin_models_cuda.inkling.checkpoint import (
     load_draft_config,
@@ -107,6 +108,10 @@ class InklingCudaRunner(SyncRunner):
         torch.cuda.set_device(self.device)
         if torch.cuda.get_device_capability(self.device)[0] < 10:
             raise RuntimeError("Inkling-Small NVFP4 requires a Blackwell GPU")
+        self._cuda_failure = CudaFailureGuard(
+            lambda: torch.cuda.synchronize(self.device),
+            label="Inkling eager execution",
+        )
 
         self.target_path = resolve_target_path(target_model)
         self.draft_path = resolve_draft_path(draft_model)
@@ -162,15 +167,18 @@ class InklingCudaRunner(SyncRunner):
             total_memory,
             free_memory,
             gpu_memory_utilization,
-            self.cache_geometry,
+            self.cache_geometry.bytes_per_slab,
         )
-        slab_capacity = capacity.slab_capacity
+        slab_capacity = capacity.parent_capacity
         if cache_slab_capacity is not None:
             slab_capacity = min(slab_capacity, cache_slab_capacity)
         self.cache_capacity_plan = replace(
             capacity,
-            slab_capacity=slab_capacity,
-            allocation_bytes=(slab_capacity + 1) * capacity.bytes_per_slab,
+            parent_capacity=slab_capacity,
+            allocation_bytes=(
+                slab_capacity + capacity.reserved_parent_count
+            )
+            * capacity.bytes_per_parent,
         )
         self.cache_layout = self.cache_geometry.layout(slab_capacity)
         self._cache = CacheArena(torch, self.device, self.cache_layout)
@@ -186,7 +194,7 @@ class InklingCudaRunner(SyncRunner):
             self.device,
             decode_graph_shapes,
             build=self._new_decode_graph_step,
-            synchronize_failure=lambda: torch.cuda.synchronize(self.device),
+            synchronize_failure=self._cuda_failure,
         )
         self._graph_state_inputs = (
             torch.empty(
@@ -657,7 +665,7 @@ class InklingCudaRunner(SyncRunner):
 
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
         rows = self._validate_plan(plan)
-        cache_plan = build_cache_plan(
+        cache_plan = PagedCachePlan.from_plan(
             plan,
             self.cache_layout,
             decode_lookahead=(
@@ -684,7 +692,7 @@ class InklingCudaRunner(SyncRunner):
                     return self._speculative_decode(plan, cache, token_ids, positions)
                 return self._ordinary_decode(plan, cache, token_ids, positions)
         except BaseException:
-            torch.cuda.synchronize(self.device)
+            self._cuda_failure()
             raise
 
     def release(self, sequence_ids: list[int]) -> None:

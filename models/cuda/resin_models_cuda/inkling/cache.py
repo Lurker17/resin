@@ -7,15 +7,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import numpy.typing as npt
 
 from resin import (
-    BatchPhase,
     CacheGroupFamily,
     CacheGroupLayout,
     CacheLayout,
     CacheRetention,
 )
+from resin.backend.plans import PagedCachePlan
 from resin.backend.resources import CachePoolBinding
 
 if TYPE_CHECKING:
@@ -98,96 +97,6 @@ class CacheGeometry:
                 ),
             ),
         )
-
-
-@dataclass(frozen=True, slots=True)
-class CacheCapacityPlan:
-    total_memory_bytes: int
-    free_memory_bytes: int
-    gpu_memory_utilization: float
-    protected_free_bytes: int
-    cache_budget_bytes: int
-    bytes_per_slab: int
-    slab_capacity: int
-    allocation_bytes: int
-
-
-def plan_cache_capacity(
-    total_memory_bytes: int,
-    free_memory_bytes: int,
-    gpu_memory_utilization: float,
-    geometry: CacheGeometry,
-    *,
-    reserved_slabs: int = 1,
-) -> CacheCapacityPlan:
-    if total_memory_bytes <= 0 or not 0 < free_memory_bytes <= total_memory_bytes:
-        raise ValueError("CUDA memory totals must be positive and internally valid")
-    if not 0 < gpu_memory_utilization < 1:
-        raise ValueError("gpu_memory_utilization must be between zero and one")
-    if reserved_slabs <= 0:
-        raise ValueError("reserved_slabs must include the null slab")
-    protected = math.ceil(total_memory_bytes * (1.0 - gpu_memory_utilization))
-    budget = free_memory_bytes - protected
-    capacity = budget // geometry.bytes_per_slab - reserved_slabs
-    if capacity <= 0:
-        raise MemoryError(
-            "Inkling cache budget leaves no usable slabs "
-            f"(total={total_memory_bytes}, free={free_memory_bytes}, "
-            f"protected={protected}, slab={geometry.bytes_per_slab})"
-        )
-    allocation = (capacity + reserved_slabs) * geometry.bytes_per_slab
-    return CacheCapacityPlan(
-        total_memory_bytes,
-        free_memory_bytes,
-        gpu_memory_utilization,
-        protected,
-        budget,
-        geometry.bytes_per_slab,
-        capacity,
-        allocation,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class GroupPlan:
-    block_indptr: npt.NDArray[np.uint32]
-    block_slab_ids: npt.NDArray[np.uint32]
-    block_slotnums: npt.NDArray[np.uint32]
-    first_blocks: npt.NDArray[np.uint32]
-    append_slab_ids: npt.NDArray[np.uint32]
-    append_slotnums: npt.NDArray[np.uint32]
-    append_offsets: npt.NDArray[np.uint32]
-    blocks_per_slab: int
-
-    def row_addresses(self, row: int) -> tuple[tuple[int, int], ...]:
-        start, end = map(int, self.block_indptr[row : row + 2])
-        return tuple(
-            zip(
-                map(int, self.block_slab_ids[start:end]),
-                map(int, self.block_slotnums[start:end]),
-            )
-        )
-
-    def address(self, row: int, logical_block: int) -> tuple[int, int]:
-        addresses = self.row_addresses(row)
-        column = logical_block - int(self.first_blocks[row])
-        if column < 0 or column >= len(addresses):
-            raise ValueError("Inkling cache row does not cover a logical block")
-        return addresses[column]
-
-
-@dataclass(frozen=True, slots=True)
-class CachePlan:
-    phase: BatchPhase
-    token_ids: npt.NDArray[np.int64]
-    positions: npt.NDArray[np.int64]
-    token_indptr: npt.NDArray[np.int32]
-    context_lengths: npt.NDArray[np.int64]
-    groups: tuple[GroupPlan, GroupPlan, GroupPlan, GroupPlan]
-
-    @property
-    def rows(self) -> int:
-        return len(self.token_indptr) - 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,147 +188,6 @@ class DeviceCache:
         self.states[slabs.long(), slots.long()] = state
 
 
-def _group_plan(
-    native: Any,
-    *,
-    index: int,
-    rows: int,
-    tokens: int,
-    expected_packing: int,
-    slab_capacity: int,
-) -> GroupPlan:
-    if native.group_index != index or native.blocks_per_slab != expected_packing:
-        raise ValueError("Inkling cache groups do not match the declared layout")
-    values = GroupPlan(
-        np.asarray(native.block_indptr, dtype=np.uint32),
-        np.asarray(native.block_slab_ids, dtype=np.uint32),
-        np.asarray(native.block_slotnums, dtype=np.uint32),
-        np.asarray(native.block_table_start_indices, dtype=np.uint32),
-        np.asarray(native.append_slab_ids, dtype=np.uint32),
-        np.asarray(native.append_slotnums, dtype=np.uint32),
-        np.asarray(native.append_block_offsets, dtype=np.uint32),
-        expected_packing,
-    )
-    if (
-        len(values.block_indptr) != rows + 1
-        or values.block_indptr[0] != 0
-        or values.block_indptr[-1] != len(values.block_slab_ids)
-        or np.any(values.block_indptr[1:] < values.block_indptr[:-1])
-        or len(values.block_slab_ids) != len(values.block_slotnums)
-        or len(values.first_blocks) != rows
-        or len(values.append_slab_ids) != tokens
-        or len(values.append_slotnums) != tokens
-        or len(values.append_offsets) != tokens
-    ):
-        raise ValueError("Inkling cache group CSR metadata is malformed")
-    if (
-        np.any(values.block_slab_ids == 0)
-        or np.any(values.append_slab_ids == 0)
-        or np.any(values.block_slab_ids > slab_capacity)
-        or np.any(values.append_slab_ids > slab_capacity)
-        or np.any(values.block_slotnums >= expected_packing)
-        or np.any(values.append_slotnums >= expected_packing)
-    ):
-        raise ValueError("Inkling cache address lies outside the physical arena")
-    return values
-
-
-def build_cache_plan(
-    plan: Any,
-    layout: CacheLayout,
-    *,
-    decode_lookahead: int = 0,
-) -> CachePlan:
-    rows = plan.num_sequences
-    token_ids = np.asarray(plan.token_ids, dtype=np.int64)
-    positions = np.asarray(plan.positions, dtype=np.int64)
-    indptr = np.asarray(plan.token_indptr, dtype=np.int32)
-    contexts = np.asarray(plan.context_lengths, dtype=np.int64)
-    if (
-        rows <= 0
-        or len(indptr) != rows + 1
-        or indptr[0] != 0
-        or indptr[-1] != len(token_ids)
-        or np.any(indptr[1:] <= indptr[:-1])
-        or len(positions) != len(token_ids)
-        or len(contexts) != rows
-    ):
-        raise ValueError("Inkling batch metadata is malformed")
-    if plan.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
-        raise ValueError("Inkling batch phase must be prefill or decode")
-    if decode_lookahead < 0 or (plan.phase != BatchPhase.DECODE and decode_lookahead):
-        raise ValueError("Inkling decode lookahead is only valid for decode")
-    for row, (start, end) in enumerate(zip(indptr[:-1], indptr[1:])):
-        expected = np.arange(int(contexts[row]), int(contexts[row]) + end - start)
-        if not np.array_equal(positions[start:end], expected):
-            raise ValueError("Inkling positions must continue the row context")
-        if plan.phase == BatchPhase.DECODE and end - start != 1:
-            raise ValueError("Inkling decode rows contain one anchor token")
-
-    native_groups = tuple(plan.cache_groups)
-    if len(native_groups) != GROUP_COUNT:
-        raise ValueError("Inkling requires global, local, draft, and state groups")
-    packings = (
-        GLOBAL_BLOCKS_PER_SLAB,
-        LOCAL_BLOCKS_PER_SLAB,
-        DRAFT_BLOCKS_PER_SLAB,
-        STATE_BLOCKS_PER_SLAB,
-    )
-    groups = tuple(
-        _group_plan(
-            native,
-            index=index,
-            rows=rows,
-            tokens=len(token_ids),
-            expected_packing=packings[index],
-            slab_capacity=layout.parent_capacity,
-        )
-        for index, native in enumerate(native_groups)
-    )
-    for group_index, (group, descriptor) in enumerate(
-        zip(groups, layout.groups, strict=True)
-    ):
-        block_tokens = descriptor.block_tokens
-        for row, (start, end) in enumerate(zip(indptr[:-1], indptr[1:])):
-            post = int(contexts[row]) + int(end - start)
-            leased = post + (decode_lookahead if plan.phase == BatchPhase.DECODE else 0)
-            first = int(group.first_blocks[row])
-            addresses = group.row_addresses(row)
-            last = (leased - 1) // block_tokens
-            expected_first = (
-                max(0, last + 1 - descriptor.window_resident_block_count)
-                if descriptor.retention is CacheRetention.WINDOW
-                else 0
-            )
-            if first != expected_first or first + len(addresses) != last + 1:
-                raise ValueError("Inkling cache row is not the exact active range")
-            logical = positions[start:end] // block_tokens
-            retained = logical >= first
-            for flat, logical_block, keep in zip(
-                range(start, end), logical, retained, strict=True
-            ):
-                if not keep:
-                    continue
-                address = group.address(row, int(logical_block))
-                if address != (
-                    int(group.append_slab_ids[flat]),
-                    int(group.append_slotnums[flat]),
-                ) or int(group.append_offsets[flat]) != int(
-                    positions[flat] % block_tokens
-                ):
-                    raise ValueError("Inkling append address disagrees with its table")
-        if group_index in (GLOBAL_GROUP, DRAFT_GROUP) and np.any(group.first_blocks):
-            raise ValueError("Inkling full-history caches must begin at block zero")
-    return CachePlan(
-        plan.phase,
-        token_ids,
-        positions,
-        indptr,
-        contexts,
-        groups,  # type: ignore[arg-type]
-    )
-
-
 class CacheArena:
     """Layer-addressable views over one Engine-owned fungible slab allocation."""
 
@@ -481,28 +249,28 @@ class CacheArena:
     def reset_null(self) -> None:
         self.storage[0].zero_()
 
-    def tensorize(self, plan: CachePlan, staging: Any) -> DeviceCache:
+    def tensorize(self, plan: PagedCachePlan, staging: Any) -> DeviceCache:
         groups = []
         for index, group in enumerate(plan.groups):
             rows = plan.rows
             width = max(
-                int(group.block_indptr[row + 1] - group.block_indptr[row])
+                len(group.block_slabs(row))
                 for row in range(rows)
             )
             slabs = np.zeros((rows, width), dtype=np.uint32)
             slots = np.zeros_like(slabs)
             for row in range(rows):
-                start, end = map(int, group.block_indptr[row : row + 2])
-                count = end - start
-                slabs[row, :count] = group.block_slab_ids[start:end]
-                slots[row, :count] = group.block_slotnums[start:end]
+                row_slabs = group.block_slabs(row)
+                row_slots = group.block_slots(row)
+                slabs[row, : len(row_slabs)] = row_slabs
+                slots[row, : len(row_slots)] = row_slots
             groups.append(
                 DeviceGroup(
                     staging.device(f"cache.{index}.slabs", slabs, self.torch.int32),
                     staging.device(f"cache.{index}.slots", slots, self.torch.int32),
                     staging.device(
                         f"cache.{index}.first",
-                        group.first_blocks,
+                        group.block_table_start_indices,
                         self.torch.int32,
                     ),
                 )
@@ -585,7 +353,9 @@ class CacheArena:
         return inputs
 
     @staticmethod
-    def graph_plan_inputs(cache: DeviceCache, plan: CachePlan) -> dict[str, object]:
+    def graph_plan_inputs(
+        cache: DeviceCache, plan: PagedCachePlan
+    ) -> dict[str, object]:
         """Pad a current Engine cache plan into fixed graph-owned tables."""
 
         inputs: dict[str, object] = {}
@@ -598,14 +368,14 @@ class CacheArena:
             if plan.rows > shape[0]:
                 raise ValueError("Inkling cache batch exceeds CUDA graph capacity")
             for row in range(plan.rows):
-                start, end = map(int, source.block_indptr[row : row + 2])
-                count = end - start
-                if count > shape[1]:
+                row_slabs = source.block_slabs(row)
+                row_slots = source.block_slots(row)
+                if len(row_slabs) > shape[1]:
                     raise ValueError("Inkling cache table exceeds CUDA graph capacity")
-                slabs[row, :count] = source.block_slab_ids[start:end]
-                slots[row, :count] = source.block_slotnums[start:end]
+                slabs[row, : len(row_slabs)] = row_slabs
+                slots[row, : len(row_slots)] = row_slots
             first = np.zeros(shape[0], dtype=np.uint32)
-            first[: plan.rows] = source.first_blocks
+            first[: plan.rows] = source.block_table_start_indices
             inputs[f"cache.{index}.slabs"] = slabs
             inputs[f"cache.{index}.slots"] = slots
             inputs[f"cache.{index}.first"] = first
@@ -614,9 +384,7 @@ class CacheArena:
 
 __all__ = [
     "CacheArena",
-    "CacheCapacityPlan",
     "CacheGeometry",
-    "CachePlan",
     "DeviceCache",
     "DeviceGroup",
     "DRAFT_GROUP",
@@ -633,6 +401,4 @@ __all__ = [
     "STATE_LENGTH",
     "STATE_WIDTH_PER_LAYER",
     "UNIT_ELEMENTS",
-    "build_cache_plan",
-    "plan_cache_capacity",
 ]

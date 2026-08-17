@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from resin import BatchPlan, CacheGroupPlan
-from resin.backend.plans import BatchView, CacheGroupView
+from resin import BatchPhase, BatchPlan, CacheGroupLayout, CacheGroupPlan, CacheLayout
+from resin.backend.plans import BatchView, CacheGroupView, PagedCachePlan
 
 
 def _plan() -> BatchPlan:
@@ -55,3 +55,29 @@ def test_cache_group_view_preserves_structured_and_packed_addresses() -> None:
     assert group.packed_block_ids.tolist() == [2, 5]
     assert group.packed_append_ids.tolist() == [2, 2, 5]
     assert group.append_block_offsets.dtype == np.uint32
+
+
+def test_paged_cache_plan_validates_exact_leased_tables() -> None:
+    layout = CacheLayout(2, [CacheGroupLayout(2)])
+    plan = BatchPlan(
+        [10],
+        [1],
+        [3],
+        [0, 1],
+        phase=BatchPhase.DECODE,
+        cache_groups=[
+            CacheGroupPlan(
+                0,
+                [0, 2],
+                [1, 2],
+                [0, 0],
+                [0],
+                [1],
+                [0],
+                [1],
+            )
+        ],
+    )
+    cache = PagedCachePlan.from_plan(plan, layout, decode_lookahead=1)
+    assert cache.rows == 1
+    assert cache.groups[0].address(0, 1) == (2, 0)

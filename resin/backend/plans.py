@@ -9,7 +9,7 @@ import numpy as np
 import numpy.typing as npt
 
 if TYPE_CHECKING:
-    from resin._resin import BatchPlan, CacheGroupPlan
+    from resin._resin import BatchPlan, CacheGroupPlan, CacheLayout
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +196,25 @@ class CacheGroupView:
     def block_slots(self, row: int) -> npt.NDArray[np.uint32]:
         return self.block_slotnums[self.block_slice(row)]
 
+    def row_addresses(self, row: int) -> tuple[tuple[int, int], ...]:
+        """Return the ordered physical addresses in one logical table row."""
+
+        return tuple(
+            zip(
+                map(int, self.block_slabs(row)),
+                map(int, self.block_slots(row)),
+            )
+        )
+
+    def address(self, row: int, logical_block: int) -> tuple[int, int]:
+        """Resolve one covered logical block to its physical slab and slot."""
+
+        column = logical_block - int(self.block_table_start_indices[row])
+        addresses = self.row_addresses(row)
+        if not 0 <= column < len(addresses):
+            raise ValueError("cache row does not cover the logical block")
+        return addresses[column]
+
     @property
     def packed_block_ids(self) -> npt.NDArray[np.uint64]:
         return (
@@ -209,6 +228,116 @@ class CacheGroupView:
             self.append_slab_ids.astype(np.uint64) * self.blocks_per_slab
             + self.append_slotnums
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PagedCachePlan:
+    """Validated exact active cache tables for one native batch plan."""
+
+    batch: BatchView
+    groups: tuple[CacheGroupView, ...]
+
+    @classmethod
+    def from_plan(
+        cls,
+        plan: BatchPlan,
+        layout: CacheLayout,
+        *,
+        decode_lookahead: int = 0,
+    ) -> PagedCachePlan:
+        """Validate group order, physical bounds, extents, and append ownership."""
+
+        from resin._resin import BatchPhase
+
+        if decode_lookahead < 0:
+            raise ValueError("decode_lookahead cannot be negative")
+        batch = BatchView.from_plan(plan)
+        if batch.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
+            raise ValueError("BatchPlan phase must be prefill or decode")
+        if len(batch.cache_groups) != len(layout.groups):
+            raise ValueError("BatchPlan cache groups do not match CacheLayout")
+
+        groups = []
+        for index, (native, descriptor) in enumerate(
+            zip(batch.cache_groups, layout.groups, strict=True)
+        ):
+            block_tokens = descriptor.block_tokens
+            group = CacheGroupView.from_plan(
+                native,
+                batch,
+                group_index=index,
+                blocks_per_slab=descriptor.blocks_per_slab,
+                parent_capacity=layout.parent_capacity,
+                block_tokens=block_tokens,
+            )
+            window_blocks = descriptor.window_resident_block_count
+            for row in range(batch.num_sequences):
+                token_slice = batch.token_slice(row)
+                query_length = token_slice.stop - token_slice.start
+                leased = int(batch.context_lengths[row]) + query_length
+                if batch.phase == BatchPhase.DECODE:
+                    leased += decode_lookahead
+                last_block = (leased - 1) // block_tokens
+                expected_first = (
+                    max(0, last_block + 1 - window_blocks)
+                    if window_blocks is not None
+                    else 0
+                )
+                slabs = group.block_slabs(row)
+                slots = group.block_slots(row)
+                if (
+                    int(group.block_table_start_indices[row]) != expected_first
+                    or len(slabs) != last_block - expected_first + 1
+                ):
+                    raise ValueError(
+                        f"cache group {index} row {row} is not its exact active range"
+                    )
+
+                positions = batch.positions[token_slice]
+                logical_blocks = positions // block_tokens
+                retained = logical_blocks >= expected_first
+                columns = logical_blocks[retained] - expected_first
+                if (
+                    not np.array_equal(
+                        group.append_slab_ids[token_slice][retained], slabs[columns]
+                    )
+                    or not np.array_equal(
+                        group.append_slotnums[token_slice][retained], slots[columns]
+                    )
+                    or not np.array_equal(
+                        group.append_block_offsets[token_slice][retained],
+                        positions[retained] % block_tokens,
+                    )
+                ):
+                    raise ValueError(
+                        f"cache group {index} row {row} append target is not row-owned"
+                    )
+            groups.append(group)
+        return cls(batch, tuple(groups))
+
+    @property
+    def phase(self) -> Any:
+        return self.batch.phase
+
+    @property
+    def rows(self) -> int:
+        return self.batch.num_sequences
+
+    @property
+    def token_ids(self) -> npt.NDArray[np.uint32]:
+        return self.batch.token_ids
+
+    @property
+    def positions(self) -> npt.NDArray[np.uint32]:
+        return self.batch.positions
+
+    @property
+    def token_indptr(self) -> npt.NDArray[np.uint32]:
+        return self.batch.token_indptr
+
+    @property
+    def context_lengths(self) -> npt.NDArray[np.uint32]:
+        return self.batch.context_lengths
 
 
 @dataclass(frozen=True, slots=True)

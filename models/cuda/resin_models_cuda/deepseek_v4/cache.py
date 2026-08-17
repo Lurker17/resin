@@ -7,12 +7,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
-import numpy.typing as npt
 
-from resin import BatchPhase, CacheGroupLayout, CacheLayout, CacheRetention
+from resin import CacheGroupLayout, CacheLayout, CacheRetention
 from resin.backend.capacity import CacheCapacityPlan
 from resin.backend.capacity import plan_cache_capacity as plan_capacity
-from resin.backend.plans import BatchView, CacheGroupView
+from resin.backend.plans import PagedCachePlan
 from resin.backend.resources import CachePoolBinding
 
 if TYPE_CHECKING:
@@ -260,18 +259,6 @@ def plan_cache_capacity(
 
 
 @dataclass(frozen=True, slots=True)
-class GroupPlan:
-    parent_ids: tuple[npt.NDArray[np.uint32], ...]
-    child_slots: tuple[npt.NDArray[np.uint32], ...]
-    first_blocks: npt.NDArray[np.uint32]
-
-
-@dataclass(frozen=True, slots=True)
-class CachePlan:
-    groups: tuple[GroupPlan, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class DeviceGroup:
     parent_ids: object
     child_slots: object
@@ -508,79 +495,6 @@ class DeviceCache:
         return physical_children.to(self.torch.int32), offsets.to(self.torch.int32)
 
 
-def build_cache_plan(plan, layout: CacheLayout, *, decode_lookahead: int) -> CachePlan:
-    """Validate the six Engine-issued page tables before a CUDA launch."""
-
-    batch = BatchView.from_plan(plan)
-    rows = batch.num_sequences
-    indptr = batch.token_indptr
-    positions = batch.positions
-    contexts = batch.context_lengths
-    native = batch.cache_groups
-    if len(native) != GROUP_COUNT:
-        raise ValueError(f"DeepSeek requires exactly {GROUP_COUNT} cache groups")
-
-    groups = []
-    for group_index, (source, descriptor) in enumerate(zip(native, layout.groups)):
-        block_tokens = descriptor.block_tokens
-        packing = descriptor.blocks_per_slab
-        group = CacheGroupView.from_plan(
-            source,
-            batch,
-            group_index=group_index,
-            blocks_per_slab=packing,
-            parent_capacity=layout.parent_capacity,
-            block_tokens=block_tokens,
-        )
-        first = group.block_table_start_indices
-        append_parents = group.append_slab_ids
-        append_slots = group.append_slotnums
-        append_offsets = group.append_block_offsets
-        parent_rows = []
-        slot_rows = []
-        for row in range(rows):
-            start, end = indptr[row : row + 2]
-            start = int(start)
-            end = int(end)
-            context = int(contexts[row])
-            leased = context + end - start
-            if batch.phase == BatchPhase.DECODE:
-                leased += decode_lookahead
-            last = (leased - 1) // block_tokens
-            if descriptor.retention is CacheRetention.WINDOW:
-                expected_first = max(
-                    0, last + 1 - descriptor.window_resident_block_count
-                )
-            else:
-                expected_first = 0
-            row_parents = group.block_slabs(row)
-            row_slots = group.block_slots(row)
-            if (
-                int(first[row]) != expected_first
-                or len(row_parents) != last - expected_first + 1
-            ):
-                raise ValueError("DeepSeek cache row has the wrong logical extent")
-            row_positions = positions[start:end]
-            logical = row_positions // block_tokens
-            retained = logical >= expected_first
-            # Sliding state/history groups intentionally ignore the old part of
-            # a large prefill; only their retained tail is materialized.
-            relative = logical[retained] - expected_first
-            if not np.array_equal(
-                append_parents[start:end][retained], row_parents[relative]
-            ) or not np.array_equal(
-                append_slots[start:end][retained], row_slots[relative]
-            ) or not np.array_equal(
-                append_offsets[start:end][retained],
-                row_positions[retained] % block_tokens,
-            ):
-                raise ValueError("DeepSeek cache append target is not row-owned")
-            parent_rows.append(row_parents)
-            slot_rows.append(row_slots)
-        groups.append(GroupPlan(tuple(parent_rows), tuple(slot_rows), first))
-    return CachePlan(tuple(groups))
-
-
 class CacheArena:
     """One allocation shared by six mutually exclusive cache groups."""
 
@@ -656,21 +570,23 @@ class CacheArena:
         # storing -inf into a score view here would corrupt null KV aliases.
         self.reset_scratch()
 
-    def tensorize(self, plan: CachePlan, staging):
+    def tensorize(self, plan: PagedCachePlan, staging):
         torch = self.torch
         groups = []
         for index, group in enumerate(plan.groups):
-            width = max(map(len, group.parent_ids))
+            width = max(
+                len(group.block_slabs(row)) for row in range(plan.rows)
+            )
             # Keep the dynamic width in one cuTile divisibility class. Merely
             # rounding to 16 is insufficient: 128, 192, and 256 produce three
             # progressively stronger JIT assumptions. Every value here is 16
             # modulo 32, so its exact power-of-two divisor is always 16.
             width = (width + 15) // 32 * 32 + 16
-            parents = np.zeros((len(group.parent_ids), width), dtype=np.uint32)
+            parents = np.zeros((plan.rows, width), dtype=np.uint32)
             slots = np.zeros_like(parents)
-            for row_index, (row_parents, row_slots) in enumerate(
-                zip(group.parent_ids, group.child_slots, strict=True)
-            ):
+            for row_index in range(plan.rows):
+                row_parents = group.block_slabs(row_index)
+                row_slots = group.block_slots(row_index)
                 parents[row_index, : len(row_parents)] = row_parents
                 slots[row_index, : len(row_slots)] = row_slots
             groups.append(
@@ -683,7 +599,7 @@ class CacheArena:
                     ),
                     staging.device(
                         f"cache.{index}.first_blocks",
-                        group.first_blocks,
+                        group.block_table_start_indices,
                         torch.int32,
                     ),
                 )
@@ -759,26 +675,30 @@ class CacheArena:
         return inputs
 
     @staticmethod
-    def graph_plan_inputs(cache: DeviceCache, plan: CachePlan) -> dict[str, object]:
+    def graph_plan_inputs(
+        cache: DeviceCache, plan: PagedCachePlan
+    ) -> dict[str, object]:
         inputs = {}
         for index, (target, source) in enumerate(zip(cache.groups, plan.groups)):
             width = target.parent_ids.shape[1]
-            padding_rows = target.parent_ids.shape[0] - len(source.parent_ids)
+            padding_rows = target.parent_ids.shape[0] - plan.rows
             if padding_rows < 0:
                 raise ValueError("DeepSeek cache batch exceeds CUDA graph capacity")
-            if any(len(row) > width for row in source.parent_ids):
+            if any(
+                len(source.block_slabs(row)) > width for row in range(plan.rows)
+            ):
                 raise ValueError("DeepSeek cache table exceeds CUDA graph capacity")
             parents = np.zeros(target.parent_ids.shape, dtype=np.uint32)
             slots = np.zeros_like(parents)
-            for row_index, (row_parents, row_slots) in enumerate(
-                zip(source.parent_ids, source.child_slots, strict=True)
-            ):
+            for row_index in range(plan.rows):
+                row_parents = source.block_slabs(row_index)
+                row_slots = source.block_slots(row_index)
                 parents[row_index, : len(row_parents)] = row_parents
                 slots[row_index, : len(row_slots)] = row_slots
             inputs[f"cache.{index}.parent_ids"] = parents
             inputs[f"cache.{index}.child_slots"] = slots
             inputs[f"cache.{index}.first_blocks"] = np.pad(
-                source.first_blocks, (0, padding_rows)
+                source.block_table_start_indices, (0, padding_rows)
             )
         return inputs
 
@@ -795,11 +715,8 @@ __all__ = [
     "CacheArena",
     "CacheCapacityPlan",
     "CacheGeometry",
-    "CachePlan",
     "DeviceCache",
     "DeviceMapping",
     "DeviceGroup",
-    "GroupPlan",
-    "build_cache_plan",
     "plan_cache_capacity",
 ]
