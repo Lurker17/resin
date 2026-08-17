@@ -9,4 +9,5 @@ Also, you can publish some basic generation endpoints:
 ```bash
 uv run modal deploy deploy/modal_gpt_oss.py
 uv run modal deploy deploy/modal_deepseek_v4.py
+uv run modal deploy deploy/modal_qwen3_5.py
 ```
