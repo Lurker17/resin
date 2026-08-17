@@ -42,6 +42,7 @@ MODEL_FILES = (
 )
 ASSISTANT_FILES = ("config.json", "model.safetensors")
 CUDA_GRAPH_HISTORY_PAGES = 4096
+PRODUCTION_SPECULATIVE_TOKENS = 3
 _http_server_processes: list[object] = []
 
 image = build_modal_image(
@@ -542,11 +543,17 @@ def sampled_text_test(
     single_use_containers=True,
 )
 def repeated_sampled_text_test(
-    max_new_tokens: int = 1024, *, eager: bool = False
+    max_new_tokens: int = 1024,
+    *,
+    eager: bool = False,
+    speculative_tokens: int = 0,
 ) -> dict[str, Any]:
     import torch
 
-    _, runner, processor, engine, _ = _build_runtime(cuda_graphs=not eager)
+    _, runner, processor, engine, _ = _build_runtime(
+        cuda_graphs=not eager,
+        speculative_tokens=speculative_tokens,
+    )
     try:
         runs = []
         for seed in (7, 8, 9):
@@ -569,8 +576,10 @@ def repeated_sampled_text_test(
             )
         report = {
             "eager": eager,
+            "speculative_tokens": speculative_tokens,
             "runs": runs,
             "cuda_graphs": runner.cuda_graph_stats,
+            "speculative": runner.speculative_stats,
         }
         print("[repeated-sampled-text] " + json.dumps(report), flush=True)
         return report
@@ -750,9 +759,9 @@ def _serve(_: int) -> None:
     from resin.server import HttpServer
     from resin_models_cuda.gemma4 import Gemma4Codec
 
-    # Keep production on ordinary graph-backed decode while long-generation
-    # parity for the speculative path remains under investigation.
-    torch, runner, processor, engine, _ = _build_runtime(speculative_tokens=0)
+    torch, runner, processor, engine, _ = _build_runtime(
+        speculative_tokens=PRODUCTION_SPECULATIVE_TOKENS
+    )
     try:
         # Compile/load every exact kernel geometry before opening the socket.
         warmup, _, _ = _generate(engine, processor, "Name the main colors.", 2)
@@ -810,7 +819,11 @@ def main(mode: str = "smoke", max_new_tokens: int = 16) -> None:
     elif mode == "spec-smoke":
         print(
             json.dumps(
-                smoke_test.remote(max_new_tokens, speculative_tokens=3), indent=2
+                smoke_test.remote(
+                    max_new_tokens,
+                    speculative_tokens=PRODUCTION_SPECULATIVE_TOKENS,
+                ),
+                indent=2,
             )
         )
     elif mode == "profile":
