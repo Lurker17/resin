@@ -1,0 +1,369 @@
+"""Fungible full-attention, DeltaNet-state, and optional MTP cache."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+
+from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout
+from resin.backend.plans import PagedCachePlan
+from resin.backend.resources import CachePoolBinding
+from resin_models_cuda.qwen3_5.config import Qwen35Config
+
+if TYPE_CHECKING:
+    from torch import Tensor
+
+PAGE_TOKENS = 128
+PREFILL_CHUNK_SIZE = 4096
+TARGET_GROUP = 0
+STATE_GROUP = 1
+MTP_GROUP = 2
+
+BF16_BYTES = 2
+FP32_BYTES = 4
+
+
+@dataclass(frozen=True, slots=True)
+class CacheGeometry:
+    """Common slab geometry for unequal Qwen cache resources."""
+
+    full_layers: int
+    linear_layers: int
+    kv_heads: int
+    head_dim: int
+    linear_value_heads: int
+    linear_key_head_dim: int
+    linear_value_head_dim: int
+    conv_dim: int
+    conv_state_length: int
+    include_mtp: bool
+    slab_units: int
+    target_blocks_per_slab: int
+    state_blocks_per_slab: int
+    mtp_blocks_per_slab: int
+
+    @classmethod
+    def from_config(
+        cls, config: Qwen35Config, *, include_mtp: bool
+    ) -> CacheGeometry:
+        if include_mtp:
+            config.require_mtp()
+        conv_state_length = config.linear_conv_kernel_dim - 1
+        unit_bytes = (
+            2 * PAGE_TOKENS * config.num_key_value_heads * config.head_dim * BF16_BYTES
+        )
+        target_block_bytes = config.full_layer_count * unit_bytes
+        state_bytes = (
+            config.linear_layer_count
+            * config.linear_num_value_heads
+            * config.linear_key_head_dim
+            * config.linear_value_head_dim
+            * FP32_BYTES
+            + config.linear_layer_count
+            * config.linear_conv_dim
+            * conv_state_length
+            * BF16_BYTES
+        )
+        slab_bytes = math.ceil(state_bytes / target_block_bytes) * target_block_bytes
+        slab_units = slab_bytes // unit_bytes
+        return cls(
+            full_layers=config.full_layer_count,
+            linear_layers=config.linear_layer_count,
+            kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            linear_value_heads=config.linear_num_value_heads,
+            linear_key_head_dim=config.linear_key_head_dim,
+            linear_value_head_dim=config.linear_value_head_dim,
+            conv_dim=config.linear_conv_dim,
+            conv_state_length=conv_state_length,
+            include_mtp=include_mtp,
+            slab_units=slab_units,
+            target_blocks_per_slab=slab_units // config.full_layer_count,
+            state_blocks_per_slab=slab_bytes // state_bytes,
+            mtp_blocks_per_slab=slab_units,
+        )
+
+    @property
+    def unit_elements(self) -> int:
+        return 2 * PAGE_TOKENS * self.kv_heads * self.head_dim
+
+    @property
+    def unit_bytes(self) -> int:
+        return self.unit_elements * BF16_BYTES
+
+    @property
+    def slab_bytes(self) -> int:
+        return self.slab_units * self.unit_bytes
+
+    @property
+    def recurrent_elements(self) -> int:
+        return (
+            self.linear_layers
+            * self.linear_value_heads
+            * self.linear_key_head_dim
+            * self.linear_value_head_dim
+        )
+
+    @property
+    def recurrent_bytes(self) -> int:
+        return self.recurrent_elements * FP32_BYTES
+
+    @property
+    def convolution_elements(self) -> int:
+        return self.linear_layers * self.conv_dim * self.conv_state_length
+
+    @property
+    def state_bytes(self) -> int:
+        return self.recurrent_bytes + self.convolution_elements * BF16_BYTES
+
+    def layout(self, slab_capacity: int) -> CacheLayout:
+        groups = [
+            CacheGroupLayout(
+                PAGE_TOKENS, blocks_per_slab=self.target_blocks_per_slab
+            ),
+            CacheGroupLayout(
+                PREFILL_CHUNK_SIZE,
+                blocks_per_slab=self.state_blocks_per_slab,
+                family=CacheGroupFamily.STATE,
+            ),
+        ]
+        if self.include_mtp:
+            groups.append(
+                CacheGroupLayout(
+                    PAGE_TOKENS, blocks_per_slab=self.mtp_blocks_per_slab
+                )
+            )
+        return CacheLayout(slab_capacity, groups)
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceGroup:
+    slab_ids: Tensor
+    slotnums: Tensor
+    first_blocks: Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceCache:
+    """Tensorized cache tables and typed views over the shared byte arena."""
+
+    torch: Any
+    geometry: CacheGeometry
+    groups: tuple[DeviceGroup, ...]
+    keys: Tensor
+    values: Tensor
+    recurrent_states: Tensor
+    convolution_states: Tensor
+
+    def row(self, index: int) -> DeviceCache:
+        return DeviceCache(
+            self.torch,
+            self.geometry,
+            tuple(
+                DeviceGroup(
+                    group.slab_ids[index : index + 1],
+                    group.slotnums[index : index + 1],
+                    group.first_blocks[index : index + 1],
+                )
+                for group in self.groups
+            ),
+            self.keys,
+            self.values,
+            self.recurrent_states,
+            self.convolution_states,
+        )
+
+    def locations(
+        self, group_index: int, positions: Tensor, *, block_tokens: int
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        group = self.groups[group_index]
+        logical = positions.div(block_tokens, rounding_mode="floor")
+        first = group.first_blocks.view((-1,) + (1,) * (positions.ndim - 1))
+        columns = logical - first
+        width = group.slab_ids.shape[1]
+        gather = columns.flatten(1).clamp(0, width - 1).long()
+        slabs = self.torch.gather(group.slab_ids, 1, gather).view_as(columns)
+        slots = self.torch.gather(group.slotnums, 1, gather).view_as(columns)
+        valid = (columns >= 0) & (columns < width)
+        slabs = self.torch.where(valid, slabs, 0)
+        slots = self.torch.where(valid, slots, 0)
+        offsets = self.torch.where(valid, positions.remainder(block_tokens), 0)
+        return slabs, slots, offsets
+
+    def pages(self, group_index: int, layer: int, layer_count: int) -> Tensor:
+        if not 0 <= layer < layer_count:
+            raise ValueError("Qwen3.5 cache layer lies outside its cache group")
+        group = self.groups[group_index]
+        return (
+            group.slab_ids * self.geometry.slab_units
+            + group.slotnums * layer_count
+            + layer
+        ).to(self.torch.int32)
+
+    def rows(
+        self,
+        group_index: int,
+        layer: int,
+        layer_count: int,
+        positions: Tensor,
+    ) -> Tensor:
+        slabs, slots, offsets = self.locations(
+            group_index, positions, block_tokens=PAGE_TOKENS
+        )
+        pages = slabs * self.geometry.slab_units + slots * layer_count + layer
+        return (pages * PAGE_TOKENS + offsets).long()
+
+    def state_at(self, positions: Tensor) -> tuple[Tensor, Tensor]:
+        slabs, slots, _ = self.locations(
+            STATE_GROUP, positions, block_tokens=PREFILL_CHUNK_SIZE
+        )
+        indices = slabs.long(), slots.long()
+        return self.recurrent_states[indices], self.convolution_states[indices]
+
+    def store_state(
+        self, positions: Tensor, recurrent: Tensor, convolution: Tensor
+    ) -> None:
+        slabs, slots, _ = self.locations(
+            STATE_GROUP, positions, block_tokens=PREFILL_CHUNK_SIZE
+        )
+        indices = slabs.long(), slots.long()
+        self.recurrent_states[indices] = recurrent
+        self.convolution_states[indices] = convolution
+
+
+class CacheArena:
+    """Layer-addressable BF16 KV and mixed-dtype recurrent state views."""
+
+    def __init__(
+        self,
+        torch: Any,
+        device: Any,
+        layout: CacheLayout,
+        geometry: CacheGeometry,
+    ) -> None:
+        self.torch = torch
+        self.device = device
+        self.layout = layout
+        self.geometry = geometry
+        self.binding = CachePoolBinding(layout, resource="Qwen3.5 cache")
+        physical = layout.parent_capacity + 1
+        self.storage = torch.zeros(
+            (physical, geometry.slab_bytes), dtype=torch.uint8, device=device
+        )
+
+        bf16 = self.storage.view(torch.bfloat16)
+        page_elements = PAGE_TOKENS * geometry.kv_heads * geometry.head_dim
+        page_shape = (
+            physical * geometry.slab_units,
+            PAGE_TOKENS,
+            geometry.kv_heads,
+            geometry.head_dim,
+        )
+        page_stride = (
+            geometry.unit_elements,
+            geometry.kv_heads * geometry.head_dim,
+            geometry.head_dim,
+            1,
+        )
+        self.keys = torch.as_strided(bf16, page_shape, page_stride)
+        self.values = torch.as_strided(
+            bf16, page_shape, page_stride, storage_offset=page_elements
+        )
+
+        fp32 = self.storage.view(torch.float32)
+        recurrent_shape = (
+            physical,
+            geometry.state_blocks_per_slab,
+            geometry.linear_layers,
+            geometry.linear_value_heads,
+            geometry.linear_key_head_dim,
+            geometry.linear_value_head_dim,
+        )
+        recurrent_layer = (
+            geometry.linear_value_heads
+            * geometry.linear_key_head_dim
+            * geometry.linear_value_head_dim
+        )
+        self.recurrent_states = torch.as_strided(
+            fp32,
+            recurrent_shape,
+            (
+                geometry.slab_bytes // FP32_BYTES,
+                geometry.state_bytes // FP32_BYTES,
+                recurrent_layer,
+                geometry.linear_key_head_dim * geometry.linear_value_head_dim,
+                geometry.linear_value_head_dim,
+                1,
+            ),
+        )
+
+        convolution_layer = geometry.conv_dim * geometry.conv_state_length
+        self.convolution_states = torch.as_strided(
+            bf16,
+            (
+                physical,
+                geometry.state_blocks_per_slab,
+                geometry.linear_layers,
+                geometry.conv_dim,
+                geometry.conv_state_length,
+            ),
+            (
+                geometry.slab_bytes // BF16_BYTES,
+                geometry.state_bytes // BF16_BYTES,
+                convolution_layer,
+                geometry.conv_state_length,
+                1,
+            ),
+            storage_offset=geometry.recurrent_bytes // BF16_BYTES,
+        )
+
+    def reset_null(self) -> None:
+        self.storage[0].zero_()
+
+    def tensorize(self, plan: PagedCachePlan, staging: Any) -> DeviceCache:
+        groups = []
+        for index, group in enumerate(plan.groups):
+            width = max(len(group.block_slabs(row)) for row in range(plan.rows))
+            slabs = np.zeros((plan.rows, width), dtype=np.uint32)
+            slots = np.zeros_like(slabs)
+            for row in range(plan.rows):
+                row_slabs = group.block_slabs(row)
+                row_slots = group.block_slots(row)
+                slabs[row, : len(row_slabs)] = row_slabs
+                slots[row, : len(row_slots)] = row_slots
+            groups.append(
+                DeviceGroup(
+                    staging.device(f"cache.{index}.slabs", slabs, self.torch.int32),
+                    staging.device(f"cache.{index}.slots", slots, self.torch.int32),
+                    staging.device(
+                        f"cache.{index}.first",
+                        group.block_table_start_indices,
+                        self.torch.int32,
+                    ),
+                )
+            )
+        return DeviceCache(
+            self.torch,
+            self.geometry,
+            tuple(groups),
+            self.keys,
+            self.values,
+            self.recurrent_states,
+            self.convolution_states,
+        )
+
+
+__all__ = [
+    "CacheArena",
+    "CacheGeometry",
+    "DeviceCache",
+    "DeviceGroup",
+    "MTP_GROUP",
+    "PAGE_TOKENS",
+    "PREFILL_CHUNK_SIZE",
+    "STATE_GROUP",
+    "TARGET_GROUP",
+]
