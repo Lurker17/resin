@@ -8,6 +8,7 @@ from torch import Tensor, nn
 
 from resin_models_cuda.inkling.attention import (
     PagedAttentionBatch,
+    append_kv,
     log_scaling_tau,
     paged_attention,
     prepare_paged_attention_batch,
@@ -441,34 +442,51 @@ class InklingAttention(nn.Module):
         attention_batch: PagedAttentionBatch,
         k_state: Tensor,
         v_state: Tensor,
+        *,
+        prefill: bool,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         batch, tokens, _ = hidden.shape
         q = self.wq(hidden).view(batch, tokens, self.heads, self.head_dim)
         k_input = self.wk(hidden)
         v_input = self.wv(hidden)
-        from resin_models_cuda.inkling.cutile import kv_sconv_norm_store
+        if prefill:
+            k, k_state = self.k_sconv(k_input, k_state)
+            v, v_state = self.v_sconv(v_input, v_state)
+            k = self.k_norm(k.view(batch, tokens, self.kv_heads, self.head_dim))
+            v = v.view(batch, tokens, self.kv_heads, self.head_dim)
+            append_kv(
+                cache,
+                group_index=self.group,
+                layer=self.cache_layer,
+                layer_count=self.cache_layers,
+                positions=positions,
+                keys=k,
+                values=v,
+            )
+        else:
+            from resin_models_cuda.inkling.cutile import kv_sconv_norm_store
 
-        group = cache.groups[self.group]
-        k_state, v_state = kv_sconv_norm_store(
-            k_input,
-            v_input,
-            k_state,
-            v_state,
-            self.k_sconv.weight,
-            self.v_sconv.weight,
-            self.k_norm.weight,
-            cache.keys,
-            cache.values,
-            group.slab_ids,
-            group.slotnums,
-            group.first_blocks,
-            positions,
-            page_tokens=cache.page_tokens,
-            slab_units=cache.slab_units,
-            layer_count=self.cache_layers,
-            layer=self.cache_layer,
-            epsilon=self.k_norm.eps,
-        )
+            group = cache.groups[self.group]
+            k_state, v_state = kv_sconv_norm_store(
+                k_input,
+                v_input,
+                k_state,
+                v_state,
+                self.k_sconv.weight,
+                self.v_sconv.weight,
+                self.k_norm.weight,
+                cache.keys,
+                cache.values,
+                group.slab_ids,
+                group.slotnums,
+                group.first_blocks,
+                positions,
+                page_tokens=cache.page_tokens,
+                slab_units=cache.slab_units,
+                layer_count=self.cache_layers,
+                layer=self.cache_layer,
+                epsilon=self.k_norm.eps,
+            )
         q = self.q_norm(q)
         relative = self.wr(hidden).view(batch * tokens, self.heads, -1)
         relative = relative @ self.rel_proj
@@ -530,6 +548,7 @@ class DecoderLayer(nn.Module):
         attention_batch: PagedAttentionBatch,
         state: Tensor,
         *,
+        prefill: bool,
         record_state_inputs: bool,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
         k_state, v_state, attn_state, mlp_state = torch.split(
@@ -545,26 +564,35 @@ class DecoderLayer(nn.Module):
             attention_batch,
             k_state,
             v_state,
+            prefill=prefill,
         )
         attn_input = attended
-        from resin_models_cuda.inkling.cutile import sconv_residual
+        if prefill:
+            attended, attn_state = self.attn_sconv(attn_input, attn_state)
+            hidden = residual + attended
+        else:
+            from resin_models_cuda.inkling.cutile import sconv_residual
 
-        hidden, attn_state = sconv_residual(
-            attn_input,
-            attn_state,
-            self.attn_sconv.weight,
-            residual,
-        )
+            hidden, attn_state = sconv_residual(
+                attn_input,
+                attn_state,
+                self.attn_sconv.weight,
+                residual,
+            )
         residual = hidden
         mlp_hidden = self.mlp(self.mlp_norm(hidden))
         tap = residual + mlp_hidden
         mlp_input = mlp_hidden
-        hidden, mlp_state = sconv_residual(
-            mlp_input,
-            mlp_state,
-            self.mlp_sconv.weight,
-            residual,
-        )
+        if prefill:
+            mlp_hidden, mlp_state = self.mlp_sconv(mlp_input, mlp_state)
+            hidden = residual + mlp_hidden
+        else:
+            hidden, mlp_state = sconv_residual(
+                mlp_input,
+                mlp_state,
+                self.mlp_sconv.weight,
+                residual,
+            )
         new_state = torch.cat((k_state, v_state, attn_state, mlp_state), dim=-1)
         state_inputs = None
         if record_state_inputs:
@@ -709,6 +737,7 @@ class InklingTarget(nn.Module):
         max_sequence_length: int,
         *,
         full_logits: bool,
+        prefill: bool = False,
         input_embeddings: Tensor | None = None,
         state_inputs_out: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
@@ -752,6 +781,7 @@ class InklingTarget(nn.Module):
                 cache,
                 attention_batch,
                 state[:, index],
+                prefill=prefill,
                 record_state_inputs=state_inputs_out is not None,
             )
             next_states.append(layer_state)

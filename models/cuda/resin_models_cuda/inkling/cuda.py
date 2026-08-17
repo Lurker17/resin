@@ -491,6 +491,7 @@ class InklingCudaRunner(Runner):
                 row_positions[:, -1] + 1,
                 context + end - start,
                 full_logits=False,
+                prefill=True,
                 input_embeddings=input_embeddings,
             )
             self._store_state(row_cache, row_positions[:, -1], final_state)
