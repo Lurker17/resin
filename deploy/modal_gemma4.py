@@ -42,7 +42,7 @@ MODEL_FILES = (
 )
 ASSISTANT_FILES = ("config.json", "model.safetensors")
 CUDA_GRAPH_HISTORY_PAGES = 4096
-PRODUCTION_SPECULATIVE_TOKENS = 3
+PRODUCTION_SPECULATIVE = True
 _http_server_processes: list[object] = []
 
 image = build_modal_image(
@@ -133,7 +133,7 @@ def download_model() -> dict[str, Any]:
 def _build_runtime(
     *,
     static_memory_fraction: float = 0.95,
-    speculative_tokens: int = 0,
+    speculative: bool = False,
     cuda_graphs: bool = True,
     kv_cache_dtype: str = "fp8",
 ):
@@ -147,13 +147,12 @@ def _build_runtime(
     load_started = time.perf_counter()
     runner = Gemma4CudaRunner(
         MODEL_PATH,
-        assistant_model=ASSISTANT_PATH if speculative_tokens else None,
-        speculative_tokens=speculative_tokens,
+        assistant_model=ASSISTANT_PATH if speculative else None,
         kv_cache_dtype=kv_cache_dtype,
         cuda_graph_decode_shapes=(
             default_decode_graph_shapes(
                 CUDA_GRAPH_HISTORY_PAGES,
-                speculative=bool(speculative_tokens),
+                speculative=speculative,
                 max_batch_size=DEFAULT_MAX_NUM_SEQS,
             )
             if cuda_graphs
@@ -407,11 +406,9 @@ def _teacher_forced_next_token(engine, runner, media, output_ids, length: int):
     single_use_containers=True,
 )
 def smoke_test(
-    max_new_tokens: int = 16, *, speculative_tokens: int = 0
+    max_new_tokens: int = 16, *, speculative: bool = False
 ) -> dict[str, Any]:
-    torch, runner, processor, engine, report = _build_runtime(
-        speculative_tokens=speculative_tokens
-    )
+    torch, runner, processor, engine, report = _build_runtime(speculative=speculative)
     try:
         warmup_started = time.perf_counter()
         _, _, warmup_steps = _generate(
@@ -546,13 +543,13 @@ def repeated_sampled_text_test(
     max_new_tokens: int = 1024,
     *,
     eager: bool = False,
-    speculative_tokens: int = 0,
+    speculative: bool = False,
 ) -> dict[str, Any]:
     import torch
 
     _, runner, processor, engine, _ = _build_runtime(
         cuda_graphs=not eager,
-        speculative_tokens=speculative_tokens,
+        speculative=speculative,
     )
     try:
         runs = []
@@ -576,7 +573,7 @@ def repeated_sampled_text_test(
             )
         report = {
             "eager": eager,
-            "speculative_tokens": speculative_tokens,
+            "speculative_enabled": speculative,
             "runs": runs,
             "cuda_graphs": runner.cuda_graph_stats,
             "speculative": runner.speculative_stats,
@@ -760,7 +757,7 @@ def _serve(_: int) -> None:
     from resin_models_cuda.gemma4 import Gemma4Codec
 
     torch, runner, processor, engine, _ = _build_runtime(
-        speculative_tokens=PRODUCTION_SPECULATIVE_TOKENS
+        speculative=PRODUCTION_SPECULATIVE
     )
     try:
         # Compile/load every exact kernel geometry before opening the socket.
@@ -821,7 +818,7 @@ def main(mode: str = "smoke", max_new_tokens: int = 16) -> None:
             json.dumps(
                 smoke_test.remote(
                     max_new_tokens,
-                    speculative_tokens=PRODUCTION_SPECULATIVE_TOKENS,
+                    speculative=True,
                 ),
                 indent=2,
             )
