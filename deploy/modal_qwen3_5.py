@@ -326,7 +326,11 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
     try:
         HttpServer(
             engine,
-            codec=RendererCodec(renderer, tokenizer=tokenizer),
+            codec=RendererCodec(
+                renderer,
+                tokenizer=tokenizer,
+                include_generation_prefix_in_parser=True,
+            ),
             model=MODEL_ID,
         ).serve(host="0.0.0.0", port=8000)
     finally:
