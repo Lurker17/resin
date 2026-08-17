@@ -593,12 +593,16 @@ class Qwen3_5CudaRunner(Runner):
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(attention.graph_inputs())
         inputs.update(self._sampler.graph_inputs(sampling))
+
+        def prepare() -> None:
+            attention.reset()
+            self._cache.reset_null()
+
         return CudaGraphStep(
             inputs=inputs,
             output=output_ids,
             launch=launch,
-            prepare=attention.reset,
-            validate_eager_output=False,
+            prepare=prepare,
         )
 
     def _graph_forward(
