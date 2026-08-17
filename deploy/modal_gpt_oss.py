@@ -20,8 +20,6 @@ from renderers import GptOssRendererConfig, Message, Renderer, create_renderer
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from deploy.http import (
-    TensorParallelServerRunner,
-    follow_tensor_parallel_server,
     monitor_spawned_server,
 )
 from deploy.jit_cache import (
@@ -45,6 +43,7 @@ from resin.backend.cuda.graphs import (
     default_decode_graph_shapes,
 )
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
+from resin.backend.parallel import TensorParallelRunner, follow_tensor_parallel_runner
 from resin.server import HttpServer, RendererCodec
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1131,14 +1130,14 @@ def _serve_http_rank(
     if rank != 0:
         assert control_group is not None
         print("[http-startup] follower ready for rank-zero commands", flush=True)
-        follow_tensor_parallel_server(runner, control_group, dist)
+        follow_tensor_parallel_runner(runner, control_group, dist)
         os._exit(0)
 
     print("[http-startup] loading tokenizer and renderer...", flush=True)
     tokenizer, renderer = _load_renderer(model_path)
     print("[http-startup] tokenizer and renderer loaded", flush=True)
     coordinated_runner = (
-        TensorParallelServerRunner(runner, control_group, dist)
+        TensorParallelRunner(runner, control_group, dist)
         if control_group is not None
         else None
     )

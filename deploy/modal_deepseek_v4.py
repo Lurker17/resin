@@ -23,8 +23,6 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from deploy.http import (
     DeepSeekV4Codec,
-    TensorParallelServerRunner,
-    follow_tensor_parallel_server,
     monitor_spawned_server,
 )
 from deploy.modal_image import build_modal_image
@@ -34,6 +32,7 @@ from resin.backend.cuda.graphs import (
     default_decode_graph_shapes,
 )
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
+from resin.backend.parallel import TensorParallelRunner, follow_tensor_parallel_runner
 from resin.server import HttpServer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -518,9 +517,7 @@ def _run_rank_workload(
             before_prefix = engine.prefix_cache_stats
             continuation_rows = [
                 [*row, *output_ids, 0]
-                for row, output_ids in zip(
-                    prompt_rows, profile_outputs, strict=True
-                )
+                for row, output_ids in zip(prompt_rows, profile_outputs, strict=True)
             ]
             probes = [
                 engine.submit(
@@ -1073,7 +1070,7 @@ def _serve_http_rank(
     tensor_parallel.barrier()
 
     if rank != 0:
-        follow_tensor_parallel_server(runner, control_group, dist)
+        follow_tensor_parallel_runner(runner, control_group, dist)
         os._exit(0)
 
     tokenizer = cast(
@@ -1083,7 +1080,7 @@ def _serve_http_rank(
         ),
     )
     encoding = _load_encoding(model_path)
-    coordinated_runner = TensorParallelServerRunner(runner, control_group, dist)
+    coordinated_runner = TensorParallelRunner(runner, control_group, dist)
     engine = Engine(
         coordinated_runner,
         max_running_requests=DEFAULT_MAX_NUM_SEQS,

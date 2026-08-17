@@ -5,13 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from deploy.http import (
-    TensorParallelServerRunner,
+from resin import BatchPhase, BatchPlan, CacheGroupPlan, Engine, SamplingParams
+from resin.backend.parallel import (
+    TensorParallelRunner,
     batch_plan_from_payload,
     batch_plan_payload,
-    follow_tensor_parallel_server,
+    follow_tensor_parallel_runner,
 )
-from resin import BatchPhase, BatchPlan, CacheGroupPlan, Engine, SamplingParams
 from resin.server import HttpServer, RendererCodec
 
 
@@ -51,7 +51,7 @@ def test_tensor_parallel_server_broadcasts_resource_binding() -> None:
             assert bound is binding
 
     distributed = RecordingDistributed()
-    runner = TensorParallelServerRunner(Runner(), "control", distributed)
+    runner = TensorParallelRunner(Runner(), "control", distributed)
 
     assert runner.bind_resources(binding) is None
     assert distributed.broadcasts == [
@@ -83,7 +83,7 @@ def test_tensor_parallel_follower_applies_resource_binding() -> None:
         ]
     )
 
-    follow_tensor_parallel_server(Runner(), "control", distributed)
+    follow_tensor_parallel_runner(Runner(), "control", distributed)
 
     assert len(Runner.calls) == 1
     assert Runner.calls[0].cache_pool_id == 41
