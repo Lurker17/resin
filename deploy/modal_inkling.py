@@ -27,7 +27,6 @@ KERNEL_VOLUME_NAME = "resin-inkling-kernels-v1"
 TARGET_PATH = Path(MODEL_MOUNT) / "target" / MODEL_SPEC.target_revision
 DRAFT_PATH = Path(MODEL_MOUNT) / "draft" / MODEL_SPEC.draft_revision
 MAX_CONTEXT_LENGTH = 131_072
-SPECULATIVE_TOKENS = 5
 TARGET_PATTERNS = (
     "*.json",
     "*.jinja",
@@ -161,10 +160,9 @@ def _build_runtime(*, context_length: int = MAX_CONTEXT_LENGTH):
         DRAFT_PATH,
         max_seq_len=context_length,
         max_batch_size=DEFAULT_MAX_NUM_SEQS,
-        speculative_tokens=SPECULATIVE_TOKENS,
         gpu_memory_utilization=0.90,
         cuda_graph_decode_shapes=default_decode_graph_shapes(
-            context_length + SPECULATIVE_TOKENS,
+            context_length + InklingCudaRunner.speculative_tokens,
             speculative=True,
             max_batch_size=DEFAULT_MAX_NUM_SEQS,
         ),

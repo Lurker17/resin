@@ -67,6 +67,8 @@ def _default_dtype(dtype: Any) -> Iterator[None]:
 class InklingCudaRunner(Runner):
     """Inkling-Small NVFP4 runner with image input and DSpark speculation."""
 
+    speculative_tokens = DSparkDraft.gamma
+
     def __init__(
         self,
         target_model: str | Path,
@@ -75,7 +77,6 @@ class InklingCudaRunner(Runner):
         max_seq_len: int,
         max_batch_size: int = 128,
         device: str | torch.device = "cuda:0",
-        speculative_tokens: int = 5,
         prefill_chunk_size: int = PREFILL_CHUNK_SIZE,
         gpu_memory_utilization: float = 0.90,
         cache_slab_capacity: int | None = None,
@@ -88,8 +89,6 @@ class InklingCudaRunner(Runner):
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        if speculative_tokens not in (0, 5):
-            raise ValueError("Inkling DSpark supports exactly gamma=5 or disabled")
         if prefill_chunk_size != PREFILL_CHUNK_SIZE:
             raise ValueError("Inkling recurrent checkpoints require 4096-token chunks")
         if not 0 < gpu_memory_utilization < 1:
@@ -126,13 +125,12 @@ class InklingCudaRunner(Runner):
 
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
-        self.speculative_tokens = speculative_tokens
         self.prefill_chunk_size = prefill_chunk_size
-        self.physical_seq_len = max_seq_len + speculative_tokens
+        self.physical_seq_len = max_seq_len + self.speculative_tokens
         self.vocab_size = self.config.unpadded_vocab_size
         self.eos_token_id = self.config.eos_token_id
         self._sampler = FlashInferSampler(torch)
-        self._speculation = SpeculativeStats(speculative_tokens)
+        self._speculation = SpeculativeStats(self.speculative_tokens)
         self._graph_device_caches: dict[GraphShape, DeviceCache] = {}
         self._media_features: dict[int, tuple[InklingMedia, torch.Tensor]] = {}
 
@@ -172,9 +170,7 @@ class InklingCudaRunner(Runner):
         self.cache_capacity_plan = replace(
             capacity,
             parent_capacity=slab_capacity,
-            allocation_bytes=(
-                slab_capacity + capacity.reserved_parent_count
-            )
+            allocation_bytes=(slab_capacity + capacity.reserved_parent_count)
             * capacity.bytes_per_parent,
         )
         self.cache_layout = self.cache_geometry.layout(slab_capacity)
@@ -184,7 +180,9 @@ class InklingCudaRunner(Runner):
             raise ValueError("CUDA graph batch capacity exceeds max_batch_size")
         if any(shape[1] > self.physical_seq_len for shape in decode_graph_shapes):
             raise ValueError("CUDA graph sequence capacity exceeds max_seq_len")
-        if any(shape[1] <= speculative_tokens + 1 for shape in decode_graph_shapes):
+        if any(
+            shape[1] <= self.speculative_tokens + 1 for shape in decode_graph_shapes
+        ):
             raise ValueError("Inkling CUDA graph sequence capacity is too small")
         self._graphs = CudaGraphCache(
             torch,
@@ -193,19 +191,15 @@ class InklingCudaRunner(Runner):
             build=self._new_decode_graph_step,
             synchronize_failure=self._cuda_failure,
         )
-        self._graph_state_inputs = (
-            torch.empty(
-                (
-                    max_batch_size,
-                    speculative_tokens + 1,
-                    self.config.num_hidden_layers,
-                    STATE_WIDTH_PER_LAYER,
-                ),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            if speculative_tokens
-            else None
+        self._graph_state_inputs = torch.empty(
+            (
+                max_batch_size,
+                self.speculative_tokens + 1,
+                self.config.num_hidden_layers,
+                STATE_WIDTH_PER_LAYER,
+            ),
+            dtype=torch.bfloat16,
+            device=self.device,
         )
         self.runner_config = RunnerConfig(
             max_batch_tokens=self.prefill_chunk_size,
@@ -278,9 +272,7 @@ class InklingCudaRunner(Runner):
         token_ids = torch.empty(batch_size, dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
         sampling = self._sampler.empty(batch_size, self.device)
-        output_width = (
-            1 if not self.speculative_tokens else 2 * self.speculative_tokens + 1
-        )
+        output_width = 2 * self.speculative_tokens + 1
         output_ids = torch.empty(
             (batch_size, output_width), dtype=torch.long, device=self.device
         )
@@ -288,26 +280,7 @@ class InklingCudaRunner(Runner):
         def launch() -> None:
             with _default_dtype(torch.bfloat16), torch.device(self.device):
                 initial_state = self._initial_state(cache, positions)
-                if not self.speculative_tokens:
-                    logits, _, final_state, _ = self._model.target(
-                        token_ids[:, None],
-                        positions[:, None],
-                        cache,
-                        initial_state,
-                        positions + 1,
-                        graph_seq_len,
-                        full_logits=False,
-                    )
-                    self._store_state(cache, positions, final_state)
-                    output_ids[:, 0].copy_(
-                        self._graph_sample(logits[:, -1], sampling, 0)
-                    )
-                    return
-
-                state_inputs = self._graph_state_inputs
-                if state_inputs is None:
-                    raise RuntimeError("Inkling speculative state workspace is missing")
-                state_inputs = state_inputs[:batch_size]
+                state_inputs = self._graph_state_inputs[:batch_size]
                 drafts, _ = self._draft.propose(
                     token_ids,
                     positions,
@@ -396,8 +369,6 @@ class InklingCudaRunner(Runner):
             )
         inputs.update(sampling_inputs)
         output = self._graphs.run(shape, inputs)[:batch_size]
-        if not self.speculative_tokens:
-            return [row[0] for row in output]
         width = self.speculative_tokens
         return self._speculation.accept(
             [row[:width] for row in output],
@@ -495,14 +466,11 @@ class InklingCudaRunner(Runner):
                 input_embeddings=input_embeddings,
             )
             self._store_state(row_cache, row_positions[:, -1], final_state)
-            if self.speculative_tokens:
-                self._draft.inject_target(taps, row_positions, row_cache)
+            self._draft.inject_target(taps, row_positions, row_cache)
             logits.append(row_logits[:, -1])
         return self._sample(torch.cat(logits), plan).tolist()
 
-    def _features_for(
-        self, sequence_id: int, media: InklingMedia
-    ) -> torch.Tensor:
+    def _features_for(self, sequence_id: int, media: InklingMedia) -> torch.Tensor:
         existing = self._media_features.get(sequence_id)
         if existing is not None:
             if existing[0] is not media:
@@ -536,7 +504,10 @@ class InklingCudaRunner(Runner):
         flat_positions = positions[0]
         position_list = flat_positions.tolist()
         for token_id, position in zip(flat_ids.tolist(), position_list):
-            if position < len(media.token_ids) and token_id != media.token_ids[position]:
+            if (
+                position < len(media.token_ids)
+                and token_id != media.token_ids[position]
+            ):
                 raise ValueError("scheduled token does not match InklingMedia prompt")
         feature_indices = {
             position: index for index, position in enumerate(media.image_positions)
@@ -548,29 +519,6 @@ class InklingCudaRunner(Runner):
             feature_index = feature_indices.get(position)
             if feature_index is not None:
                 hidden[0, query_index].copy_(features[feature_index])
-
-    def _ordinary_decode(
-        self,
-        plan: BatchPlan,
-        cache: DeviceCache,
-        token_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> list[int]:
-        contexts = torch.as_tensor(
-            plan.context_lengths, dtype=torch.long, device=self.device
-        )
-        state = self._initial_state(cache, contexts)
-        logits, _, final_state, _ = self._model.target(
-            token_ids[:, None],
-            positions[:, None],
-            cache,
-            state,
-            positions + 1,
-            int(positions.max().item()) + 1,
-            full_logits=False,
-        )
-        self._store_state(cache, positions, final_state)
-        return self._sample(logits[:, -1], plan).tolist()
 
     def _speculative_decode(
         self,
@@ -662,9 +610,7 @@ class InklingCudaRunner(Runner):
             ):
                 if plan.phase == BatchPhase.PREFILL:
                     return self._prefill(plan, rows, cache, token_ids, positions)
-                if self.speculative_tokens:
-                    return self._speculative_decode(plan, cache, token_ids, positions)
-                return self._ordinary_decode(plan, cache, token_ids, positions)
+                return self._speculative_decode(plan, cache, token_ids, positions)
 
     def release(self, sequence_ids: list[int]) -> None:
         """The Engine retires each sequence's slabs after this callback."""
