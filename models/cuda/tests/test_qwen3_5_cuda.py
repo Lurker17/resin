@@ -13,6 +13,7 @@ def test_qwen38_is_runner_default_and_public_name_is_consistent() -> None:
 
     assert parameters["model"].default == DEFAULT_MODEL == "Qwen/Qwen3.8-27B"
     assert parameters["speculative_tokens"].default == 0
+    assert parameters["kv_cache_dtype"].default == "fp8"
     assert Qwen3_5CudaRunner.__name__ == "Qwen3_5CudaRunner"
 
 

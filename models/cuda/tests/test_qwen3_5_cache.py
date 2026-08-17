@@ -30,6 +30,16 @@ def test_qwen35_cache_omits_mtp_group_when_speculation_is_disabled() -> None:
     assert len(geometry.layout(10).groups) == 2
 
 
+def test_qwen38_fp8_kv_halves_each_attention_unit() -> None:
+    config = Qwen35Config.from_hugging_face(_qwen38())
+    bf16 = CacheGeometry.from_config(config, include_mtp=True)
+    fp8 = CacheGeometry.from_config(config, include_mtp=True, kv_element_bytes=1)
+
+    assert fp8.unit_bytes * 2 == bf16.unit_bytes
+    assert fp8.target_blocks_per_slab == 37
+    assert fp8.slab_bytes == 148 * 1024**2
+
+
 def test_mixed_dtype_state_views_share_the_byte_arena() -> None:
     values = _qwen38()
     text = values["text_config"]  # type: ignore[assignment]

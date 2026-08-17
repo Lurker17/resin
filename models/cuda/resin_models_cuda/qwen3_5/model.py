@@ -8,7 +8,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from resin_models_cuda.qwen3_5.attention import append_kv, paged_attention
+from resin_models_cuda.qwen3_5.attention import (
+    PagedAttentionRuntime,
+    PreparedPagedAttention,
+    append_kv,
+)
 from resin_models_cuda.qwen3_5.cache import MTP_GROUP, TARGET_GROUP, DeviceCache
 from resin_models_cuda.qwen3_5.config import Qwen35Config
 
@@ -150,9 +154,7 @@ class Qwen35GatedDeltaNet(nn.Module):
             self.config.linear_num_value_heads,
             self.config.linear_value_head_dim,
         )
-        repeats = (
-            self.config.linear_num_value_heads // self.config.linear_num_key_heads
-        )
+        repeats = self.config.linear_num_value_heads // self.config.linear_num_key_heads
         query = query.repeat_interleave(repeats, dim=2)
         key = key.repeat_interleave(repeats, dim=2)
         beta = self.in_proj_b(hidden).sigmoid()
@@ -257,13 +259,18 @@ class Qwen35Attention(nn.Module):
         cos: Tensor,
         sin: Tensor,
         cache: DeviceCache | None,
+        attention: PreparedPagedAttention | None,
         sequence_lengths: Tensor,
         max_sequence_length: int,
     ) -> Tensor:
         batch, tokens = hidden.shape[:2]
-        query, gate = self.q_proj(hidden).view(
-            batch, tokens, self.config.num_attention_heads, 2 * self.config.head_dim
-        ).chunk(2, dim=-1)
+        query, gate = (
+            self.q_proj(hidden)
+            .view(
+                batch, tokens, self.config.num_attention_heads, 2 * self.config.head_dim
+            )
+            .chunk(2, dim=-1)
+        )
         key = self.k_proj(hidden).view(
             batch, tokens, self.config.num_key_value_heads, self.config.head_dim
         )
@@ -282,16 +289,9 @@ class Qwen35Attention(nn.Module):
                 keys=key,
                 values=value,
             )
-            output = paged_attention(
-                query,
-                cache=cache,
-                group_index=self.cache_group,
-                layer=self.cache_layer,
-                layer_count=self.cache_layer_count,
-                sequence_lengths=sequence_lengths,
-                max_sequence_length=max_sequence_length,
-                softmax_scale=self.scaling,
-            )
+            if attention is None:
+                raise RuntimeError("cached Qwen3.5 attention was not prepared")
+            output = attention.run(query, self.cache_layer)
         else:
             repeats = self.config.num_attention_heads // self.config.num_key_value_heads
             key = key.repeat_interleave(repeats, dim=2).transpose(1, 2)
@@ -350,9 +350,7 @@ class Qwen35DecoderLayer(nn.Module):
                 cache_layer_count=cache_layer_count or config.full_layer_count,
             )
         self.mlp = Qwen35MLP(config)
-        self.input_layernorm = Qwen35RMSNorm(
-            config.hidden_size, config.rms_norm_eps
-        )
+        self.input_layernorm = Qwen35RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = Qwen35RMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
@@ -363,7 +361,9 @@ class Qwen35TextModel(nn.Module):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        full_indices = {layer: index for index, layer in enumerate(config.full_layer_ids)}
+        full_indices = {
+            layer: index for index, layer in enumerate(config.full_layer_ids)
+        }
         self.layers = nn.ModuleList(
             Qwen35DecoderLayer(
                 config,
@@ -414,6 +414,7 @@ class Qwen35TextModel(nn.Module):
         sequence_lengths: Tensor | None = None,
         max_sequence_length: int | None = None,
         input_embeddings: Tensor | None = None,
+        attention_runtime: PagedAttentionRuntime | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         hidden = (
             self.embed_tokens(token_ids)
@@ -425,6 +426,18 @@ class Qwen35TextModel(nn.Module):
         if max_sequence_length is None:
             max_sequence_length = int(sequence_lengths.max().item())
         cos, sin = self.rotary(positions, hidden.dtype)
+        attention = (
+            attention_runtime.prepare(
+                cache,
+                group_index=TARGET_GROUP,
+                layer_count=self.config.full_layer_count,
+                sequence_lengths=sequence_lengths,
+                tokens=positions.shape[1],
+                softmax_scale=self.config.head_dim**-0.5,
+            )
+            if cache is not None and attention_runtime is not None
+            else None
+        )
         recurrent_out = []
         convolution_out = []
         linear_index = 0
@@ -455,6 +468,7 @@ class Qwen35TextModel(nn.Module):
                     cos,
                     sin,
                     cache,
+                    attention,
                     sequence_lengths,
                     max_sequence_length,
                 )
@@ -482,9 +496,7 @@ class Qwen35MTP(nn.Module):
         self.pre_fc_norm_embedding = Qwen35RMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
-        self.pre_fc_norm_hidden = Qwen35RMSNorm(
-            config.hidden_size, config.rms_norm_eps
-        )
+        self.pre_fc_norm_hidden = Qwen35RMSNorm(config.hidden_size, config.rms_norm_eps)
         mtp_config = replace(
             config,
             num_hidden_layers=1,
@@ -514,6 +526,7 @@ class Qwen35MTP(nn.Module):
         cache: DeviceCache | None,
         sequence_lengths: Tensor,
         max_sequence_length: int,
+        attention_runtime: PagedAttentionRuntime | None = None,
     ) -> Tensor:
         hidden = self.fc(
             torch.cat(
@@ -525,12 +538,25 @@ class Qwen35MTP(nn.Module):
             )
         )
         layer = self.layers[0]
+        attention = (
+            attention_runtime.prepare(
+                cache,
+                group_index=MTP_GROUP,
+                layer_count=1,
+                sequence_lengths=sequence_lengths,
+                tokens=positions.shape[1],
+                softmax_scale=self.config.head_dim**-0.5,
+            )
+            if cache is not None and attention_runtime is not None
+            else None
+        )
         residual = hidden
         hidden = residual + layer.self_attn(
             layer.input_layernorm(hidden),
             positions,
             *rotary,
             cache,
+            attention,
             sequence_lengths,
             max_sequence_length,
         )

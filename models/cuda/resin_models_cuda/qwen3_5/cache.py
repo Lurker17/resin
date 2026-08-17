@@ -41,6 +41,7 @@ class CacheGeometry:
     conv_state_length: int
     hidden_size: int
     include_mtp: bool
+    kv_element_bytes: int
     slab_units: int
     target_blocks_per_slab: int
     state_blocks_per_slab: int
@@ -48,13 +49,23 @@ class CacheGeometry:
 
     @classmethod
     def from_config(
-        cls, config: Qwen35Config, *, include_mtp: bool
+        cls,
+        config: Qwen35Config,
+        *,
+        include_mtp: bool,
+        kv_element_bytes: int = BF16_BYTES,
     ) -> CacheGeometry:
         if include_mtp:
             config.require_mtp()
+        if kv_element_bytes not in {1, 2}:
+            raise ValueError("Qwen3.5 KV elements must occupy one or two bytes")
         conv_state_length = config.linear_conv_kernel_dim - 1
         unit_bytes = (
-            2 * PAGE_TOKENS * config.num_key_value_heads * config.head_dim * BF16_BYTES
+            2
+            * PAGE_TOKENS
+            * config.num_key_value_heads
+            * config.head_dim
+            * kv_element_bytes
         )
         target_block_bytes = config.full_layer_count * unit_bytes
         state_bytes = (
@@ -83,6 +94,7 @@ class CacheGeometry:
             conv_state_length=conv_state_length,
             hidden_size=config.hidden_size,
             include_mtp=include_mtp,
+            kv_element_bytes=kv_element_bytes,
             slab_units=slab_units,
             target_blocks_per_slab=slab_units // config.full_layer_count,
             state_blocks_per_slab=slab_bytes // state_bytes,
@@ -95,7 +107,7 @@ class CacheGeometry:
 
     @property
     def unit_bytes(self) -> int:
-        return self.unit_elements * BF16_BYTES
+        return self.unit_elements * self.kv_element_bytes
 
     @property
     def slab_bytes(self) -> int:
@@ -128,9 +140,7 @@ class CacheGeometry:
 
     def layout(self, slab_capacity: int) -> CacheLayout:
         groups = [
-            CacheGroupLayout(
-                PAGE_TOKENS, blocks_per_slab=self.target_blocks_per_slab
-            ),
+            CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.target_blocks_per_slab),
             CacheGroupLayout(
                 PREFILL_CHUNK_SIZE,
                 blocks_per_slab=self.state_blocks_per_slab,
@@ -139,9 +149,7 @@ class CacheGeometry:
         ]
         if self.include_mtp:
             groups.append(
-                CacheGroupLayout(
-                    PAGE_TOKENS, blocks_per_slab=self.mtp_blocks_per_slab
-                )
+                CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.mtp_blocks_per_slab)
             )
         return CacheLayout(slab_capacity, groups)
 
@@ -261,17 +269,25 @@ class CacheArena:
         device: Any,
         layout: CacheLayout,
         geometry: CacheGeometry,
+        *,
+        kv_dtype: Any = None,
     ) -> None:
         self.torch = torch
         self.device = device
         self.layout = layout
         self.geometry = geometry
+        if kv_dtype is None:
+            kv_dtype = torch.bfloat16
+        if kv_dtype.itemsize != geometry.kv_element_bytes:
+            raise ValueError("Qwen3.5 KV dtype does not match its cache geometry")
+        self.kv_dtype = kv_dtype
         self.binding = CachePoolBinding(layout, resource="Qwen3.5 cache")
         physical = layout.parent_capacity + 1
         self.storage = torch.zeros(
             (physical, geometry.slab_bytes), dtype=torch.uint8, device=device
         )
 
+        kv = self.storage.view(kv_dtype)
         bf16 = self.storage.view(torch.bfloat16)
         page_elements = PAGE_TOKENS * geometry.kv_heads * geometry.head_dim
         page_shape = (
@@ -286,9 +302,9 @@ class CacheArena:
             geometry.head_dim,
             1,
         )
-        self.keys = torch.as_strided(bf16, page_shape, page_stride)
+        self.keys = torch.as_strided(kv, page_shape, page_stride)
         self.values = torch.as_strided(
-            bf16, page_shape, page_stride, storage_offset=page_elements
+            kv, page_shape, page_stride, storage_offset=page_elements
         )
 
         fp32 = self.storage.view(torch.float32)
@@ -350,8 +366,7 @@ class CacheArena:
                 1,
             ),
             storage_offset=(
-                geometry.recurrent_bytes // BF16_BYTES
-                + geometry.convolution_elements
+                geometry.recurrent_bytes // BF16_BYTES + geometry.convolution_elements
             ),
         )
 

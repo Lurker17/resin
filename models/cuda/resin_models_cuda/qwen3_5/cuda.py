@@ -19,6 +19,7 @@ from resin.backend.plans import PagedCachePlan
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
 from resin.protocols import Runner
+from resin_models_cuda.qwen3_5.attention import PagedAttentionRuntime
 from resin_models_cuda.qwen3_5.cache import (
     PREFILL_CHUNK_SIZE,
     CacheArena,
@@ -54,6 +55,7 @@ class Qwen3_5CudaRunner(Runner):
         device: str | None = None,
         gpu_memory_utilization: float = 0.90,
         cache_slab_capacity: int | None = None,
+        kv_cache_dtype: str = "fp8",
     ) -> None:
         if (
             isinstance(speculative_tokens, bool)
@@ -75,6 +77,8 @@ class Qwen3_5CudaRunner(Runner):
             or cache_slab_capacity <= 0
         ):
             raise ValueError("cache_slab_capacity must be a positive integer")
+        if kv_cache_dtype not in {"fp8", "bfloat16"}:
+            raise ValueError("kv_cache_dtype must be 'fp8' or 'bfloat16'")
 
         self.device = torch.device(device or default_device(torch, require_cuda=True))
         if self.device.type != "cuda":
@@ -86,13 +90,12 @@ class Qwen3_5CudaRunner(Runner):
             raise RuntimeError("Qwen3_5CudaRunner requires Hopper or newer CUDA")
         try:
             from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-            from flash_attn.cute import flash_attn_varlen_func
+            from flashinfer import BatchDecodeWithPagedKVCacheWrapper
         except ImportError as error:
             raise ImportError(
-                "Qwen3_5CudaRunner requires flash-linear-attention and "
-                "FlashAttention-4"
+                "Qwen3_5CudaRunner requires flash-linear-attention and FlashInfer"
             ) from error
-        del chunk_gated_delta_rule, flash_attn_varlen_func
+        del chunk_gated_delta_rule, BatchDecodeWithPagedKVCacheWrapper
 
         self._cuda_failure = CudaFailureGuard(
             lambda: torch.cuda.synchronize(self.device),
@@ -106,9 +109,7 @@ class Qwen3_5CudaRunner(Runner):
             include_mtp=speculative_tokens > 0,
         )
         selected_max_seq_len = (
-            self.config.max_position_embeddings
-            if max_seq_len is None
-            else max_seq_len
+            self.config.max_position_embeddings if max_seq_len is None else max_seq_len
         )
         if (
             isinstance(selected_max_seq_len, bool)
@@ -124,9 +125,13 @@ class Qwen3_5CudaRunner(Runner):
         self.eos_token_id = self.config.eos_token_id
         self._sampler = FlashInferSampler(torch)
         self._speculation = SpeculativeStats(speculative_tokens)
+        self.kv_cache_dtype = kv_cache_dtype
+        cache_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8" else torch.bfloat16
 
         self.cache_geometry = CacheGeometry.from_config(
-            self.config, include_mtp=speculative_tokens > 0
+            self.config,
+            include_mtp=speculative_tokens > 0,
+            kv_element_bytes=cache_dtype.itemsize,
         )
         torch.cuda.synchronize(self.device)
         free_memory, total_memory = torch.cuda.mem_get_info(self.device)
@@ -148,7 +153,18 @@ class Qwen3_5CudaRunner(Runner):
         )
         self.cache_layout = self.cache_geometry.layout(slab_capacity)
         self._cache = CacheArena(
-            torch, self.device, self.cache_layout, self.cache_geometry
+            torch,
+            self.device,
+            self.cache_layout,
+            self.cache_geometry,
+            kv_dtype=cache_dtype,
+        )
+        self._attention = PagedAttentionRuntime(
+            self.device,
+            num_attention_heads=self.config.num_attention_heads,
+            num_key_value_heads=self.config.num_key_value_heads,
+            head_dim=self.config.head_dim,
+            workspace_bytes=_CACHE_WORKSPACE_BYTES,
         )
         lookahead = speculative_tokens + 1 if speculative_tokens else 0
         self.runner_config = RunnerConfig(
@@ -180,9 +196,7 @@ class Qwen3_5CudaRunner(Runner):
             raise ValueError("Qwen3.5 sequence metadata is malformed")
         if len(plan.context_lengths) != rows or len(plan.sampling_mask) != rows:
             raise ValueError("Qwen3.5 row metadata is malformed")
-        slices = tuple(
-            (int(start), int(end)) for start, end in zip(indptr, indptr[1:])
-        )
+        slices = tuple((int(start), int(end)) for start, end in zip(indptr, indptr[1:]))
         for row, (start, end) in enumerate(slices):
             context = int(plan.context_lengths[row])
             expected = np.arange(context, context + end - start)
@@ -261,6 +275,7 @@ class Qwen3_5CudaRunner(Runner):
             cache=cache,
             sequence_lengths=sequence_lengths,
             max_sequence_length=int(sequence_lengths.max().item()),
+            attention_runtime=self._attention,
         )
 
     def _prefill_mtp(
@@ -325,10 +340,20 @@ class Qwen3_5CudaRunner(Runner):
                 convolution_states=convolution,
                 sequence_lengths=row_positions[:, -1] + 1,
                 max_sequence_length=context + end - start,
+                attention_runtime=self._attention,
             )
             final_logits.append(self._model.logits(hidden[:, -1]))
             states.append(
-                (row_cache, row_ids, row_positions, hidden, recurrent, convolution, previous_hidden, context)
+                (
+                    row_cache,
+                    row_ids,
+                    row_positions,
+                    hidden,
+                    recurrent,
+                    convolution,
+                    previous_hidden,
+                    context,
+                )
             )
         sampled = self._sample(torch.cat(final_logits), plan)
         for row, state in enumerate(states):
@@ -381,10 +406,9 @@ class Qwen3_5CudaRunner(Runner):
             convolution_states=convolution,
             sequence_lengths=positions + 1,
             max_sequence_length=int(positions.max().item()) + 1,
+            attention_runtime=self._attention,
         )
-        self._store_state(
-            cache, positions, recurrent, convolution, hidden[:, -1]
-        )
+        self._store_state(cache, positions, recurrent, convolution, hidden[:, -1])
         return self._sample(self._model.logits(hidden[:, -1]), plan).tolist()
 
     def _speculative_decode(
@@ -397,9 +421,7 @@ class Qwen3_5CudaRunner(Runner):
         contexts = torch.as_tensor(
             plan.context_lengths, dtype=torch.long, device=self.device
         )
-        initial_recurrent, initial_convolution, _ = self._initial_state(
-            cache, contexts
-        )
+        initial_recurrent, initial_convolution, _ = self._initial_state(cache, contexts)
         anchor_hidden, anchor_recurrent, anchor_convolution = (
             self._model.language_model(
                 anchors[:, None],
@@ -409,6 +431,7 @@ class Qwen3_5CudaRunner(Runner):
                 convolution_states=initial_convolution,
                 sequence_lengths=positions + 1,
                 max_sequence_length=int(positions.max().item()) + 1,
+                attention_runtime=self._attention,
             )
         )
         first = self._sample(self._model.logits(anchor_hidden[:, -1]), plan, 0)
@@ -443,6 +466,7 @@ class Qwen3_5CudaRunner(Runner):
                 convolution_states=anchor_convolution,
                 sequence_lengths=verify_positions[:, -1] + 1,
                 max_sequence_length=int(verify_positions.max().item()) + 1,
+                attention_runtime=self._attention,
             )
         )
         verify_logits = self._model.logits(verify_hidden)
@@ -464,22 +488,16 @@ class Qwen3_5CudaRunner(Runner):
                 recurrent = verify_recurrent[row : row + 1]
                 convolution = verify_convolution[row : row + 1]
             else:
-                committed_hidden, recurrent, convolution = (
-                    self._model.language_model(
-                        verify_ids[row : row + 1, :processed],
-                        verify_positions[row : row + 1, :processed],
-                        cache=row_cache,
-                        recurrent_states=anchor_recurrent[row : row + 1],
-                        convolution_states=anchor_convolution[row : row + 1],
-                        sequence_lengths=verify_positions[
-                            row : row + 1, processed - 1
-                        ]
-                        + 1,
-                        max_sequence_length=int(
-                            verify_positions[row, processed - 1].item()
-                        )
-                        + 1,
-                    )
+                committed_hidden, recurrent, convolution = self._model.language_model(
+                    verify_ids[row : row + 1, :processed],
+                    verify_positions[row : row + 1, :processed],
+                    cache=row_cache,
+                    recurrent_states=anchor_recurrent[row : row + 1],
+                    convolution_states=anchor_convolution[row : row + 1],
+                    sequence_lengths=verify_positions[row : row + 1, processed - 1] + 1,
+                    max_sequence_length=int(verify_positions[row, processed - 1].item())
+                    + 1,
+                    attention_runtime=self._attention,
                 )
             correction = targets[row, accepted : accepted + 1]
             repair_ids = torch.cat((draft_ids[row, :accepted], correction))[None]
@@ -524,9 +542,7 @@ class Qwen3_5CudaRunner(Runner):
                 if plan.phase == BatchPhase.PREFILL:
                     return self._prefill(plan, rows, cache, token_ids, positions)
                 if self.speculative_tokens:
-                    return self._speculative_decode(
-                        plan, cache, token_ids, positions
-                    )
+                    return self._speculative_decode(plan, cache, token_ids, positions)
                 return self._ordinary_decode(plan, cache, token_ids, positions)
 
 
