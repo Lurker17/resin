@@ -346,6 +346,7 @@ impl CacheGroupPlan {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
         group_index: u32,
         block_indptr: Vec<u32>,
@@ -412,6 +413,7 @@ impl CacheGroupPlan {
         *,
         blocks_per_slab = 1
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         group_index: u32,
         block_indptr: PyArrayLike1<'_, u32>,

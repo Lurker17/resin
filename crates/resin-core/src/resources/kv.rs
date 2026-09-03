@@ -246,6 +246,7 @@ pub struct KvGroupPlan {
 }
 
 impl KvGroupPlan {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         group_index: u32,
         block_indptr: Vec<u32>,
