@@ -74,6 +74,40 @@ _BF16_BYTES = 2
 _TINYGEMM_MAX_TOKENS = 128
 
 
+class _EmptyFa4AuxData:
+    """Zero-width CUTLASS JIT argument for GPT-OSS's unused FA4 auxiliary data."""
+
+    def __init__(self, value) -> None:
+        if value.tensors is not None or value.scalars is not None:
+            raise NotImplementedError(
+                "GPT-OSS attention does not support FA4 auxiliary data"
+            )
+        self._value = value
+
+    def __getattr__(self, name: str):
+        return getattr(self._value, name)
+
+    def __c_pointers__(self) -> list[object]:
+        return []
+
+    def __get_mlir_types__(self) -> list[object]:
+        return []
+
+    def __new_from_mlir_values__(self, _values: list[object]):
+        return self
+
+
+def _register_empty_fa4_aux_data() -> None:
+    """Adapt FA4's empty auxiliary bundle to the CUTLASS JIT boundary."""
+
+    from cutlass.base_dsl.runtime.jit_arg_adapters import JitArgAdapterRegistry
+    from flash_attn.cute.utils import AuxData
+
+    if AuxData in JitArgAdapterRegistry.jit_arg_adapter_registry:
+        return
+    JitArgAdapterRegistry.register_jit_arg_adapter(AuxData)(_EmptyFa4AuxData)
+
+
 def plan_gpt_oss_kv_capacity(
     total_memory_bytes: int,
     free_memory_bytes: int,
@@ -149,6 +183,8 @@ class GptOssCudaRunner(CudaRunner):
             kernel_attention = flash_attn_varlen_func
         if not callable(kernel_attention):
             raise TypeError("kernel_attention must be callable")
+        if getattr(kernel_attention, "__module__", "").startswith("flash_attn."):
+            _register_empty_fa4_aux_data()
 
         if cache_parent_capacity is not None and (
             isinstance(cache_parent_capacity, bool)

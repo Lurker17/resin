@@ -21,6 +21,7 @@ from resin.models.gpt_oss.plan import (
 )
 from resin_models_cuda.gpt_oss.cuda import (
     GptOssCudaRunner,
+    _EmptyFa4AuxData,
     _route,
     _router_logits,
     plan_gpt_oss_kv_capacity,
@@ -145,6 +146,18 @@ def _decode_plan():
 
 
 class TestGptOssCudaNativePlan:
+    def test_empty_fa4_aux_data_is_a_zero_width_jit_argument(self) -> None:
+        empty = SimpleNamespace(tensors=None, scalars=None)
+        adapted = _EmptyFa4AuxData(empty)
+
+        assert adapted.tensors is None
+        assert adapted.scalars is None
+        assert adapted.__c_pointers__() == []
+        assert adapted.__get_mlir_types__() == []
+        assert adapted.__new_from_mlir_values__([]) is adapted
+        with pytest.raises(NotImplementedError, match="does not support"):
+            _EmptyFa4AuxData(SimpleNamespace(tensors=[object()], scalars=None))
+
     @staticmethod
     def _binding_runner():
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)

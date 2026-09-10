@@ -118,7 +118,7 @@ model_cache_volume = modal.Volume.from_name(
 )
 profile_volume = modal.Volume.from_name(PROFILE_VOLUME_NAME, create_if_missing=True)
 app = modal.App(
-    "resin-gpt-oss-flat",
+    "resin-gpt-oss",
     image=image,
     volumes={
         KERNEL_CACHE_MOUNT: kernel_cache_volume,
