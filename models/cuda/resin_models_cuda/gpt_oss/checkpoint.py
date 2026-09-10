@@ -14,8 +14,8 @@ from resin.backend.loading import (
     resolve_model,
 )
 from resin.backend.quantization import BF16, MXFP4, QuantizationConfig
+from resin.backend.transformer import MoEForCausalLM
 from resin.models.gpt_oss.config import GptOssConfig
-from resin_models_cuda.gpt_oss.model import GptOssForCausalLM
 
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 MODEL_20B = "openai/gpt-oss-20b"
@@ -143,7 +143,7 @@ def load_model(
         device=device,
         dtype=dtype,
         backend="GPT-OSS",
-        build=lambda: GptOssForCausalLM(args),
+        build=lambda: MoEForCausalLM(args),
         after_cast=restore_norm_dtype,
     )
     return model, config

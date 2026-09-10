@@ -91,9 +91,6 @@ def _select_nvfp4_backend(requested: str, cudnn_version: int | None) -> str:
     return requested
 
 
-Gemma4KvCapacityPlan = CacheCapacityPlan
-
-
 def plan_gemma4_kv_capacity(
     total_memory_bytes: int,
     free_memory_bytes: int,
@@ -101,7 +98,7 @@ def plan_gemma4_kv_capacity(
     *,
     workspace_bytes: int = _DEFAULT_WORKSPACE_BYTES,
     cache_element_bytes: int = 1,
-) -> Gemma4KvCapacityPlan:
+) -> CacheCapacityPlan:
     if cache_element_bytes not in {1, 2}:
         raise ValueError("cache_element_bytes must be one or two")
     # One parent holds all 50 local layers for one 64-token page. Global
@@ -1635,6 +1632,5 @@ class Gemma4CudaRunner(Runner):
 
 __all__ = [
     "Gemma4CudaRunner",
-    "Gemma4KvCapacityPlan",
     "plan_gemma4_kv_capacity",
 ]

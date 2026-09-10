@@ -16,8 +16,17 @@ table addressing. Concrete CUDA, cuTile, TileLang, FlashInfer, and model-
 specific fused kernels remain directly importable from
 `resin_models_cuda.<family>`; they are never moved into `resin.backend.cuda` or
 selected through a registry. A small cross-model CUDA primitive may live as a
-root module, such as `paged_kv.py` or `paged_moe.py`, when it has multiple model
+root module, such as `paged_kv.py` or `paged.py`, when it has multiple model
 owners and does not justify another package layer.
+
+`PagedCudaRunner` owns the shared text-decoder paging, FA4, sampling, tensor-
+parallel, and graph lifecycle. Its default feed-forward hook calls the model's
+module directly; a family such as GPT-OSS may override that hook for a concrete
+router or MoE kernel without making MoE part of the runner's identity. Runners
+with different execution semantics remain model-owned until the common seam is
+real: Gemma 4 currently combines heterogeneous local/global cache views, FP8
+KV, media embeddings, and speculative verification, so forcing it through the
+text-decoder runner would turn the base into a collection of model branches.
 
 ## Graph execution modes
 

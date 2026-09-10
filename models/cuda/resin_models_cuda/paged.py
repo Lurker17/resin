@@ -1,8 +1,8 @@
-"""Cross-model paged FA4 execution for sink-attention routed-MoE decoders.
+"""Cross-model paged FA4 execution for sink-attention decoders.
 
 Rust owns one flat cache pool and supplies ordered History and Window plans.
-Concrete models supply checkpoint hooks and cache geometry as class data;
-kernel implementations remain explicit constructor arguments.
+Concrete models supply checkpoint, cache, and feed-forward hooks as class data;
+attention and optional MoE kernels remain explicit constructor arguments.
 
 The runner has no request-ID cache map and no Python page allocator.
 """
@@ -22,7 +22,6 @@ from flashinfer.comm import (
     create_allreduce_fusion_workspace,
 )
 from flashinfer.comm.mnnvl import TorchDistBackend
-from flashinfer.gemm import tinygemm_bf16
 from quack import rmsnorm
 from quack.rotary import apply_rotary
 from torch import Tensor
@@ -62,49 +61,16 @@ from resin.backend.cuda.staging import TensorStager
 from resin.backend.loading import default_device
 from resin.backend.paged_attention import PagedAttentionBatch
 from resin.backend.quantization import QuantizationConfig
-from resin.backend.transformer import MLP, TopKRouter
 from resin.protocols import Runner
-from resin_models_cuda.gpt_oss.cutile import top4_softmax
 
 if TYPE_CHECKING:
     from resin import BatchPlan
 
 
 _BF16_BYTES = 2
-_TINYGEMM_MAX_TOKENS = 128
 
 
-def _router_logits(router: TopKRouter, hidden: Tensor) -> Tensor:
-    """Use Hopper TinyGEMM for skinny decode routers and GEMM otherwise."""
-
-    if hidden.shape[0] <= _TINYGEMM_MAX_TOKENS:
-        output = torch.empty(
-            (hidden.shape[0], router.weight.shape[0]),
-            dtype=hidden.dtype,
-            device=hidden.device,
-        )
-        tinygemm_bf16(
-            hidden,
-            router.weight,
-            output,
-            router.bias,
-            use_pdl=False,
-        )
-        return output
-    return torch.nn.functional.linear(hidden, router.weight, router.bias)
-
-
-def _route(router: TopKRouter, logits: Tensor) -> tuple[Tensor, Tensor]:
-    if router.top_k == 4 and logits.shape[-1] == 128:
-        return top4_softmax(logits)
-    values, indices = torch.topk(logits, router.top_k, dim=-1, sorted=True)
-    return indices, torch.softmax(values, dim=-1)
-
-
-PagedMoEKvCapacityPlan = CacheCapacityPlan
-
-
-def plan_paged_moe_kv_capacity(
+def plan_paged_kv_capacity(
     total_memory_bytes: int,
     free_memory_bytes: int,
     gpu_memory_utilization: float,
@@ -114,7 +80,7 @@ def plan_paged_moe_kv_capacity(
     page_size: int,
     num_kv_heads: int,
     head_dim: int,
-) -> PagedMoEKvCapacityPlan:
+) -> CacheCapacityPlan:
     """Size the fungible KV pool from post-load free device memory.
 
     ``gpu_memory_utilization`` is the total model-plus-cache fraction. Model,
@@ -152,10 +118,11 @@ def plan_paged_moe_kv_capacity(
     )
 
 
-class PagedMoECudaRunner(Runner):
+class PagedCudaRunner(Runner):
     """FA4 runner configured by a thin concrete model subclass."""
 
-    model_label = "paged MoE"
+    model_label = "paged"
+    default_model = None
     page_size = 0
     sliding_window = 0
     prefill_chunk_size = 0
@@ -169,7 +136,7 @@ class PagedMoECudaRunner(Runner):
 
     def __init__(
         self,
-        model: str | Path,
+        model: str | Path | None = None,
         *,
         cache_parent_capacity: int | None = None,
         revision: str | None = None,
@@ -190,7 +157,7 @@ class PagedMoECudaRunner(Runner):
             self.attention_batch_builder,
         )
         if any(hook is None for hook in required_hooks):
-            raise TypeError("paged MoE runner subclass is missing a model hook")
+            raise TypeError("paged runner subclass is missing a model hook")
         if any(
             value <= 0
             for value in (
@@ -201,7 +168,7 @@ class PagedMoECudaRunner(Runner):
                 self.window_table_width,
             )
         ):
-            raise TypeError("paged MoE runner subclass has invalid cache geometry")
+            raise TypeError("paged runner subclass has invalid cache geometry")
         if kernel_attention is None:
             from flash_attn.cute import flash_attn_varlen_func
 
@@ -244,8 +211,11 @@ class PagedMoECudaRunner(Runner):
                 f"the {self.model_label} FA4 runner requires bfloat16 activations"
             )
 
+        selected_model = self.default_model if model is None else model
+        if selected_model is None:
+            raise TypeError("model is required when the runner has no default_model")
         self.model_path = self.model_resolver(
-            model,
+            selected_model,
             revision,
             quantization=quantization,
             kernel_moe=kernel_moe,
@@ -334,7 +304,7 @@ class PagedMoECudaRunner(Runner):
             )
         torch.cuda.synchronize(self.device)
         free_memory, total_memory = torch.cuda.mem_get_info(self.device)
-        capacity_plan = plan_paged_moe_kv_capacity(
+        capacity_plan = plan_paged_kv_capacity(
             total_memory,
             free_memory,
             gpu_memory_utilization,
@@ -592,12 +562,10 @@ class PagedMoECudaRunner(Runner):
         return normalized.view(shape), combined.view(shape)
 
     @staticmethod
-    def _moe(mlp: MLP, hidden: Tensor) -> Tensor:
-        shape = hidden.shape
-        flat = hidden.reshape(-1, shape[-1])
-        logits = _router_logits(mlp.router, flat)
-        indices, weights = _route(mlp.router, logits)
-        return mlp.experts(flat, indices, weights, logits).reshape(shape)
+    def _feed_forward(feed_forward, hidden: Tensor) -> Tensor:
+        """Run the model-owned dense or routed feed-forward implementation."""
+
+        return feed_forward(hidden)
 
     def _forward_batch(self, token_ids, positions, batch: DevicePagedAttentionBatch):
         selected_tokens = token_ids.index_select(0, batch.token_indices)
@@ -626,14 +594,16 @@ class PagedMoECudaRunner(Runner):
                 layer.post_attention_layernorm.weight,
                 layer.post_attention_layernorm.eps,
             )
-            moe_output = self._moe(layer.mlp, normalized_mlp_input)
+            feed_forward_output = self._feed_forward(
+                layer.mlp, normalized_mlp_input
+            )
             next_norm = (
                 layers[layer_index + 1].input_layernorm
                 if layer_index + 1 < len(layers)
                 else self._model.model.norm
             )
             normalized, hidden = self._allreduce_residual_rmsnorm(
-                moe_output,
+                feed_forward_output,
                 hidden,
                 next_norm.weight,
                 next_norm.eps,
@@ -775,9 +745,6 @@ class PagedMoECudaRunner(Runner):
 
 
 __all__ = [
-    "PagedMoECudaRunner",
-    "PagedMoEKvCapacityPlan",
-    "plan_paged_moe_kv_capacity",
-    "_route",
-    "_router_logits",
+    "PagedCudaRunner",
+    "plan_paged_kv_capacity",
 ]

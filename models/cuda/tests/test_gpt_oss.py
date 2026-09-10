@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from resin.backend.transformer import MoEForCausalLM
+
 
 def _tiny_args():
     from resin.models.gpt_oss.config import GptOssConfig
@@ -136,11 +138,9 @@ class TestGptOssImport:
 
 class TestGptOssTorch:
     def setup_method(self) -> None:
-        from resin_models_cuda.gpt_oss.model import GptOssForCausalLM
-
         torch.manual_seed(11)
         self.args = _tiny_args()
-        self.model = GptOssForCausalLM(self.args).eval()
+        self.model = MoEForCausalLM(self.args).eval()
 
     def test_topk_moe_routes_and_weights_selected_experts(self) -> None:
         mlp = self.model.model.layers[0].mlp
@@ -168,8 +168,6 @@ class TestGptOssTorch:
         )
 
     def test_expert_kernel_boundary_receives_all_routing_metadata(self) -> None:
-        from resin_models_cuda.gpt_oss.model import GptOssForCausalLM
-
         calls = []
 
         class RecordingExperts(torch.nn.Module):
@@ -177,7 +175,7 @@ class TestGptOssTorch:
                 calls.append((hidden.shape, indices.shape, weights.shape, logits.shape))
                 return torch.zeros_like(hidden)
 
-        model = GptOssForCausalLM(
+        model = MoEForCausalLM(
             self.args, expert_factory=lambda _args: RecordingExperts()
         ).eval()
         mlp = model.model.layers[0].mlp

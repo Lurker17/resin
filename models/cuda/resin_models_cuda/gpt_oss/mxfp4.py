@@ -17,6 +17,7 @@ import torch
 
 from resin.backend.cuda.parallel import TensorParallelLayout, TensorShard
 from resin.backend.loading import resolve_dtype
+from resin.backend.transformer import MoEForCausalLM
 from resin.moe_kernels import (
     MoEExpertWeights,
     MoEKernelConfig,
@@ -244,7 +245,6 @@ def load_mxfp4_model(
     """Load an official packed checkpoint without Transformers or tokenizers."""
 
     from resin.models.gpt_oss.config import GptOssConfig
-    from resin_models_cuda.gpt_oss.model import GptOssForCausalLM
 
     path = Path(model_path)
     config_path = path / "config.json"
@@ -268,7 +268,7 @@ def load_mxfp4_model(
 
     expert_factory = _make_kernel_expert_factory(kernel, moe_config)
     with torch.device("meta"):
-        model = GptOssForCausalLM(local_args, expert_factory)
+        model = MoEForCausalLM(local_args, expert_factory)
 
     load_gpt_oss_weights(
         path,

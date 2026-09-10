@@ -1,5 +1,6 @@
 """Keep the CUDA package model-owned and small enough to audit."""
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -10,10 +11,11 @@ MODEL_FAMILIES = {"deepseek_v4", "gemma4", "gpt_oss", "inkling", "qwen3_5"}
 PACKAGE_BASELINE_LINES = 22_524
 PACKAGE_MAX_LINES = 18_019
 FORBIDDEN_CATEGORY_PACKAGES = {"drafts", "kernels", "loading", "media", "runners"}
+FORBIDDEN_ROOT_SHIMS = {"paged_moe.py"}
 BACKEND_NEUTRAL_SHIMS = {
     "deepseek_v4": {"codec.py", "config.py"},
     "gemma4": {"assistant.py", "codec.py", "config.py", "media.py", "plan.py"},
-    "gpt_oss": {"config.py", "plan.py"},
+    "gpt_oss": {"config.py", "model.py", "plan.py"},
     "inkling": {"codec.py", "config.py", "media.py"},
     "qwen3_5": {"codec.py", "config.py", "media.py"},
 }
@@ -44,6 +46,31 @@ def test_cuda_package_has_no_implementation_category_directories(category: str) 
     assert not (PACKAGE_ROOT / category).exists()
 
 
+@pytest.mark.parametrize("module", sorted(FORBIDDEN_ROOT_SHIMS))
+def test_cuda_package_has_no_renamed_root_module_shims(module: str) -> None:
+    assert not (PACKAGE_ROOT / module).exists()
+
+
+def test_cuda_package_has_no_import_and_alias_only_modules() -> None:
+    for path in PACKAGE_ROOT.rglob("*.py"):
+        if path.name == "__init__.py":
+            continue
+        tree = ast.parse(path.read_text())
+        body = [
+            node
+            for node in tree.body
+            if not (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            )
+        ]
+        shim_statements = (ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign)
+        assert not body or not all(isinstance(node, shim_statements) for node in body), (
+            f"{path.relative_to(PACKAGE_ROOT)} only imports or renames symbols"
+        )
+
+
 @pytest.mark.parametrize(
     ("family", "module"),
     [
@@ -52,7 +79,7 @@ def test_cuda_package_has_no_implementation_category_directories(category: str) 
         for module in modules
     ],
 )
-def test_cuda_families_have_no_backend_neutral_compatibility_shims(
+def test_cuda_families_have_no_backend_neutral_or_name_translation_shims(
     family: str, module: str
 ) -> None:
     assert not (PACKAGE_ROOT / family / module).exists()
