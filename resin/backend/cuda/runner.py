@@ -2,12 +2,186 @@
 
 from __future__ import annotations
 
-import numpy as np
+from collections.abc import Callable, Mapping
 
-from resin import BatchPhase
-from resin.backend.cuda.sampling import SAMPLING_OFFSET_STRIDE, SamplingTensors
+import numpy as np
+import torch
+
+from resin import BatchPhase, ResourceBinding
+from resin.backend.cuda.failures import CudaFailureGuard
+from resin.backend.cuda.graphs import (
+    CudaGraphExecutor,
+    CudaGraphMode,
+    CudaGraphStats,
+    GraphShape,
+)
+from resin.backend.cuda.sampling import (
+    SAMPLING_OFFSET_STRIDE,
+    FlashInferSampler,
+    SamplingTensors,
+)
+from resin.backend.loading import default_device
+from resin.backend.resources import CachePoolBinding
+from resin.protocols import Runner
 
 _SAMPLING_DEFAULTS = (1.0, 1.0, None, 0, 0, False)
+
+
+def resolve_kv_cache_dtype(value: str) -> torch.dtype:
+    """Resolve the cache precision shared by CUDA model runners."""
+
+    if value == "fp8":
+        return torch.float8_e4m3fn
+    if value == "bfloat16":
+        return torch.bfloat16
+    raise ValueError("kv_cache_dtype must be 'fp8' or 'bfloat16'")
+
+
+class CudaRunner(Runner):
+    """Common device, cache-precision, failure, and graph runtime boundary.
+
+    Model implementations configure semantic modes and supply their graph-step
+    builders. This base owns device normalization, KV precision naming, failure
+    containment, capture, poisoning checks, mode-scoped statistics, physical
+    shape selection, fallback accounting, and replay without knowing anything
+    about transformer layers, cache geometry, kernels, or quantization.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: str | torch.device | None,
+        label: str,
+        kv_cache_dtype: str,
+    ) -> None:
+        cache_dtype = resolve_kv_cache_dtype(kv_cache_dtype)
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"{label} requires CUDA")
+        self.device = torch.device(device or default_device(require_cuda=True))
+        if self.device.type != "cuda":
+            raise RuntimeError(f"{label} requires a CUDA device")
+        if self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_cache_torch_dtype = cache_dtype
+        self._cuda_failure = CudaFailureGuard(
+            lambda: torch.cuda.synchronize(self.device),
+            label=f"{label} eager execution",
+        )
+        self._sampler = FlashInferSampler()
+        self._cache_binding: CachePoolBinding | None = None
+        self._cuda_graph_executor: CudaGraphExecutor | None = None
+
+    def _configure_cache_binding(self, binding: CachePoolBinding) -> None:
+        """Attach the model-owned physical cache to the Engine resource seam."""
+
+        if not isinstance(binding, CachePoolBinding):
+            raise TypeError("CUDA cache binding must be a CachePoolBinding")
+        if self._cache_binding is not None:
+            raise RuntimeError("CUDA cache binding is already configured")
+        self._cache_binding = binding
+
+    def bind_resources(self, binding: ResourceBinding) -> None:
+        """Bind the model cache to its Engine-owned physical allocation."""
+
+        if self._cache_binding is None:
+            raise RuntimeError("CUDA cache binding has not been configured")
+        self._cache_binding.bind_resources(binding)
+
+    def _configure_cuda_graphs(
+        self,
+        modes: Mapping[str, CudaGraphMode],
+    ) -> None:
+        if not modes:
+            raise ValueError("CUDA graph modes must not be empty")
+        if self._cuda_graph_executor is not None:
+            raise RuntimeError("CUDA graph modes are already configured")
+        self._cuda_graph_executor = CudaGraphExecutor(
+            self.device,
+            modes,
+            synchronize_failure=self._cuda_failure,
+        )
+
+    @property
+    def cuda_graph_stats(self) -> dict[str, CudaGraphStats]:
+        """Return statistics keyed by semantic graph mode."""
+
+        return self._require_cuda_graph_executor().stats
+
+    def _before_cuda_graph_capture(self) -> None:
+        """Prepare model-owned state immediately before graph capture."""
+
+    def _after_cuda_graph_capture(self) -> None:
+        """Restore model-owned state immediately after graph capture."""
+
+    def capture_cuda_graphs(self) -> dict[str, CudaGraphStats]:
+        """Capture every configured mode and return mode-scoped statistics."""
+
+        return self._require_cuda_graph_executor().capture_all(
+            before_capture=self._before_cuda_graph_capture,
+            after_capture=self._after_cuda_graph_capture,
+        )
+
+    def capture_cuda_graph(
+        self, mode: str, shape: GraphShape
+    ) -> CudaGraphStats:
+        """Capture one mode shape while honoring model-state hooks."""
+
+        executor = self._require_cuda_graph_executor()
+        self._before_cuda_graph_capture()
+        try:
+            return executor.capture(mode, shape)
+        finally:
+            self._after_cuda_graph_capture()
+
+    def _check_cuda_graphs(self) -> None:
+        """Fail before model work when any configured graph mode is poisoned."""
+
+        self._require_cuda_graph_executor().check()
+
+    def _select_cuda_graph(
+        self,
+        mode: str,
+        *,
+        match: Callable[[GraphShape], bool],
+        fallback: str = "shape",
+    ) -> GraphShape | None:
+        """Select one physical shape and account for an eager fallback."""
+
+        cache = self._require_cuda_graph_executor().mode(mode)
+        if not cache.shapes:
+            return None
+        shape = cache.match(match)
+        if shape is None:
+            cache.fallback(fallback)
+            return None
+        return shape
+
+    def _run_cuda_graph(
+        self,
+        mode: str,
+        shape: GraphShape,
+        inputs: Mapping[str, object],
+    ):
+        """Stage model-owned inputs and replay one selected physical shape."""
+
+        return self._require_cuda_graph_executor().mode(mode).run(shape, inputs)
+
+    def _cuda_graph_fallback(self, mode: str, reason: str) -> None:
+        """Record a model-level reason that a configured mode ran eagerly."""
+
+        self._require_cuda_graph_executor().mode(mode).fallback(reason)
+
+    def _cuda_graph_mode_enabled(self, mode: str) -> bool:
+        """Return whether a semantic mode has any configured physical shapes."""
+
+        return bool(self._require_cuda_graph_executor().mode(mode).shapes)
+
+    def _require_cuda_graph_executor(self) -> CudaGraphExecutor:
+        executor = self._cuda_graph_executor
+        if executor is None:
+            raise RuntimeError("CUDA graph modes have not been configured")
+        return executor
 
 
 def capture_sampling_inputs(
@@ -83,8 +257,10 @@ def validate_hybrid_plan(
 
 
 __all__ = [
+    "CudaRunner",
     "capture_sampling_inputs",
     "graph_sample",
     "pad_sampling_inputs",
+    "resolve_kv_cache_dtype",
     "validate_hybrid_plan",
 ]

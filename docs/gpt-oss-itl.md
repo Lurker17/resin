@@ -112,8 +112,8 @@ page zero is the initialized null row.
 
 Each `cuda_graph_decode_shapes` entry is `(batch_size,
 full_page_table_width)`. The runner selects the smallest configured width that
-fits the current decode batch. `cuda_graph_stats` reports capture, replay, and
-fallback counts.
+fits the current decode batch. `cuda_graph_stats["decode"]` reports capture,
+replay, and fallback counts.
 
 GPT-OSS currently pins 128-token cache blocks, a 128-token sliding window,
 64 query heads, eight KV heads, and head dimension 64. Unsupported checkpoint or

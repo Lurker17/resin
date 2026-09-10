@@ -84,7 +84,13 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
                 "cache.0.child_slots": (0, 1, 0, 0),
             }
 
-    runner._graphs = Graphs()
+    graphs = Graphs()
+    runner._select_cuda_graph = (
+        lambda _mode, *, match, fallback="shape": graphs.match(match)
+    )
+    runner._run_cuda_graph = (
+        lambda _mode, shape, inputs: graphs.run(shape, inputs)
+    )
     runner._sampler = Sampler()
     runner._cache = Cache()
     plan = SimpleNamespace(
@@ -97,7 +103,7 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
     )
 
     assert runner._graph_forward(plan, "cache-plan") == [11, 12, 13]
-    shape, inputs = runner._graphs.calls[0]
+    shape, inputs = graphs.calls[0]
     assert shape == (4, 128)
     assert inputs["token_ids"].tolist() == [5, 6, 7, 0]
     assert inputs["positions"].tolist() == [11, 12, 13, 1]

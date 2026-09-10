@@ -1,23 +1,28 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from resin.backend.cuda import graphs as graph_runtime
+from resin.backend.cuda import runner as runner_runtime
 from resin.backend.cuda import staging
 from resin.backend.cuda.graphs import (
     DEFAULT_DECODE_GRAPH_MAX_BATCH_SIZE,
     DEFAULT_MAX_NUM_SEQS,
     CudaGraphCache,
+    CudaGraphExecutor,
     CudaGraphMode,
     CudaGraphProgram,
     CudaGraphRegion,
-    CudaGraphRunner,
     CudaGraphStep,
     GraphInputError,
     default_decode_graph_shapes,
     graph_shapes,
 )
+from resin.backend.cuda.runner import CudaRunner, resolve_kv_cache_dtype
+from resin.backend.resources import CachePoolBinding
 
 
 class _Context:
@@ -144,6 +149,100 @@ def _cache(shapes, build, synchronize_failure=lambda: None):
 
 
 class TestCudaGraph:
+    def test_cuda_runner_owns_device_precision_sampler_and_cache_binding(
+        self, monkeypatch
+    ) -> None:
+        sampler = object()
+        monkeypatch.setattr(runner_runtime.torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(runner_runtime.torch.cuda, "current_device", lambda: 3)
+        monkeypatch.setattr(runner_runtime, "FlashInferSampler", lambda: sampler)
+
+        runner = CudaRunner(device="cuda", label="test", kv_cache_dtype="fp8")
+
+        assert str(runner.device) == "cuda:3"
+        assert runner.kv_cache_dtype == "fp8"
+        assert runner.kv_cache_torch_dtype is runner_runtime.torch.float8_e4m3fn
+        assert runner._sampler is sampler
+        layout = object()
+        binding = CachePoolBinding(layout, resource="test KV")
+        runner._configure_cache_binding(binding)
+        runner.bind_resources(SimpleNamespace(cache_pool_id=7, cache_layout=layout))
+        assert binding.pool_id == 7
+        with pytest.raises(RuntimeError, match="already configured"):
+            runner._configure_cache_binding(CachePoolBinding(layout))
+
+    def test_model_runner_owns_modes_capture_hooks_selection_and_stats(
+        self, monkeypatch
+    ) -> None:
+        torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
+        monkeypatch.setattr(graph_runtime, "torch", torch)
+
+        class ModelRunner(CudaRunner):
+            device = "cuda:0"
+
+            def __init__(self) -> None:
+                self.events = []
+                self._cuda_failure = lambda: None
+                self._cuda_graph_executor = None
+
+            def _before_cuda_graph_capture(self) -> None:
+                self.events.append("before")
+
+            def _after_cuda_graph_capture(self) -> None:
+                self.events.append("after")
+
+        def mode(value):
+            def build(_shape):
+                state = _Tensor([0])
+                return CudaGraphStep({"value": state}, state, lambda: None)
+
+            return CudaGraphMode(((1, 4),), build, lambda _shape: {"value": [value]})
+
+        runner = ModelRunner()
+        runner._configure_cuda_graphs(
+            {"prefill": mode(1), "decode": mode(2)}
+        )
+
+        stats = runner.capture_cuda_graphs()
+
+        assert not hasattr(CudaRunner, "primary_cuda_graph_mode")
+        assert runner.events == ["before", "after"]
+        assert stats == runner.cuda_graph_stats
+        assert set(stats) == {"prefill", "decode"}
+        assert stats["prefill"]["capture_count"] == 1
+        shape = runner._select_cuda_graph(
+            "decode", match=lambda candidate: candidate[0] == 1
+        )
+        assert shape == (1, 4)
+        assert runner._run_cuda_graph("decode", shape, {"value": [3]}) == [3]
+        runner._check_cuda_graphs()
+
+    def test_model_runner_requires_one_nonempty_mode_configuration(self) -> None:
+        class ModelRunner(CudaRunner):
+            device = "cuda:0"
+
+        runner = ModelRunner.__new__(ModelRunner)
+        runner._cuda_graph_executor = None
+        with pytest.raises(ValueError, match="must not be empty"):
+            runner._configure_cuda_graphs({})
+        with pytest.raises(RuntimeError, match="not been configured"):
+            runner._require_cuda_graph_executor()
+
+        mode = CudaGraphMode((), lambda _shape: None, lambda _shape: {})
+        runner._cuda_failure = lambda: None
+        runner._configure_cuda_graphs({"decode": mode})
+        with pytest.raises(RuntimeError, match="already configured"):
+            runner._configure_cuda_graphs({"decode": mode})
+
+    def test_kv_cache_dtype_is_one_shared_runner_option(self) -> None:
+        import torch
+
+        assert resolve_kv_cache_dtype("fp8") is torch.float8_e4m3fn
+        assert resolve_kv_cache_dtype("bfloat16") is torch.bfloat16
+        with pytest.raises(ValueError, match="kv_cache_dtype"):
+            resolve_kv_cache_dtype("float16")
+
     def test_runner_reuses_one_mechanism_across_execution_modes(
         self, monkeypatch
     ) -> None:
@@ -168,7 +267,7 @@ class TestCudaGraph:
             state = _Tensor([0])
             return CudaGraphStep({"value": state}, state, lambda: None)
 
-        graphs = CudaGraphRunner(
+        graphs = CudaGraphExecutor(
             "cuda:0",
             {
                 "prefill": CudaGraphMode(

@@ -19,23 +19,31 @@ selected through a registry. A small cross-model CUDA primitive may live as a
 root module, such as `paged_kv.py` or `paged.py`, when it has multiple model
 owners and does not justify another package layer.
 
-`PagedCudaRunner` owns the shared text-decoder paging, FA4, sampling, tensor-
-parallel, and graph lifecycle. Its default feed-forward hook calls the model's
+Every CUDA model runner derives from `resin.backend.cuda.runner.CudaRunner`.
+That base owns device normalization, KV precision selection, failure
+containment, sampling, Engine cache binding, graph modes, capture hooks, shape
+selection, fallback accounting, replay, poisoning checks, and mode-scoped
+statistics while remaining unaware of model layers and physical cache layout.
+Each model-owned cache arena decides which precision and heterogeneous state
+layouts it can actually support.
+
+`PagedCudaRunner` adds only the shared text-decoder paging, FA4, sampling, and
+tensor-parallel execution. Its default feed-forward hook calls the model's
 module directly; a family such as GPT-OSS may override that hook for a concrete
-router or MoE kernel without making MoE part of the runner's identity. Runners
-with different execution semantics remain model-owned until the common seam is
-real: Gemma 4 currently combines heterogeneous local/global cache views, FP8
-KV, media embeddings, and speculative verification, so forcing it through the
-text-decoder runner would turn the base into a collection of model branches.
+router or MoE kernel without making MoE part of the runner's identity. Gemma 4,
+Qwen3.5, Inkling, and DeepSeek V4 derive directly from the common graph base and
+retain their different cache views, media/speculation paths, and architecture
+layers without adding branches to `PagedCudaRunner`.
 
 ## Graph execution modes
 
-A runner has one `CudaGraphRunner` and registers semantic modes such as
-`prefill` and `decode`. Each `CudaGraphMode` supplies only its shape buckets,
-fixed-input factory, and program builder. The builder returns either one
-`CudaGraphStep` (a full graph) or a `CudaGraphProgram` containing captured and
-eager regions (a breakable graph). Capture, staging, replay, poisoning,
-validation, and metrics are shared by every mode and both graph styles.
+A `CudaRunner` configures one internal `CudaGraphExecutor` with semantic
+modes such as `prefill` and `decode`. Each `CudaGraphMode` supplies only its
+shape buckets, fixed-input factory, and program builder. The builder returns
+either one `CudaGraphStep` (a full graph) or a `CudaGraphProgram` containing
+captured and eager regions (a breakable graph). Capture, staging, replay,
+poisoning, validation, and metrics are shared by every model, every mode, and
+both graph styles.
 
 Phase code must keep the model operation separate from graph orchestration.
 Eager execution and graph builders call the same model/attention helpers; a

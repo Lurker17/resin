@@ -5,6 +5,7 @@ import inspect
 import pytest
 
 from resin import BatchPhase, BatchPlan
+from resin.backend.cuda.runner import CudaRunner
 from resin_models_cuda.qwen3_5.checkpoint import DEFAULT_MODEL
 from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
 
@@ -27,18 +28,21 @@ def test_qwen_runner_uses_optional_bundled_mtp_and_engine_cache() -> None:
     assert "CacheGeometry.from_config" in source
     assert "cache_write_lookahead_tokens=lookahead" in source
     assert "self._model.mtp" in source
-    assert 'torch.device("cuda", torch.cuda.current_device())' in source
+    assert 'torch.device("cuda", torch.cuda.current_device())' in inspect.getsource(
+        CudaRunner
+    )
 
 
 def test_qwen_runner_captures_both_ordinary_and_mtp_decode() -> None:
     source = inspect.getsource(Qwen3_5CudaRunner)
 
-    assert "CudaGraphRunner" in source
+    assert issubclass(Qwen3_5CudaRunner, CudaRunner)
+    assert "self._configure_cuda_graphs(" in source
     assert "GraphPagedAttentionRuntime" in source
-    assert "def capture_cuda_graphs" in source
+    assert "def capture_cuda_graphs" not in source
     assert "def _new_decode_graph_step" in source
     assert "self._mtp_forward(" in source
-    assert "self._graphs.run(shape, inputs)" in source
+    assert "self._run_cuda_graph(" in source
 
 
 def test_speculative_decode_capacity_includes_mtp_verification_lookahead() -> None:

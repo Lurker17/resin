@@ -31,15 +31,11 @@ from resin import (
     CacheGroupLayout,
     CacheLayout,
     CacheRetention,
-    ResourceBinding,
     RunnerConfig,
 )
 from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
-from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
     CudaGraphMode,
-    CudaGraphRunner,
-    CudaGraphStats,
     CudaGraphStep,
     GraphInputError,
     GraphShape,
@@ -55,13 +51,10 @@ from resin.backend.cuda.paged_kv import (
     stage_paged_attention_batch,
 )
 from resin.backend.cuda.parallel import TensorParallelContext
-from resin.backend.cuda.runner import capture_sampling_inputs
-from resin.backend.cuda.sampling import FlashInferSampler
+from resin.backend.cuda.runner import CudaRunner, capture_sampling_inputs
 from resin.backend.cuda.staging import TensorStager
-from resin.backend.loading import default_device
 from resin.backend.paged_attention import PagedAttentionBatch
 from resin.backend.quantization import QuantizationConfig
-from resin.protocols import Runner
 
 if TYPE_CHECKING:
     from resin import BatchPlan
@@ -118,7 +111,7 @@ def plan_paged_kv_capacity(
     )
 
 
-class PagedCudaRunner(Runner):
+class PagedCudaRunner(CudaRunner):
     """FA4 runner configured by a thin concrete model subclass."""
 
     model_label = "paged"
@@ -187,16 +180,13 @@ class PagedCudaRunner(Runner):
         self.tensor_parallel = tensor_parallel or TensorParallelContext()
         self.tensor_parallel_rank = self.tensor_parallel.rank
         self.tensor_parallel_size = self.tensor_parallel.size
+        super().__init__(
+            device=device,
+            label=self.model_label,
+            kv_cache_dtype="bfloat16",
+        )
 
         self._fa4 = kernel_attention
-        self._sampler = FlashInferSampler()
-        self.device = torch.device(device or default_device(require_cuda=True))
-        if self.device.type != "cuda":
-            raise RuntimeError(f"{self.model_label} requires CUDA")
-        self._cuda_failure = CudaFailureGuard(
-            lambda: torch.cuda.synchronize(self.device),
-            label=f"{self.model_label} eager execution",
-        )
         if torch.cuda.get_device_capability(self.device)[0] != 9:
             raise RuntimeError(
                 f"the {self.model_label} FA4 runner requires an SM90 GPU"
@@ -354,18 +344,15 @@ class PagedCudaRunner(Runner):
         )
         if any(width > self.cache_parent_capacity for _, width in decode_graph_shapes):
             raise ValueError("CUDA graph table width exceeds cache capacity")
-        self._graph_runner = CudaGraphRunner(
-            self.device,
+        self._configure_cuda_graphs(
             {
                 "decode": CudaGraphMode(
                     decode_graph_shapes,
                     self._new_decode_graph_step,
                     lambda shape: self._graph_capture_inputs(shape, self.vocab_size),
                 )
-            },
-            synchronize_failure=self._cuda_failure,
+            }
         )
-        self._graphs = self._graph_runner.mode("decode")
         # FA4's SM90 TMA path can load a complete physical page even when
         # ``seqused_k`` masks its unused tail.  Keep unwritten rows finite so a
         # masked PV operation can never encounter uninitialized NaN/Inf data.
@@ -379,14 +366,11 @@ class PagedCudaRunner(Runner):
             dtype=torch.bfloat16,
             resource=f"{self.model_label} KV",
         )
+        self._configure_cache_binding(self._kv.binding)
 
         for layer in self._model.model.layers:
             if layer.self_attn.sinks.dtype is not torch.bfloat16:
                 raise TypeError("FA4 learnable sink tensors must be bfloat16")
-
-    @property
-    def cuda_graph_stats(self) -> CudaGraphStats:
-        return self._graphs.stats
 
     @classmethod
     def _graph_capture_inputs(
@@ -412,20 +396,12 @@ class PagedCudaRunner(Runner):
             **capture_sampling_inputs(batch_size, vocab_size, stochastic=True),
         }
 
-    def capture_cuda_graphs(self) -> CudaGraphStats:
-        """Capture every configured decode graph before accepting requests."""
-
-        def reset_null_page() -> None:
-            # Capture writes synthetic K/V to parent zero, which the native
-            # allocator permanently reserves. Restore its null-page contract
-            # before a request can reach the runner.
-            self._kv.storage[:, :, 0].zero_()
-            torch.cuda.synchronize(self.device)
-
-        return self._graph_runner.capture_all(after_capture=reset_null_page)["decode"]
-
-    def bind_resources(self, binding: ResourceBinding) -> None:
-        self._kv.binding.bind_resources(binding)
+    def _after_cuda_graph_capture(self) -> None:
+        # Capture writes synthetic K/V to parent zero, which the native
+        # allocator permanently reserves. Restore its null-page contract
+        # before a request can reach the runner.
+        self._kv.storage[:, :, 0].zero_()
+        torch.cuda.synchronize(self.device)
 
     def _tensorize(
         self, batch: PagedAttentionBatch, staging: TensorStager, prefix: str
@@ -668,7 +644,7 @@ class PagedCudaRunner(Runner):
     def _graph_forward(
         self, plan: BatchPlan, host: PagedAttentionBatch
     ) -> list[int] | None:
-        if not self._graphs.shapes:
+        if not self._cuda_graph_mode_enabled("decode"):
             return None
         rows = len(plan.sequence_ids)
         full = host.group("full")
@@ -679,11 +655,13 @@ class PagedCudaRunner(Runner):
             or sliding.width != self.window_table_width
         ):
             raise GraphInputError("plan is not a fixed-shape decode batch")
-        shape = self._graphs.match(
-            lambda candidate: candidate[0] == rows and candidate[1] >= full.width
+        shape = self._select_cuda_graph(
+            "decode",
+            match=lambda candidate: (
+                candidate[0] == rows and candidate[1] >= full.width
+            ),
         )
         if shape is None:
-            self._graphs.fallback("shape")
             return None
         inputs = {
             "token_ids": plan.token_ids,
@@ -695,10 +673,10 @@ class PagedCudaRunner(Runner):
         }
         if hasattr(self._sampler, "host_inputs"):
             inputs.update(self._sampler.host_inputs(plan, self.vocab_size))
-        return self._graphs.run(shape, inputs)
+        return self._run_cuda_graph("decode", shape, inputs)
 
     def forward(self, plan: BatchPlan) -> list[int]:
-        self._graphs.check()
+        self._check_cuda_graphs()
         host_positions = plan.positions
 
         prefill_batches, decode_batch = self.attention_batch_builder(
@@ -713,9 +691,7 @@ class PagedCudaRunner(Runner):
                 "native attention batches do not cover every plan sequence"
             )
 
-        if prefill_batches:
-            self._graphs.fallback("prefill")
-        elif decode_batch is not None:
+        if not prefill_batches and decode_batch is not None:
             graph_output = self._graph_forward(plan, decode_batch)
             if graph_output is not None:
                 return graph_output

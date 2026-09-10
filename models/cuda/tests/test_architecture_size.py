@@ -1,11 +1,19 @@
 """Keep the CUDA package model-owned and small enough to audit."""
 
 import ast
+import inspect
 from pathlib import Path
 
 import pytest
 
 import resin_models_cuda
+from resin.backend.cuda.runner import CudaRunner
+from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
+from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
+from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
+from resin_models_cuda.inkling.cuda import InklingCudaRunner
+from resin_models_cuda.paged import PagedCudaRunner
+from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
 
 MODEL_FAMILIES = {"deepseek_v4", "gemma4", "gpt_oss", "inkling", "qwen3_5"}
 PACKAGE_BASELINE_LINES = 22_524
@@ -20,6 +28,14 @@ BACKEND_NEUTRAL_SHIMS = {
     "qwen3_5": {"codec.py", "config.py", "media.py"},
 }
 PACKAGE_ROOT = Path(resin_models_cuda.__file__).parent
+CUDA_RUNNERS = (
+    DeepSeekV4CudaRunner,
+    Gemma4CudaRunner,
+    GptOssCudaRunner,
+    InklingCudaRunner,
+    PagedCudaRunner,
+    Qwen3_5CudaRunner,
+)
 
 
 def test_cuda_model_package_is_at_least_twenty_percent_smaller() -> None:
@@ -39,6 +55,21 @@ def test_every_cuda_model_directory_is_an_architecture_family() -> None:
         if path.is_dir() and (path / "__init__.py").is_file()
     }
     assert families == MODEL_FAMILIES
+
+
+@pytest.mark.parametrize("runner", CUDA_RUNNERS)
+def test_every_cuda_runner_uses_the_common_graph_base(runner: type) -> None:
+    assert issubclass(runner, CudaRunner)
+
+
+@pytest.mark.parametrize("runner", CUDA_RUNNERS)
+def test_model_runners_do_not_reach_into_the_graph_executor(runner: type) -> None:
+    source = inspect.getsource(runner)
+    assert "_cuda_graph_executor" not in source
+    assert "CudaGraphExecutor" not in source
+    assert ".capture_all(" not in source
+    assert "def bind_resources" not in source
+    assert "FlashInferSampler()" not in source
 
 
 @pytest.mark.parametrize("category", sorted(FORBIDDEN_CATEGORY_PACKAGES))

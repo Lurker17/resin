@@ -9,18 +9,16 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from resin import BatchPhase, ResourceBinding, RunnerConfig
+from resin import BatchPhase, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
-from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
     CudaGraphMode,
-    CudaGraphRunner,
-    CudaGraphStats,
     CudaGraphStep,
     GraphShape,
     graph_shapes,
 )
 from resin.backend.cuda.runner import (
+    CudaRunner,
     capture_sampling_inputs,
     graph_sample,
     pad_sampling_inputs,
@@ -28,15 +26,12 @@ from resin.backend.cuda.runner import (
 )
 from resin.backend.cuda.sampling import (
     SAMPLING_OFFSET_STRIDE,
-    FlashInferSampler,
 )
 from resin.backend.cuda.staging import TensorStager
-from resin.backend.loading import default_device
 from resin.backend.plans import PagedCachePlan
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
 from resin.models.qwen3_5.media import Qwen35Media
-from resin.protocols import Runner
 from resin_models_cuda.nvfp4 import prepare_nvfp4_modules
 from resin_models_cuda.qwen3_5.attention import (
     GraphAttentionSpec,
@@ -63,7 +58,7 @@ _CACHE_WORKSPACE_BYTES = 512 * 1024**2
 _GRAPH_WORKSPACE_BYTES = 128 * 1024**2
 
 
-class Qwen3_5CudaRunner(Runner):
+class Qwen3_5CudaRunner(CudaRunner):
     """Dense Qwen3.5/Qwen3.8 text runner over paged FA4 and DeltaNet state."""
 
     page_size = 128
@@ -104,16 +99,14 @@ class Qwen3_5CudaRunner(Runner):
             or cache_slab_capacity <= 0
         ):
             raise ValueError("cache_slab_capacity must be a positive integer")
-        if kv_cache_dtype not in {"fp8", "bfloat16"}:
-            raise ValueError("kv_cache_dtype must be 'fp8' or 'bfloat16'")
         if nvfp4_backend not in {"auto", "cudnn", "cute-dsl"}:
             raise ValueError("nvfp4_backend must be 'auto', 'cudnn', or 'cute-dsl'")
 
-        self.device = torch.device(device or default_device(require_cuda=True))
-        if self.device.type != "cuda":
-            raise RuntimeError("Qwen3_5CudaRunner requires CUDA")
-        if self.device.index is None:
-            self.device = torch.device("cuda", torch.cuda.current_device())
+        super().__init__(
+            device=device,
+            label="Qwen3.5",
+            kv_cache_dtype=kv_cache_dtype,
+        )
         torch.cuda.set_device(self.device)
         if torch.cuda.get_device_capability(self.device)[0] < 9:
             raise RuntimeError("Qwen3_5CudaRunner requires Hopper or newer CUDA")
@@ -126,10 +119,6 @@ class Qwen3_5CudaRunner(Runner):
             ) from error
         del chunk_gated_delta_rule, BatchDecodeWithPagedKVCacheWrapper
 
-        self._cuda_failure = CudaFailureGuard(
-            lambda: torch.cuda.synchronize(self.device),
-            label="Qwen3.5 eager execution",
-        )
         self.model_path = resolve_model_path(model, revision)
         self.speculative_tokens = speculative_tokens
         self._model, self.config, self.raw_config = load_model(
@@ -176,12 +165,10 @@ class Qwen3_5CudaRunner(Runner):
         self.max_batch_size = max_batch_size
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = self.config.eos_token_id
-        self._sampler = FlashInferSampler()
         self._speculation = SpeculativeStats(speculative_tokens)
         self._graph_device_caches: dict[GraphShape, DeviceCache] = {}
         self._graph_attention: dict[GraphShape, GraphPagedAttentionRuntime] = {}
-        self.kv_cache_dtype = kv_cache_dtype
-        cache_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8" else torch.bfloat16
+        cache_dtype = self.kv_cache_torch_dtype
 
         self.cache_geometry = CacheGeometry.from_config(
             self.config,
@@ -213,6 +200,7 @@ class Qwen3_5CudaRunner(Runner):
             self.cache_geometry,
             kv_dtype=cache_dtype,
         )
+        self._configure_cache_binding(self._cache.binding)
         self._attention = PagedAttentionRuntime(
             self.device,
             num_attention_heads=self.config.num_attention_heads,
@@ -230,18 +218,15 @@ class Qwen3_5CudaRunner(Runner):
         self._graph_workspace = torch.empty(
             _GRAPH_WORKSPACE_BYTES, dtype=torch.uint8, device=self.device
         )
-        self._graph_runner = CudaGraphRunner(
-            self.device,
+        self._configure_cuda_graphs(
             {
                 "decode": CudaGraphMode(
                     decode_graph_shapes,
                     self._new_decode_graph_step,
                     self._decode_graph_capture_inputs,
                 )
-            },
-            synchronize_failure=self._cuda_failure,
+            }
         )
-        self._graphs = self._graph_runner.mode("decode")
         lookahead = speculative_tokens + 1 if speculative_tokens else 0
         self.runner_config = RunnerConfig(
             max_batch_tokens=PREFILL_CHUNK_SIZE,
@@ -252,15 +237,8 @@ class Qwen3_5CudaRunner(Runner):
         )
 
     @property
-    def cuda_graph_stats(self) -> CudaGraphStats:
-        return self._graphs.stats
-
-    @property
     def speculative_stats(self) -> dict[str, int | float]:
         return self._speculation.snapshot(include_draft_tokens=True)
-
-    def bind_resources(self, binding: ResourceBinding) -> None:
-        self._cache.binding.bind_resources(binding)
 
     @staticmethod
     def _media_at(plan: BatchPlan, row: int) -> Qwen35Media | None:
@@ -367,14 +345,9 @@ class Qwen3_5CudaRunner(Runner):
             **capture_sampling_inputs(batch_size, vocab_size, unique_seeds=True),
         }
 
-    def capture_cuda_graphs(self) -> CudaGraphStats:
-        """Capture every configured Qwen decode bucket before serving."""
-
-        def reset_null_page() -> None:
-            self._cache.reset_null()
-            torch.cuda.synchronize(self.device)
-
-        return self._graph_runner.capture_all(after_capture=reset_null_page)["decode"]
+    def _after_cuda_graph_capture(self) -> None:
+        self._cache.reset_null()
+        torch.cuda.synchronize(self.device)
 
     def _decode_graph_capture_inputs(self, shape: GraphShape) -> dict[str, object]:
         inputs = self._capture_inputs(shape, self.vocab_size)
@@ -601,19 +574,17 @@ class Qwen3_5CudaRunner(Runner):
     def _graph_forward(
         self, plan: BatchPlan, cache_plan: PagedCachePlan
     ) -> list[int] | list[list[int]] | None:
-        if not self._graphs.shapes:
-            return None
         batch_size = plan.num_sequences
         required_length = int(plan.positions.max()) + self.speculative_tokens + 2
         if not self.speculative_tokens:
             required_length = int(plan.positions.max()) + 1
-        shape = self._graphs.match(
-            lambda candidate: (
+        shape = self._select_cuda_graph(
+            "decode",
+            match=lambda candidate: (
                 candidate[0] >= batch_size and candidate[1] >= required_length
-            )
+            ),
         )
         if shape is None:
-            self._graphs.fallback("shape")
             return None
         padding = shape[0] - batch_size
         inputs: dict[str, object] = {
@@ -630,7 +601,7 @@ class Qwen3_5CudaRunner(Runner):
         inputs.update(
             pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding)
         )
-        output = self._graphs.run(shape, inputs)[:batch_size]
+        output = self._run_cuda_graph("decode", shape, inputs)[:batch_size]
         if not self.speculative_tokens:
             return [int(row[0]) for row in output]
         drafts = [row[1 : self.speculative_tokens + 1] for row in output]
@@ -1014,6 +985,7 @@ class Qwen3_5CudaRunner(Runner):
         return rows
 
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
+        self._check_cuda_graphs()
         rows = self._validate_plan(plan)
         lookahead = (
             self.speculative_tokens + 1

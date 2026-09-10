@@ -386,9 +386,11 @@ def _new_cuda_runner(
     return runner
 
 
-def _capture_cuda_graphs(runner: GptOssCudaRunner) -> CudaGraphStats:
+def _capture_cuda_graphs(
+    runner: GptOssCudaRunner,
+) -> dict[str, CudaGraphStats]:
     stats = runner.cuda_graph_stats
-    shapes = stats["configured_shapes"]
+    shapes = stats["decode"]["configured_shapes"]
     if not shapes:
         return stats
     if runner.tensor_parallel_rank == 0:
@@ -399,11 +401,12 @@ def _capture_cuda_graphs(runner: GptOssCudaRunner) -> CudaGraphStats:
         )
     capture_start = time.perf_counter()
     stats = runner.capture_cuda_graphs()
+    decode_stats = stats["decode"]
     runner.tensor_parallel.barrier()
     capture_elapsed_s = time.perf_counter() - capture_start
     if runner.tensor_parallel_rank == 0:
         print(
-            f"[cuda-graphs] Captured {stats['capture_count']} shape(s) in "
+            f"[cuda-graphs] Captured {decode_stats['capture_count']} shape(s) in "
             f"{capture_elapsed_s:.2f} seconds",
             flush=True,
         )

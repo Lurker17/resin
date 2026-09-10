@@ -17,33 +17,29 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from resin import BatchPhase, ResourceBinding, RunnerConfig
-from resin.backend.cuda.failures import CudaFailureGuard
+from resin import BatchPhase, RunnerConfig
 from resin.backend.cuda.graphs import (
     CudaGraphMode,
     CudaGraphProgram,
     CudaGraphRegion,
-    CudaGraphRunner,
-    CudaGraphStats,
     CudaGraphStep,
     GraphShape,
     graph_shapes,
 )
 from resin.backend.cuda.parallel import FlashInferAllReduce, TensorParallelContext
 from resin.backend.cuda.runner import (
+    CudaRunner,
     capture_sampling_inputs,
     graph_sample,
     pad_sampling_inputs,
 )
 from resin.backend.cuda.sampling import (
     SAMPLING_OFFSET_STRIDE,
-    FlashInferSampler,
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import BatchView, PagedCachePlan
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
-from resin.protocols import Runner
 from resin_models_cuda.deepseek_v4.cache import (
     GRAPH_SCRATCH_PARENTS,
     CacheArena,
@@ -60,7 +56,7 @@ if TYPE_CHECKING:
     from resin import BatchPlan
 
 
-class DeepSeekV4CudaRunner(Runner):
+class DeepSeekV4CudaRunner(CudaRunner):
     """Dynamically batched runner over Resin's DeepSeek-V4 implementation."""
 
     def __init__(
@@ -94,8 +90,6 @@ class DeepSeekV4CudaRunner(Runner):
             or speculative_tokens < 0
         ):
             raise ValueError("speculative_tokens must be a non-negative integer")
-        if not torch.cuda.is_available():
-            raise RuntimeError("DeepSeekV4CudaRunner requires CUDA")
         if not 0 < gpu_memory_utilization < 1:
             raise ValueError("gpu_memory_utilization must be between zero and one")
         if cache_parent_capacity is not None and (
@@ -108,12 +102,10 @@ class DeepSeekV4CudaRunner(Runner):
         self.tensor_parallel = tensor_parallel
         self.tensor_parallel_rank = tensor_parallel.rank
         self.tensor_parallel_size = tensor_parallel.size
-        self.device = torch.device(device or f"cuda:{tensor_parallel.rank}")
-        if self.device.type != "cuda":
-            raise RuntimeError("DeepSeekV4CudaRunner requires a CUDA device")
-        self._cuda_failure = CudaFailureGuard(
-            lambda: torch.cuda.synchronize(self.device),
-            label="DeepSeek-V4 eager execution",
+        super().__init__(
+            device=device or f"cuda:{tensor_parallel.rank}",
+            label="DeepSeek-V4",
+            kv_cache_dtype="bfloat16",
         )
         torch.cuda.set_device(self.device)
         if torch.cuda.get_device_capability(self.device)[0] < 10:
@@ -149,7 +141,6 @@ class DeepSeekV4CudaRunner(Runner):
         self._graph_device_caches = {}
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = 1
-        self._sampler = FlashInferSampler()
         self._speculation = SpeculativeStats(speculative_tokens)
         decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
         if any(shape[0] > max_batch_size for shape in decode_graph_shapes):
@@ -159,18 +150,15 @@ class DeepSeekV4CudaRunner(Runner):
             physical_seq_len += 1
         if any(shape[1] > physical_seq_len for shape in decode_graph_shapes):
             raise ValueError("CUDA graph sequence capacity exceeds max_seq_len")
-        self._graph_runner = CudaGraphRunner(
-            self.device,
+        self._configure_cuda_graphs(
             {
                 "decode": CudaGraphMode(
                     decode_graph_shapes,
                     self._new_decode_graph_step,
                     self._decode_graph_capture_inputs,
                 )
-            },
-            synchronize_failure=self._cuda_failure,
+            }
         )
-        self._graphs = self._graph_runner.mode("decode")
         # Import only after CUDA validation: importing this module initializes
         # cuTile and is intentionally not part of Resin's CPU package path.
         import resin_models_cuda.deepseek_v4.model as native_model
@@ -300,6 +288,7 @@ class DeepSeekV4CudaRunner(Runner):
             self.cache_geometry,
             dtype=torch.bfloat16,
         )
+        self._configure_cache_binding(self._cache.binding)
         self._model.bind_cache_arena(self._cache)
         self.runner_config = RunnerConfig(
             max_batch_tokens=max_batch_size * max_seq_len,
@@ -308,10 +297,6 @@ class DeepSeekV4CudaRunner(Runner):
             cache_write_lookahead_tokens=speculative_tokens,
             cache_layout=self.cache_layout,
         )
-
-    @property
-    def cuda_graph_stats(self) -> CudaGraphStats:
-        return self._graphs.stats
 
     @property
     def speculative_stats(self) -> dict[str, int | float]:
@@ -324,9 +309,6 @@ class DeepSeekV4CudaRunner(Runner):
         if self._last_dspark_phase_ms is None:
             return None
         return dict(self._last_dspark_phase_ms)
-
-    def bind_resources(self, binding: ResourceBinding) -> None:
-        self._cache.binding.bind_resources(binding)
 
     def _cache_plan(self, plan: BatchPlan):
         return PagedCachePlan.from_plan(
@@ -356,14 +338,9 @@ class DeepSeekV4CudaRunner(Runner):
 
         self._cache.initialize_state_sentinels()
 
-    def capture_cuda_graphs(self) -> CudaGraphStats:
-        """Capture configured decode capacities before accepting requests."""
-
-        def reset_model_state() -> None:
-            self._reset_model_state()
-            torch.cuda.synchronize(self.device)
-
-        return self._graph_runner.capture_all(after_capture=reset_model_state)["decode"]
+    def _after_cuda_graph_capture(self) -> None:
+        self._reset_model_state()
+        torch.cuda.synchronize(self.device)
 
     def _decode_graph_capture_inputs(self, shape: GraphShape) -> dict[str, object]:
         inputs = self._graph_capture_inputs(shape, self.vocab_size)
@@ -482,19 +459,17 @@ class DeepSeekV4CudaRunner(Runner):
     def _graph_forward(
         self, plan: BatchPlan, cache_plan
     ) -> list[int] | list[list[int]] | None:
-        if not self._graphs.shapes:
-            return None
         batch_size = plan.num_sequences
         positions = plan.positions
         sequence_length = int(positions.max()) + 1
-        shape = self._graphs.match(
-            lambda candidate: (
+        shape = self._select_cuda_graph(
+            "decode",
+            match=lambda candidate: (
                 candidate[0] >= batch_size
                 and candidate[1] >= sequence_length + self.speculative_tokens
-            )
+            ),
         )
         if shape is None:
-            self._graphs.fallback("shape")
             return None
         padding_rows = shape[0] - batch_size
         inputs: dict[str, object] = {
@@ -506,7 +481,7 @@ class DeepSeekV4CudaRunner(Runner):
         inputs.update(
             pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding_rows)
         )
-        output = self._graphs.run(shape, inputs)[:batch_size]
+        output = self._run_cuda_graph("decode", shape, inputs)[:batch_size]
         phase_events = self._dspark_phase_events.get(shape)
         if phase_events is not None:
             start, draft_end, verify_end, step_end = phase_events
@@ -658,15 +633,13 @@ class DeepSeekV4CudaRunner(Runner):
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
         """Run one dynamically batched prefill or decode sampling step."""
 
-        self._graphs.check()
+        self._check_cuda_graphs()
         rows = self._validate_plan(plan)
         cache_plan = self._cache_plan(plan)
         if plan.phase == BatchPhase.DECODE:
             graph_output = self._graph_forward(plan, cache_plan)
             if graph_output is not None:
                 return graph_output
-        elif self._graphs.shapes:
-            self._graphs.fallback("prefill")
         with self._cuda_failure:
             staging = TensorStager(self.device)
             cache = self._cache.tensorize(cache_plan, staging)

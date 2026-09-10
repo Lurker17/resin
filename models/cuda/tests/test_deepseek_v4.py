@@ -838,13 +838,17 @@ class TestDeepSeekV4Attention:
 
 class TestDeepSeekV4Runner:
     def test_cuda_graphs_use_shared_static_lifecycle(self) -> None:
+        from resin.backend.cuda.runner import CudaRunner
+
         parameters = inspect.signature(DeepSeekV4CudaRunner.__init__).parameters
         source = inspect.getsource(DeepSeekV4CudaRunner)
 
         assert "cuda_graph_decode_shapes" in parameters
+        assert issubclass(DeepSeekV4CudaRunner, CudaRunner)
         assert hasattr(DeepSeekV4CudaRunner, "cuda_graph_stats")
         assert hasattr(DeepSeekV4CudaRunner, "capture_cuda_graphs")
-        assert "CudaGraphRunner(" in source
+        assert "self._configure_cuda_graphs(" in source
+        assert "def capture_cuda_graphs" not in source
         assert "CudaGraphProgram(" in source
         assert "CUDAGraph" not in source
         assert ".replay()" not in source

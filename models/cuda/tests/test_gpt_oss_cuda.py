@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from resin import BatchPhase, CacheGroupLayout, CacheLayout, CacheRetention
+from resin.backend.cuda.runner import CudaRunner
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import TorchSampler
 from resin.backend.transformer import SinkAttention
@@ -150,7 +151,7 @@ class TestGptOssCudaNativePlan:
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
         runner.cache_layout = object()
         binding = CachePoolBinding(runner.cache_layout, resource="GPT-OSS KV")
-        runner._kv = SimpleNamespace(binding=binding)
+        runner._cache_binding = binding
         return runner
 
     @staticmethod
@@ -164,9 +165,11 @@ class TestGptOssCudaNativePlan:
         parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
         source = inspect.getsource(PagedCudaRunner)
         assert "cuda_graph_decode_shapes" in parameters
+        assert issubclass(PagedCudaRunner, CudaRunner)
         assert hasattr(GptOssCudaRunner, "cuda_graph_stats")
         assert hasattr(GptOssCudaRunner, "capture_cuda_graphs")
-        assert "CudaGraphRunner(" in source
+        assert "self._configure_cuda_graphs(" in source
+        assert "def capture_cuda_graphs" not in source
         assert "CUDAGraph" not in source
         assert ".replay()" not in source
 
@@ -229,7 +232,8 @@ class TestGptOssCudaNativePlan:
         assert "continuation_prefill=True" in source
         assert "prefill_chunk_size=self.prefill_chunk_size" in source
         assert "max_batch_tokens=self.prefill_chunk_size" in source
-        assert "bind_resources" in source
+        assert "self._configure_cache_binding(" in source
+        assert hasattr(PagedCudaRunner, "bind_resources")
         assert "CacheGroupLayout(self.page_size)" in source
         assert "retention=CacheRetention.WINDOW" in source
         assert "self.attention_batch_builder" in source

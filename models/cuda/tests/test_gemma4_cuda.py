@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import torch
 
+from resin.backend.cuda.runner import CudaRunner
 from resin.models.gemma4.plan import PAGE_SIZE
 from resin_models_cuda.gemma4.cuda import (
     Gemma4CudaRunner,
@@ -94,7 +95,9 @@ def test_cuda_graphs_use_shared_static_step_lifecycle() -> None:
     source = inspect.getsource(Gemma4CudaRunner)
     assert "cuda_graph_decode_shapes" in parameters
     assert "speculative_tokens" in parameters
-    assert "CudaGraphRunner(" in source
+    assert issubclass(Gemma4CudaRunner, CudaRunner)
+    assert "self._configure_cuda_graphs(" in source
+    assert "def capture_cuda_graphs" not in source
     assert "CUDAGraph" not in source
     assert ".replay()" not in source
 

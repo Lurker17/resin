@@ -480,7 +480,7 @@ class CudaGraphCache:
         }
 
 
-class CudaGraphRunner:
+class CudaGraphExecutor:
     """Own independent graph buckets without duplicating phase machinery."""
 
     def __init__(
@@ -513,6 +513,17 @@ class CudaGraphRunner:
         for cache in self._caches.values():
             cache.check()
 
+    def capture(self, name: str, shape: GraphShape) -> CudaGraphStats:
+        """Capture one configured shape using its mode-owned synthetic inputs."""
+
+        try:
+            mode = self._modes[name]
+        except KeyError as error:
+            raise KeyError(f"unknown CUDA graph mode: {name}") from error
+        cache = self.mode(name)
+        cache.capture(shape, mode.capture_inputs(shape))
+        return cache.stats
+
     def capture_all(
         self,
         *,
@@ -526,10 +537,12 @@ class CudaGraphRunner:
             return self.stats
         if before_capture is not None:
             before_capture()
-        for name, mode in self._modes.items():
-            self._caches[name].capture_all(mode.capture_inputs)
-        if after_capture is not None:
-            after_capture()
+        try:
+            for name, mode in self._modes.items():
+                self._caches[name].capture_all(mode.capture_inputs)
+        finally:
+            if after_capture is not None:
+                after_capture()
         return self.stats
 
     @property

@@ -159,13 +159,14 @@ def _build_runtime(*, speculative_tokens: int):
         trust_remote_code=False,
     )
 
-    shapes = runner.cuda_graph_stats["configured_shapes"]
+    shapes = runner.cuda_graph_stats["decode"]["configured_shapes"]
     print(f"[cuda-graphs] capturing {len(shapes)} decode shapes: {shapes}", flush=True)
     graph_started = time.perf_counter()
     graph_stats = runner.capture_cuda_graphs()
+    decode_graph_stats = graph_stats["decode"]
     graph_capture_s = time.perf_counter() - graph_started
     print(
-        f"[cuda-graphs] captured {graph_stats['capture_count']} shapes in "
+        f"[cuda-graphs] captured {decode_graph_stats['capture_count']} shapes in "
         f"{graph_capture_s:.2f}s",
         flush=True,
     )

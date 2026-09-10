@@ -581,10 +581,10 @@ def _run_rank_workload(
             for row in prompt_rows
         ]
         while engine.has_work():
-            replay_count = runner.cuda_graph_stats["replay_count"]
+            replay_count = runner.cuda_graph_stats["decode"]["replay_count"]
             events = engine.step()
             if (
-                runner.cuda_graph_stats["replay_count"] > replay_count
+                runner.cuda_graph_stats["decode"]["replay_count"] > replay_count
                 and runner.last_dspark_phase_ms is not None
             ):
                 clean_phase_timings.append(runner.last_dspark_phase_ms)
@@ -909,11 +909,7 @@ def _run_rank_benchmark(
         if use_cuda_graphs:
             capture_start = time.perf_counter()
             shape = (batch_size, context_length + DSPARK_TOKENS + 1)
-            runner._graphs.capture(  # noqa: SLF001 - benchmark shape isolation
-                shape, runner._graph_capture_inputs(shape, runner.vocab_size)
-            )
-            runner._reset_model_state()  # noqa: SLF001 - reset capture mutations
-            torch.cuda.synchronize(runner.device)
+            runner.capture_cuda_graph("decode", shape)
             tensor_parallel.barrier()
             capture_elapsed += time.perf_counter() - capture_start
         point = _benchmark_point(

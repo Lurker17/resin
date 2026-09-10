@@ -15,30 +15,25 @@ from resin import (
     CacheGroupLayout,
     CacheLayout,
     CacheRetention,
-    ResourceBinding,
     RunnerConfig,
 )
 from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
-from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
     CudaGraphMode,
-    CudaGraphRunner,
-    CudaGraphStats,
     CudaGraphStep,
     GraphInputError,
     GraphShape,
     graph_shapes,
 )
 from resin.backend.cuda.runner import (
+    CudaRunner,
     capture_sampling_inputs,
     pad_sampling_inputs,
 )
 from resin.backend.cuda.sampling import (
-    FlashInferSampler,
     SamplingTensors,
 )
-from resin.backend.loading import default_device
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import SAMPLING_OFFSET_STRIDE
 from resin.backend.speculative import SpeculativeStats
@@ -55,7 +50,6 @@ from resin.models.gemma4.plan import (
     expand_gemma4_decode_batch,
     gemma4_assistant_context,
 )
-from resin.protocols import Runner
 from resin_models_cuda.gemma4.assistant_checkpoint import (
     DEFAULT_ASSISTANT,
     load_assistant,
@@ -161,7 +155,7 @@ class _MediaFeatures:
     positions: dict[int, tuple[str, int]]
 
 
-class Gemma4CudaRunner(Runner):
+class Gemma4CudaRunner(CudaRunner):
     """Dynamic paged forward pass with FP8 KV and W4A16 NVFP4 MLPs."""
 
     page_size = PAGE_SIZE
@@ -195,12 +189,10 @@ class Gemma4CudaRunner(Runner):
             or speculative_tokens < 0
         ):
             raise ValueError("speculative_tokens must be a non-negative integer")
-        self.device = torch.device(device or default_device(require_cuda=True))
-        if self.device.type != "cuda":
-            raise RuntimeError("Gemma4CudaRunner requires CUDA")
-        self._cuda_failure = CudaFailureGuard(
-            lambda: torch.cuda.synchronize(self.device),
-            label="Gemma 4 eager execution",
+        super().__init__(
+            device=device,
+            label="Gemma 4",
+            kv_cache_dtype=kv_cache_dtype,
         )
         capability = torch.cuda.get_device_capability(self.device)
         if capability not in {(10, 0), (10, 3), (11, 0), (12, 0), (12, 1)}:
@@ -211,9 +203,7 @@ class Gemma4CudaRunner(Runner):
         nvfp4_backend = _select_nvfp4_backend(
             nvfp4_backend, torch.backends.cudnn.version()
         )
-        if kv_cache_dtype not in {"fp8", "bfloat16"}:
-            raise ValueError("kv_cache_dtype must be 'fp8' or 'bfloat16'")
-        cache_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8" else torch.bfloat16
+        cache_dtype = self.kv_cache_torch_dtype
 
         self.model_path = resolve_model_path(model, revision)
         self._model, self.config, self.raw_config = load_model(
@@ -278,8 +268,7 @@ class Gemma4CudaRunner(Runner):
             )
         if any(width > maximum_history_pages for _, width in decode_graph_shapes):
             raise ValueError("Gemma 4 CUDA graph page width exceeds context length")
-        self._graph_runner = CudaGraphRunner(
-            self.device,
+        self._configure_cuda_graphs(
             {
                 "decode": CudaGraphMode(
                     decode_graph_shapes,
@@ -288,10 +277,8 @@ class Gemma4CudaRunner(Runner):
                         shape, self.config.vocab_size
                     ),
                 )
-            },
-            synchronize_failure=self._cuda_failure,
+            }
         )
-        self._graphs = self._graph_runner.mode("decode")
 
         self.cache_layout = CacheLayout(
             self.cache_parent_capacity,
@@ -314,7 +301,9 @@ class Gemma4CudaRunner(Runner):
             cache_write_lookahead_tokens=speculative_tokens,
             cache_layout=self.cache_layout,
         )
-        self._binding = CachePoolBinding(self.cache_layout, resource="Gemma 4 KV")
+        self._configure_cache_binding(
+            CachePoolBinding(self.cache_layout, resource="Gemma 4 KV")
+        )
         self._cache = _Gemma4KvArena(
             self.device,
             self.config,
@@ -325,7 +314,6 @@ class Gemma4CudaRunner(Runner):
             torch.zeros(_GRAPH_WORKSPACE_BYTES, dtype=torch.uint8, device=self.device)
             for _ in range(2)
         )
-        self._sampler = FlashInferSampler()
         self._media_features: dict[int, _MediaFeatures] = {}
         self._target_hidden: dict[int, Tensor] = {}
         self._build_attention_wrappers()
@@ -346,10 +334,6 @@ class Gemma4CudaRunner(Runner):
     @property
     def speculative_stats(self) -> dict[str, int | float]:
         return self._speculation.snapshot(include_draft_tokens=True)
-
-    @property
-    def cuda_graph_stats(self) -> CudaGraphStats:
-        return self._graphs.stats
 
     def _build_attention_wrappers(self) -> None:
         from flashinfer import (
@@ -381,9 +365,6 @@ class Gemma4CudaRunner(Runner):
         self._global_decode = BatchDecodeWithPagedKVCacheWrapper(
             global_workspace, "NHD", backend="auto"
         )
-
-    def bind_resources(self, binding: ResourceBinding) -> None:
-        self._binding.bind_resources(binding)
 
     def release(self, request_ids: list[int]) -> None:
         for request_id in request_ids:
@@ -746,21 +727,13 @@ class Gemma4CudaRunner(Runner):
             )
         return inputs
 
-    def capture_cuda_graphs(self) -> CudaGraphStats:
-        """Capture configured decode batch buckets before serving requests."""
+    def _before_cuda_graph_capture(self) -> None:
+        if self.speculative_tokens:
+            self._cache.storage[0].fill_(0.125)
 
-        def prepare_cache() -> None:
-            if self.speculative_tokens:
-                self._cache.storage[0].fill_(0.125)
-
-        def reset_null_page() -> None:
-            self._cache.storage[0].zero_()
-            torch.cuda.synchronize(self.device)
-
-        return self._graph_runner.capture_all(
-            before_capture=prepare_cache,
-            after_capture=reset_null_page,
-        )["decode"]
+    def _after_cuda_graph_capture(self) -> None:
+        self._cache.storage[0].zero_()
+        torch.cuda.synchronize(self.device)
 
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         if self.speculative_tokens:
@@ -1329,20 +1302,20 @@ class Gemma4CudaRunner(Runner):
     def _graph_forward(
         self, native: BatchPlan, batch: Gemma4BatchPlan
     ) -> list[int] | None:
-        if not self._graphs.shapes:
+        if not self._cuda_graph_mode_enabled("decode"):
             return None
         active_rows = native.num_sequences
         history_width = int(np.diff(batch.global_.kv_indptr).max())
         local_width = int(np.diff(batch.local.kv_indptr).max())
         if local_width > _LOCAL_GRAPH_PAGE_CAPACITY:
             raise GraphInputError("local page table exceeds CUDA graph shape")
-        shape = self._graphs.match(
-            lambda candidate: (
+        shape = self._select_cuda_graph(
+            "decode",
+            match=lambda candidate: (
                 candidate[0] >= active_rows and candidate[1] >= history_width
-            )
+            ),
         )
         if shape is None:
-            self._graphs.fallback("shape")
             return None
         graph_rows, graph_history_width = shape
         padding_rows = graph_rows - active_rows
@@ -1374,29 +1347,29 @@ class Gemma4CudaRunner(Runner):
             )
         )
         self._prepare_graph_attention(shape, inputs)
-        return self._graphs.run(shape, inputs)[:active_rows]
+        return self._run_cuda_graph("decode", shape, inputs)[:active_rows]
 
     def _speculative_graph_forward(
         self, native: BatchPlan, batch: Gemma4BatchPlan
     ) -> list[list[int]] | None:
-        if not self._graphs.shapes:
+        if not self._cuda_graph_mode_enabled("decode"):
             return None
         sequence_ids = [int(value) for value in native.sequence_ids]
         if any(sequence_id not in self._target_hidden for sequence_id in sequence_ids):
-            self._graphs.fallback("target_hidden")
+            self._cuda_graph_fallback("decode", "target_hidden")
             return None
         active_rows = native.num_sequences
         history_width = int(np.diff(batch.global_.kv_indptr).max())
         local_width = int(np.diff(batch.local.kv_indptr).max())
         if local_width > _LOCAL_GRAPH_PAGE_CAPACITY:
             raise GraphInputError("local page table exceeds CUDA graph shape")
-        shape = self._graphs.match(
-            lambda candidate: (
+        shape = self._select_cuda_graph(
+            "decode",
+            match=lambda candidate: (
                 candidate[0] >= active_rows and candidate[1] >= history_width
-            )
+            ),
         )
         if shape is None:
-            self._graphs.fallback("shape")
             return None
         graph_rows, graph_history_width = shape
         padding_rows = graph_rows - active_rows
@@ -1456,7 +1429,7 @@ class Gemma4CudaRunner(Runner):
             )
         )
         self._prepare_spec_graph_attention(shape, inputs)
-        output = self._graphs.run(shape, inputs)[:active_rows]
+        output = self._run_cuda_graph("decode", shape, inputs)[:active_rows]
         drafts = [row[: self.speculative_tokens] for row in output]
         targets = [row[self.speculative_tokens :] for row in output]
         return self._accept_speculative(
@@ -1601,7 +1574,7 @@ class Gemma4CudaRunner(Runner):
 
     @torch.inference_mode()
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
-        self._graphs.check()
+        self._check_cuda_graphs()
         batch = build_gemma4_batch_plan(
             plan,
             self.cache_layout,
@@ -1618,8 +1591,6 @@ class Gemma4CudaRunner(Runner):
             graph_output = self._graph_forward(plan, batch)
             if graph_output is not None:
                 return graph_output
-        elif self._graphs.shapes:
-            self._graphs.fallback("prefill")
         with self._cuda_failure:
             hidden = self._eager_transformer(plan, batch)
             self._store_last_hidden(plan, batch, hidden)
