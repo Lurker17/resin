@@ -25,7 +25,6 @@ from resin_models_cuda.gpt_oss.cuda import (
     _router_logits,
     plan_gpt_oss_kv_capacity,
 )
-from resin_models_cuda.paged import PagedCudaRunner
 
 
 def build_attention_batches(plan, *, parent_capacity: int = 2048):
@@ -163,9 +162,9 @@ class TestGptOssCudaNativePlan:
 
     def test_cuda_graphs_use_the_shared_static_step_lifecycle(self) -> None:
         parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
-        source = inspect.getsource(PagedCudaRunner)
+        source = inspect.getsource(GptOssCudaRunner)
         assert "cuda_graph_decode_shapes" in parameters
-        assert issubclass(PagedCudaRunner, CudaRunner)
+        assert GptOssCudaRunner.__bases__ == (CudaRunner,)
         assert hasattr(GptOssCudaRunner, "cuda_graph_stats")
         assert hasattr(GptOssCudaRunner, "capture_cuda_graphs")
         assert "self._configure_cuda_graphs(" in source
@@ -226,31 +225,28 @@ class TestGptOssCudaNativePlan:
             )
 
     def test_runner_exposes_only_the_flat_grouped_cache_path(self) -> None:
-        source = inspect.getsource(PagedCudaRunner)
+        source = inspect.getsource(GptOssCudaRunner)
         parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
         assert "RunnerConfig(" in source
         assert "continuation_prefill=True" in source
         assert "prefill_chunk_size=self.prefill_chunk_size" in source
         assert "max_batch_tokens=self.prefill_chunk_size" in source
         assert "self._configure_cache_binding(" in source
-        assert hasattr(PagedCudaRunner, "bind_resources")
+        assert hasattr(GptOssCudaRunner, "bind_resources")
         assert "CacheGroupLayout(self.page_size)" in source
         assert "retention=CacheRetention.WINDOW" in source
-        assert "self.attention_batch_builder" in source
+        assert "build_attention_batches" in source
         assert "tensor_parallel" in parameters
         assert "fast_allreduce" in parameters
         assert source.count("self.tensor_parallel.sum(") == 1
         assert source.count("self._allreduce_residual_rmsnorm(") == 2
 
-    def test_shared_paged_runner_has_no_gpt_oss_router_policy(self) -> None:
-        shared_source = inspect.getsource(PagedCudaRunner)
-        gpt_source = inspect.getsource(GptOssCudaRunner)
+    def test_runner_owns_gpt_oss_router_policy_directly(self) -> None:
+        source = inspect.getsource(GptOssCudaRunner)
 
-        assert "tinygemm_bf16" not in shared_source
-        assert "top4_softmax" not in shared_source
-        assert "self._feed_forward(" in shared_source
-        assert "_router_logits(" in gpt_source
-        assert "_route(" in gpt_source
+        assert GptOssCudaRunner.__bases__ == (CudaRunner,)
+        assert "_router_logits(" in source
+        assert "_route(" in source
 
     def test_cache_pool_binding_is_exact_idempotent_and_permanent(self) -> None:
         runner = self._binding_runner()
@@ -394,7 +390,7 @@ class TestGptOssCudaNativePlan:
         assert "index_copy_" in source
 
     def test_runner_has_no_python_request_cache_or_page_allocator(self) -> None:
-        source = inspect.getsource(PagedCudaRunner)
+        source = inspect.getsource(GptOssCudaRunner)
         assert "_request_pages" not in source
         assert "_request_lengths" not in source
         assert "_free_pages" not in source
@@ -404,7 +400,7 @@ class TestGptOssCudaNativePlan:
     def test_one_zeroed_parent_allocation_backs_both_group_views(self) -> None:
         from resin.backend.cuda.paged_kv import PagedKvArena
 
-        source = inspect.getsource(PagedCudaRunner.__init__)
+        source = inspect.getsource(GptOssCudaRunner.__init__)
         arena_source = inspect.getsource(PagedKvArena.__init__)
         assert "self._kv = PagedKvArena(" in source
         assert arena_source.count("torch.zeros(") == 1
@@ -439,7 +435,7 @@ class TestGptOssCudaTinyOracle:
             return kwargs["norm_out"]
 
         monkeypatch.setattr(
-            "resin_models_cuda.paged.allreduce_fusion", fused
+            "resin_models_cuda.gpt_oss.cuda.allreduce_fusion", fused
         )
         normalized, combined = runner._allreduce_residual_rmsnorm(
             partial, residual, weight, eps
@@ -635,7 +631,7 @@ class TestGptOssCudaTinyOracle:
         )
 
         monkeypatch.setattr(
-            "resin_models_cuda.paged.apply_rotary", apply_rotary
+            "resin_models_cuda.gpt_oss.cuda.apply_rotary", apply_rotary
         )
         actual = runner._apply_yarn_rotary(hidden, cos, sin)
 

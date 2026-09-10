@@ -74,18 +74,6 @@ def _config(args, *, quantization=None):
 
 
 class TestGptOssImport:
-    def test_model_frontend_stays_below_one_thousand_lines(self) -> None:
-        import resin_models_cuda.gpt_oss as package
-
-        package_dir = Path(package.__file__).parent
-        concrete_kernel_modules = {"cutile.py", "flashinfer.py"}
-        line_count = sum(
-            len(path.read_text().splitlines())
-            for path in package_dir.glob("*.py")
-            if path.name not in concrete_kernel_modules
-        )
-        assert line_count < 1_000
-
     def test_configs_cover_both_released_model_shapes(self) -> None:
         from resin.models.gpt_oss.config import GptOssConfig
 

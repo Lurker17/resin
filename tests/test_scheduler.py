@@ -237,11 +237,9 @@ class TestSchedulerConfigContract:
 
     def test_builtin_runner_continuation_capabilities_are_explicit(self) -> None:
         from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
-        from resin_models_cuda.paged import PagedCudaRunner
         from resin_models_torch.lfm2 import Lfm2TorchRunner
 
-        assert issubclass(GptOssCudaRunner, PagedCudaRunner)
-        gpt_source = inspect.getsource(PagedCudaRunner.__init__)
+        gpt_source = inspect.getsource(GptOssCudaRunner.__init__)
         assert (
             "RunnerConfig(" in gpt_source and "continuation_prefill=True" in gpt_source
         )
