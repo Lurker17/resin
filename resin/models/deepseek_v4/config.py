@@ -1,4 +1,4 @@
-"""Validated configuration for native DeepSeek-V4 checkpoints."""
+"""Backend-neutral configuration for native DeepSeek-V4 checkpoints."""
 
 from __future__ import annotations
 

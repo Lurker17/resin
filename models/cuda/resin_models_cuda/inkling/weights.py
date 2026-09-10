@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 from resin_models_cuda.inkling.dspark import DSparkDraft
 from resin_models_cuda.inkling.model import (
@@ -16,7 +18,7 @@ from resin_models_cuda.inkling.model import (
 )
 
 
-def _copy(torch: Any, destination: Any, source: Any, name: str) -> int:
+def _copy(destination: Any, source: Any, name: str) -> int:
     if source.numel() == destination.numel() and source.shape != destination.shape:
         source = source.reshape(destination.shape)
     if tuple(source.shape) != tuple(destination.shape):
@@ -216,8 +218,6 @@ def load_target_weights(
 ) -> dict[str, int]:
     """Load the text target and image tower, excluding bundled MTP and audio."""
 
-    import torch
-
     root = Path(model_path).expanduser().resolve()
     expected = _target_names(model)
     files = _indexed_target_files(root, expected)
@@ -226,7 +226,7 @@ def load_target_weights(
         ordered = sorted(expected, key=lambda key: (files[key].name, key))
         for name in ordered:
             source = reader.read(files[name], name)
-            loaded_bytes += _copy(torch, _target_destination(model, name), source, name)
+            loaded_bytes += _copy(_target_destination(model, name), source, name)
     return {"tensors": len(expected), "bytes": loaded_bytes}
 
 
@@ -299,8 +299,6 @@ def _draft_destination(model: DSparkDraft, name: str):
 def load_draft_weights(model_path: str | Path, model: DSparkDraft) -> dict[str, int]:
     """Load the external BF16 DSpark checkpoint without duplicated target weights."""
 
-    import torch
-
     root = Path(model_path).expanduser().resolve()
     files = indexed_tensor_files(root)
     expected = _draft_names(model)
@@ -310,7 +308,6 @@ def load_draft_weights(model_path: str | Path, model: DSparkDraft) -> dict[str, 
     with SafetensorReader() as reader:
         for name in sorted(expected):
             loaded_bytes += _copy(
-                torch,
                 _draft_destination(model, name),
                 reader.read(files[name], name),
                 name,

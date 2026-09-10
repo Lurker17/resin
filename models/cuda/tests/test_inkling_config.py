@@ -5,7 +5,7 @@ import math
 
 import pytest
 
-from resin_models_cuda.inkling.config import InklingConfig, InklingDSparkConfig
+from resin.models.inkling.config import InklingConfig, InklingDSparkConfig
 
 
 def _target() -> dict[str, object]:

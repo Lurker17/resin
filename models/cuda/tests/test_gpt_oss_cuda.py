@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import inspect
 from types import SimpleNamespace
 
@@ -9,6 +8,15 @@ import pytest
 from resin import BatchPhase, CacheGroupLayout, CacheLayout, CacheRetention
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import TorchSampler
+from resin.models.gpt_oss.plan import (
+    PAGE_SIZE,
+    PREFILL_CHUNK_SIZE,
+    WINDOW_RETENTION_TOKENS,
+    WINDOW_TABLE_WIDTH,
+)
+from resin.models.gpt_oss.plan import (
+    build_attention_batches as _build_attention_batches,
+)
 from resin_models_cuda.gpt_oss.cuda import (
     GptOssCudaRunner,
     _route,
@@ -16,15 +24,7 @@ from resin_models_cuda.gpt_oss.cuda import (
     plan_gpt_oss_kv_capacity,
 )
 from resin_models_cuda.gpt_oss.model import Attention
-from resin_models_cuda.gpt_oss.plan import (
-    PAGE_SIZE,
-    PREFILL_CHUNK_SIZE,
-    WINDOW_RETENTION_TOKENS,
-    WINDOW_TABLE_WIDTH,
-)
-from resin_models_cuda.gpt_oss.plan import (
-    build_attention_batches as _build_attention_batches,
-)
+from resin_models_cuda.paged_moe import PagedMoECudaRunner
 
 
 def build_attention_batches(plan, *, parent_capacity: int = 2048):
@@ -162,13 +162,24 @@ class TestGptOssCudaNativePlan:
 
     def test_cuda_graphs_use_the_shared_static_step_lifecycle(self) -> None:
         parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
-        source = inspect.getsource(GptOssCudaRunner)
+        source = inspect.getsource(PagedMoECudaRunner)
         assert "cuda_graph_decode_shapes" in parameters
         assert hasattr(GptOssCudaRunner, "cuda_graph_stats")
         assert hasattr(GptOssCudaRunner, "capture_cuda_graphs")
-        assert "CudaGraphCache(" in source
+        assert "CudaGraphRunner(" in source
         assert "CUDAGraph" not in source
         assert ".replay()" not in source
+
+    def test_kernels_are_flat_explicit_constructor_arguments(self) -> None:
+        parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
+
+        assert "quantization" in parameters
+        assert "kernel_attention" in parameters
+        assert "kernel_moe" in parameters
+        assert "kernels" not in parameters
+        assert "moe_kernel" not in parameters
+        with pytest.raises(TypeError, match="kernel_attention"):
+            GptOssCudaRunner(kernel_attention=object())
 
     def test_graph_capture_inputs_use_only_the_reserved_null_page(self) -> None:
         inputs = GptOssCudaRunner._graph_capture_inputs((2, 4))
@@ -203,17 +214,25 @@ class TestGptOssCudaNativePlan:
         assert tp4.bytes_per_parent == plan.bytes_per_parent // 4
         assert tp4.parent_capacity > plan.parent_capacity
 
+        with pytest.raises(ValueError, match="tensor_parallel_size"):
+            plan_gpt_oss_kv_capacity(
+                100 * gib,
+                45 * gib,
+                0.75,
+                tensor_parallel_size=0,
+            )
+
     def test_runner_exposes_only_the_flat_grouped_cache_path(self) -> None:
-        source = inspect.getsource(GptOssCudaRunner)
+        source = inspect.getsource(PagedMoECudaRunner)
         parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
         assert "RunnerConfig(" in source
         assert "continuation_prefill=True" in source
-        assert "prefill_chunk_size=_PREFILL_CHUNK_SIZE" in source
-        assert "max_batch_tokens=_PREFILL_CHUNK_SIZE" in source
+        assert "prefill_chunk_size=self.prefill_chunk_size" in source
+        assert "max_batch_tokens=self.prefill_chunk_size" in source
         assert "bind_resources" in source
-        assert "CacheGroupLayout(_PAGE_SIZE)" in source
+        assert "CacheGroupLayout(self.page_size)" in source
         assert "retention=CacheRetention.WINDOW" in source
-        assert "build_attention_batches" in source
+        assert "self.attention_batch_builder" in source
         assert "tensor_parallel" in parameters
         assert "fast_allreduce" in parameters
         assert source.count("self.tensor_parallel.sum(") == 1
@@ -245,21 +264,21 @@ class TestGptOssCudaNativePlan:
         assert batch.query_lengths == (128, 5)
         assert batch.token_indices[:3].tolist() == [0, 1, 2]
         assert batch.token_indices[-3:].tolist() == [130, 131, 132]
-        assert batch.full_width == 2
-        assert batch.full_table.tolist() == [1, 1, 129, 130]
-        assert batch.full_lengths == (128, 135)
-        assert batch.sliding_width == WINDOW_TABLE_WIDTH
+        assert batch.group("full").width == 2
+        assert batch.group("full").page_table.tolist() == [1, 1, 129, 130]
+        assert batch.group("full").lengths == (128, 135)
+        assert batch.group("sliding").width == WINDOW_TABLE_WIDTH
         assert (
-            batch.sliding_table[:WINDOW_TABLE_WIDTH].tolist()
+            batch.group("sliding").page_table[:WINDOW_TABLE_WIDTH].tolist()
             == [1025] * WINDOW_TABLE_WIDTH
         )
-        assert batch.sliding_table[
+        assert batch.group("sliding").page_table[
             WINDOW_TABLE_WIDTH : WINDOW_TABLE_WIDTH + 2
         ].tolist() == [1153, 1154]
-        assert batch.sliding_lengths == (128, 135)
-        assert batch.full_append_slots[0] == 128
-        assert batch.full_append_slots[-1] == 130 * 128 + 6
-        assert batch.sliding_append_slots[-1] == 1154 * 128 + 6
+        assert batch.group("sliding").lengths == (128, 135)
+        assert batch.group("full").append_slots[0] == 128
+        assert batch.group("full").append_slots[-1] == 130 * 128 + 6
+        assert batch.group("sliding").append_slots[-1] == 1154 * 128 + 6
 
     def test_one_token_continuation_remains_explicit_prefill(self) -> None:
         plan = _flat_plan([260], [1])
@@ -270,10 +289,10 @@ class TestGptOssCudaNativePlan:
         batch = prefill[0]
         assert batch.query_lengths == (1,)
         assert batch.token_indices.tolist() == [0]
-        assert batch.full_table.tolist() == [1, 2, 3]
-        assert batch.full_lengths == (261,)
-        assert batch.sliding_table[:3].tolist() == [1025, 1026, 1027]
-        assert batch.sliding_lengths == (261,)
+        assert batch.group("full").page_table.tolist() == [1, 2, 3]
+        assert batch.group("full").lengths == (261,)
+        assert batch.group("sliding").page_table[:3].tolist() == [1025, 1026, 1027]
+        assert batch.group("sliding").lengths == (261,)
 
     def test_graph_padding_repeats_only_pages_owned_by_each_row(self) -> None:
         _, batch = build_attention_batches(_decode_plan())
@@ -296,19 +315,19 @@ class TestGptOssCudaNativePlan:
         assert batch is not None
         assert batch.sequence_indices == (0, 1)
         assert batch.query_lengths == (1, 1)
-        assert batch.full_width == 3
-        assert batch.full_table.tolist() == [1, 2, 1, 129, 130, 131]
-        assert batch.full_lengths == (131, 261)
-        assert batch.sliding_table[:3].tolist() == [1025, 1026, 1025]
-        assert batch.sliding_table[
+        assert batch.group("full").width == 3
+        assert batch.group("full").page_table.tolist() == [1, 2, 1, 129, 130, 131]
+        assert batch.group("full").lengths == (131, 261)
+        assert batch.group("sliding").page_table[:3].tolist() == [1025, 1026, 1025]
+        assert batch.group("sliding").page_table[
             WINDOW_TABLE_WIDTH : WINDOW_TABLE_WIDTH + 3
         ].tolist() == [1153, 1154, 1155]
-        assert batch.sliding_lengths == (131, 261)
-        assert batch.sliding_append_slots.tolist() == [
+        assert batch.group("sliding").lengths == (131, 261)
+        assert batch.group("sliding").append_slots.tolist() == [
             1026 * 128 + 2,
             1155 * 128 + 4,
         ]
-        assert batch.full_append_slots.tolist() == [2 * 128 + 2, 131 * 128 + 4]
+        assert batch.group("full").append_slots.tolist() == [2 * 128 + 2, 131 * 128 + 4]
 
     def test_frozen_append_destinations_are_a_validation_oracle(self) -> None:
         plan = _prefill_plan()
@@ -342,9 +361,9 @@ class TestGptOssCudaNativePlan:
 
         assert decode is None
         assert prefill[0].query_lengths == (PREFILL_CHUNK_SIZE,)
-        assert prefill[0].full_width == PREFILL_CHUNK_SIZE // 128
-        assert prefill[0].sliding_width == WINDOW_TABLE_WIDTH
-        assert len(set(prefill[0].sliding_append_slots)) == PREFILL_CHUNK_SIZE
+        assert prefill[0].group("full").width == PREFILL_CHUNK_SIZE // 128
+        assert prefill[0].group("sliding").width == WINDOW_TABLE_WIDTH
+        assert len(set(prefill[0].group("sliding").append_slots)) == PREFILL_CHUNK_SIZE
 
         with pytest.raises(ValueError, match="exceeds 8192"):
             build_attention_batches(_flat_plan([0], [PREFILL_CHUNK_SIZE + 1]))
@@ -361,7 +380,7 @@ class TestGptOssCudaNativePlan:
         assert "index_copy_" in source
 
     def test_runner_has_no_python_request_cache_or_page_allocator(self) -> None:
-        source = inspect.getsource(GptOssCudaRunner)
+        source = inspect.getsource(PagedMoECudaRunner)
         assert "_request_pages" not in source
         assert "_request_lengths" not in source
         assert "_free_pages" not in source
@@ -371,7 +390,7 @@ class TestGptOssCudaNativePlan:
     def test_one_zeroed_parent_allocation_backs_both_group_views(self) -> None:
         from resin.backend.cuda.paged_kv import PagedKvArena
 
-        source = inspect.getsource(GptOssCudaRunner.__init__)
+        source = inspect.getsource(PagedMoECudaRunner.__init__)
         arena_source = inspect.getsource(PagedKvArena.__init__)
         assert "self._kv = PagedKvArena(" in source
         assert arena_source.count("torch.zeros(") == 1
@@ -380,9 +399,6 @@ class TestGptOssCudaNativePlan:
         assert "self.values = self.storage[1]" in arena_source
 
 
-@pytest.mark.skipif(
-    not importlib.util.find_spec("torch"), reason="PyTorch is not installed"
-)
 class TestGptOssCudaTinyOracle:
     def test_flashinfer_allreduce_fuses_residual_and_rmsnorm(
         self, monkeypatch: pytest.MonkeyPatch
@@ -408,7 +424,9 @@ class TestGptOssCudaTinyOracle:
             kwargs["norm_out"].copy_((normalized * kwargs["rms_gamma"]).bfloat16())
             return kwargs["norm_out"]
 
-        monkeypatch.setattr("resin_models_cuda.gpt_oss.cuda.allreduce_fusion", fused)
+        monkeypatch.setattr(
+            "resin_models_cuda.paged_moe.allreduce_fusion", fused
+        )
         normalized, combined = runner._allreduce_residual_rmsnorm(
             partial, residual, weight, eps
         )
@@ -465,7 +483,9 @@ class TestGptOssCudaTinyOracle:
             calls.append((input.shape[0], use_pdl))
             output.copy_(torch.nn.functional.linear(input, weight, bias))
 
-        monkeypatch.setattr("resin_models_cuda.gpt_oss.cuda.tinygemm_bf16", tinygemm)
+        monkeypatch.setattr(
+            "resin_models_cuda.paged_moe.tinygemm_bf16", tinygemm
+        )
         for rows in (1, 2, 4, 8, 16, 32, 64, 128):
             hidden = torch.randn(rows, 64, dtype=torch.bfloat16)
             expected = torch.nn.functional.linear(hidden, router.weight, router.bias)
@@ -506,7 +526,9 @@ class TestGptOssCudaTinyOracle:
             return expected_indices.to(torch.int32), expected_weights.to(torch.float32)
 
         with monkeypatch.context() as context:
-            context.setattr("resin_models_cuda.gpt_oss.cuda.top4_softmax", top4_softmax)
+            context.setattr(
+                "resin_models_cuda.paged_moe.top4_softmax", top4_softmax
+            )
             indices, weights = _route(official, logits)
 
         assert calls == [torch.Size([32, 128])]
@@ -528,7 +550,7 @@ class TestGptOssCudaTinyOracle:
             return large_indices.int(), torch.softmax(large_values, dim=-1)
 
         with monkeypatch.context() as context:
-            context.setattr("resin_models_cuda.gpt_oss.cuda.top4_softmax", fused)
+            context.setattr("resin_models_cuda.paged_moe.top4_softmax", fused)
             _route(official, large_logits)
         assert len(fused_calls) == 1
         assert fused_calls[0] is large_logits
@@ -539,8 +561,7 @@ class TestGptOssCudaTinyOracle:
         import torch
 
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        runner._torch = torch
-        runner._sampler = TorchSampler(torch)
+        runner._sampler = TorchSampler()
         runner.device = "cpu"
         runner.hidden_size = 3
         runner._model = SimpleNamespace(lm_head=lambda hidden: hidden)
@@ -599,7 +620,9 @@ class TestGptOssCudaTinyOracle:
             dim=-1,
         )
 
-        monkeypatch.setattr("resin_models_cuda.gpt_oss.cuda.apply_rotary", apply_rotary)
+        monkeypatch.setattr(
+            "resin_models_cuda.paged_moe.apply_rotary", apply_rotary
+        )
         actual = runner._apply_yarn_rotary(hidden, cos, sin)
 
         assert actual.dtype == torch.bfloat16

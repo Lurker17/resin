@@ -1,4 +1,4 @@
-"""Blackwell CUDA forward pass for NVIDIA's Gemma 4 31B NVFP4 checkpoint."""
+"""Gemma 4 31B NVFP4 CUDA runner for Blackwell."""
 
 from __future__ import annotations
 
@@ -22,12 +22,17 @@ from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
 from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
-    CudaGraphCache,
+    CudaGraphMode,
+    CudaGraphRunner,
     CudaGraphStats,
     CudaGraphStep,
     GraphInputError,
     GraphShape,
     graph_shapes,
+)
+from resin.backend.cuda.runner import (
+    capture_sampling_inputs,
+    pad_sampling_inputs,
 )
 from resin.backend.cuda.sampling import (
     FlashInferSampler,
@@ -37,6 +42,19 @@ from resin.backend.loading import default_device
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import SAMPLING_OFFSET_STRIDE
 from resin.backend.speculative import SpeculativeStats
+from resin.models.gemma4.config import SLIDING_ATTENTION
+from resin.models.gemma4.media import Gemma4Media
+from resin.models.gemma4.plan import (
+    PAGE_SIZE,
+    PREFILL_CHUNK_SIZE,
+    SLIDING_WINDOW,
+    WINDOW_RETENTION_TOKENS,
+    Gemma4BatchPlan,
+    PagedAttentionPlan,
+    build_gemma4_batch_plan,
+    expand_gemma4_decode_batch,
+    gemma4_assistant_context,
+)
 from resin.protocols import Runner
 from resin_models_cuda.gemma4.assistant_checkpoint import (
     DEFAULT_ASSISTANT,
@@ -48,20 +66,7 @@ from resin_models_cuda.gemma4.checkpoint import (
     load_model,
     resolve_model_path,
 )
-from resin_models_cuda.gemma4.config import SLIDING_ATTENTION
-from resin_models_cuda.gemma4.media import Gemma4Media
 from resin_models_cuda.gemma4.model import Gemma4ForConditionalGeneration
-from resin_models_cuda.gemma4.plan import (
-    PAGE_SIZE,
-    PREFILL_CHUNK_SIZE,
-    SLIDING_WINDOW,
-    WINDOW_RETENTION_TOKENS,
-    Gemma4BatchPlan,
-    PagedAttentionPlan,
-    build_gemma4_batch_plan,
-    expand_gemma4_decode_batch,
-    gemma4_assistant_context,
-)
 from resin_models_cuda.nvfp4 import prepare_nvfp4_modules
 
 if TYPE_CHECKING:
@@ -112,9 +117,7 @@ def plan_gemma4_kv_capacity(
 
 
 class _Gemma4KvArena:
-    def __init__(
-        self, torch_module: Any, device, config, parent_capacity: int, *, dtype
-    ) -> None:
+    def __init__(self, device, config, parent_capacity: int, *, dtype) -> None:
         self.dtype = dtype
         self.parent_capacity = parent_capacity
         physical_parent_capacity = parent_capacity + 1
@@ -126,7 +129,7 @@ class _Gemma4KvArena:
             config.num_key_value_heads,
             config.head_dim,
         )
-        self.storage = torch_module.empty(local_shape, dtype=self.dtype, device=device)
+        self.storage = torch.empty(local_shape, dtype=self.dtype, device=device)
         local = self.storage.permute(1, 2, 0, 3, 4, 5)
         self.local_keys, self.local_values = local[0], local[1]
 
@@ -195,7 +198,7 @@ class Gemma4CudaRunner(Runner):
             or speculative_tokens < 0
         ):
             raise ValueError("speculative_tokens must be a non-negative integer")
-        self.device = torch.device(device or default_device(torch, require_cuda=True))
+        self.device = torch.device(device or default_device(require_cuda=True))
         if self.device.type != "cuda":
             raise RuntimeError("Gemma4CudaRunner requires CUDA")
         self._cuda_failure = CudaFailureGuard(
@@ -278,13 +281,20 @@ class Gemma4CudaRunner(Runner):
             )
         if any(width > maximum_history_pages for _, width in decode_graph_shapes):
             raise ValueError("Gemma 4 CUDA graph page width exceeds context length")
-        self._graphs = CudaGraphCache(
-            torch,
+        self._graph_runner = CudaGraphRunner(
             self.device,
-            decode_graph_shapes,
-            build=self._new_decode_graph_step,
+            {
+                "decode": CudaGraphMode(
+                    decode_graph_shapes,
+                    self._new_decode_graph_step,
+                    lambda shape: self._graph_capture_inputs(
+                        shape, self.config.vocab_size
+                    ),
+                )
+            },
             synchronize_failure=self._cuda_failure,
         )
+        self._graphs = self._graph_runner.mode("decode")
 
         self.cache_layout = CacheLayout(
             self.cache_parent_capacity,
@@ -309,7 +319,6 @@ class Gemma4CudaRunner(Runner):
         )
         self._binding = CachePoolBinding(self.cache_layout, resource="Gemma 4 KV")
         self._cache = _Gemma4KvArena(
-            torch,
             self.device,
             self.config,
             self.cache_parent_capacity,
@@ -319,7 +328,7 @@ class Gemma4CudaRunner(Runner):
             torch.zeros(_GRAPH_WORKSPACE_BYTES, dtype=torch.uint8, device=self.device)
             for _ in range(2)
         )
-        self._sampler = FlashInferSampler(torch)
+        self._sampler = FlashInferSampler()
         self._media_features: dict[int, _MediaFeatures] = {}
         self._target_hidden: dict[int, Tensor] = {}
         self._build_attention_wrappers()
@@ -675,12 +684,7 @@ class Gemma4CudaRunner(Runner):
         inputs: dict[str, object] = {
             "token_ids": token_ids,
             "positions": positions,
-            "sampling_temperatures": (1.0,) * batch_size,
-            "sampling_top_ps": (1.0,) * batch_size,
-            "sampling_top_ks": (vocab_size,) * batch_size,
-            "sampling_seeds": zeros,
-            "sampling_offsets": zeros,
-            "sampling_stochastic_mask": (False,) * batch_size,
+            **capture_sampling_inputs(batch_size, vocab_size),
         }
         if self.speculative_tokens:
             width = self.speculative_tokens + 1
@@ -748,18 +752,18 @@ class Gemma4CudaRunner(Runner):
     def capture_cuda_graphs(self) -> CudaGraphStats:
         """Capture configured decode batch buckets before serving requests."""
 
-        captured = set(self._graphs.stats["captured_shapes"])
-        if self.speculative_tokens and self._graphs.shapes:
-            self._cache.storage[0].fill_(0.125)
-        for shape in self._graphs.shapes:
-            if shape not in captured:
-                self._graphs.capture(
-                    shape, self._graph_capture_inputs(shape, self.config.vocab_size)
-                )
-        if self._graphs.shapes:
+        def prepare_cache() -> None:
+            if self.speculative_tokens:
+                self._cache.storage[0].fill_(0.125)
+
+        def reset_null_page() -> None:
             self._cache.storage[0].zero_()
             torch.cuda.synchronize(self.device)
-        return self._graphs.stats
+
+        return self._graph_runner.capture_all(
+            before_capture=prepare_cache,
+            after_capture=reset_null_page,
+        )["decode"]
 
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         if self.speculative_tokens:
@@ -1367,18 +1371,11 @@ class Gemma4CudaRunner(Runner):
                 width=graph_history_width,
             )
         )
-        sampling = self._sampler.host_inputs(native, self.config.vocab_size)
-        padding_defaults = {
-            "sampling_temperatures": 1.0,
-            "sampling_top_ps": 1.0,
-            "sampling_top_ks": self.config.vocab_size,
-            "sampling_seeds": 0,
-            "sampling_offsets": 0,
-            "sampling_stochastic_mask": False,
-        }
-        for name, default in padding_defaults.items():
-            sampling[name] = (*sampling[name], *((default,) * padding_rows))
-        inputs.update(sampling)
+        inputs.update(
+            pad_sampling_inputs(
+                self._sampler, native, self.config.vocab_size, padding_rows
+            )
+        )
         self._prepare_graph_attention(shape, inputs)
         return self._graphs.run(shape, inputs)[:active_rows]
 
@@ -1456,18 +1453,11 @@ class Gemma4CudaRunner(Runner):
                 query_width=width,
             )
         )
-        sampling = self._sampler.host_inputs(native, self.config.vocab_size)
-        padding_defaults = {
-            "sampling_temperatures": 1.0,
-            "sampling_top_ps": 1.0,
-            "sampling_top_ks": self.config.vocab_size,
-            "sampling_seeds": 0,
-            "sampling_offsets": 0,
-            "sampling_stochastic_mask": False,
-        }
-        for name, default in padding_defaults.items():
-            sampling[name] = (*sampling[name], *((default,) * padding_rows))
-        inputs.update(sampling)
+        inputs.update(
+            pad_sampling_inputs(
+                self._sampler, native, self.config.vocab_size, padding_rows
+            )
+        )
         self._prepare_spec_graph_attention(shape, inputs)
         output = self._graphs.run(shape, inputs)[:active_rows]
         drafts = [row[: self.speculative_tokens] for row in output]

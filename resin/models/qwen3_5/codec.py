@@ -9,10 +9,10 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from resin.models.qwen3_5.media import Qwen35Media
 from resin.protocols import RenderedPrompt, ResponseParser
 from resin.server import RendererCodec
 from resin.server.media import normalize_image_messages
-from resin_models_cuda.qwen3_5.media import Qwen35Media
 
 
 class Qwen35Codec:

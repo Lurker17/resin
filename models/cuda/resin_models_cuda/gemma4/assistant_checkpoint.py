@@ -6,13 +6,12 @@ from pathlib import Path
 
 import torch
 
-from resin.backend.loading import read_config, resolve_model
+from resin.backend.loading import assign_model_tensor, read_config, resolve_model
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
-from resin_models_cuda.gemma4.assistant import (
+from resin.models.gemma4.assistant import (
     Gemma4AssistantConfig,
     Gemma4AssistantForCausalLM,
 )
-from resin_models_cuda.gemma4.checkpoint import _assign_tensor
 
 DEFAULT_ASSISTANT = "google/gemma-4-31B-it-assistant"
 DEFAULT_ASSISTANT_REVISION = "627c5ec1458b9086b841a91e0512fd31fd2fbbf1"
@@ -74,7 +73,7 @@ def load_assistant(
         )
     with SafetensorReader() as reader:
         for key, path in tensor_files.items():
-            _assign_tensor(model, key, reader.read(path, key), target)
+            assign_model_tensor(model, key, reader.read(path, key), device=target)
     model.materialize_buffers(target)
     model.eval()
     return model, config

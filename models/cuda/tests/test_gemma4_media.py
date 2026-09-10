@@ -8,8 +8,8 @@ import torch
 from PIL import Image
 
 from resin import Engine, MediaInput, MediaTokenSpan
+from resin.models.gemma4.media import Gemma4Media
 from resin.server.media import decode_image
-from resin_models_cuda.gemma4.media import Gemma4Media
 
 
 def _png_bytes() -> bytes:

@@ -1,8 +1,7 @@
-"""Prepared Gemma 4 media inputs kept outside the token scheduler."""
+"""Backend-neutral Gemma 4 media inputs kept outside the token scheduler."""
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,16 +11,12 @@ from torch import Tensor
 
 from resin.protocols import MediaTokenSpan
 from resin.server.media import canonical_rgb_image, decode_image
-
-
-def _owned_cpu_tensor(value: Any, name: str, *, ndim: int) -> Tensor:
-    if not isinstance(value, Tensor):
-        value = torch.as_tensor(value)
-    if value.device.type != "cpu":
-        raise ValueError(f"{name} must be CPU-resident")
-    if value.ndim != ndim:
-        raise ValueError(f"{name} must have rank {ndim}, got {value.ndim}")
-    return value.detach().contiguous().clone()
+from resin.server.media_inputs import (
+    digest_tensors,
+    owned_cpu_tensor,
+    salt_token_positions,
+    single_row,
+)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -46,15 +41,21 @@ class Gemma4Media:
         token_ids = tuple(int(token) for token in self.token_ids)
         token_types = tuple(int(token_type) for token_type in self.mm_token_type_ids)
         if not token_ids or len(token_ids) != len(token_types):
-            raise ValueError("media token IDs and token types must have one nonempty row")
+            raise ValueError(
+                "media token IDs and token types must have one nonempty row"
+            )
         if unsupported := set(token_types) - {0, 1, 2}:
-            raise ValueError(f"unsupported Gemma 4 media token types: {sorted(unsupported)}")
+            raise ValueError(
+                f"unsupported Gemma 4 media token types: {sorted(unsupported)}"
+            )
         object.__setattr__(self, "token_ids", token_ids)
         object.__setattr__(self, "mm_token_type_ids", token_types)
 
         image_pair = (self.pixel_values is None, self.image_position_ids is None)
         if image_pair[0] != image_pair[1]:
-            raise ValueError("pixel_values and image_position_ids must be supplied together")
+            raise ValueError(
+                "pixel_values and image_position_ids must be supplied together"
+            )
         video_pair = (
             self.pixel_values_videos is None,
             self.video_position_ids is None,
@@ -71,12 +72,12 @@ class Gemma4Media:
             object.__setattr__(
                 self,
                 "pixel_values",
-                _owned_cpu_tensor(self.pixel_values, "pixel_values", ndim=3),
+                owned_cpu_tensor(self.pixel_values, "pixel_values", ndim=3),
             )
             object.__setattr__(
                 self,
                 "image_position_ids",
-                _owned_cpu_tensor(
+                owned_cpu_tensor(
                     self.image_position_ids, "image_position_ids", ndim=3
                 ).to(torch.int64),
             )
@@ -84,14 +85,14 @@ class Gemma4Media:
             object.__setattr__(
                 self,
                 "pixel_values_videos",
-                _owned_cpu_tensor(
+                owned_cpu_tensor(
                     self.pixel_values_videos, "pixel_values_videos", ndim=4
                 ),
             )
             object.__setattr__(
                 self,
                 "video_position_ids",
-                _owned_cpu_tensor(
+                owned_cpu_tensor(
                     self.video_position_ids, "video_position_ids", ndim=4
                 ).to(torch.int64),
             )
@@ -164,8 +165,8 @@ class Gemma4Media:
 
     @classmethod
     def from_processor_output(cls, output: Any) -> Gemma4Media:
-        token_ids = _single_row(output["input_ids"], "input_ids")
-        token_types = _single_row(output["mm_token_type_ids"], "mm_token_type_ids")
+        token_ids = single_row(output["input_ids"], "input_ids")
+        token_types = single_row(output["mm_token_type_ids"], "mm_token_type_ids")
         return cls(
             token_ids=tuple(token_ids.tolist()),
             mm_token_type_ids=tuple(token_types.tolist()),
@@ -208,7 +209,10 @@ class Gemma4Media:
     ) -> Gemma4Media:
         """Build media from canonical RGB/HWC float32 arrays in ``[0, 1]``."""
 
-        owned = [canonical_rgb_image(image, index=index) for index, image in enumerate(images)]
+        owned = [
+            canonical_rgb_image(image, index=index)
+            for index, image in enumerate(images)
+        ]
         if not owned:
             raise ValueError("images must not be empty")
         content = [{"type": "image", "image": image} for image in owned]
@@ -243,47 +247,24 @@ class Gemma4Media:
         )
 
 
-def _single_row(value: Any, name: str) -> Tensor:
-    tensor = _owned_cpu_tensor(value, name, ndim=2)
-    if tensor.shape[0] != 1:
-        raise ValueError(f"{name} must contain exactly one prompt")
-    return tensor[0].to(torch.int64)
-
-
 def _media_digest(media: Gemma4Media) -> str:
     """SHA-256 of canonical model inputs, independent of file codecs."""
 
-    digest = hashlib.sha256(b"resin-gemma4-media-v1\0")
-    digest.update(np.asarray(media.mm_token_type_ids, dtype=np.uint8).tobytes())
-    for name in (
-        "pixel_values",
-        "image_position_ids",
-        "pixel_values_videos",
-        "video_position_ids",
-    ):
-        tensor = getattr(media, name)
-        if tensor is None:
-            continue
-        digest.update(name.encode())
-        digest.update(str(tensor.dtype).encode())
-        digest.update(np.asarray(tensor.shape, dtype=np.int64).tobytes())
-        digest.update(tensor.numpy().tobytes(order="C"))
-    return digest.hexdigest()
+    names = (
+        "pixel_values", "image_position_ids", "pixel_values_videos", "video_position_ids"
+    )
+    return digest_tensors(
+        b"resin-gemma4-media-v1\0",
+        ((name, getattr(media, name)) for name in names),
+        metadata=(np.asarray(media.mm_token_type_ids, dtype=np.uint8).tobytes(),),
+    )
 
 
 def _cache_identity(media: Gemma4Media, digest: str) -> tuple[int, ...]:
     """Build a same-length token identity salted at vision placeholders."""
 
-    identity = list(media.token_ids)
     media_positions = media.image_positions + media.video_positions
-    if not media_positions:
-        return tuple(identity)
-    stream = hashlib.shake_256(bytes.fromhex(digest)).digest(4 * len(media_positions))
-    for index, position in enumerate(media_positions):
-        identity[position] = int.from_bytes(
-            stream[4 * index : 4 * index + 4], "little"
-        )
-    return tuple(identity)
+    return salt_token_positions(media.token_ids, media_positions, digest)
 
 
 __all__ = ["Gemma4Media", "canonical_rgb_image", "decode_image"]

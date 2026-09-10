@@ -11,9 +11,9 @@ import pytest
 import torch
 
 from resin.backend.cuda.parallel import FlashInferAllReduce
-from resin_models_cuda.deepseek_v4 import DeepSeekV4CudaRunner
+from resin.models.deepseek_v4.config import DeepSeekV4Config
 from resin_models_cuda.deepseek_v4.checkpoint import resolve_model_path
-from resin_models_cuda.deepseek_v4.config import DeepSeekV4Config
+from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 from resin_models_cuda.deepseek_v4.weights import (
     load_deepseek_v4_weights,
     tensor_parallel_axis,
@@ -193,7 +193,7 @@ class TestDeepSeekV4Weights:
     def test_streaming_loader_reads_only_the_local_vocab_shards(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        from resin_models_cuda.deepseek_v4 import weights
+        import resin_models_cuda.deepseek_v4.weights as weights
 
         class TinyRank(torch.nn.Module):
             def __init__(self) -> None:
@@ -244,7 +244,6 @@ class TestDeepSeekV4Weights:
         for name in (
             "act_quant",
             "clear_rejected_compress_state",
-            "compress_decode",
             "compress_verify",
             "dspark_attention_metadata",
             "fp4_act_quant",
@@ -257,7 +256,6 @@ class TestDeepSeekV4Weights:
             "qk_norm_rope_block",
             "qk_norm_rope_store",
             "rope_last_block_inplace",
-            "sparse_attn",
             "swiglu",
             "top6_sqrt_softplus",
             "verify_attention_metadata",
@@ -846,7 +844,8 @@ class TestDeepSeekV4Runner:
         assert "cuda_graph_decode_shapes" in parameters
         assert hasattr(DeepSeekV4CudaRunner, "cuda_graph_stats")
         assert hasattr(DeepSeekV4CudaRunner, "capture_cuda_graphs")
-        assert "CudaGraphCache(" in source
+        assert "CudaGraphRunner(" in source
+        assert "CudaGraphProgram(" in source
         assert "CUDAGraph" not in source
         assert ".replay()" not in source
 

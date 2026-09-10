@@ -8,9 +8,9 @@ from typing import Any, Literal
 
 from renderers import DefaultRendererConfig, create_renderer
 
+from resin.models.inkling.media import InklingMedia
 from resin.protocols import ParserEvent, RenderedPrompt
 from resin.server.media import normalize_image_messages
-from resin_models_cuda.inkling.media import InklingMedia
 
 MESSAGE_MODEL = "<|message_model|>"
 CONTENT_TEXT = "<|content_text|>"
@@ -127,9 +127,7 @@ class InklingCodec:
                     "multi-token stop sequences are not supported yet"
                 )
             rendered["stop_token_ids"].append(int(encoded[0]))
-        rendered["stop_token_ids"] = list(
-            dict.fromkeys(rendered["stop_token_ids"])
-        )
+        rendered["stop_token_ids"] = list(dict.fromkeys(rendered["stop_token_ids"]))
         return rendered
 
     def create_parser(

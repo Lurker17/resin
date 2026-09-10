@@ -1,4 +1,4 @@
-"""Single-GPU Qwen3.5 hybrid runner with optional bundled-MTP decoding."""
+"""Qwen3.5 CUDA runner with optional bundled-MTP decoding."""
 
 from __future__ import annotations
 
@@ -13,22 +13,29 @@ from resin import BatchPhase, ResourceBinding, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
 from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
-    CudaGraphCache,
+    CudaGraphMode,
+    CudaGraphRunner,
     CudaGraphStats,
     CudaGraphStep,
     GraphShape,
     graph_shapes,
 )
+from resin.backend.cuda.runner import (
+    capture_sampling_inputs,
+    graph_sample,
+    pad_sampling_inputs,
+    validate_hybrid_plan,
+)
 from resin.backend.cuda.sampling import (
     SAMPLING_OFFSET_STRIDE,
     FlashInferSampler,
-    SamplingTensors,
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.loading import default_device
 from resin.backend.plans import PagedCachePlan
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
+from resin.models.qwen3_5.media import Qwen35Media
 from resin.protocols import Runner
 from resin_models_cuda.nvfp4 import prepare_nvfp4_modules
 from resin_models_cuda.qwen3_5.attention import (
@@ -48,7 +55,6 @@ from resin_models_cuda.qwen3_5.checkpoint import (
     load_model,
     resolve_model_path,
 )
-from resin_models_cuda.qwen3_5.media import Qwen35Media
 
 if TYPE_CHECKING:
     from resin import BatchPlan
@@ -103,7 +109,7 @@ class Qwen3_5CudaRunner(Runner):
         if nvfp4_backend not in {"auto", "cudnn", "cute-dsl"}:
             raise ValueError("nvfp4_backend must be 'auto', 'cudnn', or 'cute-dsl'")
 
-        self.device = torch.device(device or default_device(torch, require_cuda=True))
+        self.device = torch.device(device or default_device(require_cuda=True))
         if self.device.type != "cuda":
             raise RuntimeError("Qwen3_5CudaRunner requires CUDA")
         if self.device.index is None:
@@ -170,7 +176,7 @@ class Qwen3_5CudaRunner(Runner):
         self.max_batch_size = max_batch_size
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = self.config.eos_token_id
-        self._sampler = FlashInferSampler(torch)
+        self._sampler = FlashInferSampler()
         self._speculation = SpeculativeStats(speculative_tokens)
         self._graph_device_caches: dict[GraphShape, DeviceCache] = {}
         self._graph_attention: dict[GraphShape, GraphPagedAttentionRuntime] = {}
@@ -202,7 +208,6 @@ class Qwen3_5CudaRunner(Runner):
         )
         self.cache_layout = self.cache_geometry.layout(slab_capacity)
         self._cache = CacheArena(
-            torch,
             self.device,
             self.cache_layout,
             self.cache_geometry,
@@ -225,13 +230,18 @@ class Qwen3_5CudaRunner(Runner):
         self._graph_workspace = torch.empty(
             _GRAPH_WORKSPACE_BYTES, dtype=torch.uint8, device=self.device
         )
-        self._graphs = CudaGraphCache(
-            torch,
+        self._graph_runner = CudaGraphRunner(
             self.device,
-            decode_graph_shapes,
-            build=self._new_decode_graph_step,
+            {
+                "decode": CudaGraphMode(
+                    decode_graph_shapes,
+                    self._new_decode_graph_step,
+                    self._decode_graph_capture_inputs,
+                )
+            },
             synchronize_failure=self._cuda_failure,
         )
+        self._graphs = self._graph_runner.mode("decode")
         lookahead = speculative_tokens + 1 if speculative_tokens else 0
         self.runner_config = RunnerConfig(
             max_batch_tokens=PREFILL_CHUNK_SIZE,
@@ -354,48 +364,26 @@ class Qwen3_5CudaRunner(Runner):
             "token_ids": (0,) * batch_size,
             "positions": (1,) * batch_size,
             "rope_deltas": (0,) * batch_size,
-            "sampling_temperatures": (1.0,) * batch_size,
-            "sampling_top_ps": (1.0,) * batch_size,
-            "sampling_top_ks": (vocab_size,) * batch_size,
-            "sampling_seeds": tuple(range(batch_size)),
-            "sampling_offsets": (0,) * batch_size,
-            "sampling_stochastic_mask": (False,) * batch_size,
+            **capture_sampling_inputs(batch_size, vocab_size, unique_seeds=True),
         }
 
     def capture_cuda_graphs(self) -> CudaGraphStats:
         """Capture every configured Qwen decode bucket before serving."""
 
-        captured = set(self._graphs.stats["captured_shapes"])
-        for shape in self._graphs.shapes:
-            if shape in captured:
-                continue
-            inputs = self._capture_inputs(shape, self.vocab_size)
-            inputs.update(self._cache.graph_shape_capture_inputs(*shape))
-            for index, call in enumerate(self._graph_attention_for(shape).calls):
-                inputs[f"attention.{index}.logical_pages"] = (0,) * len(
-                    call.prepared.logical_pages
-                )
-            self._graphs.capture(shape, inputs)
-        if self._graphs.shapes:
+        def reset_null_page() -> None:
             self._cache.reset_null()
             torch.cuda.synchronize(self.device)
-        return self._graphs.stats
 
-    def _graph_sample(
-        self,
-        logits: torch.Tensor,
-        sampling: SamplingTensors,
-        step: int,
-    ) -> torch.Tensor:
-        tensors = SamplingTensors(
-            temperatures=sampling.temperatures,
-            top_ps=sampling.top_ps,
-            top_ks=sampling.top_ks,
-            seeds=sampling.seeds,
-            offsets=sampling.offsets + step * SAMPLING_OFFSET_STRIDE,
-            stochastic_mask=sampling.stochastic_mask,
-        )
-        return self._sampler.sample_tensors(logits.float(), tensors)
+        return self._graph_runner.capture_all(after_capture=reset_null_page)["decode"]
+
+    def _decode_graph_capture_inputs(self, shape: GraphShape) -> dict[str, object]:
+        inputs = self._capture_inputs(shape, self.vocab_size)
+        inputs.update(self._cache.graph_shape_capture_inputs(*shape))
+        for index, call in enumerate(self._graph_attention_for(shape).calls):
+            inputs[f"attention.{index}.logical_pages"] = (0,) * len(
+                call.prepared.logical_pages
+            )
+        return inputs
 
     def _graph_specs(self) -> tuple[GraphAttentionSpec, ...]:
         target = self.config.full_layer_count
@@ -447,13 +435,12 @@ class Qwen3_5CudaRunner(Runner):
         def ordinary_launch() -> None:
             attention.reset()
             recurrent, convolution, _ = self._initial_state(cache, positions)
-            hidden, recurrent, convolution = self._model.language_model(
+            hidden, recurrent, convolution = self._target_forward(
+                cache,
                 token_ids[:, None],
                 positions[:, None],
-                cache=cache,
-                recurrent_states=recurrent,
-                convolution_states=convolution,
-                sequence_lengths=positions + 1,
+                recurrent,
+                convolution,
                 max_sequence_length=graph_seq_len,
                 attention_runtime=attention,
                 rotary_positions=(positions + rope_deltas)[None, :, None].expand(
@@ -462,27 +449,28 @@ class Qwen3_5CudaRunner(Runner):
             )
             self._store_state(cache, positions, recurrent, convolution, hidden[:, -1])
             output_ids[:, 0].copy_(
-                self._graph_sample(self._model.logits(hidden[:, -1]), sampling, 0)
+                graph_sample(
+                    self._sampler, self._model.logits(hidden[:, -1]), sampling, 0
+                )
             )
 
         def speculative_launch() -> None:
             attention.reset()
             recurrent, convolution, _ = self._initial_state(cache, positions)
-            anchor_hidden, recurrent, convolution = self._model.language_model(
+            anchor_hidden, recurrent, convolution = self._target_forward(
+                cache,
                 token_ids[:, None],
                 positions[:, None],
-                cache=cache,
-                recurrent_states=recurrent,
-                convolution_states=convolution,
-                sequence_lengths=positions + 1,
+                recurrent,
+                convolution,
                 max_sequence_length=graph_seq_len,
                 attention_runtime=attention,
                 rotary_positions=(positions + rope_deltas)[None, :, None].expand(
                     3, -1, -1
                 ),
             )
-            first = self._graph_sample(
-                self._model.logits(anchor_hidden[:, -1]), sampling, 0
+            first = graph_sample(
+                self._sampler, self._model.logits(anchor_hidden[:, -1]), sampling, 0
             )
 
             draft_columns = []
@@ -499,8 +487,11 @@ class Qwen3_5CudaRunner(Runner):
                     max_sequence_length=graph_seq_len,
                     rope_deltas=rope_deltas,
                 )
-                draft_input = self._graph_sample(
-                    self._model.logits(draft_hidden[:, -1]), sampling, step + 1
+                draft_input = graph_sample(
+                    self._sampler,
+                    self._model.logits(draft_hidden[:, -1]),
+                    sampling,
+                    step + 1,
                 )
                 draft_columns.append(draft_input)
             drafts = torch.stack(draft_columns, dim=1)
@@ -516,13 +507,12 @@ class Qwen3_5CudaRunner(Runner):
             work_convolution = convolution
             for step in range(self.speculative_tokens + 1):
                 verify_position = positions + step + 1
-                hidden, work_recurrent, work_convolution = self._model.language_model(
+                hidden, work_recurrent, work_convolution = self._target_forward(
+                    cache,
                     verify_ids[:, step : step + 1],
                     verify_position[:, None],
-                    cache=cache,
-                    recurrent_states=work_recurrent,
-                    convolution_states=work_convolution,
-                    sequence_lengths=verify_position + 1,
+                    work_recurrent,
+                    work_convolution,
                     max_sequence_length=graph_seq_len,
                     attention_runtime=attention,
                     rotary_positions=(verify_position + rope_deltas)[
@@ -544,8 +534,11 @@ class Qwen3_5CudaRunner(Runner):
                     active[:, None], current_hidden, selected_hidden
                 )
                 verify_hidden.append(current_hidden)
-                target = self._graph_sample(
-                    self._model.logits(current_hidden), sampling, step + 1
+                target = graph_sample(
+                    self._sampler,
+                    self._model.logits(current_hidden),
+                    sampling,
+                    step + 1,
                 )
                 target_columns.append(target)
                 if step < self.speculative_tokens:
@@ -634,21 +627,9 @@ class Qwen3_5CudaRunner(Runner):
         inputs.update(
             self._graph_attention[shape].plan(cache_plan, np.asarray(plan.positions))
         )
-        sampling_inputs = self._sampler.host_inputs(plan, self.vocab_size)
-        defaults = {
-            "sampling_temperatures": 1.0,
-            "sampling_top_ps": 1.0,
-            "sampling_top_ks": self.vocab_size,
-            "sampling_seeds": 0,
-            "sampling_offsets": 0,
-            "sampling_stochastic_mask": False,
-        }
-        for name, default in defaults.items():
-            sampling_inputs[name] = (
-                *sampling_inputs[name],
-                *((default,) * padding),
-            )
-        inputs.update(sampling_inputs)
+        inputs.update(
+            pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding)
+        )
         output = self._graphs.run(shape, inputs)[:batch_size]
         if not self.speculative_tokens:
             return [int(row[0]) for row in output]
@@ -661,40 +642,15 @@ class Qwen3_5CudaRunner(Runner):
         ]
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
-        rows = plan.num_sequences
-        if rows == 0 or rows > self.max_batch_size:
-            raise ValueError("Qwen3.5 batch size is outside runner capacity")
-        indptr = np.asarray(plan.token_indptr)
-        if (
-            len(indptr) != rows + 1
-            or indptr[0] != 0
-            or indptr[-1] != len(plan.token_ids)
-            or np.any(indptr[1:] <= indptr[:-1])
-        ):
-            raise ValueError("Qwen3.5 sequence metadata is malformed")
-        if len(plan.context_lengths) != rows or len(plan.sampling_mask) != rows:
-            raise ValueError("Qwen3.5 row metadata is malformed")
-        slices = tuple((int(start), int(end)) for start, end in zip(indptr, indptr[1:]))
-        for row, (start, end) in enumerate(slices):
-            context = int(plan.context_lengths[row])
-            expected = np.arange(context, context + end - start)
-            if not np.array_equal(plan.positions[start:end], expected):
-                raise ValueError("Qwen3.5 positions must continue their context")
-            extra = (
-                self.speculative_tokens + 1
-                if plan.phase == BatchPhase.DECODE and self.speculative_tokens
-                else 0
-            )
-            if context + end - start + extra > self.max_seq_len:
-                raise ValueError("Qwen3.5 sequence exceeds max_seq_len")
-        if plan.phase == BatchPhase.DECODE:
-            if any(end - start != 1 for start, end in slices):
-                raise ValueError("Qwen3.5 decode rows must contain one anchor token")
-            if any(int(context) == 0 for context in plan.context_lengths):
-                raise ValueError("Qwen3.5 decode requires a cached prefix")
-        elif plan.phase != BatchPhase.PREFILL:
-            raise ValueError("Qwen3.5 plan phase must be prefill or decode")
-        return slices
+        return validate_hybrid_plan(
+            plan,
+            label="Qwen3.5",
+            max_batch_size=self.max_batch_size,
+            max_seq_len=self.max_seq_len,
+            decode_lookahead=self.speculative_tokens + 1
+            if self.speculative_tokens
+            else 0,
+        )
 
     def _sample(self, logits: torch.Tensor, plan: BatchPlan, step: int = 0):
         return self._sampler(
@@ -730,6 +686,39 @@ class Qwen3_5CudaRunner(Runner):
             recurrent[:, None],
             convolution[:, None],
             target_hidden[:, None],
+        )
+
+    def _target_forward(
+        self,
+        cache: DeviceCache,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        recurrent: torch.Tensor,
+        convolution: torch.Tensor,
+        *,
+        attention_runtime: object | None = None,
+        max_sequence_length: int | None = None,
+        rotary_positions: torch.Tensor | None = None,
+        input_embeddings: torch.Tensor | None = None,
+    ):
+        """Run target tokens through the phase-independent model operation."""
+
+        sequence_lengths = positions[:, -1] + 1
+        if max_sequence_length is None:
+            max_sequence_length = int(sequence_lengths.max().item())
+        return self._model.language_model(
+            input_ids,
+            positions,
+            cache=cache,
+            recurrent_states=recurrent,
+            convolution_states=convolution,
+            sequence_lengths=sequence_lengths,
+            max_sequence_length=max_sequence_length,
+            attention_runtime=(
+                self._attention if attention_runtime is None else attention_runtime
+            ),
+            rotary_positions=rotary_positions,
+            input_embeddings=input_embeddings,
         )
 
     def _mtp_forward(
@@ -840,15 +829,13 @@ class Qwen3_5CudaRunner(Runner):
             media = self._merge_media_embeddings(
                 plan, row, row_ids, row_positions, embeddings
             )
-            hidden, recurrent, convolution = self._model.language_model(
+            hidden, recurrent, convolution = self._target_forward(
+                row_cache,
                 row_ids,
                 row_positions,
-                cache=row_cache,
-                recurrent_states=recurrent,
-                convolution_states=convolution,
-                sequence_lengths=row_positions[:, -1] + 1,
+                recurrent,
+                convolution,
                 max_sequence_length=context + end - start,
-                attention_runtime=self._attention,
                 input_embeddings=embeddings,
                 rotary_positions=self._prefill_rotary_positions(media, row_positions),
             )
@@ -910,15 +897,12 @@ class Qwen3_5CudaRunner(Runner):
             plan.context_lengths, dtype=torch.long, device=self.device
         )
         recurrent, convolution, _ = self._initial_state(cache, contexts)
-        hidden, recurrent, convolution = self._model.language_model(
+        hidden, recurrent, convolution = self._target_forward(
+            cache,
             anchors[:, None],
             positions[:, None],
-            cache=cache,
-            recurrent_states=recurrent,
-            convolution_states=convolution,
-            sequence_lengths=positions + 1,
-            max_sequence_length=int(positions.max().item()) + 1,
-            attention_runtime=self._attention,
+            recurrent,
+            convolution,
             rotary_positions=self._decode_rotary_positions(plan, positions),
         )
         self._store_state(cache, positions, recurrent, convolution, hidden[:, -1])
@@ -936,20 +920,13 @@ class Qwen3_5CudaRunner(Runner):
         )
         rope_deltas = self._rope_deltas(plan)
         initial_recurrent, initial_convolution, _ = self._initial_state(cache, contexts)
-        anchor_hidden, anchor_recurrent, anchor_convolution = (
-            self._model.language_model(
-                anchors[:, None],
-                positions[:, None],
-                cache=cache,
-                recurrent_states=initial_recurrent,
-                convolution_states=initial_convolution,
-                sequence_lengths=positions + 1,
-                max_sequence_length=int(positions.max().item()) + 1,
-                attention_runtime=self._attention,
-                rotary_positions=(positions + rope_deltas)[None, :, None].expand(
-                    3, -1, -1
-                ),
-            )
+        anchor_hidden, anchor_recurrent, anchor_convolution = self._target_forward(
+            cache,
+            anchors[:, None],
+            positions[:, None],
+            initial_recurrent,
+            initial_convolution,
+            rotary_positions=(positions + rope_deltas)[None, :, None].expand(3, -1, -1),
         )
         first = self._sample(self._model.logits(anchor_hidden[:, -1]), plan, 0)
 
@@ -975,20 +952,15 @@ class Qwen3_5CudaRunner(Runner):
         verify_positions = positions[:, None] + torch.arange(
             1, self.speculative_tokens + 2, device=self.device
         )
-        verify_hidden, verify_recurrent, verify_convolution = (
-            self._model.language_model(
-                verify_ids,
-                verify_positions,
-                cache=cache,
-                recurrent_states=anchor_recurrent,
-                convolution_states=anchor_convolution,
-                sequence_lengths=verify_positions[:, -1] + 1,
-                max_sequence_length=int(verify_positions.max().item()) + 1,
-                attention_runtime=self._attention,
-                rotary_positions=(verify_positions + rope_deltas[:, None])[None].expand(
-                    3, -1, -1
-                ),
-            )
+        verify_hidden, verify_recurrent, verify_convolution = self._target_forward(
+            cache,
+            verify_ids,
+            verify_positions,
+            anchor_recurrent,
+            anchor_convolution,
+            rotary_positions=(verify_positions + rope_deltas[:, None])[None].expand(
+                3, -1, -1
+            ),
         )
         verify_logits = self._model.logits(verify_hidden)
         targets = torch.stack(
@@ -1009,16 +981,12 @@ class Qwen3_5CudaRunner(Runner):
                 recurrent = verify_recurrent[row : row + 1]
                 convolution = verify_convolution[row : row + 1]
             else:
-                committed_hidden, recurrent, convolution = self._model.language_model(
+                committed_hidden, recurrent, convolution = self._target_forward(
+                    row_cache,
                     verify_ids[row : row + 1, :processed],
                     verify_positions[row : row + 1, :processed],
-                    cache=row_cache,
-                    recurrent_states=anchor_recurrent[row : row + 1],
-                    convolution_states=anchor_convolution[row : row + 1],
-                    sequence_lengths=verify_positions[row : row + 1, processed - 1] + 1,
-                    max_sequence_length=int(verify_positions[row, processed - 1].item())
-                    + 1,
-                    attention_runtime=self._attention,
+                    anchor_recurrent[row : row + 1],
+                    anchor_convolution[row : row + 1],
                     rotary_positions=(
                         verify_positions[row : row + 1, :processed]
                         + rope_deltas[row : row + 1, None]

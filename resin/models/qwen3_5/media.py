@@ -1,26 +1,20 @@
-"""Prepared Qwen3.5 image inputs and multimodal rotary positions."""
+"""Backend-neutral Qwen3.5 image inputs and multimodal rotary positions."""
 
 from __future__ import annotations
 
-import hashlib
 import itertools
 from dataclasses import dataclass, field
 from typing import Any
 
-import numpy as np
 import torch
 from torch import Tensor
 
 from resin.protocols import MediaTokenSpan
-
-
-def _owned_cpu_tensor(value: Any, name: str, *, ndim: int) -> Tensor:
-    tensor = value if isinstance(value, Tensor) else torch.as_tensor(value)
-    if tensor.device.type != "cpu":
-        raise ValueError(f"{name} must be CPU-resident")
-    if tensor.ndim != ndim:
-        raise ValueError(f"{name} must have rank {ndim}, got {tensor.ndim}")
-    return tensor.detach().contiguous().clone()
+from resin.server.media_inputs import (
+    digest_tensors,
+    owned_cpu_tensor,
+    salt_token_positions,
+)
 
 
 def _mrope_positions(
@@ -90,8 +84,8 @@ class Qwen35Media:
             for position in image_positions
         ):
             raise ValueError("Qwen image placeholders do not match image token IDs")
-        pixels = _owned_cpu_tensor(self.pixel_values, "pixel_values", ndim=2).float()
-        grids = _owned_cpu_tensor(self.image_grid_thw, "image_grid_thw", ndim=2).to(
+        pixels = owned_cpu_tensor(self.pixel_values, "pixel_values", ndim=2).float()
+        grids = owned_cpu_tensor(self.image_grid_thw, "image_grid_thw", ndim=2).to(
             torch.int64
         )
         if grids.shape[1] != 3 or self.spatial_merge_size <= 0:
@@ -112,13 +106,11 @@ class Qwen35Media:
         object.__setattr__(self, "rope_delta", rope_delta)
         digest = _media_digest(pixels, grids)
         object.__setattr__(self, "digest", digest)
-        identity = list(token_ids)
-        salt = hashlib.shake_256(bytes.fromhex(digest)).digest(4 * len(image_positions))
-        for index, position in enumerate(image_positions):
-            identity[position] = int.from_bytes(
-                salt[index * 4 : index * 4 + 4], "little"
-            )
-        object.__setattr__(self, "cache_key", tuple(identity))
+        object.__setattr__(
+            self,
+            "cache_key",
+            salt_token_positions(token_ids, image_positions, digest),
+        )
 
     @classmethod
     def from_rendered(
@@ -161,16 +153,10 @@ class Qwen35Media:
 
 
 def _media_digest(pixel_values: Tensor, image_grid_thw: Tensor) -> str:
-    digest = hashlib.sha256(b"resin-qwen35-media-v1\0")
-    for name, tensor in (
-        ("pixel_values", pixel_values),
-        ("image_grid_thw", image_grid_thw),
-    ):
-        digest.update(name.encode())
-        digest.update(str(tensor.dtype).encode())
-        digest.update(np.asarray(tensor.shape, dtype=np.int64).tobytes())
-        digest.update(tensor.numpy().tobytes(order="C"))
-    return digest.hexdigest()
+    return digest_tensors(
+        b"resin-qwen35-media-v1\0",
+        (("pixel_values", pixel_values), ("image_grid_thw", image_grid_thw)),
+    )
 
 
 __all__ = ["Qwen35Media"]

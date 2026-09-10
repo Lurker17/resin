@@ -160,7 +160,7 @@ def _build_runtime(*, context_length: int = MAX_CONTEXT_LENGTH):
     from transformers import AutoProcessor
 
     from resin import Engine, SchedulerConfig
-    from resin_models_cuda.inkling import InklingCudaRunner
+    from resin_models_cuda.inkling.cuda import InklingCudaRunner
 
     inventory = _require_models()
     runner = InklingCudaRunner(
@@ -202,7 +202,7 @@ def _build_runtime(*, context_length: int = MAX_CONTEXT_LENGTH):
         "cuda_graphs": graph_stats,
         "device": torch.cuda.get_device_name(runner.device),
     }
-    return torch, runner, processor, renderer, engine, report
+    return runner, processor, renderer, engine, report
 
 
 def _prompt_ids(renderer: Any, prompt: str) -> list[int]:
@@ -227,9 +227,11 @@ def smoke_test(
     *,
     context_length: int = 32_768,
 ) -> dict[str, Any]:
+    import torch
+
     from resin import SamplingParams
 
-    torch, runner, processor, renderer, engine, report = _build_runtime(
+    runner, processor, renderer, engine, report = _build_runtime(
         context_length=context_length
     )
     try:
@@ -270,11 +272,13 @@ def smoke_test(
 
 
 def _serve(_: int) -> None:
-    from resin import SamplingParams
-    from resin.server import HttpServer
-    from resin_models_cuda.inkling import InklingCodec
+    import torch
 
-    torch, runner, processor, renderer, engine, _ = _build_runtime()
+    from resin import SamplingParams
+    from resin.models.inkling.codec import InklingCodec
+    from resin.server import HttpServer
+
+    runner, processor, renderer, engine, _ = _build_runtime()
     try:
         warmup = engine.submit(
             _prompt_ids(renderer, "Reply with one word."),

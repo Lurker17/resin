@@ -1,19 +1,12 @@
 from __future__ import annotations
 
-import importlib.util
-
-import pytest
+import torch
 
 from resin.moe_kernels import MoEKernelConfig
 
 
-@pytest.mark.skipif(
-    not importlib.util.find_spec("torch"), reason="PyTorch is not installed"
-)
 class TestGptOssPackedBridge:
     def test_official_block_layout_is_flattened_and_installed(self) -> None:
-        import torch
-
         from resin_models_cuda.gpt_oss.mxfp4 import (
             _install_expert_layer,
             _make_kernel_expert_factory,
@@ -52,7 +45,7 @@ class TestGptOssPackedBridge:
             num_experts_per_tok = 2
 
         kernel = Kernel()
-        factory = _make_kernel_expert_factory(torch, kernel, config)
+        factory = _make_kernel_expert_factory(kernel, config)
 
         class MLP(torch.nn.Module):
             def __init__(self) -> None:

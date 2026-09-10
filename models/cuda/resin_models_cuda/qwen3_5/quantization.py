@@ -1,4 +1,4 @@
-"""ModelOpt FP8 projection modules used by the RadixArk Qwen3.8 checkpoint."""
+"""Qwen3.5 ModelOpt FP8 projection modules."""
 
 from __future__ import annotations
 

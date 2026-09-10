@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_cuda.nvfp4 import Nvfp4Linear
 from resin_models_cuda.qwen3_5.attention import (
     PagedAttentionRuntime,
@@ -15,7 +16,6 @@ from resin_models_cuda.qwen3_5.attention import (
     append_kv,
 )
 from resin_models_cuda.qwen3_5.cache import MTP_GROUP, TARGET_GROUP, DeviceCache
-from resin_models_cuda.qwen3_5.config import Qwen35Config
 from resin_models_cuda.qwen3_5.quantization import ModelOptFp8Linear
 
 

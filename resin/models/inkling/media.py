@@ -1,33 +1,19 @@
-"""Prepared Inkling image inputs kept outside the token scheduler."""
+"""Backend-neutral Inkling image inputs kept outside the token scheduler."""
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
-import numpy as np
-import torch
 from torch import Tensor
 
 from resin.protocols import MediaTokenSpan
-
-
-def _owned_cpu_tensor(value: Any, name: str, *, ndim: int) -> Tensor:
-    if not isinstance(value, Tensor):
-        value = torch.as_tensor(value)
-    if value.device.type != "cpu":
-        raise ValueError(f"{name} must be CPU-resident")
-    if value.ndim != ndim:
-        raise ValueError(f"{name} must have rank {ndim}, got {value.ndim}")
-    return value.detach().contiguous().clone()
-
-
-def _single_row(value: Any, name: str) -> Tensor:
-    tensor = _owned_cpu_tensor(value, name, ndim=2)
-    if tensor.shape[0] != 1:
-        raise ValueError(f"{name} must contain exactly one prompt")
-    return tensor[0].to(torch.int64)
+from resin.server.media_inputs import (
+    digest_tensors,
+    owned_cpu_tensor,
+    salt_token_positions,
+    single_row,
+)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -52,7 +38,7 @@ class InklingMedia:
             if positions:
                 raise ValueError("Inkling image placeholders require pixel_values")
         else:
-            pixels = _owned_cpu_tensor(self.pixel_values, "pixel_values", ndim=5)
+            pixels = owned_cpu_tensor(self.pixel_values, "pixel_values", ndim=5)
             if pixels.shape[0] != len(positions):
                 raise ValueError(
                     "Inkling image placeholder count does not match pixel patches"
@@ -75,27 +61,17 @@ class InklingMedia:
         return ()
 
     def _digest(self) -> str:
-        digest = hashlib.sha256(b"resin-inkling-media-v1\0")
-        pixels = self.pixel_values
-        if pixels is not None:
-            digest.update(str(pixels.dtype).encode())
-            digest.update(np.asarray(pixels.shape, dtype=np.int64).tobytes())
-            digest.update(pixels.numpy().tobytes(order="C"))
-        return digest.hexdigest()
+        return digest_tensors(
+            b"resin-inkling-media-v1\0", (("pixel_values", self.pixel_values),)
+        )
 
     def _cache_identity(self, digest: str) -> tuple[int, ...]:
-        identity = list(self.token_ids)
         positions = self.image_positions
-        stream = hashlib.shake_256(bytes.fromhex(digest)).digest(4 * len(positions))
-        for index, position in enumerate(positions):
-            identity[position] = int.from_bytes(
-                stream[4 * index : 4 * index + 4], "little"
-            )
-        return tuple(identity)
+        return salt_token_positions(self.token_ids, positions, digest)
 
     @classmethod
     def from_processor_output(cls, processor: Any, output: Any) -> InklingMedia:
-        token_ids = _single_row(output["input_ids"], "input_ids")
+        token_ids = single_row(output["input_ids"], "input_ids")
         return cls(
             token_ids=tuple(token_ids.tolist()),
             image_token_id=int(processor.image_token_id),

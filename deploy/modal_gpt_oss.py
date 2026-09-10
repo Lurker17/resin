@@ -96,8 +96,10 @@ image = build_modal_image(
 ).env(KERNEL_CACHE_ENV)
 
 with image.imports():
-    from resin_models_cuda.gpt_oss import GptOssCudaRunner
-    from resin_models_cuda.gpt_oss.flashinfer import make_flashinfer_sm90_mxfp4_kernel
+    from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
+    from resin_models_cuda.gpt_oss.flashinfer import (
+        FlashInferSM90MXFP4Kernel,
+    )
 
 # Mirror the runner's frozen paged-cache geometry without reading names from
 # ``image.imports()`` while Modal is still parsing this file locally.
@@ -352,7 +354,7 @@ def _new_cuda_runner(
     tensor_parallel: TensorParallelContext,
     cuda_graph_decode_shapes: tuple[tuple[int, int], ...] = (),
 ) -> GptOssCudaRunner:
-    moe_kernel = make_flashinfer_sm90_mxfp4_kernel()
+    kernel_moe = FlashInferSM90MXFP4Kernel()
     if tensor_parallel.rank == 0:
         print(
             f"[model-load] Loading TP={tensor_parallel.size} model from "
@@ -364,7 +366,7 @@ def _new_cuda_runner(
         model_path,
         cache_parent_capacity=cache_parent_capacity,
         device=f"cuda:{tensor_parallel.rank}",
-        moe_kernel=moe_kernel,
+        kernel_moe=kernel_moe,
         cuda_graph_decode_shapes=cuda_graph_decode_shapes,
         tensor_parallel=tensor_parallel,
     )

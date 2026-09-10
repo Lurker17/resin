@@ -8,13 +8,13 @@ from resin import (
     CacheLayout,
     CacheRetention,
 )
-from resin_models_cuda.gemma4.plan import (
+from resin.models.gemma4.plan import (
     PAGE_SIZE,
     WINDOW_RETENTION_TOKENS,
     expand_gemma4_decode_batch,
     gemma4_assistant_context,
 )
-from resin_models_cuda.gemma4.plan import (
+from resin.models.gemma4.plan import (
     build_gemma4_batch_plan as _build_gemma4_batch_plan,
 )
 

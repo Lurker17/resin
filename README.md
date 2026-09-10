@@ -31,6 +31,7 @@ The focused contracts are:
 - [scheduler](docs/scheduler.md)
 - [runner/kernel boundary](docs/kernel-boundary.md)
 - [authoring a CUDA model runner](docs/model-forward-pass.md)
+- [CUDA model package boundaries](models/cuda/ARCHITECTURE.md)
 - [GPT-OSS runner status](docs/gpt-oss-itl.md)
 - [persistent kernel artifacts](docs/kernel-cache.md)
 
@@ -48,7 +49,7 @@ uv run ruff format resin/_resin.pyi
 The control-plane tests do not require a GPU. Importing a concrete model module
 loads PyTorch; importing `resin` or a model package namespace does not.
 
-Install `resin-models-cuda`; it pulls in `resin[gpu]` for the shared
+Install `resin-models-cuda`; it pulls in `resin[cuda]` for the shared
 accelerator runtime. The uv lock intentionally
 overrides FlashAttention-4's stale CUTLASS
 DSL metadata pin so FA4 and Quack use one tested toolchain.

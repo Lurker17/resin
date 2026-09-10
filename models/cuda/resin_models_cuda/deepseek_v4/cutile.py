@@ -1,17 +1,16 @@
-"""cuTile kernels used by Resin's native DeepSeek-V4 implementation."""
+"""DeepSeek-V4 cuTile kernels."""
 
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Annotated, TypeAlias
+from typing import Annotated, TypeAlias
 
 import cuda.tile as ct
 import torch
 from torch import Tensor
 from torch.nn import functional as F
 
-if TYPE_CHECKING:
-    from resin_models_cuda.deepseek_v4.cache import DeviceMapping
+from resin.backend.cuda.paged_kv import PagedCacheMapping
 
 _ConstantInt: TypeAlias = ct.Constant[int]
 _ConstantBool: TypeAlias = ct.Constant[bool]
@@ -508,10 +507,7 @@ def _index_score_kernel(
             )
             child_rows = parent_rows // packing
             rows = (
-                (
-                    selected_parents * parent_rows
-                    + selected_slots * child_rows
-                )
+                (selected_parents * parent_rows + selected_slots * child_rows)
                 * row_scale
                 + layer_offset
                 + (logical_positions % 128) // ratio
@@ -554,7 +550,7 @@ def index_scores(
     ratio: int,
     weight_scale: float,
     *,
-    cache_mapping: DeviceMapping,
+    cache_mapping: PagedCacheMapping,
     cache_width: int | None = None,
 ) -> Tensor:
     """Compute and collapse per-head index logits in one tensor-core launch."""
@@ -566,10 +562,7 @@ def index_scores(
     if width is None:
         width = (
             math.ceil(
-                cache_mapping.parent_ids.shape[1]
-                * 128
-                / ratio
-                / _INDEX_SCORE_TILE
+                cache_mapping.parent_ids.shape[1] * 128 / ratio / _INDEX_SCORE_TILE
             )
             * _INDEX_SCORE_TILE
         )
@@ -666,9 +659,7 @@ def _finish_index_topk_kernel(
                 + layer_offset
                 + (logical_positions % 128) // ratio
             )
-            values = ct.where(
-                (values >= 0) & (selected_parents > 0), physical, -1
-            )
+            values = ct.where((values >= 0) & (selected_parents > 0), physical, -1)
         ct.store(output, (batch, sequence, tile), values.astype(ct.int32))
 
 
@@ -678,7 +669,7 @@ def finish_index_topk(
     ratio: int,
     offset: int,
     *,
-    cache_mapping: DeviceMapping,
+    cache_mapping: PagedCacheMapping,
 ) -> Tensor:
     """Mask causal index results and convert them to attention indices."""
 
@@ -1187,7 +1178,7 @@ def qk_norm_rope_store(
     position: Tensor,
     epsilon: float,
     *,
-    cache_mapping: DeviceMapping,
+    cache_mapping: PagedCacheMapping,
 ) -> None:
     """Normalize Q/K, apply RoPE, quantize K, and update the decode cache."""
 
@@ -1245,7 +1236,7 @@ def qk_norm_rope_block(
     positions: Tensor,
     epsilon: float,
     *,
-    cache_mapping: DeviceMapping,
+    cache_mapping: PagedCacheMapping,
 ) -> None:
     """Normalize/rotate a verification block and store its guarded window KV."""
 
@@ -1302,7 +1293,7 @@ def kv_norm_rope_store(
     positions: Tensor,
     epsilon: float,
     *,
-    cache_mapping: DeviceMapping,
+    cache_mapping: PagedCacheMapping,
 ) -> None:
     """Fuse DSpark main-KV normalization, RoPE, quantization, and cache store."""
 
@@ -1615,8 +1606,8 @@ def verify_attention_metadata(
     compress_ratio: int,
     generated_compressed_width: int = 0,
     *,
-    window_mapping: DeviceMapping,
-    compressed_mapping: DeviceMapping | None = None,
+    window_mapping: PagedCacheMapping,
+    compressed_mapping: PagedCacheMapping | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Build all sparse-verification indices and lengths in one launch."""
 
@@ -1813,7 +1804,7 @@ def dspark_attention_metadata(
     window_size: int,
     window_capacity: int,
     *,
-    window_mapping: DeviceMapping,
+    window_mapping: PagedCacheMapping,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Build graph-safe sparse-MLA metadata for a parallel DSpark block."""
 
@@ -2297,7 +2288,7 @@ def _compress_verify_finalize_kernel(
             )
 
 
-def _compress_block(
+def compress_verify(
     values: Tensor,
     gates: Tensor,
     ape: Tensor,
@@ -2311,11 +2302,11 @@ def _compress_block(
     rotate: bool,
     epsilon: float,
     *,
-    cache_mapping: DeviceMapping,
-    state_mapping: DeviceMapping,
+    cache_mapping: PagedCacheMapping,
+    state_mapping: PagedCacheMapping,
     state_ring_size: int,
 ) -> None:
-    """Append a decode/verify block to a padded compressor ring."""
+    """Update one fixed verification block in a padded compressor ring."""
 
     dimension = cache.shape[-1]
     width = values.shape[-1]
@@ -2388,89 +2379,6 @@ def _compress_block(
     )
 
 
-def compress_verify(
-    values: Tensor,
-    gates: Tensor,
-    ape: Tensor,
-    value_state: Tensor,
-    score_state: Tensor,
-    norm_weight: Tensor,
-    frequencies: Tensor,
-    cache: Tensor,
-    positions: Tensor,
-    ratio: int,
-    rotate: bool,
-    epsilon: float,
-    *,
-    cache_mapping: DeviceMapping,
-    state_mapping: DeviceMapping,
-    state_ring_size: int,
-) -> None:
-    """Update one fixed verification block without materializing checkpoints."""
-
-    _compress_block(
-        values,
-        gates,
-        ape,
-        value_state,
-        score_state,
-        norm_weight,
-        frequencies,
-        cache,
-        positions,
-        ratio,
-        rotate,
-        epsilon,
-        cache_mapping=cache_mapping,
-        state_mapping=state_mapping,
-        state_ring_size=state_ring_size,
-    )
-
-
-def compress_decode(
-    values: Tensor,
-    gates: Tensor,
-    ape: Tensor,
-    value_state: Tensor,
-    score_state: Tensor,
-    norm_weight: Tensor,
-    frequencies: Tensor,
-    cache: Tensor,
-    position: Tensor,
-    ratio: int,
-    rotate: bool,
-    epsilon: float,
-    *,
-    cache_mapping: DeviceMapping,
-    state_mapping: DeviceMapping,
-    state_ring_size: int,
-) -> None:
-    """Update one token through the same padded-ring path as verification."""
-
-    batch_size = values.shape[0]
-    if values.shape[1] != 1 or position.shape != (batch_size,):
-        raise ValueError(
-            "decode compression requires one correctly sized token per row"
-        )
-    _compress_block(
-        values,
-        gates,
-        ape,
-        value_state,
-        score_state,
-        norm_weight,
-        frequencies,
-        cache,
-        position[:, None],
-        ratio,
-        rotate,
-        epsilon,
-        cache_mapping=cache_mapping,
-        state_mapping=state_mapping,
-        state_ring_size=state_ring_size,
-    )
-
-
 def clear_rejected_compress_state(
     value_state: Tensor,
     score_state: Tensor,
@@ -2478,7 +2386,7 @@ def clear_rejected_compress_state(
     processed_counts: Tensor,
     block_length: int,
     *,
-    state_mapping: DeviceMapping,
+    state_mapping: PagedCacheMapping,
     state_ring_size: int,
 ) -> None:
     """Discard rejected c128 rows without restoring the committed ring."""
@@ -2516,96 +2424,6 @@ def clear_rejected_compress_state(
             state_mapping.packing,
         ),
     )
-
-
-@ct.kernel(occupancy=2)
-def _sparse_attention_kernel(
-    query: _StaticLastTwoDims,
-    key_value: _StaticLastDim,
-    sinks: _StaticLastDim,
-    indices,
-    output: _StaticLastTwoDims,
-    heads: _ConstantInt,
-    dimension: _ConstantInt,
-    softmax_scale: float,
-):
-    sequence = ct.bid(0)
-    batch = ct.bid(1)
-    q = ct.load(query, (batch, sequence, 0, 0), shape=(1, 1, heads, dimension))
-    q = q.reshape((heads, dimension))
-    sink = ct.load(sinks, (0,), shape=(heads,)).reshape((heads, 1))
-    maximum = sink
-    denominator = ct.full((heads, 1), 1.0, dtype=ct.float32)
-    accumulator = ct.full((heads, dimension), 0.0, dtype=ct.float32)
-    dimensions = ct.arange(dimension, dtype=ct.int32).reshape((1, dimension))
-    # Keep the number of sparse blocks dynamic. Prompt length determines this
-    # width, so specializing it would compile a new kernel for each 64-token
-    # context-width increment and stall an otherwise warm server.
-    index_width = ct.assume_divisible_by(indices.shape[-1], 64)
-    for index_block in range(index_width // 64):
-        selected = ct.load(
-            indices, (batch, sequence, index_block), shape=(1, 1, 64)
-        ).reshape((64, 1))
-        batches = ct.full((64, 1), batch, dtype=ct.int32)
-        values = ct.gather(
-            key_value,
-            (batches, selected, dimensions),
-            padding_value=0,
-        )
-        scores = ct.mma(
-            q,
-            values.permute((1, 0)),
-            ct.full((heads, 64), 0.0, dtype=ct.float32),
-        )
-        valid = selected.permute((1, 0)) >= 0
-        scores = ct.where(valid, scores * softmax_scale, _NEGATIVE)
-        next_maximum = ct.maximum(maximum, ct.max(scores, axis=1, keepdims=True))
-        correction = ct.exp(maximum - next_maximum)
-        probabilities = ct.exp(scores - next_maximum)
-        denominator = denominator * correction + ct.sum(
-            probabilities, axis=1, keepdims=True
-        )
-        accumulator *= correction
-        accumulator = ct.mma(probabilities.astype(query.dtype), values, accumulator)
-        maximum = next_maximum
-    ct.store(
-        output,
-        (batch, sequence, 0, 0),
-        (accumulator / denominator)
-        .reshape((1, 1, heads, dimension))
-        .astype(output.dtype),
-    )
-
-
-def sparse_attn(
-    query: Tensor,
-    key_value: Tensor,
-    sinks: Tensor,
-    indices: Tensor,
-    softmax_scale: float,
-) -> Tensor:
-    """Gather sparse KV positions and apply online-softmax attention."""
-
-    padded = math.ceil(indices.shape[-1] / 64) * 64
-    if padded != indices.shape[-1]:
-        indices = F.pad(indices, (0, padded - indices.shape[-1]), value=-1)
-    output = torch.empty_like(query)
-    ct.launch(
-        torch.cuda.current_stream(query.device),
-        (query.shape[1], query.shape[0], 1),
-        _sparse_attention_kernel,
-        (
-            query,
-            key_value,
-            sinks,
-            indices,
-            output,
-            query.shape[2],
-            query.shape[3],
-            softmax_scale,
-        ),
-    )
-    return output
 
 
 @ct.kernel
@@ -2653,7 +2471,6 @@ def hadamard_transform(values: Tensor) -> Tensor:
 __all__ = [
     "act_quant",
     "clear_rejected_compress_state",
-    "compress_decode",
     "compress_verify",
     "dspark_attention_metadata",
     "fp4_act_quant",
@@ -2668,7 +2485,6 @@ __all__ = [
     "qk_norm_rope_store",
     "qk_norm_rope_block",
     "rope_last_block_inplace",
-    "sparse_attn",
     "swiglu",
     "top6_sqrt_softplus",
     "verify_attention_metadata",

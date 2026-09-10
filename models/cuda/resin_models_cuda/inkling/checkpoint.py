@@ -1,4 +1,4 @@
-"""Pinned checkpoint identities and local validation for Inkling-Small."""
+"""Inkling-Small checkpoint identities and local validation."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from resin_models_cuda.inkling.config import InklingConfig, InklingDSparkConfig
+from resin.models.inkling.config import InklingConfig, InklingDSparkConfig
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

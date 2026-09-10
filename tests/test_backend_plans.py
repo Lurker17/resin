@@ -10,6 +10,10 @@ from resin import (
     CacheGroupPlan,
     CacheLayout,
 )
+from resin.backend.paged_attention import (
+    PagedAttentionGroupSpec,
+    build_paged_attention_batch,
+)
 from resin.backend.plans import BatchView, CacheGroupView, PagedCachePlan
 
 
@@ -64,6 +68,41 @@ def test_cache_group_view_preserves_structured_and_packed_addresses() -> None:
     assert group.append_block_offsets.dtype == np.uint32
 
 
+def test_paged_attention_names_semantics_and_preserves_packed_addresses() -> None:
+    plan = BatchPlan(
+        [10],
+        [0],
+        [1, 2, 3],
+        [0, 3],
+        cache_groups=[
+            CacheGroupPlan(
+                0,
+                [0, 2],
+                [1, 2],
+                [0, 1],
+                [0],
+                [1, 1, 2],
+                [0, 0, 1],
+                [0, 1, 0],
+                blocks_per_slab=2,
+            )
+        ],
+    )
+    batch = build_paged_attention_batch(
+        plan,
+        CacheLayout(2, [CacheGroupLayout(2, blocks_per_slab=2)]),
+        (PagedAttentionGroupSpec("history", 0, minimum_table_width=3),),
+        max_query_tokens=3,
+    )
+    history = batch.group("history")
+
+    assert batch.query_lengths == (3,)
+    assert history.width == 3
+    assert history.page_table.tolist() == [2, 5, 2]
+    assert history.lengths == (3,)
+    assert history.append_slots.tolist() == [4, 5, 10]
+
+
 def test_paged_cache_plan_validates_exact_leased_tables() -> None:
     layout = CacheLayout(2, [CacheGroupLayout(2)])
     plan = BatchPlan(
@@ -91,9 +130,7 @@ def test_paged_cache_plan_validates_exact_leased_tables() -> None:
 
 
 def test_paged_cache_plan_accepts_the_two_checkpoint_state_ring() -> None:
-    layout = CacheLayout(
-        2, [CacheGroupLayout(4, family=CacheGroupFamily.STATE)]
-    )
+    layout = CacheLayout(2, [CacheGroupLayout(4, family=CacheGroupFamily.STATE)])
     plan = BatchPlan(
         [10],
         [11],

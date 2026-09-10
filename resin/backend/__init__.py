@@ -1,5 +1,6 @@
-"""Reusable, framework-neutral execution and resource gadgets.
+"""Reusable PyTorch execution and resource helpers.
 
 Device-specific helpers live under an explicit module such as
-:mod:`resin.backend.cuda`. This package imports no accelerator framework.
+:mod:`resin.backend.cuda`. This initializer imports no accelerator-specific
+libraries.
 """

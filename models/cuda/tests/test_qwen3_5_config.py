@@ -4,8 +4,8 @@ import copy
 
 import pytest
 
+from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_cuda.qwen3_5.checkpoint import DEFAULT_MODEL, DEFAULT_REVISION
-from resin_models_cuda.qwen3_5.config import Qwen35Config
 
 
 def _qwen38() -> dict[str, object]:

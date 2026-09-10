@@ -1,4 +1,4 @@
-"""Six-layer DSpark semi-autoregressive drafter for Inkling-Small."""
+"""Inkling-Small six-layer DSpark semi-autoregressive drafter."""
 
 from __future__ import annotations
 
@@ -10,13 +10,13 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from resin_models_cuda.inkling.attention import append_kv, paged_attention
-from resin_models_cuda.inkling.cache import DRAFT_GROUP, DRAFT_LAYERS, DeviceCache
-from resin_models_cuda.inkling.config import (
+from resin.models.inkling.config import (
     InklingConfig,
     InklingDSparkConfig,
     YarnConfig,
 )
+from resin_models_cuda.inkling.attention import append_kv, paged_attention
+from resin_models_cuda.inkling.cache import DRAFT_GROUP, DRAFT_LAYERS, DeviceCache
 from resin_models_cuda.inkling.model import InklingTarget, RMSNorm
 
 

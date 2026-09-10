@@ -5,7 +5,8 @@ import inspect
 import pytest
 
 from resin import BatchPhase, BatchPlan
-from resin_models_cuda.qwen3_5 import DEFAULT_MODEL, Qwen3_5CudaRunner
+from resin_models_cuda.qwen3_5.checkpoint import DEFAULT_MODEL
+from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
 
 
 def test_qwen38_is_runner_default_and_public_name_is_consistent() -> None:
@@ -32,7 +33,7 @@ def test_qwen_runner_uses_optional_bundled_mtp_and_engine_cache() -> None:
 def test_qwen_runner_captures_both_ordinary_and_mtp_decode() -> None:
     source = inspect.getsource(Qwen3_5CudaRunner)
 
-    assert "CudaGraphCache" in source
+    assert "CudaGraphRunner" in source
     assert "GraphPagedAttentionRuntime" in source
     assert "def capture_cuda_graphs" in source
     assert "def _new_decode_graph_step" in source

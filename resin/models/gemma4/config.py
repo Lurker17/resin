@@ -1,4 +1,4 @@
-"""Validated configuration for NVIDIA's dense Gemma 4 NVFP4 checkpoint."""
+"""Backend-neutral configuration for Gemma 4 checkpoints."""
 
 from __future__ import annotations
 

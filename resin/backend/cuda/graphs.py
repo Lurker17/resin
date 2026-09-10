@@ -1,4 +1,4 @@
-"""Reusable, current-batch-only CUDA graph execution."""
+"""Reusable CUDA graph execution for prefill, decode, and other modes."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, TypedDict
+
+import torch
 
 from resin.backend.cuda.staging import StagingError, TensorStager
 
@@ -41,6 +43,8 @@ class CudaGraphShapeStats(TypedDict):
     warmup_count: int
     capture_ms: float | None
     capture_memory_bytes: int | None
+    graph_region_count: int
+    graph_break_count: int
 
 
 class CudaGraphStats(TypedDict):
@@ -49,6 +53,8 @@ class CudaGraphStats(TypedDict):
     captured_shapes: tuple[GraphShape, ...]
     capture_count: int
     replay_count: int
+    graph_region_count: int
+    graph_break_count: int
     eager_fallback_count: int
     fallback_counts: dict[str, int]
     shape_stats: tuple[CudaGraphShapeStats, ...]
@@ -119,7 +125,7 @@ def default_decode_graph_shapes(
 
 @dataclass(frozen=True, slots=True)
 class CudaGraphStep:
-    """One fixed-address device operation that can be captured automatically."""
+    """One fixed-address operation, retained as the simple one-graph API."""
 
     inputs: Mapping[str, Any]
     output: Any
@@ -128,12 +134,93 @@ class CudaGraphStep:
     validate_eager_output: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class CudaGraphRegion:
+    """One ordered region in a CUDA graph program.
+
+    ``capture=False`` is an explicit graph break. The callable still executes
+    on the same CUDA stream and must use the program's fixed-address tensors,
+    but it runs eagerly between its neighboring captured regions.
+    """
+
+    name: str
+    launch: Callable[[], None]
+    capture: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("CUDA graph region name must be nonempty")
+        if not callable(self.launch):
+            raise TypeError("CUDA graph region launch must be callable")
+        if not isinstance(self.capture, bool):
+            raise TypeError("CUDA graph region capture must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class CudaGraphProgram:
+    """Fixed-address CUDA work split by zero or more explicit graph breaks."""
+
+    inputs: Mapping[str, Any]
+    output: Any
+    regions: tuple[CudaGraphRegion, ...]
+    prepare: Callable[[], None] | None = None
+    validate_eager_output: bool = True
+
+    def __post_init__(self) -> None:
+        regions = tuple(self.regions)
+        if not regions:
+            raise ValueError("CUDA graph program must contain at least one region")
+        if any(not isinstance(region, CudaGraphRegion) for region in regions):
+            raise TypeError("CUDA graph program regions must be CudaGraphRegion values")
+        names = tuple(region.name for region in regions)
+        if len(names) != len(set(names)):
+            raise ValueError("CUDA graph region names must be unique")
+        if not any(region.capture for region in regions):
+            raise ValueError("CUDA graph program must capture at least one region")
+        object.__setattr__(self, "regions", regions)
+
+
+def _as_program(step: CudaGraphStep | CudaGraphProgram) -> CudaGraphProgram:
+    if isinstance(step, CudaGraphProgram):
+        return step
+    if isinstance(step, CudaGraphStep):
+        return CudaGraphProgram(
+            inputs=step.inputs,
+            output=step.output,
+            regions=(CudaGraphRegion("step", step.launch),),
+            prepare=step.prepare,
+            validate_eager_output=step.validate_eager_output,
+        )
+    raise TypeError("CUDA graph builder must return a step or program")
+
+
+@dataclass(frozen=True, slots=True)
+class CudaGraphMode:
+    """One independently bucketed execution mode in a CUDA graph runner.
+
+    Modes are intentionally semantic rather than CUDA-specific algorithms:
+    callers commonly register ``prefill`` and ``decode``. Either mode may
+    build one full graph with :class:`CudaGraphStep` or a breakable graph with
+    :class:`CudaGraphProgram`; capture and replay stay identical.
+    """
+
+    shapes: tuple[GraphShape, ...]
+    build: Callable[[GraphShape], CudaGraphStep | CudaGraphProgram]
+    capture_inputs: Callable[[GraphShape], Mapping[str, object]]
+
+    def __post_init__(self) -> None:
+        if not callable(self.build) or not callable(self.capture_inputs):
+            raise TypeError("CUDA graph mode hooks must be callable")
+        object.__setattr__(self, "shapes", tuple(self.shapes))
+
+
 @dataclass(slots=True)
 class _GraphEntry:
     shape: GraphShape
-    step: CudaGraphStep | None = None
+    program: CudaGraphProgram | None = None
     staging: TensorStager | None = None
-    graph: Any = None
+    graphs: tuple[Any | None, ...] = ()
+    captured: bool = False
     captures: int = 0
     replays: int = 0
     warmups: int = 0
@@ -144,22 +231,20 @@ class _GraphEntry:
 class CudaGraphCache:
     """Capture and replay reusable static CUDA steps.
 
-    The backend describes each physical shape once with :class:`CudaGraphStep`.
-    This cache owns input staging, explicit warmup/capture, parity validation,
-    replay, failure poisoning, and metrics. It only executes the batch passed
-    to :meth:`run`; it never plans future work or implements overlap scheduling.
+    A model describes each physical shape with a simple :class:`CudaGraphStep`
+    or a segmented :class:`CudaGraphProgram`. This cache owns persistent input
+    staging, explicit warmup/capture, parity validation, ordered graph breaks,
+    replay, failure poisoning, and metrics. It executes only the current batch.
     """
 
     def __init__(
         self,
-        torch,
         device,
         shapes: tuple[GraphShape, ...],
         *,
-        build: Callable[[GraphShape], CudaGraphStep],
+        build: Callable[[GraphShape], CudaGraphStep | CudaGraphProgram],
         synchronize_failure: Callable[[], None],
     ) -> None:
-        self.torch = torch
         self.device = device
         self.shapes = shapes
         self._build = build
@@ -184,6 +269,33 @@ class CudaGraphCache:
                 f"construct a fresh runner ({self._poison})"
             )
 
+    def capture_all(
+        self,
+        inputs_for_shape: Callable[[GraphShape], Mapping[str, object]],
+        *,
+        before_capture: Callable[[], None] | None = None,
+        after_capture: Callable[[], None] | None = None,
+    ) -> CudaGraphStats:
+        """Capture every pending shape with optional model-state hooks.
+
+        The hooks run whenever capture is configured, including idempotent
+        calls after every shape is already captured. This keeps restoration
+        behavior owned by the model while centralizing capture bookkeeping.
+        """
+
+        self.check()
+        if not self.shapes:
+            return self.stats
+        if before_capture is not None:
+            before_capture()
+        captured = set(self.stats["captured_shapes"])
+        for shape in self.shapes:
+            if shape not in captured:
+                self.capture(shape, inputs_for_shape(shape))
+        if after_capture is not None:
+            after_capture()
+        return self.stats
+
     def _fail(self, stage: str, error: BaseException) -> None:
         if self._poison is None:
             self._poison = f"{stage}: {type(error).__name__}: {error}"
@@ -196,16 +308,16 @@ class CudaGraphCache:
             entry = self._entries[shape]
         except KeyError as error:
             raise ValueError(f"unconfigured CUDA graph shape: {shape}") from error
-        if entry.graph is not None:
+        if entry.captured:
             raise RuntimeError(f"CUDA graph shape is already captured: {shape}")
-        before = self.torch.cuda.memory_allocated(self.device)
-        entry.step = self._build(shape)
-        assert entry.step is not None
+        before = torch.cuda.memory_allocated(self.device)
+        entry.program = _as_program(self._build(shape))
         try:
             entry.staging = TensorStager(self.device)
-            entry.staging.copy_into(entry.step.inputs, inputs)
+            entry.staging.copy_into(entry.program.inputs, inputs)
         except StagingError as error:
-            entry.step = None
+            entry.program = None
+            entry.staging = None
             raise GraphInputError(str(error)) from error
         except BaseException as error:
             self._fail("graph input copy", error)
@@ -216,7 +328,7 @@ class CudaGraphCache:
             self._fail("graph capture", error)
             self._synchronize_failure()
             raise
-        return entry.step.output.tolist()
+        return entry.program.output.tolist()
 
     def run(self, shape: GraphShape, inputs: Mapping[str, object]) -> Any:
         """Stage and replay one current batch using a pre-captured graph."""
@@ -226,14 +338,13 @@ class CudaGraphCache:
             entry = self._entries[shape]
         except KeyError as error:
             raise ValueError(f"unconfigured CUDA graph shape: {shape}") from error
-        if entry.graph is None or entry.step is None:
+        if not entry.captured or entry.program is None or entry.staging is None:
             raise RuntimeError(
                 f"CUDA graph shape {shape} has not been captured; "
                 "capture configured graphs during runner initialization"
             )
         try:
-            entry.staging = TensorStager(self.device)
-            entry.staging.copy_into(entry.step.inputs, inputs)
+            entry.staging.copy_into(entry.program.inputs, inputs)
         except StagingError as error:
             raise GraphInputError(str(error)) from error
         except BaseException as error:
@@ -241,9 +352,9 @@ class CudaGraphCache:
             raise
 
         try:
-            with self.torch.cuda.device(self.device):
-                entry.graph.replay()
-            result = entry.step.output.tolist()
+            with torch.cuda.device(self.device), torch.inference_mode():
+                self._replay(entry.program, entry.graphs)
+            result = entry.program.output.tolist()
         except BaseException as error:
             self._fail("graph replay", error)
             self._synchronize_failure()
@@ -252,66 +363,104 @@ class CudaGraphCache:
         return result
 
     def _capture(self, entry: _GraphEntry, allocation_before: int) -> None:
-        torch, step = self.torch, entry.step
-        assert step is not None
+        program = entry.program
+        assert program is not None
         current = torch.cuda.current_stream(self.device)
         warmup = torch.cuda.Stream(device=self.device)
         warmup.wait_stream(current)
         with torch.cuda.stream(warmup), torch.inference_mode():
             for _ in range(3):
-                if step.prepare is not None:
-                    step.prepare()
-                step.launch()
-            expected = step.output.clone()
+                if program.prepare is not None:
+                    program.prepare()
+                self._launch(program)
+            expected = program.output.clone()
         current.wait_stream(warmup)
         entry.warmups = 3
         torch.cuda.synchronize(self.device)
 
         started = perf_counter()
         with torch.cuda.device(self.device):
-            if step.prepare is not None:
-                step.prepare()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph), torch.inference_mode():
-                step.launch()
-            if step.prepare is not None:
-                step.prepare()
-            graph.replay()
+            if program.prepare is not None:
+                program.prepare()
+            graphs = self._capture_regions(program)
+            if program.prepare is not None:
+                program.prepare()
+            self._replay(program, graphs)
         torch.cuda.synchronize(self.device)
-        if step.validate_eager_output:
-            if not torch.equal(expected, step.output):
+        if program.validate_eager_output:
+            if not torch.equal(expected, program.output):
                 raise RuntimeError(
                     "CUDA graph replay differs from eager warmup "
-                    f"(expected={expected.tolist()}, actual={step.output.tolist()})"
+                    f"(expected={expected.tolist()}, "
+                    f"actual={program.output.tolist()})"
                 )
         else:
-            expected_replay = step.output.clone()
-            graph.replay()
+            expected_replay = program.output.clone()
+            self._replay(program, graphs)
             torch.cuda.synchronize(self.device)
-            if not torch.equal(expected_replay, step.output):
+            if not torch.equal(expected_replay, program.output):
                 raise RuntimeError(
                     "CUDA graph replays are not deterministic "
                     f"(expected={expected_replay.tolist()}, "
-                    f"actual={step.output.tolist()})"
+                    f"actual={program.output.tolist()})"
                 )
-        entry.graph = graph
+        entry.graphs = graphs
+        entry.captured = True
         entry.captures = 1
         entry.capture_ms = (perf_counter() - started) * 1000
         entry.memory_bytes = max(
             0, torch.cuda.memory_allocated(self.device) - allocation_before
         )
 
+    @staticmethod
+    def _launch(program: CudaGraphProgram) -> None:
+        for region in program.regions:
+            region.launch()
+
+    def _capture_regions(self, program: CudaGraphProgram) -> tuple[Any | None, ...]:
+        graphs: list[Any | None] = []
+        for region in program.regions:
+            if not region.capture:
+                region.launch()
+                graphs.append(None)
+                continue
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph), torch.inference_mode():
+                region.launch()
+            graphs.append(graph)
+        return tuple(graphs)
+
+    @staticmethod
+    def _replay(program: CudaGraphProgram, graphs: tuple[Any | None, ...]) -> None:
+        if len(graphs) != len(program.regions):
+            raise RuntimeError("CUDA graph program capture is incomplete")
+        for region, graph in zip(program.regions, graphs, strict=True):
+            if graph is None:
+                region.launch()
+            else:
+                graph.replay()
+
     @property
     def stats(self) -> CudaGraphStats:
         rows: tuple[CudaGraphShapeStats, ...] = tuple(
             {
                 "shape": entry.shape,
-                "captured": entry.graph is not None,
+                "captured": entry.captured,
                 "capture_count": entry.captures,
                 "replay_count": entry.replays,
                 "warmup_count": entry.warmups,
                 "capture_ms": entry.capture_ms,
                 "capture_memory_bytes": entry.memory_bytes,
+                "graph_region_count": sum(
+                    region.capture for region in entry.program.regions
+                )
+                if entry.program is not None
+                else 0,
+                "graph_break_count": sum(
+                    not region.capture for region in entry.program.regions
+                )
+                if entry.program is not None
+                else 0,
             }
             for entry in self._entries.values()
         )
@@ -321,9 +470,68 @@ class CudaGraphCache:
             "captured_shapes": tuple(row["shape"] for row in rows if row["captured"]),
             "capture_count": sum(entry.captures for entry in self._entries.values()),
             "replay_count": sum(entry.replays for entry in self._entries.values()),
+            "graph_region_count": sum(row["graph_region_count"] for row in rows),
+            "graph_break_count": sum(row["graph_break_count"] for row in rows),
             "eager_fallback_count": sum(self._fallbacks.values()),
             "fallback_counts": dict(self._fallbacks),
             "shape_stats": rows,
             "poisoned": self._poison is not None,
             "poison_error": self._poison,
         }
+
+
+class CudaGraphRunner:
+    """Own independent graph buckets without duplicating phase machinery."""
+
+    def __init__(
+        self,
+        device,
+        modes: Mapping[str, CudaGraphMode],
+        *,
+        synchronize_failure: Callable[[], None],
+    ) -> None:
+        if any(not isinstance(name, str) or not name.strip() for name in modes):
+            raise ValueError("CUDA graph mode names must be nonempty")
+        self._modes = dict(modes)
+        self._caches = {
+            name: CudaGraphCache(
+                device,
+                mode.shapes,
+                build=mode.build,
+                synchronize_failure=synchronize_failure,
+            )
+            for name, mode in self._modes.items()
+        }
+
+    def mode(self, name: str) -> CudaGraphCache:
+        try:
+            return self._caches[name]
+        except KeyError as error:
+            raise KeyError(f"unknown CUDA graph mode: {name}") from error
+
+    def check(self) -> None:
+        for cache in self._caches.values():
+            cache.check()
+
+    def capture_all(
+        self,
+        *,
+        before_capture: Callable[[], None] | None = None,
+        after_capture: Callable[[], None] | None = None,
+    ) -> dict[str, CudaGraphStats]:
+        """Capture all configured modes under one pair of state hooks."""
+
+        self.check()
+        if not any(cache.shapes for cache in self._caches.values()):
+            return self.stats
+        if before_capture is not None:
+            before_capture()
+        for name, mode in self._modes.items():
+            self._caches[name].capture_all(mode.capture_inputs)
+        if after_capture is not None:
+            after_capture()
+        return self.stats
+
+    @property
+    def stats(self) -> dict[str, CudaGraphStats]:
+        return {name: cache.stats for name, cache in self._caches.items()}

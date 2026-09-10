@@ -192,43 +192,47 @@ def _config(**changes) -> MoEKernelConfig:
     return MoEKernelConfig(**values)
 
 
-def _tensor(torch, shape, dtype=None, *, device=None):
+def _tensor(runtime, shape, dtype=None, *, device=None):
     return _FakeTensor(
         shape,
-        torch.uint8 if dtype is None else dtype,
+        runtime.uint8 if dtype is None else dtype,
         device=device,
     )
 
 
-def _weights(torch, config=None):
+def _weights(runtime, config=None):
     config = _config() if config is None else config
     experts = config.num_experts
     hidden = config.hidden_size
     intermediate = config.intermediate_size
     return MoEExpertWeights(
-        gate_up=_tensor(torch, (experts, 2 * intermediate, hidden // 2)),
-        down=_tensor(torch, (experts, hidden, intermediate // 2)),
-        gate_up_scales=_tensor(torch, (experts, 2 * intermediate, hidden // 32)),
-        down_scales=_tensor(torch, (experts, hidden, intermediate // 32)),
-        gate_up_bias=_tensor(torch, (experts, 2 * intermediate), torch.float32),
-        down_bias=_tensor(torch, (experts, hidden), torch.float32),
+        gate_up=_tensor(runtime, (experts, 2 * intermediate, hidden // 2)),
+        down=_tensor(runtime, (experts, hidden, intermediate // 2)),
+        gate_up_scales=_tensor(runtime, (experts, 2 * intermediate, hidden // 32)),
+        down_scales=_tensor(runtime, (experts, hidden, intermediate // 32)),
+        gate_up_bias=_tensor(
+            runtime, (experts, 2 * intermediate), runtime.float32
+        ),
+        down_bias=_tensor(runtime, (experts, hidden), runtime.float32),
     )
 
 
 class TestFlashInferMXFP4Adapter:
-    def _kernel(self, *, capability=(9, 0)):
-        from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
+    def _kernel(self, monkeypatch, *, capability=(9, 0)):
+        import resin_models_cuda.gpt_oss.flashinfer as flashinfer
+        from resin_models_cuda.gpt_oss.flashinfer import (
+            FlashInferSM90MXFP4Kernel,
+        )
 
         torch = _FakeTorch(capability)
         fused_moe = _FakeFusedMoE()
-        kernel = FlashInferSM90MXFP4Kernel(
-            _torch_module=torch,
-            _fused_moe_api=fused_moe,
-        )
+        monkeypatch.setattr(flashinfer, "torch", torch)
+        kernel = FlashInferSM90MXFP4Kernel()
+        kernel._fused_moe = fused_moe
         return kernel, torch, fused_moe
 
-    def test_capabilities_implement_the_standard_contract(self) -> None:
-        kernel, _, _ = self._kernel()
+    def test_capabilities_implement_the_standard_contract(self, monkeypatch) -> None:
+        kernel, _, _ = self._kernel(monkeypatch)
         assert isinstance(kernel, MoEKernel)
         assert kernel.supports(_config(), num_tokens=16)
         assert not kernel.supports(replace(_config(), architecture="sm100"))
@@ -238,8 +242,10 @@ class TestFlashInferMXFP4Adapter:
         ):
             kernel.validate(replace(_config(), activation_limit=None))
 
-    def test_prepare_pads_2880_and_uses_exact_sm90_interleavers(self) -> None:
-        kernel, torch, fused_moe = self._kernel()
+    def test_prepare_pads_2880_and_uses_exact_sm90_interleavers(
+        self, monkeypatch
+    ) -> None:
+        kernel, torch, fused_moe = self._kernel(monkeypatch)
         prepared = kernel.prepare_weights(_weights(torch), _config())
 
         assert [(call[0].shape, call[1]) for call in fused_moe.weight_calls] == [
@@ -290,8 +296,10 @@ class TestFlashInferMXFP4Adapter:
         assert prepared.padded_hidden_size == 2944
         assert prepared.padded_intermediate_size == 2944
 
-    def test_forward_uses_exact_low_level_api_types_and_scale_order(self) -> None:
-        kernel, torch, fused_moe = self._kernel()
+    def test_forward_uses_exact_low_level_api_types_and_scale_order(
+        self, monkeypatch
+    ) -> None:
+        kernel, torch, fused_moe = self._kernel(monkeypatch)
         config = _config()
         prepared = kernel.prepare_weights(_weights(torch), config)
         hidden = _tensor(torch, (16, 2880), torch.bfloat16)
@@ -325,8 +333,8 @@ class TestFlashInferMXFP4Adapter:
         assert call["tune_max_num_tokens"] == 8192
         assert call["activation_type"] == _ActivationType.Swiglu
 
-    def test_shape_architecture_and_incremental_builder_fail_early(self) -> None:
-        kernel, torch, _ = self._kernel()
+    def test_shape_and_architecture_fail_early(self, monkeypatch) -> None:
+        kernel, torch, _ = self._kernel(monkeypatch)
         config = _config()
         invalid = _weights(torch)
         invalid = replace(
@@ -336,30 +344,8 @@ class TestFlashInferMXFP4Adapter:
         with pytest.raises(ValueError, match="gate_up must have shape"):
             kernel.prepare_weights(invalid, config)
 
-        wrong_arch_kernel, wrong_arch_torch, _ = self._kernel(capability=(10, 0))
+        wrong_arch_kernel, wrong_arch_torch, _ = self._kernel(
+            monkeypatch, capability=(10, 0)
+        )
         with pytest.raises(UnsupportedMoEConfiguration, match="requires SM90"):
             wrong_arch_kernel.prepare_weights(_weights(wrong_arch_torch), config)
-
-        builder = kernel.builder(config)
-        weights = _weights(torch)
-        builder.add("gate_up", weights.gate_up)
-        with pytest.raises(ValueError, match="duplicate"):
-            builder.add("gate_up", weights.gate_up)
-        with pytest.raises(ValueError, match="missing MXFP4"):
-            builder.finish()
-
-        complete = kernel.builder(config)
-        for field in (
-            "gate_up",
-            "down",
-            "gate_up_scales",
-            "down_scales",
-            "gate_up_bias",
-            "down_bias",
-        ):
-            complete.add(field, getattr(weights, field))
-        prepared = complete.finish()
-        assert prepared.padded_hidden_size == 2944
-        assert not complete._tensors
-        with pytest.raises(RuntimeError, match="already finished"):
-            complete.finish()

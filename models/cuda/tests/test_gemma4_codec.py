@@ -8,9 +8,9 @@ import pytest
 import torch
 from PIL import Image
 
+from resin.models.gemma4.codec import Gemma4Codec
+from resin.models.gemma4.media import Gemma4Media
 from resin.server.media import normalized_rgb_from_data_url
-from resin_models_cuda.gemma4.codec import Gemma4Codec
-from resin_models_cuda.gemma4.media import Gemma4Media
 
 
 def _data_url() -> str:

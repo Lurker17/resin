@@ -1,4 +1,4 @@
-"""Validated text configuration for Qwen3.5-family checkpoints."""
+"""Backend-neutral text configuration for Qwen3.5-family checkpoints."""
 
 from __future__ import annotations
 

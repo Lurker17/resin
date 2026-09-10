@@ -1,4 +1,4 @@
-"""Translate native flat-cache metadata to Gemma 4 paged-attention inputs."""
+"""Translate Resin cache metadata to Gemma 4 paged-attention inputs."""
 
 from __future__ import annotations
 

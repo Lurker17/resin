@@ -1,12 +1,12 @@
-"""FlashInfer's Hopper MXFP4 fused-MoE adapter for GPT-OSS.
+"""GPT-OSS FlashInfer Hopper MXFP4 fused-MoE kernel adapter.
 
 The public boundary is :mod:`resin.moe_kernels`; this module contains only the
 FlashInfer-specific cold-path layout conversion and hot-path invocation.
 
 FlashInfer's SM90 W4A16 scale layout groups four consecutive MXFP4 groups.
-GPT-OSS uses a width of 2880 (90 groups), so preparation pads the hidden and
-intermediate dimensions to 2944 (92 groups).  Gate/up rows are padded in paired
-order from 5760 to 5888.  GPT-OSS stores paired ``[gate, up]`` rows, while the
+For a width of 2880 (90 groups), preparation pads the hidden and intermediate
+dimensions to 2944 (92 groups). Gate/up rows are padded in paired order from
+5760 to 5888. The semantic interface stores paired ``[gate, up]`` rows, while the
 CUTLASS activation consumes ``[all up, all gate]``; preparation applies that
 row permutation consistently to weights, scales, and biases.  FlashInfer's
 fused runner uses one hidden size for both input and output, so the second
@@ -86,7 +86,7 @@ def _shape(tensor: Any) -> tuple[int, ...]:
         raise TypeError("MoE weights and routing values must be tensor-like") from error
 
 
-def _reinterpret_interleaved_scales(torch: Any, tensor: Any, field: str):
+def _reinterpret_interleaved_scales(tensor: Any, field: str):
     """Expose FlashInfer's interleaved scale bytes through its tested ABI view."""
 
     shape = _shape(tensor)
@@ -102,7 +102,7 @@ def _reinterpret_interleaved_scales(torch: Any, tensor: Any, field: str):
     return tensor.view(torch.int32)
 
 
-def _copy_into_padded(torch: Any, tensor: Any, shape: tuple[int, ...], fill: int):
+def _copy_into_padded(tensor: Any, shape: tuple[int, ...], fill: int):
     if _shape(tensor) == shape:
         return tensor.contiguous()
     padded = torch.full(
@@ -118,7 +118,7 @@ def _copy_into_padded(torch: Any, tensor: Any, shape: tuple[int, ...], fill: int
 
 
 def _reorder_and_pad_gate_up(
-    torch: Any, tensor: Any, shape: tuple[int, ...], fill: int
+    tensor: Any, shape: tuple[int, ...], fill: int
 ):
     """Convert paired ``[gate, up]`` rows to CUTLASS ``[up..., gate...]``."""
 
@@ -154,13 +154,7 @@ def _reorder_and_pad_gate_up(
 
 
 class FlashInferSM90MXFP4Kernel:
-    """Adapter for ``flashinfer.fused_moe.cutlass_fused_moe`` on H100.
-
-    The optional underscored constructor arguments are dependency-injection
-    seams for CPU contract tests.  Production callers should use the default
-    constructor, which validates CUDA compute capability before transforming
-    any weights.
-    """
+    """Adapter for ``flashinfer.fused_moe.cutlass_fused_moe`` on H100."""
 
     capabilities = MoEKernelCapabilities(
         kernel_id=KERNEL_ID,
@@ -176,15 +170,6 @@ class FlashInferSM90MXFP4Kernel:
         max_tokens=_MAX_TOKENS,
         gate_up_layouts={"interleaved_gate_up"},
     )
-
-    def __init__(
-        self,
-        *,
-        _torch_module: Any | None = None,
-        _fused_moe_api: Any | None = None,
-    ) -> None:
-        self._torch = _torch_module
-        self._fused_moe = _fused_moe_api
 
     def supports(
         self, config: MoEKernelConfig, *, num_tokens: int | None = None
@@ -202,13 +187,8 @@ class FlashInferSM90MXFP4Kernel:
                 f"kernel {KERNEL_ID!r} requires activation_limit for SwiGLU"
             )
 
-    def _get_torch(self):
-        if self._torch is None:
-            self._torch = torch
-        return self._torch
-
     def _get_fused_moe(self):
-        if self._fused_moe is None:
+        if not hasattr(self, "_fused_moe"):
             from flashinfer import fused_moe
 
             self._fused_moe = fused_moe
@@ -228,7 +208,6 @@ class FlashInferSM90MXFP4Kernel:
         return self._fused_moe
 
     def _validate_sm90_tensor(self, tensor: Any, field: str) -> None:
-        torch = self._get_torch()
         if not bool(getattr(tensor, "is_cuda", False)):
             raise ValueError(f"{field} must be a CUDA tensor")
         capability = tuple(torch.cuda.get_device_capability(tensor.device))
@@ -254,7 +233,6 @@ class FlashInferSM90MXFP4Kernel:
     def _validate_weight_field(
         self, field: str, tensor: Any, config: MoEKernelConfig
     ) -> None:
-        torch = self._get_torch()
         expected = self._expected_shapes(config)[field]
         actual = _shape(tensor)
         if actual != expected:
@@ -281,17 +259,10 @@ class FlashInferSM90MXFP4Kernel:
                     f"{tensor.device}, expected {expected}"
                 )
 
-    def builder(self, config: MoEKernelConfig) -> FlashInferMXFP4WeightBuilder:
-        """Create a per-layer receiver for tensors arriving shard by shard."""
-
-        self.validate(config)
-        return FlashInferMXFP4WeightBuilder(self, config)
-
     def prepare_weights(
         self, weights: MoEExpertWeights[Any], config: MoEKernelConfig
     ) -> PreparedFlashInferMXFP4Weights:
         self.validate(config)
-        torch = self._get_torch()
         fused_moe = self._get_fused_moe()
 
         required = {
@@ -326,14 +297,12 @@ class FlashInferSM90MXFP4Kernel:
         # an interleaver allocates its output would add several unnecessary
         # gigabytes to GPT-OSS-120B's load-time peak.
         fc1 = _reorder_and_pad_gate_up(
-            torch,
             weights.gate_up,
             (experts, 2 * padded_intermediate, padded_hidden // 2),
             0,
         )
         fc1 = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(fc1, "fp4")
         fc1_scales = _reorder_and_pad_gate_up(
-            torch,
             weights.gate_up_scales,
             (experts, 2 * padded_intermediate, padded_hidden // _MXFP4_GROUP_SIZE),
             127,
@@ -341,18 +310,14 @@ class FlashInferSM90MXFP4Kernel:
         fc1_scales = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(
             fc1_scales, _MXFP4_GROUP_SIZE
         )
-        fc1_scales = _reinterpret_interleaved_scales(
-            torch, fc1_scales, "gate_up_scales"
-        )
+        fc1_scales = _reinterpret_interleaved_scales(fc1_scales, "gate_up_scales")
         fc2 = _copy_into_padded(
-            torch,
             weights.down,
             (experts, padded_hidden, padded_intermediate // 2),
             0,
         )
         fc2 = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(fc2, "fp4")
         fc2_scales = _copy_into_padded(
-            torch,
             weights.down_scales,
             (
                 experts,
@@ -364,7 +329,7 @@ class FlashInferSM90MXFP4Kernel:
         fc2_scales = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(
             fc2_scales, _MXFP4_GROUP_SIZE
         )
-        fc2_scales = _reinterpret_interleaved_scales(torch, fc2_scales, "down_scales")
+        fc2_scales = _reinterpret_interleaved_scales(fc2_scales, "down_scales")
 
         device = weights.gate_up.device
         fc1_bias = None
@@ -374,12 +339,12 @@ class FlashInferSM90MXFP4Kernel:
                 device=device, dtype=torch.bfloat16
             ).contiguous()
             fc1_bias = _reorder_and_pad_gate_up(
-                torch, fc1_bias, (experts, 2 * padded_intermediate), 0
+                fc1_bias, (experts, 2 * padded_intermediate), 0
             )
             fc2_bias = weights.down_bias.to(
                 device=device, dtype=torch.bfloat16
             ).contiguous()
-            fc2_bias = _copy_into_padded(torch, fc2_bias, (experts, padded_hidden), 0)
+            fc2_bias = _copy_into_padded(fc2_bias, (experts, padded_hidden), 0)
 
         activation_shape = (experts,)
         alpha = torch.full(
@@ -438,7 +403,6 @@ class FlashInferSM90MXFP4Kernel:
                 f"hidden_states width must be {config.hidden_size}, got {hidden_size}"
             )
 
-        torch = self._get_torch()
         fused_moe = self._get_fused_moe()
         self._validate_sm90_tensor(hidden_states, "hidden_states")
         if hidden_states.dtype != torch.bfloat16:
@@ -483,7 +447,6 @@ class FlashInferSM90MXFP4Kernel:
         ).contiguous()
 
         kernel_input = _copy_into_padded(
-            torch,
             hidden_states,
             (num_tokens, weights.padded_hidden_size),
             0,
@@ -533,79 +496,8 @@ class FlashInferSM90MXFP4Kernel:
         return output
 
 
-class FlashInferMXFP4WeightBuilder:
-    """Incremental, single-layer receiver for a shard-streaming model loader."""
-
-    _FIELDS = frozenset(
-        {
-            "gate_up",
-            "down",
-            "gate_up_scales",
-            "down_scales",
-            "gate_up_bias",
-            "down_bias",
-        }
-    )
-
-    def __init__(
-        self, kernel: FlashInferSM90MXFP4Kernel, config: MoEKernelConfig
-    ) -> None:
-        self._kernel = kernel
-        self._config = config
-        self._tensors: dict[str, Any] = {}
-        self._finished = False
-
-    def add(self, field: str, tensor: Any) -> FlashInferMXFP4WeightBuilder:
-        if self._finished:
-            raise RuntimeError("this MXFP4 weight builder is already finished")
-        if field not in self._FIELDS:
-            raise KeyError(f"unknown MXFP4 expert tensor: {field!r}")
-        if field in self._tensors:
-            raise ValueError(f"duplicate MXFP4 expert tensor: {field}")
-        self._kernel._validate_weight_field(field, tensor, self._config)
-        if self._tensors:
-            expected_device = next(iter(self._tensors.values())).device
-            if tensor.device != expected_device:
-                raise ValueError(
-                    f"all expert tensors must share one device; {field} is on "
-                    f"{tensor.device}, expected {expected_device}"
-                )
-        self._tensors[field] = tensor
-        return self
-
-    def finish(self) -> PreparedFlashInferMXFP4Weights:
-        if self._finished:
-            raise RuntimeError("this MXFP4 weight builder is already finished")
-        required = {"gate_up", "down", "gate_up_scales", "down_scales"}
-        if self._config.expert_bias:
-            required.update({"gate_up_bias", "down_bias"})
-        missing = sorted(required - self._tensors.keys())
-        if missing:
-            raise ValueError("missing MXFP4 expert tensors: " + ", ".join(missing))
-        weights = MoEExpertWeights(
-            gate_up=self._tensors["gate_up"],
-            down=self._tensors["down"],
-            gate_up_scales=self._tensors["gate_up_scales"],
-            down_scales=self._tensors["down_scales"],
-            gate_up_bias=self._tensors.get("gate_up_bias"),
-            down_bias=self._tensors.get("down_bias"),
-        )
-        prepared = self._kernel.prepare_weights(weights, self._config)
-        self._tensors.clear()
-        self._finished = True
-        return prepared
-
-
-def make_flashinfer_sm90_mxfp4_kernel() -> FlashInferSM90MXFP4Kernel:
-    """Return the production adapter without importing accelerator packages."""
-
-    return FlashInferSM90MXFP4Kernel()
-
-
 __all__ = [
     "KERNEL_ID",
-    "FlashInferMXFP4WeightBuilder",
     "FlashInferSM90MXFP4Kernel",
     "PreparedFlashInferMXFP4Weights",
-    "make_flashinfer_sm90_mxfp4_kernel",
 ]

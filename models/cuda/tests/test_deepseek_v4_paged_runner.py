@@ -106,7 +106,7 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
     assert inputs["sampling_top_ks"] == (32, 32, 32, 32)
 
 
-def test_prefill_uses_fresh_prompt_then_replays_only_continuation_suffix() -> None:
+def test_prefill_uses_one_paged_path_for_fresh_and_continuation_rows() -> None:
     runner = _validation_runner()
     runner.device = torch.device("cpu")
     runner.speculative_tokens = 0
@@ -123,13 +123,6 @@ def test_prefill_uses_fresh_prompt_then_replays_only_continuation_suffix() -> No
     class Model:
         def __init__(self) -> None:
             self.calls = []
-
-        def forward_target(self, input_ids, *, cache):
-            self.calls.append(("fresh", input_ids.tolist(), cache))
-            logits = torch.nn.functional.one_hot(
-                input_ids[:, -1], num_classes=64
-            ).float()
-            return logits, None
 
         def forward_prefill(self, input_ids, start_position, *, cache):
             self.calls.append(
@@ -165,6 +158,6 @@ def test_prefill_uses_fresh_prompt_then_replays_only_continuation_suffix() -> No
 
     assert logits.argmax(dim=-1).tolist() == [3, 9]
     assert runner._model.calls == [
-        ("fresh", [[2, 3]], "cache-row-0"),
+        ("continue", [[2, 3]], 0, "cache-row-0"),
         ("continue", [[8, 9]], 128, "cache-row-1"),
     ]

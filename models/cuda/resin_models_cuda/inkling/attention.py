@@ -1,4 +1,4 @@
-"""FlashAttention-4 helpers for Inkling relative and DSpark rotary attention."""
+"""Inkling FlashAttention-4 relative and DSpark rotary attention kernels."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from resin_models_cuda.inkling.cache import PAGE_TOKENS, DeviceCache
+from resin.backend.cuda.paged_kv import SlabPagedKvCache
+from resin_models_cuda.paged_kv import append_slab_kv
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,7 +25,7 @@ class PagedAttentionBatch:
 
 
 def prepare_paged_attention_batch(
-    cache: DeviceCache,
+    cache: SlabPagedKvCache,
     sequence_lengths: Tensor,
     max_sequence_length: int,
     *,
@@ -36,16 +37,16 @@ def prepare_paged_attention_batch(
 
     if sequence_lengths.shape != (batch,):
         raise ValueError("Inkling sequence lengths do not match the attention batch")
-    if len(layer_counts) > len(cache.groups) or any(count <= 0 for count in layer_counts):
+    if len(layer_counts) > len(cache.groups) or any(
+        count <= 0 for count in layer_counts
+    ):
         raise ValueError("Inkling attention cache-group geometry is invalid")
 
     page_tables = []
     used_lengths = []
     max_lengths = []
     for group, layer_count in zip(cache.groups, layer_counts):
-        base_pages = (
-            group.slab_ids * cache.slab_units + group.slotnums * layer_count
-        )
+        base_pages = group.slab_ids * cache.slab_units + group.slotnums * layer_count
         layer_offsets = torch.arange(
             layer_count,
             dtype=base_pages.dtype,
@@ -112,29 +113,13 @@ def log_scaling_tau(positions: Tensor, *, n_floor: int, alpha: float) -> Tensor:
     return 1.0 + alpha * torch.log(torch.clamp(effective / float(n_floor), min=1.0))
 
 
-def append_kv(
-    cache: DeviceCache,
-    *,
-    group_index: int,
-    layer: int,
-    layer_count: int,
-    positions: Tensor,
-    keys: Tensor,
-    values: Tensor,
-) -> None:
-    """Write a rectangular batch into one layer's slab-addressed KV pages."""
-
-    rows = cache.rows(group_index, layer, layer_count, positions)
-    pages = rows.div(PAGE_TOKENS, rounding_mode="floor")
-    offsets = rows.remainder(PAGE_TOKENS)
-    cache.keys[pages, offsets] = keys
-    cache.values[pages, offsets] = values
+append_kv = append_slab_kv
 
 
 def paged_attention(
     queries: Tensor,
     *,
-    cache: DeviceCache,
+    cache: SlabPagedKvCache,
     group_index: int,
     layer: int,
     layer_count: int,
@@ -156,9 +141,9 @@ def paged_attention(
     if prepared_batch is None:
         group = cache.groups[group_index]
         page_table = cache.pages(group_index, layer, layer_count)
-        retained_starts = group.first_blocks * PAGE_TOKENS
+        retained_starts = group.first_blocks * cache.page_tokens
         used_lengths = (sequence_lengths - retained_starts).to(torch.int32)
-        max_k = min(max_sequence_length, page_table.shape[1] * PAGE_TOKENS)
+        max_k = min(max_sequence_length, page_table.shape[1] * cache.page_tokens)
         cu_q = (
             torch.arange(batch + 1, dtype=torch.int32, device=queries.device) * tokens
         )

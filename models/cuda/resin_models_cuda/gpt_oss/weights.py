@@ -9,45 +9,12 @@ from typing import Any
 
 import torch
 
-from resin.backend.loading import resolve_dtype
+from resin.backend.loading import assign_model_tensor, resolve_dtype
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 
 _EXPERT_KEY = re.compile(
     r"^model\.layers\.(?P<layer>[0-9]+)\.mlp\.experts\.(?P<name>.+)$"
 )
-
-
-def _assign_tensor(model: Any, key: str, tensor: Any, *, device, dtype) -> None:
-    module_path, name = key.rsplit(".", 1)
-    try:
-        module = model.get_submodule(module_path)
-    except AttributeError as error:
-        raise ValueError(f"checkpoint tensor has no model target: {key!r}") from error
-
-    if name in module._parameters and module._parameters[name] is not None:
-        existing = module._parameters[name]
-        parameter = True
-    elif name in module._buffers and module._buffers[name] is not None:
-        existing = module._buffers[name]
-        parameter = False
-    else:
-        raise ValueError(f"checkpoint tensor has no model target: {key!r}")
-    if tuple(existing.shape) != tuple(tensor.shape):
-        raise ValueError(
-            f"shape mismatch for {key!r}: checkpoint {tuple(tensor.shape)}, "
-            f"model {tuple(existing.shape)}"
-        )
-
-    moved = tensor.to(
-        device=device,
-        dtype=dtype if dtype is not None and tensor.is_floating_point() else None,
-    )
-    if parameter:
-        module._parameters[name] = torch.nn.Parameter(
-            moved, requires_grad=existing.requires_grad
-        )
-    else:
-        module._buffers[name] = moved
 
 
 def _identity_tensor(_key: str, tensor: Any) -> Any:
@@ -73,7 +40,7 @@ def load_gpt_oss_weights(
     target = torch.device(device)
     if target.type == "meta":
         raise ValueError("GPT-OSS weights must be loaded onto a material device")
-    resolved_dtype = resolve_dtype(torch, dtype)
+    resolved_dtype = resolve_dtype(dtype)
     if resolved_dtype is not None and not resolved_dtype.is_floating_point:
         raise ValueError("model dtype must be floating point")
 
@@ -99,7 +66,7 @@ def load_gpt_oss_weights(
         for key in ordinary_keys:
             tensor = reader.read(tensor_files[key], key)
             tensor = transform_tensor(key, tensor)
-            _assign_tensor(
+            assign_model_tensor(
                 model,
                 key,
                 tensor,

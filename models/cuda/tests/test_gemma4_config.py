@@ -4,7 +4,7 @@ import copy
 
 import pytest
 
-from resin_models_cuda.gemma4.config import Gemma4Nvfp4Config
+from resin.models.gemma4.config import Gemma4Nvfp4Config
 
 
 def gemma4_config_dict() -> dict:

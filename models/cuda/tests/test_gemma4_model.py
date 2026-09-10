@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from resin_models_cuda.gemma4.config import Gemma4Nvfp4Config
+from resin.models.gemma4.config import Gemma4Nvfp4Config
 from resin_models_cuda.gemma4.model import (
     Gemma4Attention,
     RotaryEmbedding,

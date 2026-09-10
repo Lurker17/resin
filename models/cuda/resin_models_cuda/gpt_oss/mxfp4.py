@@ -128,7 +128,7 @@ def _checkpoint_tensor_for_rank(
     return tensor
 
 
-def _cuda_architecture(torch, device) -> str:
+def _cuda_architecture(device) -> str:
     if device.type != "cuda":
         raise ValueError("packed GPT-OSS MXFP4 execution requires a CUDA device")
     major, minor = torch.cuda.get_device_capability(device)
@@ -153,7 +153,7 @@ def _moe_config(args, architecture: str) -> MoEKernelConfig:
     )
 
 
-def _make_kernel_expert_factory(torch, kernel, config: MoEKernelConfig):
+def _make_kernel_expert_factory(kernel, config: MoEKernelConfig):
     class KernelExperts(torch.nn.Module):
         storage_format = config.quantization
 
@@ -243,7 +243,7 @@ def load_mxfp4_model(
 ):
     """Load an official packed checkpoint without Transformers or tokenizers."""
 
-    from resin_models_cuda.gpt_oss.config import GptOssConfig
+    from resin.models.gpt_oss.config import GptOssConfig
     from resin_models_cuda.gpt_oss.model import GptOssForCausalLM
 
     path = Path(model_path)
@@ -258,15 +258,15 @@ def load_mxfp4_model(
         raise ValueError("load_mxfp4_model requires an MXFP4 GPT-OSS checkpoint")
 
     target = torch.device(device)
-    resolved_dtype = resolve_dtype(torch, dtype)
+    resolved_dtype = resolve_dtype(dtype)
     if resolved_dtype not in {None, torch.bfloat16}:
         raise ValueError("the packed SM90 GPT-OSS path requires bfloat16 activations")
-    architecture = _cuda_architecture(torch, target)
+    architecture = _cuda_architecture(target)
     local_args = _local_args(args, tensor_parallel)
     moe_config = _moe_config(local_args, architecture)
     kernel.validate(moe_config)
 
-    expert_factory = _make_kernel_expert_factory(torch, kernel, moe_config)
+    expert_factory = _make_kernel_expert_factory(kernel, moe_config)
     with torch.device("meta"):
         model = GptOssForCausalLM(local_args, expert_factory)
 
@@ -307,7 +307,7 @@ def load_mxfp4_model(
             "ordinary model parameters remain on meta: " + ", ".join(remaining_meta[:8])
         )
     model.eval()
-    return torch, model, config
+    return model, config
 
 
 __all__ = ["load_mxfp4_model"]

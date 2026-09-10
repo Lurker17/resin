@@ -6,17 +6,24 @@ benchmark results.
 
 ## CUDA runner
 
-`resin_models_cuda.gpt_oss.GptOssCudaRunner` is the managed path. Its relevant
+`resin_models_cuda.gpt_oss.cuda.GptOssCudaRunner` is the managed path. Its relevant
 constructor surface is:
 
 ```python
+from resin.backend.quantization import MXFP4, QuantizationConfig
+from resin_models_cuda.gpt_oss.flashinfer import (
+    FlashInferSM90MXFP4Kernel,
+)
+
 runner = GptOssCudaRunner(
     model,
     cache_parent_capacity=...,
     revision=None,
     device=None,
     dtype=None,
-    moe_kernel=None,
+    quantization=QuantizationConfig({"transformer.experts": MXFP4}),
+    kernel_attention=None,
+    kernel_moe=FlashInferSM90MXFP4Kernel(),
     cuda_graph_decode_shapes=((1, full_page_table_width),),
 )
 
@@ -35,7 +42,11 @@ CacheLayout(
     cache_parent_capacity,
     [
         CacheGroupLayout(128),
-        CacheGroupLayout(128, retention=CacheRetention.WINDOW, window_tokens=128),
+        CacheGroupLayout(
+            128,
+            retention=CacheRetention.WINDOW,
+            window_tokens=8192 + 128 - 1,
+        ),
     ],
 )
 ```
@@ -73,8 +84,14 @@ The managed runner keeps policy boundaries narrow:
 - Shared FlashInfer logits processing applies each row's temperature, top-k,
   top-p, seed, and offset. Temperature zero selects argmax.
 - Configured decode shapes use Resin's reusable CUDA graph cache: the backend
-  declares stable tensors and one device launch, then the shared cache stages,
-  warms, captures, validates, and replays it automatically.
+  declares stable tensors and ordered capture/eager regions, then the shared
+  cache stages, warms, captures, validates, and replays them automatically.
+
+The model frontend passes imported kernels as ordinary Python objects. There is
+no kernel or quantization registry: `QuantizationConfig` validates the physical
+checkpoint encoding, while the selected MoE adapter validates its own semantic
+operator contract. GPT-OSS-specific code supplies only checkpoint/configuration
+hooks and fixed cache geometry to the reusable paged sink-MoE runner.
 
 CUDA graphs are strictly a current-batch execution optimization. The common
 graph layer stages the current Rust-built decode plan into stable buffers; it

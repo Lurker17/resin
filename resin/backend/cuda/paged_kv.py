@@ -2,10 +2,48 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
+
+import numpy as np
+import torch
 
 from resin.backend.resources import CachePoolBinding
+
+
+class SlabPageGroup(Protocol):
+    """The page-table fields shared by slab-packed model caches."""
+
+    slab_ids: Any
+    slotnums: Any
+    first_blocks: Any
+
+
+class SlabPagedKvCache(Protocol):
+    """Narrow cache interface consumed by importable attention kernels."""
+
+    page_tokens: int
+    slab_units: int
+    groups: tuple[SlabPageGroup, ...]
+    keys: Any
+    values: Any
+
+    def rows(self, group_index, layer, layer_count, positions): ...
+
+
+class PagedCacheMapping(Protocol):
+    """Physical address mapping accepted by fused cache-aware kernels."""
+
+    parent_ids: Any
+    child_slots: Any
+    first_blocks: Any
+    block_tokens: int
+    divisor: int
+    parent_rows: int
+    packing: int
+    row_scale: int
+    layer_offset: int
 
 
 class PagedKvArena:
@@ -13,7 +51,6 @@ class PagedKvArena:
 
     def __init__(
         self,
-        torch,
         device,
         layout,
         *,
@@ -57,3 +94,195 @@ class PagedKvCsr:
     last_page_lengths: Any
     append_batch_indices: Any
     append_positions: Any
+
+
+@dataclass(frozen=True, slots=True)
+class DevicePagedAttentionBatch:
+    """CUDA tensors for one backend-neutral named paged-attention batch."""
+
+    phase: Any
+    round_index: int
+    token_indices: Any
+    sequence_indices: Any
+    last_token_indices: Any
+    cu_seqlens_q: Any
+    max_seqlen_q: int
+    groups: tuple[tuple[str, PagedKvTable], ...]
+
+    def group(self, name: str) -> PagedKvTable:
+        try:
+            return next(
+                group for group_name, group in self.groups if group_name == name
+            )
+        except StopIteration as error:
+            raise KeyError(f"unknown device paged attention group: {name!r}") from error
+
+
+def stage_paged_attention_batch(batch, staging, prefix: str):
+    """Copy one semantic paged-attention batch to CUDA tensors."""
+
+    def device(name, values, dtype):
+        return staging.device(f"{prefix}.{name}", values, dtype)
+
+    cu_seqlens_q = [0]
+    for length in batch.query_lengths:
+        cu_seqlens_q.append(cu_seqlens_q[-1] + length)
+    row_count = len(batch.sequence_indices)
+    groups = []
+    for group in batch.groups:
+        if (
+            group.page_table.size
+            and int(group.page_table.max()) > np.iinfo(np.int32).max
+        ):
+            raise ValueError(f"paged attention group {group.name!r} exceeds CUDA int32")
+        groups.append(
+            (
+                group.name,
+                PagedKvTable(
+                    page_table=device(
+                        f"{group.name}.pages", group.page_table, torch.int32
+                    ).view(row_count, group.width),
+                    lengths=device(f"{group.name}.lengths", group.lengths, torch.int32),
+                    append_slots=device(
+                        f"{group.name}.append", group.append_slots, torch.long
+                    ),
+                    min_length=min(group.lengths),
+                    max_length=max(group.lengths),
+                ),
+            )
+        )
+    return DevicePagedAttentionBatch(
+        phase=batch.phase,
+        round_index=0,
+        token_indices=device("token_indices", batch.token_indices, torch.long),
+        sequence_indices=device("sequence_indices", batch.sequence_indices, torch.long),
+        last_token_indices=device(
+            "last_token_indices",
+            tuple(end - 1 for end in cu_seqlens_q[1:]),
+            torch.long,
+        ),
+        cu_seqlens_q=device("cu_seqlens_q", cu_seqlens_q, torch.int32),
+        max_seqlen_q=max(batch.query_lengths),
+        groups=tuple(groups),
+    )
+
+
+def empty_decode_paged_attention_batch(
+    device,
+    batch_size: int,
+    group_shapes: Mapping[str, tuple[int, int]],
+) -> DevicePagedAttentionBatch:
+    """Allocate one fixed-address decode batch for CUDA graph capture."""
+
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or batch_size <= 0
+    ):
+        raise ValueError("batch_size must be a positive integer")
+    if not group_shapes:
+        raise ValueError("a decode attention batch needs at least one cache group")
+    for name, dimensions in group_shapes.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("paged attention group name must be nonempty")
+        if (
+            not isinstance(dimensions, tuple)
+            or len(dimensions) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in dimensions
+            )
+        ):
+            raise ValueError("paged attention group shapes must be positive pairs")
+
+    def empty(dtype, *shape):
+        return torch.empty(shape, dtype=dtype, device=device)
+
+    groups = tuple(
+        (
+            name,
+            PagedKvTable(
+                page_table=empty(torch.int32, batch_size, width),
+                lengths=empty(torch.int32, batch_size),
+                append_slots=empty(torch.long, batch_size),
+                min_length=1,
+                max_length=width * page_size,
+            ),
+        )
+        for name, (width, page_size) in group_shapes.items()
+    )
+    from resin import BatchPhase
+
+    return DevicePagedAttentionBatch(
+        phase=BatchPhase.DECODE,
+        round_index=0,
+        token_indices=empty(torch.long, batch_size),
+        sequence_indices=empty(torch.long, batch_size),
+        last_token_indices=torch.arange(batch_size, dtype=torch.long, device=device),
+        cu_seqlens_q=torch.arange(batch_size + 1, dtype=torch.int32, device=device),
+        max_seqlen_q=1,
+        groups=groups,
+    )
+
+
+def paged_attention_graph_inputs(batch: DevicePagedAttentionBatch) -> dict[str, Any]:
+    """Expose stable graph input names for one device batch."""
+
+    inputs = {
+        "token_indices": batch.token_indices,
+        "sequence_indices": batch.sequence_indices,
+    }
+    for name, group in batch.groups:
+        inputs[f"{name}_page_table"] = group.page_table
+        inputs[f"{name}_seqused_k"] = group.lengths
+        inputs[f"{name}_append_slots"] = group.append_slots
+    return inputs
+
+
+def pad_paged_attention_table(group, width: int):
+    """Pad each host row by repeating one page already owned by that row."""
+
+    if group.width > width:
+        raise ValueError("paged attention table exceeds fixed CUDA graph shape")
+    rows = len(group.lengths)
+    source = group.page_table.reshape(rows, group.width)
+    padded = np.empty((rows, width), dtype=group.page_table.dtype)
+    padded[:, : group.width] = source
+    padded[:, group.width :] = source[:, :1]
+    return padded.reshape(-1)
+
+
+def paged_attention_host_inputs(
+    batch, group_widths: Mapping[str, int]
+) -> dict[str, Any]:
+    """Build named host values matching :func:`paged_attention_graph_inputs`."""
+
+    inputs = {
+        "token_indices": batch.token_indices,
+        "sequence_indices": batch.sequence_indices,
+    }
+    if set(group_widths) != {group.name for group in batch.groups}:
+        raise ValueError("CUDA graph group widths do not match attention groups")
+    for group in batch.groups:
+        inputs[f"{group.name}_page_table"] = pad_paged_attention_table(
+            group, group_widths[group.name]
+        )
+        inputs[f"{group.name}_seqused_k"] = group.lengths
+        inputs[f"{group.name}_append_slots"] = group.append_slots
+    return inputs
+
+
+__all__ = [
+    "DevicePagedAttentionBatch",
+    "PagedKvArena",
+    "PagedCacheMapping",
+    "PagedKvCsr",
+    "PagedKvTable",
+    "SlabPageGroup",
+    "SlabPagedKvCache",
+    "empty_decode_paged_attention_batch",
+    "pad_paged_attention_table",
+    "paged_attention_graph_inputs",
+    "paged_attention_host_inputs",
+    "stage_paged_attention_batch",
+]

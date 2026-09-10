@@ -1,4 +1,4 @@
-"""Validated geometry for Inkling-Small and its external DSpark drafter."""
+"""Backend-neutral geometry for Inkling-Small and its DSpark drafter."""
 
 from __future__ import annotations
 

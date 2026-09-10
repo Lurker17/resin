@@ -1,6 +1,8 @@
-"""Framework-injected sampling operations shared by model runners."""
+"""PyTorch sampling operations shared by model runners."""
 
 from __future__ import annotations
+
+import torch
 
 SAMPLING_OFFSET_STRIDE = 32
 
@@ -44,9 +46,6 @@ def batch_sampling_inputs(plan, vocab_size: int) -> dict[str, object]:
 class TorchSampler:
     """Readable reference sampler with row-stable stateless randomness."""
 
-    def __init__(self, torch) -> None:
-        self.torch = torch
-
     @staticmethod
     def _mixed_seed(seed: int, offset: int) -> int:
         value = (seed + offset * 0x9E3779B97F4A7C15) & ((1 << 64) - 1)
@@ -76,23 +75,23 @@ class TorchSampler:
             scores = logits[row].float() / temperature
             top_k = values["top_ks"][row]
             if top_k < scores.numel():
-                scores, token_ids = self.torch.topk(scores, top_k, sorted=True)
+                scores, token_ids = torch.topk(scores, top_k, sorted=True)
             else:
-                scores, token_ids = self.torch.sort(scores, descending=True)
-            probabilities = self.torch.softmax(scores, dim=-1)
+                scores, token_ids = torch.sort(scores, descending=True)
+            probabilities = torch.softmax(scores, dim=-1)
             top_p = values["top_ps"][row]
             if top_p < 1.0:
                 cumulative = probabilities.cumsum(dim=-1)
                 keep = cumulative - probabilities < top_p
                 probabilities = probabilities * keep
                 probabilities = probabilities / probabilities.sum()
-            generator = self.torch.Generator(device=logits.device)
+            generator = torch.Generator(device=logits.device)
             generator.manual_seed(
                 self._mixed_seed(values["seeds"][row], values["offsets"][row])
             )
-            selected = self.torch.multinomial(
-                probabilities, 1, generator=generator
-            ).squeeze(0)
+            selected = torch.multinomial(probabilities, 1, generator=generator).squeeze(
+                0
+            )
             result[row] = token_ids[selected]
 
         if out is None:

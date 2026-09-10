@@ -9,7 +9,7 @@ description = "Optimized LLM implementations for Resin, in CUDA"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 dependencies = [
-  "resin[gpu]==0.1.0",
+  "resin[cuda]==0.1.0",
   "resin-models-torch==0.1.0",
   "huggingface-hub>=0.35",
   "pillow>=10",

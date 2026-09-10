@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-import numpy as np
+import torch
+from torch import Tensor
 
 from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout
+from resin.backend.cuda.slab import (
+    DevicePageGroup as DeviceGroup,
+)
+from resin.backend.cuda.slab import (
+    GraphPageTableArena,
+    SlabDeviceCache,
+    stage_page_groups,
+)
 from resin.backend.plans import PagedCachePlan
 from resin.backend.resources import CachePoolBinding
-from resin_models_cuda.qwen3_5.config import Qwen35Config
-
-if TYPE_CHECKING:
-    from torch import Tensor
+from resin.models.qwen3_5.config import Qwen35Config
 
 PAGE_TOKENS = 128
 PREFILL_CHUNK_SIZE = 4096
@@ -155,17 +161,9 @@ class CacheGeometry:
 
 
 @dataclass(frozen=True, slots=True)
-class DeviceGroup:
-    slab_ids: Tensor
-    slotnums: Tensor
-    first_blocks: Tensor
-
-
-@dataclass(frozen=True, slots=True)
-class DeviceCache:
+class DeviceCache(SlabDeviceCache):
     """Tensorized cache tables and typed views over the shared byte arena."""
 
-    torch: Any
     geometry: CacheGeometry
     groups: tuple[DeviceGroup, ...]
     keys: Tensor
@@ -173,65 +171,6 @@ class DeviceCache:
     recurrent_states: Tensor
     convolution_states: Tensor
     target_hidden_states: Tensor
-
-    def row(self, index: int) -> DeviceCache:
-        return DeviceCache(
-            self.torch,
-            self.geometry,
-            tuple(
-                DeviceGroup(
-                    group.slab_ids[index : index + 1],
-                    group.slotnums[index : index + 1],
-                    group.first_blocks[index : index + 1],
-                )
-                for group in self.groups
-            ),
-            self.keys,
-            self.values,
-            self.recurrent_states,
-            self.convolution_states,
-            self.target_hidden_states,
-        )
-
-    def locations(
-        self, group_index: int, positions: Tensor, *, block_tokens: int
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        group = self.groups[group_index]
-        logical = positions.div(block_tokens, rounding_mode="floor")
-        first = group.first_blocks.view((-1,) + (1,) * (positions.ndim - 1))
-        columns = logical - first
-        width = group.slab_ids.shape[1]
-        gather = columns.flatten(1).clamp(0, width - 1).long()
-        slabs = self.torch.gather(group.slab_ids, 1, gather).view_as(columns)
-        slots = self.torch.gather(group.slotnums, 1, gather).view_as(columns)
-        valid = (columns >= 0) & (columns < width)
-        slabs = self.torch.where(valid, slabs, 0)
-        slots = self.torch.where(valid, slots, 0)
-        offsets = self.torch.where(valid, positions.remainder(block_tokens), 0)
-        return slabs, slots, offsets
-
-    def pages(self, group_index: int, layer: int, layer_count: int) -> Tensor:
-        if not 0 <= layer < layer_count:
-            raise ValueError("Qwen3.5 cache layer lies outside its cache group")
-        group = self.groups[group_index]
-        return (
-            group.slab_ids * self.geometry.slab_units
-            + group.slotnums * layer_count
-            + layer
-        ).to(self.torch.int32)
-
-    def rows(
-        self,
-        group_index: int,
-        layer: int,
-        layer_count: int,
-        positions: Tensor,
-    ) -> Tensor:
-        slabs, slots, offsets = self.locations(
-            group_index, positions, block_tokens=PAGE_TOKENS
-        )
-        pages = slabs * self.geometry.slab_units + slots * layer_count + layer
-        return (pages * PAGE_TOKENS + offsets).long()
 
     def state_at(self, positions: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         slabs, slots, _ = self.locations(
@@ -260,19 +199,19 @@ class DeviceCache:
         self.target_hidden_states[indices] = target_hidden
 
 
-class CacheArena:
+class CacheArena(GraphPageTableArena):
     """Layer-addressable BF16 KV and mixed-dtype recurrent state views."""
+
+    graph_label = "Qwen3.5"
 
     def __init__(
         self,
-        torch: Any,
         device: Any,
         layout: CacheLayout,
         geometry: CacheGeometry,
         *,
         kv_dtype: Any = None,
     ) -> None:
-        self.torch = torch
         self.device = device
         self.layout = layout
         self.geometry = geometry
@@ -374,31 +313,9 @@ class CacheArena:
         self.storage[0].zero_()
 
     def tensorize(self, plan: PagedCachePlan, staging: Any) -> DeviceCache:
-        groups = []
-        for index, group in enumerate(plan.groups):
-            width = max(len(group.block_slabs(row)) for row in range(plan.rows))
-            slabs = np.zeros((plan.rows, width), dtype=np.uint32)
-            slots = np.zeros_like(slabs)
-            for row in range(plan.rows):
-                row_slabs = group.block_slabs(row)
-                row_slots = group.block_slots(row)
-                slabs[row, : len(row_slabs)] = row_slabs
-                slots[row, : len(row_slots)] = row_slots
-            groups.append(
-                DeviceGroup(
-                    staging.device(f"cache.{index}.slabs", slabs, self.torch.int32),
-                    staging.device(f"cache.{index}.slots", slots, self.torch.int32),
-                    staging.device(
-                        f"cache.{index}.first",
-                        group.block_table_start_indices,
-                        self.torch.int32,
-                    ),
-                )
-            )
         return DeviceCache(
-            self.torch,
             self.geometry,
-            tuple(groups),
+            stage_page_groups(plan, staging),
             self.keys,
             self.values,
             self.recurrent_states,
@@ -406,42 +323,8 @@ class CacheArena:
             self.target_hidden_states,
         )
 
-    def _graph_group_widths(self, sequence_capacity: int) -> tuple[int, ...]:
-        if sequence_capacity <= 0:
-            raise ValueError("Qwen3.5 graph sequence capacity must be positive")
-        widths = []
-        for descriptor in self.layout.groups:
-            total = math.ceil(sequence_capacity / descriptor.block_tokens)
-            if descriptor.family is CacheGroupFamily.STATE:
-                total = min(total, 2)
-            widths.append(max(total, 1))
-        return tuple(widths)
-
-    def graph_cache(self, batch_size: int, sequence_capacity: int) -> DeviceCache:
-        """Allocate fixed cache tables for one padded CUDA graph bucket."""
-
-        groups = tuple(
-            DeviceGroup(
-                self.torch.empty(
-                    (batch_size, width),
-                    dtype=self.torch.int32,
-                    device=self.device,
-                ),
-                self.torch.empty(
-                    (batch_size, width),
-                    dtype=self.torch.int32,
-                    device=self.device,
-                ),
-                self.torch.empty(
-                    batch_size,
-                    dtype=self.torch.int32,
-                    device=self.device,
-                ),
-            )
-            for width in self._graph_group_widths(sequence_capacity)
-        )
+    def _make_graph_cache(self, groups) -> DeviceCache:
         return DeviceCache(
-            self.torch,
             self.geometry,
             groups,
             self.keys,
@@ -450,56 +333,6 @@ class CacheArena:
             self.convolution_states,
             self.target_hidden_states,
         )
-
-    @staticmethod
-    def graph_device_inputs(cache: DeviceCache) -> dict[str, object]:
-        inputs: dict[str, object] = {}
-        for index, group in enumerate(cache.groups):
-            inputs[f"cache.{index}.slabs"] = group.slab_ids
-            inputs[f"cache.{index}.slots"] = group.slotnums
-            inputs[f"cache.{index}.first"] = group.first_blocks
-        return inputs
-
-    def graph_shape_capture_inputs(
-        self, batch_size: int, sequence_capacity: int
-    ) -> dict[str, object]:
-        """Return null-slab tables used only to warm and capture a graph."""
-
-        inputs: dict[str, object] = {}
-        for index, width in enumerate(self._graph_group_widths(sequence_capacity)):
-            inputs[f"cache.{index}.slabs"] = (0,) * (batch_size * width)
-            inputs[f"cache.{index}.slots"] = (0,) * (batch_size * width)
-            inputs[f"cache.{index}.first"] = (0,) * batch_size
-        return inputs
-
-    @staticmethod
-    def graph_plan_inputs(
-        cache: DeviceCache, plan: PagedCachePlan
-    ) -> dict[str, object]:
-        """Pad an Engine cache plan into fixed graph-owned tables."""
-
-        inputs: dict[str, object] = {}
-        for index, (target, source) in enumerate(
-            zip(cache.groups, plan.groups, strict=True)
-        ):
-            shape = tuple(target.slab_ids.shape)
-            slabs = np.zeros(shape, dtype=np.uint32)
-            slots = np.zeros(shape, dtype=np.uint32)
-            if plan.rows > shape[0]:
-                raise ValueError("Qwen3.5 cache batch exceeds CUDA graph capacity")
-            for row in range(plan.rows):
-                row_slabs = source.block_slabs(row)
-                row_slots = source.block_slots(row)
-                if len(row_slabs) > shape[1]:
-                    raise ValueError("Qwen3.5 cache table exceeds CUDA graph capacity")
-                slabs[row, : len(row_slabs)] = row_slabs
-                slots[row, : len(row_slots)] = row_slots
-            first = np.zeros(shape[0], dtype=np.uint32)
-            first[: plan.rows] = source.block_table_start_indices
-            inputs[f"cache.{index}.slabs"] = slabs
-            inputs[f"cache.{index}.slots"] = slots
-            inputs[f"cache.{index}.first"] = first
-        return inputs
 
 
 __all__ = [

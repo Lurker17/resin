@@ -6,8 +6,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import torch
-
 from resin.backend.cuda.parallel import TensorParallelLayout
 from resin.backend.loading import (
     MODEL_FILES,
@@ -15,7 +13,8 @@ from resin.backend.loading import (
     read_config,
     resolve_model,
 )
-from resin_models_cuda.gpt_oss.config import GptOssConfig
+from resin.backend.quantization import BF16, MXFP4, QuantizationConfig
+from resin.models.gpt_oss.config import GptOssConfig
 from resin_models_cuda.gpt_oss.model import GptOssForCausalLM
 
 DEFAULT_MODEL = "openai/gpt-oss-20b"
@@ -28,7 +27,11 @@ MODEL_REVISIONS = {
 
 
 def _download_model(
-    repo_id: str, revision: str | None, *, allow_mxfp4: bool = False
+    repo_id: str,
+    revision: str | None,
+    *,
+    quantization: QuantizationConfig | None = None,
+    kernel_moe=None,
 ) -> Path:
     from huggingface_hub import hf_hub_download, snapshot_download
 
@@ -37,7 +40,11 @@ def _download_model(
     config_file = Path(
         hf_hub_download(repo_id=repo_id, filename="config.json", revision=revision)
     )
-    _check_quantization(json.loads(config_file.read_text()), allow_mxfp4=allow_mxfp4)
+    _check_quantization(
+        json.loads(config_file.read_text()),
+        quantization=quantization,
+        kernel_moe=kernel_moe,
+    )
     return Path(
         snapshot_download(
             repo_id=repo_id,
@@ -48,7 +55,11 @@ def _download_model(
 
 
 def resolve_model_path(
-    model: str | Path, revision: str | None, *, allow_mxfp4: bool = False
+    model: str | Path,
+    revision: str | None,
+    *,
+    quantization: QuantizationConfig | None = None,
+    kernel_moe=None,
 ) -> Path:
     repo_id = str(model)
     selected_revision = MODEL_REVISIONS.get(repo_id) if revision is None else revision
@@ -56,25 +67,35 @@ def resolve_model_path(
         model,
         selected_revision,
         lambda repository, selected: _download_model(
-            repository, selected, allow_mxfp4=allow_mxfp4
+            repository,
+            selected,
+            quantization=quantization,
+            kernel_moe=kernel_moe,
         ),
     )
 
 
-def _check_quantization(config: dict[str, Any], *, allow_mxfp4: bool = False) -> None:
-    quantization = config.get("quantization_config") or config.get("quantization")
-    if not quantization:
-        return
-    method = quantization.get("quant_method")
+def _check_quantization(
+    config: dict[str, Any],
+    *,
+    quantization: QuantizationConfig | None = None,
+    kernel_moe=None,
+):
+    checkpoint_config = config.get("quantization_config") or config.get("quantization")
+    method = checkpoint_config.get("quant_method") if checkpoint_config else None
+    checkpoint_encoding = BF16
     if method == "mxfp4":
-        if allow_mxfp4:
-            return
+        checkpoint_encoding = MXFP4
+    elif method is not None:
+        raise ValueError(f"unsupported GPT-OSS quantization method: {method!r}")
+    if quantization is not None:
+        quantization.require("transformer.experts", checkpoint_encoding)
+    if checkpoint_encoding == MXFP4 and kernel_moe is None:
         raise NotImplementedError(
             "the released GPT-OSS checkpoint uses MXFP4 expert weights; "
-            "Resin's dense reference expert module cannot load packed blocks yet. "
-            "An H100 MXFP4 expert kernel must be selected at this boundary"
+            "pass an imported CUDA implementation as kernel_moe"
         )
-    raise ValueError(f"unsupported GPT-OSS quantization method: {method!r}")
+    return checkpoint_encoding
 
 
 def load_model(
@@ -82,20 +103,24 @@ def load_model(
     *,
     device,
     dtype=None,
-    moe_kernel=None,
+    quantization: QuantizationConfig | None = None,
+    kernel_moe=None,
     tensor_parallel: TensorParallelLayout | None = None,
 ):
     config = read_config(model_path)
     args = GptOssConfig.from_dict(config)
-    _check_quantization(config, allow_mxfp4=moe_kernel is not None)
-    quantization = config.get("quantization_config") or config.get("quantization")
-    if quantization and quantization.get("quant_method") == "mxfp4":
+    checkpoint_encoding = _check_quantization(
+        config,
+        quantization=quantization,
+        kernel_moe=kernel_moe,
+    )
+    if checkpoint_encoding == MXFP4:
         from resin_models_cuda.gpt_oss.mxfp4 import load_mxfp4_model
 
         return load_mxfp4_model(
             model_path,
             device=device,
-            kernel=moe_kernel,
+            kernel=kernel_moe,
             dtype=dtype,
             tensor_parallel=tensor_parallel,
         )
@@ -114,7 +139,6 @@ def load_model(
                 module.float()
 
     model = materialize_safetensor_model(
-        torch,
         model_path,
         device=device,
         dtype=dtype,
@@ -122,4 +146,4 @@ def load_model(
         build=lambda: GptOssForCausalLM(args),
         after_cast=restore_norm_dtype,
     )
-    return torch, model, config
+    return model, config

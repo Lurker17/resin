@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 
 def _tiny_args():
@@ -49,22 +50,15 @@ for name in ('transformers', 'tokenizers', 'huggingface_hub', 'safetensors'):
             Lfm2Config.from_dict({"model_type": "llama"})
 
 
-@pytest.mark.skipif(
-    not importlib.util.find_spec("torch"), reason="PyTorch is not installed"
-)
 class TestLfm2Torch:
     def setup_method(self) -> None:
-        import torch
-
         from resin_models_torch.lfm2.model import Lfm2ForCausalLM
 
         torch.manual_seed(7)
-        self.torch = torch
         self.args = _tiny_args()
         self.model = Lfm2ForCausalLM(self.args).eval()
 
     def test_cached_chunks_match_full_forward(self) -> None:
-        torch = self.torch
         tokens = torch.tensor([[1, 2, 3, 4]])
         with torch.inference_mode():
             full = self.model(tokens, self.model.make_cache())
@@ -77,7 +71,6 @@ class TestLfm2Torch:
                 )
 
     def test_batched_decode_matches_independent_cached_forwards(self) -> None:
-        torch = self.torch
         independent_states = [self.model.make_cache(), self.model.make_cache()]
         batched_states = [self.model.make_cache(), self.model.make_cache()]
         prefixes = [torch.tensor([[1, 2, 3]]), torch.tensor([[4, 5]])]
@@ -128,8 +121,7 @@ class TestLfm2Torch:
         from resin_models_torch.lfm2 import Lfm2TorchRunner
 
         runner = Lfm2TorchRunner.__new__(Lfm2TorchRunner)
-        runner.device = self.torch.device("cpu")
-        runner._torch = self.torch
+        runner.device = torch.device("cpu")
         runner._model = self.model
         runner.config = {"vocab_size": self.args.vocab_size}
         runner.eos_token_id = None
@@ -192,14 +184,14 @@ class TestLfm2Torch:
             },
             "layer_types": list(self.args.layer_types),
         }
-        tokens = self.torch.tensor([[1, 2, 3]])
-        with self.torch.inference_mode():
+        tokens = torch.tensor([[1, 2, 3]])
+        with torch.inference_mode():
             expected = self.model(tokens, self.model.make_cache())
 
         path = tmp_path
         (path / "config.json").write_text(json.dumps(config))
         save_file(self.model.state_dict(), path / "model.safetensors")
-        torch, loaded, loaded_config = load_model(path, device="cpu")
+        loaded, loaded_config = load_model(path, device="cpu")
         assert "transformers" not in sys.modules
         assert "tokenizers" not in sys.modules
         with torch.inference_mode():

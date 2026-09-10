@@ -6,13 +6,13 @@ from types import SimpleNamespace
 
 import torch
 
+from resin.models.gemma4.plan import PAGE_SIZE
 from resin_models_cuda.gemma4.cuda import (
     Gemma4CudaRunner,
     _Gemma4KvArena,
     _select_nvfp4_backend,
     plan_gemma4_kv_capacity,
 )
-from resin_models_cuda.gemma4.plan import PAGE_SIZE
 
 
 def test_capacity_planner_accounts_for_fp8_shared_parent_bytes() -> None:
@@ -48,7 +48,6 @@ def test_local_and_global_cache_views_cover_raw_parent_child_rows() -> None:
         history_blocks_per_parent=2,
     )
     arena = _Gemma4KvArena(
-        torch,
         torch.device("cpu"),
         config,
         parent_capacity=3,
@@ -95,7 +94,7 @@ def test_cuda_graphs_use_shared_static_step_lifecycle() -> None:
     source = inspect.getsource(Gemma4CudaRunner)
     assert "cuda_graph_decode_shapes" in parameters
     assert "speculative_tokens" in parameters
-    assert "CudaGraphCache(" in source
+    assert "CudaGraphRunner(" in source
     assert "CUDAGraph" not in source
     assert ".replay()" not in source
 

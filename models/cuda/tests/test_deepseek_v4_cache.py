@@ -84,7 +84,7 @@ def test_post_load_vram_budget_includes_null_parent() -> None:
 def test_graph_capture_uses_group_private_scratch_parents() -> None:
     geometry = _geometry()
     layout = geometry.layout(3)
-    arena = CacheArena(torch, "cpu", layout, geometry, dtype=torch.bfloat16)
+    arena = CacheArena("cpu", layout, geometry, dtype=torch.bfloat16)
 
     inputs = arena.graph_shape_capture_inputs(2, 256)
 

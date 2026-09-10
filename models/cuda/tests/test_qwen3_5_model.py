@@ -7,8 +7,8 @@ from pathlib import Path
 import torch
 from test_qwen3_5_config import _qwen38
 
+from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_cuda.qwen3_5.checkpoint import _select_tensor_files
-from resin_models_cuda.qwen3_5.config import Qwen35Config
 from resin_models_cuda.qwen3_5.model import (
     Qwen3_5ForConditionalGeneration,
     Qwen35GatedDeltaNet,

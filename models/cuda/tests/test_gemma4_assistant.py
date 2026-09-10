@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from resin_models_cuda.gemma4.assistant import Gemma4AssistantConfig
+from resin.models.gemma4.assistant import Gemma4AssistantConfig
 from resin_models_cuda.gemma4.assistant_checkpoint import build_meta_assistant
 
 

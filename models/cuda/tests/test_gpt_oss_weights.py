@@ -5,24 +5,17 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 SAFETENSORS_AVAILABLE = importlib.util.find_spec("safetensors") is not None
-TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 
 
 @pytest.mark.skipif(
-    not SAFETENSORS_AVAILABLE and TORCH_AVAILABLE,
-    reason="torch and safetensors are required",
+    not SAFETENSORS_AVAILABLE,
+    reason="safetensors is required",
 )
 class TestGptOssWeightLoader:
-    def setup_method(self) -> None:
-        import torch
-
-        self.torch = torch
-
     def _model(self):
-        torch = self.torch
-
         class Backbone(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -37,7 +30,6 @@ class TestGptOssWeightLoader:
         return Model()
 
     def _tensors(self, *, layers: int = 2):
-        torch = self.torch
         tensors = {
             "model.embed_tokens.weight": torch.arange(15, dtype=torch.float32).view(
                 5, 3
@@ -87,9 +79,9 @@ class TestGptOssWeightLoader:
             dtype="float64",
         )
 
-        assert model.model.embed_tokens.weight.dtype == self.torch.float64
+        assert model.model.embed_tokens.weight.dtype == torch.float64
         assert not model.model.embed_tokens.weight.is_meta
-        self.torch.testing.assert_close(
+        torch.testing.assert_close(
             model.model.embed_tokens.weight,
             tensors["model.embed_tokens.weight"].double(),
         )
@@ -144,7 +136,7 @@ class TestGptOssWeightLoader:
 
     def test_shape_mismatch_is_rejected(self, tmp_path: Path) -> None:
         tensors = self._tensors(layers=1)
-        tensors["model.embed_tokens.weight"] = self.torch.ones(1, 1)
+        tensors["model.embed_tokens.weight"] = torch.ones(1, 1)
         root = tmp_path
         self._write_single(root, tensors)
         with pytest.raises(ValueError, match="shape mismatch"):

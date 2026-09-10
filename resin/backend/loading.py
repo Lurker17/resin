@@ -1,4 +1,4 @@
-"""Lazy, framework-neutral model loading helpers."""
+"""Shared PyTorch model loading helpers."""
 
 from __future__ import annotations
 
@@ -8,10 +8,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import torch
+
 MODEL_FILES = ("config.json", "model*.safetensors", "model.safetensors.index.json")
 
 
-def default_device(torch, *, require_cuda: bool = False) -> str:
+def default_device(*, require_cuda: bool = False) -> str:
     if torch.cuda.is_available():
         return "cuda"
     if require_cuda:
@@ -22,7 +24,7 @@ def default_device(torch, *, require_cuda: bool = False) -> str:
     return "cpu"
 
 
-def resolve_dtype(torch, dtype):
+def resolve_dtype(dtype):
     if dtype is None or not isinstance(dtype, str):
         return dtype
     resolved = getattr(torch, dtype.removeprefix("torch."), None)
@@ -68,7 +70,6 @@ def load_safetensor_shards(model_path: Path, *, device, backend: str) -> dict[st
 
 
 def materialize_safetensor_model(
-    torch,
     model_path: Path,
     *,
     device,
@@ -89,7 +90,7 @@ def materialize_safetensor_model(
     if target != load_target:
         model.to(target)
 
-    resolved_dtype = resolve_dtype(torch, dtype)
+    resolved_dtype = resolve_dtype(dtype)
     if resolved_dtype is not None:
         if not resolved_dtype.is_floating_point:
             raise ValueError("model dtype must be floating point")
@@ -101,3 +102,41 @@ def materialize_safetensor_model(
     model.materialize_buffers(target)
     model.eval()
     return model
+
+
+def assign_model_tensor(
+    model,
+    key: str,
+    tensor,
+    *,
+    device,
+    dtype=None,
+) -> None:
+    """Validate and assign one parameter or buffer into a materialized module."""
+
+    module_path, name = key.rsplit(".", 1)
+    try:
+        module = model.get_submodule(module_path)
+    except AttributeError as error:
+        raise ValueError(f"checkpoint tensor has no model target: {key!r}") from error
+    if name in module._parameters and module._parameters[name] is not None:
+        existing, parameter = module._parameters[name], True
+    elif name in module._buffers and module._buffers[name] is not None:
+        existing, parameter = module._buffers[name], False
+    else:
+        raise ValueError(f"checkpoint tensor has no model target: {key!r}")
+    if tuple(existing.shape) != tuple(tensor.shape):
+        raise ValueError(
+            f"shape mismatch for {key!r}: checkpoint {tuple(tensor.shape)}, "
+            f"model {tuple(existing.shape)}"
+        )
+    moved = tensor.to(
+        device=device,
+        dtype=dtype if dtype is not None and tensor.is_floating_point() else None,
+    )
+    if parameter:
+        module._parameters[name] = torch.nn.Parameter(
+            moved, requires_grad=existing.requires_grad
+        )
+    else:
+        module._buffers[name] = moved

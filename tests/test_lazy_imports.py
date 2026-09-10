@@ -14,26 +14,30 @@ class TestImport:
             "import resin.backend.cuda; import resin_models_cuda; "
             "import resin_models_torch; "
             "print(*(int(name in sys.modules) for name in "
-            "('torch', 'flashinfer', 'flash_attn')))"
+            "('flashinfer', 'flash_attn')))"
         )
         result = subprocess.run(
             [sys.executable, "-c", code], check=True, capture_output=True, text=True
         )
-        assert result.stdout.strip() == "0 0 0"
+        assert result.stdout.strip() == "0 0"
 
-    def test_accelerator_dependencies_are_optional(self) -> None:
+    def test_torch_is_required_and_cuda_dependencies_are_optional(self) -> None:
         project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
-        assert project["dependencies"] == ["blake3>=1.0,<2", "numpy>=1.26,<3"]
+        assert project["dependencies"] == [
+            "blake3>=1.0,<2",
+            "numpy>=1.26,<3",
+            "torch>=2.13.0",
+        ]
         optional_dependencies = project["optional-dependencies"]
         assert "torch" not in optional_dependencies
         assert "demo" not in optional_dependencies
         assert "dev" not in optional_dependencies
 
-        gpu = optional_dependencies["gpu"]
-        assert gpu == [
-            "torch>=2.13.0",
+        cuda = optional_dependencies["cuda"]
+        assert cuda == [
             "flashinfer-python>=0.6.15.post1; sys_platform == 'linux'",
         ]
+        assert "gpu" not in optional_dependencies
 
         workspace = tomllib.loads(Path("pyproject.toml").read_text())
         dev = workspace["dependency-groups"]["dev"]
@@ -48,7 +52,7 @@ class TestImport:
             "project"
         ]
         cuda_dependencies = cuda_models["dependencies"]
-        assert "resin[gpu]==0.1.0" in cuda_dependencies
+        assert "resin[cuda]==0.1.0" in cuda_dependencies
         assert "resin-models-torch==0.1.0" in cuda_dependencies
         assert "huggingface-hub>=0.35" in cuda_dependencies
         assert "safetensors>=0.5" in cuda_dependencies

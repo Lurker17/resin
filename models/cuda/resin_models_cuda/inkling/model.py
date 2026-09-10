@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from resin.backend.transformer import RMSNorm as SharedRMSNorm
+from resin.models.inkling.config import InklingConfig
 from resin_models_cuda.inkling.attention import (
     PagedAttentionBatch,
     append_kv,
@@ -22,24 +24,12 @@ from resin_models_cuda.inkling.cache import (
     STATE_WIDTH_PER_LAYER,
     DeviceCache,
 )
-from resin_models_cuda.inkling.config import InklingConfig
 from resin_models_cuda.nvfp4 import prepare_nvfp4_moe_weights, quantize_nvfp4
 
 
-class RMSNorm(nn.Module):
+class RMSNorm(SharedRMSNorm):
     def __init__(self, width: int, eps: float) -> None:
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(width, dtype=torch.bfloat16))
-
-    def forward(self, hidden: Tensor) -> Tensor:
-        if hidden.is_cuda:
-            from quack import rmsnorm
-
-            return rmsnorm(hidden, self.weight, eps=self.eps)
-        normalized = hidden.float()
-        normalized *= torch.rsqrt(normalized.square().mean(-1, keepdim=True) + self.eps)
-        return (normalized * self.weight.float()).to(hidden.dtype)
+        super().__init__(width, eps, weight_dtype=torch.bfloat16)
 
 
 class ShortConvolution(nn.Module):
@@ -138,7 +128,10 @@ class Router(nn.Module):
         self.global_scale = nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
 
     def forward(self, hidden: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        from resin_models_cuda.inkling.cutile import router_choice, router_weights
+        from resin_models_cuda.inkling.cutile import (
+            router_choice,
+            router_weights,
+        )
 
         flat = hidden.reshape(-1, hidden.shape[-1])
         logits = F.linear(flat, self.weight)
@@ -175,7 +168,10 @@ class SharedExperts(nn.Module):
         gammas: Tensor,
         routed: Tensor,
     ) -> Tensor:
-        from resin_models_cuda.inkling.cutile import shared_reduce_add, shared_swiglu
+        from resin_models_cuda.inkling.cutile import (
+            shared_reduce_add,
+            shared_swiglu,
+        )
 
         shape = hidden.shape
         flat = hidden.reshape(-1, shape[-1])

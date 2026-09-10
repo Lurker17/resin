@@ -1,4 +1,4 @@
-"""Resolve and stream Qwen3.5-family multimodal checkpoints."""
+"""Resolve and stream Qwen3.5-family checkpoints."""
 
 from __future__ import annotations
 
@@ -7,10 +7,15 @@ from typing import Any
 
 import torch
 
-from resin.backend.loading import MODEL_FILES, read_config, resolve_model
+from resin.backend.loading import (
+    MODEL_FILES,
+    assign_model_tensor,
+    read_config,
+    resolve_model,
+)
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 from resin.backend.torch import use_default_dtype
-from resin_models_cuda.qwen3_5.config import Qwen35Config
+from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_cuda.qwen3_5.model import Qwen3_5ForConditionalGeneration
 
 DEFAULT_MODEL = "RadixArk/Qwen3.8-27B-NVFP4"
@@ -96,34 +101,6 @@ def build_meta_model(
     return model, config
 
 
-def _assign_tensor(
-    model: torch.nn.Module, key: str, tensor: torch.Tensor, device: torch.device
-) -> None:
-    module_path, name = key.rsplit(".", 1)
-    try:
-        module = model.get_submodule(module_path)
-    except AttributeError as error:
-        raise ValueError(f"checkpoint tensor has no model target: {key!r}") from error
-    if name in module._parameters and module._parameters[name] is not None:
-        existing = module._parameters[name]
-        is_parameter = True
-    elif name in module._buffers and module._buffers[name] is not None:
-        existing = module._buffers[name]
-        is_parameter = False
-    else:
-        raise ValueError(f"checkpoint tensor has no model target: {key!r}")
-    if tuple(existing.shape) != tuple(tensor.shape):
-        raise ValueError(
-            f"shape mismatch for {key!r}: checkpoint {tuple(tensor.shape)}, "
-            f"model {tuple(existing.shape)}"
-        )
-    moved = tensor.to(device=device)
-    if is_parameter:
-        module._parameters[name] = torch.nn.Parameter(moved, requires_grad=False)
-    else:
-        module._buffers[name] = moved
-
-
 def _select_tensor_files(
     tensor_files: dict[str, Path],
     expected: set[str],
@@ -174,7 +151,7 @@ def load_model(
     )
     with SafetensorReader() as reader:
         for key, path in tensor_files.items():
-            _assign_tensor(model, key, reader.read(path, key), target)
+            assign_model_tensor(model, key, reader.read(path, key), device=target)
     model.language_model.materialize_buffers(target)
     if model.visual is not None:
         rotary = model.visual.rotary_pos_emb

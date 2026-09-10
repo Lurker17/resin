@@ -7,10 +7,15 @@ from typing import Any
 
 import torch
 
-from resin.backend.loading import MODEL_FILES, read_config, resolve_model
+from resin.backend.loading import (
+    MODEL_FILES,
+    assign_model_tensor,
+    read_config,
+    resolve_model,
+)
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 from resin.backend.torch import use_default_dtype
-from resin_models_cuda.gemma4.config import Gemma4Nvfp4Config
+from resin.models.gemma4.config import Gemma4Nvfp4Config
 from resin_models_cuda.gemma4.model import Gemma4ForConditionalGeneration
 
 DEFAULT_MODEL = "nvidia/Gemma-4-31B-IT-NVFP4"
@@ -46,34 +51,6 @@ def resolve_model_path(model: str | Path, revision: str | None = None) -> Path:
         else revision
     )
     return resolve_model(model, selected, _download_model)
-
-
-def _assign_tensor(
-    model: torch.nn.Module, key: str, tensor: torch.Tensor, device
-) -> None:
-    module_path, name = key.rsplit(".", 1)
-    try:
-        module = model.get_submodule(module_path)
-    except AttributeError as error:
-        raise ValueError(f"checkpoint tensor has no model target: {key!r}") from error
-    if name in module._parameters and module._parameters[name] is not None:
-        existing = module._parameters[name]
-        is_parameter = True
-    elif name in module._buffers and module._buffers[name] is not None:
-        existing = module._buffers[name]
-        is_parameter = False
-    else:
-        raise ValueError(f"checkpoint tensor has no model target: {key!r}")
-    if tuple(existing.shape) != tuple(tensor.shape):
-        raise ValueError(
-            f"shape mismatch for {key!r}: checkpoint {tuple(tensor.shape)}, "
-            f"model {tuple(existing.shape)}"
-        )
-    moved = tensor.to(device=device)
-    if is_parameter:
-        module._parameters[name] = torch.nn.Parameter(moved, requires_grad=False)
-    else:
-        module._buffers[name] = moved
 
 
 def build_meta_model(
@@ -117,7 +94,7 @@ def load_model(
 
     with SafetensorReader() as reader:
         for key, path in tensor_files.items():
-            _assign_tensor(model, key, reader.read(path, key), target)
+            assign_model_tensor(model, key, reader.read(path, key), device=target)
     model.materialize_buffers(target)
     model.eval()
     return model, config, raw_config

@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from resin.models.gemma4.media import Gemma4Media
 from resin.server.media import normalize_image_messages
-from resin_models_cuda.gemma4.media import Gemma4Media
 
 
 class Gemma4Codec:

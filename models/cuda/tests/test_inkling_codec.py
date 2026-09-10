@@ -4,8 +4,8 @@ from typing import Any
 
 import pytest
 
-import resin_models_cuda.inkling.codec as codec_module
-from resin_models_cuda.inkling.codec import InklingCodec
+import resin.models.inkling.codec as codec_module
+from resin.models.inkling.codec import InklingCodec
 
 SPECIAL_TOKENS = {
     "<|message_model|>": 200001,

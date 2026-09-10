@@ -1,4 +1,4 @@
-"""Persistent cuTile kernels for Inkling decode fusion."""
+"""Persistent Inkling cuTile kernels for decode fusion."""
 
 from __future__ import annotations
 

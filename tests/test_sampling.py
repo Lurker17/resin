@@ -164,7 +164,7 @@ class TestSharedSampler:
         )
 
     def test_torch_sampler_unifies_greedy_top_k_and_unsampled_rows(self) -> None:
-        sampler = TorchSampler(torch)
+        sampler = TorchSampler()
         logits = torch.tensor([[0.0, 2.0, 1.0], [0.0, 2.0, 1.0], [0.0, 2.0, 1.0]])
         plan = self._plan(
             [
@@ -180,7 +180,6 @@ class TestSharedSampler:
     def test_flashinfer_sampler_receives_per_row_filter_and_rng_tensors(self) -> None:
         calls = {}
         sampler = FlashInferSampler.__new__(FlashInferSampler)
-        sampler.torch = torch
 
         def softmax(logits, *, temperature):
             calls["temperatures"] = temperature.clone()

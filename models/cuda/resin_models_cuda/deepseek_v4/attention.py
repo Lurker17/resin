@@ -1,4 +1,4 @@
-"""FlashInfer attention adapters for DeepSeek-V4 decode."""
+"""FlashInfer attention kernels for DeepSeek-V4 decode."""
 
 from __future__ import annotations
 

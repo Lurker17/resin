@@ -137,7 +137,7 @@ def _build_runtime(*, speculative_tokens: int):
     from transformers import AutoProcessor
 
     from resin import Engine, SchedulerConfig
-    from resin_models_cuda.gemma4 import Gemma4CudaRunner
+    from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
 
     _require_model(speculative_tokens=speculative_tokens)
     load_started = time.perf_counter()
@@ -197,7 +197,7 @@ def _build_runtime(*, speculative_tokens: int):
         report["assistant_checkpoint_bytes"] = (
             (ASSISTANT_PATH / "model.safetensors").stat().st_size
         )
-    return torch, runner, processor, engine, report
+    return runner, processor, engine, report
 
 
 def _synthetic_image(size: int = 96):
@@ -211,7 +211,7 @@ def _synthetic_image(size: int = 96):
 
 def _generate(engine, processor, prompt: str, max_new_tokens: int):
     from resin import SamplingParams
-    from resin_models_cuda.gemma4 import Gemma4Media
+    from resin.models.gemma4.media import Gemma4Media
 
     media = Gemma4Media.from_images(
         processor,
@@ -239,7 +239,7 @@ def _generate(engine, processor, prompt: str, max_new_tokens: int):
 
 def _warmup_text(engine, processor) -> None:
     from resin import SamplingParams
-    from resin_models_cuda.gemma4 import Gemma4Media
+    from resin.models.gemma4.media import Gemma4Media
 
     media = Gemma4Media.from_messages(
         processor,
@@ -268,7 +268,9 @@ def smoke_test(
     *,
     speculative_tokens: int,
 ) -> dict[str, Any]:
-    torch, runner, processor, engine, report = _build_runtime(
+    import torch
+
+    runner, processor, engine, report = _build_runtime(
         speculative_tokens=speculative_tokens
     )
     try:
@@ -324,10 +326,12 @@ def smoke_test(
 
 
 def _serve(_: int) -> None:
-    from resin.server import HttpServer
-    from resin_models_cuda.gemma4 import Gemma4Codec
+    import torch
 
-    torch, runner, processor, engine, _ = _build_runtime(
+    from resin.models.gemma4.codec import Gemma4Codec
+    from resin.server import HttpServer
+
+    runner, processor, engine, _ = _build_runtime(
         speculative_tokens=PRODUCTION_SPECULATIVE_TOKENS
     )
     try:

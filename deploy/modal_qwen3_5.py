@@ -175,7 +175,7 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
     from transformers import AutoProcessor
 
     from resin import Engine, SchedulerConfig
-    from resin_models_cuda.qwen3_5 import Qwen3_5CudaRunner
+    from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
 
     inventory = _require_model()
     kernel_files_before_load = _kernel_inventory()
@@ -250,7 +250,6 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
         },
     }
     return (
-        torch,
         runner,
         processor,
         renderer,
@@ -304,10 +303,11 @@ def smoke_test(
     context_length: int = DEFAULT_CONTEXT_LENGTH,
     speculative_tokens: int = DEFAULT_SPECULATIVE_TOKENS,
 ) -> dict[str, Any]:
+    import torch
+
     from resin import SamplingParams
 
     (
-        torch,
         runner,
         processor,
         renderer,
@@ -338,7 +338,7 @@ def smoke_test(
         first_token_s = event_times[0] - started if event_times else None
         timed_tokens = max(0, len(event_times) - 1)
         steady_s = event_times[-1] - event_times[0] if timed_tokens else 0.0
-        from resin_models_cuda.qwen3_5 import Qwen35Codec
+        from resin.models.qwen3_5.codec import Qwen35Codec
 
         codec = Qwen35Codec(renderer, processor)
         image_prompt = codec.render(
@@ -415,10 +415,10 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
     import torch
 
     from resin import SamplingParams
+    from resin.models.qwen3_5.codec import Qwen35Codec
     from resin.server import HttpServer
-    from resin_models_cuda.qwen3_5 import Qwen35Codec
 
-    _, runner, processor, renderer, engine, report, kernels_before_warmup = (
+    runner, processor, renderer, engine, report, kernels_before_warmup = (
         _build_runtime(
             context_length=context_length,
             speculative_tokens=speculative_tokens,

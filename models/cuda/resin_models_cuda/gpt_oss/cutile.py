@@ -1,4 +1,4 @@
-"""cuTile kernels for GPT-OSS routing operations."""
+"""GPT-OSS cuTile top-four routing kernel."""
 
 from __future__ import annotations
 

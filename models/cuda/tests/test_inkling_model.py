@@ -6,7 +6,7 @@ import pytest
 import torch
 from test_inkling_config import _target
 
-from resin_models_cuda.inkling.config import InklingConfig, YarnConfig
+from resin.models.inkling.config import InklingConfig, YarnConfig
 from resin_models_cuda.inkling.dspark import precompute_yarn_rope
 from resin_models_cuda.inkling.model import (
     InklingVisionModel,

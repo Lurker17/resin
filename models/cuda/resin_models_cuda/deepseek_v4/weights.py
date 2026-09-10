@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 
 
@@ -44,7 +46,7 @@ def _dequantize_wo_a(weight: Any, scale: Any):
     return weight.flatten(2, 3).flatten(0, 1).bfloat16()
 
 
-def _coerce_for_target(torch: Any, tensor: Any, target: Any):
+def _coerce_for_target(tensor: Any, target: Any):
     fp4 = getattr(torch, "float4_e2m1fn_x2", None)
     if fp4 is not None and target.dtype == fp4 and tensor.dtype == torch.int8:
         tensor = tensor.view(fp4)
@@ -73,8 +75,6 @@ def load_deepseek_v4_weights(
     conventional tensor-parallel axes follow the official ``convert.py``.
     """
 
-    import torch
-
     if not 0 <= rank < tensor_parallel_size:
         raise ValueError("rank must be in [0, tensor_parallel_size)")
     root = Path(model_path).expanduser().resolve()
@@ -102,7 +102,7 @@ def load_deepseek_v4_weights(
                     tensor_parallel_size,
                 )
                 tensor = _dequantize_wo_a(tensor, scale)
-            tensor = _coerce_for_target(torch, tensor, targets[name])
+            tensor = _coerce_for_target(tensor, targets[name])
             loaded_bytes += tensor.numel() * tensor.element_size()
             loaded_tensors += 1
             with torch.no_grad():

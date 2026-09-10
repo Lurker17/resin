@@ -1,4 +1,4 @@
-"""TileLang kernels adapted from SGLang's Apache-2.0 MHC implementation."""
+"""DeepSeek-V4 TileLang kernels adapted from SGLang's MHC implementation."""
 
 from __future__ import annotations
 

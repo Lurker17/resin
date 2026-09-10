@@ -33,8 +33,8 @@ from resin.backend.parallel import (
     follow_tensor_parallel_runner,
     monitor_process_context,
 )
+from resin.models.deepseek_v4.codec import DeepSeekV4Codec
 from resin.server import HttpServer
-from resin_models_cuda.deepseek_v4.codec import DeepSeekV4Codec
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_CACHE_MOUNT = "/models/resin-deepseek-v4"
@@ -376,7 +376,7 @@ def _run_rank_workload(
     profile_run_id: str | None,
     speculative_tokens: int,
 ) -> dict[str, object]:
-    from resin_models_cuda.deepseek_v4 import DeepSeekV4CudaRunner
+    from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 
     if rank == 0:
         print(
@@ -854,7 +854,7 @@ def _run_rank_benchmark(
     batch_sizes: tuple[int, ...],
     use_cuda_graphs: bool,
 ) -> None:
-    from resin_models_cuda.deepseek_v4 import DeepSeekV4CudaRunner
+    from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 
     tensor_parallel = _initialize_tensor_parallel(
         rank, master_port, tensor_parallel_size
@@ -1046,7 +1046,7 @@ def _serve_http_rank(
 ) -> None:
     """Run one TP rank; rank zero additionally owns the public HTTP listener."""
 
-    from resin_models_cuda.deepseek_v4 import DeepSeekV4CudaRunner
+    from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 
     tensor_parallel = _initialize_tensor_parallel(rank, master_port, DEFAULT_TP_SIZE)
     control_group = dist.new_group(backend="gloo", timeout=timedelta(minutes=30))

@@ -1,4 +1,4 @@
-"""Native DeepSeek-V4-Flash-0731 execution on Blackwell with TP sharding.
+"""Native DeepSeek-V4-Flash-0731 CUDA execution with TP sharding.
 
 Resin owns the model hierarchy, kernels, request lifetime, sampling, and
 scheduling. SWA, compressed history, and recurrent compressor tails are
@@ -20,17 +20,24 @@ import torch.nn.functional as F
 from resin import BatchPhase, ResourceBinding, RunnerConfig
 from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
-    CudaGraphCache,
+    CudaGraphMode,
+    CudaGraphProgram,
+    CudaGraphRegion,
+    CudaGraphRunner,
     CudaGraphStats,
     CudaGraphStep,
     GraphShape,
     graph_shapes,
 )
 from resin.backend.cuda.parallel import FlashInferAllReduce, TensorParallelContext
+from resin.backend.cuda.runner import (
+    capture_sampling_inputs,
+    graph_sample,
+    pad_sampling_inputs,
+)
 from resin.backend.cuda.sampling import (
     SAMPLING_OFFSET_STRIDE,
     FlashInferSampler,
-    SamplingTensors,
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import BatchView, PagedCachePlan
@@ -142,7 +149,7 @@ class DeepSeekV4CudaRunner(Runner):
         self._graph_device_caches = {}
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = 1
-        self._sampler = FlashInferSampler(torch)
+        self._sampler = FlashInferSampler()
         self._speculation = SpeculativeStats(speculative_tokens)
         decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
         if any(shape[0] > max_batch_size for shape in decode_graph_shapes):
@@ -152,16 +159,21 @@ class DeepSeekV4CudaRunner(Runner):
             physical_seq_len += 1
         if any(shape[1] > physical_seq_len for shape in decode_graph_shapes):
             raise ValueError("CUDA graph sequence capacity exceeds max_seq_len")
-        self._graphs = CudaGraphCache(
-            torch,
+        self._graph_runner = CudaGraphRunner(
             self.device,
-            decode_graph_shapes,
-            build=self._new_decode_graph_step,
+            {
+                "decode": CudaGraphMode(
+                    decode_graph_shapes,
+                    self._new_decode_graph_step,
+                    self._decode_graph_capture_inputs,
+                )
+            },
             synchronize_failure=self._cuda_failure,
         )
+        self._graphs = self._graph_runner.mode("decode")
         # Import only after CUDA validation: importing this module initializes
         # cuTile and is intentionally not part of Resin's CPU package path.
-        from resin_models_cuda.deepseek_v4 import model as native_model
+        import resin_models_cuda.deepseek_v4.model as native_model
 
         inference_config_path = self.model_path / "inference/config.json"
         try:
@@ -283,7 +295,6 @@ class DeepSeekV4CudaRunner(Runner):
         )
         self.cache_layout = self.cache_geometry.layout(local_capacity)
         self._cache = CacheArena(
-            torch,
             self.device,
             self.cache_layout,
             self.cache_geometry,
@@ -336,12 +347,7 @@ class DeepSeekV4CudaRunner(Runner):
         inputs = {
             "token_ids": (0,) * batch_size,
             "positions": (1,) * batch_size,
-            "sampling_temperatures": (1.0,) * batch_size,
-            "sampling_top_ps": (1.0,) * batch_size,
-            "sampling_top_ks": (vocab_size,) * batch_size,
-            "sampling_seeds": tuple(range(batch_size)),
-            "sampling_offsets": (0,) * batch_size,
-            "sampling_stochastic_mask": (False,) * batch_size,
+            **capture_sampling_inputs(batch_size, vocab_size, unique_seeds=True),
         }
         return inputs
 
@@ -353,20 +359,20 @@ class DeepSeekV4CudaRunner(Runner):
     def capture_cuda_graphs(self) -> CudaGraphStats:
         """Capture configured decode capacities before accepting requests."""
 
-        captured = set(self._graphs.stats["captured_shapes"])
-        for shape in self._graphs.shapes:
-            if shape not in captured:
-                inputs = self._graph_capture_inputs(shape, self.vocab_size)
-                inputs.update(
-                    self._cache.graph_shape_capture_inputs(shape[0], shape[1])
-                )
-                self._graphs.capture(shape, inputs)
-        if self._graphs.shapes:
+        def reset_model_state() -> None:
             self._reset_model_state()
             torch.cuda.synchronize(self.device)
-        return self._graphs.stats
 
-    def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
+        return self._graph_runner.capture_all(after_capture=reset_model_state)["decode"]
+
+    def _decode_graph_capture_inputs(self, shape: GraphShape) -> dict[str, object]:
+        inputs = self._graph_capture_inputs(shape, self.vocab_size)
+        inputs.update(self._cache.graph_shape_capture_inputs(*shape))
+        return inputs
+
+    def _new_decode_graph_step(
+        self, shape: GraphShape
+    ) -> CudaGraphStep | CudaGraphProgram:
         if self.speculative_tokens:
             return self._new_dspark_graph_step(shape)
         batch_size, graph_seq_len = shape
@@ -386,21 +392,26 @@ class DeepSeekV4CudaRunner(Runner):
                     cache=cache,
                 )
                 self._sampler.sample_tensors(logits, sampling, out=output_ids)
-                if self.tensor_parallel.enabled:
-                    dist.broadcast(
-                        output_ids,
-                        src=0,
-                        group=self.tensor_parallel.process_group,
-                    )
+
+        def broadcast() -> None:
+            dist.broadcast(
+                output_ids,
+                src=0,
+                group=self.tensor_parallel.process_group,
+            )
 
         inputs = {"token_ids": token_ids, "positions": positions}
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(self._sampler.graph_inputs(sampling))
-        return CudaGraphStep(
-            inputs=inputs,
-            output=output_ids,
-            launch=launch,
-            prepare=self._reset_model_state,
+        kwargs = dict(inputs=inputs, output=output_ids, prepare=self._reset_model_state)
+        if not self.tensor_parallel.enabled:
+            return CudaGraphStep(launch=launch, **kwargs)
+        return CudaGraphProgram(
+            regions=(
+                CudaGraphRegion("model", launch),
+                CudaGraphRegion("broadcast", broadcast, capture=False),
+            ),
+            **kwargs,
         )
 
     def _new_dspark_graph_step(self, shape: GraphShape) -> CudaGraphStep:
@@ -424,16 +435,8 @@ class DeepSeekV4CudaRunner(Runner):
             self._dspark_phase_events[shape] = phase_events
 
         def sample(logits: torch.Tensor, step: int) -> torch.Tensor:
-            step_sampling = SamplingTensors(
-                temperatures=sampling.temperatures,
-                top_ps=sampling.top_ps,
-                top_ks=sampling.top_ks,
-                seeds=sampling.seeds,
-                offsets=sampling.offsets + step * SAMPLING_OFFSET_STRIDE,
-                stochastic_mask=sampling.stochastic_mask,
-            )
             return self._broadcast_tokens(
-                self._sampler.sample_tensors(logits, step_sampling)
+                graph_sample(self._sampler, logits, sampling, step)
             )
 
         def launch() -> None:
@@ -500,21 +503,9 @@ class DeepSeekV4CudaRunner(Runner):
         }
         graph_cache = self._graph_device_caches[shape]
         inputs.update(self._cache.graph_plan_inputs(graph_cache, cache_plan))
-        sampling_inputs = self._sampler.host_inputs(plan, self.vocab_size)
-        padding_defaults = {
-            "sampling_temperatures": 1.0,
-            "sampling_top_ps": 1.0,
-            "sampling_top_ks": self.vocab_size,
-            "sampling_seeds": 0,
-            "sampling_offsets": 0,
-            "sampling_stochastic_mask": False,
-        }
-        for name, default in padding_defaults.items():
-            sampling_inputs[name] = (
-                *sampling_inputs[name],
-                *((default,) * padding_rows),
-            )
-        inputs.update(sampling_inputs)
+        inputs.update(
+            pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding_rows)
+        )
         output = self._graphs.run(shape, inputs)[:batch_size]
         phase_events = self._dspark_phase_events.get(shape)
         if phase_events is not None:
@@ -573,27 +564,15 @@ class DeepSeekV4CudaRunner(Runner):
             row_cache = cache.row(slot)
             input_ids = token_ids[start:end].unsqueeze(0)
             context = int(plan.context_lengths[slot])
-            if context == 0:
-                row_logits, main_hidden = self._model.forward_target(
-                    input_ids, cache=row_cache
-                )
-                if self.speculative_tokens:
-                    if main_hidden is None:
-                        raise RuntimeError(
-                            "target did not produce DSpark hidden states"
-                        )
+            row_logits, main_hidden = self._model.forward_prefill(
+                input_ids, context, cache=row_cache
+            )
+            if self.speculative_tokens:
+                if main_hidden is None:
+                    raise RuntimeError("target did not produce DSpark hidden states")
+                if context == 0:
                     self._model.prefill_dspark(main_hidden, cache=row_cache)
-            else:
-                row_logits, main_hidden = self._model.forward_prefill(
-                    input_ids,
-                    context,
-                    cache=row_cache,
-                )
-                if self.speculative_tokens:
-                    if main_hidden is None:
-                        raise RuntimeError(
-                            "target did not produce DSpark hidden states"
-                        )
+                else:
                     self._model.commit_dspark_main_block(
                         main_hidden,
                         positions[start : start + 1],

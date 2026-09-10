@@ -4,8 +4,8 @@ import torch
 from test_qwen3_5_config import _qwen38
 
 from resin import CacheGroupFamily
+from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_cuda.qwen3_5.cache import CacheArena, CacheGeometry
-from resin_models_cuda.qwen3_5.config import Qwen35Config
 
 
 def test_qwen38_cache_geometry_accounts_for_fp32_recurrent_state() -> None:
@@ -63,7 +63,7 @@ def test_mixed_dtype_state_views_share_the_byte_arena() -> None:
     )
     config = Qwen35Config.from_hugging_face(values)
     geometry = CacheGeometry.from_config(config, include_mtp=True)
-    arena = CacheArena(torch, torch.device("cpu"), geometry.layout(2), geometry)
+    arena = CacheArena(torch.device("cpu"), geometry.layout(2), geometry)
 
     assert arena.storage.dtype is torch.uint8
     assert arena.keys.dtype is torch.bfloat16
@@ -101,7 +101,7 @@ def test_graph_cache_uses_fixed_tables_and_null_capture_inputs() -> None:
     )
     config = Qwen35Config.from_hugging_face(values)
     geometry = CacheGeometry.from_config(config, include_mtp=True)
-    arena = CacheArena(torch, torch.device("cpu"), geometry.layout(2), geometry)
+    arena = CacheArena(torch.device("cpu"), geometry.layout(2), geometry)
 
     cache = arena.graph_cache(batch_size=3, sequence_capacity=257)
     assert [tuple(group.slab_ids.shape) for group in cache.groups] == [

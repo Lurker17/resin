@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from resin_models_cuda.inkling.media import InklingMedia
+from resin.models.inkling.media import InklingMedia
 
 
 def test_media_owns_pixels_and_salts_only_image_placeholders() -> None:

@@ -1,4 +1,4 @@
-"""Library GEMM adapters for Resin's native DeepSeek-V4 implementation."""
+"""Library GEMM adapters for DeepSeek-V4."""
 
 from __future__ import annotations
 

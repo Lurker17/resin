@@ -1,4 +1,4 @@
-"""Google Gemma 4 single-position assistant over the target's paged K/V."""
+"""Backend-neutral Gemma 4 assistant over injected paged-attention calls."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from resin_models_cuda.gemma4.config import FULL_ATTENTION, SLIDING_ATTENTION
-from resin_models_cuda.gemma4.model import RMSNorm, RotaryEmbedding, apply_rotary
+from resin.models.gemma4.config import FULL_ATTENTION, SLIDING_ATTENTION
+from resin.models.gemma4.model import RMSNorm, RotaryEmbedding, apply_rotary
 
 
 @dataclass(frozen=True, slots=True)

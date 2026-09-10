@@ -55,14 +55,13 @@ def load_model(model_path: Path, *, device, dtype=None):
         )
     args = Lfm2Config.from_dict(config)
     model = materialize_safetensor_model(
-        torch,
         model_path,
         device=device,
         dtype=dtype,
         backend="LFM2",
         build=lambda: Lfm2ForCausalLM(args),
     )
-    return torch, model, config
+    return model, config
 
 
 class Lfm2TorchRunner(Runner):
@@ -78,19 +77,18 @@ class Lfm2TorchRunner(Runner):
         device: str | None = None,
         dtype=None,
     ) -> None:
-        self.device = torch.device(device or default_device(torch))
+        self.device = torch.device(device or default_device())
         self.model_path = resolve_model_path(model, revision)
-        self._torch, self._model, self.config = load_model(
+        self._model, self.config = load_model(
             self.model_path, device=self.device, dtype=dtype
         )
         self.eos_token_id = self.config.get("eos_token_id")
         self.vocab_size = self.config["vocab_size"]
-        self._sampler = TorchSampler(torch)
+        self._sampler = TorchSampler()
         self._cache: dict[int, Lfm2State] = {}
         self.forward_calls = 0
 
     def forward(self, plan: BatchPlan) -> list[int]:
-        torch = self._torch
         logits_rows = []
         self.forward_calls += 1
         rows = plan_rows(plan, self._cache, self.vocab_size)
@@ -120,11 +118,10 @@ class Lfm2TorchRunner(Runner):
                 self._forward_rows(rows, logits_rows)
         sampler = getattr(self, "_sampler", None)
         if sampler is None:
-            sampler = self._sampler = TorchSampler(torch)
+            sampler = self._sampler = TorchSampler()
         return sampler(torch.cat(logits_rows), plan).tolist()
 
     def _forward_rows(self, rows, logits_rows) -> None:
-        torch = self._torch
         for row in rows:
             cache = row.cache
             if cache is None:

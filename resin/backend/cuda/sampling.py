@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
 from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, batch_sampling_inputs
 
 
@@ -26,10 +28,9 @@ class FlashInferSampler:
     random result is discarded and their native offset is not advanced.
     """
 
-    def __init__(self, torch) -> None:
+    def __init__(self) -> None:
         from flashinfer.sampling import softmax, top_k_top_p_sampling_from_probs
 
-        self.torch = torch
         self._softmax = softmax
         self._sample = top_k_top_p_sampling_from_probs
 
@@ -60,7 +61,6 @@ class FlashInferSampler:
         }
 
     def empty(self, batch_size: int, device) -> SamplingTensors:
-        torch = self.torch
         return SamplingTensors(
             temperatures=torch.empty(batch_size, dtype=torch.float32, device=device),
             top_ps=torch.empty(batch_size, dtype=torch.float32, device=device),
@@ -97,8 +97,8 @@ class FlashInferSampler:
         sampled = sampled.to(dtype=greedy.dtype)
         in_range = (sampled >= 0) & (sampled < logits.shape[-1])
         safe_sampled = sampled.clamp(0, logits.shape[-1] - 1)
-        sampled = self.torch.where(valid & in_range, safe_sampled, greedy)
-        result = self.torch.where(tensors.stochastic_mask, sampled, greedy)
+        sampled = torch.where(valid & in_range, safe_sampled, greedy)
+        result = torch.where(tensors.stochastic_mask, sampled, greedy)
         if out is None:
             return result
         out.copy_(result)
@@ -129,26 +129,26 @@ class FlashInferSampler:
             device = logits.device
             host = self.host_inputs(plan, logits.shape[-1], offset_delta=offset_delta)
             tensors = SamplingTensors(
-                temperatures=self.torch.tensor(
+                temperatures=torch.tensor(
                     host["sampling_temperatures"],
-                    dtype=self.torch.float32,
+                    dtype=torch.float32,
                     device=device,
                 ),
-                top_ps=self.torch.tensor(
-                    host["sampling_top_ps"], dtype=self.torch.float32, device=device
+                top_ps=torch.tensor(
+                    host["sampling_top_ps"], dtype=torch.float32, device=device
                 ),
-                top_ks=self.torch.tensor(
-                    host["sampling_top_ks"], dtype=self.torch.int32, device=device
+                top_ks=torch.tensor(
+                    host["sampling_top_ks"], dtype=torch.int32, device=device
                 ),
-                seeds=self.torch.tensor(
-                    host["sampling_seeds"], dtype=self.torch.int64, device=device
+                seeds=torch.tensor(
+                    host["sampling_seeds"], dtype=torch.int64, device=device
                 ),
-                offsets=self.torch.tensor(
-                    host["sampling_offsets"], dtype=self.torch.int64, device=device
+                offsets=torch.tensor(
+                    host["sampling_offsets"], dtype=torch.int64, device=device
                 ),
-                stochastic_mask=self.torch.tensor(
+                stochastic_mask=torch.tensor(
                     host["sampling_stochastic_mask"],
-                    dtype=self.torch.bool,
+                    dtype=torch.bool,
                     device=device,
                 ),
             )

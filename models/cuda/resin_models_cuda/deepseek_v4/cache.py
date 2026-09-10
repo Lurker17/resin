@@ -6,11 +6,20 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import numpy as np
+import torch
 
 from resin import CacheGroupLayout, CacheLayout, CacheRetention
 from resin.backend.capacity import CacheCapacityPlan
 from resin.backend.capacity import plan_cache_capacity as plan_capacity
+from resin.backend.cuda.slab import (
+    PARENT_PAGE_NAMES,
+    GraphPageTableArena,
+    slice_page_groups,
+    stage_page_groups,
+)
+from resin.backend.cuda.slab import (
+    DevicePageGroup as DeviceGroup,
+)
 from resin.backend.plans import PagedCachePlan
 from resin.backend.resources import CachePoolBinding
 
@@ -239,6 +248,7 @@ class CacheGeometry:
 
         return self.parent_rows * 512 * 2
 
+
 def plan_cache_capacity(
     total_memory_bytes: int,
     free_memory_bytes: int,
@@ -256,13 +266,6 @@ def plan_cache_capacity(
         geometry.bytes_per_parent,
         reserved_parent_count=reserved_parent_count,
     )
-
-
-@dataclass(frozen=True, slots=True)
-class DeviceGroup:
-    parent_ids: object
-    child_slots: object
-    first_blocks: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,7 +287,6 @@ class DeviceMapping:
 class DeviceCache:
     """Device page tables plus graph-safe logical-to-physical mapping."""
 
-    torch: object
     geometry: CacheGeometry
     groups: tuple[DeviceGroup, ...]
     latents: object
@@ -294,16 +296,8 @@ class DeviceCache:
         """Return a one-sequence metadata view over the same physical pools."""
 
         return DeviceCache(
-            self.torch,
             self.geometry,
-            tuple(
-                DeviceGroup(
-                    group.parent_ids[index : index + 1],
-                    group.child_slots[index : index + 1],
-                    group.first_blocks[index : index + 1],
-                )
-                for group in self.groups
-            ),
+            slice_page_groups(self.groups, index),
             self.latents,
             self.index_keys,
         )
@@ -346,8 +340,8 @@ class DeviceCache:
             (-1,) + (1,) * (positions.ndim - 1)
         )
         flat = columns.flatten(1).clamp(0, table.parent_ids.shape[1] - 1)
-        parents = self.torch.gather(table.parent_ids, 1, flat).view_as(columns)
-        children = self.torch.gather(table.child_slots, 1, flat).view_as(columns)
+        parents = torch.gather(table.parent_ids, 1, flat).view_as(columns)
+        children = torch.gather(table.child_slots, 1, flat).view_as(columns)
         packing = self.geometry.packings[group]
         child_rows = self.geometry.parent_rows // packing
         offsets = positions.remainder(block_tokens).div(divisor, rounding_mode="floor")
@@ -359,8 +353,8 @@ class DeviceCache:
         # Parent/page zero is a real, permanently zeroed graph-padding target.
         # It maps to physical row zero; out-of-table logical positions remain
         # sparse-index sentinels.
-        physical = self.torch.where(parents > 0, physical, 0)
-        return self.torch.where(in_table, physical, -1).to(self.torch.int32)
+        physical = torch.where(parents > 0, physical, 0)
+        return torch.where(in_table, physical, -1).to(torch.int32)
 
     def mapping(
         self,
@@ -468,7 +462,9 @@ class DeviceCache:
         block_tokens = _GROUP_BLOCK_TOKENS[group]
         table = self.groups[group]
         if positions.is_cuda:
-            from resin_models_cuda.deepseek_v4.cutile import paged_state_locations
+            from resin_models_cuda.deepseek_v4.cutile import (
+                paged_state_locations,
+            )
 
             return paged_state_locations(
                 table.parent_ids,
@@ -483,25 +479,25 @@ class DeviceCache:
             (-1,) + (1,) * (positions.ndim - 1)
         )
         flat = columns.flatten(1).clamp(0, table.parent_ids.shape[1] - 1)
-        parents = self.torch.gather(table.parent_ids, 1, flat).view_as(columns)
-        children = self.torch.gather(table.child_slots, 1, flat).view_as(columns)
+        parents = torch.gather(table.parent_ids, 1, flat).view_as(columns)
+        children = torch.gather(table.child_slots, 1, flat).view_as(columns)
         packing = self.geometry.packings[group]
-        physical_children = self.torch.where(
-            parents > 0, parents * packing + children, 0
-        )
+        physical_children = torch.where(parents > 0, parents * packing + children, 0)
         valid = (columns >= 0) & (columns < table.parent_ids.shape[1])
-        physical_children = self.torch.where(valid, physical_children, -1)
-        offsets = self.torch.where(valid, positions.remainder(block_tokens), 0)
-        return physical_children.to(self.torch.int32), offsets.to(self.torch.int32)
+        physical_children = torch.where(valid, physical_children, -1)
+        offsets = torch.where(valid, positions.remainder(block_tokens), 0)
+        return physical_children.to(torch.int32), offsets.to(torch.int32)
 
 
-class CacheArena:
+class CacheArena(GraphPageTableArena):
     """One allocation shared by six mutually exclusive cache groups."""
 
-    def __init__(
-        self, torch, device, layout, geometry: CacheGeometry, *, dtype
-    ) -> None:
-        self.torch = torch
+    graph_input_names = PARENT_PAGE_NAMES
+    graph_label = "DeepSeek"
+
+    def __init__(self, device, layout, geometry: CacheGeometry, *, dtype) -> None:
+        self.device = device
+        self.layout = layout
         self.binding = CachePoolBinding(layout, resource="DeepSeek-V4 KV")
         self.geometry = geometry
         self.storage = torch.empty(
@@ -547,10 +543,10 @@ class CacheArena:
         block_tokens = _GROUP_BLOCK_TOKENS[group]
         child_floats = self.geometry.parent_rows * 512 * 2 // packing // 4
         child_count = self.storage.shape[0] * packing
-        flat = self.storage.view(self.torch.float32).flatten()
+        flat = self.storage.view(torch.float32).flatten()
 
         def field(offset: int) -> Tensor:
-            return self.torch.as_strided(
+            return torch.as_strided(
                 flat,
                 (child_count, block_tokens, width),
                 (child_floats, width, 1),
@@ -568,136 +564,30 @@ class CacheArena:
         self.reset_scratch()
 
     def tensorize(self, plan: PagedCachePlan, staging):
-        torch = self.torch
-        groups = []
-        for index, group in enumerate(plan.groups):
-            width = max(
-                len(group.block_slabs(row)) for row in range(plan.rows)
-            )
-            # Keep the dynamic width in one cuTile divisibility class. Merely
-            # rounding to 16 is insufficient: 128, 192, and 256 produce three
-            # progressively stronger JIT assumptions. Every value here is 16
-            # modulo 32, so its exact power-of-two divisor is always 16.
-            width = (width + 15) // 32 * 32 + 16
-            parents = np.zeros((plan.rows, width), dtype=np.uint32)
-            slots = np.zeros_like(parents)
-            for row_index in range(plan.rows):
-                row_parents = group.block_slabs(row_index)
-                row_slots = group.block_slots(row_index)
-                parents[row_index, : len(row_parents)] = row_parents
-                slots[row_index, : len(row_slots)] = row_slots
-            groups.append(
-                DeviceGroup(
-                    staging.device(
-                        f"cache.{index}.parent_ids", parents, torch.int32
-                    ),
-                    staging.device(
-                        f"cache.{index}.child_slots", slots, torch.int32
-                    ),
-                    staging.device(
-                        f"cache.{index}.first_blocks",
-                        group.block_table_start_indices,
-                        torch.int32,
-                    ),
-                )
-            )
+        groups = stage_page_groups(
+            plan,
+            staging,
+            names=PARENT_PAGE_NAMES,
+            # Preserve one cuTile divisibility class for dynamic widths.
+            width=lambda value: (value + 15) // 32 * 32 + 16,
+        )
         return DeviceCache(
-            torch,
             self.geometry,
             tuple(groups),
             self.latents,
             self.index_keys,
         )
 
-    def _graph_widths(self, sequence_capacity: int) -> tuple[int, ...]:
-        return tuple(
-            descriptor.window_resident_block_count
-            if descriptor.retention is CacheRetention.WINDOW
-            else math.ceil(sequence_capacity / descriptor.block_tokens)
-            for descriptor in self.binding.layout.groups
-        )
-
-    def graph_cache(self, batch_size: int, sequence_capacity: int):
-        """Allocate fixed page-table tensors owned by one CUDA graph shape."""
-
-        groups = []
-        for width in self._graph_widths(sequence_capacity):
-            groups.append(
-                DeviceGroup(
-                    self.torch.empty(
-                        (batch_size, width),
-                        dtype=self.torch.int32,
-                        device=self.storage.device,
-                    ),
-                    self.torch.empty(
-                        (batch_size, width),
-                        dtype=self.torch.int32,
-                        device=self.storage.device,
-                    ),
-                    self.torch.empty(
-                        batch_size,
-                        dtype=self.torch.int32,
-                        device=self.storage.device,
-                    ),
-                )
-            )
+    def _make_graph_cache(self, groups):
         return DeviceCache(
-            self.torch,
             self.geometry,
-            tuple(groups),
+            groups,
             self.latents,
             self.index_keys,
         )
 
-    @staticmethod
-    def graph_device_inputs(cache: DeviceCache) -> dict[str, object]:
-        inputs = {}
-        for index, group in enumerate(cache.groups):
-            inputs[f"cache.{index}.parent_ids"] = group.parent_ids
-            inputs[f"cache.{index}.child_slots"] = group.child_slots
-            inputs[f"cache.{index}.first_blocks"] = group.first_blocks
-        return inputs
-
-    def graph_shape_capture_inputs(
-        self, batch_size: int, sequence_capacity: int
-    ) -> dict[str, object]:
-        inputs = {}
-        for index, width in enumerate(self._graph_widths(sequence_capacity)):
-            parent = self.binding.layout.parent_capacity + index + 1
-            inputs[f"cache.{index}.parent_ids"] = (parent,) * (
-                batch_size * width
-            )
-            inputs[f"cache.{index}.child_slots"] = (0,) * (batch_size * width)
-            inputs[f"cache.{index}.first_blocks"] = (0,) * batch_size
-        return inputs
-
-    @staticmethod
-    def graph_plan_inputs(
-        cache: DeviceCache, plan: PagedCachePlan
-    ) -> dict[str, object]:
-        inputs = {}
-        for index, (target, source) in enumerate(zip(cache.groups, plan.groups)):
-            width = target.parent_ids.shape[1]
-            padding_rows = target.parent_ids.shape[0] - plan.rows
-            if padding_rows < 0:
-                raise ValueError("DeepSeek cache batch exceeds CUDA graph capacity")
-            if any(
-                len(source.block_slabs(row)) > width for row in range(plan.rows)
-            ):
-                raise ValueError("DeepSeek cache table exceeds CUDA graph capacity")
-            parents = np.zeros(target.parent_ids.shape, dtype=np.uint32)
-            slots = np.zeros_like(parents)
-            for row_index in range(plan.rows):
-                row_parents = source.block_slabs(row_index)
-                row_slots = source.block_slots(row_index)
-                parents[row_index, : len(row_parents)] = row_parents
-                slots[row_index, : len(row_slots)] = row_slots
-            inputs[f"cache.{index}.parent_ids"] = parents
-            inputs[f"cache.{index}.child_slots"] = slots
-            inputs[f"cache.{index}.first_blocks"] = np.pad(
-                source.block_table_start_indices, (0, padding_rows)
-            )
-        return inputs
+    def _graph_padding_id(self, index: int) -> int:
+        return self.layout.parent_capacity + index + 1
 
 
 __all__ = [

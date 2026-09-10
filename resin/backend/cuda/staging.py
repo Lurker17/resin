@@ -21,14 +21,16 @@ class TensorStager:
 
     def host(self, name: str, values, dtype):
         values = np.asarray(values)
-        tensor = torch.empty(
-            values.shape,
-            dtype=dtype,
-            device="cpu",
-            pin_memory=True,
-        )
+        tensor = self.host_tensors.get(name)
+        if tensor is None or tensor.shape != values.shape or tensor.dtype != dtype:
+            tensor = torch.empty(
+                values.shape,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            self.host_tensors[name] = tensor
         np.copyto(tensor.numpy(), values, casting="unsafe")
-        self.host_tensors[name] = tensor
         return tensor
 
     def device(self, name: str, values, dtype):
@@ -37,14 +39,20 @@ class TensorStager:
         )
 
     def output(self, name: str, source):
-        tensor = torch.empty(
-            source.shape,
-            dtype=source.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
+        tensor = self.host_tensors.get(name)
+        if (
+            tensor is None
+            or tensor.shape != source.shape
+            or tensor.dtype != source.dtype
+        ):
+            tensor = torch.empty(
+                source.shape,
+                dtype=source.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            self.host_tensors[name] = tensor
         tensor.copy_(source, non_blocking=True)
-        self.host_tensors[name] = tensor
         return tensor
 
     def tensors(self, fields: Mapping[str, tuple[object, object]], *, device: bool):
@@ -79,7 +87,6 @@ class TensorStager:
                     source = self.host(name, value, target.dtype).view(target.shape)
                 staged.append((name, target, source))
         except Exception as error:
-            self.host_tensors.clear()
             raise StagingError("inputs do not fit fixed device buffers") from error
         for name, target, source in staged:
             target.copy_(source, non_blocking=True)

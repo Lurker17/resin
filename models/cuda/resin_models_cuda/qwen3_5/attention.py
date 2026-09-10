@@ -1,4 +1,4 @@
-"""FlashInfer paged-cache helpers for Qwen3.5 full-attention layers."""
+"""Qwen3.5 FlashInfer paged-attention kernels."""
 
 from __future__ import annotations
 
@@ -8,26 +8,41 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from resin_models_cuda.qwen3_5.cache import PAGE_TOKENS, DeviceCache
+from resin.backend.cuda.paged_kv import SlabPagedKvCache
+from resin_models_cuda.paged_kv import append_slab_kv
+
+append_kv = append_slab_kv
 
 
-def append_kv(
-    cache: DeviceCache,
+def _plan_wrapper(
+    wrapper,
+    tokens: int,
+    kv_indptr,
+    pages,
+    last_page_lengths,
     *,
-    group_index: int,
-    layer: int,
-    layer_count: int,
-    positions: Tensor,
-    keys: Tensor,
-    values: Tensor,
+    num_attention_heads: int,
+    num_key_value_heads: int,
+    head_dim: int,
+    page_tokens: int,
+    common: dict[str, Any],
 ) -> None:
-    """Write a rectangular batch into one layer's slab-addressed pages."""
-
-    rows = cache.rows(group_index, layer, layer_count, positions)
-    pages = rows.div(PAGE_TOKENS, rounding_mode="floor")
-    offsets = rows.remainder(PAGE_TOKENS)
-    cache.keys[pages, offsets] = keys.to(cache.keys.dtype)
-    cache.values[pages, offsets] = values.to(cache.values.dtype)
+    args = (
+        kv_indptr,
+        pages,
+        last_page_lengths,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        page_tokens,
+    )
+    if tokens == 1:
+        wrapper.plan(*args, **common)
+    else:
+        qo_indptr = torch.arange(
+            len(kv_indptr), dtype=torch.int32, device=kv_indptr.device
+        ) * tokens
+        wrapper.plan(qo_indptr, *args, causal=True, **common)
 
 
 @dataclass(slots=True)
@@ -35,7 +50,7 @@ class PreparedPagedAttention:
     """One FlashInfer plan shared by every physical layer in a cache group."""
 
     wrapper: Any
-    cache: DeviceCache
+    cache: SlabPagedKvCache
     logical_pages: Tensor
     physical_pages: Tensor
     layer_count: int
@@ -84,7 +99,7 @@ class PagedAttentionRuntime:
 
     def prepare(
         self,
-        cache: DeviceCache,
+        cache: SlabPagedKvCache,
         *,
         group_index: int,
         layer_count: int,
@@ -93,20 +108,21 @@ class PagedAttentionRuntime:
         softmax_scale: float,
     ) -> PreparedPagedAttention:
         group = cache.groups[group_index]
-        retained_starts = group.first_blocks * PAGE_TOKENS
+        page_tokens = cache.page_tokens
+        retained_starts = group.first_blocks * page_tokens
         used_lengths = (sequence_lengths - retained_starts).to(torch.int32)
         if bool(torch.any(used_lengths <= 0)):
             raise ValueError("Qwen3.5 paged attention requires retained context")
         required_pages = torch.div(
-            used_lengths + PAGE_TOKENS - 1,
-            PAGE_TOKENS,
+            used_lengths + page_tokens - 1,
+            page_tokens,
             rounding_mode="floor",
         )
         width = group.slab_ids.shape[1]
         if bool(torch.any(required_pages > width)):
             raise ValueError("Qwen3.5 paged attention exceeds its cache lease")
 
-        pages_per_slab = cache.geometry.slab_units // layer_count
+        pages_per_slab = cache.slab_units // layer_count
         page_table = group.slab_ids * pages_per_slab + group.slotnums
         columns = torch.arange(width, device=self.device)[None]
         logical_pages = page_table[columns < required_pages[:, None]].to(torch.int32)
@@ -115,7 +131,7 @@ class PagedAttentionRuntime:
             len(used_lengths) + 1, dtype=torch.int32, device=self.device
         )
         kv_indptr[1:] = required_pages.cumsum(0)
-        last_page_lengths = (used_lengths - 1).remainder(PAGE_TOKENS) + 1
+        last_page_lengths = (used_lengths - 1).remainder(page_tokens) + 1
         common = {
             "pos_encoding_mode": "NONE",
             "q_data_type": torch.bfloat16,
@@ -123,40 +139,19 @@ class PagedAttentionRuntime:
             "o_data_type": torch.bfloat16,
             "sm_scale": softmax_scale,
         }
-        if tokens == 1:
-            wrapper = self.decode
-            wrapper.plan(
-                kv_indptr,
-                physical_pages,
-                last_page_lengths,
-                self.num_attention_heads,
-                self.num_key_value_heads,
-                self.head_dim,
-                PAGE_TOKENS,
-                **common,
-            )
-        else:
-            wrapper = self.prefill
-            qo_indptr = (
-                torch.arange(
-                    len(used_lengths) + 1,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                * tokens
-            )
-            wrapper.plan(
-                qo_indptr,
-                kv_indptr,
-                physical_pages,
-                last_page_lengths,
-                self.num_attention_heads,
-                self.num_key_value_heads,
-                self.head_dim,
-                PAGE_TOKENS,
-                causal=True,
-                **common,
-            )
+        wrapper = self.decode if tokens == 1 else self.prefill
+        _plan_wrapper(
+            wrapper,
+            tokens,
+            kv_indptr,
+            physical_pages,
+            last_page_lengths,
+            num_attention_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
+            head_dim=self.head_dim,
+            page_tokens=page_tokens,
+            common=common,
+        )
         return PreparedPagedAttention(
             wrapper,
             cache,
@@ -192,7 +187,7 @@ class GraphPagedAttentionRuntime:
     def __init__(
         self,
         device: torch.device,
-        cache: DeviceCache,
+        cache: SlabPagedKvCache,
         specs: tuple[GraphAttentionSpec, ...],
         *,
         num_attention_heads: int,
@@ -237,7 +232,6 @@ class GraphPagedAttentionRuntime:
             )
             initial_indices = torch.zeros(batch_size, dtype=torch.int32, device=device)
             initial_last = torch.ones(batch_size, dtype=torch.int32, device=device)
-            qo_indptr = None
             if spec.tokens == 1:
                 wrapper = BatchDecodeWithPagedKVCacheWrapper(
                     self.workspace,
@@ -248,16 +242,6 @@ class GraphPagedAttentionRuntime:
                     paged_kv_indices_buffer=physical_pages,
                     paged_kv_last_page_len_buffer=last,
                     backend="fa2",
-                )
-                wrapper.plan(
-                    initial_indptr,
-                    initial_indices,
-                    initial_last,
-                    num_attention_heads,
-                    num_key_value_heads,
-                    head_dim,
-                    PAGE_TOKENS,
-                    **common,
                 )
             else:
                 qo_indptr = torch.empty(
@@ -273,19 +257,18 @@ class GraphPagedAttentionRuntime:
                     paged_kv_last_page_len_buf=last,
                     backend="auto",
                 )
-                initial_qo = initial_indptr * spec.tokens
-                wrapper.plan(
-                    initial_qo,
-                    initial_indptr,
-                    initial_indices,
-                    initial_last,
-                    num_attention_heads,
-                    num_key_value_heads,
-                    head_dim,
-                    PAGE_TOKENS,
-                    causal=True,
-                    **common,
-                )
+            _plan_wrapper(
+                wrapper,
+                spec.tokens,
+                initial_indptr,
+                initial_indices,
+                initial_last,
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_dim=head_dim,
+                page_tokens=cache.page_tokens,
+                common=common,
+            )
             calls.append(
                 _GraphAttentionCall(
                     spec,
@@ -299,7 +282,7 @@ class GraphPagedAttentionRuntime:
                     ),
                     kv_indptr,
                     last,
-                    qo_indptr,
+                    None if spec.tokens == 1 else qo_indptr,
                 )
             )
         self.calls = tuple(calls)
@@ -309,7 +292,7 @@ class GraphPagedAttentionRuntime:
 
     def prepare(
         self,
-        cache: DeviceCache,
+        cache: SlabPagedKvCache,
         *,
         group_index: int,
         layer_count: int,
@@ -348,6 +331,7 @@ class GraphPagedAttentionRuntime:
         sequence_lengths: Any,
         layer_count: int,
         slab_units: int,
+        page_tokens: int,
     ) -> tuple[Any, Any, Any]:
         import numpy as np
 
@@ -358,13 +342,13 @@ class GraphPagedAttentionRuntime:
         pages_per_slab = slab_units // layer_count
         for row in range(graph_rows):
             if row < rows:
-                retained = int(group.block_table_start_indices[row]) * PAGE_TOKENS
+                retained = int(group.block_table_start_indices[row]) * page_tokens
                 used = int(sequence_lengths[row]) - retained
                 if used <= 0:
                     raise ValueError(
                         "Qwen3.5 graph attention requires retained context"
                     )
-                count = (used + PAGE_TOKENS - 1) // PAGE_TOKENS
+                count = (used + page_tokens - 1) // page_tokens
                 slabs = group.block_slabs(row)
                 slots = group.block_slots(row)
                 if count > len(slabs) or count > graph_width:
@@ -372,7 +356,7 @@ class GraphPagedAttentionRuntime:
                 logical[cursor : cursor + count] = slabs[:count].astype(
                     np.int64
                 ) * pages_per_slab + slots[:count].astype(np.int64)
-                last[row] = (used - 1) % PAGE_TOKENS + 1
+                last[row] = (used - 1) % page_tokens + 1
             else:
                 count = 1
             cursor += count
@@ -400,7 +384,8 @@ class GraphPagedAttentionRuntime:
                 graph_width=graph_width,
                 sequence_lengths=lengths,
                 layer_count=spec.layer_count,
-                slab_units=self.cache.geometry.slab_units,
+                slab_units=self.cache.slab_units,
+                page_tokens=self.cache.page_tokens,
             )
             physical = logical * spec.layer_count
             common = {
@@ -420,36 +405,18 @@ class GraphPagedAttentionRuntime:
                 physical[:page_count], dtype=torch.int32, device=self.device
             )
             device_last = torch.as_tensor(last, dtype=torch.int32, device=self.device)
-            if spec.tokens == 1:
-                call.prepared.wrapper.plan(
-                    device_indptr,
-                    device_pages,
-                    device_last,
-                    self.num_attention_heads,
-                    self.num_key_value_heads,
-                    self.head_dim,
-                    PAGE_TOKENS,
-                    **common,
-                )
-            else:
-                qo = np.arange(
-                    0,
-                    (graph_rows + 1) * spec.tokens,
-                    spec.tokens,
-                    dtype=np.int32,
-                )
-                call.prepared.wrapper.plan(
-                    torch.as_tensor(qo, dtype=torch.int32, device=self.device),
-                    device_indptr,
-                    device_pages,
-                    device_last,
-                    self.num_attention_heads,
-                    self.num_key_value_heads,
-                    self.head_dim,
-                    PAGE_TOKENS,
-                    causal=True,
-                    **common,
-                )
+            _plan_wrapper(
+                call.prepared.wrapper,
+                spec.tokens,
+                device_indptr,
+                device_pages,
+                device_last,
+                num_attention_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                page_tokens=self.cache.page_tokens,
+                common=common,
+            )
             inputs[f"attention.{index}.logical_pages"] = logical
         self.reset()
         return inputs

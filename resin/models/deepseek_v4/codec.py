@@ -1,4 +1,4 @@
-"""DeepSeek-V4 conversation rendering and incremental response parsing."""
+"""Backend-neutral DeepSeek-V4 rendering and response parsing."""
 
 from __future__ import annotations
 

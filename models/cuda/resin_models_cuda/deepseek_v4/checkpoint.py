@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from resin_models_cuda.deepseek_v4.config import DeepSeekV4Config
+from resin.models.deepseek_v4.config import DeepSeekV4Config
 
 DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
 DEFAULT_REVISION = "7872f01b1d1fe23eabc4c98b48bffcef5a386062"

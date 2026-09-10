@@ -12,12 +12,12 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from deep_gemm import tf32_hc_prenorm_gemm
-from flashinfer.mhc import mhc_post, mhc_pre_big_fuse_with_prenorm
+from flashinfer.mhc import mhc_post
 from flashinfer.topk import top_k as flashinfer_top_k
-from quack import rmsnorm as quack_rmsnorm
 from torch import nn
 
 from resin.backend.torch import use_default_dtype
+from resin.backend.transformer import RMSNorm as SharedRMSNorm
 from resin_models_cuda.deepseek_v4.attention import (
     sparse_decode_attention,
     sparse_verify_attention,
@@ -33,7 +33,6 @@ from resin_models_cuda.deepseek_v4.cache import (
 from resin_models_cuda.deepseek_v4.cutile import (
     act_quant,
     clear_rejected_compress_state,
-    compress_decode,
     compress_verify,
     dspark_attention_metadata,
     finish_index_topk,
@@ -46,7 +45,6 @@ from resin_models_cuda.deepseek_v4.cutile import (
     qk_norm_rope_block,
     qk_norm_rope_store,
     rope_last_block_inplace,
-    sparse_attn,
     swiglu,
     top6_sqrt_softplus,
     verify_attention_metadata,
@@ -321,15 +319,9 @@ class RowParallelLinear(Linear):
         return y.type_as(x)
 
 
-class RMSNorm(nn.Module):
+class RMSNorm(SharedRMSNorm):
     def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.bfloat16))
-
-    def forward(self, x: torch.Tensor):
-        return quack_rmsnorm(x, self.weight, eps=self.eps)
+        super().__init__(dim, eps, weight_dtype=torch.bfloat16)
 
 
 @lru_cache(2)
@@ -402,22 +394,6 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Applies randomized Hadamard rotation to spread information across dims before FP8 quant."""
     assert x.dtype == torch.bfloat16
     return hadamard_transform(x)
-
-
-@lru_cache(4)
-def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int):
-    base = torch.arange(seqlen).unsqueeze(1)
-    matrix = (base - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
-    matrix = torch.where(matrix > base, -1, matrix)
-    return matrix.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
-
-
-@lru_cache(2)
-def get_compress_topk_idxs(ratio: int, bsz: int, seqlen: int, offset: int):
-    matrix = torch.arange(seqlen // ratio).repeat(seqlen, 1)
-    mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-    matrix = torch.where(mask, -1, matrix + offset)
-    return matrix.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
 
 
 class Compressor(nn.Module):
@@ -494,83 +470,6 @@ class Compressor(nn.Module):
         if self.kv_state is None or self.score_state is None:
             raise RuntimeError("compressor state is not bound to the cache arena")
         return self.kv_state, self.score_state
-
-    def overlap_transform(self, tensor: torch.Tensor, value=0):
-        # tensor: [b,s,r,2d]
-        b, s, _, _ = tensor.size()
-        ratio, d = self.compress_ratio, self.head_dim
-        new_tensor = tensor.new_full((b, s, 2 * ratio, d), value)
-        new_tensor[:, :, ratio:] = tensor[:, :, :, d:]
-        new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
-        return new_tensor
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        cache_pool: torch.Tensor,
-        cache_rows: torch.Tensor,
-        state_pages: torch.Tensor,
-        state_offsets: torch.Tensor,
-    ):
-        bsz, seqlen, _ = x.size()
-        ratio, overlap, rd = (
-            self.compress_ratio,
-            self.overlap,
-            self.rope_head_dim,
-        )
-        dtype = x.dtype
-        projected = bf16_linear_fp32(x, self._fused_projection_weight)
-        raw_kv, raw_score = projected.chunk(2, dim=-1)
-        cutoff = seqlen - seqlen % ratio
-
-        # Stage the raw prompt tail in the same physical ring used by decode.
-        tail_start = max(0, seqlen - self.ring_size)
-        tail_positions = torch.arange(tail_start, seqlen, device=x.device)
-        ape_slots = tail_positions.remainder(ratio)
-        if (
-            state_pages.shape != (bsz, seqlen)
-            or state_offsets.shape != state_pages.shape
-        ):
-            raise ValueError("paged prompt state requires one location per token")
-        value_state, score_state = self._state_tensors()
-        pages = state_pages[:, tail_start:].flatten().long()
-        offsets = state_offsets[:, tail_start:].flatten().long()
-        valid = pages >= 0
-        pages = pages[valid]
-        offsets = offsets[valid]
-        tail_values = raw_kv[:, tail_start:].flatten(0, 1)[valid]
-        tail_scores = (raw_score[:, tail_start:] + self.ape[ape_slots]).flatten(0, 1)[
-            valid
-        ]
-        value_state[pages, offsets] = tail_values
-        score_state[pages, offsets] = tail_scores
-
-        if cutoff == 0:
-            return
-        kv = raw_kv[:, :cutoff].unflatten(1, (-1, ratio))
-        score = raw_score[:, :cutoff].unflatten(1, (-1, ratio)) + self.ape
-        if overlap:
-            kv = self.overlap_transform(kv, 0)
-            score = self.overlap_transform(score, float("-inf"))
-        kv = (kv * score.softmax(dim=2)).sum(dim=2)
-        kv = self.norm(kv.to(dtype))
-        freqs_cis = self.freqs_cis[:cutoff:ratio]
-        apply_rotary_emb(kv[..., -rd:], freqs_cis)
-        if self.rotate:
-            kv = rotate_activation(kv)
-            fp4_act_quant(kv, fp4_block_size, True)
-        else:
-            act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
-        if cache_rows.shape != (bsz, seqlen):
-            raise ValueError("paged compressor writes need one row per source token")
-        complete_rows = cache_rows[:, ratio - 1 : cutoff : ratio]
-        cache_pool.index_copy_(
-            0,
-            complete_rows.flatten().long(),
-            kv.flatten(0, 1).to(cache_pool.dtype),
-        )
-        return kv
 
     def forward_prefill(
         self,
@@ -700,38 +599,6 @@ class Compressor(nn.Module):
             pooled.flatten(0, 1).to(cache_pool.dtype),
         )
 
-    def forward_decode(
-        self,
-        x: torch.Tensor,
-        position: torch.Tensor,
-        *,
-        cache_pool: torch.Tensor,
-        cache_mapping: DeviceMapping,
-        state_mapping: DeviceMapping,
-    ) -> torch.Tensor:
-        """Update recurrent compression state from a graph-staged position."""
-
-        value_state, score_state = self._state_tensors()
-        kv, score = bf16_linear_fp32(x, self._fused_projection_weight).chunk(2, dim=-1)
-        compress_decode(
-            kv,
-            score,
-            self.ape,
-            value_state,
-            score_state,
-            self.norm.weight,
-            torch.view_as_real(self.freqs_cis),
-            cache_pool,
-            position,
-            self.compress_ratio,
-            self.rotate,
-            self.norm.eps,
-            cache_mapping=cache_mapping,
-            state_mapping=state_mapping,
-            state_ring_size=self.ring_size,
-        )
-        return kv[..., : self.head_dim]
-
     def forward_verify(
         self,
         x: torch.Tensor,
@@ -819,50 +686,6 @@ class Indexer(torch.nn.Module):
         self.compressor = Compressor(args, compress_ratio, self.head_dim, True)
         self.freqs_cis: torch.Tensor | None = None
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        qr: torch.Tensor,
-        offset: int,
-        *,
-        cache: DeviceCache,
-    ):
-        bsz, seqlen, _ = x.size()
-        freqs_cis = self.freqs_cis[:seqlen]
-        ratio, rd = self.compress_ratio, self.rope_head_dim
-        q = self.wq_b(qr)
-        q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
-        q = rotate_activation(q)
-        # use fp4 simulation for q and kv in indexer
-        fp4_act_quant(q, fp4_block_size, True)
-        token_positions = (
-            torch.arange(seqlen, device=x.device).view(1, -1).expand(bsz, -1)
-        )
-        state_pages, state_offsets = cache.state_locations(
-            INDEX_STATE_GROUP, token_positions
-        )
-        compressed = self.compressor(
-            x,
-            cache_pool=cache.index_keys.view(-1, self.head_dim),
-            cache_rows=cache.index_rows(self.layer_id, token_positions),
-            state_pages=state_pages,
-            state_offsets=state_offsets,
-        )
-        if compressed is None:
-            compressed = x.new_empty((bsz, 0, self.head_dim))
-        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
-        # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
-        index_score = torch.einsum("bshd,btd->bsht", q, compressed)
-        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
-        if world_size > 1:
-            index_score = self.allreduce(index_score)
-        complete = torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-        mask = torch.arange(seqlen // ratio).repeat(seqlen, 1) >= complete
-        index_score += torch.where(mask, float("-inf"), 0)
-        topk_idxs = index_score.topk(min(self.index_topk, seqlen // ratio), dim=-1)[1]
-        return torch.where(topk_idxs >= complete, -1, topk_idxs + offset)
-
     def forward_decode(
         self,
         x: torch.Tensor,
@@ -875,50 +698,16 @@ class Indexer(torch.nn.Module):
     ) -> torch.Tensor:
         """Select compressed positions with graph-static score geometry."""
 
-        bsz, _, _ = x.size()
-        ratio, rd = self.compress_ratio, self.rope_head_dim
-        width = math.ceil(graph_seq_len / ratio / 64) * 64
-        self.compressor.forward_decode(
+        self.compressor.forward_verify(
             x,
-            position,
+            position[:, None],
             cache_pool=cache.index_keys.view(-1, self.head_dim),
             cache_mapping=cache.index_mapping(self.layer_id),
             state_mapping=cache.state_mapping(INDEX_STATE_GROUP),
         )
-
-        if width == 0:
-            return torch.empty((bsz, 1, 0), dtype=torch.int32, device=x.device)
-
-        freqs_cis = self.freqs_cis.index_select(0, position)
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
-        q = rotate_activation(q)
-        fp4_act_quant(q, fp4_block_size, True)
-        weights = self.weights_proj(x)
-        index_cache = cache.index_keys.view(-1, self.head_dim)
-        index_score = index_scores(
-            q,
-            index_cache,
-            weights,
-            position[:, None],
-            ratio,
-            self.softmax_scale * self.n_heads**-0.5,
-            cache_mapping=cache.index_mapping(self.layer_id),
-            cache_width=width,
+        return self._forward_graph(
+            x, qr, position[:, None], offset, graph_seq_len, cache=cache
         )
-        if world_size > 1:
-            index_score = self.allreduce(index_score)
-        topk_width = min(self.index_topk, width)
-        topk_idxs = _compact_topk_indices(index_score.flatten(0, 1), topk_width)
-        topk_idxs = topk_idxs.view(*index_score.shape[:2], topk_width)
-        selected = finish_index_topk(
-            topk_idxs,
-            position[:, None],
-            ratio,
-            offset,
-            cache_mapping=cache.compressed_mapping(self.layer_id, ratio),
-        )
-        return selected
 
     def forward_prefill(
         self,
@@ -983,7 +772,7 @@ class Indexer(torch.nn.Module):
         )
         return torch.where(logical >= 0, physical, -1).to(torch.int32)
 
-    def forward_verify(
+    def _forward_graph(
         self,
         x: torch.Tensor,
         qr: torch.Tensor,
@@ -993,7 +782,7 @@ class Indexer(torch.nn.Module):
         *,
         cache: DeviceCache,
     ) -> torch.Tensor:
-        """Score a fixed verification block with one projection and collective."""
+        """Score one fixed graph block with one projection and collective."""
 
         bsz, block_length, _ = x.shape
         ratio = self.compress_ratio
@@ -1169,81 +958,40 @@ class Attention(nn.Module):
             compressed_mapping=compressed_mapping,
         )
 
-    def forward(self, x: torch.Tensor, *, cache: DeviceCache) -> torch.Tensor:
-        bsz, seqlen, _ = x.size()
-        freqs_cis = self.freqs_cis[:seqlen]
-        win = self.window_size
-        ratio = self.compress_ratio
-        rd = self.rope_head_dim
-        if self.compress_ratio and self.compressor.freqs_cis is None:
-            self.compressor.freqs_cis = self.freqs_cis
-            if self.indexer is not None:
-                self.indexer.freqs_cis = self.freqs_cis
-                self.indexer.compressor.freqs_cis = self.freqs_cis
-        # q
+    def _prepare_compression(self) -> None:
+        if not self.compress_ratio or self.compressor.freqs_cis is not None:
+            return
+        self.compressor.freqs_cis = self.freqs_cis
+        if self.indexer is not None:
+            self.indexer.freqs_cis = self.freqs_cis
+            self.indexer.compressor.freqs_cis = self.freqs_cis
+
+    def _project(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self._fused_wqkv:
-            qkv = linear(x, self._fused_wqkv_weight)
-            q_input, kv = qkv.split((self.q_lora_rank, self.head_dim), dim=-1)
+            q_input, kv = linear(x, self._fused_wqkv_weight).split(
+                (self.q_lora_rank, self.head_dim), dim=-1
+            )
         else:
             q_input, kv = self.wq_a(x), self.wkv(x)
-        qr = q = self.q_norm(q_input)
-        q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
-        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        return self.q_norm(q_input), kv
 
-        # win kv & topk_idxs
-        kv = self.kv_norm(kv)
-        apply_rotary_emb(kv[..., -rd:], freqs_cis)
-        # FP8-simulate non-rope dims to match QAT; rope dims stay bf16 for positional precision
-        act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
-        topk_idxs = get_window_topk_idxs(win, bsz, seqlen)
-        if self.compress_ratio:
-            offset = kv.size(1)
-            if self.indexer is not None:
-                compress_topk_idxs = self.indexer(x, qr, offset, cache=cache).int()
-            else:
-                compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, offset)
-            topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
-
-        # compress kv & attn
-        token_positions = (
-            torch.arange(seqlen, device=x.device).view(1, -1).expand(bsz, -1)
-        )
-        window_rows = cache.window_rows(self.layer_id, token_positions)
-        retained = window_rows >= 0
-        cache.latents.view(-1, self.head_dim).index_copy_(
-            0,
-            window_rows[retained].long(),
-            kv[retained].to(cache.latents.dtype),
-        )
-        if self.compress_ratio:
-            state_group = C4_STATE_GROUP if ratio == 4 else C128_STATE_GROUP
-            state_pages, state_offsets = cache.state_locations(
-                state_group, token_positions
+    def _finish(self, output: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if positions.ndim == 1:
+            apply_rotary_emb(
+                output[..., -self.rope_head_dim :],
+                self.freqs_cis.index_select(0, positions),
+                True,
             )
-            if (
-                kv_compress := self.compressor(
-                    x,
-                    cache_pool=cache.latents.view(-1, self.head_dim),
-                    cache_rows=cache.compressed_rows(
-                        self.layer_id, ratio, token_positions
-                    ),
-                    state_pages=state_pages,
-                    state_offsets=state_offsets,
-                )
-            ) is not None:
-                kv = torch.cat([kv, kv_compress], dim=1)
-        # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
-        o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
-        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
-
-        # o
-        o = o.view(bsz, seqlen, self.n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        # BF16 einsum is faster than the available tiny-M grouped FP8 paths.
-        o = grouped_bf16_linear(o, wo_a)
-        x = self.wo_b(o.flatten(2))
-        return x
+        else:
+            rope_last_block_inplace(
+                output,
+                torch.view_as_real(self.freqs_cis),
+                positions,
+                inverse=True,
+            )
+        output = output.view(*output.shape[:2], self.n_local_groups, -1)
+        weight = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        return self.wo_b(grouped_bf16_linear(output, weight).flatten(2))
 
     def forward_decode(
         self,
@@ -1255,20 +1003,9 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         """Run one reusable fixed-geometry decode attention step."""
 
-        bsz, _, _ = x.size()
-        ratio, rd = self.compress_ratio, self.rope_head_dim
-        if ratio and self.compressor.freqs_cis is None:
-            self.compressor.freqs_cis = self.freqs_cis
-            if self.indexer is not None:
-                self.indexer.freqs_cis = self.freqs_cis
-                self.indexer.compressor.freqs_cis = self.freqs_cis
-
-        if self._fused_wqkv:
-            qkv = linear(x, self._fused_wqkv_weight)
-            q_input, kv = qkv.split((self.q_lora_rank, self.head_dim), dim=-1)
-        else:
-            q_input, kv = self.wq_a(x), self.wkv(x)
-        qr = q = self.q_norm(q_input)
+        ratio = self.compress_ratio
+        self._prepare_compression()
+        qr, kv = self._project(x)
 
         compressed_width = 0
         compress_topk_idxs = None
@@ -1283,9 +1020,9 @@ class Attention(nn.Module):
             main_stream = torch.cuda.current_stream(x.device)
             self.decode_overlap_stream.wait_stream(main_stream)
             with torch.cuda.stream(self.decode_overlap_stream):
-                self.compressor.forward_decode(
+                self.compressor.forward_verify(
                     x,
-                    position,
+                    position[:, None],
                     cache_pool=cache.latents.view(-1, self.head_dim),
                     cache_mapping=cache.compressed_mapping(self.layer_id, ratio),
                     state_mapping=cache.state_mapping(
@@ -1304,7 +1041,7 @@ class Attention(nn.Module):
                 else:
                     generated_compressed_width = compressed_width
 
-        q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
         qk_norm_rope_store(
             q,
             kv,
@@ -1340,12 +1077,7 @@ class Attention(nn.Module):
             self.attention_workspace,
             self.softmax_scale,
         )
-        freqs_cis = self.freqs_cis.index_select(0, position)
-        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
-        o = o.view(bsz, 1, self.n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = grouped_bf16_linear(o, wo_a)
-        return self.wo_b(o.flatten(2))
+        return self._finish(o, position)
 
     def forward_prefill(
         self,
@@ -1362,18 +1094,8 @@ class Attention(nn.Module):
         ratio = self.compress_ratio
         if token_positions.shape != (batch_size, block_length):
             raise ValueError("prefill positions must match the token block")
-        if ratio and self.compressor.freqs_cis is None:
-            self.compressor.freqs_cis = self.freqs_cis
-            if self.indexer is not None:
-                self.indexer.freqs_cis = self.freqs_cis
-                self.indexer.compressor.freqs_cis = self.freqs_cis
-
-        if self._fused_wqkv:
-            qkv = linear(x, self._fused_wqkv_weight)
-            q_input, kv = qkv.split((self.q_lora_rank, self.head_dim), dim=-1)
-        else:
-            q_input, kv = self.wq_a(x), self.wkv(x)
-        qr = q = self.q_norm(q_input)
+        self._prepare_compression()
+        qr, kv = self._project(x)
 
         if ratio:
             state_group = C4_STATE_GROUP if ratio == 4 else C128_STATE_GROUP
@@ -1387,7 +1109,7 @@ class Attention(nn.Module):
                 state_group=state_group,
             )
 
-        q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
         compressed_indices = None
         generated_compressed_width = 0
         if ratio:
@@ -1432,16 +1154,7 @@ class Attention(nn.Module):
             self.attention_workspace,
             self.softmax_scale,
         )
-        rope_last_block_inplace(
-            o,
-            torch.view_as_real(self.freqs_cis),
-            token_positions,
-            inverse=True,
-        )
-        o = o.view(batch_size, block_length, self.n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = grouped_bf16_linear(o, wo_a)
-        return self.wo_b(o.flatten(2))
+        return self._finish(o, token_positions)
 
     def forward_verify(
         self,
@@ -1455,18 +1168,8 @@ class Attention(nn.Module):
 
         batch_size, block_length, _ = x.shape
         ratio = self.compress_ratio
-        if ratio and self.compressor.freqs_cis is None:
-            self.compressor.freqs_cis = self.freqs_cis
-            if self.indexer is not None:
-                self.indexer.freqs_cis = self.freqs_cis
-                self.indexer.compressor.freqs_cis = self.freqs_cis
-
-        if self._fused_wqkv:
-            qkv = linear(x, self._fused_wqkv_weight)
-            q_input, kv = qkv.split((self.q_lora_rank, self.head_dim), dim=-1)
-        else:
-            q_input, kv = self.wq_a(x), self.wkv(x)
-        qr = q = self.q_norm(q_input)
+        self._prepare_compression()
+        qr, kv = self._project(x)
 
         compressed_width = 0
         if ratio:
@@ -1494,13 +1197,13 @@ class Attention(nn.Module):
                     state_mapping=cache.state_mapping(INDEX_STATE_GROUP),
                 )
 
-        q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
 
         block_compressed_indices = None
         generated_compressed_width = 0
         if ratio:
             if self.indexer is not None:
-                block_compressed_indices = self.indexer.forward_verify(
+                block_compressed_indices = self.indexer._forward_graph(
                     x,
                     qr,
                     token_positions,
@@ -1540,17 +1243,7 @@ class Attention(nn.Module):
             self.attention_workspace,
             self.softmax_scale,
         )
-        rope_last_block_inplace(
-            o,
-            torch.view_as_real(self.freqs_cis),
-            token_positions,
-            inverse=True,
-        )
-
-        o = o.view(batch_size, block_length, self.n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = grouped_bf16_linear(o, wo_a)
-        return self.wo_b(o.flatten(2))
+        return self._finish(o, token_positions)
 
 
 class Gate(nn.Module):
@@ -1933,28 +1626,6 @@ class Block(nn.Module):
             self.hc_attn_scale = nn.Parameter(torch.empty(3))
             self.hc_ffn_scale = nn.Parameter(torch.empty(3))
 
-    def hc_pre(
-        self,
-        x: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
-    ):
-        # x: [b,s,hc,d], hc_fn: [mix_hc,hc*d], hc_scale: [3], hc_base: [mix_hc], y: [b,s,hc,d]
-        mixes = F.linear(x.flatten(2).float(), hc_fn)
-        post, comb, layer_input = mhc_pre_big_fuse_with_prenorm(
-            mixes,
-            x,
-            hc_scale,
-            hc_base,
-            rms_eps=self.norm_eps,
-            mhc_pre_eps=self.hc_eps,
-            mhc_sinkhorn_eps=self.hc_eps,
-            mhc_post_mult_value=2.0,
-            sinkhorn_repeat=self.hc_sinkhorn_iters,
-        )
-        return layer_input, post.squeeze(-1), comb
-
     def hc_pre_graph(
         self,
         x: torch.Tensor,
@@ -2006,103 +1677,7 @@ class Block(nn.Module):
             comb.reshape(*outer_shape, x.shape[-2], x.shape[-2]),
         )
 
-    def hc_post(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-        post: torch.Tensor,
-        comb: torch.Tensor,
-    ):
-        # x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc], y: [b,s,hc,d]
-        return mhc_post(x, residual, post, comb)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        input_ids: torch.Tensor,
-        *,
-        cache: DeviceCache,
-    ) -> torch.Tensor:
-        residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
-        )
-        x = self.attn_norm(x)
-        x = self.attn(x, cache=cache)
-        x = self.hc_post(x, residual, post, comb)
-
-        residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
-        )
-        x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
-        x = self.hc_post(x, residual, post, comb)
-        return x
-
-    def forward_decode(
-        self,
-        x: torch.Tensor,
-        position: torch.Tensor,
-        input_ids: torch.Tensor,
-        graph_seq_len: int,
-        *,
-        cache: DeviceCache,
-    ) -> torch.Tensor:
-        """Run a target block without host-side position specialization."""
-
-        return self._forward_graph(
-            x,
-            input_ids,
-            lambda layer_input: self.attn.forward_decode(
-                layer_input, position, graph_seq_len, cache=cache
-            ),
-        )
-
-    def forward_prefill(
-        self,
-        x: torch.Tensor,
-        token_positions: torch.Tensor,
-        input_ids: torch.Tensor,
-        start_position: int,
-        sequence_length: int,
-        *,
-        cache: DeviceCache,
-    ) -> torch.Tensor:
-        """Run one target layer over an arbitrary cached prompt suffix."""
-
-        return self._forward_graph(
-            x,
-            input_ids,
-            lambda layer_input: self.attn.forward_prefill(
-                layer_input,
-                token_positions,
-                start_position,
-                sequence_length,
-                cache=cache,
-            ),
-        )
-
-    def forward_verify(
-        self,
-        x: torch.Tensor,
-        token_positions: torch.Tensor,
-        input_ids: torch.Tensor,
-        graph_seq_len: int,
-        *,
-        cache: DeviceCache,
-    ) -> torch.Tensor:
-        """Run one target layer over a short causal verification block."""
-
-        return self._forward_graph(
-            x,
-            input_ids,
-            lambda layer_input: self.attn.forward_verify(
-                layer_input, token_positions, graph_seq_len, cache=cache
-            ),
-        )
-
-    def _forward_graph(
+    def forward_attention(
         self,
         x: torch.Tensor,
         input_ids: torch.Tensor,
@@ -2119,7 +1694,7 @@ class Block(nn.Module):
             self.attn_norm.weight,
         )
         x = attention(x)
-        x = self.hc_post(x, residual, post, comb)
+        x = mhc_post(x, residual, post, comb)
 
         residual = x
         x, post, comb = self.hc_pre_graph(
@@ -2130,7 +1705,7 @@ class Block(nn.Module):
             self.ffn_norm.weight,
         )
         x = self.ffn(x, input_ids)
-        return self.hc_post(x, residual, post, comb)
+        return mhc_post(x, residual, post, comb)
 
     def hc_head(
         self,
@@ -2314,7 +1889,7 @@ class DSparkBlock(Block):
         *,
         cache: DeviceCache,
     ) -> torch.Tensor:
-        return self._forward_graph(
+        return self.forward_attention(
             x,
             input_ids,
             lambda layer_input: self.attn(layer_input, position, cache=cache),
@@ -2405,11 +1980,6 @@ class Transformer(nn.Module):
                 indexer.compressor.freqs_cis = attention.freqs_cis
                 indexer.freqs_cis = attention.freqs_cis
 
-    @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor, *, cache: DeviceCache) -> torch.Tensor:
-        logits, _ = self.forward_target(input_ids, cache=cache)
-        return logits
-
     def _forward_layers(
         self,
         input_ids: torch.Tensor,
@@ -2440,19 +2010,6 @@ class Transformer(nn.Module):
         return self.head(self.norm(hidden), full_logits=full_logits), main_hidden
 
     @torch.inference_mode()
-    def forward_target(
-        self, input_ids: torch.Tensor, *, cache: DeviceCache
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run target prefill and return the hidden states consumed by DSpark."""
-
-        with dynamic_gemm_rows():
-            h, main_hidden = self._forward_layers(
-                input_ids,
-                lambda layer, hidden: layer(hidden, input_ids, cache=cache),
-            )
-            return self._target_output(h, main_hidden)
-
-    @torch.inference_mode()
     def forward_decode(
         self,
         input_ids: torch.Tensor,
@@ -2481,8 +2038,12 @@ class Transformer(nn.Module):
 
         h, main_hidden = self._forward_layers(
             input_ids,
-            lambda layer, hidden: layer.forward_decode(
-                hidden, position, input_ids, graph_seq_len, cache=cache
+            lambda layer, hidden: layer.forward_attention(
+                hidden,
+                input_ids,
+                lambda layer_input: layer.attn.forward_decode(
+                    layer_input, position, graph_seq_len, cache=cache
+                ),
             ),
         )
         return self._target_output(h, main_hidden)
@@ -2504,13 +2065,16 @@ class Transformer(nn.Module):
         with dynamic_gemm_rows():
             h, main_hidden = self._forward_layers(
                 input_ids,
-                lambda layer, hidden: layer.forward_prefill(
+                lambda layer, hidden: layer.forward_attention(
                     hidden,
-                    token_positions,
                     input_ids,
-                    start_position,
-                    sequence_length,
-                    cache=cache,
+                    lambda layer_input: layer.attn.forward_prefill(
+                        layer_input,
+                        token_positions,
+                        start_position,
+                        sequence_length,
+                        cache=cache,
+                    ),
                 ),
             )
             return self._target_output(h, main_hidden)
@@ -2531,8 +2095,12 @@ class Transformer(nn.Module):
         )
         h, main_hidden = self._forward_layers(
             input_ids,
-            lambda layer, hidden: layer.forward_verify(
-                hidden, token_positions, input_ids, graph_seq_len, cache=cache
+            lambda layer, hidden: layer.forward_attention(
+                hidden,
+                input_ids,
+                lambda layer_input: layer.attn.forward_verify(
+                    layer_input, token_positions, graph_seq_len, cache=cache
+                ),
             ),
         )
         return self._target_output(h, main_hidden, full_logits=True)

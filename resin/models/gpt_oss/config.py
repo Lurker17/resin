@@ -1,4 +1,4 @@
-"""Validated GPT-OSS checkpoint configuration."""
+"""Backend-neutral GPT-OSS checkpoint configuration."""
 
 from __future__ import annotations
 

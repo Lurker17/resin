@@ -1,4 +1,4 @@
-"""Single-Blackwell Inkling-Small target with gamma-five DSpark decoding."""
+"""Inkling-Small CUDA target with gamma-five DSpark decoding."""
 
 from __future__ import annotations
 
@@ -13,21 +13,28 @@ from resin import BatchPhase, ResourceBinding, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
 from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
-    CudaGraphCache,
+    CudaGraphMode,
+    CudaGraphRunner,
     CudaGraphStats,
     CudaGraphStep,
     GraphShape,
     graph_shapes,
 )
+from resin.backend.cuda.runner import (
+    capture_sampling_inputs,
+    graph_sample,
+    pad_sampling_inputs,
+    validate_hybrid_plan,
+)
 from resin.backend.cuda.sampling import (
     SAMPLING_OFFSET_STRIDE,
     FlashInferSampler,
-    SamplingTensors,
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
+from resin.models.inkling.media import InklingMedia
 from resin.protocols import Runner
 from resin_models_cuda.inkling.cache import (
     PREFILL_CHUNK_SIZE,
@@ -43,7 +50,6 @@ from resin_models_cuda.inkling.checkpoint import (
     resolve_target_path,
 )
 from resin_models_cuda.inkling.dspark import DSparkDraft
-from resin_models_cuda.inkling.media import InklingMedia
 from resin_models_cuda.inkling.model import (
     InklingForCausalLM,
     select_convolution_state,
@@ -119,7 +125,7 @@ class InklingCudaRunner(Runner):
         self.physical_seq_len = max_seq_len + self.speculative_tokens
         self.vocab_size = self.config.unpadded_vocab_size
         self.eos_token_id = self.config.eos_token_id
-        self._sampler = FlashInferSampler(torch)
+        self._sampler = FlashInferSampler()
         self._speculation = SpeculativeStats(self.speculative_tokens)
         self._graph_device_caches: dict[GraphShape, DeviceCache] = {}
         self._media_features: dict[int, tuple[InklingMedia, torch.Tensor]] = {}
@@ -164,7 +170,7 @@ class InklingCudaRunner(Runner):
             * capacity.bytes_per_parent,
         )
         self.cache_layout = self.cache_geometry.layout(slab_capacity)
-        self._cache = CacheArena(torch, self.device, self.cache_layout)
+        self._cache = CacheArena(self.device, self.cache_layout)
         decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
         if any(shape[0] > max_batch_size for shape in decode_graph_shapes):
             raise ValueError("CUDA graph batch capacity exceeds max_batch_size")
@@ -174,13 +180,18 @@ class InklingCudaRunner(Runner):
             shape[1] <= self.speculative_tokens + 1 for shape in decode_graph_shapes
         ):
             raise ValueError("Inkling CUDA graph sequence capacity is too small")
-        self._graphs = CudaGraphCache(
-            torch,
+        self._graph_runner = CudaGraphRunner(
             self.device,
-            decode_graph_shapes,
-            build=self._new_decode_graph_step,
+            {
+                "decode": CudaGraphMode(
+                    decode_graph_shapes,
+                    self._new_decode_graph_step,
+                    self._decode_graph_capture_inputs,
+                )
+            },
             synchronize_failure=self._cuda_failure,
         )
+        self._graphs = self._graph_runner.mode("decode")
         self._graph_state_inputs = torch.empty(
             (
                 max_batch_size,
@@ -216,44 +227,22 @@ class InklingCudaRunner(Runner):
         return {
             "token_ids": (0,) * batch_size,
             "positions": (1,) * batch_size,
-            "sampling_temperatures": (1.0,) * batch_size,
-            "sampling_top_ps": (1.0,) * batch_size,
-            "sampling_top_ks": (vocab_size,) * batch_size,
-            "sampling_seeds": tuple(range(batch_size)),
-            "sampling_offsets": (0,) * batch_size,
-            "sampling_stochastic_mask": (False,) * batch_size,
+            **capture_sampling_inputs(batch_size, vocab_size, unique_seeds=True),
         }
 
     def capture_cuda_graphs(self) -> CudaGraphStats:
         """Capture every configured, fixed-grid decode bucket."""
 
-        captured = set(self._graphs.stats["captured_shapes"])
-        for shape in self._graphs.shapes:
-            if shape in captured:
-                continue
-            inputs = self._capture_inputs(shape, self.vocab_size)
-            inputs.update(self._cache.graph_shape_capture_inputs(*shape))
-            self._graphs.capture(shape, inputs)
-        if self._graphs.shapes:
+        def reset_null_page() -> None:
             self._cache.reset_null()
             torch.cuda.synchronize(self.device)
-        return self._graphs.stats
 
-    def _graph_sample(
-        self,
-        logits: torch.Tensor,
-        sampling: SamplingTensors,
-        step: int,
-    ) -> torch.Tensor:
-        tensors = SamplingTensors(
-            temperatures=sampling.temperatures,
-            top_ps=sampling.top_ps,
-            top_ks=sampling.top_ks,
-            seeds=sampling.seeds,
-            offsets=sampling.offsets + step * SAMPLING_OFFSET_STRIDE,
-            stochastic_mask=sampling.stochastic_mask,
-        )
-        return self._sampler.sample_tensors(logits.float(), tensors)
+        return self._graph_runner.capture_all(after_capture=reset_null_page)["decode"]
+
+    def _decode_graph_capture_inputs(self, shape: GraphShape) -> dict[str, object]:
+        inputs = self._capture_inputs(shape, self.vocab_size)
+        inputs.update(self._cache.graph_shape_capture_inputs(*shape))
+        return inputs
 
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         batch_size, graph_seq_len = shape
@@ -276,7 +265,9 @@ class InklingCudaRunner(Runner):
                     positions,
                     cache,
                     graph_seq_len,
-                    lambda logits, step: self._graph_sample(logits, sampling, step),
+                    lambda logits, step: graph_sample(
+                        self._sampler, logits, sampling, step
+                    ),
                 )
                 verify_ids = torch.cat((token_ids[:, None], drafts), dim=1)
                 offsets = torch.arange(self.speculative_tokens + 1, device=self.device)
@@ -293,7 +284,9 @@ class InklingCudaRunner(Runner):
                 )
                 targets = torch.stack(
                     [
-                        self._graph_sample(logits[:, step].contiguous(), sampling, step)
+                        graph_sample(
+                            self._sampler, logits[:, step].contiguous(), sampling, step
+                        )
                         for step in range(self.speculative_tokens + 1)
                     ],
                     dim=1,
@@ -343,21 +336,9 @@ class InklingCudaRunner(Runner):
         inputs.update(
             self._cache.graph_plan_inputs(self._graph_device_caches[shape], cache_plan)
         )
-        sampling_inputs = self._sampler.host_inputs(plan, self.vocab_size)
-        defaults = {
-            "sampling_temperatures": 1.0,
-            "sampling_top_ps": 1.0,
-            "sampling_top_ks": self.vocab_size,
-            "sampling_seeds": 0,
-            "sampling_offsets": 0,
-            "sampling_stochastic_mask": False,
-        }
-        for name, default in defaults.items():
-            sampling_inputs[name] = (
-                *sampling_inputs[name],
-                *((default,) * padding),
-            )
-        inputs.update(sampling_inputs)
+        inputs.update(
+            pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding)
+        )
         output = self._graphs.run(shape, inputs)[:batch_size]
         width = self.speculative_tokens
         return self._speculation.accept(
@@ -366,35 +347,13 @@ class InklingCudaRunner(Runner):
         ).token_rows
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
-        rows = plan.num_sequences
-        if rows == 0 or rows > self.max_batch_size:
-            raise ValueError("Inkling batch size is outside runner capacity")
-        indptr = np.asarray(plan.token_indptr)
-        if (
-            len(indptr) != rows + 1
-            or indptr[0] != 0
-            or indptr[-1] != len(plan.token_ids)
-            or np.any(indptr[1:] <= indptr[:-1])
-        ):
-            raise ValueError("Inkling sequence metadata is malformed")
-        if len(plan.context_lengths) != rows or len(plan.sampling_mask) != rows:
-            raise ValueError("Inkling row metadata is malformed")
-        slices = tuple((int(start), int(end)) for start, end in zip(indptr, indptr[1:]))
-        for row, (start, end) in enumerate(slices):
-            context = int(plan.context_lengths[row])
-            expected = np.arange(context, context + end - start)
-            if not np.array_equal(plan.positions[start:end], expected):
-                raise ValueError("Inkling positions must continue their context")
-            if context + end - start > self.max_seq_len:
-                raise ValueError("Inkling sequence exceeds max_seq_len")
-        if plan.phase == BatchPhase.DECODE:
-            if any(end - start != 1 for start, end in slices):
-                raise ValueError("Inkling decode rows must contain one anchor token")
-            if any(int(context) == 0 for context in plan.context_lengths):
-                raise ValueError("Inkling decode requires a cached prefix")
-        elif plan.phase != BatchPhase.PREFILL:
-            raise ValueError("Inkling plan phase must be prefill or decode")
-        return slices
+        return validate_hybrid_plan(
+            plan,
+            label="Inkling",
+            max_batch_size=self.max_batch_size,
+            max_seq_len=self.max_seq_len,
+            decode_lookahead=0,
+        )
 
     def _sample(self, logits: torch.Tensor, plan: BatchPlan, step: int = 0):
         return self._sampler(

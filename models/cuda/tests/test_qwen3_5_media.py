@@ -10,8 +10,8 @@ from PIL import Image
 from renderers.base import MultiModalData, PlaceholderRange, RenderedTokens
 
 from resin import MediaInput
-from resin_models_cuda.qwen3_5.codec import Qwen35Codec
-from resin_models_cuda.qwen3_5.media import Qwen35Media
+from resin.models.qwen3_5.codec import Qwen35Codec
+from resin.models.qwen3_5.media import Qwen35Media
 
 
 def _media() -> Qwen35Media:

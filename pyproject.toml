@@ -15,13 +15,10 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["blake3>=1.0,<2", "numpy>=1.26,<3"]
+dependencies = ["blake3>=1.0,<2", "numpy>=1.26,<3", "torch>=2.13.0"]
 
 [project.optional-dependencies]
-gpu = [
-  "torch>=2.13.0",
-  "flashinfer-python>=0.6.15.post1; sys_platform == 'linux'",
-]
+cuda = ["flashinfer-python>=0.6.15.post1; sys_platform == 'linux'"]
 server = ["renderers>=0.1.9,<0.2"]
 
 [dependency-groups]
@@ -38,7 +35,6 @@ dev = [
   "modal>=1.5.3",
   "pytest>=8,<9",
   "ruff>=0.16,<0.17",
-  "torch>=2.13.0",
   "huggingface-hub>=0.35",
   "safetensors>=0.5",
   "renderers>=0.1.9",
