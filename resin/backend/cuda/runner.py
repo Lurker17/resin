@@ -20,7 +20,6 @@ from resin.backend.cuda.sampling import (
     FlashInferSampler,
     SamplingTensors,
 )
-from resin.backend.loading import default_device
 from resin.backend.resources import CachePoolBinding
 from resin.protocols import Runner
 
@@ -50,14 +49,14 @@ class CudaRunner(Runner):
     def __init__(
         self,
         *,
-        device: str | torch.device | None,
+        device: str | torch.device,
         label: str,
         kv_cache_dtype: str,
     ) -> None:
         cache_dtype = resolve_kv_cache_dtype(kv_cache_dtype)
         if not torch.cuda.is_available():
             raise RuntimeError(f"{label} requires CUDA")
-        self.device = torch.device(device or default_device(require_cuda=True))
+        self.device = torch.device(device)
         if self.device.type != "cuda":
             raise RuntimeError(f"{label} requires a CUDA device")
         if self.device.index is None:

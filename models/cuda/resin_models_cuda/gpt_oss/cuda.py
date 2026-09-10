@@ -133,7 +133,7 @@ class GptOssCudaRunner(CudaRunner):
         *,
         cache_parent_capacity: int | None = None,
         revision: str | None = None,
-        device: str | None = None,
+        device: str | torch.device,
         dtype=None,
         quantization: QuantizationConfig | None = None,
         kernel_attention=None,

@@ -11,7 +11,6 @@ import torch
 from resin import RunnerConfig
 from resin.backend.loading import (
     MODEL_FILES,
-    default_device,
     materialize_safetensor_model,
     read_config,
     resolve_model,
@@ -58,7 +57,6 @@ def load_model(model_path: Path, *, device, dtype=None):
         model_path,
         device=device,
         dtype=dtype,
-        backend="LFM2",
         build=lambda: Lfm2ForCausalLM(args),
     )
     return model, config
@@ -74,10 +72,10 @@ class Lfm2TorchRunner(Runner):
         model: str | Path = DEFAULT_MODEL,
         *,
         revision: str | None = DEFAULT_REVISION,
-        device: str | None = None,
+        device: str | torch.device,
         dtype=None,
     ) -> None:
-        self.device = torch.device(device or default_device())
+        self.device = torch.device(device)
         self.model_path = resolve_model_path(model, revision)
         self._model, self.config = load_model(
             self.model_path, device=self.device, dtype=dtype

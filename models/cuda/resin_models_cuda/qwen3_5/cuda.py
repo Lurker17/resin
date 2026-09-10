@@ -72,7 +72,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         max_seq_len: int | None = None,
         max_batch_size: int = 32,
         speculative_tokens: int = 0,
-        device: str | None = None,
+        device: str | torch.device,
         gpu_memory_utilization: float = 0.90,
         cache_slab_capacity: int | None = None,
         kv_cache_dtype: str = "fp8",

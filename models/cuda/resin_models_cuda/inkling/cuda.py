@@ -68,7 +68,7 @@ class InklingCudaRunner(CudaRunner):
         *,
         max_seq_len: int,
         max_batch_size: int = 128,
-        device: str | torch.device = "cuda:0",
+        device: str | torch.device,
         prefill_chunk_size: int = PREFILL_CHUNK_SIZE,
         gpu_memory_utilization: float = 0.90,
         cache_slab_capacity: int | None = None,

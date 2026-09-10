@@ -6,16 +6,28 @@ import json
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from resin.backend.cuda.parallel import TensorParallelLayout
 from resin.backend.loading import (
     MODEL_FILES,
-    materialize_safetensor_model,
     read_config,
+    resolve_dtype,
     resolve_model,
 )
-from resin.backend.quantization import BF16, MXFP4, QuantizationConfig
+from resin.backend.quantization import MXFP4, QuantizationConfig
 from resin.backend.transformer import MoEForCausalLM
 from resin.models.gpt_oss.config import GptOssConfig
+from resin_models_cuda.gpt_oss.mxfp4 import (
+    EXPERT_CHECKPOINT_NAMES,
+    cuda_architecture,
+    install_expert_layer,
+    kernel_expert_factory,
+    moe_kernel_config,
+    shard_checkpoint_tensor,
+    shard_model_config,
+)
+from resin_models_cuda.gpt_oss.weights import load_gpt_oss_weights
 
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 MODEL_20B = "openai/gpt-oss-20b"
@@ -80,70 +92,90 @@ def _check_quantization(
     *,
     quantization: QuantizationConfig | None = None,
     kernel_moe=None,
-):
+) -> None:
     checkpoint_config = config.get("quantization_config") or config.get("quantization")
     method = checkpoint_config.get("quant_method") if checkpoint_config else None
-    checkpoint_encoding = BF16
-    if method == "mxfp4":
-        checkpoint_encoding = MXFP4
-    elif method is not None:
-        raise ValueError(f"unsupported GPT-OSS quantization method: {method!r}")
+    if method != "mxfp4":
+        raise ValueError("GPT-OSS CUDA inference requires an MXFP4 checkpoint")
     if quantization is not None:
-        quantization.require("transformer.experts", checkpoint_encoding)
-    if checkpoint_encoding == MXFP4 and kernel_moe is None:
+        quantization.require("transformer.experts", MXFP4)
+    if kernel_moe is None:
         raise NotImplementedError(
             "the released GPT-OSS checkpoint uses MXFP4 expert weights; "
             "pass an imported CUDA implementation as kernel_moe"
         )
-    return checkpoint_encoding
 
 
 def load_model(
-    model_path: Path,
+    model_path: str | Path,
     *,
-    device,
-    dtype=None,
+    device: str | torch.device,
+    dtype: str | torch.dtype | None = None,
     quantization: QuantizationConfig | None = None,
     kernel_moe=None,
     tensor_parallel: TensorParallelLayout | None = None,
-):
-    config = read_config(model_path)
+) -> tuple[MoEForCausalLM, dict[str, Any]]:
+    root = Path(model_path).expanduser().resolve()
+    config = read_config(root)
     args = GptOssConfig.from_dict(config)
-    checkpoint_encoding = _check_quantization(
+    _check_quantization(
         config,
         quantization=quantization,
         kernel_moe=kernel_moe,
     )
-    if checkpoint_encoding == MXFP4:
-        from resin_models_cuda.gpt_oss.mxfp4 import load_mxfp4_model
-
-        return load_mxfp4_model(
-            model_path,
-            device=device,
-            kernel=kernel_moe,
-            dtype=dtype,
-            tensor_parallel=tensor_parallel,
-        )
-
     tensor_parallel = tensor_parallel or TensorParallelLayout()
-    if tensor_parallel.enabled:
-        raise NotImplementedError(
-            "tensor parallel loading currently requires packed MXFP4 experts"
+    target = torch.device(device)
+    resolved_dtype = resolve_dtype(dtype)
+    if resolved_dtype not in {None, torch.bfloat16}:
+        raise ValueError("the packed SM90 GPT-OSS path requires bfloat16 activations")
+    local_args = shard_model_config(args, tensor_parallel)
+    kernel_config = moe_kernel_config(local_args, cuda_architecture(target))
+    kernel_moe.validate(kernel_config)
+    with torch.device("meta"):
+        model = MoEForCausalLM(
+            local_args,
+            kernel_expert_factory(kernel_moe, kernel_config),
         )
 
-    def restore_norm_dtype(model) -> None:
-        # The checkpoint stores BF16 scales, but normalization accumulates and
-        # retains its parameters in FP32.
-        for module in model.modules():
-            if module.__class__.__name__ == "RMSNorm":
-                module.float()
-
-    model = materialize_safetensor_model(
-        model_path,
+    load_gpt_oss_weights(
+        root,
+        model,
         device=device,
-        dtype=dtype,
-        backend="GPT-OSS",
-        build=lambda: MoEForCausalLM(args),
-        after_cast=restore_norm_dtype,
+        dtype=torch.bfloat16,
+        num_hidden_layers=args.num_hidden_layers,
+        expert_tensor_names=EXPERT_CHECKPOINT_NAMES,
+        transform_tensor=lambda key, tensor: shard_checkpoint_tensor(
+            key,
+            tensor,
+            args=args,
+            tensor_parallel=tensor_parallel,
+        ),
+        install_expert_layer=lambda layer, tensors: install_expert_layer(
+            model,
+            kernel_moe,
+            kernel_config,
+            layer,
+            dict(tensors),
+        ),
     )
+
+    model.materialize_buffers(target)
+    for module in model.modules():
+        if module.__class__.__name__ == "RMSNorm":
+            module.float()
+    unprepared = [
+        index
+        for index, layer in enumerate(model.model.layers)
+        if not layer.mlp.experts.is_prepared
+    ]
+    if unprepared:
+        raise RuntimeError(f"packed expert layers were not prepared: {unprepared}")
+    remaining_meta = [
+        name for name, parameter in model.named_parameters() if parameter.is_meta
+    ]
+    if remaining_meta:
+        raise RuntimeError(
+            "ordinary model parameters remain on meta: " + ", ".join(remaining_meta[:8])
+        )
+    model.eval()
     return model, config

@@ -66,7 +66,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         max_seq_len: int,
         max_batch_size: int = 1,
         tensor_parallel: TensorParallelContext,
-        device: str | torch.device | None = None,
+        device: str | torch.device,
         cuda_graph_decode_shapes: object | None = None,
         fast_allreduce: bool = True,
         speculative_tokens: int = 0,
@@ -103,7 +103,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         self.tensor_parallel_rank = tensor_parallel.rank
         self.tensor_parallel_size = tensor_parallel.size
         super().__init__(
-            device=device or f"cuda:{tensor_parallel.rank}",
+            device=device,
             label="DeepSeek-V4",
             kv_cache_dtype="bfloat16",
         )

@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from resin.backend.loading import assign_model_tensor, resolve_dtype
+from resin.backend.loading import load_safetensor_weights, resolve_dtype
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 
 _EXPERT_KEY = re.compile(
@@ -62,18 +62,15 @@ def load_gpt_oss_weights(
     if unexpected := actual - expected:
         raise ValueError(f"checkpoint has unexpected tensors: {sorted(unexpected)[:8]}")
 
+    load_safetensor_weights(
+        root,
+        model,
+        device=target,
+        dtype=resolved_dtype,
+        checkpoint_keys=ordinary_keys,
+        transform_tensor=transform_tensor,
+    )
     with SafetensorReader() as reader:
-        for key in ordinary_keys:
-            tensor = reader.read(tensor_files[key], key)
-            tensor = transform_tensor(key, tensor)
-            assign_model_tensor(
-                model,
-                key,
-                tensor,
-                device=target,
-                dtype=resolved_dtype,
-            )
-
         for layer in range(num_hidden_layers):
             tensors = {}
             for name in expert_names:

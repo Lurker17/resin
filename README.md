@@ -113,7 +113,7 @@ FlashInfer/FA4 packages are still required remotely.
 from resin import Engine, SamplingParams
 from resin_models_torch.lfm2 import Lfm2TorchRunner
 
-runner = Lfm2TorchRunner()
+runner = Lfm2TorchRunner(device="cpu")
 
 with Engine(
     runner,

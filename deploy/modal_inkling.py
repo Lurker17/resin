@@ -166,6 +166,7 @@ def _build_runtime(*, context_length: int = MAX_CONTEXT_LENGTH):
     runner = InklingCudaRunner(
         TARGET_PATH,
         DRAFT_PATH,
+        device="cuda",
         max_seq_len=context_length,
         max_batch_size=DEFAULT_MAX_NUM_SEQS,
         gpu_memory_utilization=0.90,

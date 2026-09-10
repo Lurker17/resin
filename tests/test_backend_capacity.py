@@ -21,7 +21,7 @@ def test_capacity_plan_accounts_for_protected_memory_overhead_and_null_parent() 
     assert plan.cache_budget_bytes == 650
     assert plan.parent_capacity == 5
     assert plan.allocation_bytes == 600
-    assert plan.workspace_bytes == 50
+    assert plan.overhead_bytes == 50
 
 
 def test_capacity_plan_rejects_a_budget_without_one_usable_parent() -> None:

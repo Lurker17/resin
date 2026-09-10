@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -208,9 +206,7 @@ class TestGptOssTorch:
         config = _config(self.args, quantization={"quant_method": "mxfp4"})
         plan = QuantizationConfig({"transformer.experts": MXFP4})
 
-        assert (
-            _check_quantization(config, quantization=plan, kernel_moe=object()) == MXFP4
-        )
+        _check_quantization(config, quantization=plan, kernel_moe=object())
         with pytest.raises(ValueError, match="quantization config selected"):
             _check_quantization(
                 config,
@@ -218,26 +214,10 @@ class TestGptOssTorch:
                 kernel_moe=object(),
             )
 
-    @pytest.mark.skipif(
-        not importlib.util.find_spec("safetensors"),
-        reason="safetensors is not installed",
-    )
-    def test_direct_dense_safetensors_loading_without_transformers(
-        self, tmp_path: Path
-    ) -> None:
-        from safetensors.torch import save_file
-
+    def test_loader_rejects_non_mxfp4_checkpoints(self, tmp_path: Path) -> None:
         from resin_models_cuda.gpt_oss.checkpoint import load_model
 
         path = tmp_path
         (path / "config.json").write_text(json.dumps(_config(self.args)))
-        save_file(self.model.state_dict(), path / "model.safetensors")
-        loaded, loaded_config = load_model(path, device="cpu")
-        assert "transformers" not in sys.modules
-        assert "tokenizers" not in sys.modules
-        assert loaded_config["model_type"] == "gpt_oss"
-        expected = self.model.state_dict()
-        actual = loaded.state_dict()
-        assert actual.keys() == expected.keys()
-        for name in expected:
-            torch.testing.assert_close(expected[name], actual[name], rtol=0, atol=0)
+        with pytest.raises(ValueError, match="requires an MXFP4 checkpoint"):
+            load_model(path, device="cpu", kernel_moe=object())

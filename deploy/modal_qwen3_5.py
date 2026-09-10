@@ -182,6 +182,7 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
     started = time.perf_counter()
     runner = Qwen3_5CudaRunner(
         MODEL_PATH,
+        device="cuda",
         max_seq_len=context_length,
         max_batch_size=MAX_RUNNING_REQUESTS,
         speculative_tokens=speculative_tokens,

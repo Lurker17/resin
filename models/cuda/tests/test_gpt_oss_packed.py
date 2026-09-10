@@ -8,8 +8,8 @@ from resin.moe_kernels import MoEKernelConfig
 class TestGptOssPackedBridge:
     def test_official_block_layout_is_flattened_and_installed(self) -> None:
         from resin_models_cuda.gpt_oss.mxfp4 import (
-            _install_expert_layer,
-            _make_kernel_expert_factory,
+            install_expert_layer,
+            kernel_expert_factory,
         )
 
         config = MoEKernelConfig(
@@ -45,7 +45,7 @@ class TestGptOssPackedBridge:
             num_experts_per_tok = 2
 
         kernel = Kernel()
-        factory = _make_kernel_expert_factory(kernel, config)
+        factory = kernel_expert_factory(kernel, config)
 
         class MLP(torch.nn.Module):
             def __init__(self) -> None:
@@ -76,7 +76,7 @@ class TestGptOssPackedBridge:
             "down_proj_scales": torch.zeros(4, 32, 1, dtype=torch.uint8),
             "down_proj_bias": torch.zeros(4, 32),
         }
-        _install_expert_layer(model, kernel, config, 0, tensors)
+        install_expert_layer(model, kernel, config, 0, tensors)
 
         assert len(kernel.prepared) == 1
         weights, actual_config = kernel.prepared[0]

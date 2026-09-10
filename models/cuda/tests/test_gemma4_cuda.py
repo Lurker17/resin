@@ -25,11 +25,11 @@ def test_capacity_planner_accounts_for_fp8_shared_parent_bytes() -> None:
     assert plan.protected_free_bytes == math.ceil(total * 0.2)
     assert (
         plan.parent_capacity
-        == (free - plan.protected_free_bytes - plan.workspace_bytes)
+        == (free - plan.protected_free_bytes - plan.overhead_bytes)
         // plan.bytes_per_parent
         - 1
     )
-    assert plan.workspace_bytes == 7 * 256 * 1024**2
+    assert plan.overhead_bytes == 7 * 256 * 1024**2
     assert plan.allocation_bytes == (plan.parent_capacity + 1) * plan.bytes_per_parent
 
 

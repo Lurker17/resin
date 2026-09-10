@@ -19,7 +19,7 @@ runner = GptOssCudaRunner(
     model,
     cache_parent_capacity=...,
     revision=None,
-    device=None,
+    device="cuda:0",
     dtype=None,
     quantization=QuantizationConfig({"transformer.experts": MXFP4}),
     kernel_attention=None,

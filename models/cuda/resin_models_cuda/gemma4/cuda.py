@@ -171,7 +171,7 @@ class Gemma4CudaRunner(CudaRunner):
         assistant_model: str | Path | None = None,
         assistant_revision: str | None = None,
         speculative_tokens: int = 0,
-        device: str | None = None,
+        device: str | torch.device,
         nvfp4_backend: str = "auto",
         kv_cache_dtype: str = "fp8",
         cuda_graph_decode_shapes: object | None = None,

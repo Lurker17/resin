@@ -21,18 +21,6 @@ class CacheCapacityPlan:
     parent_capacity: int
     allocation_bytes: int
 
-    @property
-    def gpu_memory_utilization(self) -> float:
-        return self.memory_utilization
-
-    @property
-    def static_memory_fraction(self) -> float:
-        return self.memory_utilization
-
-    @property
-    def workspace_bytes(self) -> int:
-        return self.overhead_bytes
-
 
 def plan_cache_capacity(
     total_memory_bytes: int,

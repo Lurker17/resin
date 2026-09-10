@@ -181,7 +181,7 @@ class TestGptOssCudaNativePlan:
         assert "kernels" not in parameters
         assert "moe_kernel" not in parameters
         with pytest.raises(TypeError, match="kernel_attention"):
-            GptOssCudaRunner(kernel_attention=object())
+            GptOssCudaRunner(device="cuda", kernel_attention=object())
 
     def test_graph_capture_inputs_use_only_the_reserved_null_page(self) -> None:
         inputs = GptOssCudaRunner._graph_capture_inputs((2, 4))

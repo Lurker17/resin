@@ -19,7 +19,7 @@ def main() -> None:
     model = DEFAULT_MODEL
     tokenizer = AutoTokenizer.from_pretrained(model, revision=DEFAULT_REVISION)
     renderer = create_renderer(tokenizer)
-    runner = Lfm2TorchRunner(model)
+    runner = Lfm2TorchRunner(model, device="cpu")
     engine = Engine(runner, eos_token_id=runner.eos_token_id)
 
     print(f"Serving {model} at http://127.0.0.1:8000")

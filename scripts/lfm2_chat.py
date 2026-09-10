@@ -24,7 +24,7 @@ def main() -> None:
     )
     input_ids = tokenizer.encode(prompt, add_special_tokens=False).ids
 
-    runner = Lfm2TorchRunner(model)
+    runner = Lfm2TorchRunner(model, device="cpu")
     engine = Engine(runner, eos_token_id=runner.eos_token_id)
     request = engine.submit(input_ids, max_new_tokens=256)
     while engine.has_work():

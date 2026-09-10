@@ -1128,7 +1128,7 @@ def _serve_http_rank(
             f"parents={runner.cache_parent_capacity:,}; "
             f"parent={cache.bytes_per_parent / 2**20:.2f} MiB; "
             f"allocation={cache.allocation_bytes / 2**30:.2f} GiB; "
-            f"gpu_memory_utilization={cache.gpu_memory_utilization:.2f}",
+            f"gpu_memory_utilization={cache.memory_utilization:.2f}",
             flush=True,
         )
     _capture_cuda_graphs(runner)

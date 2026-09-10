@@ -143,6 +143,7 @@ def _build_runtime(*, speculative_tokens: int):
     load_started = time.perf_counter()
     runner = Gemma4CudaRunner(
         MODEL_PATH,
+        device="cuda",
         assistant_model=ASSISTANT_PATH if speculative_tokens else None,
         speculative_tokens=speculative_tokens,
         cuda_graph_decode_shapes=default_decode_graph_shapes(
