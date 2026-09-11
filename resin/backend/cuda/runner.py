@@ -121,9 +121,7 @@ class CudaRunner(Runner):
             after_capture=self._after_cuda_graph_capture,
         )
 
-    def capture_cuda_graph(
-        self, mode: str, shape: GraphShape
-    ) -> CudaGraphStats:
+    def capture_cuda_graph(self, mode: str, shape: GraphShape) -> CudaGraphStats:
         """Capture one mode shape while honoring model-state hooks."""
 
         executor = self._require_cuda_graph_executor()

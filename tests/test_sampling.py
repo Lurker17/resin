@@ -240,8 +240,6 @@ class TestSharedSampler:
             offsets=torch.zeros(3, dtype=torch.int64),
             stochastic_mask=torch.ones(3, dtype=torch.bool),
         )
-        logits = torch.tensor(
-            [[0.0, 2.0, 1.0], [3.0, 0.0, 1.0], [0.0, 1.0, 2.0]]
-        )
+        logits = torch.tensor([[0.0, 2.0, 1.0], [3.0, 0.0, 1.0], [0.0, 1.0, 2.0]])
 
         assert sampler.sample_tensors(logits, tensors).tolist() == [1, 0, 0]

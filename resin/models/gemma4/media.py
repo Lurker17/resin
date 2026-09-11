@@ -251,7 +251,10 @@ def _media_digest(media: Gemma4Media) -> str:
     """SHA-256 of canonical model inputs, independent of file codecs."""
 
     names = (
-        "pixel_values", "image_position_ids", "pixel_values_videos", "video_position_ids"
+        "pixel_values",
+        "image_position_ids",
+        "pixel_values_videos",
+        "video_position_ids",
     )
     return digest_tensors(
         b"resin-gemma4-media-v1\0",

@@ -44,16 +44,12 @@ def plan_cache_capacity(
     if overhead_bytes < 0:
         raise ValueError("overhead_bytes cannot be negative")
 
-    protected_free_bytes = math.ceil(
-        total_memory_bytes * (1.0 - memory_utilization)
-    )
+    protected_free_bytes = math.ceil(total_memory_bytes * (1.0 - memory_utilization))
     cache_budget_bytes = free_memory_bytes - protected_free_bytes - overhead_bytes
     parent_capacity = cache_budget_bytes // bytes_per_parent - reserved_parent_count
     if parent_capacity <= 0:
         raise MemoryError("cache budget cannot hold its reserved and usable parents")
-    allocation_bytes = (
-        parent_capacity + reserved_parent_count
-    ) * bytes_per_parent
+    allocation_bytes = (parent_capacity + reserved_parent_count) * bytes_per_parent
     return CacheCapacityPlan(
         total_memory_bytes,
         free_memory_bytes,

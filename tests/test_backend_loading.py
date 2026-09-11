@@ -46,9 +46,7 @@ def test_load_safetensor_weights_streams_with_name_replacements(tmp_path) -> Non
 
 def test_load_safetensor_weights_rejects_missing_model_state(tmp_path) -> None:
     safetensors = pytest.importorskip("safetensors.torch")
-    safetensors.save_file(
-        {"weight": torch.ones(2, 3)}, tmp_path / "model.safetensors"
-    )
+    safetensors.save_file({"weight": torch.ones(2, 3)}, tmp_path / "model.safetensors")
 
     with pytest.raises(ValueError, match="missing tensors"):
         load_safetensor_weights(

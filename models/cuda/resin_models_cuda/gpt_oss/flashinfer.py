@@ -117,9 +117,7 @@ def _copy_into_padded(tensor: Any, shape: tuple[int, ...], fill: int):
     return padded
 
 
-def _reorder_and_pad_gate_up(
-    tensor: Any, shape: tuple[int, ...], fill: int
-):
+def _reorder_and_pad_gate_up(tensor: Any, shape: tuple[int, ...], fill: int):
     """Convert paired ``[gate, up]`` rows to CUTLASS ``[up..., gate...]``."""
 
     source_shape = _shape(tensor)

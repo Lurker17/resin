@@ -89,13 +89,17 @@ class Gemma4Nvfp4Config:
             * self.global_head_dim
         )
         if not global_ or local % global_:
-            raise ValueError("local/global KV geometry does not share an integral parent")
+            raise ValueError(
+                "local/global KV geometry does not share an integral parent"
+            )
         return local // global_
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> Gemma4Nvfp4Config:
         if config.get("model_type") != "gemma4":
-            raise ValueError(f"expected a Gemma 4 checkpoint, got {config.get('model_type')!r}")
+            raise ValueError(
+                f"expected a Gemma 4 checkpoint, got {config.get('model_type')!r}"
+            )
         if config.get("audio_config") is not None:
             raise ValueError("the CUDA runner does not implement Gemma 4 audio inputs")
         text = config.get("text_config") or {}
@@ -136,7 +140,9 @@ class Gemma4Nvfp4Config:
             or activations.get("dynamic") is not False
             or weights.get("group_size") != activations.get("group_size")
         ):
-            raise ValueError("checkpoint is not static ModelOpt NVFP4 with matching groups")
+            raise ValueError(
+                "checkpoint is not static ModelOpt NVFP4 with matching groups"
+            )
 
         rope = text.get("rope_parameters") or {}
         local_rope = rope.get(SLIDING_ATTENTION) or {}
@@ -169,9 +175,7 @@ class Gemma4Nvfp4Config:
             final_logit_softcapping=text["final_logit_softcapping"],
             local_rope_theta=local_rope.get("rope_theta", 10_000.0),
             global_rope_theta=global_rope["rope_theta"],
-            global_partial_rotary_factor=global_rope.get(
-                "partial_rotary_factor", 1.0
-            ),
+            global_partial_rotary_factor=global_rope.get("partial_rotary_factor", 1.0),
             group_size=weights["group_size"],
         )
 

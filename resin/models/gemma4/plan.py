@@ -101,9 +101,7 @@ def build_gemma4_batch_plan(
     if batch.phase != BatchPhase.DECODE and decode_lookahead:
         raise ValueError("decode_lookahead is only valid during decode")
     query_lengths = batch.query_lengths
-    if batch.phase == BatchPhase.PREFILL and np.any(
-        query_lengths > PREFILL_CHUNK_SIZE
-    ):
+    if batch.phase == BatchPhase.PREFILL and np.any(query_lengths > PREFILL_CHUNK_SIZE):
         raise ValueError(f"prefill rows cannot exceed {PREFILL_CHUNK_SIZE} tokens")
     if batch.phase == BatchPhase.DECODE and np.any(query_lengths != 1):
         raise ValueError("decode rows must contain one token")

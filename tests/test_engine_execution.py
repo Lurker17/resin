@@ -122,7 +122,11 @@ class TestEngineExecution:
         assert [event.request_id for event in events] == [first, second]
         failed, retry = runner.plans
         assert (failed.batch_id, retry.batch_id) == (1, 2)
-        assert failed.sequence_ids.tolist() == retry.sequence_ids.tolist() == [first, second]
+        assert (
+            failed.sequence_ids.tolist()
+            == retry.sequence_ids.tolist()
+            == [first, second]
+        )
         assert (engine.cache_free_parent_count, engine.cache_occupied_block_count) == (
             2,
             0,

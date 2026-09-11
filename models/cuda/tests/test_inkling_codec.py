@@ -102,7 +102,10 @@ def test_render_maps_openai_xhigh_to_inkling_max(
 
     monkeypatch.setattr(codec_module, "create_renderer", create_renderer)
     InklingCodec(FakeTokenizer()).render(
-        {"messages": [{"role": "user", "content": "hello"}], "reasoning_effort": "xhigh"}
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "xhigh",
+        }
     )
 
     assert seen["config"].model_extra == {"reasoning_effort": "max"}

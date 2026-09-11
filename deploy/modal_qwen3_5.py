@@ -420,11 +420,9 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
     from resin.models.qwen3_5.codec import Qwen35Codec
     from resin.server import HttpServer
 
-    runner, processor, renderer, engine, report, kernels_before_warmup = (
-        _build_runtime(
-            context_length=context_length,
-            speculative_tokens=speculative_tokens,
-        )
+    runner, processor, renderer, engine, report, kernels_before_warmup = _build_runtime(
+        context_length=context_length,
+        speculative_tokens=speculative_tokens,
     )
     codec = Qwen35Codec(renderer, processor)
     try:

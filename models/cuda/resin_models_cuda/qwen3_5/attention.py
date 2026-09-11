@@ -39,9 +39,10 @@ def _plan_wrapper(
     if tokens == 1:
         wrapper.plan(*args, **common)
     else:
-        qo_indptr = torch.arange(
-            len(kv_indptr), dtype=torch.int32, device=kv_indptr.device
-        ) * tokens
+        qo_indptr = (
+            torch.arange(len(kv_indptr), dtype=torch.int32, device=kv_indptr.device)
+            * tokens
+        )
         wrapper.plan(qo_indptr, *args, causal=True, **common)
 
 

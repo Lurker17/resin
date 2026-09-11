@@ -210,9 +210,7 @@ def _weights(runtime, config=None):
         down=_tensor(runtime, (experts, hidden, intermediate // 2)),
         gate_up_scales=_tensor(runtime, (experts, 2 * intermediate, hidden // 32)),
         down_scales=_tensor(runtime, (experts, hidden, intermediate // 32)),
-        gate_up_bias=_tensor(
-            runtime, (experts, 2 * intermediate), runtime.float32
-        ),
+        gate_up_bias=_tensor(runtime, (experts, 2 * intermediate), runtime.float32),
         down_bias=_tensor(runtime, (experts, hidden), runtime.float32),
     )
 
