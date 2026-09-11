@@ -23,10 +23,10 @@ KERNEL_CACHE_VOLUME_VERSION = 2
 KERNEL_CACHE_MARKER_SCHEMA = 2
 KERNEL_CACHE_MOUNT = "/cache/resin-kernels"
 KERNEL_CACHE_ABI = (
-    "v11-blake3-localpublish1-h100-sm90a-py312-cuda13.3.1-torch2.13.0-cu130-"
+    "v12-blake3-localpublish1-h100-sm90a-py312-cuda13.3.1-torch2.13.0-cu130-"
     "triton3.7.1-"
     "flashinfer0.6.15p1-fijit0.6.15p1cu130-fa4b26-cutlassdsl4.6.2-"
-    "tvmffi0.1.13p2-fa4emptyaux1-quack0.6.4-cutile1.4.0-"
+    "tvmffi0.1.12-fa4emptyaux1-quack0.6.4-cutile1.5.0-"
     "qkvpack-tinygemm-top4-fiar"
 )
 KERNEL_CACHE_ROOT = f"{KERNEL_CACHE_MOUNT}/{KERNEL_CACHE_ABI}"

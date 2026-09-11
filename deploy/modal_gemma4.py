@@ -29,13 +29,13 @@ ASSISTANT_REVISION = "627c5ec1458b9086b841a91e0512fd31fd2fbbf1"
 ASSISTANT_PATH = Path(MODEL_MOUNT) / "assistant" / ASSISTANT_REVISION
 MODEL_FILES = (
     "config.json",
+    "generation_config.json",
+    "hf_quant_config.json",
     "model*.safetensors",
     "model.safetensors.index.json",
     "chat_template.jinja",
-    "preprocessor_config.json",
     "processor_config.json",
     "tokenizer.json",
-    "tokenizer.model",
     "tokenizer_config.json",
 )
 ASSISTANT_FILES = ("config.json", "model.safetensors")

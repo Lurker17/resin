@@ -9,6 +9,7 @@ import modal
 _DEPENDENCY_ROOT = "/opt/resin-deps"
 _SOURCE_ROOT = "/opt/resin"
 _SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_PYTHON_SOURCE_IGNORE = ("**/__pycache__", "**/*.py[co]")
 
 
 def build_modal_image(
@@ -94,7 +95,12 @@ def build_modal_image(
         .add_local_file(root / "README.md", f"{_SOURCE_ROOT}/README.md", copy=True)
         .add_local_dir(root / "docs", f"{_SOURCE_ROOT}/docs", copy=True)
         .add_local_dir(root / "crates", f"{_SOURCE_ROOT}/crates", copy=True)
-        .add_local_dir(root / "resin", f"{_SOURCE_ROOT}/resin", copy=True)
+        .add_local_dir(
+            root / "resin",
+            f"{_SOURCE_ROOT}/resin",
+            copy=True,
+            ignore=list(_PYTHON_SOURCE_IGNORE),
+        )
         .add_local_file(
             root / "models/torch/pyproject.toml",
             f"{_SOURCE_ROOT}/models/torch/pyproject.toml",
@@ -109,7 +115,7 @@ def build_modal_image(
             root / "models/cuda",
             f"{_SOURCE_ROOT}/models/cuda",
             copy=True,
-            ignore=["tests", "**/__pycache__", *cuda_source_ignore],
+            ignore=["tests", *_PYTHON_SOURCE_IGNORE, *cuda_source_ignore],
         )
         .uv_pip_install(_SOURCE_ROOT, extra_options="--no-deps")
         .uv_pip_install(f"{_SOURCE_ROOT}/models/torch", extra_options="--no-deps")
