@@ -1498,6 +1498,11 @@ impl Engine {
                 );
             }
         };
+        // Validate the complete execution result before terminal output limits
+        // can hide writes beyond the leased capacity or extra prefill tokens.
+        if let Err(error) = self.validate_runner_output(&batch.rows, &output_token_ids) {
+            return self.quarantine(batch, "runner output exceeds its execution contract", error);
+        }
         let decoded_batch = batch
             .rows
             .first()
@@ -2216,22 +2221,6 @@ impl Engine {
                     "sampled runner output rows must contain at least one token",
                 ));
             }
-            if scheduled.phase == Phase::Prefill && token_ids.len() != 1 {
-                return Err(PyRuntimeError::new_err(
-                    "speculative token rows are only supported during decode",
-                ));
-            }
-            if token_ids.len() > 1 && request.cache.is_some() {
-                let maximum = usize::try_from(self.runner_config.cache_write_lookahead_tokens)
-                    .unwrap_or(usize::MAX)
-                    .saturating_add(1);
-                if token_ids.len() > maximum {
-                    return Err(PyRuntimeError::new_err(format!(
-                        "runner returned {} decode tokens but leased cache space for at most {maximum}",
-                        token_ids.len(),
-                    )));
-                }
-            }
             if request.cancel_pending {
                 prepared.push(PreparedProgress {
                     apply: false,
@@ -2279,6 +2268,24 @@ impl Engine {
             row.request.resident_tokens = progress.resident_tokens;
             row.request.generated.extend(progress.sampled_tokens);
         }
+    }
+
+    fn validate_runner_output(&self, rows: &[BatchRow], token_rows: &[Vec<u32>]) -> PyResult<()> {
+        for (row, tokens) in rows.iter().zip(token_rows) {
+            if row.scheduled.phase == Phase::Prefill && tokens.len() != 1 {
+                return Err(PyRuntimeError::new_err(
+                    "speculative token rows are only supported during decode",
+                ));
+            }
+            let maximum = u64::from(self.runner_config.cache_write_lookahead_tokens) + 1;
+            if row.request.cache.is_some() && tokens.len() as u64 > maximum {
+                return Err(PyRuntimeError::new_err(format!(
+                    "runner returned {} decode tokens but leased cache space for at most {maximum}",
+                    tokens.len(),
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn release_kv_access(&mut self, access: Option<WriterAccessLease>) {

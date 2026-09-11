@@ -218,17 +218,41 @@ class TestEngine:
         assert event.finish_reason == "length"
         assert request.take_result() == [2]
 
-    def test_speculative_rows_are_rejected_during_prefill(self) -> None:
+    @pytest.mark.parametrize("max_new_tokens", [1, 2])
+    def test_speculative_rows_are_rejected_during_prefill(self, max_new_tokens) -> None:
         class BadRunner:
             @staticmethod
             def forward(plan: BatchPlan):
                 return [[2, 3] for _ in range(plan.num_sequences)]
 
         engine = Engine(BadRunner())
-        engine.submit([1], max_new_tokens=2)
+        engine.submit([1], max_new_tokens=max_new_tokens)
 
         with pytest.raises(RuntimeError, match="only supported during decode"):
             engine.step()
+
+    @pytest.mark.parametrize("stop_token_ids", [None, [3]])
+    def test_terminal_truncation_cannot_hide_unleased_decode_tokens(
+        self, stop_token_ids
+    ):
+        class BadRunner:
+            runner_config = RunnerConfig(
+                cache_layout=CacheLayout(4, [CacheGroupLayout(2)])
+            )
+
+            def bind_resources(self, binding):
+                pass
+
+            def forward(self, plan):
+                return [2] if plan.phase == BatchPhase.PREFILL else [[3, 4, 5]]
+
+        engine = Engine(BadRunner())
+        request = engine.submit([1], max_new_tokens=2, stop_token_ids=stop_token_ids)
+        engine.step()
+        with pytest.raises(RuntimeError, match="leased cache space for at most 1"):
+            engine.step()
+        assert engine.poisoned
+        assert not request.done
 
     def test_batch_limit_keeps_running_request_ahead_of_waiter(self) -> None:
         runner = RecordingRunner()
@@ -313,9 +337,7 @@ class TestEngine:
         assert group.block_indptr.tolist() == [0, 2]
         assert group.block_table_start_indices.tolist() == [0]
         blocks = list(zip(group.block_slab_ids, group.block_slotnums, strict=True))
-        appends = list(
-            zip(group.append_slab_ids, group.append_slotnums, strict=True)
-        )
+        appends = list(zip(group.append_slab_ids, group.append_slotnums, strict=True))
         assert appends == [
             blocks[0],
             blocks[0],
