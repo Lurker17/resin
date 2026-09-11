@@ -9,6 +9,11 @@ packed into those slabs:
 - `retention=HISTORY` keeps the full logical history. State groups retain only
   their current and preceding checkpoints.
 - `retention=WINDOW` keeps a bounded chronological suffix.
+- `window_tokens` is that suffix's physical retention budget;
+  `read_window_tokens` is the logical window including the current token.
+  It defaults to `window_tokens`. To write a chunk of `Q` tokens while its
+  earliest query reads a window of `W` tokens, reserve at least `W + Q - 1`
+  retained tokens and declare `read_window_tokens=W`.
 - `blocks_per_slab` says how many blocks of that type fit in one slab.
 
 Slabs are fungible. They are not divided into fixed History, Window, or State
@@ -79,3 +84,23 @@ equal-sized pages.
 
 Slab zero is reserved as the device null target. Positive slab IDs are stable for
 the lifetime of the Engine-issued lease.
+
+Window read history and all scheduled writes share one chronological table.
+The Engine caps prefill chunks by the smallest `window_tokens -
+read_window_tokens + 1` across Window groups and rejects decode lookahead that
+exceeds it. The same bound is checked before native cache growth or copy-on-write.
+This prevents a later write in a chunk from overwriting the earlier queries'
+history, including when a prefix hit shares those pages with another request.
+
+DeepSeek-V4 defaults to 4096-token prefill chunks and reserves this guard band
+for sliding attention and compressor tails. The runner's `prefill_chunk_size`
+parameter controls both execution size and retained capacity. This preserves
+vectorized prefill but uses more cache memory per live request than a decode-only
+tail; the scheduler accounts for that physical demand. A future separate
+transient prefill workspace could reduce the retained footprint.
+
+With DSpark enabled, draft attention reads the preceding 128 main-hidden rows
+before target verification consumes the current anchor. Its shared attention
+group therefore declares a 129-token read envelope. This preserves that oldest
+row even for short, unaligned verification blocks; default 4096-token chunks
+use the same number of physical blocks after rounding.

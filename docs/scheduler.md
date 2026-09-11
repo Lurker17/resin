@@ -40,8 +40,8 @@ reserves that entire lifetime at submission.
 `prefill_chunk_size` defaults to 8192 tokens and is the scheduler's execution
 unit for prompt or replay work. A runner may declare a smaller hard
 `prefill_chunk_size`; the Engine uses the smaller bound and never silently
-re-chunks an accepted plan. A runner must declare exact
-`supports_continuation_prefill = True` when the selected range stops before the
+re-chunks an accepted plan. A runner must declare
+`RunnerConfig(continuation_prefill=True)` when the selected range stops before the
 end of a prompt; the Engine rejects such a range before runner acceptance when
 the runner does not support continuation.
 
@@ -62,10 +62,16 @@ Selection is deterministic:
    `batch_key` cohort.
 5. Never exceed `max_running_requests` admitted requests.
 
-The scheduler does not fill spare rows with a lower priority, another key, or an
-incompatible phase. `batch_key=None` is a real cohort and differs from zero.
-Priorities are signed 32-bit integers; larger values run first within the
-preferred phase.
+Waiting admission chooses the highest compatible priority, while already
+admitted requests retain their slots. A batch may therefore contain admitted
+rows of different priorities. It never mixes keys or phases. `batch_key=None`
+is a real cohort and differs from zero. Priorities are signed 32-bit integers;
+larger values are admitted first within the preferred phase.
+
+The ready queue stays in age order. Taking a batch merges selected indices with
+one queue traversal; returning survivors sorts only those survivors and merges
+them into the queue. Neither operation repeatedly scans or sorts all waiting
+requests for each selected row.
 
 Prefill and decode never share a plan. `BatchPlan.phase` is the explicit
 `BatchPhase.PREFILL` or `BatchPhase.DECODE` value for the complete batch. A
@@ -96,7 +102,7 @@ actual pages are allocated on demand, and allocation failure cannot corrupt an
 existing request table.
 
 If the next step cannot grow, Resin keeps at least one running request and
-retracts an eligible attention-only request with the least completed output
+retracts an eligible request with the least completed output
 (longer prompts lose ties). It asks the runner to release request-local state,
 frees the request's KV, returns it to the waiting tail, and later replays its
 prompt plus committed generated inputs. Replay prefill never samples a duplicate
@@ -118,22 +124,27 @@ input and a decode row consumes its one input token. With controls:
 - the scheduler keeps an oldest prefix of the selected cohort rather than
   skipping a row.
 
-For a managed Window cache group, prefill also stops at the next group block
-boundary. That makes each accepted range safe for the current private cyclic
-Window storage: no plan overwrites a physical block that it still exposes for
-attention. Multiple Window groups compose by taking the earliest boundary.
+For every managed Window group, a step's write span must fit
+`window_tokens - read_window_tokens + 1`. The Engine caps prefill by the smallest
+of these spans and rejects incompatible speculative lookahead at construction.
+If the logical read window is omitted, it defaults to physical retention, which
+permits one write per step. Built-in runners reserve the read window plus a
+prefill guard band so they can execute whole chunks safely, including after a
+prefix-cache hit. Physical block boundaries alone do not determine safe chunks.
 
 `BatchPlan.token_indptr` describes the final flattened range for each row.
 `context_lengths` contains each row's pre-append logical length. Initial prefill
 is sampled only when it reaches the end of the prompt; replay prefill is never
 sampled; decode rows are always sampled. `sampling_mask` makes this event/commit
-mask explicit. The runner still returns one token ID per row,
-including an unsampled continuation or replay row.
+mask explicit. Prefill returns one token ID per row, including an ignored ID
+for an unsampled continuation or replay row. Decode may return a verified token
+block within the runner's declared speculative capacity.
 
 `SamplingParams` is per request and defaults to temperature `1.0`, top-p `1.0`,
 and no top-k limit. Temperature `0` requests deterministic argmax. The frozen
-plan carries one policy, effective seed, and random offset per row so mixed
-requests can share a batch without sharing a random stream. The optional
+plan carries one policy and effective seed per row; the runner derives random
+offsets from absolute sequence progress so requests can share a batch without
+sharing a random stream. The optional
 `extra` value is an opaque Python object for custom runner code; Resin preserves
 it but does not inspect it. Shared Torch and FlashInfer backend samplers consume
 the standard fields.
@@ -146,11 +157,11 @@ empty or when a continuation-prefill step advances cache state without sampling.
 
 On successful completion Resin:
 
-1. validates exactly one output token ID per plan row;
-2. asks the runner to release terminal physical request state, if supported;
-3. releases state and cache writer leases;
-4. commits prefill/decode progress;
-5. retires completed or cancelled requests;
+1. validates every raw output row against the phase and leased write capacity;
+2. applies stop and length limits and prepares progress updates and events;
+3. asks the runner to release terminal request-local state, if supported;
+4. releases cache access, publishes aligned prefixes, and retires terminal resources;
+5. commits prefill/decode progress and completes terminal request handles;
 6. returns survivors to the sticky admitted set;
 7. emits events for sampled rows.
 

@@ -76,15 +76,33 @@ A runner implements:
 def forward(plan: BatchPlan) -> Sequence[int] | Sequence[Sequence[int]]: ...
 ```
 
-Prefill runners return one token for each sampled sequence. A decode runner may
+Prefill runners return one token for each sequence, including a placeholder ID
+for unsampled continuation or replay rows. A decode runner may
 return multiple tokens for each sequence; this is how speculative decoding
 commits an accepted block. The runner declares its maximum additional cache writes through
 `RunnerConfig.cache_write_lookahead_tokens`, so the Engine reserves those pages
 before execution. DSpark and other speculative algorithms remain model-runner
-details rather than fields in the generic plan.
+details rather than fields in the generic plan. The Engine validates raw output
+rows before applying stop tokens and length limits, so truncation cannot hide
+an oversized verified block.
+
+`resin.ManagedRunner` describes the managed lifecycle: publish a frozen
+`runner_config`, then accept one `bind_resources(ResourceBinding)` call before
+execution. An optional `release(sequence_ids)` callback clears model-local
+state on completion, cancellation, and retraction. Cache pages always remain
+Engine-owned. The one-method `Runner` protocol remains sufficient for a runner
+that does not declare managed resources.
 
 An exception before work is accepted is retryable. An exception marked
 `_resin_post_accept = True` or a malformed result after execution quarantines
-the batch resources because GPU use may still exist.
-CUDA runners use `resin.backend.cuda.failures.CudaFailureGuard` to establish
-quiescence after an eager failure or apply that post-accept marker consistently.
+the batch resources because execution may have changed persistent state or GPU
+use may still exist. An unmarked Python exception is an assertion by the runner
+that the step had no persistent effects or rolled them back. Native Rust
+runners express this explicitly with `engine::Error::rejected`; other native
+execution failures are fatal.
+CUDA runners validate their plans before entering
+`resin.backend.cuda.failures.CudaFailureGuard`. Once execution begins, any
+failure quarantines resources even if CUDA synchronization succeeds: an
+in-place recurrent-state or sliding-window update cannot be undone by waiting
+for the device. Graph host-input validation remains retryable because it occurs
+before device copies or model execution.

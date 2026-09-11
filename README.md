@@ -9,8 +9,10 @@ _Inspired by SGLang, vLLM, TokenSpeed, FlashInfer, and FlashAttention-4._
 
 Resin is an inference engine _engine_. It provides modular, low-level
 building blocks for making your own LLM inference engine. At its core is the
-`Engine` class: a fast, native scheduler and KV cache allocator, which then
-hands off to a `Runner` – you write the forward pass yourself in Python.
+`Engine` class: a native request lifecycle, scheduler, and KV cache allocator,
+which hands off to a `Runner` – you write the forward pass yourself in Python.
+The same lifecycle is available directly to Rust applications through the
+PyO3-free `resin-core::engine::EngineCore`.
 
 ```text
 token IDs -> Rust Engine -> frozen BatchPlan -> Python Runner -> token IDs
@@ -150,6 +152,12 @@ Responses, Anthropic Messages, and a small streaming chat page. Model-specific
 prompt rendering and response parsing stay in Python so they can follow model
 formats without coupling them to the native scheduler.
 
+The bridge bounds queued jobs (32), active requests (128), admissions before
+an inference step (4), and buffered events per client (64). A full admission
+queue returns HTTP 429; slow or disconnected clients are cancelled without
+blocking other requests. Actor failure stops the listener, and
+`HttpServer.shutdown()` requests shutdown after the current model step.
+
 ```bash
 # Run one LFM2 prompt in the terminal.
 uv run python scripts/lfm2_chat.py
@@ -222,10 +230,10 @@ The native layer currently provides:
   sliding-window and recurrent-state copy-on-write;
 - retryable pre-accept failure and fail-stop post-accept quarantine.
 
-The native implementation is split in two. `crates/resin-core` is ordinary,
-PyO3-free Rust containing typed scheduling, token-range planning, grouped cache
-allocation, and leases. `crates/resin-py` adapts those types to Python and
-coordinates runner acceptance and completion.
+`crates/resin-core` is ordinary, dependency-free Rust containing request
+lifecycle, scheduling, token-range planning, grouped cache allocation, and
+execution transactions. `crates/resin-py` converts Python inputs and adapts
+runner callbacks, plans, errors, handles, and events to that core.
 
 History cache grows on demand to each frozen plan. Window cache grows toward
 bounded cyclic storage whose plan row is projected into chronological order.
@@ -266,6 +274,7 @@ Top-level imports are limited to native control-plane types:
 ```python
 Engine
 Runner
+ManagedRunner
 BatchPlan
 BatchPhase
 TokenEvent
@@ -299,7 +308,8 @@ unavailable accelerator libraries.
 
 ## Repository map
 
-- `crates/resin-py/src/lib.rs` — Python API, Engine lifecycle, and transactional orchestration
+- `crates/resin-core/src/engine.rs` — request lifecycle and execution transactions
+- `crates/resin-py/src/lib.rs` — Python objects and the native Engine adapter
 - `crates/resin-py/src/planning.rs` — conversion from core batch/resource views to `BatchPlan`
 - `crates/resin-py/src/runner.rs` — execution discovery and one-time resource binding
 - `crates/resin-py/src/cache.rs` — Python adapters for core KV descriptors
