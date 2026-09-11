@@ -464,7 +464,6 @@ def _index_score_kernel(
     heads: _ConstantInt,
     head_dim: _ConstantInt,
     tile_width: _ConstantInt,
-    paged_cache: _ConstantBool,
     parent_rows: _ConstantInt,
     packing: _ConstantInt,
     row_scale: _ConstantInt,
@@ -485,39 +484,33 @@ def _index_score_kernel(
             (batch, sequence, 0, 0),
             shape=(1, 1, heads, head_dim),
         ).reshape((heads, head_dim))
-        if paged_cache:
-            logical_positions = columns * ratio
-            first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
-            page_columns = logical_positions // 128 - first
-            selected_parents = ct.gather(
-                cache_parent_ids,
-                (
-                    ct.full((tile_width,), batch, dtype=ct.int32),
-                    page_columns,
-                ),
-                padding_value=0,
-            )
-            selected_slots = ct.gather(
-                cache_child_slots,
-                (
-                    ct.full((tile_width,), batch, dtype=ct.int32),
-                    page_columns,
-                ),
-                padding_value=0,
-            )
-            child_rows = parent_rows // packing
-            rows = (
-                (selected_parents * parent_rows + selected_slots * child_rows)
-                * row_scale
-                + layer_offset
-                + (logical_positions % 128) // ratio
-            ).reshape((tile_width, 1))
-            dimensions = ct.arange(head_dim, dtype=ct.int32).reshape((1, head_dim))
-            keys = ct.gather(cache, (rows, dimensions), padding_value=0)
-        else:
-            keys = ct.load(
-                cache, (batch, tile, 0), shape=(1, tile_width, head_dim)
-            ).reshape((tile_width, head_dim))
+        logical_positions = columns * ratio
+        first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
+        page_columns = logical_positions // 128 - first
+        selected_parents = ct.gather(
+            cache_parent_ids,
+            (
+                ct.full((tile_width,), batch, dtype=ct.int32),
+                page_columns,
+            ),
+            padding_value=0,
+        )
+        selected_slots = ct.gather(
+            cache_child_slots,
+            (
+                ct.full((tile_width,), batch, dtype=ct.int32),
+                page_columns,
+            ),
+            padding_value=0,
+        )
+        child_rows = parent_rows // packing
+        rows = (
+            (selected_parents * parent_rows + selected_slots * child_rows) * row_scale
+            + layer_offset
+            + (logical_positions % 128) // ratio
+        ).reshape((tile_width, 1))
+        dimensions = ct.arange(head_dim, dtype=ct.int32).reshape((1, head_dim))
+        keys = ct.gather(cache, (rows, dimensions), padding_value=0)
         scores = ct.mma(
             q,
             keys.permute((1, 0)),
@@ -597,7 +590,6 @@ def index_scores(
             heads,
             head_dim,
             _INDEX_SCORE_TILE,
-            True,
             cache_mapping.parent_rows,
             cache_mapping.packing,
             cache_mapping.row_scale,
@@ -618,7 +610,6 @@ def _finish_index_topk_kernel(
     output: _StaticLastDim,
     ratio: _ConstantInt,
     width: _ConstantInt,
-    direct_page_mapping: _ConstantBool,
     parent_rows: _ConstantInt,
     packing: _ConstantInt,
     layer_offset: int,
@@ -632,34 +623,33 @@ def _finish_index_topk_kernel(
     for tile in range(width // 64):
         values = ct.load(indices, (batch, sequence, tile), shape=(1, 1, 64))
         values = ct.where(values < (token + 1) // ratio, values + offset, -1)
-        if direct_page_mapping:
-            logical_positions = values * ratio
-            first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
-            page_columns = logical_positions // 128 - first
-            selected_parents = ct.gather(
-                cache_parent_ids,
-                (
-                    ct.full((1, 1, 64), batch, dtype=ct.int32),
-                    page_columns,
-                ),
-                padding_value=0,
-            )
-            selected_slots = ct.gather(
-                cache_child_slots,
-                (
-                    ct.full((1, 1, 64), batch, dtype=ct.int32),
-                    page_columns,
-                ),
-                padding_value=0,
-            )
-            child_rows = parent_rows // packing
-            physical = (
-                selected_parents * parent_rows
-                + selected_slots * child_rows
-                + layer_offset
-                + (logical_positions % 128) // ratio
-            )
-            values = ct.where((values >= 0) & (selected_parents > 0), physical, -1)
+        logical_positions = values * ratio
+        first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
+        page_columns = logical_positions // 128 - first
+        selected_parents = ct.gather(
+            cache_parent_ids,
+            (
+                ct.full((1, 1, 64), batch, dtype=ct.int32),
+                page_columns,
+            ),
+            padding_value=0,
+        )
+        selected_slots = ct.gather(
+            cache_child_slots,
+            (
+                ct.full((1, 1, 64), batch, dtype=ct.int32),
+                page_columns,
+            ),
+            padding_value=0,
+        )
+        child_rows = parent_rows // packing
+        physical = (
+            selected_parents * parent_rows
+            + selected_slots * child_rows
+            + layer_offset
+            + (logical_positions % 128) // ratio
+        )
+        values = ct.where((values >= 0) & (selected_parents > 0), physical, -1)
         ct.store(output, (batch, sequence, tile), values.astype(ct.int32))
 
 
@@ -693,7 +683,6 @@ def finish_index_topk(
             output,
             ratio,
             indices.shape[-1],
-            True,
             cache_mapping.parent_rows,
             cache_mapping.packing,
             cache_mapping.layer_offset,
@@ -1040,9 +1029,6 @@ def _qk_norm_rope_kernel(
     heads: _ConstantInt,
     dimension: _ConstantInt,
     rope_dimension: _ConstantInt,
-    window: _ConstantInt,
-    store_cache: _ConstantBool,
-    paged_cache: _ConstantBool,
     parent_rows: _ConstantInt,
     packing: _ConstantInt,
     layer_offset: int,
@@ -1123,50 +1109,36 @@ def _qk_norm_rope_kernel(
         value = ct.where(group_ids < dimension // 64 - 1, simulated, groups).reshape(
             (dimension,)
         )
-        if store_cache:
-            if paged_cache:
-                first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
-                column = token // 128 - first
-                cache_parent = ct.gather(
-                    cache_parent_ids,
-                    (
-                        ct.full((1,), batch, dtype=ct.int32),
-                        ct.full((1,), column, dtype=ct.int32),
-                    ),
-                    padding_value=0,
-                ).item()
-                cache_slot = ct.gather(
-                    cache_child_slots,
-                    (
-                        ct.full((1,), batch, dtype=ct.int32),
-                        ct.full((1,), column, dtype=ct.int32),
-                    ),
-                    padding_value=0,
-                ).item()
-                child_rows = parent_rows // packing
-                cache_row = (
-                    cache_parent * parent_rows
-                    + cache_slot * child_rows
-                    + layer_offset
-                    + token % 128
-                )
-                ct.store(
-                    cache,
-                    (cache_row, 0),
-                    value.reshape((1, dimension)).astype(cache.dtype),
-                )
-            else:
-                ct.store(
-                    cache,
-                    (batch, token % window, 0),
-                    value.reshape((1, 1, dimension)).astype(cache.dtype),
-                )
-        else:
-            ct.store(
-                key_value,
-                (batch, sequence, 0),
-                value.reshape((1, 1, dimension)).astype(key_value.dtype),
-            )
+        first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
+        column = token // 128 - first
+        cache_parent = ct.gather(
+            cache_parent_ids,
+            (
+                ct.full((1,), batch, dtype=ct.int32),
+                ct.full((1,), column, dtype=ct.int32),
+            ),
+            padding_value=0,
+        ).item()
+        cache_slot = ct.gather(
+            cache_child_slots,
+            (
+                ct.full((1,), batch, dtype=ct.int32),
+                ct.full((1,), column, dtype=ct.int32),
+            ),
+            padding_value=0,
+        ).item()
+        child_rows = parent_rows // packing
+        cache_row = (
+            cache_parent * parent_rows
+            + cache_slot * child_rows
+            + layer_offset
+            + token % 128
+        )
+        ct.store(
+            cache,
+            (cache_row, 0),
+            value.reshape((1, dimension)).astype(cache.dtype),
+        )
 
 
 def qk_norm_rope_store(
@@ -1183,47 +1155,17 @@ def qk_norm_rope_store(
     """Normalize Q/K, apply RoPE, quantize K, and update the decode cache."""
 
     batch_size = query.shape[0]
-    if (
-        query.shape[1] != 1
-        or key_value.shape != (batch_size, 1, query.shape[-1])
-        or position.shape != (batch_size,)
-        or cache.ndim != 2
-        or cache.shape[-1] != query.shape[-1]
-    ):
+    if query.shape[1] != 1 or position.shape != (batch_size,):
         raise ValueError("fused Q/K decode requires one token per matching batch row")
-    dimension = query.shape[-1]
-    rope_dimension = frequencies.shape[-2] * 2
-    if dimension != 512 or rope_dimension != 64:
-        raise ValueError(
-            "DeepSeek-V4 fused Q/K decode requires 512D heads and 64D RoPE"
-        )
-    if cache_mapping.block_tokens != 128 or cache_mapping.divisor != 1:
-        raise ValueError("Q/K cache mapping must address 128-token window rows")
-    ct.launch(
-        torch.cuda.current_stream(query.device),
-        (query.shape[2] + 1, batch_size, 1),
-        _qk_norm_rope_kernel,
-        (
-            query,
-            key_value,
-            norm_weight,
-            frequencies,
-            cache,
-            cache_mapping.parent_ids,
-            cache_mapping.child_slots,
-            cache_mapping.first_blocks,
-            position.view(batch_size, 1),
-            query.shape[2],
-            dimension,
-            rope_dimension,
-            cache.shape[1],
-            True,
-            True,
-            cache_mapping.parent_rows,
-            cache_mapping.packing,
-            cache_mapping.layer_offset,
-            epsilon,
-        ),
+    qk_norm_rope_block(
+        query,
+        key_value,
+        norm_weight,
+        frequencies,
+        cache,
+        position.view(batch_size, 1),
+        epsilon,
+        cache_mapping=cache_mapping,
     )
 
 
@@ -1274,9 +1216,6 @@ def qk_norm_rope_block(
             query.shape[2],
             dimension,
             rope_dimension,
-            cache.shape[1],
-            True,
-            True,
             cache_mapping.parent_rows,
             cache_mapping.packing,
             cache_mapping.layer_offset,
@@ -1328,9 +1267,6 @@ def kv_norm_rope_store(
             0,
             512,
             64,
-            cache.shape[1],
-            True,
-            True,
             cache_mapping.parent_rows,
             cache_mapping.packing,
             cache_mapping.layer_offset,
@@ -1428,13 +1364,10 @@ def _verify_attention_metadata_kernel(
     sparse_lengths,
     sequence_lengths,
     window_size: _ConstantInt,
-    window_capacity: _ConstantInt,
-    compressed_pool_width: _ConstantInt,
     compress_ratio: _ConstantInt,
     compressed_index_width: int,
     has_compression: _ConstantBool,
     has_explicit_compressed_indices: _ConstantBool,
-    paged_cache: _ConstantBool,
     parent_rows: _ConstantInt,
     window_packing: _ConstantInt,
     compressed_packing: _ConstantInt,
@@ -1456,54 +1389,38 @@ def _verify_attention_metadata_kernel(
     columns = tile * 64 + ct.arange(64, dtype=ct.int32)
     old_column = ct.minimum(columns, ct.maximum(history_count - 1, 0))
     old_position = start - history_count + old_column
-    old_index = old_position % window_capacity
-    old_index = ct.where(columns < history_count, old_index, -1)
     block_column = columns - history_count
     block_position = start + query + 1 - block_count + block_column
-    block_index = block_position % window_capacity
-    block_index = ct.where(
-        (columns >= history_count) & (columns < block_end), block_index, -1
-    )
     window_positions = ct.where(columns < history_count, old_position, block_position)
     window_valid = (columns < history_count) | (
         (columns >= history_count) & (columns < block_end)
     )
-    if paged_cache:
-        first_window = ct.load(window_first_blocks, (batch,), shape=(1,)).item()
-        window_columns = window_positions // 128 - first_window
-        window_parents = ct.gather(
-            window_parent_ids,
-            (
-                ct.full((64,), batch, dtype=ct.int32),
-                window_columns,
-            ),
-            padding_value=0,
-        )
-        window_children = ct.gather(
-            window_child_slots,
-            (
-                ct.full((64,), batch, dtype=ct.int32),
-                window_columns,
-            ),
-            padding_value=0,
-        )
-        child_rows = parent_rows // window_packing
-        window_indices = (
-            window_parents * parent_rows
-            + window_children * child_rows
-            + window_layer_offset
-            + window_positions % 128
-        )
-        window_indices = ct.where(
-            window_valid & (window_parents > 0), window_indices, -1
-        )
-    else:
-        window_indices = ct.where(columns < history_count, old_index, block_index)
-        window_indices = ct.where(
-            window_indices >= 0,
-            window_indices + batch * window_capacity,
-            -1,
-        )
+    first_window = ct.load(window_first_blocks, (batch,), shape=(1,)).item()
+    window_columns = window_positions // 128 - first_window
+    window_parents = ct.gather(
+        window_parent_ids,
+        (
+            ct.full((64,), batch, dtype=ct.int32),
+            window_columns,
+        ),
+        padding_value=0,
+    )
+    window_children = ct.gather(
+        window_child_slots,
+        (
+            ct.full((64,), batch, dtype=ct.int32),
+            window_columns,
+        ),
+        padding_value=0,
+    )
+    child_rows = parent_rows // window_packing
+    window_indices = (
+        window_parents * parent_rows
+        + window_children * child_rows
+        + window_layer_offset
+        + window_positions % 128
+    )
+    window_indices = ct.where(window_valid & (window_parents > 0), window_indices, -1)
 
     output = window_indices
     if has_compression:
@@ -1526,45 +1443,38 @@ def _verify_attention_metadata_kernel(
                 compressed_column,
                 -1,
             )
-        if paged_cache:
-            if not has_explicit_compressed_indices:
-                first_compressed = ct.load(
-                    compressed_first_blocks, (batch,), shape=(1,)
-                ).item()
-                compressed_positions = compressed * compress_ratio
-                compressed_columns = compressed_positions // 128 - first_compressed
-                compressed_parents = ct.gather(
-                    compressed_parent_ids,
-                    (
-                        ct.full((64,), batch, dtype=ct.int32),
-                        compressed_columns,
-                    ),
-                    padding_value=0,
-                )
-                compressed_children = ct.gather(
-                    compressed_child_slots,
-                    (
-                        ct.full((64,), batch, dtype=ct.int32),
-                        compressed_columns,
-                    ),
-                    padding_value=0,
-                )
-                child_rows = parent_rows // compressed_packing
-                compressed_physical = (
-                    compressed_parents * parent_rows
-                    + compressed_children * child_rows
-                    + compressed_layer_offset
-                    + (compressed_positions % 128) // compress_ratio
-                )
-                compressed = ct.where(
-                    (compressed >= 0) & (compressed_parents > 0),
-                    compressed_physical,
-                    -1,
-                )
-        else:
+        if not has_explicit_compressed_indices:
+            first_compressed = ct.load(
+                compressed_first_blocks, (batch,), shape=(1,)
+            ).item()
+            compressed_positions = compressed * compress_ratio
+            compressed_columns = compressed_positions // 128 - first_compressed
+            compressed_parents = ct.gather(
+                compressed_parent_ids,
+                (
+                    ct.full((64,), batch, dtype=ct.int32),
+                    compressed_columns,
+                ),
+                padding_value=0,
+            )
+            compressed_children = ct.gather(
+                compressed_child_slots,
+                (
+                    ct.full((64,), batch, dtype=ct.int32),
+                    compressed_columns,
+                ),
+                padding_value=0,
+            )
+            child_rows = parent_rows // compressed_packing
+            compressed_physical = (
+                compressed_parents * parent_rows
+                + compressed_children * child_rows
+                + compressed_layer_offset
+                + (compressed_positions % 128) // compress_ratio
+            )
             compressed = ct.where(
-                compressed >= 0,
-                compressed + batch * compressed_pool_width,
+                (compressed >= 0) & (compressed_parents > 0),
+                compressed_physical,
                 -1,
             )
         output = ct.where(
@@ -1687,13 +1597,10 @@ def verify_attention_metadata(
             sparse_lengths,
             sequence_lengths,
             window_size,
-            window_capacity,
-            compressed_pool_width,
             compress_ratio,
             compressed_index_width,
             compress_ratio > 0,
             compressed_indices is not None,
-            True,
             window_mapping.parent_rows,
             window_mapping.packing,
             compressed_mapping.packing if compressed_mapping is not None else 1,
@@ -1714,10 +1621,8 @@ def _dspark_attention_metadata_kernel(
     sparse_lengths,
     sequence_lengths,
     window_size: _ConstantInt,
-    window_capacity: _ConstantInt,
     block_length: _ConstantInt,
     index_width: _ConstantInt,
-    paged_cache: _ConstantBool,
     parent_rows: _ConstantInt,
     packing: _ConstantInt,
     layer_offset: int,
@@ -1732,39 +1637,34 @@ def _dspark_attention_metadata_kernel(
     for tile in ct.static_iter(range(index_width // 64)):
         columns = tile * 64 + ct.arange(64, dtype=ct.int32)
         history_positions = history_start + columns
-        if paged_cache:
-            first = ct.load(window_first_blocks, (batch,), shape=(1,)).item()
-            page_columns = history_positions // 128 - first
-            selected_parents = ct.gather(
-                window_parent_ids,
-                (
-                    ct.full((64,), batch, dtype=ct.int32),
-                    page_columns,
-                ),
-                padding_value=0,
-            )
-            selected_slots = ct.gather(
-                window_child_slots,
-                (
-                    ct.full((64,), batch, dtype=ct.int32),
-                    page_columns,
-                ),
-                padding_value=0,
-            )
-            child_rows = parent_rows // packing
-            history = (
-                selected_parents * parent_rows
-                + selected_slots * child_rows
-                + layer_offset
-                + history_positions % 128
-            )
-            history = ct.where(
-                (columns < history_count) & (selected_parents > 0), history, -1
-            )
-        else:
-            history = history_positions % window_capacity
-            history += batch * window_capacity
-            history = ct.where(columns < history_count, history, -1)
+        first = ct.load(window_first_blocks, (batch,), shape=(1,)).item()
+        page_columns = history_positions // 128 - first
+        selected_parents = ct.gather(
+            window_parent_ids,
+            (
+                ct.full((64,), batch, dtype=ct.int32),
+                page_columns,
+            ),
+            padding_value=0,
+        )
+        selected_slots = ct.gather(
+            window_child_slots,
+            (
+                ct.full((64,), batch, dtype=ct.int32),
+                page_columns,
+            ),
+            padding_value=0,
+        )
+        child_rows = parent_rows // packing
+        history = (
+            selected_parents * parent_rows
+            + selected_slots * child_rows
+            + layer_offset
+            + history_positions % 128
+        )
+        history = ct.where(
+            (columns < history_count) & (selected_parents > 0), history, -1
+        )
         # FlashInfer reserves the first ``window_size`` columns for the SWA
         # pool even when a short sequence has fewer valid history tokens.
         draft_column = columns - window_size
@@ -1841,10 +1741,8 @@ def dspark_attention_metadata(
             sparse_lengths,
             sequence_lengths,
             window_size,
-            window_capacity,
             block_length,
             index_width,
-            True,
             window_mapping.parent_rows,
             window_mapping.packing,
             window_mapping.layer_offset,
@@ -1869,7 +1767,6 @@ def _compress_ring_kernel(
     block_length: _ConstantInt,
     ring_size: _ConstantInt,
     overlap: _ConstantBool,
-    direct_page_mapping: _ConstantBool,
     state_block_tokens: _ConstantInt,
     state_packing: _ConstantInt,
 ):
@@ -1885,40 +1782,36 @@ def _compress_ring_kernel(
     batch = ct.bid(1)
     rows = ct.arange(ring_size, dtype=ct.int32).reshape((1, ring_size, 1))
     if overlap:
-        if direct_page_mapping:
-            end = ct.load(positions, (batch, block_length - 1), shape=(1, 1)).item()
-            slots = ct.arange(ring_size, dtype=ct.int32)
-            chronological = end - (end - slots) % ring_size
-            first = ct.load(state_first_blocks, (batch,), shape=(1,)).item()
-            columns = chronological // state_block_tokens - first
-            selected_parents = ct.gather(
-                state_parent_ids,
-                (
-                    ct.full((ring_size,), batch, dtype=ct.int32),
-                    columns,
-                ),
-                padding_value=0,
-            )
-            selected_slots = ct.gather(
-                state_child_slots,
-                (
-                    ct.full((ring_size,), batch, dtype=ct.int32),
-                    columns,
-                ),
-                padding_value=0,
-            )
-            valid = chronological >= 0
-            pages = ct.where(
-                valid & (selected_parents > 0),
-                selected_parents * state_packing + selected_slots,
-                -1,
-            ).reshape((ring_size, 1))
-            offsets = ct.where(valid, chronological % state_block_tokens, 0).reshape(
-                (ring_size, 1)
-            )
-        else:
-            pages = ct.full((ring_size, 1), batch, dtype=ct.int32)
-            offsets = ct.arange(ring_size, dtype=ct.int32).reshape((ring_size, 1))
+        end = ct.load(positions, (batch, block_length - 1), shape=(1, 1)).item()
+        slots = ct.arange(ring_size, dtype=ct.int32)
+        chronological = end - (end - slots) % ring_size
+        first = ct.load(state_first_blocks, (batch,), shape=(1,)).item()
+        columns = chronological // state_block_tokens - first
+        selected_parents = ct.gather(
+            state_parent_ids,
+            (
+                ct.full((ring_size,), batch, dtype=ct.int32),
+                columns,
+            ),
+            padding_value=0,
+        )
+        selected_slots = ct.gather(
+            state_child_slots,
+            (
+                ct.full((ring_size,), batch, dtype=ct.int32),
+                columns,
+            ),
+            padding_value=0,
+        )
+        valid = chronological >= 0
+        pages = ct.where(
+            valid & (selected_parents > 0),
+            selected_parents * state_packing + selected_slots,
+            -1,
+        ).reshape((ring_size, 1))
+        offsets = ct.where(valid, chronological % state_block_tokens, 0).reshape(
+            (ring_size, 1)
+        )
         dimensions = block * 32 + ct.arange(32, dtype=ct.int32).reshape((1, 32))
         first_values = (
             ct.gather(value_state, (pages, offsets, dimensions), padding_value=0)
@@ -1955,30 +1848,26 @@ def _compress_ring_kernel(
         token = ct.load(positions, (batch, token_index), shape=(1, 1)).item()
         ape_slot = token % ratio
         ring_slot = token % ring_size
-        if direct_page_mapping:
-            first = ct.load(state_first_blocks, (batch,), shape=(1,)).item()
-            column = token // state_block_tokens - first
-            selected_parent = ct.gather(
-                state_parent_ids,
-                (
-                    ct.full((1,), batch, dtype=ct.int32),
-                    ct.full((1,), column, dtype=ct.int32),
-                ),
-                padding_value=0,
-            ).item()
-            selected_slot = ct.gather(
-                state_child_slots,
-                (
-                    ct.full((1,), batch, dtype=ct.int32),
-                    ct.full((1,), column, dtype=ct.int32),
-                ),
-                padding_value=0,
-            ).item()
-            state_page = selected_parent * state_packing + selected_slot
-            state_offset = token % state_block_tokens
-        else:
-            state_page = batch
-            state_offset = ring_slot
+        first = ct.load(state_first_blocks, (batch,), shape=(1,)).item()
+        column = token // state_block_tokens - first
+        selected_parent = ct.gather(
+            state_parent_ids,
+            (
+                ct.full((1,), batch, dtype=ct.int32),
+                ct.full((1,), column, dtype=ct.int32),
+            ),
+            padding_value=0,
+        ).item()
+        selected_slot = ct.gather(
+            state_child_slots,
+            (
+                ct.full((1,), batch, dtype=ct.int32),
+                ct.full((1,), column, dtype=ct.int32),
+            ),
+            padding_value=0,
+        ).item()
+        state_page = selected_parent * state_packing + selected_slot
+        state_offset = token % state_block_tokens
         selected = rows == ring_slot
         current = ct.load(values, (batch, token_index, block), shape=(1, 1, 32)).astype(
             ct.float32
@@ -2037,40 +1926,31 @@ def _compress_ring_kernel(
                     axis=1,
                 )
             else:
-                if direct_page_mapping:
-                    pooled_positions = (
-                        token + 1 - ratio + ct.arange(ratio, dtype=ct.int32)
-                    )
-                    first = ct.load(state_first_blocks, (batch,), shape=(1,)).item()
-                    pooled_columns = pooled_positions // state_block_tokens - first
-                    selected_parents = ct.gather(
-                        state_parent_ids,
-                        (
-                            ct.full((ratio,), batch, dtype=ct.int32),
-                            pooled_columns,
-                        ),
-                        padding_value=0,
-                    )
-                    selected_slots = ct.gather(
-                        state_child_slots,
-                        (
-                            ct.full((ratio,), batch, dtype=ct.int32),
-                            pooled_columns,
-                        ),
-                        padding_value=0,
-                    )
-                    pooled_pages = (
-                        selected_parents * state_packing + selected_slots
-                    ).reshape((ratio, 1))
-                    pooled_offsets = (pooled_positions % state_block_tokens).reshape(
-                        (ratio, 1)
-                    )
-                else:
-                    window_start = (token + 1 - ratio) % ring_size
-                    pooled_offsets = (
-                        window_start + ct.arange(ratio, dtype=ct.int32)
-                    ).reshape((ratio, 1)) % ring_size
-                    pooled_pages = ct.full((ratio, 1), batch, dtype=ct.int32)
+                pooled_positions = token + 1 - ratio + ct.arange(ratio, dtype=ct.int32)
+                first = ct.load(state_first_blocks, (batch,), shape=(1,)).item()
+                pooled_columns = pooled_positions // state_block_tokens - first
+                selected_parents = ct.gather(
+                    state_parent_ids,
+                    (
+                        ct.full((ratio,), batch, dtype=ct.int32),
+                        pooled_columns,
+                    ),
+                    padding_value=0,
+                )
+                selected_slots = ct.gather(
+                    state_child_slots,
+                    (
+                        ct.full((ratio,), batch, dtype=ct.int32),
+                        pooled_columns,
+                    ),
+                    padding_value=0,
+                )
+                pooled_pages = (
+                    selected_parents * state_packing + selected_slots
+                ).reshape((ratio, 1))
+                pooled_offsets = (pooled_positions % state_block_tokens).reshape(
+                    (ratio, 1)
+                )
                 dimensions = block * 32 + ct.arange(32, dtype=ct.int32).reshape((1, 32))
                 pooled_values = (
                     ct.gather(
@@ -2107,8 +1987,6 @@ def _clear_rejected_ring_kernel(
     positions,
     processed_counts,
     block_length: _ConstantInt,
-    ring_size: _ConstantInt,
-    direct_page_mapping: _ConstantBool,
     state_block_tokens: _ConstantInt,
     state_packing: _ConstantInt,
 ):
@@ -2123,30 +2001,26 @@ def _clear_rejected_ring_kernel(
     for token_index in ct.static_iter(range(block_length)):
         if token_index >= processed:
             token = start + token_index
-            if direct_page_mapping:
-                first = ct.load(state_first_blocks, (batch,), shape=(1,)).item()
-                column = token // state_block_tokens - first
-                selected_parent = ct.gather(
-                    state_parent_ids,
-                    (
-                        ct.full((1,), batch, dtype=ct.int32),
-                        ct.full((1,), column, dtype=ct.int32),
-                    ),
-                    padding_value=0,
-                ).item()
-                selected_slot = ct.gather(
-                    state_child_slots,
-                    (
-                        ct.full((1,), batch, dtype=ct.int32),
-                        ct.full((1,), column, dtype=ct.int32),
-                    ),
-                    padding_value=0,
-                ).item()
-                page = selected_parent * state_packing + selected_slot
-                offset = token % state_block_tokens
-            else:
-                page = batch
-                offset = token % ring_size
+            first = ct.load(state_first_blocks, (batch,), shape=(1,)).item()
+            column = token // state_block_tokens - first
+            selected_parent = ct.gather(
+                state_parent_ids,
+                (
+                    ct.full((1,), batch, dtype=ct.int32),
+                    ct.full((1,), column, dtype=ct.int32),
+                ),
+                padding_value=0,
+            ).item()
+            selected_slot = ct.gather(
+                state_child_slots,
+                (
+                    ct.full((1,), batch, dtype=ct.int32),
+                    ct.full((1,), column, dtype=ct.int32),
+                ),
+                padding_value=0,
+            ).item()
+            page = selected_parent * state_packing + selected_slot
+            offset = token % state_block_tokens
             ct.store(value_state, (page, offset, block), zeros)
             ct.store(score_state, (page, offset, block), empty_scores)
 
@@ -2165,7 +2039,6 @@ def _compress_verify_finalize_kernel(
     dimension: _ConstantInt,
     stages: _ConstantInt,
     rotate: _ConstantBool,
-    paged_cache: _ConstantBool,
     parent_rows: _ConstantInt,
     packing: _ConstantInt,
     layer_offset: int,
@@ -2249,43 +2122,36 @@ def _compress_verify_finalize_kernel(
             value = ct.where(
                 group_ids < dimension // 64 - 1, simulated, groups
             ).reshape((dimension,))
-        if paged_cache:
-            first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
-            column = token // 128 - first
-            cache_parent = ct.gather(
-                cache_parent_ids,
-                (
-                    ct.full((1,), batch, dtype=ct.int32),
-                    ct.full((1,), column, dtype=ct.int32),
-                ),
-                padding_value=0,
-            ).item()
-            cache_slot = ct.gather(
-                cache_child_slots,
-                (
-                    ct.full((1,), batch, dtype=ct.int32),
-                    ct.full((1,), column, dtype=ct.int32),
-                ),
-                padding_value=0,
-            ).item()
-            child_rows = parent_rows // packing
-            cache_row = (
-                cache_parent * parent_rows
-                + cache_slot * child_rows
-                + layer_offset
-                + (token % 128) // ratio
-            )
-            ct.store(
-                cache,
-                (cache_row, 0),
-                value.reshape((1, dimension)).astype(cache.dtype),
-            )
-        else:
-            ct.store(
-                cache,
-                (batch, token // ratio, 0),
-                value.reshape((1, 1, dimension)).astype(cache.dtype),
-            )
+        first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
+        column = token // 128 - first
+        cache_parent = ct.gather(
+            cache_parent_ids,
+            (
+                ct.full((1,), batch, dtype=ct.int32),
+                ct.full((1,), column, dtype=ct.int32),
+            ),
+            padding_value=0,
+        ).item()
+        cache_slot = ct.gather(
+            cache_child_slots,
+            (
+                ct.full((1,), batch, dtype=ct.int32),
+                ct.full((1,), column, dtype=ct.int32),
+            ),
+            padding_value=0,
+        ).item()
+        child_rows = parent_rows // packing
+        cache_row = (
+            cache_parent * parent_rows
+            + cache_slot * child_rows
+            + layer_offset
+            + (token % 128) // ratio
+        )
+        ct.store(
+            cache,
+            (cache_row, 0),
+            value.reshape((1, dimension)).astype(cache.dtype),
+        )
 
 
 def compress_verify(
@@ -2348,7 +2214,6 @@ def compress_verify(
             block_length,
             ring_size,
             ratio == 4,
-            True,
             state_mapping.block_tokens,
             state_mapping.packing,
         ),
@@ -2370,7 +2235,6 @@ def compress_verify(
             dimension,
             int(math.log2(dimension)),
             rotate,
-            True,
             cache_mapping.parent_rows,
             cache_mapping.packing,
             cache_mapping.layer_offset,
@@ -2418,8 +2282,6 @@ def clear_rejected_compress_state(
             positions,
             processed_counts,
             block_length,
-            ring_size,
-            True,
             state_mapping.block_tokens,
             state_mapping.packing,
         ),
