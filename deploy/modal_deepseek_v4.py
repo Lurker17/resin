@@ -1199,6 +1199,50 @@ def benchmark_tp2() -> dict[str, object]:
 
 
 @app.function(
+    image=image.uv_pip_install("pytest>=8,<9").add_local_file(
+        ROOT / "models/cuda/tests/test_deepseek_v4_window.py",
+        "/opt/resin/validation/test_deepseek_v4_window.py",
+        copy=True,
+    ),
+    gpu="B300:1",
+    cpu=4,
+    memory=8 * 1024,
+    timeout=10 * 60,
+)
+def validate_window_metadata() -> dict[str, object]:
+    """Check long-prefill and speculative attention windows without a model."""
+
+    import subprocess
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        raise RuntimeError("window validation requires an available Blackwell GPU")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            # The source checkout may contain a host-built native extension.
+            # Validate the image's installed Linux wheels, without the repo's
+            # development-only pytest pythonpath setting.
+            "-c",
+            "/dev/null",
+            "-q",
+            "/opt/resin/validation/test_deepseek_v4_window.py",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=9 * 60,
+        check=False,
+    )
+    print(result.stdout, flush=True)
+    if result.returncode or "skipped" in result.stdout:
+        raise RuntimeError("DeepSeek-V4 window metadata validation did not pass")
+    kernel_cache_volume.commit()
+    return {"gpu": torch.cuda.get_device_name(), "tests": result.stdout.strip()}
+
+
+@app.function(
     gpu="B300:4",
     cpu=32,
     memory=256 * 1024,
@@ -1327,6 +1371,8 @@ def main(
     model_spec = _model_spec(model)
     if mode == "download":
         report = cache_checkpoint.remote(model_spec.key)
+    elif mode == "validate-window":
+        report = validate_window_metadata.remote()
     elif mode == "bench-tp2":
         if model_spec.key != DEFAULT_MODEL_KEY:
             raise ValueError("bench-tp2 currently supports only flash-0731")
@@ -1355,7 +1401,7 @@ def main(
         )
     else:
         raise ValueError(
-            "mode must be 'download', 'bench-tp2', 'bench-tp4', 'run', 'real', "
+            "mode must be 'download', 'validate-window', 'bench-tp2', 'bench-tp4', 'run', 'real', "
             "or 'profile'"
         )
     print(json.dumps(report, indent=2, sort_keys=True))
