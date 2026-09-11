@@ -11,6 +11,7 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from resin.backend.cuda.paged_kv import PagedCacheMapping
+from resin_models_cuda.deepseek_v4.tilelang_kernels import per_token_cast
 
 _ConstantInt: TypeAlias = ct.Constant[int]
 _ConstantBool: TypeAlias = ct.Constant[bool]
@@ -226,6 +227,17 @@ def _quant_groups_per_program(rows: int, group_count: int) -> int:
     return 1
 
 
+def _sqrt_softplus(values):
+    # Compensate for rounding in 1 + exp(-abs(x)), including when it rounds
+    # to exactly one. Otherwise negative logits can produce zero scores/NaNs.
+    z = ct.exp(-ct.abs(values))
+    y = 1.0 + z
+    denominator = ct.where(y == 1.0, 1.0, y - 1.0)
+    logarithm = ct.where(y == 1.0, z, ct.log(y) * (z / denominator))
+    softplus = ct.maximum(values, 0.0) + logarithm
+    return ct.sqrt(ct.where(values > 20.0, values, softplus))
+
+
 @ct.kernel
 def _top6_sqrt_softplus_kernel(
     logits: _StaticLastDim,
@@ -238,11 +250,7 @@ def _top6_sqrt_softplus_kernel(
     row = ct.bid(0)
     logits_tile = ct.load(logits, (row, 0), shape=(1, num_experts)).astype(ct.float32)
     bias_tile = ct.load(bias, (0,), shape=(num_experts,)).reshape((1, num_experts))
-    stable_softplus = ct.maximum(logits_tile, 0.0) + ct.log(
-        1.0 + ct.exp(-ct.abs(logits_tile))
-    )
-    softplus = ct.where(logits_tile > 20.0, logits_tile, stable_softplus)
-    original = ct.sqrt(softplus)
+    original = _sqrt_softplus(logits_tile)
     scores = original + bias_tile
     expert_ids = ct.arange(num_experts, dtype=ct.int32).reshape((1, num_experts))
 
@@ -342,80 +350,27 @@ def _hash_sqrt_softplus_kernel(
     expert_indices: _StaticLastDim,
     expert_weights: _StaticLastDim,
     route_scale,
-    expert_tile: _ConstantInt,
 ):
     """Fuse hash lookup with the exact sqrt-softplus routing weights."""
 
     row = ct.bid(0)
-    logits_tile = ct.load(
-        logits,
-        (row, 0),
-        shape=(1, expert_tile),
-        padding_mode=ct.PaddingMode.ZERO,
-    ).astype(ct.float32)
-    stable_softplus = ct.maximum(logits_tile, 0.0) + ct.log(
-        1.0 + ct.exp(-ct.abs(logits_tile))
-    )
-    original = ct.sqrt(ct.where(logits_tile > 20.0, logits_tile, stable_softplus))
     token = ct.load(token_ids, (row,), shape=(1,)).item()
-    indices01 = ct.load(token_to_experts, (token, 0), shape=(1, 2)).astype(ct.int32)
-    indices23 = ct.load(token_to_experts, (token, 1), shape=(1, 2)).astype(ct.int32)
-    indices45 = ct.load(token_to_experts, (token, 2), shape=(1, 2)).astype(ct.int32)
-    expert_ids = ct.arange(expert_tile, dtype=ct.int32).reshape((1, expert_tile))
-    weights0 = ct.sum(
-        ct.where(
-            expert_ids == ct.extract(indices01, (0, 0), shape=(1, 1)), original, 0.0
-        ),
-        axis=1,
-        keepdims=True,
-    )
-    weights1 = ct.sum(
-        ct.where(
-            expert_ids == ct.extract(indices01, (0, 1), shape=(1, 1)), original, 0.0
-        ),
-        axis=1,
-        keepdims=True,
-    )
-    weights2 = ct.sum(
-        ct.where(
-            expert_ids == ct.extract(indices23, (0, 0), shape=(1, 1)), original, 0.0
-        ),
-        axis=1,
-        keepdims=True,
-    )
-    weights3 = ct.sum(
-        ct.where(
-            expert_ids == ct.extract(indices23, (0, 1), shape=(1, 1)), original, 0.0
-        ),
-        axis=1,
-        keepdims=True,
-    )
-    weights4 = ct.sum(
-        ct.where(
-            expert_ids == ct.extract(indices45, (0, 0), shape=(1, 1)), original, 0.0
-        ),
-        axis=1,
-        keepdims=True,
-    )
-    weights5 = ct.sum(
-        ct.where(
-            expert_ids == ct.extract(indices45, (0, 1), shape=(1, 1)), original, 0.0
-        ),
-        axis=1,
-        keepdims=True,
-    )
-    normalization = route_scale / (
-        weights0 + weights1 + weights2 + weights3 + weights4 + weights5
-    )
-    weight01 = ct.cat((weights0, weights1), axis=1) * normalization
-    weight23 = ct.cat((weights2, weights3), axis=1) * normalization
-    weight45 = ct.cat((weights4, weights5), axis=1) * normalization
-    ct.store(expert_indices, (row, 0), indices01)
-    ct.store(expert_indices, (row, 1), indices23)
-    ct.store(expert_indices, (row, 2), indices45)
-    ct.store(expert_weights, (row, 0), weight01.astype(expert_weights.dtype))
-    ct.store(expert_weights, (row, 1), weight23.astype(expert_weights.dtype))
-    ct.store(expert_weights, (row, 2), weight45.astype(expert_weights.dtype))
+    indices = ct.load(
+        token_to_experts,
+        (token, 0),
+        shape=(1, 8),
+        padding_mode=ct.PaddingMode.ZERO,
+    ).astype(ct.int32)
+    logits_tile = ct.gather(logits, (row, indices)).astype(ct.float32)
+    original = _sqrt_softplus(logits_tile)
+    # Preserve the original left-associated six-term sum, excluding padding.
+    total = ct.extract(original, (0, 0), shape=(1, 1))
+    for slot in ct.static_iter(range(1, 6)):
+        total += ct.extract(original, (0, slot), shape=(1, 1))
+    weights = original * (route_scale / total)
+    # Both output rows have width six; the two padded lanes are not stored.
+    ct.store(expert_indices, (row, 0), indices)
+    ct.store(expert_weights, (row, 0), weights.astype(expert_weights.dtype))
 
 
 def hash_sqrt_softplus(
@@ -428,7 +383,7 @@ def hash_sqrt_softplus(
 
     if logits.ndim != 2 or logits.shape[0] == 0:
         raise ValueError("hash routing requires nonempty two-dimensional logits")
-    rows, num_experts = logits.shape
+    rows = logits.shape[0]
     if token_ids.shape != (rows,) or token_to_experts.shape[-1] != 6:
         raise ValueError("hash routing inputs have incompatible shapes")
     expert_indices = torch.empty((rows, 6), dtype=torch.int32, device=logits.device)
@@ -444,7 +399,6 @@ def hash_sqrt_softplus(
             expert_indices,
             expert_weights,
             route_scale,
-            1 << (num_experts - 1).bit_length(),
         ),
     )
     return expert_weights, expert_indices
@@ -693,76 +647,6 @@ def finish_index_topk(
 
 
 @ct.kernel
-def _fp8_quantize_kernel(
-    source: _StaticLastDim,
-    output: _StaticLastDim,
-    scales: _StaticLastDim,
-):
-    row = ct.bid(0)
-    group = ct.bid(1)
-    values = ct.load(source, (row, group), shape=(1, 128)).astype(ct.float32)
-    maximum = ct.maximum(ct.max(ct.abs(values), axis=1, keepdims=True), 1e-4)
-    exponent = ct.ceil(ct.log2(maximum / 448.0))
-    scale = ct.exp2(exponent)
-    quantized = ct.maximum(ct.minimum(values / scale, 448.0), -448.0).astype(
-        ct.float8_e4m3fn
-    )
-    ct.store(output, (row, group), quantized)
-    # E8M0 stores the unbiased power-of-two exponent plus 127. cuda-tile 1.4
-    # can consume E8M0 arrays but cannot select the required rounding mode for
-    # a float-to-E8M0 conversion, so emit the exact byte representation.
-    ct.store(scales, (row, group), (exponent + 127).astype(ct.uint8))
-
-
-@ct.kernel
-def _fp8_quantize_four_groups_kernel(
-    source: _StaticLastDim,
-    output: _StaticLastDim,
-    scales: _StaticLastDim,
-):
-    row = ct.bid(0)
-    tile = ct.bid(1)
-    values = ct.load(source, (row, tile), shape=(1, 512)).reshape((4, 128))
-    values = values.astype(ct.float32)
-    maximum = ct.maximum(ct.max(ct.abs(values), axis=1, keepdims=True), 1e-4)
-    exponent = ct.ceil(ct.log2(maximum / 448.0))
-    scale = ct.exp2(exponent)
-    quantized = ct.maximum(ct.minimum(values / scale, 448.0), -448.0).astype(
-        ct.float8_e4m3fn
-    )
-    ct.store(output, (row, tile), quantized.reshape((1, 512)))
-    ct.store(scales, (row, tile), (exponent + 127).astype(ct.uint8).reshape((1, 4)))
-
-
-@ct.kernel
-def _fp8_quantize_four_groups_packed_kernel(
-    source: _StaticLastDim,
-    output: _StaticLastDim,
-    scale_storage: _StaticLastDim,
-):
-    """Quantize four K128 groups and emit DeepGEMM's packed MN-major scales."""
-
-    row = ct.bid(0)
-    tile = ct.bid(1)
-    values = ct.load(source, (row, tile), shape=(1, 512)).reshape((4, 128))
-    values = values.astype(ct.float32)
-    maximum = ct.maximum(ct.max(ct.abs(values), axis=1, keepdims=True), 1e-4)
-    exponent = ct.ceil(ct.log2(maximum / 448.0))
-    scale = ct.exp2(exponent)
-    quantized = ct.maximum(ct.minimum(values / scale, 448.0), -448.0).astype(
-        ct.float8_e4m3fn
-    )
-    ct.store(output, (row, tile), quantized.reshape((1, 512)))
-    # Storage is [packed_k, tma_aligned_m, 4 bytes]. Viewing it as int32 and
-    # transposing produces shape [m, packed_k], stride [1, aligned_m].
-    ct.store(
-        scale_storage,
-        (tile, row, 0),
-        (exponent + 127).astype(ct.uint8).reshape((1, 1, 4)),
-    )
-
-
-@ct.kernel
 def _fp8_quantize_moe_kernel(
     source: _StaticLastDim,
     output: _StaticLastDim,
@@ -848,7 +732,12 @@ def act_quant(
     *,
     packed_scales: bool = False,
 ):
-    """Power-of-two FP8 block quantization matching the Flash checkpoint."""
+    """Power-of-two FP8 block quantization matching the Flash checkpoint.
+
+    GEMM inputs are BF16/FP32 with contiguous features and flattenable leading
+    dimensions. Packed scales are int32; unpacked scales are FP32 powers of two
+    with MN-major storage. In-place simulation preserves the input dtype.
+    """
 
     if inplace:
         if block_size != 64:
@@ -869,52 +758,21 @@ def act_quant(
     if scale_dtype != torch.float8_e8m0fnu:
         raise ValueError("DeepSeek-V4 FP8 scales must use float8_e8m0fnu")
     rows, width = values.numel() // values.shape[-1], values.shape[-1]
-    output = torch.empty_like(values, dtype=torch.float8_e4m3fn)
-    group_count = width // block_size
-    if packed_scales:
-        if group_count % 4:
-            raise ValueError("packed DeepGEMM scales require a multiple of four groups")
-        aligned_rows = (rows + 3) // 4 * 4
-        scale_storage = torch.empty(
-            (group_count // 4, aligned_rows, 4),
-            dtype=torch.uint8,
-            device=values.device,
-        )
-        ct.launch(
-            torch.cuda.current_stream(values.device),
-            (rows, group_count // 4),
-            _fp8_quantize_four_groups_packed_kernel,
-            (
-                values.view(rows, width),
-                output.view(rows, width),
-                scale_storage,
-            ),
-        )
-        scales = scale_storage.view(torch.int32).squeeze(-1).T[:rows]
-        return output, scales
-    scale_storage = torch.empty(
-        (*values.shape[:-1], width // block_size),
-        dtype=torch.uint8,
-        device=values.device,
+    if packed_scales and (width // block_size) % 4:
+        raise ValueError("packed DeepGEMM scales require a multiple of four groups")
+    quantized, scales = per_token_cast(
+        values.view(rows, width),
+        "e4m3",
+        block_size,
+        use_tma_aligned_col_major_sf=True,
+        round_sf=True,
+        use_packed_ue8m0=packed_scales,
     )
-    scales = scale_storage.view(scale_dtype)
-    groups_per_program = _quant_groups_per_program(rows, group_count)
-    kernel = (
-        _fp8_quantize_four_groups_kernel
-        if groups_per_program == 4
-        else _fp8_quantize_kernel
-    )
-    ct.launch(
-        torch.cuda.current_stream(values.device),
-        (rows, group_count // groups_per_program),
-        kernel,
-        (
-            values.view(rows, width),
-            output.view(rows, width),
-            scale_storage.view(rows, -1),
-        ),
-    )
-    return output, scales
+    # Both GEMMs consume MN-major scales: packed UE8M0 for DeepGEMM decode,
+    # FP32 powers of two for TRT-LLM prefill. No device conversion is needed.
+    if not packed_scales:
+        scales = scales.view(*values.shape[:-1], width // block_size)
+    return quantized.view_as(values), scales
 
 
 def moe_act_quant(

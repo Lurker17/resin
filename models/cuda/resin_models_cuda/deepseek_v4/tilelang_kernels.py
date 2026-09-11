@@ -1,4 +1,4 @@
-"""DeepSeek-V4 TileLang kernels adapted from SGLang's MHC implementation."""
+"""TileKernels quantization and fused mHC adapted from SGLang."""
 
 from __future__ import annotations
 
@@ -11,6 +11,12 @@ from torch import Tensor
 if sys.platform == "linux":
     import tilelang
     import tilelang.language as T
+    from tilelang.backend import target
+
+    # TileKernels 1.0.0 uses the path renamed in TileLang 0.1.14. Remove this
+    # compatibility alias when upgrading to a release with the corrected import.
+    sys.modules.setdefault("tilelang.utils.target", target)
+    from tile_kernels.quant import per_token_cast
 
     @tilelang.jit(
         pass_configs={
@@ -181,6 +187,7 @@ if sys.platform == "linux":
 
 else:
     _mhc_pre_norm_kernel = None
+    per_token_cast = None
 
 
 def mhc_pre_norm(
@@ -241,4 +248,4 @@ def mhc_pre_norm(
     return post, comb.view(rows, 4, 4), layer_input
 
 
-__all__ = ["mhc_pre_norm"]
+__all__ = ["mhc_pre_norm", "per_token_cast"]

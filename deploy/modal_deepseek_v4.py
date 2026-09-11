@@ -1199,9 +1199,15 @@ def benchmark_tp2() -> dict[str, object]:
 
 
 @app.function(
-    image=image.uv_pip_install("pytest>=8,<9").add_local_file(
+    image=image.uv_pip_install("pytest>=8,<9")
+    .add_local_file(
         ROOT / "models/cuda/tests/test_deepseek_v4_window.py",
         "/opt/resin/validation/test_deepseek_v4_window.py",
+        copy=True,
+    )
+    .add_local_file(
+        ROOT / "models/cuda/tests/test_deepseek_v4_kernels.py",
+        "/opt/resin/validation/test_deepseek_v4_kernels.py",
         copy=True,
     ),
     gpu="B300:1",
@@ -1209,13 +1215,13 @@ def benchmark_tp2() -> dict[str, object]:
     memory=8 * 1024,
     timeout=10 * 60,
 )
-def validate_window_metadata() -> dict[str, object]:
-    """Check long-prefill and speculative attention windows without a model."""
+def validate_kernels() -> dict[str, object]:
+    """Check fused math, packed cache writes, and speculative attention windows."""
 
     import subprocess
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
-        raise RuntimeError("window validation requires an available Blackwell GPU")
+        raise RuntimeError("kernel validation requires an available Blackwell GPU")
     result = subprocess.run(
         [
             sys.executable,
@@ -1228,6 +1234,7 @@ def validate_window_metadata() -> dict[str, object]:
             "/dev/null",
             "-q",
             "/opt/resin/validation/test_deepseek_v4_window.py",
+            "/opt/resin/validation/test_deepseek_v4_kernels.py",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -1237,7 +1244,7 @@ def validate_window_metadata() -> dict[str, object]:
     )
     print(result.stdout, flush=True)
     if result.returncode or "skipped" in result.stdout:
-        raise RuntimeError("DeepSeek-V4 window metadata validation did not pass")
+        raise RuntimeError("DeepSeek-V4 kernel validation did not pass")
     kernel_cache_volume.commit()
     return {"gpu": torch.cuda.get_device_name(), "tests": result.stdout.strip()}
 
@@ -1371,8 +1378,8 @@ def main(
     model_spec = _model_spec(model)
     if mode == "download":
         report = cache_checkpoint.remote(model_spec.key)
-    elif mode == "validate-window":
-        report = validate_window_metadata.remote()
+    elif mode in {"validate-kernels", "validate-window"}:
+        report = validate_kernels.remote()
     elif mode == "bench-tp2":
         if model_spec.key != DEFAULT_MODEL_KEY:
             raise ValueError("bench-tp2 currently supports only flash-0731")
@@ -1401,7 +1408,7 @@ def main(
         )
     else:
         raise ValueError(
-            "mode must be 'download', 'validate-window', 'bench-tp2', 'bench-tp4', 'run', 'real', "
+            "mode must be 'download', 'validate-kernels', 'bench-tp2', 'bench-tp4', 'run', 'real', "
             "or 'profile'"
         )
     print(json.dumps(report, indent=2, sort_keys=True))

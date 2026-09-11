@@ -89,11 +89,11 @@ def fp8_gemm(
     if not fp8_gemm_uses_packed_scales(rows):
         expected_activation_scales = (*left.shape[:-1], depth // 128)
         if (
-            left_scales.dtype != torch.float8_e8m0fnu
+            left_scales.dtype != torch.float32
             or left_scales.shape != expected_activation_scales
         ):
             raise ValueError(
-                "prefill activation scales must be contiguous UE8M0 with shape "
+                "prefill activation scales must be FP32 powers of two with shape "
                 f"{expected_activation_scales}, got {left_scales.dtype} "
                 f"{tuple(left_scales.shape)}"
             )
@@ -102,7 +102,7 @@ def fp8_gemm(
         # runtime-dynamic. This avoids DeepGEMM selecting and JIT-compiling a
         # new tile configuration when a warm server sees a novel prompt length.
         matrix = left.view(rows, depth)
-        activation_scales = left_scales.view(rows, depth // 128).float()
+        activation_scales = left_scales.view(rows, depth // 128)
         aligned_rows = (rows + 3) // 4 * 4
         if aligned_rows != rows:
             padded_matrix = torch.zeros(

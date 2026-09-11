@@ -2545,6 +2545,7 @@ dependencies = [
     { name = "resin-models-torch" },
     { name = "safetensors" },
     { name = "sgl-deep-gemm", marker = "sys_platform == 'linux'" },
+    { name = "tile-kernels", marker = "sys_platform == 'linux'" },
     { name = "tilelang", marker = "sys_platform == 'linux'" },
     { name = "torch" },
     { name = "torchvision" },
@@ -2568,6 +2569,7 @@ requires-dist = [
     { name = "resin-models-torch", editable = "models/torch" },
     { name = "safetensors", specifier = ">=0.5" },
     { name = "sgl-deep-gemm", marker = "sys_platform == 'linux'", specifier = "==0.1.5.post2" },
+    { name = "tile-kernels", marker = "sys_platform == 'linux'", specifier = "==1.0.0" },
     { name = "tilelang", marker = "sys_platform == 'linux'", specifier = "==0.1.14" },
     { name = "torch", specifier = "==2.13.0" },
     { name = "torchvision", specifier = "==0.28.0" },
@@ -2780,6 +2782,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/96/d9/dfd086aa2d918c563a140720e0ce296cada1634efd2783d5cf51e05f984e/tiktoken-0.13.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:6644c9c2b5cf3916f5a3641d7d12fdb3f006a7b3d9ff6acdaec44e29ab1ff91e", size = 1181863, upload-time = "2026-05-15T04:51:15.025Z" },
     { url = "https://files.pythonhosted.org/packages/2f/68/a18b4f307086954fdae32714cb4f85562e34f9d34ab206e61f1816aa6018/tiktoken-0.13.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:5cb65b60b9408563676d874a3a4ee573370066f0dc4e29d84e82e989c6517424", size = 1239218, upload-time = "2026-05-15T04:51:16.103Z" },
     { url = "https://files.pythonhosted.org/packages/16/5b/f2aa703a4fc5d2dff73460a7d46cc2f3f44aa0f3dd8eeb20d2a0ecf68862/tiktoken-0.13.0-cp314-cp314t-win_amd64.whl", hash = "sha256:85b78cc3a2c3d48723ca751fa981f1fedccd54194ca0471b957364353a898b07", size = 918110, upload-time = "2026-05-15T04:51:17.237Z" },
+]
+
+[[package]]
+name = "tile-kernels"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "tilelang" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/17/70/f0f62438b89c96bfe36d6ed95bfcc101b75df12f771a800cb6feb0fa9337/tile_kernels-1.0.0.tar.gz", hash = "sha256:259b7d70219cce6afa868f724c3032936c6ae331239285b1111554c4baa46eb3", size = 107895, upload-time = "2026-04-23T09:01:30.093Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d3/74/7511421ab2a2f292ca2c147a7af78eaec90e39bd6d6703283a4ba8fd7dfc/tile_kernels-1.0.0-py3-none-any.whl", hash = "sha256:9f1e09c1bccde32f3189d1ff32ba9725f86fc04ac1d0ac93284e16fcab1a5666", size = 120627, upload-time = "2026-04-23T09:01:28.287Z" },
 ]
 
 [[package]]

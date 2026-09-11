@@ -40,7 +40,7 @@ semantics. Gemma's size is concentrated in runner code: 1,512 lines at baseline,
 while its CUDA model definition is 230. That made repeated host setup a useful
 first reduction without changing numerical kernels.
 
-## Implemented reductions
+## First-pass reductions
 
 | Area | Production lines removed |
 | --- | ---: |
@@ -62,7 +62,7 @@ and Gemma's FlashInfer planning options. Model kernels and numerical launch
 closures remain unchanged. Native plan construction also loses one temporary
 allocation per batch.
 
-## Validation
+## First-pass validation
 
 All 341 Python tests and 97 Rust tests pass. Formatting, lint, and whitespace
 checks pass. The CPU benchmark uses the complete native `EngineCore.step`
@@ -92,6 +92,21 @@ cargo test --all-targets
 uv run pytest -q
 uv run modal run deploy/modal_gemma4.py --mode smoke --max-new-tokens 16
 ```
+
+## DeepSeek kernel reuse
+
+The next pass replaces three local GEMM quantizers with DeepSeek's TileKernels,
+simplifies hash routing to gather six selected logits, shares numerically stable
+sqrt-softplus, and removes unused cache-layout branches. Production implementation
+decreases by another **272 lines**, from **31,103 to 30,831**. DeepSeek decreases
+from **6,290 to 6,018** lines. Including the expanded GPU regression tests and
+deployment entry point, all Rust/Python source decreases from **47,545 to 47,520**:
+**25 fewer lines overall** in this pass.
+
+Across both passes, this is **496 fewer production lines** and **111 fewer total
+source lines** than the audit baseline. See [DeepSeek kernel reuse](deepseek-kernel-reuse.md)
+for measured kernel costs, numerical validation, and the replacements retained
+or rejected. Counts use the same Tokei method as above.
 
 ## Further reductions
 

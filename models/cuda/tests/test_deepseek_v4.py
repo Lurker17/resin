@@ -497,8 +497,9 @@ class TestDeepSeekV4Gemms:
             assert not deepseek_gemm.fp8_gemm_uses_packed_scales(5)
         assert deepseek_gemm.fp8_gemm_uses_packed_scales(5)
 
+    @pytest.mark.parametrize("rows", [132, 129])
     def test_fp8_prefill_uses_dynamic_trtllm_gemm_and_aligns_rows(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, rows: int
     ) -> None:
         deepseek_gemm = self._module(monkeypatch)
 
@@ -512,8 +513,10 @@ class TestDeepSeekV4Gemms:
         monkeypatch.setattr(
             deepseek_gemm.torch, "get_default_dtype", lambda: torch.bfloat16
         )
-        left = torch.zeros(1, 129, 256, dtype=torch.float8_e4m3fn)
-        left_scales = torch.ones(1, 129, 2, dtype=torch.float8_e8m0fnu)
+        aligned_rows = (rows + 3) // 4 * 4
+        left = torch.zeros(1, rows, 256, dtype=torch.float8_e4m3fn)
+        scale_storage = (torch.arange(2 * aligned_rows).float() % 7).exp2().view(2, -1)
+        left_scales = scale_storage[:, :rows].T.view(1, rows, 2)
         right = torch.zeros(128, 256, dtype=torch.float8_e4m3fn)
         right_scales = torch.ones(1, 2, dtype=torch.float8_e8m0fnu)
 
@@ -525,19 +528,22 @@ class TestDeepSeekV4Gemms:
             torch.float8_e8m0fnu,
         )
 
-        assert output.shape == (1, 129, 128)
+        assert output.shape == (1, rows, 128)
         assert output.dtype == torch.bfloat16
         args, kwargs = calls[0]
-        assert args[0].shape == (132, 256)
-        assert torch.count_nonzero(args[0][129:].float()) == 0
-        assert args[2].shape == (2, 132)
+        assert args[0].shape == (aligned_rows, 256)
+        assert torch.count_nonzero(args[0][rows:].float()) == 0
+        assert args[2].shape == (2, aligned_rows)
         assert args[2].dtype == torch.float32
-        assert torch.all(args[2][:, 129:] == 1)
+        assert torch.all(args[2][:, rows:] == 1)
+        torch.testing.assert_close(args[2][:, :rows], scale_storage[:, :rows])
+        if rows == aligned_rows:
+            assert args[2].data_ptr() == left_scales.data_ptr()
         assert args[3].shape == (1, 2)
         assert args[3].dtype == torch.float32
         assert kwargs["scale_major_mode"] == "MN"
         assert kwargs["scale_granularity_mnk"] == (1, 128, 128)
-        assert kwargs["out"].shape == (132, 128)
+        assert kwargs["out"].shape == (aligned_rows, 128)
         assert kwargs["out"].dtype == torch.bfloat16
         assert kwargs["backend"] == "trtllm"
 
