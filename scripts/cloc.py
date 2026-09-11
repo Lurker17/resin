@@ -162,10 +162,7 @@ def report() -> dict[str, dict[str, object]]:
             "resin-py": source_files(ROOT / "crates/resin-py/src", "*.rs"),
         },
         "python": {
-            "resin": {
-                "_self": source_files(ROOT / "resin", "*.py", recursive=False),
-                "backend": source_files(ROOT / "resin/backend", "*.py"),
-            },
+            "resin": python_package(ROOT / "resin"),
             "resin-models-cuda": python_package(ROOT / "models/cuda/resin_models_cuda"),
             "resin-models-torch": python_package(
                 ROOT / "models/torch/resin_models_torch"

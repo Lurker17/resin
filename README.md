@@ -31,6 +31,7 @@ The focused contracts are:
 
 - [flat cache pool](docs/cache-pool.md)
 - [scheduler](docs/scheduler.md)
+- [code size and simplification](docs/code-size.md)
 - [runner/kernel boundary](docs/kernel-boundary.md)
 - [authoring a CUDA model runner](docs/model-forward-pass.md)
 - [CUDA model package boundaries](models/cuda/ARCHITECTURE.md)
