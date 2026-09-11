@@ -111,6 +111,22 @@ pub(crate) struct ToolCall {
 }
 
 impl ResponseAccumulator {
+    /// Collect one non-streaming result. All wire protocols require an explicit
+    /// completion event; dropping the actor's sender is never a partial success.
+    pub async fn collect(mut receiver: mpsc::Receiver<GenerationEvent>) -> Result<Self, String> {
+        let mut response = Self::default();
+        while let Some(event) = receiver.recv().await {
+            if let GenerationEvent::Error { message } = event {
+                return Err(message);
+            }
+            response.apply(&event);
+            if response.reason.is_some() {
+                return Ok(response);
+            }
+        }
+        Err("the inference engine ended the request without a result".to_owned())
+    }
+
     pub fn apply(&mut self, event: &GenerationEvent) {
         match event {
             GenerationEvent::Started { input_tokens } => self.input_tokens = *input_tokens,

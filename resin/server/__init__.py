@@ -23,6 +23,23 @@ if TYPE_CHECKING:
     from renderers import Renderer
 
 
+def encode_stop_tokens(
+    tokenizer: Any, defaults: Sequence[int], stop_strings: Sequence[str]
+) -> list[int]:
+    """Combine model stops with tokenized user stops, preserving their order."""
+
+    token_ids = list(defaults)
+    for stop in stop_strings:
+        encoded = list(tokenizer.encode(stop, add_special_tokens=False))
+        if len(encoded) != 1:
+            raise ValueError(
+                f"stop sequence {stop!r} encodes to {len(encoded)} tokens; "
+                "multi-token stop sequences are not supported yet"
+            )
+        token_ids.append(int(encoded[0]))
+    return list(dict.fromkeys(token_ids))
+
+
 class RendererCodec(ConversationCodec):
     """Adapt a ``renderers.Renderer`` to Resin's streaming server contract.
 
@@ -54,23 +71,16 @@ class RendererCodec(ConversationCodec):
         token_ids = self.renderer.render_ids(
             request["messages"], tools=tools, add_generation_prompt=True
         )
-        stop_token_ids = list(self.renderer.get_stop_token_ids())
         stop_strings = request.get("stop") or []
         if stop_strings and self.tokenizer is None:
             raise ValueError(
                 "string stop sequences require RendererCodec(tokenizer=...)"
             )
-        for stop in stop_strings:
-            encoded = list(self.tokenizer.encode(stop, add_special_tokens=False))
-            if len(encoded) != 1:
-                raise ValueError(
-                    f"stop sequence {stop!r} encodes to {len(encoded)} tokens; "
-                    "multi-token stop sequences are not supported yet"
-                )
-            stop_token_ids.append(encoded[0])
         return {
             "token_ids": list(token_ids),
-            "stop_token_ids": list(dict.fromkeys(stop_token_ids)),
+            "stop_token_ids": encode_stop_tokens(
+                self.tokenizer, self.renderer.get_stop_token_ids(), stop_strings
+            ),
         }
 
     def create_parser(
@@ -250,6 +260,7 @@ class HttpServer:
 
 __all__ = [
     "ConversationCodec",
+    "encode_stop_tokens",
     "HttpServer",
     "ParserEvent",
     "RenderedPrompt",

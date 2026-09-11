@@ -7,6 +7,8 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
+from resin.server import encode_stop_tokens
+
 
 def _thinking_settings(request: dict[str, Any]) -> tuple[str, str]:
     extra = request.get("extra") or {}
@@ -77,18 +79,11 @@ class DeepSeekV4Codec:
         eos_token_id = self._tokenizer.convert_tokens_to_ids(self._encoding.eos_token)
         if isinstance(eos_token_id, bool) or not isinstance(eos_token_id, int):
             raise ValueError("DeepSeek-V4 EOS token did not resolve to one token ID")
-        stop_token_ids = [eos_token_id]
-        for stop in request.get("stop") or []:
-            encoded = list(self._tokenizer.encode(stop, add_special_tokens=False))
-            if len(encoded) != 1:
-                raise ValueError(
-                    f"stop sequence {stop!r} encodes to {len(encoded)} tokens; "
-                    "multi-token stop sequences are not supported yet"
-                )
-            stop_token_ids.append(int(encoded[0]))
         return {
             "token_ids": token_ids,
-            "stop_token_ids": list(dict.fromkeys(stop_token_ids)),
+            "stop_token_ids": encode_stop_tokens(
+                self._tokenizer, [eos_token_id], request.get("stop") or []
+            ),
         }
 
     def create_parser(

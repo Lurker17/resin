@@ -11,7 +11,7 @@ from PIL import Image
 
 from resin.models.qwen3_5.media import Qwen35Media
 from resin.protocols import RenderedPrompt, ResponseParser
-from resin.server import RendererCodec
+from resin.server import RendererCodec, encode_stop_tokens
 from resin.server.media import normalize_image_messages
 
 
@@ -57,18 +57,13 @@ class Qwen35Codec:
             tools=normalized.get("tools") or None,
             add_generation_prompt=True,
         )
-        stop_token_ids = list(self.renderer.get_stop_token_ids())
-        for stop in normalized.get("stop") or []:
-            encoded = list(self.tokenizer.encode(stop, add_special_tokens=False))
-            if len(encoded) != 1:
-                raise ValueError(
-                    f"stop sequence {stop!r} encodes to {len(encoded)} tokens; "
-                    "multi-token stop sequences are not supported yet"
-                )
-            stop_token_ids.append(int(encoded[0]))
         result: RenderedPrompt = {
             "token_ids": list(rendered.token_ids),
-            "stop_token_ids": list(dict.fromkeys(stop_token_ids)),
+            "stop_token_ids": encode_stop_tokens(
+                self.tokenizer,
+                self.renderer.get_stop_token_ids(),
+                request.get("stop") or [],
+            ),
         }
         if rendered.multi_modal_data is not None:
             result["media"] = Qwen35Media.from_rendered(

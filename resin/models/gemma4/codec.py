@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from resin.models.gemma4.media import Gemma4Media
+from resin.server import encode_stop_tokens
 from resin.server.media import normalize_image_messages
 
 
@@ -25,18 +26,11 @@ class Gemma4Codec:
             tools=request.get("tools") or None,
             processor_kwargs={"do_rescale": False},
         )
-        stop_token_ids = list(self.eos_token_ids)
-        for stop in request.get("stop") or []:
-            encoded = self.tokenizer.encode(stop, add_special_tokens=False)
-            if len(encoded) != 1:
-                raise ValueError(
-                    f"stop sequence {stop!r} encodes to {len(encoded)} tokens; "
-                    "multi-token stop sequences are not supported yet"
-                )
-            stop_token_ids.append(int(encoded[0]))
         return {
             "token_ids": list(media.token_ids),
-            "stop_token_ids": list(dict.fromkeys(stop_token_ids)),
+            "stop_token_ids": encode_stop_tokens(
+                self.tokenizer, self.eos_token_ids, request.get("stop") or []
+            ),
             "media": media,
         }
 

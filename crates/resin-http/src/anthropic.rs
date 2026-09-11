@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     AppState,
-    openai::{RequestResult, invalid_request},
+    openai::{RequestResult, invalid_request, validate_sampling},
     protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error},
 };
 
@@ -96,17 +96,7 @@ fn conversation_request(
     if body.max_tokens == 0 {
         return Err(invalid_request("max_tokens must be positive"));
     }
-    if !body.temperature.is_finite() || body.temperature < 0.0 {
-        return Err(invalid_request(
-            "temperature must be finite and non-negative",
-        ));
-    }
-    if !body.top_p.is_finite() || !(0.0 < body.top_p && body.top_p <= 1.0) {
-        return Err(invalid_request("top_p must be finite and in (0, 1]"));
-    }
-    if body.top_k == Some(0) {
-        return Err(invalid_request("top_k must be positive"));
-    }
+    validate_sampling(body.temperature, body.top_p, body.top_k, None)?;
     let mut messages = Vec::new();
     if let Some(system) = body.system {
         messages.push(json!({"role": "system", "content": content_text(&system)?}));
@@ -246,32 +236,19 @@ fn content_text(content: &Value) -> RequestResult<String> {
 
 async fn messages_response(
     request: ConversationRequest,
-    mut receiver: mpsc::Receiver<GenerationEvent>,
+    receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Response {
-    let mut response = ResponseAccumulator::default();
-    while let Some(event) = receiver.recv().await {
-        if let GenerationEvent::Error { message } = &event {
+    let response = match ResponseAccumulator::collect(receiver).await {
+        Ok(response) => response,
+        Err(message) => {
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json_error(message, "api_error")),
             )
                 .into_response();
         }
-        response.apply(&event);
-        if response.reason.is_some() {
-            break;
-        }
-    }
-    let Some(reason) = response.reason else {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json_error(
-                "the inference engine ended the request without a result",
-                "api_error",
-            )),
-        )
-            .into_response();
     };
+    let reason = response.reason.expect("collector requires completion");
     let mut content = Vec::new();
     if !response.reasoning.is_empty() {
         content.push(json!({"type": "thinking", "thinking": response.reasoning, "signature": ""}));

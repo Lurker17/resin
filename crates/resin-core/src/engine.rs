@@ -345,6 +345,44 @@ impl<P> Request<P> {
     fn sample_at_prefill_end(&self) -> bool {
         self.generated.is_empty()
     }
+
+    /// Check the frozen row both before execution and before committing progress.
+    fn validate_step(&self, scheduled: ScheduledRow) -> Result<u32> {
+        if scheduled.phase != self.phase() || scheduled.token_start() != self.logical_context()? {
+            return Err(Error::internal(format!(
+                "request {} progress changed after its row was scheduled",
+                self.id
+            )));
+        }
+        let token_end = scheduled
+            .token_end()
+            .ok_or_else(|| Error::invalid("scheduled token range overflows u32"))?;
+        let expected_sample = match scheduled.phase {
+            Phase::Prefill => {
+                let prefill_length = self.prefill_length()?;
+                if token_end > prefill_length {
+                    return Err(Error::internal(
+                        "scheduled prefill range exceeds the request replay input",
+                    ));
+                }
+                self.sample_at_prefill_end() && token_end == prefill_length
+            }
+            Phase::Decode => {
+                if scheduled.token_count().get() != 1 {
+                    return Err(Error::internal(
+                        "scheduled decode rows must contain exactly one token",
+                    ));
+                }
+                true
+            }
+        };
+        if scheduled.sample != expected_sample {
+            return Err(Error::internal(
+                "scheduled row sampling does not match its token range",
+            ));
+        }
+        Ok(token_end)
+    }
 }
 
 impl<P> Schedulable for Request<P> {
@@ -968,7 +1006,7 @@ impl<P: Clone> EngineCore<P> {
         }
 
         let prepared_progress =
-            match self.prepare_scheduled_progress(&mut batch.rows, &committed_token_ids) {
+            match Self::prepare_scheduled_progress(&mut batch.rows, &committed_token_ids) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     return self.quarantine(batch, "native progress commit failed", error);
@@ -981,22 +1019,8 @@ impl<P: Clone> EngineCore<P> {
             if !*retire {
                 continue;
             }
-            match (self.kv_resources.as_ref(), row.request.cache.as_ref()) {
-                (Some(resources), Some(pages)) => {
-                    if let Err(error) = resources.pool().validate_request(pages) {
-                        return self.quarantine(
-                            batch,
-                            "native cache retirement failed",
-                            Error::from(error),
-                        );
-                    }
-                }
-                (None, None) => {}
-                _ => {
-                    let error =
-                        Error::internal("retiring request and Engine cache ownership disagree");
-                    return self.quarantine(batch, "native cache retirement failed", error);
-                }
+            if let Err(error) = self.validate_request_cache(&row.request) {
+                return self.quarantine(batch, "native cache retirement failed", error);
             }
         }
         let mut survivors = Vec::new();
@@ -1021,23 +1045,15 @@ impl<P: Clone> EngineCore<P> {
             return self.quarantine(batch, "native prefix publication failed", error);
         }
 
-        for (row_index, retire) in retired.iter().copied().enumerate() {
-            if !retire {
+        for (row, retire) in batch.rows.iter_mut().zip(&retired) {
+            if !*retire {
                 continue;
             }
-            let Some(pages) = batch.rows[row_index].request.cache.take() else {
-                continue;
-            };
-            let resources = self
-                .kv_resources
-                .as_mut()
-                .expect("request KV pages keep their resources");
-            if let Err(failure) = resources.retire(pages) {
-                batch.rows[row_index].request.cache = Some(failure.request);
+            if let Err(error) = self.retire_request_cache(&mut row.request) {
                 return self.quarantine(
                     batch,
                     "native cache retirement failed after preflight",
-                    Error::from(failure.error),
+                    error,
                 );
             }
         }
@@ -1068,39 +1084,18 @@ impl<P: Clone> EngineCore<P> {
         let request_id = request.request_id;
         if let Some(index) = self.scheduler.position(|request| request.id == request_id) {
             let mut request = self.scheduler.remove(index);
-            match (self.kv_resources.as_ref(), request.cache.as_ref()) {
-                (Some(resources), Some(pages)) => {
-                    if let Err(error) = resources.pool().validate_request(pages) {
-                        self.scheduler.restore(index, request);
-                        let error = Error::from(error);
-                        self.poison("native cache cancellation retirement failed", &error);
-                        return Err(error);
-                    }
-                }
-                (None, None) => {}
-                _ => {
-                    self.scheduler.restore(index, request);
-                    let error =
-                        Error::internal("ready request and Engine cache ownership disagree");
-                    self.poison("native cache cancellation retirement failed", &error);
-                    return Err(error);
-                }
+            if let Err(error) = self.validate_request_cache(&request) {
+                self.scheduler.restore(index, request);
+                self.poison("native cache cancellation retirement failed", &error);
+                return Err(error);
             }
             if let Err(error) = execution_call("release", || runner.release(&[request_id])) {
                 self.scheduler.restore(index, request);
                 self.poison("runner release failed during ready cancellation", &error);
                 return Err(error);
             }
-            if let Some(pages) = request.cache.take()
-                && let Err(failure) = self
-                    .kv_resources
-                    .as_mut()
-                    .expect("request KV pages keep their resources")
-                    .retire(pages)
-            {
-                request.cache = Some(failure.request);
+            if let Err(error) = self.retire_request_cache(&mut request) {
                 self.scheduler.restore(index, request);
-                let error = Error::from(failure.error);
                 self.poison(
                     "native cache cancellation retirement failed after preflight",
                     &error,
@@ -1369,18 +1364,10 @@ impl<P: Clone> EngineCore<P> {
             .iter()
             .map(|request| request.id)
             .collect::<Vec<_>>();
-        let retirement_validation = self.scheduler.iter().try_for_each(|request| {
-            match (self.kv_resources.as_ref(), request.cache.as_ref()) {
-                (Some(resources), Some(pages)) => resources
-                    .pool()
-                    .validate_request(pages)
-                    .map_err(Error::from),
-                (None, None) => Ok(()),
-                _ => Err(Error::internal(
-                    "ready request and Engine cache ownership disagree",
-                )),
-            }
-        });
+        let retirement_validation = self
+            .scheduler
+            .iter()
+            .try_for_each(|request| self.validate_request_cache(request));
         if let Err(error) = retirement_validation {
             self.poison("native cache retirement failed during Engine close", &error);
             return Err(error);
@@ -1396,14 +1383,7 @@ impl<P: Clone> EngineCore<P> {
         }
         retired.extend(self.scheduler.drain());
         for mut request in retired {
-            if let Some(pages) = request.cache.take()
-                && let Err(failure) = self
-                    .kv_resources
-                    .as_mut()
-                    .expect("request KV pages keep their resources")
-                    .retire(pages)
-            {
-                let error = Error::from(failure.error);
+            if let Err(error) = self.retire_request_cache(&mut request) {
                 self.poison(
                     "native cache retirement failed after close preflight",
                     &error,
@@ -1416,8 +1396,34 @@ impl<P: Clone> EngineCore<P> {
         Ok(())
     }
 
+    fn validate_request_cache(&self, request: &Request<P>) -> Result<()> {
+        match (self.kv_resources.as_ref(), request.cache.as_ref()) {
+            (Some(resources), Some(pages)) => resources
+                .pool()
+                .validate_request(pages)
+                .map_err(Error::from),
+            (None, None) => Ok(()),
+            _ => Err(Error::internal(
+                "request and Engine cache ownership disagree",
+            )),
+        }
+    }
+
+    fn retire_request_cache(&mut self, request: &mut Request<P>) -> Result<()> {
+        if let Some(pages) = request.cache.take()
+            && let Err(failure) = self
+                .kv_resources
+                .as_mut()
+                .expect("request KV pages keep their resources")
+                .retire(pages)
+        {
+            request.cache = Some(failure.request);
+            return Err(Error::from(failure.error));
+        }
+        Ok(())
+    }
+
     fn prepare_scheduled_progress(
-        &self,
         rows: &mut [BatchRow<P>],
         output_token_ids: &[Vec<u32>],
     ) -> Result<Vec<PreparedProgress>> {
@@ -1430,39 +1436,7 @@ impl<P: Clone> EngineCore<P> {
         for (row, token_ids) in rows.iter_mut().zip(output_token_ids) {
             let request = &mut row.request;
             let scheduled = row.scheduled;
-            let context = request.logical_context()?;
-            if scheduled.phase != request.phase() || scheduled.token_start() != context {
-                return Err(Error::internal(format!(
-                    "request {} progress changed during its runner step",
-                    request.id
-                )));
-            }
-            let token_end = scheduled
-                .token_end()
-                .ok_or_else(|| Error::invalid("scheduled token range overflows u32"))?;
-            let expected_sample = match scheduled.phase {
-                Phase::Prefill => {
-                    request.sample_at_prefill_end() && token_end == request.prefill_length()?
-                }
-                Phase::Decode => {
-                    if scheduled.token_count().get() != 1 {
-                        return Err(Error::internal(
-                            "scheduled decode rows must contain exactly one token",
-                        ));
-                    }
-                    true
-                }
-            };
-            if scheduled.sample != expected_sample {
-                return Err(Error::internal(
-                    "frozen sampling metadata does not match scheduled progress",
-                ));
-            }
-            if scheduled.phase == Phase::Prefill && token_end > request.prefill_length()? {
-                return Err(Error::internal(
-                    "scheduled prefill commit exceeds the request replay input",
-                ));
-            }
+            let token_end = request.validate_step(scheduled)?;
             if token_ids.is_empty() {
                 return Err(Error::internal(
                     "sampled runner output rows must contain at least one token",
@@ -1540,16 +1514,12 @@ impl<P: Clone> EngineCore<P> {
         }
     }
 }
-fn build_plan<P: Clone, R: std::borrow::Borrow<Request<P>>>(
+fn build_plan<P: Clone>(
     batch_id: u64,
-    scheduled_requests: &[R],
+    requests: &[Request<P>],
     scheduled_rows: &[ScheduledRow],
     kv_view: Option<&mut PagedKvBatchView>,
 ) -> Result<ExecutionPlan<P>> {
-    let requests = scheduled_requests
-        .iter()
-        .map(std::borrow::Borrow::borrow)
-        .collect::<Vec<_>>();
     if requests.len() != scheduled_rows.len() {
         return Err(Error::internal(
             "scheduled row metadata does not cover every request",
@@ -1593,35 +1563,9 @@ fn build_plan<P: Clone, R: std::borrow::Borrow<Request<P>>>(
     for (request, scheduled) in requests.iter().zip(scheduled_rows) {
         sequence_ids.push(request.id);
         payloads.push(request.payload.clone());
-        if scheduled.phase != request.phase()
-            || scheduled.token_start() != request.logical_context()?
-        {
-            return Err(Error::internal(format!(
-                "request {} progress changed after its row was scheduled",
-                request.id
-            )));
-        }
-        let token_end = scheduled
-            .token_end()
-            .ok_or_else(|| Error::invalid("scheduled token range overflows u32"))?;
-        let expected_sample = match scheduled.phase {
-            Phase::Prefill => {
-                request.sample_at_prefill_end() && token_end == request.prefill_length()?
-            }
-            Phase::Decode => true,
-        };
-        if scheduled.sample != expected_sample {
-            return Err(Error::internal(
-                "scheduled row sampling does not match its token range",
-            ));
-        }
+        let token_end = request.validate_step(*scheduled)?;
         match scheduled.phase {
             Phase::Prefill => {
-                if token_end > request.prefill_length()? {
-                    return Err(Error::internal(
-                        "scheduled prefill range exceeds the request replay input",
-                    ));
-                }
                 let start = scheduled.token_start() as usize;
                 let end = token_end as usize;
                 let prompt_end = end.min(request.prompt.len());
@@ -1633,20 +1577,14 @@ fn build_plan<P: Clone, R: std::borrow::Borrow<Request<P>>>(
                     let generated_end = end - request.prompt.len();
                     token_ids.extend_from_slice(&request.generated[generated_start..generated_end]);
                 }
-                context_lengths.push(scheduled.token_start());
             }
             Phase::Decode => {
-                if scheduled.token_count().get() != 1 {
-                    return Err(Error::internal(
-                        "scheduled decode rows must contain exactly one token",
-                    ));
-                }
                 token_ids.push(*request.generated.last().ok_or_else(|| {
                     Error::internal("scheduled decode request has no generated token")
                 })?);
-                context_lengths.push(scheduled.token_start());
             }
         }
+        context_lengths.push(scheduled.token_start());
         sampling_mask.push(scheduled.sample);
         token_indptr.push(
             u32::try_from(token_ids.len())
@@ -1776,6 +1714,31 @@ mod tests {
     }
 
     #[test]
+    fn malformed_rows_are_rejected_before_execution_and_progress_commit() {
+        for (decode, phase, start, count, sample) in [
+            (false, Phase::Prefill, 1, 2, true),
+            (false, Phase::Decode, 0, 1, true),
+            (false, Phase::Prefill, 0, 4, true),
+            (false, Phase::Prefill, 0, 1, true),
+            (true, Phase::Decode, 3, 2, true),
+            (true, Phase::Decode, 3, 1, false),
+        ] {
+            let request = request(1, &[1, 2, 3], if decode { &[9] } else { &[] }, None);
+            let scheduled = SequenceStep {
+                phase,
+                tokens: crate::TokenRange {
+                    start,
+                    count: NonZeroU32::new(count).unwrap(),
+                },
+                sample,
+            };
+            assert!(build_plan(1, std::slice::from_ref(&request), &[scheduled], None).is_err());
+            let mut rows = [BatchRow { request, scheduled }];
+            assert!(EngineCore::<()>::prepare_scheduled_progress(&mut rows, &[vec![9]]).is_err());
+        }
+    }
+
+    #[test]
     fn history_plan_is_sparse_and_writer_claims_match_active_pages() {
         let layout = history_layout();
         let mut resources = PagedKvResources::new(layout.clone()).unwrap();
@@ -1791,7 +1754,13 @@ mod tests {
         let mut acquired = resources.acquire(&resource_refs, &rows, 0).unwrap();
         let groups_ptr = acquired.view.groups.as_ptr();
         let block_ids_ptr = acquired.view.groups[0].block_slab_ids.as_ptr();
-        let plan = build_plan(9, &scheduled, &rows, Some(&mut acquired.view)).unwrap();
+        let plan = build_plan(
+            9,
+            std::slice::from_ref(&managed),
+            &rows,
+            Some(&mut acquired.view),
+        )
+        .unwrap();
 
         assert!(acquired.view.groups.is_empty());
         assert_eq!(plan.cache_groups.as_ptr(), groups_ptr);
@@ -1847,7 +1816,13 @@ mod tests {
             state: managed.cache.as_ref().unwrap(),
         }];
         let mut acquired = resources.acquire(&resource_refs, &rows, 0).unwrap();
-        let plan = build_plan(10, &scheduled, &rows, Some(&mut acquired.view)).unwrap();
+        let plan = build_plan(
+            10,
+            std::slice::from_ref(&managed),
+            &rows,
+            Some(&mut acquired.view),
+        )
+        .unwrap();
         let window = &plan.cache_groups[0];
         assert_eq!(window.block_table_start_indices, [1]);
         assert_eq!(window.block_indptr, [0, 2]);

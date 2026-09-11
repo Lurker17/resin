@@ -187,21 +187,13 @@ fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<Conversati
 
 async fn chat_response(
     request: ConversationRequest,
-    mut receiver: mpsc::Receiver<GenerationEvent>,
+    receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Response {
-    let mut response = ResponseAccumulator::default();
-    while let Some(event) = receiver.recv().await {
-        if let GenerationEvent::Error { message } = &event {
-            return internal_error(message);
-        }
-        response.apply(&event);
-        if response.reason.is_some() {
-            break;
-        }
-    }
-    let Some(reason) = response.reason else {
-        return internal_error("the inference engine ended the request without a result");
+    let response = match ResponseAccumulator::collect(receiver).await {
+        Ok(response) => response,
+        Err(message) => return internal_error(message),
     };
+    let reason = response.reason.expect("collector requires completion");
     let tool_calls = response
         .tool_calls
         .iter()
@@ -409,20 +401,11 @@ fn response_input_messages(input: Value) -> RequestResult<Vec<Value>> {
 
 async fn responses_response(
     request: ConversationRequest,
-    mut receiver: mpsc::Receiver<GenerationEvent>,
+    receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Response {
-    let mut accumulator = ResponseAccumulator::default();
-    while let Some(event) = receiver.recv().await {
-        if let GenerationEvent::Error { message } = &event {
-            return internal_error(message);
-        }
-        accumulator.apply(&event);
-        if accumulator.reason.is_some() {
-            break;
-        }
-    }
-    let Some(_) = accumulator.reason else {
-        return internal_error("the inference engine ended the request without a result");
+    let accumulator = match ResponseAccumulator::collect(receiver).await {
+        Ok(response) => response,
+        Err(message) => return internal_error(message),
     };
     Json(response_object(&request, &accumulator)).into_response()
 }
@@ -610,7 +593,7 @@ fn validate_model(state: &AppState, model: &str) -> RequestResult<()> {
     }
 }
 
-fn validate_sampling(
+pub(crate) fn validate_sampling(
     temperature: f64,
     top_p: f64,
     top_k: Option<u32>,

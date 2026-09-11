@@ -389,19 +389,59 @@ async fn slow_stream_has_a_bounded_queue_and_does_not_block_another_response() {
 }
 
 #[tokio::test]
-async fn interrupted_streams_report_failure_instead_of_silent_success() {
+async fn failed_requests_never_return_partial_success() {
     for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
-        let (jobs, mut receiver) = mpsc::channel(1);
-        let app = router("test-model", jobs, RouteConfig::default());
-        let response = app.oneshot(generation_request(path, true)).await.unwrap();
-        let job = receiver.recv().await.unwrap();
-        job.events
-            .try_send(GenerationEvent::TextDelta("partial".to_owned()))
-            .unwrap();
-        drop(job);
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let text = std::str::from_utf8(&bytes).unwrap();
-        assert!(text.contains("ended before completion"), "{path}");
+        for streaming in [false, true] {
+            for explicit_error in [false, true] {
+                let (jobs, mut receiver) = mpsc::channel(1);
+                let app = router("test-model", jobs, RouteConfig::default());
+                let pending = tokio::spawn(app.oneshot(generation_request(path, streaming)));
+                let job = receiver.recv().await.unwrap();
+                job.events
+                    .try_send(GenerationEvent::TextDelta("partial".to_owned()))
+                    .unwrap();
+                if explicit_error {
+                    job.events
+                        .try_send(GenerationEvent::Error {
+                            message: "model execution failed".to_owned(),
+                        })
+                        .unwrap();
+                }
+                drop(job);
+                let response = pending.await.unwrap().unwrap();
+                assert_eq!(
+                    response.status(),
+                    if streaming {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                );
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert!(
+                    text.contains(if explicit_error {
+                        "model execution failed"
+                    } else if streaming {
+                        "ended before completion"
+                    } else {
+                        "ended the request without a result"
+                    }),
+                    "{path}"
+                );
+                if !streaming {
+                    let body: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(
+                        body["error"]["type"],
+                        if path == "/v1/messages" {
+                            "api_error"
+                        } else {
+                            "server_error"
+                        }
+                    );
+                }
+            }
+        }
     }
 }
 

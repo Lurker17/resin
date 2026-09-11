@@ -10,6 +10,7 @@ from renderers import DefaultRendererConfig, create_renderer
 
 from resin.models.inkling.media import InklingMedia
 from resin.protocols import ParserEvent, RenderedPrompt
+from resin.server import encode_stop_tokens
 from resin.server.media import normalize_image_messages
 
 MESSAGE_MODEL = "<|message_model|>"
@@ -119,15 +120,9 @@ class InklingCodec:
                 "token_ids": list(token_ids),
                 "stop_token_ids": [self.token_ids[CONTENT_MODEL_END_SAMPLING]],
             }
-        for stop in request.get("stop") or []:
-            encoded = list(self.tokenizer.encode(stop, add_special_tokens=False))
-            if len(encoded) != 1:
-                raise ValueError(
-                    f"stop sequence {stop!r} encodes to {len(encoded)} tokens; "
-                    "multi-token stop sequences are not supported yet"
-                )
-            rendered["stop_token_ids"].append(int(encoded[0]))
-        rendered["stop_token_ids"] = list(dict.fromkeys(rendered["stop_token_ids"]))
+        rendered["stop_token_ids"] = encode_stop_tokens(
+            self.tokenizer, rendered["stop_token_ids"], request.get("stop") or []
+        )
         return rendered
 
     def create_parser(
