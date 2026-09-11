@@ -24,6 +24,7 @@ from resin._resin import (
 )
 from resin.protocols import (
     ConversationCodec,
+    ManagedRunner,
     MediaInput,
     MediaTokenSpan,
     Runner,
@@ -39,6 +40,7 @@ __all__ = [
     "CacheRetention",
     "ConversationCodec",
     "Engine",
+    "ManagedRunner",
     "MediaInput",
     "MediaTokenSpan",
     "ResourceBinding",

@@ -91,6 +91,7 @@ class CacheGeometry:
                     blocks_per_slab=self.local_blocks_per_slab,
                     retention=CacheRetention.WINDOW,
                     window_tokens=LOCAL_RETENTION_TOKENS,
+                    read_window_tokens=512,
                 ),
                 CacheGroupLayout(
                     PAGE_TOKENS, blocks_per_slab=self.draft_blocks_per_slab

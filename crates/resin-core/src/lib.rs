@@ -1,6 +1,8 @@
-//! PyO3-free scheduling and resource ownership for Resin.
+//! Dependency-free request lifecycle and resource ownership for Resin.
 //!
-//! The crate separates three concerns:
+//! [`engine::EngineCore`] owns synchronous execution transactions and request
+//! progress. Runners receive frozen plans carrying opaque frontend payloads.
+//! Its constituent pieces remain available independently:
 //! - [`Scheduler`] chooses a phase-homogeneous, key-homogeneous cohort.
 //! - [`schedule_ready_prefix`] freezes each row's current token range.
 //! - [`resources`] owns allocator state and just-in-time batch leases.
@@ -11,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 mod batch;
+pub mod engine;
 mod ids;
 mod planning;
 pub mod resources;

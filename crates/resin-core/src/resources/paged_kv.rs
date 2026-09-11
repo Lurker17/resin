@@ -1,4 +1,5 @@
 use std::fmt;
+use std::num::NonZeroU32;
 
 use crate::{RequestId, SequenceStep};
 
@@ -50,6 +51,32 @@ impl PagedKvResources {
         self.layout.parent_capacity().get()
     }
 
+    /// A batch must preserve the earliest query's read window while writing
+    /// every scheduled token (including speculative lookahead).
+    pub fn max_write_tokens(&self) -> Option<NonZeroU32> {
+        self.layout
+            .groups()
+            .iter()
+            .copied()
+            .filter_map(KvGroupLayout::max_write_tokens)
+            .min()
+    }
+
+    fn validate_write_span(&self, token_start: u32, context: u32) -> Result<(), CachePoolError> {
+        let requested = context
+            .checked_sub(token_start)
+            .ok_or(CachePoolError::DemandOverflow)?;
+        if let Some(maximum) = self.max_write_tokens()
+            && requested > maximum.get()
+        {
+            return Err(CachePoolError::InvalidWriteSpan {
+                requested,
+                maximum: maximum.get(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn attach(
         &mut self,
         request_id: RequestId,
@@ -69,6 +96,7 @@ impl PagedKvResources {
         token_start: u32,
         context: u32,
     ) -> Result<(), CachePoolError> {
+        self.validate_write_span(token_start, context)?;
         let demands = self.demands(context);
         loop {
             match self.pool.grow_request(state, &demands) {
@@ -85,8 +113,18 @@ impl PagedKvResources {
         let mut replacements = vec![Vec::new(); self.layout.groups().len()];
         for (group_index, group) in self.layout.groups().iter().copied().enumerate() {
             let table = &state.groups()[group_index];
-            for position in token_start..context {
-                let logical = position / group.block_tokens().get();
+            let first = token_start / group.block_tokens().get();
+            let count = context
+                .div_ceil(group.block_tokens().get())
+                .saturating_sub(first);
+            // A cyclic table can be visited at most once. In particular, a
+            // long prefill must not scan every token to discover COW pages.
+            let count = if group.is_recurrent() || group.max_write_tokens().is_some() {
+                count.min(table.pages().len() as u32)
+            } else {
+                count
+            };
+            for logical in first..first + count {
                 let index = page_index(group, table.pages().len(), logical).ok_or(
                     CachePoolError::InsufficientCapacity {
                         group: GroupId::new(group_index as u32),
@@ -252,6 +290,19 @@ impl PagedKvResources {
             return Err(Self::invalid(
                 "KV requests and steps must have equal nonzero lengths",
             ));
+        }
+        for step in steps {
+            let post_length = step
+                .token_end()
+                .ok_or_else(|| Self::invalid("scheduled token range overflows u32"))?;
+            let leased_length = post_length
+                .checked_add(if step.phase == crate::Phase::Decode {
+                    decode_write_lookahead
+                } else {
+                    0
+                })
+                .ok_or_else(|| Self::invalid("decode cache write lookahead overflows u32"))?;
+            self.validate_write_span(step.token_start(), leased_length)?;
         }
         for request in requests {
             self.pool.validate_request(request.state)?;
@@ -475,9 +526,11 @@ mod tests {
                     2,
                     2,
                     KvRetention::SlidingWindow {
-                        tokens: NonZeroU32::new(4).unwrap(),
+                        tokens: NonZeroU32::new(7).unwrap(),
                     },
                 )
+                .unwrap()
+                .with_read_window_tokens(4)
                 .unwrap(),
             ],
         )
@@ -662,7 +715,11 @@ mod tests {
         let mut resources = PagedKvResources::with_prefix_cache(layout).unwrap();
         let first_id = RequestId::new(NonZeroU64::new(1).unwrap());
         let mut first = resources.attach(first_id, 0).unwrap();
-        resources.ensure_context(&mut first, 0, 6).unwrap();
+        for position in 0..6 {
+            resources
+                .ensure_context(&mut first, position, position + 1)
+                .unwrap();
+        }
         let write = resources
             .acquire(
                 &[RequestResourceRef {
@@ -670,10 +727,10 @@ mod tests {
                     state: &first,
                 }],
                 &[SequenceStep {
-                    phase: Phase::Prefill,
+                    phase: Phase::Decode,
                     tokens: TokenRange {
-                        start: 0,
-                        count: NonZeroU32::new(6).unwrap(),
+                        start: 5,
+                        count: NonZeroU32::new(1).unwrap(),
                     },
                     sample: false,
                 }],
@@ -698,6 +755,123 @@ mod tests {
         assert!(second.groups()[0].pages()[0].is_writable());
         resources.retire(second).unwrap();
         resources.retire(first).unwrap();
+    }
+
+    #[test]
+    fn unsafe_window_write_is_rejected_before_copy_on_write() {
+        let layout = KvLayout::new(
+            20,
+            vec![
+                KvGroupLayout::new(
+                    2,
+                    1,
+                    KvRetention::SlidingWindow {
+                        tokens: NonZeroU32::new(4).unwrap(),
+                    },
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::with_prefix_cache(layout).unwrap();
+        let id = RequestId::new(NonZeroU64::new(1).unwrap());
+        let mut state = resources.attach(id, 0).unwrap();
+        for position in 0..6 {
+            resources
+                .ensure_context(&mut state, position, position + 1)
+                .unwrap();
+        }
+        resources
+            .publish_prefix(&mut state, &(0..6).collect::<Vec<_>>(), 6)
+            .unwrap();
+        let original = state.groups()[0]
+            .pages()
+            .iter()
+            .map(|page| page.handle())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resources.ensure_context(&mut state, 6, 12),
+            Err(CachePoolError::InvalidWriteSpan {
+                requested: 6,
+                maximum: 1
+            })
+        );
+        assert_eq!(
+            state.groups()[0]
+                .pages()
+                .iter()
+                .map(|page| page.handle())
+                .collect::<Vec<_>>(),
+            original
+        );
+        assert_eq!(resources.pool().occupied_block_count(), 3);
+        resources.retire(state).unwrap();
+    }
+
+    #[test]
+    fn chunked_window_prefill_keeps_early_query_history_after_prefix_cow() {
+        let group = KvGroupLayout::new(
+            2,
+            1,
+            KvRetention::SlidingWindow {
+                tokens: NonZeroU32::new(9).unwrap(),
+            },
+        )
+        .unwrap()
+        .with_read_window_tokens(4)
+        .unwrap();
+        let mut resources =
+            PagedKvResources::with_prefix_cache(KvLayout::new(20, vec![group]).unwrap()).unwrap();
+        let id = RequestId::new(NonZeroU64::new(1).unwrap());
+        let mut state = resources.attach(id, 0).unwrap();
+        resources.ensure_context(&mut state, 0, 6).unwrap();
+        let history = state.groups()[0]
+            .pages()
+            .iter()
+            .map(|page| resources.pool().physical_address(page.handle()).unwrap())
+            .collect::<Vec<_>>();
+        resources
+            .publish_prefix(&mut state, &(0..6).collect::<Vec<_>>(), 6)
+            .unwrap();
+        resources.ensure_context(&mut state, 6, 12).unwrap();
+        let access = resources
+            .acquire(
+                &[RequestResourceRef {
+                    request_id: id,
+                    state: &state,
+                }],
+                &[SequenceStep {
+                    phase: Phase::Prefill,
+                    tokens: TokenRange {
+                        start: 6,
+                        count: NonZeroU32::new(6).unwrap(),
+                    },
+                    sample: false,
+                }],
+                0,
+            )
+            .unwrap();
+        let plan = &access.view.groups[0];
+        assert_eq!(plan.block_table_start_indices, vec![1]);
+        let addresses = plan
+            .block_slab_ids
+            .iter()
+            .copied()
+            .zip(plan.block_slotnums.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(&addresses[..2], &history[1..]);
+        assert_eq!(addresses.len(), 5);
+        for (offset, (&slab, &slot)) in plan
+            .append_slab_ids
+            .iter()
+            .zip(&plan.append_slotnums)
+            .enumerate()
+        {
+            assert_eq!((slab, slot), addresses[(6 + offset) / 2 - 1]);
+            assert!(!history[1..].contains(&(slab, slot)));
+        }
+        resources.release(access.lease);
+        resources.retire(state).unwrap();
     }
 
     #[test]

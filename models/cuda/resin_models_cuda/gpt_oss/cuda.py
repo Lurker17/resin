@@ -343,6 +343,7 @@ class GptOssCudaRunner(CudaRunner):
                     self.page_size,
                     retention=CacheRetention.WINDOW,
                     window_tokens=self.window_retention_tokens,
+                    read_window_tokens=self.sliding_window,
                 ),
             ],
         )

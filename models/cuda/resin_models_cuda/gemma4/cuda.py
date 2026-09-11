@@ -291,6 +291,7 @@ class Gemma4CudaRunner(CudaRunner):
                     PAGE_SIZE,
                     retention=CacheRetention.WINDOW,
                     window_tokens=WINDOW_RETENTION_TOKENS,
+                    read_window_tokens=SLIDING_WINDOW,
                 ),
             ],
         )

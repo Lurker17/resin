@@ -157,6 +157,7 @@ class CacheGroupLayout:
         retention: CacheRetention = ...,
         window_tokens: int | None = None,
         family: CacheGroupFamily = ...,
+        read_window_tokens: int | None = None,
     ) -> CacheGroupLayout: ...
     def __repr__(self, /) -> str: ...
     @property
@@ -173,6 +174,12 @@ class CacheGroupLayout:
     def family(self, /) -> CacheGroupFamily:
         """
         Whether this group stores token history or recurrent checkpoints.
+        """
+    @property
+    def read_window_tokens(self, /) -> int | None:
+        """
+        Logical read window including the current token. Defaults to the full
+        retained window; reserve extra `window_tokens` for simultaneous writes.
         """
     @property
     def retention(self, /) -> CacheRetention:
@@ -423,12 +430,12 @@ class RequestLease:
     def __int__(self, /) -> int: ...
     def __repr__(self, /) -> str: ...
     @property
-    def cancelled(self, /) -> bool: ...
-    @property
     def cached_tokens(self, /) -> int:
         """
         Number of prompt tokens restored from the prefix cache at admission.
         """
+    @property
+    def cancelled(self, /) -> bool: ...
     @property
     def done(self, /) -> bool: ...
     @property

@@ -12,6 +12,7 @@ from resin.backend.sampling import TorchSampler
 from resin.models.gpt_oss.plan import (
     PAGE_SIZE,
     PREFILL_CHUNK_SIZE,
+    SLIDING_WINDOW,
     WINDOW_RETENTION_TOKENS,
     WINDOW_TABLE_WIDTH,
 )
@@ -37,6 +38,7 @@ def build_attention_batches(plan, *, parent_capacity: int = 2048):
                 PAGE_SIZE,
                 retention=CacheRetention.WINDOW,
                 window_tokens=WINDOW_RETENTION_TOKENS,
+                read_window_tokens=SLIDING_WINDOW,
             ),
         ],
     )

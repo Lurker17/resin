@@ -14,7 +14,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from resin._resin import BatchPlan
+    from resin._resin import BatchPlan, ResourceBinding, RunnerConfig
 
 
 class MediaTokenSpan(NamedTuple):
@@ -77,12 +77,25 @@ class ConversationCodec(Protocol):
 class Runner(Protocol):
     """Execute one Engine-owned immutable plan synchronously."""
 
-    def forward(
-        self, plan: BatchPlan
-    ) -> Sequence[int] | Sequence[Sequence[int]]: ...
+    def forward(self, plan: BatchPlan) -> Sequence[int] | Sequence[Sequence[int]]: ...
+
+
+class ManagedRunner(Runner, Protocol):
+    """Declare cache resources and bind their arena once during construction.
+
+    An optional ``release(sequence_ids)`` callback cleans up model-local state
+    on completion, cancellation, or retraction. Physical page ownership remains
+    with the Engine; release must never independently return cache pages.
+    """
+
+    runner_config: RunnerConfig
+
+    def bind_resources(self, resources: ResourceBinding) -> None: ...
+
 
 __all__ = [
     "ConversationCodec",
+    "ManagedRunner",
     "MediaInput",
     "MediaTokenSpan",
     "ParserEvent",

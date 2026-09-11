@@ -10,6 +10,7 @@ from resin import (
 )
 from resin.models.gemma4.plan import (
     PAGE_SIZE,
+    SLIDING_WINDOW,
     WINDOW_RETENTION_TOKENS,
     expand_gemma4_decode_batch,
     gemma4_assistant_context,
@@ -29,19 +30,16 @@ def build_gemma4_batch_plan(
     layout = CacheLayout(
         parent_capacity,
         [
-            CacheGroupLayout(
-                PAGE_SIZE, blocks_per_slab=history_blocks_per_parent
-            ),
+            CacheGroupLayout(PAGE_SIZE, blocks_per_slab=history_blocks_per_parent),
             CacheGroupLayout(
                 PAGE_SIZE,
                 retention=CacheRetention.WINDOW,
                 window_tokens=WINDOW_RETENTION_TOKENS,
+                read_window_tokens=SLIDING_WINDOW,
             ),
         ],
     )
-    return _build_gemma4_batch_plan(
-        plan, layout, decode_lookahead=decode_lookahead
-    )
+    return _build_gemma4_batch_plan(plan, layout, decode_lookahead=decode_lookahead)
 
 
 def _append_metadata(pages: list[int], token_count: int) -> tuple[list[int], list[int]]:

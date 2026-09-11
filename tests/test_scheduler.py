@@ -105,10 +105,17 @@ class TestSchedulerConfigContract:
         assert not second.done
         engine.close()
 
-    def test_window_prefill_spans_multiple_pages_by_default(self) -> None:
+    def test_window_guard_band_permits_multi_page_prefill(self) -> None:
         layout = CacheLayout(
             8,
-            [CacheGroupLayout(2, retention=CacheRetention.WINDOW, window_tokens=8)],
+            [
+                CacheGroupLayout(
+                    2,
+                    retention=CacheRetention.WINDOW,
+                    window_tokens=8,
+                    read_window_tokens=3,
+                )
+            ],
         )
 
         class MultiPageRunner(ContinuationRecordingRunner):

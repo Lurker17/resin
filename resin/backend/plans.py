@@ -57,7 +57,9 @@ class BatchView:
                 dtype=np.uint32,
             )
             if not np.array_equal(positions[start:end], expected):
-                raise ValueError("BatchPlan positions are not contiguous within each row")
+                raise ValueError(
+                    "BatchPlan positions are not contiguous within each row"
+                )
         try:
             cache_groups = tuple(plan.cache_groups)
         except (AttributeError, TypeError) as error:
@@ -130,9 +132,7 @@ class CacheGroupView:
         block_indptr = np.asarray(native.block_indptr, dtype=np.uint32)
         block_slab_ids = np.asarray(native.block_slab_ids, dtype=np.uint32)
         block_slotnums = np.asarray(native.block_slotnums, dtype=np.uint32)
-        first_blocks = np.asarray(
-            native.block_table_start_indices, dtype=np.uint32
-        )
+        first_blocks = np.asarray(native.block_table_start_indices, dtype=np.uint32)
         append_slab_ids = np.asarray(native.append_slab_ids, dtype=np.uint32)
         append_slotnums = np.asarray(native.append_slotnums, dtype=np.uint32)
         append_offsets = np.asarray(native.append_block_offsets, dtype=np.uint32)
@@ -275,9 +275,19 @@ class PagedCachePlan:
             for row in range(batch.num_sequences):
                 token_slice = batch.token_slice(row)
                 query_length = token_slice.stop - token_slice.start
-                leased = int(batch.context_lengths[row]) + query_length
-                if batch.phase == BatchPhase.DECODE:
-                    leased += decode_lookahead
+                write_tokens = query_length + (
+                    decode_lookahead if batch.phase == BatchPhase.DECODE else 0
+                )
+                if window_blocks is not None:
+                    maximum = (
+                        descriptor.window_tokens - descriptor.read_window_tokens + 1
+                    )
+                    if write_tokens > maximum:
+                        raise ValueError(
+                            f"cache group {index} row {row} write span {write_tokens} "
+                            f"exceeds {maximum}-token Window read/write capacity"
+                        )
+                leased = int(batch.context_lengths[row]) + write_tokens
                 last_block = (leased - 1) // block_tokens
                 if descriptor.family == CacheGroupFamily.STATE:
                     expected_first = max(0, last_block - 1)

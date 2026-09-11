@@ -58,6 +58,12 @@ fn group_repr(group: KvGroupLayout) -> String {
         KvGroupFamily::History => "",
         KvGroupFamily::State => ", family=CacheGroupFamily.STATE",
     };
+    let read_window = match group.read_window_tokens() {
+        Some(tokens) if Some(tokens) != group.retention().window_tokens() => {
+            format!(", read_window_tokens={tokens}")
+        }
+        _ => String::new(),
+    };
     match group.retention() {
         KvRetention::FullContext => format!(
             "CacheGroupLayout(block_tokens={}, blocks_per_slab={}, retention=CacheRetention.HISTORY{family})",
@@ -65,7 +71,7 @@ fn group_repr(group: KvGroupLayout) -> String {
             group.blocks_per_slab()
         ),
         KvRetention::SlidingWindow { tokens } => format!(
-            "CacheGroupLayout(block_tokens={}, blocks_per_slab={}, retention=CacheRetention.WINDOW, window_tokens={tokens}{family})",
+            "CacheGroupLayout(block_tokens={}, blocks_per_slab={}, retention=CacheRetention.WINDOW, window_tokens={tokens}{read_window}{family})",
             group.block_tokens(),
             group.blocks_per_slab()
         ),
@@ -89,6 +95,7 @@ impl CacheGroupLayout {
         retention: CacheRetention,
         window_tokens: Option<u32>,
         family: CacheGroupFamily,
+        read_window_tokens: Option<u32>,
     ) -> PyResult<Self> {
         let retention = match retention {
             CacheRetention::History => {
@@ -112,10 +119,16 @@ impl CacheGroupLayout {
             CacheGroupFamily::History => KvGroupFamily::History,
             CacheGroupFamily::State => KvGroupFamily::State,
         };
-        Ok(Self {
-            inner: KvGroupLayout::new_with_family(block_tokens, blocks_per_slab, retention, family)
+        let inner =
+            KvGroupLayout::new_with_family(block_tokens, blocks_per_slab, retention, family)
+                .map_err(layout_error)?;
+        let inner = match read_window_tokens {
+            Some(tokens) => inner
+                .with_read_window_tokens(tokens)
                 .map_err(layout_error)?,
-        })
+            None => inner,
+        };
+        Ok(Self { inner })
     }
 
     fn from_inner(inner: KvGroupLayout) -> Self {
@@ -141,7 +154,8 @@ impl CacheGroupLayout {
         blocks_per_slab = 1,
         retention = CacheRetention::History,
         window_tokens = None,
-        family = CacheGroupFamily::History
+        family = CacheGroupFamily::History,
+        read_window_tokens = None
     ))]
     fn new(
         block_tokens: u32,
@@ -149,6 +163,7 @@ impl CacheGroupLayout {
         retention: CacheRetention,
         window_tokens: Option<u32>,
         family: CacheGroupFamily,
+        read_window_tokens: Option<u32>,
     ) -> PyResult<Self> {
         Self::from_parts(
             block_tokens,
@@ -156,6 +171,7 @@ impl CacheGroupLayout {
             retention,
             window_tokens,
             family,
+            read_window_tokens,
         )
     }
 
@@ -193,6 +209,13 @@ impl CacheGroupLayout {
     #[getter]
     fn window_tokens(&self) -> Option<u32> {
         self.inner.retention().window_tokens().map(NonZeroU32::get)
+    }
+
+    /// Logical read window including the current token. Defaults to the full
+    /// retained window; reserve extra `window_tokens` for simultaneous writes.
+    #[getter]
+    fn read_window_tokens(&self) -> Option<u32> {
+        self.inner.read_window_tokens().map(NonZeroU32::get)
     }
 
     /// Maximum resident logical blocks per sequence for a window group.
@@ -526,6 +549,7 @@ mod tests {
             CacheRetention::History,
             None,
             CacheGroupFamily::History,
+            None,
         )
         .unwrap()
     }
@@ -551,6 +575,7 @@ mod tests {
             CacheRetention::Window,
             Some(128),
             CacheGroupFamily::History,
+            None,
         )
         .unwrap();
         let layout = CacheLayout::from_groups(8, vec![history, window]).unwrap();

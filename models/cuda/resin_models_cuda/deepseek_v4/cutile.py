@@ -1450,16 +1450,16 @@ def _verify_attention_metadata_kernel(
     # grows, retire one pre-block history row per query instead of appending the
     # whole block to a fixed-width history (which made verify attend to as many
     # as ``window_size + block_length`` dense tokens).
-    block_count = query + 1
+    block_count = ct.minimum(query + 1, window_size)
     history_count = ct.minimum(start, ct.maximum(window_size - block_count, 0))
-    block_end = history_count + query + 1
+    block_end = history_count + block_count
     columns = tile * 64 + ct.arange(64, dtype=ct.int32)
     old_column = ct.minimum(columns, ct.maximum(history_count - 1, 0))
     old_position = start - history_count + old_column
     old_index = old_position % window_capacity
     old_index = ct.where(columns < history_count, old_index, -1)
     block_column = columns - history_count
-    block_position = start + block_column
+    block_position = start + query + 1 - block_count + block_column
     block_index = block_position % window_capacity
     block_index = ct.where(
         (columns >= history_count) & (columns < block_end), block_index, -1
@@ -1645,7 +1645,7 @@ def verify_attention_metadata(
     ):
         raise ValueError("compressed verification mapping is incompatible")
     index_width = _aligned_size(
-        window_size + block_length + compressed_index_width,
+        window_size + compressed_index_width,
         alignment=64,
     )
     indices = torch.empty(

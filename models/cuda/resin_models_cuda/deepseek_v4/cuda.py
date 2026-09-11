@@ -73,11 +73,18 @@ class DeepSeekV4CudaRunner(CudaRunner):
         profile_graph_phases: bool = False,
         gpu_memory_utilization: float = 0.95,
         cache_parent_capacity: int | None = None,
+        prefill_chunk_size: int = 4096,
     ) -> None:
         if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, int):
             raise ValueError("max_seq_len must be a positive integer")
         if max_seq_len <= 0:
             raise ValueError("max_seq_len must be a positive integer")
+        if (
+            isinstance(prefill_chunk_size, bool)
+            or not isinstance(prefill_chunk_size, int)
+            or prefill_chunk_size <= 0
+        ):
+            raise ValueError("prefill_chunk_size must be a positive integer")
         if isinstance(max_batch_size, bool) or not isinstance(max_batch_size, int):
             raise ValueError("max_batch_size must be a positive integer")
         if max_batch_size <= 0:
@@ -133,6 +140,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         if max_seq_len > 1_048_576:
             raise ValueError("max_seq_len exceeds the checkpoint context length")
         self.max_seq_len = max_seq_len
+        self.prefill_chunk_size = min(prefill_chunk_size, max_seq_len)
         self.max_batch_size = max_batch_size
         self.speculative_tokens = speculative_tokens
         self.profile_graph_phases = profile_graph_phases
@@ -252,6 +260,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             dspark_layers=args.n_mtp_layers,
             window_size=args.window_size,
             decode_input_tokens=max(1, speculative_tokens + 1),
+            prefill_chunk_size=self.prefill_chunk_size,
         )
         torch.cuda.synchronize(self.device)
         free_memory, total_memory = torch.cuda.mem_get_info(self.device)
@@ -291,8 +300,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
         self._configure_cache_binding(self._cache.binding)
         self._model.bind_cache_arena(self._cache)
         self.runner_config = RunnerConfig(
-            max_batch_tokens=max_batch_size * max_seq_len,
-            prefill_chunk_size=max_seq_len,
+            max_batch_tokens=max_batch_size * self.prefill_chunk_size,
+            prefill_chunk_size=self.prefill_chunk_size,
             continuation_prefill=True,
             cache_write_lookahead_tokens=speculative_tokens,
             cache_layout=self.cache_layout,
@@ -516,7 +525,10 @@ class DeepSeekV4CudaRunner(CudaRunner):
         )
 
         if batch.phase == BatchPhase.PREFILL:
-            pass
+            if any(end - start > self.prefill_chunk_size for start, end in rows):
+                raise ValueError(
+                    "DeepSeek-V4 prefill row exceeds its cache write capacity"
+                )
         elif batch.phase == BatchPhase.DECODE:
             if any(end - start != 1 for start, end in rows):
                 raise ValueError("DeepSeek-V4 decode rows must contain one token")

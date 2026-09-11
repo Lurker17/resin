@@ -13,6 +13,7 @@ from resin import (
     Engine,
     ResourceBinding,
     RunnerConfig,
+    SchedulerConfig,
 )
 
 
@@ -92,6 +93,18 @@ class TestFlatCacheApi:
         assert history.window_tokens is None
         assert window.retention is CacheRetention.WINDOW
         assert window.window_tokens == 4
+        assert window.read_window_tokens == 4
+        assert history.read_window_tokens is None
+        with pytest.raises(ValueError, match="read_window_tokens"):
+            CacheGroupLayout(4, read_window_tokens=1)
+        for read_window in (0, 5):
+            with pytest.raises(ValueError, match="read_window_tokens"):
+                CacheGroupLayout(
+                    4,
+                    retention=CacheRetention.WINDOW,
+                    window_tokens=4,
+                    read_window_tokens=read_window,
+                )
         with pytest.raises(AttributeError):
             _ = history.resident_blocks
         with pytest.raises(TypeError, match="resident_blocks"):
@@ -390,9 +403,8 @@ class TestFlatCacheEngine:
 
         events = engine.step()
         assert [event.request_id for event in events] == [request]
-        assert (
-            _block_addresses(runner.plans[0].cache_groups[0])
-            == _block_addresses(runner.plans[1].cache_groups[0])
+        assert _block_addresses(runner.plans[0].cache_groups[0]) == _block_addresses(
+            runner.plans[1].cache_groups[0]
         )
         assert engine.cache_free_parent_count == 1
         assert engine.cache_occupied_block_count == 0
@@ -402,7 +414,14 @@ class TestFlatCacheEngine:
     ) -> None:
         layout = CacheLayout(
             4,
-            [CacheGroupLayout(4, retention=CacheRetention.WINDOW, window_tokens=12)],
+            [
+                CacheGroupLayout(
+                    4,
+                    retention=CacheRetention.WINDOW,
+                    window_tokens=12,
+                    read_window_tokens=1,
+                )
+            ],
         )
         runner = RecordingCachedRunner(layout)
         engine = Engine(runner)
@@ -418,3 +437,87 @@ class TestFlatCacheEngine:
         ]
         assert engine.cache_occupied_block_count == 0
         assert engine.cache_free_parent_count == 4
+
+
+@pytest.mark.parametrize("prefix_cache", [False, True])
+@pytest.mark.parametrize("write_tokens", [1, 6])
+def test_window_attention_reads_survive_prefill_writes_and_prefix_reuse(
+    prefix_cache: bool, write_tokens: int
+) -> None:
+    window = 4
+    block_tokens = 2
+    layout = CacheLayout(
+        40,
+        [
+            CacheGroupLayout(
+                block_tokens,
+                retention=CacheRetention.WINDOW,
+                window_tokens=window + write_tokens - 1,
+                read_window_tokens=window,
+            )
+        ],
+    )
+
+    class WindowRunner(RecordingCachedRunner):
+        def __init__(self) -> None:
+            super().__init__(layout)
+            self.storage: dict[tuple[int, int, int], int] = {}
+            self.query_count = 0
+
+        def forward(self, plan: BatchPlan) -> list[int]:
+            self.plans.append(plan)
+            group = plan.cache_groups[0]
+            # Device kernels commonly append the entire batch before reading
+            # any attention row. This catches both aliasing and missing COW
+            # history, which metadata-only shape assertions cannot detect.
+            for slab, slot, offset, token in zip(
+                group.append_slab_ids,
+                group.append_slotnums,
+                group.append_block_offsets,
+                plan.token_ids,
+                strict=True,
+            ):
+                self.storage[int(slab), int(slot), int(offset)] = int(token)
+            outputs = []
+            for row in range(plan.num_sequences):
+                start, end = plan.token_range(row)
+                assert end - start <= write_tokens
+                first = int(group.block_table_start_indices[row])
+                table_start = int(group.block_indptr[row])
+                table_end = int(group.block_indptr[row + 1])
+                for query in plan.positions[start:end]:
+                    for position in range(
+                        max(0, int(query) - window + 1), int(query) + 1
+                    ):
+                        column = table_start + position // block_tokens - first
+                        assert table_start <= column < table_end
+                        address = (
+                            int(group.block_slab_ids[column]),
+                            int(group.block_slotnums[column]),
+                            position % block_tokens,
+                        )
+                        assert self.storage[address] == position
+                    self.query_count += 1
+                outputs.append(int(plan.token_ids[end - 1]) + 1)
+            return outputs
+
+    runner = WindowRunner()
+    with Engine(
+        runner,
+        context_length=64,
+        prefix_cache=prefix_cache,
+        scheduler_config=SchedulerConfig(prefill_chunk_size=6),
+    ) as engine:
+        first = engine.submit(list(range(13)), max_new_tokens=1)
+        while engine.has_work():
+            engine.step()
+        assert first.take_result() == [13]
+        if write_tokens == 6:
+            assert runner.plans[0].num_tokens == 6
+            assert runner.plans[1].num_tokens == 6
+        second = engine.submit(list(range(19)), max_new_tokens=1)
+        assert second.cached_tokens == (12 if prefix_cache else 0)
+        while engine.has_work():
+            engine.step()
+        assert second.take_result() == [19]
+        assert runner.query_count == 13 + 19 - second.cached_tokens

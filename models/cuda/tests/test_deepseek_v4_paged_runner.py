@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from resin import BatchPhase, BatchPlan
@@ -14,6 +15,7 @@ def _validation_runner() -> DeepSeekV4CudaRunner:
     runner.vocab_size = 64
     runner.max_seq_len = 256
     runner.max_batch_size = 4
+    runner.prefill_chunk_size = 128
     return runner
 
 
@@ -36,6 +38,19 @@ def test_managed_pages_allow_continuation_and_arbitrary_decode_rows() -> None:
 
     assert runner._validate_plan(continuation) == ((0, 2),)
     assert runner._validate_plan(decode) == ((0, 1), (1, 2))
+
+
+def test_prefill_rejects_a_block_larger_than_its_retained_write_capacity() -> None:
+    runner = _validation_runner()
+    plan = BatchPlan(
+        [70],
+        [0],
+        [4] * (runner.prefill_chunk_size + 1),
+        [0, runner.prefill_chunk_size + 1],
+        phase=BatchPhase.PREFILL,
+    )
+    with pytest.raises(ValueError, match="cache write capacity"):
+        runner._validate_plan(plan)
 
 
 def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None:
@@ -85,12 +100,10 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
             }
 
     graphs = Graphs()
-    runner._select_cuda_graph = (
-        lambda _mode, *, match, fallback="shape": graphs.match(match)
+    runner._select_cuda_graph = lambda _mode, *, match, fallback="shape": graphs.match(
+        match
     )
-    runner._run_cuda_graph = (
-        lambda _mode, shape, inputs: graphs.run(shape, inputs)
-    )
+    runner._run_cuda_graph = lambda _mode, shape, inputs: graphs.run(shape, inputs)
     runner._sampler = Sampler()
     runner._cache = Cache()
     plan = SimpleNamespace(

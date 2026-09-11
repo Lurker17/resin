@@ -36,6 +36,7 @@ pub struct KvGroupLayout {
     block_tokens: NonZeroU32,
     blocks_per_slab: NonZeroU32,
     retention: KvRetention,
+    read_window_tokens: Option<NonZeroU32>,
     family: KvGroupFamily,
 }
 
@@ -87,7 +88,39 @@ impl KvGroupLayout {
             block_tokens,
             blocks_per_slab,
             retention,
+            read_window_tokens: retention.window_tokens(),
             family,
+        })
+    }
+
+    /// Declare the logical read window separately from its physical guard band.
+    /// The window includes the current token; all writes in one batch must fit
+    /// beside the preceding `read_window_tokens - 1` tokens without aliasing.
+    pub fn with_read_window_tokens(mut self, tokens: u32) -> Result<Self, KvLayoutError> {
+        let retained = self.retention.window_tokens().ok_or_else(|| {
+            KvLayoutError::new("history retention does not accept read_window_tokens")
+        })?;
+        let tokens = NonZeroU32::new(tokens)
+            .filter(|tokens| tokens.get() <= retained.get())
+            .ok_or_else(|| {
+                KvLayoutError::new(
+                    "read_window_tokens must be positive and no larger than window_tokens",
+                )
+            })?;
+        self.read_window_tokens = Some(tokens);
+        Ok(self)
+    }
+
+    pub const fn read_window_tokens(self) -> Option<NonZeroU32> {
+        self.read_window_tokens
+    }
+
+    /// Maximum simultaneous writes whose earliest query retains its full read
+    /// window. Block rounding may provide extra capacity, but is not a promise.
+    pub fn max_write_tokens(self) -> Option<NonZeroU32> {
+        self.retention.window_tokens().map(|retained| {
+            NonZeroU32::new(retained.get() - self.read_window_tokens.unwrap().get() + 1)
+                .expect("validated read window fits retention")
         })
     }
 
@@ -381,6 +414,26 @@ mod tests {
         assert_eq!(layout.kernel_page_capacity(0), Some(8));
         assert_eq!(layout.kernel_page_count(1), Some(33));
         assert!(KvLayout::new(MAX_KERNEL_VALUE, vec![full(1, 2)]).is_err());
+    }
+
+    #[test]
+    fn window_guard_band_declares_its_safe_write_span() {
+        let group = KvGroupLayout::new(
+            2,
+            1,
+            KvRetention::SlidingWindow {
+                tokens: NonZeroU32::new(9).unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(group.read_window_tokens().unwrap().get(), 9);
+        assert_eq!(group.max_write_tokens().unwrap().get(), 1);
+        let group = group.with_read_window_tokens(4).unwrap();
+        assert_eq!(group.max_write_tokens().unwrap().get(), 6);
+        assert_eq!(group.window_resident_blocks().unwrap().get(), 5);
+        assert!(group.with_read_window_tokens(0).is_err());
+        assert!(group.with_read_window_tokens(10).is_err());
+        assert!(full(2, 1).with_read_window_tokens(1).is_err());
     }
 
     #[test]

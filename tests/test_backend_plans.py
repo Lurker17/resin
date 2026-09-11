@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from resin import (
     BatchPhase,
@@ -9,6 +10,7 @@ from resin import (
     CacheGroupLayout,
     CacheGroupPlan,
     CacheLayout,
+    CacheRetention,
 )
 from resin.backend.paged_attention import (
     PagedAttentionGroupSpec,
@@ -151,3 +153,37 @@ def test_paged_cache_plan_accepts_the_two_checkpoint_state_ring() -> None:
     )
     cache = PagedCachePlan.from_plan(plan, layout)
     assert cache.groups[0].address(0, 2) == (2, 0)
+
+
+@pytest.mark.parametrize("decode", [False, True])
+def test_source_free_window_plan_rejects_writes_that_discard_read_history(
+    decode: bool,
+) -> None:
+    layout = CacheLayout(
+        8,
+        [CacheGroupLayout(2, retention=CacheRetention.WINDOW, window_tokens=4)],
+    )
+    token_count = 1 if decode else 6
+    plan = BatchPlan(
+        [10],
+        [6],
+        list(range(6, 6 + token_count)),
+        [0, token_count],
+        phase=BatchPhase.DECODE if decode else BatchPhase.PREFILL,
+        cache_groups=[
+            CacheGroupPlan(
+                0,
+                [0, 3],
+                [1, 2, 3],
+                [0, 0, 0],
+                [3],
+                [1 + index // 2 for index in range(token_count)],
+                [0] * token_count,
+                [index % 2 for index in range(token_count)],
+            )
+        ],
+    )
+    # The final suffix and every append address look valid, but the first
+    # query still needs positions3..5, which this table has already discarded.
+    with pytest.raises(ValueError, match="Window read/write capacity"):
+        PagedCachePlan.from_plan(plan, layout, decode_lookahead=5 if decode else 0)

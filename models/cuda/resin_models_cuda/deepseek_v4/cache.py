@@ -63,6 +63,8 @@ class CacheGeometry:
     """Offsets for all layers bundled into each 128-token cache block."""
 
     attention_layers: int
+    read_window_tokens: int
+    max_write_tokens: int
     window_tokens: int
     c4_state_tokens: int
     index_base_rows: int
@@ -85,6 +87,7 @@ class CacheGeometry:
         dspark_layers: int,
         window_size: int,
         decode_input_tokens: int = 1,
+        prefill_chunk_size: int = 1,
     ) -> CacheGeometry:
         ratios = _ints("compress_ratios", compress_ratios)
         if (
@@ -93,6 +96,13 @@ class CacheGeometry:
             or decode_input_tokens <= 0
         ):
             raise ValueError("decode_input_tokens must be a positive integer")
+        if (
+            isinstance(prefill_chunk_size, bool)
+            or not isinstance(prefill_chunk_size, int)
+            or prefill_chunk_size <= 0
+        ):
+            raise ValueError("prefill_chunk_size must be a positive integer")
+        max_write_tokens = max(prefill_chunk_size, decode_input_tokens)
         if len(ratios) < target_layers or any(
             ratio not in (0, 4, 128) for ratio in ratios[:target_layers]
         ):
@@ -150,12 +160,7 @@ class CacheGeometry:
         index_state_value_offsets.extend((None,) * dspark_layers)
         index_state_score_offsets.extend((None,) * dspark_layers)
         attention_layers = target_layers + dspark_layers
-        c4_state_tokens = (
-            math.ceil(
-                max(8, 4 + decode_input_tokens) / _GROUP_BLOCK_TOKENS[C4_STATE_GROUP]
-            )
-            * _GROUP_BLOCK_TOKENS[C4_STATE_GROUP]
-        )
+        c4_state_tokens = 8 + max_write_tokens - 1
         # Express every group in equivalent 512D BF16 rows.  The physical
         # parent is a union: at runtime it belongs to exactly one group, whose
         # smaller logical blocks are packed into the same bytes.  TokenSpeed's
@@ -182,12 +187,14 @@ class CacheGeometry:
             )
             * alignment
         )
-        # Verification writes the anchor plus every draft before acceptance is
-        # known. Keep the ordinary attention window and that uncommitted tail
-        # resident together, even when their union straddles three pages.
-        window_tokens = window_size + decode_input_tokens - 1
+        # Prefill/verification writes the entire block before reading attention
+        # or compressor history. The earliest query's read window and all new
+        # rows must remain addressable together, including after a prefix hit.
+        window_tokens = window_size + max_write_tokens - 1
         return cls(
             attention_layers,
+            window_size,
+            max_write_tokens,
             window_tokens,
             c4_state_tokens,
             compressed_cursors[4],
@@ -214,6 +221,7 @@ class CacheGeometry:
                     PAGE_TOKENS,
                     retention=CacheRetention.WINDOW,
                     window_tokens=self.window_tokens,
+                    read_window_tokens=self.read_window_tokens,
                 ),
                 CacheGroupLayout(
                     PAGE_TOKENS, blocks_per_slab=self.packings[C4_KV_GROUP]
@@ -223,6 +231,7 @@ class CacheGeometry:
                     blocks_per_slab=self.packings[C4_STATE_GROUP],
                     retention=CacheRetention.WINDOW,
                     window_tokens=self.c4_state_tokens,
+                    read_window_tokens=8,
                 ),
                 CacheGroupLayout(
                     PAGE_TOKENS, blocks_per_slab=self.packings[C128_KV_GROUP]
@@ -231,13 +240,15 @@ class CacheGeometry:
                     _GROUP_BLOCK_TOKENS[C128_STATE_GROUP],
                     blocks_per_slab=self.packings[C128_STATE_GROUP],
                     retention=CacheRetention.WINDOW,
-                    window_tokens=128,
+                    window_tokens=128 + self.max_write_tokens - 1,
+                    read_window_tokens=128,
                 ),
                 CacheGroupLayout(
                     _GROUP_BLOCK_TOKENS[INDEX_STATE_GROUP],
                     blocks_per_slab=self.packings[INDEX_STATE_GROUP],
                     retention=CacheRetention.WINDOW,
-                    window_tokens=12,
+                    window_tokens=8 + self.max_write_tokens - 1,
+                    read_window_tokens=8,
                 ),
             ),
         )

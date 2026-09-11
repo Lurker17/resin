@@ -31,7 +31,7 @@ def test_deepseek_groups_use_tokenspeed_power_of_two_packing() -> None:
 
     assert geometry.attention_layers == 46
     assert geometry.window_tokens == 133
-    assert geometry.c4_state_tokens == 12
+    assert geometry.c4_state_tokens == 13
     assert geometry.packings == (1, 4, 8, 256, 8, 32)
     assert geometry.parent_rows == 5_888
     assert geometry.bytes_per_parent == 6_029_312
@@ -49,6 +49,14 @@ def test_deepseek_groups_use_tokenspeed_power_of_two_packing() -> None:
     assert tuple(group.blocks_per_slab for group in groups) == geometry.packings
     assert groups[0].window_tokens == 133
     assert groups[0].window_resident_block_count == 3
+    assert tuple(group.read_window_tokens for group in groups) == (
+        128,
+        None,
+        8,
+        None,
+        128,
+        8,
+    )
 
 
 def test_non_speculative_c4_tail_only_retains_its_logical_window() -> None:
@@ -58,6 +66,21 @@ def test_non_speculative_c4_tail_only_retains_its_logical_window() -> None:
     assert geometry.c4_state_tokens == 8
     assert geometry.layout(10).groups[0].window_resident_block_count == 2
     assert geometry.layout(10).groups[C4_STATE_GROUP].window_tokens == 8
+
+
+def test_prefill_guard_bands_preserve_history_beside_a_full_chunk() -> None:
+    geometry = CacheGeometry.build(
+        [0, 0, *([4, 128] * 20), 4, 0, 0, 0],
+        target_layers=43,
+        dspark_layers=3,
+        window_size=128,
+        decode_input_tokens=6,
+        prefill_chunk_size=4096,
+    )
+    assert geometry.max_write_tokens == 4096
+    for group in geometry.layout(300).groups:
+        if group.retention is CacheRetention.WINDOW:
+            assert group.window_tokens - group.read_window_tokens + 1 == 4096
 
 
 def test_post_load_vram_budget_includes_null_parent() -> None:
