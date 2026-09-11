@@ -636,11 +636,11 @@ class DeepSeekV4CudaRunner(CudaRunner):
         self._check_cuda_graphs()
         rows = self._validate_plan(plan)
         cache_plan = self._cache_plan(plan)
-        if plan.phase == BatchPhase.DECODE:
-            graph_output = self._graph_forward(plan, cache_plan)
-            if graph_output is not None:
-                return graph_output
         with self._cuda_failure:
+            if plan.phase == BatchPhase.DECODE:
+                graph_output = self._graph_forward(plan, cache_plan)
+                if graph_output is not None:
+                    return graph_output
             staging = TensorStager(self.device)
             cache = self._cache.tensorize(cache_plan, staging)
             token_ids = staging.device("token_ids", plan.token_ids, torch.long)

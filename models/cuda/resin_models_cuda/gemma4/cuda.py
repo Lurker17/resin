@@ -18,11 +18,11 @@ from resin import (
     RunnerConfig,
 )
 from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
+from resin.backend.cuda.failures import GraphInputError
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
     CudaGraphMode,
     CudaGraphStep,
-    GraphInputError,
     GraphShape,
     graph_shapes,
 )
@@ -1582,16 +1582,16 @@ class Gemma4CudaRunner(CudaRunner):
                 self.speculative_tokens if plan.phase == BatchPhase.DECODE else 0
             ),
         )
-        if batch.phase == BatchPhase.DECODE:
-            if self.speculative_tokens:
-                graph_output = self._speculative_graph_forward(plan, batch)
+        with self._cuda_failure:
+            if batch.phase == BatchPhase.DECODE:
+                if self.speculative_tokens:
+                    graph_output = self._speculative_graph_forward(plan, batch)
+                    if graph_output is not None:
+                        return graph_output
+                    return self._speculative_decode(plan, batch)
+                graph_output = self._graph_forward(plan, batch)
                 if graph_output is not None:
                     return graph_output
-                return self._speculative_decode(plan, batch)
-            graph_output = self._graph_forward(plan, batch)
-            if graph_output is not None:
-                return graph_output
-        with self._cuda_failure:
             hidden = self._eager_transformer(plan, batch)
             self._store_last_hidden(plan, batch, hidden)
             last = torch.as_tensor(

@@ -28,10 +28,10 @@ from resin import (
     RunnerConfig,
 )
 from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
+from resin.backend.cuda.failures import GraphInputError
 from resin.backend.cuda.graphs import (
     CudaGraphMode,
     CudaGraphStep,
-    GraphInputError,
     GraphShape,
     graph_shapes,
 )
@@ -49,7 +49,6 @@ from resin.backend.cuda.runner import CudaRunner, capture_sampling_inputs
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.paged_attention import PagedAttentionBatch
 from resin.backend.quantization import QuantizationConfig
-from resin.backend.transformer import MLP, TopKRouter
 from resin.models.gpt_oss.config import GptOssConfig
 from resin.models.gpt_oss.plan import (
     PAGE_SIZE,
@@ -65,6 +64,7 @@ from resin_models_cuda.gpt_oss.checkpoint import (
     resolve_model_path,
 )
 from resin_models_cuda.gpt_oss.cutile import top4_softmax
+from resin_models_cuda.gpt_oss.model import MLP, TopKRouter
 
 if TYPE_CHECKING:
     from resin import BatchPlan
@@ -584,9 +584,7 @@ class GptOssCudaRunner(CudaRunner):
                 layer.post_attention_layernorm.weight,
                 layer.post_attention_layernorm.eps,
             )
-            feed_forward_output = self._feed_forward(
-                layer.mlp, normalized_mlp_input
-            )
+            feed_forward_output = self._feed_forward(layer.mlp, normalized_mlp_input)
             next_norm = (
                 layers[layer_index + 1].input_layernorm
                 if layer_index + 1 < len(layers)
@@ -612,6 +610,7 @@ class GptOssCudaRunner(CudaRunner):
 
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         batch_size, full_width = shape
+
         def empty(dtype, *shape):
             return torch.empty(shape, dtype=dtype, device=self.device)
 
@@ -671,9 +670,7 @@ class GptOssCudaRunner(CudaRunner):
             raise GraphInputError("plan is not a fixed-shape decode batch")
         shape = self._select_cuda_graph(
             "decode",
-            match=lambda candidate: (
-                candidate[0] == rows and candidate[1] >= full.width
-            ),
+            match=lambda candidate: candidate[0] == rows and candidate[1] >= full.width,
         )
         if shape is None:
             return None
@@ -703,21 +700,21 @@ class GptOssCudaRunner(CudaRunner):
                 "native attention batches do not cover every plan sequence"
             )
 
-        if not prefill_batches and decode_batch is not None:
-            graph_output = self._graph_forward(plan, decode_batch)
-            if graph_output is not None:
-                return graph_output
-
-        staging = TensorStager(self.device)
-        token_ids = staging.device("token_ids", plan.token_ids, torch.long)
-        positions = staging.device("positions", host_positions, torch.long)
-        final_hidden = torch.empty(
-            len(plan.sequence_ids),
-            self.hidden_size,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
         with self._cuda_failure:
+            if not prefill_batches and decode_batch is not None:
+                graph_output = self._graph_forward(plan, decode_batch)
+                if graph_output is not None:
+                    return graph_output
+
+            staging = TensorStager(self.device)
+            token_ids = staging.device("token_ids", plan.token_ids, torch.long)
+            positions = staging.device("positions", host_positions, torch.long)
+            final_hidden = torch.empty(
+                len(plan.sequence_ids),
+                self.hidden_size,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
             with torch.inference_mode():
                 for index, host_batch in enumerate(prefill_batches):
                     batch = self._tensorize(host_batch, staging, f"prefill.{index}")

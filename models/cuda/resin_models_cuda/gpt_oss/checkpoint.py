@@ -16,8 +16,8 @@ from resin.backend.loading import (
     resolve_model,
 )
 from resin.backend.quantization import MXFP4, QuantizationConfig
-from resin.backend.transformer import MoEForCausalLM
 from resin.models.gpt_oss.config import GptOssConfig
+from resin_models_cuda.gpt_oss.model import MoEForCausalLM
 from resin_models_cuda.gpt_oss.mxfp4 import (
     EXPERT_CHECKPOINT_NAMES,
     cuda_architecture,

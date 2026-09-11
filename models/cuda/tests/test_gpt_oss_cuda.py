@@ -9,7 +9,6 @@ from resin import BatchPhase, CacheGroupLayout, CacheLayout, CacheRetention
 from resin.backend.cuda.runner import CudaRunner
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import TorchSampler
-from resin.backend.transformer import SinkAttention
 from resin.models.gpt_oss.plan import (
     PAGE_SIZE,
     PREFILL_CHUNK_SIZE,
@@ -26,6 +25,7 @@ from resin_models_cuda.gpt_oss.cuda import (
     _router_logits,
     plan_gpt_oss_kv_capacity,
 )
+from resin_models_cuda.gpt_oss.model import SinkAttention
 
 
 def build_attention_batches(plan, *, parent_capacity: int = 2048):
@@ -447,9 +447,7 @@ class TestGptOssCudaTinyOracle:
             kwargs["norm_out"].copy_((normalized * kwargs["rms_gamma"]).bfloat16())
             return kwargs["norm_out"]
 
-        monkeypatch.setattr(
-            "resin_models_cuda.gpt_oss.cuda.allreduce_fusion", fused
-        )
+        monkeypatch.setattr("resin_models_cuda.gpt_oss.cuda.allreduce_fusion", fused)
         normalized, combined = runner._allreduce_residual_rmsnorm(
             partial, residual, weight, eps
         )
@@ -506,9 +504,7 @@ class TestGptOssCudaTinyOracle:
             calls.append((input.shape[0], use_pdl))
             output.copy_(torch.nn.functional.linear(input, weight, bias))
 
-        monkeypatch.setattr(
-            "resin_models_cuda.gpt_oss.cuda.tinygemm_bf16", tinygemm
-        )
+        monkeypatch.setattr("resin_models_cuda.gpt_oss.cuda.tinygemm_bf16", tinygemm)
         for rows in (1, 2, 4, 8, 16, 32, 64, 128):
             hidden = torch.randn(rows, 64, dtype=torch.bfloat16)
             expected = torch.nn.functional.linear(hidden, router.weight, router.bias)
@@ -549,9 +545,7 @@ class TestGptOssCudaTinyOracle:
             return expected_indices.to(torch.int32), expected_weights.to(torch.float32)
 
         with monkeypatch.context() as context:
-            context.setattr(
-                "resin_models_cuda.gpt_oss.cuda.top4_softmax", top4_softmax
-            )
+            context.setattr("resin_models_cuda.gpt_oss.cuda.top4_softmax", top4_softmax)
             indices, weights = _route(official, logits)
 
         assert calls == [torch.Size([32, 128])]
@@ -643,9 +637,7 @@ class TestGptOssCudaTinyOracle:
             dim=-1,
         )
 
-        monkeypatch.setattr(
-            "resin_models_cuda.gpt_oss.cuda.apply_rotary", apply_rotary
-        )
+        monkeypatch.setattr("resin_models_cuda.gpt_oss.cuda.apply_rotary", apply_rotary)
         actual = runner._apply_yarn_rotary(hidden, cos, sin)
 
         assert actual.dtype == torch.bfloat16

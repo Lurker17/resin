@@ -6,10 +6,11 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any, TypedDict
+from typing import Any, NoReturn, TypedDict
 
 import torch
 
+from resin.backend.cuda.failures import GraphInputError, PostAcceptCudaError
 from resin.backend.cuda.staging import StagingError, TensorStager
 
 GraphShape = tuple[int, ...]
@@ -60,10 +61,6 @@ class CudaGraphStats(TypedDict):
     shape_stats: tuple[CudaGraphShapeStats, ...]
     poisoned: bool
     poison_error: str | None
-
-
-class GraphInputError(ValueError):
-    """Host inputs do not fit a graph's fixed device buffers."""
 
 
 def graph_shapes(value: object, *, dimensions: int) -> tuple[GraphShape, ...]:
@@ -296,9 +293,20 @@ class CudaGraphCache:
             after_capture()
         return self.stats
 
-    def _fail(self, stage: str, error: BaseException) -> None:
+    def _fail(self, stage: str, error: BaseException) -> NoReturn:
         if self._poison is None:
             self._poison = f"{stage}: {type(error).__name__}: {error}"
+        try:
+            self._synchronize_failure()
+        except BaseException as synchronization_error:
+            raise PostAcceptCudaError(
+                f"{stage} failed and CUDA quiescence could not be established; "
+                f"resources must remain quarantined: {error}"
+            ) from synchronization_error
+        raise PostAcceptCudaError(
+            f"{stage} failed; persistent state may have changed and cannot be "
+            f"retried: {error}"
+        ) from error
 
     def capture(self, shape: GraphShape, inputs: Mapping[str, object]) -> Any:
         """Build and capture one configured shape before request execution."""
@@ -321,13 +329,10 @@ class CudaGraphCache:
             raise GraphInputError(str(error)) from error
         except BaseException as error:
             self._fail("graph input copy", error)
-            raise
         try:
             self._capture(entry, before)
         except BaseException as error:
             self._fail("graph capture", error)
-            self._synchronize_failure()
-            raise
         return entry.program.output.tolist()
 
     def run(self, shape: GraphShape, inputs: Mapping[str, object]) -> Any:
@@ -349,7 +354,6 @@ class CudaGraphCache:
             raise GraphInputError(str(error)) from error
         except BaseException as error:
             self._fail("graph input copy", error)
-            raise
 
         try:
             with torch.cuda.device(self.device), torch.inference_mode():
@@ -357,8 +361,6 @@ class CudaGraphCache:
             result = entry.program.output.tolist()
         except BaseException as error:
             self._fail("graph replay", error)
-            self._synchronize_failure()
-            raise
         entry.replays += 1
         return result
 

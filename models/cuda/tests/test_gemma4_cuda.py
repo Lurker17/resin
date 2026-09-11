@@ -4,10 +4,14 @@ import inspect
 import math
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from resin import BatchPhase
+from resin.backend.cuda.failures import CudaFailureGuard, PostAcceptCudaError
 from resin.backend.cuda.runner import CudaRunner
 from resin.models.gemma4.plan import PAGE_SIZE
+from resin_models_cuda.gemma4 import cuda as gemma4_runtime
 from resin_models_cuda.gemma4.cuda import (
     Gemma4CudaRunner,
     _Gemma4KvArena,
@@ -135,3 +139,37 @@ def test_ordinary_graph_decode_uses_graph_stable_attention_plan() -> None:
     assert "use_tensor_cores=True" in source
     assert 'backend="fa2"' in source
     assert "disable_split_kv=True" in source
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_speculative_failure_after_state_update_is_not_retryable(
+    monkeypatch, graph
+) -> None:
+    state = [0]
+    synchronized = []
+    runner = object.__new__(Gemma4CudaRunner)
+    runner.speculative_tokens = 1
+    runner.cache_layout = object()
+    runner._check_cuda_graphs = lambda: None
+    runner._cuda_failure = CudaFailureGuard(
+        lambda: synchronized.append(True), label="Gemma speculative decode"
+    )
+    native = SimpleNamespace(phase=BatchPhase.DECODE)
+    monkeypatch.setattr(
+        gemma4_runtime, "build_gemma4_batch_plan", lambda *_args, **_kwargs: native
+    )
+
+    def fail_after_update(_plan, _batch):
+        state[0] += 1
+        raise ValueError("sampling failed after state update")
+
+    runner._speculative_graph_forward = (
+        fail_after_update if graph else lambda _plan, _batch: None
+    )
+    runner._speculative_decode = fail_after_update
+
+    with pytest.raises(PostAcceptCudaError, match="sampling failed"):
+        runner.forward(native)
+
+    assert state == [1]
+    assert synchronized == [True]

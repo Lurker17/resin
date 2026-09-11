@@ -8,6 +8,7 @@ import pytest
 from resin.backend.cuda import graphs as graph_runtime
 from resin.backend.cuda import runner as runner_runtime
 from resin.backend.cuda import staging
+from resin.backend.cuda.failures import GraphInputError, PostAcceptCudaError
 from resin.backend.cuda.graphs import (
     DEFAULT_DECODE_GRAPH_MAX_BATCH_SIZE,
     DEFAULT_MAX_NUM_SEQS,
@@ -17,7 +18,6 @@ from resin.backend.cuda.graphs import (
     CudaGraphProgram,
     CudaGraphRegion,
     CudaGraphStep,
-    GraphInputError,
     default_decode_graph_shapes,
     graph_shapes,
 )
@@ -200,9 +200,7 @@ class TestCudaGraph:
             return CudaGraphMode(((1, 4),), build, lambda _shape: {"value": [value]})
 
         runner = ModelRunner()
-        runner._configure_cuda_graphs(
-            {"prefill": mode(1), "decode": mode(2)}
-        )
+        runner._configure_cuda_graphs({"prefill": mode(1), "decode": mode(2)})
 
         stats = runner.capture_cuda_graphs()
 
@@ -584,10 +582,13 @@ class TestCudaGraph:
             state = _Tensor([1])
             return CudaGraphStep({"value": state}, state, lambda: None)
 
-        graphs = _cache(((1, 4),), build)
+        synchronized = []
+        graphs = _cache(((1, 4),), build, lambda: synchronized.append(True))
         graphs.capture((1, 4), {"value": [1]})
         torch.cuda.graphs[0].error = RuntimeError("illegal replay")
-        with pytest.raises(RuntimeError, match="illegal replay"):
+        with pytest.raises(PostAcceptCudaError, match="illegal replay") as caught:
             graphs.run((1, 4), {"value": [1]})
+        assert caught.value._resin_post_accept is True
+        assert synchronized == [True]
         assert graphs.stats["replay_count"] == 0
         assert "graph replay" in graphs.stats["poison_error"]

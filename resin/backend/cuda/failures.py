@@ -1,8 +1,12 @@
-"""Conservative CUDA quiescence after a synchronous runner failure."""
+"""Failure containment after CUDA execution may have changed model state."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
+
+
+class GraphInputError(ValueError):
+    """Host inputs were rejected before graph copies or execution began."""
 
 
 class PostAcceptCudaError(RuntimeError):
@@ -12,7 +16,12 @@ class PostAcceptCudaError(RuntimeError):
 
 
 class CudaFailureGuard:
-    """Synchronize failed CUDA work or mark its resources for quarantine."""
+    """Quarantine failed execution even when its CUDA work has finished.
+
+    Enter after validating the plan and before model work. Synchronization can
+    establish memory quiescence, but cannot undo an in-place recurrent-state or
+    sliding-window update. Only graph input validation is safe to retry here.
+    """
 
     def __init__(self, synchronize: Callable[[], None], *, label: str) -> None:
         self._synchronize = synchronize
@@ -31,6 +40,12 @@ class CudaFailureGuard:
         return self
 
     def __exit__(self, _type, error, _traceback) -> bool:
-        if error is not None:
-            self()
-        return False
+        if error is None or isinstance(error, GraphInputError):
+            return False
+        if isinstance(error, PostAcceptCudaError):
+            return False
+        self()
+        raise PostAcceptCudaError(
+            f"{self._label} failed after execution began; persistent state may "
+            f"have changed and cannot be retried: {error}"
+        ) from error

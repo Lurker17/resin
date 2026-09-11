@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from resin.backend.transformer import MoEForCausalLM
+from resin_models_cuda.gpt_oss.model import MoEForCausalLM
 
 
 def _tiny_args():
