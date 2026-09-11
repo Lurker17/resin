@@ -190,10 +190,14 @@ class CacheGeometry:
         # Prefill/verification writes the entire block before reading attention
         # or compressor history. The earliest query's read window and all new
         # rows must remain addressable together, including after a prefix hit.
-        window_tokens = window_size + max_write_tokens - 1
+        # Draft attention reads the preceding main-hidden window before target
+        # verification consumes its anchor. Include that extra preceding row in
+        # the read envelope so preparing a short lease cannot recycle it.
+        read_window_tokens = window_size + int(dspark_layers > 0)
+        window_tokens = read_window_tokens + max_write_tokens - 1
         return cls(
             attention_layers,
-            window_size,
+            read_window_tokens,
             max_write_tokens,
             window_tokens,
             c4_state_tokens,

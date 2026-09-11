@@ -16,11 +16,11 @@ from resin_models_cuda.deepseek_v4.cache import (
 )
 
 
-def _geometry(*, decode_input_tokens: int = 6) -> CacheGeometry:
+def _geometry(*, decode_input_tokens: int = 6, dspark_layers: int = 3) -> CacheGeometry:
     return CacheGeometry.build(
         [0, 0, *([4, 128] * 20), 4, 0, 0, 0],
         target_layers=43,
-        dspark_layers=3,
+        dspark_layers=dspark_layers,
         window_size=128,
         decode_input_tokens=decode_input_tokens,
     )
@@ -30,7 +30,7 @@ def test_deepseek_groups_use_tokenspeed_power_of_two_packing() -> None:
     geometry = _geometry()
 
     assert geometry.attention_layers == 46
-    assert geometry.window_tokens == 133
+    assert geometry.window_tokens == 134
     assert geometry.c4_state_tokens == 13
     assert geometry.packings == (1, 4, 8, 256, 8, 32)
     assert geometry.parent_rows == 5_888
@@ -47,10 +47,10 @@ def test_deepseek_groups_use_tokenspeed_power_of_two_packing() -> None:
         CacheRetention.WINDOW,
     )
     assert tuple(group.blocks_per_slab for group in groups) == geometry.packings
-    assert groups[0].window_tokens == 133
+    assert groups[0].window_tokens == 134
     assert groups[0].window_resident_block_count == 3
     assert tuple(group.read_window_tokens for group in groups) == (
-        128,
+        129,
         None,
         8,
         None,
@@ -60,7 +60,7 @@ def test_deepseek_groups_use_tokenspeed_power_of_two_packing() -> None:
 
 
 def test_non_speculative_c4_tail_only_retains_its_logical_window() -> None:
-    geometry = _geometry(decode_input_tokens=1)
+    geometry = _geometry(decode_input_tokens=1, dspark_layers=0)
 
     assert geometry.window_tokens == 128
     assert geometry.c4_state_tokens == 8
@@ -78,9 +78,30 @@ def test_prefill_guard_bands_preserve_history_beside_a_full_chunk() -> None:
         prefill_chunk_size=4096,
     )
     assert geometry.max_write_tokens == 4096
+    assert geometry.layout(300).groups[0].window_resident_block_count == 34
     for group in geometry.layout(300).groups:
         if group.retention is CacheRetention.WINDOW:
             assert group.window_tokens - group.read_window_tokens + 1 == 4096
+
+
+def test_dspark_short_verify_lease_keeps_the_entire_preceding_anchor_window() -> None:
+    window = 128
+    for writes in (2, 6, 130, 4096):
+        geometry = CacheGeometry.build(
+            [0, 4, 128],
+            target_layers=3,
+            dspark_layers=1,
+            window_size=window,
+            decode_input_tokens=min(writes, 6),
+            prefill_chunk_size=writes,
+        )
+        group = geometry.layout(1000).groups[0]
+        for context in range(2 * window, 3 * window):
+            last_block = (context + writes - 1) // group.block_tokens
+            first_block = max(0, last_block + 1 - group.window_resident_block_count)
+            # DSpark reads [context-W, context) before writing its verify block;
+            # even an unaligned anchor must retain that oldest physical page.
+            assert first_block * group.block_tokens <= context - window
 
 
 def test_post_load_vram_budget_includes_null_parent() -> None:
