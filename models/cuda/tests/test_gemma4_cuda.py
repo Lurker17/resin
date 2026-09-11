@@ -10,7 +10,7 @@ import torch
 from resin import BatchPhase
 from resin.backend.cuda.failures import CudaFailureGuard, PostAcceptCudaError
 from resin.backend.cuda.runner import CudaRunner
-from resin.models.gemma4.plan import PAGE_SIZE
+from resin.models.gemma4.plan import PAGE_SIZE, SLIDING_WINDOW
 from resin_models_cuda.gemma4 import cuda as gemma4_runtime
 from resin_models_cuda.gemma4.cuda import (
     Gemma4CudaRunner,
@@ -133,12 +133,81 @@ def test_ordinary_graph_padding_rows_stay_inside_null_page() -> None:
     assert max(inputs["local_append_offsets"]) < PAGE_SIZE
 
 
-def test_ordinary_graph_decode_uses_graph_stable_attention_plan() -> None:
-    source = inspect.getsource(Gemma4CudaRunner._new_decode_graph_step)
+@pytest.mark.parametrize("speculative_tokens", [0, 3])
+def test_graph_attention_contract_matches_capture_and_replay(
+    monkeypatch, speculative_tokens
+) -> None:
+    import flashinfer
 
-    assert "use_tensor_cores=True" in source
-    assert 'backend="fa2"' in source
-    assert "disable_split_kv=True" in source
+    wrappers = []
+
+    class Wrapper:
+        def __init__(self, _workspace, _layout, **options):
+            self.options = options
+            self.calls = []
+            wrappers.append(self)
+
+        def plan(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    for name in (
+        "BatchDecodeWithPagedKVCacheWrapper",
+        "BatchPrefillWithPagedKVCacheWrapper",
+    ):
+        monkeypatch.setattr(flashinfer, name, Wrapper, raising=False)
+    runner = object.__new__(Gemma4CudaRunner)
+    runner.device = torch.device("cpu")
+    runner.config = SimpleNamespace(
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_global_key_value_heads=1,
+        head_dim=4,
+        global_head_dim=8,
+        hidden_size=8,
+        vocab_size=16,
+    )
+    runner.speculative_tokens = speculative_tokens
+    runner._assistant = object()
+    runner._cache = SimpleNamespace(
+        dtype=torch.float8_e4m3fn,
+        local_keys=[None],
+        local_values=[None],
+        global_keys=[None],
+        global_values=[None],
+    )
+    runner._sampler = SimpleNamespace(empty=lambda *_: None, graph_inputs=lambda _: {})
+    runner._graph_attention_workspaces = (None, None)
+    runner._graph_attention = {}
+    runner._graph_spec_attention = {}
+    runner._graph_verify_hidden = {}
+    shape = (2, 3)
+    step = runner._new_decode_graph_step(shape)
+    inputs = runner._graph_capture_inputs(shape, vocab_size=16)
+    for name, values in inputs.items():
+        if name.endswith("_page_indices"):
+            inputs[name] = (17 if "local" in name else 23,) * len(values)
+    runner._prepare_graph_attention(shape, inputs)
+
+    assert step.inputs.keys() <= inputs.keys()
+    assert len(wrappers) == (4 if speculative_tokens else 2)
+    for wrapper in wrappers:
+        (initial, initial_options), (current, current_options) = wrapper.calls
+        assert initial_options == current_options
+        assert initial[-4:] == current[-4:]
+        local = current[-2] == 4
+        assert current[-4:] == (4, 2 if local else 1, 4 if local else 8, PAGE_SIZE)
+        assert current_options["window_left"] == (SLIDING_WINDOW - 1 if local else -1)
+        assert current_options["disable_split_kv"] is True
+        verify = "qo_indptr_buf" in wrapper.options
+        assert current_options.get("causal", False) is verify
+        assert current[-6].tolist() == [17 if local else 23] * shape[0]
+        if verify:
+            assert current[0].tolist() == [0, 4, 8]
+            assert current[-5].tolist() == [5, 5]
+        assert wrapper.options["backend"] == ("auto" if speculative_tokens else "fa2")
+        assert wrapper.options.get("use_tensor_cores", False) is (
+            not speculative_tokens
+        )
 
 
 @pytest.mark.parametrize("graph", [False, True])
