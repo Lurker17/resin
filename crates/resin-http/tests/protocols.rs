@@ -9,19 +9,19 @@ use tokio::sync::mpsc;
 use tower::ServiceExt;
 
 fn test_router() -> axum::Router {
-    let (jobs, mut receiver) = mpsc::unbounded_channel::<GenerationJob>();
+    let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(32);
     tokio::spawn(async move {
         while let Some(job) = receiver.recv().await {
             let _ = job
                 .events
-                .send(GenerationEvent::Started { input_tokens: 3 });
+                .try_send(GenerationEvent::Started { input_tokens: 3 });
             let _ = job
                 .events
-                .send(GenerationEvent::ReasoningDelta("brief thought".to_owned()));
+                .try_send(GenerationEvent::ReasoningDelta("brief thought".to_owned()));
             let _ = job
                 .events
-                .send(GenerationEvent::TextDelta("hello".to_owned()));
-            let _ = job.events.send(GenerationEvent::Finished {
+                .try_send(GenerationEvent::TextDelta("hello".to_owned()));
+            let _ = job.events.try_send(GenerationEvent::Finished {
                 reason: FinishReason::Stop,
                 input_tokens: 3,
                 cached_tokens: 2,
@@ -36,25 +36,27 @@ fn test_router() -> axum::Router {
 }
 
 fn tool_router() -> axum::Router {
-    let (jobs, mut receiver) = mpsc::unbounded_channel::<GenerationJob>();
+    let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(32);
     tokio::spawn(async move {
         while let Some(job) = receiver.recv().await {
             let _ = job
                 .events
-                .send(GenerationEvent::Started { input_tokens: 7 });
+                .try_send(GenerationEvent::Started { input_tokens: 7 });
             let _ = job
                 .events
-                .send(GenerationEvent::ReasoningDelta("check weather".to_owned()));
-            let _ = job.events.send(GenerationEvent::ToolCallStart {
+                .try_send(GenerationEvent::ReasoningDelta("check weather".to_owned()));
+            let _ = job.events.try_send(GenerationEvent::ToolCallStart {
                 index: 0,
                 id: "call_weather".to_owned(),
                 name: "weather".to_owned(),
             });
-            let _ = job.events.send(GenerationEvent::ToolCallArgumentsDelta {
-                index: 0,
-                delta: r#"{"city":"Paris"}"#.to_owned(),
-            });
-            let _ = job.events.send(GenerationEvent::Finished {
+            let _ = job
+                .events
+                .try_send(GenerationEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    delta: r#"{"city":"Paris"}"#.to_owned(),
+                });
+            let _ = job.events.try_send(GenerationEvent::Finished {
                 reason: FinishReason::Stop,
                 input_tokens: 7,
                 cached_tokens: 4,
@@ -144,7 +146,7 @@ async fn anthropic_messages_returns_thinking_and_text_blocks() {
 
 #[tokio::test]
 async fn route_flags_remove_disabled_apis_and_demo() {
-    let (jobs, _receiver) = mpsc::unbounded_channel();
+    let (jobs, _receiver) = mpsc::channel(32);
     let app = router(
         "test-model",
         jobs,
@@ -267,4 +269,162 @@ async fn responses_and_anthropic_streams_emit_protocol_events() {
     assert!(events.contains(r#""type":"thinking_delta""#));
     assert!(events.contains(r#""type":"text_delta""#));
     assert!(events.contains("event: message_stop"));
+}
+
+fn generation_request(path: &str, stream: bool) -> Request<Body> {
+    let body = if path == "/v1/responses" {
+        json!({"model": "test-model", "input": "hi", "stream": stream})
+    } else {
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "stream": stream,
+        })
+    };
+    Request::post(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn full_admission_queue_rejects_each_api_without_waiting() {
+    for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+        let (jobs, receiver) = mpsc::channel(1);
+        let app = router("test-model", jobs, RouteConfig::default());
+        let first = app
+            .clone()
+            .oneshot(generation_request(path, true))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            json_response(app, generation_request(path, false)),
+        )
+        .await
+        .expect("overload must be rejected immediately");
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("queue is full")
+        );
+        assert_eq!(receiver.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn stopped_actor_fails_health_and_generation_admission() {
+    let (jobs, receiver) = mpsc::channel(1);
+    let app = router("test-model", jobs, RouteConfig::default());
+    drop(receiver);
+    let (status, _) = json_response(
+        app.clone(),
+        Request::get("/health").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let (status, _) = json_response(app, generation_request("/v1/responses", false)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn slow_stream_has_a_bounded_queue_and_does_not_block_another_response() {
+    let (jobs, mut receiver) = mpsc::channel(2);
+    let app = router("test-model", jobs, RouteConfig::default());
+    let slow = app
+        .clone()
+        .oneshot(generation_request("/v1/chat/completions", true))
+        .await
+        .unwrap();
+    let slow_job = receiver.recv().await.unwrap();
+    for _ in 0..resin_http::EVENT_QUEUE_CAPACITY {
+        slow_job
+            .events
+            .try_send(GenerationEvent::TextDelta("x".to_owned()))
+            .unwrap();
+    }
+    assert!(matches!(
+        slow_job
+            .events
+            .try_send(GenerationEvent::TextDelta("overflow".to_owned())),
+        Err(mpsc::error::TrySendError::Full(_)),
+    ));
+    drop(slow_job);
+
+    let fast = tokio::spawn(json_response(
+        app,
+        generation_request("/v1/responses", false),
+    ));
+    let fast_job = receiver.recv().await.unwrap();
+    fast_job
+        .events
+        .try_send(GenerationEvent::TextDelta("finished".to_owned()))
+        .unwrap();
+    fast_job
+        .events
+        .try_send(GenerationEvent::Finished {
+            reason: FinishReason::Stop,
+            input_tokens: 1,
+            cached_tokens: 0,
+            output_tokens: 1,
+            elapsed_ms: 1.0,
+            generation_elapsed_ms: 1.0,
+            time_to_first_token_ms: 0.0,
+        })
+        .unwrap();
+    let (status, _) = tokio::time::timeout(std::time::Duration::from_secs(1), fast)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+
+    let bytes = slow.into_body().collect().await.unwrap().to_bytes();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains("ended before completion"));
+    assert!(!text.contains("overflow"));
+}
+
+#[tokio::test]
+async fn interrupted_streams_report_failure_instead_of_silent_success() {
+    for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+        let (jobs, mut receiver) = mpsc::channel(1);
+        let app = router("test-model", jobs, RouteConfig::default());
+        let response = app.oneshot(generation_request(path, true)).await.unwrap();
+        let job = receiver.recv().await.unwrap();
+        job.events
+            .try_send(GenerationEvent::TextDelta("partial".to_owned()))
+            .unwrap();
+        drop(job);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("ended before completion"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn programmatic_shutdown_closes_the_listener() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (jobs, _receiver) = mpsc::channel(1);
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(resin_http::serve_with_shutdown(
+        listener,
+        "test-model",
+        jobs,
+        RouteConfig::default(),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
 }

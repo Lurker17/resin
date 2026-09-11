@@ -20,9 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     AppState,
-    protocol::{
-        ConversationRequest, GenerationEvent, GenerationJob, ResponseAccumulator, json_error,
-    },
+    protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error},
     ui::INDEX_HTML,
 };
 
@@ -108,8 +106,16 @@ pub async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-pub async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+pub async fn health(State(state): State<AppState>) -> Response {
+    if state.jobs.is_closed() {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "unavailable"})),
+        )
+            .into_response()
+    } else {
+        Json(json!({"status": "ok"})).into_response()
+    }
 }
 
 pub async fn models(State(state): State<AppState>) -> Json<Value> {
@@ -134,17 +140,12 @@ pub async fn chat_completions(
         Ok(request) => request,
         Err(response) => return *response,
     };
-    let (events, receiver) = mpsc::unbounded_channel();
-    if state
-        .jobs
-        .send(GenerationJob {
-            request: request.clone(),
-            events,
-        })
-        .is_err()
-    {
-        return internal_error("the inference engine is not running");
-    }
+    let receiver = match state.enqueue(request.clone()) {
+        Ok(receiver) => receiver,
+        Err((status, message)) => {
+            return (status, Json(json_error(message, "server_error"))).into_response();
+        }
+    };
     if stream {
         chat_stream(request, receiver, include_usage).into_response()
     } else {
@@ -186,7 +187,7 @@ fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<Conversati
 
 async fn chat_response(
     request: ConversationRequest,
-    mut receiver: mpsc::UnboundedReceiver<GenerationEvent>,
+    mut receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Response {
     let mut response = ResponseAccumulator::default();
     while let Some(event) = receiver.recv().await {
@@ -237,10 +238,11 @@ async fn chat_response(
 
 fn chat_stream(
     request: ConversationRequest,
-    mut receiver: mpsc::UnboundedReceiver<GenerationEvent>,
+    mut receiver: mpsc::Receiver<GenerationEvent>,
     include_usage: bool,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
     let output = stream! {
+        let mut terminated = false;
         let created = unix_seconds();
         let mut has_tool_calls = false;
         while let Some(event) = receiver.recv().await {
@@ -259,6 +261,7 @@ fn chat_stream(
                     "index": index, "function": {"arguments": delta}
                 }]}), None),
                 GenerationEvent::Finished { reason, input_tokens, cached_tokens, output_tokens, elapsed_ms, generation_elapsed_ms, time_to_first_token_ms } => {
+                    terminated = true;
                     let mut chunk = chat_chunk(&request, created, json!({}), Some(reason.openai(has_tool_calls)));
                     let tokens_per_second = if generation_elapsed_ms > 0.0 { output_tokens as f64 * 1000.0 / generation_elapsed_ms } else { 0.0 };
                     chunk["resin"] = json!({
@@ -284,11 +287,15 @@ fn chat_stream(
                     break;
                 }
                 GenerationEvent::Error { message } => {
+                    terminated = true;
                     yield Ok(Event::default().data(json_error(message, "server_error").to_string()));
                     break;
                 }
             };
             yield Ok(Event::default().data(value.to_string()));
+        }
+        if !terminated {
+            yield Ok(Event::default().data(json_error("the inference stream ended before completion", "server_error").to_string()));
         }
         yield Ok(Event::default().data("[DONE]"));
     };
@@ -319,17 +326,12 @@ pub async fn responses(
         Ok(request) => request,
         Err(response) => return *response,
     };
-    let (events, receiver) = mpsc::unbounded_channel();
-    if state
-        .jobs
-        .send(GenerationJob {
-            request: request.clone(),
-            events,
-        })
-        .is_err()
-    {
-        return internal_error("the inference engine is not running");
-    }
+    let receiver = match state.enqueue(request.clone()) {
+        Ok(receiver) => receiver,
+        Err((status, message)) => {
+            return (status, Json(json_error(message, "server_error"))).into_response();
+        }
+    };
     if stream {
         responses_stream(request, receiver).into_response()
     } else {
@@ -407,7 +409,7 @@ fn response_input_messages(input: Value) -> RequestResult<Vec<Value>> {
 
 async fn responses_response(
     request: ConversationRequest,
-    mut receiver: mpsc::UnboundedReceiver<GenerationEvent>,
+    mut receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Response {
     let mut accumulator = ResponseAccumulator::default();
     while let Some(event) = receiver.recv().await {
@@ -488,9 +490,10 @@ fn response_object(request: &ConversationRequest, response: &ResponseAccumulator
 
 fn responses_stream(
     request: ConversationRequest,
-    mut receiver: mpsc::UnboundedReceiver<GenerationEvent>,
+    mut receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
     let output = stream! {
+        let mut terminated = false;
         let mut sequence = 0_u64;
         let mut accumulator = ResponseAccumulator::default();
         let mut text_open = false;
@@ -533,6 +536,7 @@ fn responses_stream(
                     yield Ok(Event::default().data(event_json("response.function_call_arguments.delta", sequence, json!({"item_id": format!("fc_{}_{index}", &request.id[5..]), "output_index": output_index, "delta": delta})).to_string())); sequence += 1;
                 }
                 GenerationEvent::Finished { .. } => {
+                    terminated = true;
                     if reasoning_open {
                         let id = format!("rs_{}", &request.id[5..]);
                         yield Ok(Event::default().data(event_json("response.reasoning_summary_text.done", sequence, json!({"item_id": id, "output_index": 0, "summary_index": 0, "text": accumulator.reasoning})).to_string())); sequence += 1;
@@ -556,10 +560,14 @@ fn responses_stream(
                     break;
                 }
                 GenerationEvent::Error { message } => {
+                    terminated = true;
                     yield Ok(Event::default().data(event_json("error", sequence, json_error(message, "server_error")).to_string()));
                     break;
                 }
             }
+        }
+        if !terminated {
+            yield Ok(Event::default().data(event_json("error", sequence, json_error("the inference stream ended before completion", "server_error")).to_string()));
         }
     };
     Sse::new(output).keep_alive(KeepAlive::default())

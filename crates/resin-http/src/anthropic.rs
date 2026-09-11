@@ -16,9 +16,7 @@ use tokio::sync::mpsc;
 use crate::{
     AppState,
     openai::{RequestResult, invalid_request},
-    protocol::{
-        ConversationRequest, GenerationEvent, GenerationJob, ResponseAccumulator, json_error,
-    },
+    protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error},
 };
 
 #[derive(Debug, Deserialize)]
@@ -60,24 +58,12 @@ pub async fn messages(
         Ok(request) => request,
         Err(response) => return *response,
     };
-    let (events, receiver) = mpsc::unbounded_channel();
-    if state
-        .jobs
-        .send(GenerationJob {
-            request: request.clone(),
-            events,
-        })
-        .is_err()
-    {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json_error(
-                "the inference engine is not running",
-                "api_error",
-            )),
-        )
-            .into_response();
-    }
+    let receiver = match state.enqueue(request.clone()) {
+        Ok(receiver) => receiver,
+        Err((status, message)) => {
+            return (status, Json(json_error(message, "api_error"))).into_response();
+        }
+    };
     if stream {
         messages_stream(request, receiver).into_response()
     } else {
@@ -260,7 +246,7 @@ fn content_text(content: &Value) -> RequestResult<String> {
 
 async fn messages_response(
     request: ConversationRequest,
-    mut receiver: mpsc::UnboundedReceiver<GenerationEvent>,
+    mut receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Response {
     let mut response = ResponseAccumulator::default();
     while let Some(event) = receiver.recv().await {
@@ -313,9 +299,10 @@ async fn messages_response(
 
 fn messages_stream(
     request: ConversationRequest,
-    mut receiver: mpsc::UnboundedReceiver<GenerationEvent>,
+    mut receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
     let output = stream! {
+        let mut terminated = false;
         let mut input_tokens = 0;
         let mut block_index = 0_usize;
         let mut reasoning_open = false;
@@ -372,6 +359,7 @@ fn messages_stream(
                     yield named_event("content_block_delta", json!({"type": "content_block_delta", "index": wire_index, "delta": {"type": "input_json_delta", "partial_json": delta}}));
                 }
                 GenerationEvent::Finished { reason, output_tokens, .. } => {
+                    terminated = true;
                     if reasoning_open || text_open {
                         yield named_event("content_block_stop", json!({"type": "content_block_stop", "index": block_index}));
                     }
@@ -383,10 +371,14 @@ fn messages_stream(
                     break;
                 }
                 GenerationEvent::Error { message } => {
+                    terminated = true;
                     yield named_event("error", json!({"type": "error", "error": {"type": "api_error", "message": message}}));
                     break;
                 }
             }
+        }
+        if !terminated {
+            yield named_event("error", json!({"type": "error", "error": {"type": "api_error", "message": "the inference stream ended before completion"}}));
         }
     };
     Sse::new(output).keep_alive(KeepAlive::default())

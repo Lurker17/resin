@@ -24,7 +24,15 @@ if TYPE_CHECKING:
 
 
 class RendererCodec(ConversationCodec):
-    """Adapt a ``renderers.Renderer`` to Resin's streaming server contract."""
+    """Adapt a ``renderers.Renderer`` to Resin's streaming server contract.
+
+    ``renderers`` 0.1.9 exposes whole-response parsing only. This adapter
+    reparses accumulated tokens on each feed and emits newly available fields;
+    long responses can therefore require quadratic parsing work on the engine
+    actor. A codec with its own incremental ``ResponseParser`` can avoid that
+    cost. There is no upstream incremental parser or final-flush API to delegate
+    to in the pinned dependency.
+    """
 
     def __init__(
         self,
@@ -226,9 +234,18 @@ class HttpServer:
         return self._native.running
 
     def serve(self, *, host: str = "127.0.0.1", port: int = 8000) -> None:
-        """Block while serving requests, stopping gracefully on Ctrl-C."""
+        """Block while serving, until Ctrl-C or another thread calls shutdown."""
 
         self._native.serve(host=host, port=port)
+
+    def shutdown(self) -> None:
+        """Request shutdown after the current inference step finishes.
+
+        This does not block the caller. Join the thread running ``serve()`` to
+        wait for shutdown; active requests are cancelled and the Engine closes.
+        """
+
+        self._native.shutdown()
 
 
 __all__ = [

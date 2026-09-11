@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -12,11 +15,14 @@ use pyo3::{
     types::PyDict,
 };
 use pythonize::{depythonize, pythonize};
-use resin_http::{FinishReason, GenerationEvent, GenerationJob, RouteConfig};
+use resin_http::{FinishReason, GenerationEvent, GenerationJob, JOB_QUEUE_CAPACITY, RouteConfig};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{CompletionReason, Engine, RequestLease, SamplingParams};
+
+const MAX_ACTIVE_REQUESTS: usize = 128;
+const ADMISSIONS_PER_STEP: usize = 4;
 
 #[derive(Debug, Deserialize)]
 struct RenderedPrompt {
@@ -63,7 +69,7 @@ impl ParsedEvent {
 struct ActiveRequest {
     lease: Py<RequestLease>,
     parser: Py<PyAny>,
-    events: mpsc::UnboundedSender<GenerationEvent>,
+    events: mpsc::Sender<GenerationEvent>,
     started: Instant,
     first_token_at: Option<Instant>,
     input_tokens: usize,
@@ -78,6 +84,7 @@ pub(crate) struct NativeHttpServer {
     model: String,
     routes: RouteConfig,
     running: AtomicBool,
+    shutdown: Mutex<Option<watch::Sender<bool>>>,
 }
 
 #[pymethods]
@@ -118,6 +125,7 @@ impl NativeHttpServer {
                 enable_demo,
             },
             running: AtomicBool::new(false),
+            shutdown: Mutex::new(None),
         })
     }
 
@@ -126,16 +134,44 @@ impl NativeHttpServer {
         let host = host.parse::<IpAddr>().map_err(|_| {
             PyValueError::new_err("host must be an IPv4 or IPv6 address such as '0.0.0.0'")
         })?;
-        if self.running.swap(true, Ordering::AcqRel) {
-            return Err(PyRuntimeError::new_err("HttpServer is already running"));
+        let (shutdown, _) = watch::channel(false);
+        {
+            let mut slot = self
+                .shutdown
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if self.running.swap(true, Ordering::AcqRel) {
+                return Err(PyRuntimeError::new_err("HttpServer is already running"));
+            }
+            *slot = Some(shutdown.clone());
         }
         let engine = self.engine.clone_ref(py);
         let codec = self.codec.clone_ref(py);
         let model = self.model.clone();
         let routes = self.routes;
-        let result = py.detach(move || run_server(engine, codec, model, routes, host, port));
-        self.running.store(false, Ordering::Release);
+        let result =
+            py.detach(move || run_server(engine, codec, model, routes, host, port, shutdown));
+        {
+            let mut slot = self
+                .shutdown
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *slot = None;
+            self.running.store(false, Ordering::Release);
+        }
         result.map_err(PyRuntimeError::new_err)
+    }
+
+    /// Request shutdown from another thread; serve returns after the current
+    /// inference step has finished and its requests have been cancelled.
+    fn shutdown(&self) {
+        let slot = self
+            .shutdown
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(shutdown) = slot.as_ref() {
+            shutdown.send_replace(true);
+        }
     }
 
     #[getter]
@@ -167,6 +203,7 @@ fn run_server(
     routes: RouteConfig,
     host: IpAddr,
     port: u16,
+    shutdown: watch::Sender<bool>,
 ) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -175,18 +212,39 @@ fn run_server(
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind((host, port)))
         .map_err(|error| format!("failed to bind {host}:{port}: {error}"))?;
-    let (jobs, receiver) = mpsc::unbounded_channel();
+    let (jobs, receiver) = mpsc::channel(JOB_QUEUE_CAPACITY);
+    let actor_shutdown = shutdown.subscribe();
+    let (actor_finished, actor_done) = oneshot::channel();
     let actor = thread::Builder::new()
         .name("resin-http-engine".to_owned())
         .spawn(move || {
-            let result = engine_actor(engine, codec, receiver);
+            let result = engine_actor(engine, codec, receiver, actor_shutdown);
             if let Err(error) = &result {
                 eprintln!("[resin-http] inference actor failed: {error}");
             }
+            let _ = actor_finished.send(());
             result
         })
         .map_err(|error| format!("failed to start the inference thread: {error}"))?;
-    let server_result = runtime.block_on(resin_http::serve(listener, model, jobs, routes));
+    let mut stopping = shutdown.subscribe();
+    let stop_actor = shutdown.clone();
+    let server_result = runtime.block_on(resin_http::serve_with_shutdown(
+        listener,
+        model,
+        jobs,
+        routes,
+        async move {
+            if !*stopping.borrow() {
+                tokio::select! {
+                    _ = actor_done => {},
+                    _ = stopping.changed() => {},
+                    _ = tokio::signal::ctrl_c() => {},
+                }
+            }
+            stop_actor.send_replace(true);
+        },
+    ));
+    shutdown.send_replace(true);
     let actor_result = actor
         .join()
         .map_err(|_| "the inference thread panicked".to_owned())?;
@@ -198,18 +256,24 @@ fn run_server(
 fn engine_actor(
     engine: Py<Engine>,
     codec: Py<PyAny>,
-    mut jobs: mpsc::UnboundedReceiver<GenerationJob>,
+    mut jobs: mpsc::Receiver<GenerationJob>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<(), String> {
     let mut active = HashMap::<u64, ActiveRequest>::new();
     let mut disconnected = false;
-    loop {
-        if active.is_empty() && !disconnected && !engine_has_work(&engine)? {
-            match jobs.blocking_recv() {
-                Some(job) => admit(&engine, &codec, job, &mut active),
-                None => disconnected = true,
-            }
+    Python::attach(|py| {
+        let engine = engine.bind(py).borrow();
+        if engine.closed() || engine.poisoned() {
+            Err("the inference engine is closed or poisoned".to_owned())
+        } else {
+            Ok(())
         }
-        while !disconnected {
+    })?;
+    loop {
+        for _ in 0..ADMISSIONS_PER_STEP {
+            if disconnected || *shutdown.borrow() || active.len() >= MAX_ACTIVE_REQUESTS {
+                break;
+            }
             match jobs.try_recv() {
                 Ok(job) => admit(&engine, &codec, job, &mut active),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -219,7 +283,7 @@ fn engine_actor(
                 }
             }
         }
-        if disconnected {
+        if disconnected || *shutdown.borrow() {
             Python::attach(|py| {
                 let mut engine = engine.bind(py).borrow_mut();
                 for request in active.values() {
@@ -231,6 +295,10 @@ fn engine_actor(
             return Ok(());
         }
         cancel_disconnected(&engine, &mut active)?;
+        if active.is_empty() && !engine_has_work(&engine)? {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
         let token_events = Python::attach(|py| {
             let mut engine = engine.bind(py).borrow_mut();
             engine.step(py).map(|events| {
@@ -263,33 +331,36 @@ fn engine_actor(
             request.first_token_at.get_or_insert_with(Instant::now);
             request.output_tokens += tokens.len();
             let token_ids = tokens.iter().map(|(token, _)| *token).collect::<Vec<_>>();
-            match parser_events(&request.parser, &token_ids) {
-                Ok(events) => {
-                    for event in events {
-                        let _ = request.events.send(event.into_http());
-                    }
-                }
+            let delivered = match parser_events(&request.parser, &token_ids) {
+                Ok(events) => events
+                    .into_iter()
+                    .all(|event| request.events.try_send(event.into_http()).is_ok()),
                 Err(error) => {
-                    let _ = request.events.send(GenerationEvent::Error {
+                    let _ = request.events.try_send(GenerationEvent::Error {
                         message: format_python_error("response parser failed", error),
                     });
-                    Python::attach(|py| {
-                        engine
-                            .bind(py)
-                            .borrow_mut()
-                            .cancel(py, request.lease.bind(py).borrow())
-                    })
-                    .map_err(|error| format_python_error("request cancellation failed", error))?;
-                    active.remove(&request_id);
-                    continue;
+                    false
                 }
+            };
+            if !delivered {
+                // A full output queue belongs to this client only. Never wait
+                // for it from the one inference actor and stall every request.
+                Python::attach(|py| {
+                    engine
+                        .bind(py)
+                        .borrow_mut()
+                        .cancel(py, request.lease.bind(py).borrow())
+                })
+                .map_err(|error| format_python_error("request cancellation failed", error))?;
+                active.remove(&request_id);
+                continue;
             }
             if let Some(reason) = tokens.iter().find_map(|(_, reason)| *reason) {
                 let reason = match reason {
                     CompletionReason::Stop => FinishReason::Stop,
                     CompletionReason::Length => FinishReason::Length,
                 };
-                let _ = request.events.send(GenerationEvent::Finished {
+                let _ = request.events.try_send(GenerationEvent::Finished {
                     reason,
                     input_tokens: request.input_tokens,
                     cached_tokens: request.cached_tokens,
@@ -358,14 +429,16 @@ fn admit(
             media,
         )?;
         let lease_ref = lease.bind(py).borrow();
-        let request_id = lease_ref.request_id;
+        let request_id = lease_ref.request_id();
         let cached_tokens = lease_ref.cached_tokens() as usize;
         drop(lease_ref);
         Ok::<_, PyErr>((request_id, lease, parser, input_tokens, cached_tokens))
     });
     match result {
         Ok((request_id, lease, parser, input_tokens, cached_tokens)) => {
-            let _ = job.events.send(GenerationEvent::Started { input_tokens });
+            let _ = job
+                .events
+                .try_send(GenerationEvent::Started { input_tokens });
             active.insert(
                 request_id,
                 ActiveRequest {
@@ -381,7 +454,7 @@ fn admit(
             );
         }
         Err(error) => {
-            let _ = job.events.send(GenerationEvent::Error {
+            let _ = job.events.try_send(GenerationEvent::Error {
                 message: format_python_error("request admission failed", error),
             });
         }

@@ -3,19 +3,27 @@ mod openai;
 mod protocol;
 mod ui;
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    future::{Future, IntoFuture},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use axum::{
     Router,
     extract::DefaultBodyLimit,
+    http::StatusCode,
     routing::{get, post},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 pub use protocol::{ConversationRequest, FinishReason, GenerationEvent, GenerationJob};
+
+pub const JOB_QUEUE_CAPACITY: usize = 32;
+pub const EVENT_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RouteConfig {
@@ -36,7 +44,7 @@ impl Default for RouteConfig {
 
 #[derive(Clone)]
 struct AppState {
-    jobs: mpsc::UnboundedSender<GenerationJob>,
+    jobs: mpsc::Sender<GenerationJob>,
     model: Arc<str>,
     next_id: Arc<AtomicU64>,
 }
@@ -46,11 +54,29 @@ impl AppState {
         let sequence = self.next_id.fetch_add(1, Ordering::Relaxed);
         format!("{prefix}_{sequence:016x}")
     }
+
+    fn enqueue(
+        &self,
+        request: ConversationRequest,
+    ) -> Result<mpsc::Receiver<GenerationEvent>, (StatusCode, &'static str)> {
+        let (events, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+        match self.jobs.try_send(GenerationJob { request, events }) {
+            Ok(()) => Ok(receiver),
+            Err(mpsc::error::TrySendError::Full(_)) => Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "the inference request queue is full; retry later",
+            )),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the inference engine is not running",
+            )),
+        }
+    }
 }
 
 pub fn router(
     model: impl Into<Arc<str>>,
-    jobs: mpsc::UnboundedSender<GenerationJob>,
+    jobs: mpsc::Sender<GenerationJob>,
     routes: RouteConfig,
 ) -> Router {
     let state = AppState {
@@ -79,12 +105,39 @@ pub fn router(
 pub async fn serve(
     listener: tokio::net::TcpListener,
     model: impl Into<Arc<str>>,
-    jobs: mpsc::UnboundedSender<GenerationJob>,
+    jobs: mpsc::Sender<GenerationJob>,
     routes: RouteConfig,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(model, jobs, routes))
+    serve_with_shutdown(listener, model, jobs, routes, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+}
+
+/// Stop accepting connections when requested and bound the time spent draining
+/// existing HTTP connections. The hosting runtime may then be dropped even if
+/// a client has stopped reading its response.
+pub async fn serve_with_shutdown(
+    listener: tokio::net::TcpListener,
+    model: impl Into<Arc<str>>,
+    jobs: mpsc::Sender<GenerationJob>,
+    routes: RouteConfig,
+    shutdown: impl Future<Output = ()>,
+) -> std::io::Result<()> {
+    let (stop, stopped) = oneshot::channel::<()>();
+    let server = axum::serve(listener, router(model, jobs, routes))
         .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+            let _ = stopped.await;
         })
-        .await
+        .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        () = shutdown => {
+            let _ = stop.send(());
+            tokio::time::timeout(Duration::from_secs(5), &mut server)
+                .await
+                .unwrap_or(Ok(()))
+        }
+    }
 }

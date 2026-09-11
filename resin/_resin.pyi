@@ -564,3 +564,8 @@ class _HttpServer:
     @property
     def running(self, /) -> bool: ...
     def serve(self, /, *, host: str = "127.0.0.1", port: int = 8000) -> None: ...
+    def shutdown(self, /) -> None:
+        """
+        Request shutdown from another thread; serve returns after the current
+        inference step has finished and its requests have been cancelled.
+        """

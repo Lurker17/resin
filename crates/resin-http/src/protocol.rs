@@ -86,7 +86,7 @@ pub enum GenerationEvent {
 #[derive(Debug)]
 pub struct GenerationJob {
     pub request: ConversationRequest,
-    pub events: mpsc::UnboundedSender<GenerationEvent>,
+    pub events: mpsc::Sender<GenerationEvent>,
 }
 
 #[derive(Debug, Default)]
