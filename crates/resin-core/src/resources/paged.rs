@@ -6,10 +6,11 @@
 //! page-table policy, prefix identity, and device byte layout deliberately live
 //! outside this module.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -100,6 +101,9 @@ impl GroupDemand {
 pub struct GroupTable<R> {
     group: GroupId,
     pages: Vec<R>,
+    /// A non-owning hint for sharing an unchanged published prefix. Ownership
+    /// stays exclusively with cache snapshots, so eviction can reclaim it.
+    snapshot: Weak<CachedSegment>,
 }
 
 impl<R> GroupTable<R> {
@@ -137,12 +141,91 @@ impl PageRef {
 #[must_use = "cached pages must be retired through their issuing pool"]
 pub struct CachedPages {
     pool_id: u64,
-    groups: Vec<GroupTable<PageRef>>,
+    groups: Vec<CachedGroupTable>,
 }
 
 impl CachedPages {
-    pub fn groups(&self) -> &[GroupTable<PageRef>] {
+    pub fn groups(&self) -> &[CachedGroupTable] {
         &self.groups
+    }
+}
+
+/// An immutable page table whose earlier segments may belong to several
+/// checkpoints. A physical cache reference belongs to a segment, not to every
+/// snapshot of the growing table.
+#[derive(Debug)]
+pub struct CachedGroupTable {
+    group: GroupId,
+    tail: Option<Arc<CachedSegment>>,
+}
+
+impl CachedGroupTable {
+    pub const fn group(&self) -> GroupId {
+        self.group
+    }
+
+    pub fn len(&self) -> usize {
+        self.tail.as_ref().map_or(0, |tail| tail.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tail.is_none()
+    }
+
+    /// Segments in reverse chronological order, with their absolute table
+    /// offsets. No temporary flattened table is allocated.
+    pub fn segments(&self) -> impl Iterator<Item = (usize, &[PageRef])> {
+        cached_segments(self.tail.as_deref())
+            .map(|segment| (segment.start, segment.pages.as_slice()))
+    }
+
+    fn pages_rev(&self) -> impl Iterator<Item = &PageRef> {
+        self.segments().flat_map(|(_, pages)| pages.iter().rev())
+    }
+}
+
+struct CachedSegment {
+    start: usize,
+    pages: Vec<PageRef>,
+    previous: Option<Arc<CachedSegment>>,
+}
+
+impl fmt::Debug for CachedSegment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CachedSegment")
+            .field("start", &self.start)
+            .field("pages", &self.pages)
+            .field(
+                "previous_len",
+                &self.previous.as_ref().map(|previous| previous.len()),
+            )
+            .finish()
+    }
+}
+
+impl CachedSegment {
+    fn len(&self) -> usize {
+        self.start + self.pages.len()
+    }
+}
+
+fn cached_segments(tail: Option<&CachedSegment>) -> impl Iterator<Item = &CachedSegment> {
+    std::iter::successors(tail, |segment| segment.previous.as_deref())
+}
+
+impl Drop for CachedSegment {
+    fn drop(&mut self) {
+        // Explicit pool retirement handles physical refs. Even when an owner
+        // is abandoned or the entire engine is dropped, free metadata without
+        // recursing through a potentially long checkpoint chain.
+        let mut previous = self.previous.take();
+        while let Some(segment) = previous {
+            match Arc::try_unwrap(segment) {
+                Ok(mut segment) => previous = segment.previous.take(),
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -264,6 +347,10 @@ pub enum CachePoolError {
         requested: usize,
         available: usize,
     },
+    InvalidWriteSpan {
+        requested: u32,
+        maximum: u32,
+    },
     ParentGenerationExhausted {
         parent: u32,
     },
@@ -315,6 +402,10 @@ impl fmt::Display for CachePoolError {
                 formatter,
                 "cache group {} requested {requested} blocks but only {available} fit",
                 group.index()
+            ),
+            Self::InvalidWriteSpan { requested, maximum } => write!(
+                formatter,
+                "cache write span {requested} exceeds window-safe maximum {maximum}"
             ),
             Self::ParentGenerationExhausted { parent } => {
                 write!(formatter, "cache parent {parent} generation is exhausted")
@@ -633,6 +724,10 @@ pub struct CachePool {
     /// priority. Capacity is fixed up front for allocation-free teardown.
     partial_parents: Vec<u32>,
     occupied_blocks: usize,
+    /// Reused for linear ownership validation. Capacity grows before request
+    /// tables grow, so validation and retirement never allocate. The mutex
+    /// preserves read-only validation through a shared pool reference.
+    validation_handles: Mutex<HashSet<PageHandle>>,
 }
 
 impl CachePool {
@@ -688,6 +783,7 @@ impl CachePool {
             free_parents,
             partial_parents,
             occupied_blocks: 0,
+            validation_handles: Mutex::new(HashSet::new()),
         })
     }
 
@@ -747,6 +843,7 @@ impl CachePool {
         self.occupied_blocks
             .checked_add(total_blocks)
             .ok_or(CachePoolError::DemandOverflow)?;
+        self.prepare_validation_capacity(total_blocks)?;
 
         let mut groups = Vec::new();
         groups
@@ -760,6 +857,7 @@ impl CachePool {
             groups.push(GroupTable {
                 group: demand.group,
                 pages,
+                snapshot: Weak::new(),
             });
         }
 
@@ -830,6 +928,12 @@ impl CachePool {
         {
             return Err(CachePoolError::StaleHandle);
         }
+        let request_blocks = demands.iter().try_fold(0usize, |total, demand| {
+            total
+                .checked_add(demand.blocks)
+                .ok_or(CachePoolError::DemandOverflow)
+        })?;
+        self.prepare_validation_capacity(request_blocks)?;
         let mut total_blocks = 0usize;
         let mut additions = Vec::new();
         additions
@@ -854,6 +958,7 @@ impl CachePool {
             additions.push(GroupTable {
                 group: demand.group,
                 pages,
+                snapshot: Weak::new(),
             });
         }
         if total_blocks == 0 {
@@ -913,35 +1018,63 @@ impl CachePool {
         {
             return Err(CachePoolError::StaleHandle);
         }
-        for (demand, group) in demands.iter().zip(&request.groups) {
-            for page in &group.pages[..demand.blocks] {
-                if self.validate_live_handle(page.handle)?.request_refs == u32::MAX {
-                    return Err(CachePoolError::DemandOverflow);
-                }
-            }
-        }
-
         let mut groups = Vec::new();
         groups
             .try_reserve_exact(demands.len())
             .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let mut shared_lengths = Vec::new();
+        shared_lengths
+            .try_reserve_exact(demands.len())
+            .map_err(|_| CachePoolError::MetadataAllocation)?;
         for (demand, source) in demands.iter().zip(&request.groups) {
-            let mut pages = Vec::new();
-            pages
-                .try_reserve_exact(demand.blocks)
-                .map_err(|_| CachePoolError::MetadataAllocation)?;
-            pages.extend(source.pages[..demand.blocks].iter().map(|page| PageRef {
-                handle: page.handle,
-                writable: false,
-            }));
-            groups.push(GroupTable {
+            // Append-only growth preserves this prefix. Replacement and reset
+            // invalidate the private hint before changing existing positions,
+            // so publishing never has to compare the entire ancestor chain.
+            let previous = source
+                .snapshot
+                .upgrade()
+                .filter(|tail| tail.len() <= demand.blocks);
+            let shared = previous.as_ref().map_or(0, |tail| tail.len());
+            for page in &source.pages[shared..demand.blocks] {
+                if self.validate_live_handle(page.handle)?.request_refs == u32::MAX {
+                    return Err(CachePoolError::DemandOverflow);
+                }
+            }
+            let tail = if shared == demand.blocks {
+                previous
+            } else {
+                let mut pages = Vec::new();
+                pages
+                    .try_reserve_exact(demand.blocks - shared)
+                    .map_err(|_| CachePoolError::MetadataAllocation)?;
+                pages.extend(
+                    source.pages[shared..demand.blocks]
+                        .iter()
+                        .map(|page| PageRef {
+                            handle: page.handle,
+                            writable: false,
+                        }),
+                );
+                Some(Arc::new(CachedSegment {
+                    start: shared,
+                    pages,
+                    previous,
+                }))
+            };
+            shared_lengths.push(shared);
+            groups.push(CachedGroupTable {
                 group: demand.group,
-                pages,
+                tail,
             });
         }
 
-        for (demand, source) in demands.iter().zip(&mut request.groups) {
-            for page in &mut source.pages[..demand.blocks] {
+        for (((demand, source), shared), cached) in demands
+            .iter()
+            .zip(&mut request.groups)
+            .zip(shared_lengths)
+            .zip(&groups)
+        {
+            for page in &mut source.pages[shared..demand.blocks] {
                 let slot = self.slot_mut(page.handle);
                 match slot.mode {
                     Some(PageMode::Mutable { writer }) => {
@@ -956,6 +1089,7 @@ impl CachePool {
                 }
                 slot.request_refs += 1;
             }
+            source.snapshot = cached.tail.as_ref().map(Arc::downgrade).unwrap_or_default();
         }
         Ok(CachedPages {
             pool_id: self.id,
@@ -977,7 +1111,7 @@ impl CachePool {
             if target.group != source.group || !target.pages.is_empty() {
                 return Err(CachePoolError::StaleHandle);
             }
-            for page in &source.pages {
+            for page in source.pages_rev() {
                 let slot = self.validate_live_handle(page.handle)?;
                 if slot.mode != Some(PageMode::Shared) || page.writable {
                     return Err(CachePoolError::StaleHandle);
@@ -990,17 +1124,25 @@ impl CachePool {
         for (target, source) in request.groups.iter_mut().zip(&cached.groups) {
             target
                 .pages
-                .try_reserve_exact(source.pages.len())
+                .try_reserve_exact(source.len())
                 .map_err(|_| CachePoolError::MetadataAllocation)?;
         }
+        let request_blocks = cached.groups.iter().try_fold(0usize, |total, group| {
+            total
+                .checked_add(group.len())
+                .ok_or(CachePoolError::DemandOverflow)
+        })?;
+        self.prepare_validation_capacity(request_blocks)?;
         for (target, source) in request.groups.iter_mut().zip(&cached.groups) {
-            for page in &source.pages {
+            for page in source.pages_rev() {
                 self.slot_mut(page.handle).request_refs += 1;
                 target.pages.push(PageRef {
                     handle: page.handle,
                     writable: false,
                 });
             }
+            target.pages.reverse();
+            target.snapshot = source.tail.as_ref().map(Arc::downgrade).unwrap_or_default();
         }
         Ok(())
     }
@@ -1010,17 +1152,36 @@ impl CachePool {
             return Err(CachePoolError::ForeignPool);
         }
         for group in &cached.groups {
-            for page in &group.pages {
-                let slot = self.validate_live_handle(page.handle)?;
-                if slot.mode != Some(PageMode::Shared) || page.writable || slot.request_refs == 0 {
-                    return Err(CachePoolError::StaleHandle);
+            let mut current = group.tail.as_ref();
+            while let Some(segment) = current {
+                if Arc::strong_count(segment) != 1 {
+                    break;
                 }
+                for page in &segment.pages {
+                    let slot = self.validate_live_handle(page.handle)?;
+                    if slot.mode != Some(PageMode::Shared)
+                        || page.writable
+                        || slot.request_refs == 0
+                    {
+                        return Err(CachePoolError::StaleHandle);
+                    }
+                }
+                current = segment.previous.as_ref();
             }
         }
-        for group in cached.groups.iter().rev() {
-            for page in group.pages.iter().rev() {
-                self.slot_mut(page.handle).request_refs -= 1;
-                self.retire_slot_if_unused(page.handle);
+        for group in cached.groups.into_iter().rev() {
+            let mut current = group.tail;
+            while let Some(segment) = current {
+                match Arc::try_unwrap(segment) {
+                    Ok(mut segment) => {
+                        for page in segment.pages.iter().rev() {
+                            self.slot_mut(page.handle).request_refs -= 1;
+                            self.retire_slot_if_unused(page.handle);
+                        }
+                        current = segment.previous.take();
+                    }
+                    Err(_) => break,
+                }
             }
         }
         Ok(())
@@ -1074,6 +1235,7 @@ impl CachePool {
             additions.push(GroupTable {
                 group: group.group,
                 pages,
+                snapshot: Weak::new(),
             });
         }
 
@@ -1104,6 +1266,9 @@ impl CachePool {
         for ((indices, group), additions) in
             replacements.iter().zip(&mut request.groups).zip(additions)
         {
+            if !indices.is_empty() {
+                group.snapshot = Weak::new();
+            }
             for (&index, replacement) in indices.iter().zip(additions.pages) {
                 let old = std::mem::replace(&mut group.pages[index], replacement);
                 debug_assert!(!old.writable);
@@ -1118,6 +1283,7 @@ impl CachePool {
     pub fn clear_request(&mut self, request: &mut RequestPages) -> Result<(), CachePoolError> {
         self.validate_request_idle(request)?;
         for group in request.groups.iter_mut().rev() {
+            group.snapshot = Weak::new();
             for page in group.pages.drain(..).rev() {
                 let slot = self.slot_mut(page.handle);
                 debug_assert_ne!(slot.request_refs, 0);
@@ -1408,7 +1574,7 @@ impl CachePool {
         if request.pool_id != self.id {
             return Err(CachePoolError::ForeignPool);
         }
-        if Self::has_duplicate_request_handle(request) {
+        if self.has_duplicate_request_handle(request)? {
             return Err(CachePoolError::DuplicateHandle);
         }
         for group in &request.groups {
@@ -1445,24 +1611,38 @@ impl CachePool {
         Ok(())
     }
 
-    fn has_duplicate_request_handle(request: &RequestPages) -> bool {
-        for (group_index, group) in request.groups.iter().enumerate() {
-            for (page_index, page) in group.pages.iter().enumerate() {
-                if group.pages[page_index + 1..]
-                    .iter()
-                    .any(|later| later.handle == page.handle)
-                {
-                    return true;
-                }
-                if request.groups[group_index + 1..]
-                    .iter()
-                    .any(|later| later.pages.iter().any(|entry| entry.handle == page.handle))
-                {
-                    return true;
-                }
+    fn prepare_validation_capacity(&mut self, count: usize) -> Result<(), CachePoolError> {
+        let handles = self
+            .validation_handles
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        handles.clear();
+        handles
+            .try_reserve(count)
+            .map_err(|_| CachePoolError::MetadataAllocation)
+    }
+
+    fn has_duplicate_request_handle(&self, request: &RequestPages) -> Result<bool, CachePoolError> {
+        let mut handles = self
+            .validation_handles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        handles.clear();
+        for page in request.groups.iter().flat_map(|group| &group.pages) {
+            // An allocator-issued request always fits the preallocated table.
+            // Reject internally forged excess owners without allocating here.
+            if handles.len() == handles.capacity() {
+                return if handles.contains(&page.handle) {
+                    Ok(true)
+                } else {
+                    Err(CachePoolError::StaleHandle)
+                };
+            }
+            if !handles.insert(page.handle) {
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
     fn validate_writer_claim(&self, claim: PageAccessClaim) -> Result<(), CachePoolError> {
@@ -1647,6 +1827,192 @@ mod tests {
             .iter()
             .flat_map(|group| group.pages().iter().map(|page| request.access_claim(page)))
             .collect()
+    }
+
+    #[test]
+    fn growing_checkpoints_share_linear_metadata_and_reclaim_after_last_owner() {
+        let mut pool = CachePool::new(512, &[nz(1)]).unwrap();
+        let pending = pool
+            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 0)])
+            .unwrap();
+        let mut request = pool.promote_request(pending);
+        let mut snapshots = Vec::new();
+        for count in 1..=512 {
+            let demands = [GroupDemand::new(GroupId::new(0), count)];
+            pool.grow_request(&mut request, &demands).unwrap();
+            snapshots.push(pool.share_request_prefix(&mut request, &demands).unwrap());
+        }
+        let mut segments = HashSet::new();
+        let mut stored_pages = 0;
+        for snapshot in &snapshots {
+            for segment in cached_segments(snapshot.groups[0].tail.as_deref()) {
+                if segments.insert(std::ptr::from_ref(segment)) {
+                    stored_pages += segment.pages.len();
+                }
+            }
+        }
+        assert_eq!(segments.len(), 512);
+        assert_eq!(stored_pages, 512);
+        for page in &request.groups[0].pages {
+            assert_eq!(
+                pool.validate_live_handle(page.handle).unwrap().request_refs,
+                2
+            );
+        }
+        let expected = request_handles(&request);
+        let validation_capacity = pool.validation_handles.lock().unwrap().capacity();
+        let last = snapshots.pop().unwrap();
+        pool.retire_request(request).unwrap();
+        for snapshot in snapshots {
+            pool.retire_cached_prefix(snapshot).unwrap();
+            assert_eq!(pool.occupied_block_count(), 512);
+        }
+
+        let pending = pool
+            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 0)])
+            .unwrap();
+        let mut restored = pool.promote_request(pending);
+        pool.attach_shared_prefix(&mut restored, &last).unwrap();
+        assert_eq!(request_handles(&restored), expected);
+        pool.retire_cached_prefix(last).unwrap();
+        assert_eq!(pool.occupied_block_count(), 512);
+        pool.retire_request(restored).unwrap();
+        assert_eq!(pool.free_parent_count(), 512);
+        assert_eq!(
+            pool.validation_handles.lock().unwrap().capacity(),
+            validation_capacity
+        );
+    }
+
+    #[test]
+    fn branched_checkpoints_keep_shared_ancestors_until_both_branches_retire() {
+        let mut pool = CachePool::new(10, &[nz(1)]).unwrap();
+        let pending = pool
+            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 2)])
+            .unwrap();
+        let mut base = pool.promote_request(pending);
+        let snapshot = pool
+            .share_request_prefix(&mut base, &[GroupDemand::new(GroupId::new(0), 2)])
+            .unwrap();
+        let mut branches = Vec::new();
+        for id in 2..=3 {
+            let pending = pool
+                .reserve_request(sequence(id), &[GroupDemand::new(GroupId::new(0), 0)])
+                .unwrap();
+            let mut request = pool.promote_request(pending);
+            pool.attach_shared_prefix(&mut request, &snapshot).unwrap();
+            pool.grow_request(&mut request, &[GroupDemand::new(GroupId::new(0), 3)])
+                .unwrap();
+            let cached = pool
+                .share_request_prefix(&mut request, &[GroupDemand::new(GroupId::new(0), 3)])
+                .unwrap();
+            branches.push((request, cached));
+        }
+        pool.retire_request(base).unwrap();
+        pool.retire_cached_prefix(snapshot).unwrap();
+        assert_eq!(pool.occupied_block_count(), 4);
+        let (request, cached) = branches.pop().unwrap();
+        pool.retire_request(request).unwrap();
+        pool.retire_cached_prefix(cached).unwrap();
+        assert_eq!(pool.occupied_block_count(), 3);
+        let (request, cached) = branches.pop().unwrap();
+        pool.retire_cached_prefix(cached).unwrap();
+        assert_eq!(pool.occupied_block_count(), 3);
+        pool.retire_request(request).unwrap();
+        assert_eq!(pool.occupied_block_count(), 0);
+    }
+
+    #[test]
+    fn cyclic_replacement_starts_a_new_snapshot_without_reusing_stale_prefixes() {
+        let mut pool = CachePool::new(8, &[nz(1)]).unwrap();
+        let demands = [GroupDemand::new(GroupId::new(0), 3)];
+        let pending = pool.reserve_request(sequence(1), &demands).unwrap();
+        let mut request = pool.promote_request(pending);
+        let old = pool.share_request_prefix(&mut request, &demands).unwrap();
+        let old_handles = request_handles(&request);
+        pool.replace_shared_pages(&mut request, &[vec![0]]).unwrap();
+        assert!(request.groups[0].snapshot.upgrade().is_none());
+        let new = pool.share_request_prefix(&mut request, &demands).unwrap();
+        assert!(new.groups[0].tail.as_ref().unwrap().previous.is_none());
+        assert_ne!(request_handles(&request)[0], old_handles[0]);
+        pool.retire_cached_prefix(old).unwrap();
+        assert_eq!(pool.occupied_block_count(), 3);
+        pool.retire_request(request).unwrap();
+        pool.retire_cached_prefix(new).unwrap();
+        assert_eq!(pool.occupied_block_count(), 0);
+    }
+
+    #[test]
+    fn evicted_snapshot_hint_cannot_resurrect_retired_ownership() {
+        let mut pool = CachePool::new(3, &[nz(1)]).unwrap();
+        let demands = [GroupDemand::new(GroupId::new(0), 2)];
+        let pending = pool.reserve_request(sequence(1), &demands).unwrap();
+        let mut request = pool.promote_request(pending);
+        let snapshot = pool.share_request_prefix(&mut request, &demands).unwrap();
+        pool.retire_cached_prefix(snapshot).unwrap();
+        assert!(request.groups[0].snapshot.upgrade().is_none());
+        let replacement = pool.share_request_prefix(&mut request, &demands).unwrap();
+        for page in &request.groups[0].pages {
+            assert_eq!(
+                pool.validate_live_handle(page.handle).unwrap().request_refs,
+                2
+            );
+        }
+        pool.retire_request(request).unwrap();
+        pool.retire_cached_prefix(replacement).unwrap();
+        assert_eq!(pool.free_parent_count(), 3);
+    }
+
+    #[test]
+    fn republishing_the_same_checkpoint_reuses_its_segment_ownership() {
+        let mut pool = CachePool::new(2, &[nz(1)]).unwrap();
+        let demands = [GroupDemand::new(GroupId::new(0), 2)];
+        let pending = pool.reserve_request(sequence(1), &demands).unwrap();
+        let mut request = pool.promote_request(pending);
+        let first = pool.share_request_prefix(&mut request, &demands).unwrap();
+        let second = pool.share_request_prefix(&mut request, &demands).unwrap();
+        assert!(Arc::ptr_eq(
+            first.groups[0].tail.as_ref().unwrap(),
+            second.groups[0].tail.as_ref().unwrap()
+        ));
+        for page in &request.groups[0].pages {
+            assert_eq!(
+                pool.validate_live_handle(page.handle).unwrap().request_refs,
+                2
+            );
+        }
+        pool.retire_cached_prefix(first).unwrap();
+        pool.retire_request(request).unwrap();
+        assert_eq!(pool.occupied_block_count(), 2);
+        pool.retire_cached_prefix(second).unwrap();
+        assert_eq!(pool.occupied_block_count(), 0);
+    }
+
+    #[test]
+    fn dropping_a_long_segment_chain_is_iterative_and_does_not_return_physical_refs() {
+        let mut pool = CachePool::new(1, &[nz(1)]).unwrap();
+        let pending = pool
+            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+            .unwrap();
+        let mut request = pool.promote_request(pending);
+        let snapshot = pool
+            .share_request_prefix(&mut request, &[GroupDemand::new(GroupId::new(0), 1)])
+            .unwrap();
+        pool.retire_request(request).unwrap();
+        drop(snapshot);
+        // Explicit pool retirement is required; abandoning a token must never
+        // make possibly addressed physical storage reusable.
+        assert_eq!(pool.occupied_block_count(), 1);
+
+        let mut tail = None;
+        for _ in 0..50_000 {
+            tail = Some(Arc::new(CachedSegment {
+                start: 0,
+                pages: Vec::new(),
+                previous: tail,
+            }));
+        }
+        drop(tail);
     }
 
     #[test]

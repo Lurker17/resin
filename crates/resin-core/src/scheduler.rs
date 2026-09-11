@@ -136,14 +136,22 @@ impl<T: Schedulable> Scheduler<T> {
         let mut selected = std::iter::repeat_with(|| None)
             .take(selection.selected.len())
             .collect::<Vec<Option<T>>>();
-        let mut remaining = Vec::with_capacity(self.ready.len() - selection.selected.len());
+        // Dispatch order may put an admitted row before an older waiting row.
+        // Walk the queue in index order, retaining each row's dispatch position.
+        let mut locations = selection
+            .selected
+            .into_iter()
+            .enumerate()
+            .collect::<Vec<_>>();
+        locations.sort_unstable_by_key(|(_, identity)| identity.index);
+        let mut locations = locations.into_iter().peekable();
+        let mut remaining = Vec::with_capacity(self.ready.len() - selected.len());
         for (index, item) in self.ready.drain(..).enumerate() {
-            if let Some((position, identity)) = selection
-                .selected
-                .iter()
-                .enumerate()
-                .find(|(_, identity)| identity.index == index)
+            if locations
+                .peek()
+                .is_some_and(|(_, identity)| identity.index == index)
             {
+                let (position, identity) = locations.next().expect("selected location was peeked");
                 assert_eq!(item.turn_ordinal(), identity.turn);
                 selected[position] = Some(item);
             } else {
@@ -166,8 +174,7 @@ impl<T: Schedulable> Scheduler<T> {
         if selected.is_empty() {
             return;
         }
-        self.ready.extend(selected);
-        self.sort_by_turn();
+        self.merge_by_turn(selected);
         self.bump_epoch();
     }
 
@@ -178,8 +185,7 @@ impl<T: Schedulable> Scheduler<T> {
         for survivor in &mut survivors {
             survivor.set_running(true);
         }
-        self.ready.extend(survivors);
-        self.sort_by_turn();
+        self.merge_by_turn(survivors);
         self.bump_epoch();
     }
 
@@ -355,8 +361,23 @@ impl<T: Schedulable> Scheduler<T> {
         turn
     }
 
-    fn sort_by_turn(&mut self) {
-        self.ready.sort_by_key(Schedulable::turn_ordinal);
+    /// Queue mutations preserve age order. Only the returning batch may arrive
+    /// out of order, so sort it and merge instead of sorting every waiting row.
+    fn merge_by_turn(&mut self, mut returning: Vec<T>) {
+        returning.sort_by_key(Schedulable::turn_ordinal);
+        let mut merged = Vec::with_capacity(self.ready.len() + returning.len());
+        let mut ready = std::mem::take(&mut self.ready).into_iter().peekable();
+        let mut returning = returning.into_iter().peekable();
+        while let (Some(queued), Some(returned)) = (ready.peek(), returning.peek()) {
+            if queued.turn_ordinal() <= returned.turn_ordinal() {
+                merged.push(ready.next().expect("queued item was peeked"));
+            } else {
+                merged.push(returning.next().expect("returning item was peeked"));
+            }
+        }
+        merged.extend(ready);
+        merged.extend(returning);
+        self.ready = merged;
     }
 
     fn bump_epoch(&mut self) {
@@ -703,5 +724,29 @@ mod tests {
             vec![0, 1, 2, 3, 4]
         );
         assert!(scheduler.is_empty());
+    }
+
+    #[test]
+    fn dispatch_order_can_differ_from_queue_age_without_changing_requeue_order() {
+        let waiting = item(1, 0, Some(7), Phase::Prefill);
+        let mut running = item(2, 5, Some(7), Phase::Prefill);
+        running.running = true;
+        let mut scheduler = scheduler(2, vec![waiting, running]);
+
+        let (_, selection) = scheduler.selected();
+        let selected = scheduler.take_selected(selection);
+        assert_eq!(
+            selected.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        scheduler.enqueue(item(3, 0, None, Phase::Prefill));
+        scheduler.requeue_survivors(selected);
+        assert_eq!(ready_ids(&scheduler), [1, 2, 3]);
+
+        let (_, selection) = scheduler.selected();
+        let rejected = scheduler.take_selected(selection);
+        scheduler.enqueue(item(4, 0, None, Phase::Prefill));
+        scheduler.restore_rejected(rejected);
+        assert_eq!(ready_ids(&scheduler), [1, 2, 3, 4]);
     }
 }

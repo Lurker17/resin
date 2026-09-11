@@ -1,15 +1,18 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug)]
 struct Entry<T> {
     snapshot: T,
-    last_used: u64,
+    previous: Option<usize>,
+    next: Option<usize>,
 }
 
 #[derive(Debug)]
 struct Node<T> {
     parent: Option<usize>,
-    children: HashMap<Box<[u32]>, usize>,
+    block: Option<Arc<[u32]>>,
+    children: HashMap<Arc<[u32]>, usize>,
     entry: Option<Entry<T>>,
 }
 
@@ -17,6 +20,7 @@ impl<T> Default for Node<T> {
     fn default() -> Self {
         Self {
             parent: None,
+            block: None,
             children: HashMap::new(),
             entry: None,
         }
@@ -29,7 +33,8 @@ impl<T> Default for Node<T> {
 #[derive(Debug)]
 pub(crate) struct PrefixCache<T> {
     alignment: u32,
-    clock: u64,
+    oldest: Option<usize>,
+    newest: Option<usize>,
     nodes: Vec<Node<T>>,
     free_nodes: Vec<usize>,
     entries: usize,
@@ -43,7 +48,8 @@ impl<T> PrefixCache<T> {
         debug_assert_ne!(alignment, 0);
         Self {
             alignment,
-            clock: 0,
+            oldest: None,
+            newest: None,
             nodes: vec![Node::default()],
             free_nodes: Vec::new(),
             entries: 0,
@@ -79,12 +85,12 @@ impl<T> PrefixCache<T> {
             self.misses = self.misses.saturating_add(1);
             return None;
         };
-        self.clock = self.clock.saturating_add(1);
+        self.remove_from_lru(node);
+        self.push_recent(node);
         let entry = self.nodes[node]
             .entry
-            .as_mut()
+            .as_ref()
             .expect("matched prefix node keeps its snapshot");
-        entry.last_used = self.clock;
         self.hits = self.hits.saturating_add(1);
         Some((length as u32, &entry.snapshot))
     }
@@ -96,17 +102,22 @@ impl<T> PrefixCache<T> {
             node = match self.nodes[node].children.get(block).copied() {
                 Some(child) => child,
                 None => {
-                    let child = self.allocate_node(node);
-                    self.nodes[node].children.insert(block.into(), child);
+                    let block: Arc<[u32]> = block.into();
+                    let child = self.allocate_node(node, Arc::clone(&block));
+                    self.nodes[node].children.insert(block, child);
                     child
                 }
             };
         }
-        self.clock = self.clock.saturating_add(1);
+        if self.nodes[node].entry.is_some() {
+            self.remove_from_lru(node);
+        }
         let previous = self.nodes[node].entry.replace(Entry {
             snapshot,
-            last_used: self.clock,
+            previous: None,
+            next: None,
         });
+        self.push_recent(node);
         if previous.is_none() {
             self.entries += 1;
         }
@@ -114,13 +125,8 @@ impl<T> PrefixCache<T> {
     }
 
     pub(crate) fn evict_lru(&mut self) -> Option<T> {
-        let node = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| node.entry.as_ref().map(|entry| (index, entry.last_used)))
-            .min_by_key(|(_, last_used)| *last_used)?
-            .0;
+        let node = self.oldest?;
+        self.remove_from_lru(node);
         let snapshot = self.nodes[node]
             .entry
             .take()
@@ -132,10 +138,50 @@ impl<T> PrefixCache<T> {
         Some(snapshot)
     }
 
-    fn allocate_node(&mut self, parent: usize) -> usize {
+    fn remove_from_lru(&mut self, node: usize) {
+        let entry = self.nodes[node].entry.as_ref().expect("LRU entry exists");
+        let (previous, next) = (entry.previous, entry.next);
+        if let Some(previous) = previous {
+            self.nodes[previous]
+                .entry
+                .as_mut()
+                .expect("previous LRU entry exists")
+                .next = next;
+        } else {
+            self.oldest = next;
+        }
+        if let Some(next) = next {
+            self.nodes[next]
+                .entry
+                .as_mut()
+                .expect("next LRU entry exists")
+                .previous = previous;
+        } else {
+            self.newest = previous;
+        }
+    }
+
+    fn push_recent(&mut self, node: usize) {
+        let entry = self.nodes[node].entry.as_mut().expect("LRU entry exists");
+        entry.previous = self.newest;
+        entry.next = None;
+        if let Some(previous) = self.newest {
+            self.nodes[previous]
+                .entry
+                .as_mut()
+                .expect("previous LRU entry exists")
+                .next = Some(node);
+        } else {
+            self.oldest = Some(node);
+        }
+        self.newest = Some(node);
+    }
+
+    fn allocate_node(&mut self, parent: usize, block: Arc<[u32]>) -> usize {
         if let Some(index) = self.free_nodes.pop() {
             self.nodes[index] = Node {
                 parent: Some(parent),
+                block: Some(block),
                 ..Node::default()
             };
             index
@@ -143,6 +189,7 @@ impl<T> PrefixCache<T> {
             let index = self.nodes.len();
             self.nodes.push(Node {
                 parent: Some(parent),
+                block: Some(block),
                 ..Node::default()
             });
             index
@@ -155,9 +202,11 @@ impl<T> PrefixCache<T> {
             let parent = self.nodes[node]
                 .parent
                 .expect("non-root prefix nodes keep their parent");
-            self.nodes[parent]
-                .children
-                .retain(|_, child| *child != node);
+            let block = self.nodes[node]
+                .block
+                .take()
+                .expect("non-root prefix node keeps its block");
+            self.nodes[parent].children.remove(block.as_ref());
             self.nodes[node] = Node::default();
             self.free_nodes.push(node);
             node = parent;
@@ -178,5 +227,62 @@ impl<T> PrefixCache<T> {
 
     pub(crate) const fn evictions(&self) -> u64 {
         self.evictions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PrefixCache;
+
+    #[test]
+    fn hits_and_replacements_update_lru_order() {
+        let mut cache = PrefixCache::new(1);
+        cache.insert(&[1], "one");
+        cache.insert(&[2], "two");
+        cache.insert(&[3], "three");
+        assert_eq!(cache.find(&[1, 99]), Some((1, &"one")));
+        assert_eq!(cache.insert(&[2], "new two"), Some("two"));
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.evict_lru(), Some("three"));
+        assert_eq!(cache.evict_lru(), Some("one"));
+        assert_eq!(cache.evict_lru(), Some("new two"));
+        assert_eq!(cache.evict_lru(), None);
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(cache.evictions(), 3);
+    }
+
+    #[test]
+    fn evicting_ancestors_preserves_descendants_and_reuses_pruned_nodes() {
+        let mut cache = PrefixCache::new(1);
+        cache.insert(&[1], 1);
+        cache.insert(&[1, 2], 2);
+        cache.insert(&[1, 2, 3], 3);
+        assert_eq!(cache.evict_lru(), Some(1));
+        assert_eq!(cache.find(&[1, 2, 99]), Some((2, &2)));
+        assert_eq!(cache.evict_lru(), Some(3));
+        assert_eq!(cache.evict_lru(), Some(2));
+        assert!(cache.nodes[0].children.is_empty());
+        assert_eq!(cache.free_nodes.len(), 3);
+
+        cache.insert(&[4, 5], 4);
+        assert_eq!(cache.nodes.len(), 4);
+        assert_eq!(cache.find(&[4, 5, 99]), Some((2, &4)));
+        assert_eq!(cache.evict_lru(), Some(4));
+        assert_eq!(cache.oldest, None);
+        assert_eq!(cache.newest, None);
+    }
+
+    #[test]
+    fn wide_cache_eviction_removes_exact_parent_edges() {
+        let mut cache = PrefixCache::new(2);
+        for id in 0..1024 {
+            cache.insert(&[id, id + 1], id);
+        }
+        for id in 0..1024 {
+            assert_eq!(cache.evict_lru(), Some(id));
+            assert_eq!(cache.nodes[0].children.len(), 1023 - id as usize);
+        }
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.free_nodes.len(), 1024);
     }
 }
