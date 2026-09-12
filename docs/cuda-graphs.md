@@ -138,3 +138,44 @@ Small cases use seven alternating rounds of 20 calls; large cases use three
 rounds of five calls. These are region measurements, not an end-to-end throughput
 claim. Small launch-bound work benefits; the largest compute-bound case is
 effectively unchanged. Validation replays are included in reported replay totals.
+
+### Model coverage and remaining limits
+
+All five integrations pass the twelve first/last-region numerical probes, which
+include exact graph buckets and awkward lengths that use the eager fallback.
+Completed generation runs are:
+
+| Model / hardware | Capture time, decode + prefill shapes | Completed workload |
+| --- | --- | --- |
+| [GPT-OSS 120B / H200 × 2](https://modal.com/apps/ekzhang/main/ap-JilfRMfGHPmKsxGPHzr6Xs) | 7.73 s, 3 + 504 | Batches 3 and 4, 9,001 prompt tokens, 16 output tokens each; separate padded-batch greedy parity probe |
+| [Gemma 4 / RTX PRO 6000](https://modal.com/apps/ekzhang/main/ap-dL2VaSUIp14Mughxsr04kb) | 65.88 s, 20 + 780 | Image input, 16 output tokens, speculative decoding |
+| [Qwen3.8-27B / B200](https://modal.com/apps/ekzhang/main/ap-GsBjupN2h3dfy8Rjmia3eb) | 32.47 s, 6 + 845 | Qwen3.5-family runner; text and image input, 16 output tokens each, speculative decoding |
+| [Inkling / B300](https://modal.com/apps/ekzhang/main/ap-4WsdpFmDjGCcjhxGrfwwnk) | 65.53 s, 20 + 546 | 16 output tokens, speculative decoding |
+
+These are startup costs in the deployed environments, including kernel warmup;
+they are not isolated graph-capture costs or a cold-cache comparison. GPT-OSS,
+Qwen, and the completed Inkling smoke preceded the final removal of redundant
+views and a self-copy in the shared host path. The final shared GPU suite passes;
+[Inkling's final host path](https://modal.com/apps/ekzhang/main/ap-NIDezJfwd8H7Yirug8bimc)
+also passes all twelve region probes, but that run's final generation result was
+not recovered after the client disconnected. Its later reruns were cancelled.
+
+The eager fallback still has a small dispatch cost. For example, Inkling's final
+129-token probes measured 123.16 → 130.78 µs at the first region and
+708.16 → 725.11 µs at the last region. At three tokens, the same regions measured
+127.59 → 89.90 µs and 696.90 → 119.13 µs with graph replay. This is not evidence
+of a speedup at every shape, and the smoke runs do not establish end-to-end
+throughput improvement.
+
+DeepSeek's final [ordinary](https://modal.com/apps/ekzhang/main/ap-au8nBe6WqQIaxgv96dNGul)
+and [speculative](https://modal.com/apps/ekzhang/main/ap-KcO7QwGNp2KdP5Ywqfj7ut)
+profiling runs capture 559 prefill region shapes and pass all twelve numerical
+probes. They exercise a 4,113-token prompt (a 4,096-token graph chunk followed
+by a 17-token eager tail), drain the profiled generation requests, and pass
+cached-prefix continuation against fresh execution. Both reach the subsequent
+clean timed request, but Modal cancels the calls before a complete timing and
+final tensor-parallel token-agreement report is returned. Server logs report
+cancellation without identifying its source. No numerical or CUDA failure
+preceded those cancellations. Complete final DeepSeek timing and rank-agreement
+validation therefore remain outstanding; the partial runs are not counted as
+completed model benchmarks.
