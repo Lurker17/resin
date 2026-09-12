@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 
 import torch
@@ -373,10 +374,14 @@ class Qwen35DecoderLayer(nn.Module):
                 quantized=quantized,
             )
         self.mlp = Qwen35MLP(config, quantized=quantized)
+        self.prefill_ffn: Callable | None = None
         self.input_layernorm = Qwen35RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = Qwen35RMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
+
+    def feed_forward(self, hidden: Tensor, _ids: Tensor | None = None) -> Tensor:
+        return self.mlp(self.post_attention_layernorm(hidden))
 
 
 class Qwen35TextModel(nn.Module):
@@ -513,7 +518,7 @@ class Qwen35TextModel(nn.Module):
                     max_sequence_length,
                 )
             hidden = residual + mixed
-            hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+            hidden = hidden + (layer.prefill_ffn or layer.feed_forward)(hidden)
         return (
             self.norm(hidden),
             torch.stack(recurrent_out, dim=1),
@@ -614,7 +619,7 @@ class Qwen35MTP(nn.Module):
             sequence_lengths,
             max_sequence_length,
         )
-        hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+        hidden = hidden + (layer.prefill_ffn or layer.feed_forward)(hidden)
         return self.norm(hidden)
 
 

@@ -11,6 +11,7 @@ from typing import Any
 
 import modal
 
+from deploy.graph_validation import capture_cuda_graphs, validate_prefill_graphs
 from deploy.modal_image import build_modal_image
 from resin.backend.parallel import monitor_process_context
 
@@ -169,7 +170,9 @@ def download_model() -> dict[str, Any]:
     }
 
 
-def _build_runtime(*, context_length: int, speculative_tokens: int):
+def _build_runtime(
+    *, context_length: int, speculative_tokens: int, validate_graphs: bool = False
+):
     import torch
     from renderers import Qwen35Renderer, Qwen35RendererConfig
     from transformers import AutoProcessor
@@ -201,17 +204,11 @@ def _build_runtime(*, context_length: int, speculative_tokens: int):
         Qwen35RendererConfig(enable_thinking=True),
         processor=processor,
     )
-    shapes = runner.cuda_graph_stats["decode"]["configured_shapes"]
-    print(f"[cuda-graphs] capturing {len(shapes)} decode shapes: {shapes}", flush=True)
     graph_started = time.perf_counter()
-    graph_stats = runner.capture_cuda_graphs()
-    decode_graph_stats = graph_stats["decode"]
+    graph_stats = capture_cuda_graphs(runner)
     graph_capture_s = time.perf_counter() - graph_started
-    print(
-        f"[cuda-graphs] captured {decode_graph_stats['capture_count']} shapes in "
-        f"{graph_capture_s:.2f}s",
-        flush=True,
-    )
+    if validate_graphs:
+        validate_prefill_graphs(runner)
     engine = Engine(
         runner,
         max_running_requests=MAX_RUNNING_REQUESTS,
@@ -319,6 +316,7 @@ def smoke_test(
     ) = _build_runtime(
         context_length=context_length,
         speculative_tokens=speculative_tokens,
+        validate_graphs=True,
     )
     tokenizer = processor.tokenizer
     try:

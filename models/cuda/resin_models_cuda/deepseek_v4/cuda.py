@@ -8,6 +8,7 @@ logical cache groups backed by one fungible Engine-owned parent pool.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -24,7 +25,7 @@ from resin.backend.cuda.graphs import (
     CudaGraphRegion,
     CudaGraphStep,
     GraphShape,
-    graph_shapes,
+    resolve_decode_graph_shapes,
 )
 from resin.backend.cuda.parallel import FlashInferAllReduce, TensorParallelContext
 from resin.backend.cuda.runner import (
@@ -67,6 +68,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
         max_batch_size: int = 1,
         tensor_parallel: TensorParallelContext,
         device: str | torch.device,
+        cuda_graph_prefill: str = "breakable",
+        cuda_graph_decode: str = "full",
         cuda_graph_decode_shapes: object | None = None,
         fast_allreduce: bool = True,
         speculative_tokens: int = 0,
@@ -113,6 +116,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
             device=device,
             label="DeepSeek-V4",
             kv_cache_dtype="bfloat16",
+            cuda_graph_prefill=cuda_graph_prefill,
+            cuda_graph_decode=cuda_graph_decode,
         )
         torch.cuda.set_device(self.device)
         if torch.cuda.get_device_capability(self.device)[0] < 10:
@@ -150,12 +155,20 @@ class DeepSeekV4CudaRunner(CudaRunner):
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = 1
         self._speculation = SpeculativeStats(speculative_tokens)
-        decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
-        if any(shape[0] > max_batch_size for shape in decode_graph_shapes):
-            raise ValueError("CUDA graph batch capacity exceeds max_batch_size")
         physical_seq_len = max_seq_len + speculative_tokens
         if speculative_tokens:
             physical_seq_len += 1
+        decode_graph_shapes = resolve_decode_graph_shapes(
+            cuda_graph_decode_shapes,
+            policy=self.cuda_graph_decode,
+            width=physical_seq_len,
+            speculative=bool(speculative_tokens),
+            max_batch_size=max_batch_size,
+        )
+        if any(shape[0] > max_batch_size for shape in decode_graph_shapes):
+            raise ValueError("CUDA graph batch capacity exceeds max_batch_size")
+        if any(shape[1] < 2 for shape in decode_graph_shapes):
+            raise ValueError("DeepSeek-V4 CUDA graph sequence capacity must be >= 2")
         if any(shape[1] > physical_seq_len for shape in decode_graph_shapes):
             raise ValueError("CUDA graph sequence capacity exceeds max_seq_len")
         self._configure_cuda_graphs(
@@ -306,6 +319,27 @@ class DeepSeekV4CudaRunner(CudaRunner):
             cache_write_lookahead_tokens=speculative_tokens,
             cache_layout=self.cache_layout,
         )
+        prefill_ffns = self._configure_prefill_graphs(
+            tuple(layer.ffn for layer in self._model.layers),
+            hidden_size=self.config.hidden_size,
+            max_tokens=self.prefill_chunk_size,
+            token_ids=True,
+            pad_up_to=0,
+            capture_context=self._prefill_compute_context,
+        )
+        for layer, callback in zip(self._model.layers, prefill_ffns, strict=True):
+            layer.prefill_ffn = callback
+
+    @contextmanager
+    def _prefill_compute_context(self):
+        from resin_models_cuda.deepseek_v4.gemm import dynamic_gemm_rows
+
+        with (
+            dynamic_gemm_rows(),
+            use_default_dtype(torch.bfloat16),
+            torch.device(self.device),
+        ):
+            yield
 
     @property
     def speculative_stats(self) -> dict[str, int | float]:
@@ -392,6 +426,13 @@ class DeepSeekV4CudaRunner(CudaRunner):
         kwargs = dict(inputs=inputs, output=output_ids, prepare=self._reset_model_state)
         if not self.tensor_parallel.enabled:
             return CudaGraphStep(launch=launch, **kwargs)
+        if self.cuda_graph_decode == "full":
+
+            def full_launch() -> None:
+                launch()
+                broadcast()
+
+            return CudaGraphStep(launch=full_launch, **kwargs)
         return CudaGraphProgram(
             regions=(
                 CudaGraphRegion("model", launch),
@@ -645,7 +686,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
         """Run one dynamically batched prefill or decode sampling step."""
 
-        self._check_cuda_graphs()
+        self._check_cuda_graphs(plan.phase)
         rows = self._validate_plan(plan)
         cache_plan = self._cache_plan(plan)
         with self._cuda_failure:
@@ -663,7 +704,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 torch.device(self.device),
             ):
                 if plan.phase == BatchPhase.PREFILL:
-                    logits = self._prefill(plan, rows, cache, token_ids, positions)
+                    with self._prefill_graphs():
+                        logits = self._prefill(plan, rows, cache, token_ids, positions)
                 elif self.speculative_tokens:
                     return self._speculative_decode(plan, cache, token_ids, positions)
                 else:

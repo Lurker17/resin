@@ -85,6 +85,11 @@ def build_modal_image(
             root / "deploy/jit_cache.py", "/root/deploy/jit_cache.py", copy=True
         )
         .add_local_file(
+            root / "deploy/graph_validation.py",
+            "/root/deploy/graph_validation.py",
+            copy=True,
+        )
+        .add_local_file(
             root / "deploy/modal_image.py", "/root/deploy/modal_image.py", copy=True
         )
         .add_local_file(root / "Cargo.toml", f"{_SOURCE_ROOT}/Cargo.toml", copy=True)

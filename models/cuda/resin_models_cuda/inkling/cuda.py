@@ -15,7 +15,7 @@ from resin.backend.cuda.graphs import (
     CudaGraphMode,
     CudaGraphStep,
     GraphShape,
-    graph_shapes,
+    resolve_decode_graph_shapes,
 )
 from resin.backend.cuda.runner import (
     CudaRunner,
@@ -72,6 +72,8 @@ class InklingCudaRunner(CudaRunner):
         prefill_chunk_size: int = PREFILL_CHUNK_SIZE,
         gpu_memory_utilization: float = 0.90,
         cache_slab_capacity: int | None = None,
+        cuda_graph_prefill: str = "breakable",
+        cuda_graph_decode: str = "full",
         cuda_graph_decode_shapes: object | None = None,
     ) -> None:
         for name, value in (
@@ -95,6 +97,8 @@ class InklingCudaRunner(CudaRunner):
             device=device,
             label="Inkling",
             kv_cache_dtype="bfloat16",
+            cuda_graph_prefill=cuda_graph_prefill,
+            cuda_graph_decode=cuda_graph_decode,
         )
         torch.cuda.set_device(self.device)
         if torch.cuda.get_device_capability(self.device)[0] < 10:
@@ -162,7 +166,13 @@ class InklingCudaRunner(CudaRunner):
         self.cache_layout = self.cache_geometry.layout(slab_capacity)
         self._cache = CacheArena(self.device, self.cache_layout)
         self._configure_cache_binding(self._cache.binding)
-        decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
+        decode_graph_shapes = resolve_decode_graph_shapes(
+            cuda_graph_decode_shapes,
+            policy=self.cuda_graph_decode,
+            width=self.physical_seq_len,
+            speculative=True,
+            max_batch_size=max_batch_size,
+        )
         if any(shape[0] > max_batch_size for shape in decode_graph_shapes):
             raise ValueError("CUDA graph batch capacity exceeds max_batch_size")
         if any(shape[1] > self.physical_seq_len for shape in decode_graph_shapes):
@@ -197,6 +207,15 @@ class InklingCudaRunner(CudaRunner):
             cache_write_lookahead_tokens=self.speculative_tokens,
             cache_layout=self.cache_layout,
         )
+        prefill_ffns = self._configure_prefill_graphs(
+            tuple(layer.feed_forward for layer in self._model.target.layers),
+            hidden_size=self.config.hidden_size,
+            max_tokens=self.prefill_chunk_size,
+        )
+        for layer, callback in zip(
+            self._model.target.layers, prefill_ffns, strict=True
+        ):
+            layer.prefill_ffn = callback
 
     @property
     def speculative_stats(self) -> dict[str, int | float]:
@@ -509,7 +528,7 @@ class InklingCudaRunner(CudaRunner):
         return acceptance.token_rows
 
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
-        self._check_cuda_graphs()
+        self._check_cuda_graphs(plan.phase)
         rows = self._validate_plan(plan)
         cache_plan = PagedCachePlan.from_plan(
             plan,
@@ -533,7 +552,8 @@ class InklingCudaRunner(CudaRunner):
                 torch.device(self.device),
             ):
                 if plan.phase == BatchPhase.PREFILL:
-                    return self._prefill(plan, rows, cache, token_ids, positions)
+                    with self._prefill_graphs():
+                        return self._prefill(plan, rows, cache, token_ids, positions)
                 return self._speculative_decode(plan, cache, token_ids, positions)
 
     def release(self, sequence_ids: list[int]) -> None:

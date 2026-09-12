@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -529,10 +531,14 @@ class DecoderLayer(nn.Module):
             else SparseMlp(config, bf16=layer_id == config.dense_layer_count)
         )
         self.mlp_sconv = ShortConvolution(config.hidden_size)
+        self.prefill_ffn: Callable | None = None
 
     def prepare(self) -> None:
         if isinstance(self.mlp, SparseMlp):
             self.mlp.prepare()
+
+    def feed_forward(self, hidden: Tensor, _ids: Tensor | None = None) -> Tensor:
+        return self.mlp(self.mlp_norm(hidden))
 
     def forward(
         self,
@@ -576,7 +582,7 @@ class DecoderLayer(nn.Module):
                 residual,
             )
         residual = hidden
-        mlp_hidden = self.mlp(self.mlp_norm(hidden))
+        mlp_hidden = (self.prefill_ffn or self.feed_forward)(hidden)
         tap = residual + mlp_hidden
         mlp_input = mlp_hidden
         if prefill:

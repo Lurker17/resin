@@ -34,6 +34,7 @@ The focused contracts are:
 - [code size and simplification](docs/code-size.md)
 - [runner/kernel boundary](docs/kernel-boundary.md)
 - [authoring a CUDA model runner](docs/model-forward-pass.md)
+- [CUDA graph policies and startup](docs/cuda-graphs.md)
 - [CUDA model package boundaries](models/cuda/ARCHITECTURE.md)
 - [GPT-OSS runner status](docs/gpt-oss-itl.md)
 - [persistent kernel artifacts](docs/kernel-cache.md)

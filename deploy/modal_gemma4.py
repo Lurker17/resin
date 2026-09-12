@@ -11,6 +11,7 @@ from typing import Any
 
 import modal
 
+from deploy.graph_validation import capture_cuda_graphs, validate_prefill_graphs
 from deploy.modal_image import build_modal_image
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
@@ -132,7 +133,7 @@ def download_model() -> dict[str, Any]:
     }
 
 
-def _build_runtime(*, speculative_tokens: int):
+def _build_runtime(*, speculative_tokens: int, validate_graphs: bool = False):
     import torch
     from transformers import AutoProcessor
 
@@ -160,17 +161,11 @@ def _build_runtime(*, speculative_tokens: int):
         trust_remote_code=False,
     )
 
-    shapes = runner.cuda_graph_stats["decode"]["configured_shapes"]
-    print(f"[cuda-graphs] capturing {len(shapes)} decode shapes: {shapes}", flush=True)
     graph_started = time.perf_counter()
-    graph_stats = runner.capture_cuda_graphs()
-    decode_graph_stats = graph_stats["decode"]
+    graph_stats = capture_cuda_graphs(runner)
     graph_capture_s = time.perf_counter() - graph_started
-    print(
-        f"[cuda-graphs] captured {decode_graph_stats['capture_count']} shapes in "
-        f"{graph_capture_s:.2f}s",
-        flush=True,
-    )
+    if validate_graphs:
+        validate_prefill_graphs(runner)
 
     engine = Engine(
         runner,
@@ -273,7 +268,7 @@ def smoke_test(
     import torch
 
     runner, processor, engine, report = _build_runtime(
-        speculative_tokens=speculative_tokens
+        speculative_tokens=speculative_tokens, validate_graphs=True
     )
     try:
         warmup_started = time.perf_counter()

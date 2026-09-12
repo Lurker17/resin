@@ -21,6 +21,7 @@ import torch.distributed as dist
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from deploy.graph_validation import capture_cuda_graphs, validate_prefill_graphs
 from deploy.modal_image import build_modal_image
 from resin import Engine, SamplingParams, SchedulerConfig
 from resin.backend.cuda.graphs import (
@@ -414,7 +415,7 @@ def _run_rank_workload(
 
     tensor_parallel.barrier()
     capture_start = time.perf_counter()
-    runner.capture_cuda_graphs()
+    capture_cuda_graphs(runner)
     tensor_parallel.barrier()
     capture_elapsed = time.perf_counter() - capture_start
     if rank == 0:
@@ -422,6 +423,8 @@ def _run_rank_workload(
             f"[deepseek-v4] graph captured in {capture_elapsed:.2f}s",
             flush=True,
         )
+
+    validate_prefill_graphs(runner)
 
     engine = Engine(
         runner,
@@ -882,6 +885,8 @@ def _run_rank_benchmark(
             if use_cuda_graphs
             else ()
         ),
+        cuda_graph_prefill="breakable" if use_cuda_graphs else "disabled",
+        cuda_graph_decode="full" if use_cuda_graphs else "disabled",
         speculative_tokens=DSPARK_TOKENS,
     )
     if rank == 0:
@@ -891,6 +896,11 @@ def _run_rank_benchmark(
     load_elapsed = time.perf_counter() - load_start
 
     capture_elapsed = 0.0
+    if use_cuda_graphs:
+        capture_start = time.perf_counter()
+        capture_cuda_graphs(runner)
+        capture_elapsed = time.perf_counter() - capture_start
+        validate_prefill_graphs(runner)
     sampling_params = SamplingParams(
         temperature=1.0,
         top_p=0.95,
@@ -906,12 +916,6 @@ def _run_rank_benchmark(
                 f"{len(prompt_ids)}/{max_new_tokens}",
                 flush=True,
             )
-        if use_cuda_graphs:
-            capture_start = time.perf_counter()
-            shape = (batch_size, context_length + DSPARK_TOKENS + 1)
-            runner.capture_cuda_graph("decode", shape)
-            tensor_parallel.barrier()
-            capture_elapsed += time.perf_counter() - capture_start
         point = _benchmark_point(
             runner,
             tensor_parallel,
@@ -1063,7 +1067,7 @@ def _serve_http_rank(
         _log_cache_capacity(runner)
     torch.cuda.synchronize(runner.device)
     tensor_parallel.barrier()
-    runner.capture_cuda_graphs()
+    capture_cuda_graphs(runner)
     tensor_parallel.barrier()
 
     if rank != 0:

@@ -66,6 +66,8 @@ class TensorStager:
         targets: Mapping[str, object],
         values: Mapping[str, object],
     ) -> None:
+        if targets is values:
+            return
         if targets.keys() != values.keys():
             missing = targets.keys() - values.keys()
             extra = values.keys() - targets.keys()

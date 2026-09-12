@@ -4,6 +4,7 @@ import importlib
 import inspect
 import json
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -237,9 +238,8 @@ class TestDeepSeekV4Weights:
         assert torch.equal(model.head.weight, tensors["head.weight"][4:])
         assert report == {"tensors": 2, "bytes": 64}
 
-    def test_grouped_expert_storage_preserves_checkpoint_parameter_names(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    @staticmethod
+    def _native_model(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
         cutile = ModuleType("resin_models_cuda.deepseek_v4.cutile")
         for name in (
             "act_quant",
@@ -304,6 +304,12 @@ class TestDeepSeekV4Weights:
         native_model = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, spec.name, native_model)
         spec.loader.exec_module(native_model)
+        return native_model
+
+    def test_grouped_expert_storage_preserves_checkpoint_parameter_names(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        native_model = self._native_model(monkeypatch)
         topk_call: dict[str, object] = {}
 
         def top_k(scores: torch.Tensor, width: int, **kwargs: object):
@@ -495,6 +501,29 @@ class TestDeepSeekV4Gemms:
         assert deepseek_gemm.fp8_gemm_uses_packed_scales(5)
         with deepseek_gemm.dynamic_gemm_rows():
             assert not deepseek_gemm.fp8_gemm_uses_packed_scales(5)
+        assert deepseek_gemm.fp8_gemm_uses_packed_scales(5)
+
+    def test_prefill_capture_restores_compute_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        deepseek_gemm = self._module(monkeypatch)
+        runner = object.__new__(DeepSeekV4CudaRunner)
+        runner.device = torch.device("meta")
+        original = torch.empty(0)
+
+        with pytest.raises(RuntimeError, match="capture failed"):
+            with runner._prefill_compute_context():
+                output = torch.empty(0)
+                assert output.dtype == torch.bfloat16
+                assert output.device.type == "meta"
+                assert not deepseek_gemm.fp8_gemm_uses_packed_scales(5)
+                raise RuntimeError("capture failed")
+
+        restored = torch.empty(0)
+        assert (restored.dtype, restored.device) == (
+            original.dtype,
+            original.device,
+        )
         assert deepseek_gemm.fp8_gemm_uses_packed_scales(5)
 
     @pytest.mark.parametrize("rows", [132, 129])
@@ -843,6 +872,66 @@ class TestDeepSeekV4Attention:
 
 
 class TestDeepSeekV4Runner:
+    def test_prefill_ffn_preserves_hash_inputs_and_decode_dispatch(self, monkeypatch):
+        from test_cuda_runner_graph_policy import cpu_prefill_regions
+
+        native = TestDeepSeekV4Weights._native_model(monkeypatch)
+        mode = {"prefill": False}
+
+        @contextmanager
+        def prefill_context():
+            previous = mode["prefill"]
+            mode["prefill"] = True
+            try:
+                yield
+            finally:
+                mode["prefill"] = previous
+
+        def ffn(hidden, ids):
+            routed = ids.reshape(*hidden.shape[:-1], 1).to(hidden.dtype)
+            return hidden + routed * (2 if mode["prefill"] else 1)
+
+        block = SimpleNamespace(
+            ffn=ffn,
+            prefill_ffn=None,
+            hc_pre_graph=lambda hidden, *_args: (hidden, None, None),
+            attn_norm=SimpleNamespace(weight=None),
+            ffn_norm=SimpleNamespace(weight=None),
+            **dict.fromkeys(
+                (
+                    "hc_attn_fn",
+                    "hc_attn_scale",
+                    "hc_attn_base",
+                    "hc_ffn_fn",
+                    "hc_ffn_scale",
+                    "hc_ffn_base",
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            native, "mhc_post", lambda x, residual, *_args: x + residual
+        )
+
+        def forward(hidden, ids):
+            return native.Block.forward_attention(block, hidden, ids, lambda x: x)
+
+        runner, (callback,), replays = cpu_prefill_regions(
+            (ffn,), 4, token_ids=True, capture_context=prefill_context
+        )
+        for ids in (torch.tensor([[2, 7, 3]]), torch.tensor([[8, 1]])):
+            hidden = torch.ones((*ids.shape, 4), dtype=torch.bfloat16)
+            block.prefill_ffn = None
+            eager_decode = forward(hidden, ids)
+            with prefill_context():
+                eager_prefill = forward(hidden, ids)
+            block.prefill_ffn = callback
+            torch.testing.assert_close(forward(hidden, ids), eager_decode)
+            with runner._prefill_graphs():
+                actual = forward(hidden, ids)
+            torch.testing.assert_close(actual, eager_prefill)
+            assert mode["prefill"] is False
+        assert replays == [(4, 1), (2, 1)]
+
     def test_cuda_graphs_use_shared_static_lifecycle(self) -> None:
         from resin.backend.cuda.runner import CudaRunner
 
@@ -854,6 +943,8 @@ class TestDeepSeekV4Runner:
         assert hasattr(DeepSeekV4CudaRunner, "cuda_graph_stats")
         assert hasattr(DeepSeekV4CudaRunner, "capture_cuda_graphs")
         assert "self._configure_cuda_graphs(" in source
+        assert "pad_up_to=0" in source
+        assert "capture_context=self._prefill_compute_context" in source
         assert "def capture_cuda_graphs" not in source
         assert "CudaGraphProgram(" in source
         assert "CUDAGraph" not in source

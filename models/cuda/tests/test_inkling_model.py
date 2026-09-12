@@ -9,6 +9,7 @@ from test_inkling_config import _target
 from resin.models.inkling.config import InklingConfig, YarnConfig
 from resin_models_cuda.inkling.dspark import precompute_yarn_rope
 from resin_models_cuda.inkling.model import (
+    DecoderLayer,
     InklingVisionModel,
     ShortConvolution,
     select_convolution_state,
@@ -44,6 +45,83 @@ def test_short_convolution_split_matches_one_pass() -> None:
 
     torch.testing.assert_close(torch.cat((first, second), dim=1), expected)
     torch.testing.assert_close(actual_state, expected_state)
+
+
+def test_prefill_ffn_shared_output_preserves_convolution_state_and_dspark_taps():
+    from test_cuda_runner_graph_policy import cpu_prefill_regions
+
+    class Attention(torch.nn.Module):
+        def forward(self, hidden, *args, **_kwargs):
+            k_state, v_state = args[-2:]
+            keys, values = hidden[..., :1024], hidden[..., :1024] * 0.5
+            return (
+                hidden * 0.25,
+                torch.cat((k_state, keys), dim=1)[:, -3:],
+                torch.cat((v_state, values), dim=1)[:, -3:],
+                keys,
+                values,
+            )
+
+    torch.manual_seed(29)
+    layers = []
+    for _ in range(2):
+        # Keep real layer/convolution math without allocating checkpoint-sized MLPs.
+        layer = object.__new__(DecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.attn_norm = layer.mlp_norm = torch.nn.Identity()
+        layer.attn = Attention()
+        layer.attn_sconv = ShortConvolution(4096)
+        layer.mlp_sconv = ShortConvolution(4096)
+        layer.mlp = torch.nn.SiLU()
+        layer.prefill_ffn = None
+        with torch.no_grad():
+            layer.attn_sconv.weight.uniform_(-0.1, 0.1)
+            layer.mlp_sconv.weight.uniform_(-0.1, 0.1)
+        layers.append(layer)
+
+    def forward(hidden, positions, states):
+        taps, next_states = [], []
+        for layer, state in zip(layers, states, strict=True):
+            hidden, tap, next_state, _ = layer(
+                hidden,
+                positions,
+                positions[:, -1] + 1,
+                7,
+                None,
+                None,
+                state,
+                prefill=True,
+                record_state_inputs=False,
+            )
+            taps.append(tap)
+            next_states.append(next_state)
+        return hidden, torch.cat(taps, dim=-1), next_states
+
+    hidden = torch.randn(1, 7, 4096, dtype=torch.bfloat16)
+    positions = torch.arange(7)[None]
+    initial = [torch.zeros(1, 3, 10240, dtype=torch.bfloat16) for _ in layers]
+    with torch.no_grad():
+        expected, expected_taps, expected_states = forward(hidden, positions, initial)
+        runner, callbacks, replays = cpu_prefill_regions(
+            (layer.feed_forward for layer in layers), 4096
+        )
+        for layer, callback in zip(layers, callbacks, strict=True):
+            layer.prefill_ffn = callback
+        with runner._prefill_graphs():
+            first, first_taps, states = forward(
+                hidden[:, :3], positions[:, :3], initial
+            )
+            second, second_taps, states = forward(
+                hidden[:, 3:], positions[:, 3:], states
+            )
+
+    torch.testing.assert_close(torch.cat((first, second), dim=1), expected)
+    torch.testing.assert_close(
+        torch.cat((first_taps, second_taps), dim=1), expected_taps
+    )
+    for state, expected_state in zip(states, expected_states, strict=True):
+        torch.testing.assert_close(state, expected_state)
+    assert replays == [(4, 1), (4, 2), (4, 1), (4, 2)]
 
 
 @requires_cutile

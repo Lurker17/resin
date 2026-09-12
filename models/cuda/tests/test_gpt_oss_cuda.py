@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import nullcontext
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 
 from resin import BatchPhase, CacheGroupLayout, CacheLayout, CacheRetention
+from resin.backend.cuda.graphs import default_decode_graph_shapes
+from resin.backend.cuda.paged_kv import paged_attention_host_inputs
 from resin.backend.cuda.runner import CudaRunner
+from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import TorchSampler
 from resin.models.gpt_oss.plan import (
@@ -19,6 +25,7 @@ from resin.models.gpt_oss.plan import (
 from resin.models.gpt_oss.plan import (
     build_attention_batches as _build_attention_batches,
 )
+from resin_models_cuda.gpt_oss import cuda as gpt_oss_runtime
 from resin_models_cuda.gpt_oss.cuda import (
     GptOssCudaRunner,
     _EmptyFa4AuxData,
@@ -148,6 +155,66 @@ def _decode_plan():
 
 
 class TestGptOssCudaNativePlan:
+    @pytest.mark.parametrize(
+        "capacity,context_length,expected_width", [(128, 32769, 128), (512, 32769, 257)]
+    )
+    def test_default_graph_history_uses_cache_and_context_bounds(
+        self, monkeypatch, capacity, context_length, expected_width
+    ) -> None:
+        class ConfiguredGraphs(Exception):
+            pass
+
+        config = {
+            "model_type": "gpt_oss",
+            "vocab_size": 16,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "num_local_experts": 2,
+            "num_experts_per_tok": 1,
+            "head_dim": 4,
+            "sliding_window": SLIDING_WINDOW,
+            "max_position_embeddings": context_length,
+        }
+        model = SimpleNamespace(
+            args=gpt_oss_runtime.GptOssConfig.from_dict(config),
+            model=SimpleNamespace(layers=[], norm=torch.nn.Identity()),
+        )
+        received = []
+
+        def initialize(runner, **options):
+            runner.device = torch.device("cpu")
+            runner.cuda_graph_decode = options["cuda_graph_decode"]
+
+        def configure(runner, modes):
+            received.append(modes["decode"].shapes)
+            raise ConfiguredGraphs
+
+        monkeypatch.setattr(CudaRunner, "__init__", initialize)
+        monkeypatch.setattr(GptOssCudaRunner, "_configure_cuda_graphs", configure)
+        monkeypatch.setattr(
+            gpt_oss_runtime, "resolve_model_path", lambda *a, **k: "unused"
+        )
+        monkeypatch.setattr(
+            gpt_oss_runtime, "load_model", lambda *a, **k: (model, config)
+        )
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _: (100 * 1024**3,) * 2)
+        with pytest.raises(ConfiguredGraphs):
+            GptOssCudaRunner(
+                device="cuda",
+                cache_parent_capacity=capacity,
+                kernel_attention=lambda: None,
+            )
+        assert received == [
+            default_decode_graph_shapes(
+                expected_width, speculative=False, max_batch_size=128
+            )
+        ]
+
     def test_empty_fa4_aux_data_is_a_zero_width_jit_argument(self) -> None:
         empty = SimpleNamespace(tensors=None, scalars=None)
         adapted = _EmptyFa4AuxData(empty)
@@ -205,8 +272,107 @@ class TestGptOssCudaNativePlan:
         assert inputs["sequence_indices"] == (0, 1)
         assert inputs["full_page_table"] == (0,) * 8
         assert inputs["sliding_page_table"] == (0,) * (2 * WINDOW_TABLE_WIDTH)
-        assert inputs["full_append_slots"] == (0, 0)
-        assert inputs["sliding_append_slots"] == (0, 0)
+        assert inputs["full_append_slots"] == (0, 1)
+        assert inputs["sliding_append_slots"] == (0, 1)
+
+    @pytest.mark.parametrize("rows,expected_bucket", [(3, 4), (4, 4), (6, 8)])
+    def test_decode_graph_buckets_preserve_live_rows_and_isolate_padding(
+        self, rows, expected_bucket
+    ) -> None:
+        plan = _flat_plan(
+            [130 + 10 * row for row in range(rows)], [1] * rows, phase=BatchPhase.DECODE
+        )
+        plan.sampling_params = [
+            SimpleNamespace(temperature=0.7, top_p=0.9, top_k=5, seed=100 + row)
+            for row in range(rows)
+        ]
+        _, batch = build_attention_batches(plan)
+        runner = object.__new__(GptOssCudaRunner)
+        runner.vocab_size = 16
+        runner._sampler = FlashInferSampler
+        runner._cuda_graph_mode_enabled = lambda _: True
+        shapes = default_decode_graph_shapes(4, speculative=False, max_batch_size=128)
+        runner._select_cuda_graph = lambda _, match: next(
+            shape for shape in shapes if match(shape)
+        )
+        captured = []
+
+        def replay(mode, shape, inputs):
+            captured.append((mode, shape, inputs))
+            return list(range(1000, 1000 + shape[0]))
+
+        runner._run_cuda_graph = replay
+        assert runner._graph_forward(plan, batch) == list(range(1000, 1000 + rows))
+        mode, shape, inputs = captured.pop()
+        assert mode == "decode"
+        assert shape == (expected_bucket, 4)
+        expected = paged_attention_host_inputs(
+            batch, {"full": 4, "sliding": WINDOW_TABLE_WIDTH}
+        )
+        for name, values in expected.items():
+            np.testing.assert_array_equal(inputs[name][: len(values)], values)
+        for name, values in FlashInferSampler.host_inputs(plan, 16).items():
+            assert inputs[name][:rows] == values
+        for name in ("token_ids", "positions"):
+            np.testing.assert_array_equal(inputs[name][:rows], getattr(plan, name))
+            np.testing.assert_array_equal(inputs[name][rows:], 0)
+        for name in ("token_indices", "sequence_indices"):
+            np.testing.assert_array_equal(inputs[name], np.arange(expected_bucket))
+        for name, width in (("full", 4), ("sliding", WINDOW_TABLE_WIDTH)):
+            np.testing.assert_array_equal(
+                inputs[f"{name}_page_table"][rows * width :], 0
+            )
+            np.testing.assert_array_equal(inputs[f"{name}_seqused_k"][rows:], 1)
+            np.testing.assert_array_equal(
+                inputs[f"{name}_append_slots"][rows:], np.arange(rows, expected_bucket)
+            )
+            assert all(
+                slot < PAGE_SIZE for slot in inputs[f"{name}_append_slots"][rows:]
+            )
+        assert inputs["sampling_stochastic_mask"][rows:] == (False,) * (
+            expected_bucket - rows
+        )
+
+    @pytest.mark.parametrize("phase", [BatchPhase.PREFILL, BatchPhase.DECODE])
+    def test_prefill_regions_are_inactive_during_decode_fallback(
+        self, monkeypatch, phase
+    ) -> None:
+        plan = _flat_plan([130, 260], [1, 1], phase=phase)
+        batches = build_attention_batches(plan)
+        runner = object.__new__(GptOssCudaRunner)
+        runner.device = "cpu"
+        runner.hidden_size = 2
+        runner.cache_layout = object()
+        runner.cuda_graph_prefill = "breakable"
+        runner._prefill_graph_active = False
+        runner._cuda_failure = nullcontext()
+        runner._check_cuda_graphs = lambda _phase: None
+        runner._graph_forward = lambda *_: None
+        runner._model = SimpleNamespace(lm_head=lambda hidden: hidden)
+        runner._sampler = lambda logits, _: logits.argmax(dim=-1)
+        runner._tensorize = lambda host, *_: SimpleNamespace(
+            sequence_indices=torch.tensor(host.sequence_indices)
+        )
+        events = []
+
+        def forward(*_):
+            events.append(runner._prefill_graph_active)
+            return torch.tensor([[0, 1], [1, 0]], dtype=torch.bfloat16)
+
+        runner._forward_batch = forward
+        monkeypatch.setattr(
+            gpt_oss_runtime, "build_attention_batches", lambda *_: batches
+        )
+        monkeypatch.setattr(
+            gpt_oss_runtime,
+            "TensorStager",
+            lambda _: SimpleNamespace(
+                device=lambda _name, values, dtype: torch.tensor(values, dtype=dtype)
+            ),
+        )
+        assert runner.forward(plan) == [1, 0]
+        assert events == [phase == BatchPhase.PREFILL]
+        assert not runner._prefill_graph_active
 
     def test_kv_capacity_plan_uses_post_load_free_memory(self) -> None:
         gib = 1024**3

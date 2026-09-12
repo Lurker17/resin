@@ -9,7 +9,9 @@ import torch
 
 from resin import BatchPhase
 from resin.backend.cuda.failures import CudaFailureGuard, PostAcceptCudaError
+from resin.backend.cuda.graphs import default_decode_graph_shapes
 from resin.backend.cuda.runner import CudaRunner
+from resin.models.gemma4.config import SLIDING_ATTENTION
 from resin.models.gemma4.plan import PAGE_SIZE, SLIDING_WINDOW
 from resin_models_cuda.gemma4 import cuda as gemma4_runtime
 from resin_models_cuda.gemma4.cuda import (
@@ -106,6 +108,63 @@ def test_cuda_graphs_use_shared_static_step_lifecycle() -> None:
     assert ".replay()" not in source
 
 
+@pytest.mark.parametrize("capacity,expected_width", [(2, 8), (32, 11)])
+@pytest.mark.parametrize("speculative_tokens", [0, 3])
+def test_default_graph_history_uses_packed_cache_and_context_bounds(
+    monkeypatch, capacity, expected_width, speculative_tokens
+) -> None:
+    class ConfiguredGraphs(Exception):
+        pass
+
+    config = SimpleNamespace(
+        max_position_embeddings=641,
+        history_blocks_per_parent=4,
+        num_attention_heads=2,
+        head_dim=4,
+        global_head_dim=8,
+        hidden_size=8,
+        vocab_size=16,
+    )
+    model = SimpleNamespace(prepare_attention=lambda: None)
+    assistant_config = SimpleNamespace(backbone_hidden_size=8, vocab_size=16)
+    received = []
+
+    def initialize(runner, **options):
+        runner.device = torch.device("cpu")
+        runner.cuda_graph_decode = options["cuda_graph_decode"]
+        runner.kv_cache_torch_dtype = torch.float8_e4m3fn
+
+    def configure(runner, modes):
+        received.append(modes["decode"].shapes)
+        raise ConfiguredGraphs
+
+    monkeypatch.setattr(CudaRunner, "__init__", initialize)
+    monkeypatch.setattr(Gemma4CudaRunner, "_configure_cuda_graphs", configure)
+    monkeypatch.setattr(gemma4_runtime, "resolve_model_path", lambda *a: "unused")
+    monkeypatch.setattr(gemma4_runtime, "resolve_assistant_path", lambda *a: "unused")
+    monkeypatch.setattr(
+        gemma4_runtime, "load_model", lambda *a, **k: (model, config, {})
+    )
+    monkeypatch.setattr(
+        gemma4_runtime, "load_assistant", lambda *a, **k: (object(), assistant_config)
+    )
+    monkeypatch.setattr(gemma4_runtime, "prepare_nvfp4_modules", lambda *a: None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (10, 0))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _: (100 * 1024**3,) * 2)
+    with pytest.raises(ConfiguredGraphs):
+        Gemma4CudaRunner(
+            device="cuda",
+            cache_parent_capacity=capacity,
+            speculative_tokens=speculative_tokens,
+        )
+    assert received == [
+        default_decode_graph_shapes(
+            expected_width, speculative=bool(speculative_tokens), max_batch_size=128
+        )
+    ]
+
+
 def test_ordinary_graph_capture_rows_stay_inside_null_page() -> None:
     runner = object.__new__(Gemma4CudaRunner)
     runner.speculative_tokens = 0
@@ -131,6 +190,106 @@ def test_ordinary_graph_padding_rows_stay_inside_null_page() -> None:
     )
 
     assert max(inputs["local_append_offsets"]) < PAGE_SIZE
+
+
+@pytest.mark.parametrize("phase", [BatchPhase.PREFILL, BatchPhase.DECODE])
+def test_prefill_regions_activate_after_media_and_attention_planning(phase) -> None:
+    runner = object.__new__(Gemma4CudaRunner)
+    runner.device = torch.device("cpu")
+    runner.cuda_graph_prefill = "breakable"
+    runner._prefill_graph_active = False
+    runner._model = SimpleNamespace(embed_tokens=lambda ids: ids[:, None].bfloat16())
+    events = []
+
+    def record(name, result):
+        def call(*_args):
+            events.append((name, runner._prefill_graph_active))
+            return result
+
+        return call
+
+    runner._merge_media_embeddings = record("media", {})
+    runner._local_custom_mask = record("mask", None)
+    runner._device_plan = record("cache", object())
+    runner._plan_attention = record("attention", (object(), object()))
+    expected = torch.ones(3, 1, dtype=torch.bfloat16)
+    runner._run_transformer = record("transformer", expected)
+    batch = SimpleNamespace(
+        token_ids=(1, 2, 3),
+        positions=(130, 131, 132),
+        local=object(),
+        global_=object(),
+        phase=phase,
+    )
+    assert runner._eager_transformer(object(), batch) is expected
+    assert events[:-1] == [
+        (name, False) for name in ("media", "mask", "cache", "cache", "attention")
+    ]
+    assert events[-1] == ("transformer", phase == BatchPhase.PREFILL)
+    assert not runner._prefill_graph_active
+
+
+def test_prefill_feed_forward_can_reuse_output_storage_across_layers() -> None:
+    runner = object.__new__(Gemma4CudaRunner)
+    rows, width = 3, 4
+    layers = [
+        SimpleNamespace(
+            input_layernorm=lambda hidden: hidden * 0.5,
+            self_attn=SimpleNamespace(
+                layer_type=SLIDING_ATTENTION,
+                project_qkv=lambda hidden, *_: (hidden[:, None],) * 3,
+                o_proj=lambda hidden: hidden * 0.25,
+            ),
+            post_attention_layernorm=lambda hidden: hidden + 0.125,
+            pre_feedforward_layernorm=lambda hidden: hidden * 0.5,
+            mlp=lambda hidden: hidden.square() + 0.25,
+            post_feedforward_layernorm=lambda hidden: hidden * 0.25,
+            layer_scalar=scale,
+        )
+        for scale in (0.5, 0.75)
+    ]
+    runner.config = SimpleNamespace(layer_types=(SLIDING_ATTENTION,) * 2)
+    runner._model = SimpleNamespace(
+        language_model=SimpleNamespace(
+            layers=layers,
+            rotary_emb=lambda *_: (None, None),
+            norm=lambda hidden: hidden * 0.5,
+        )
+    )
+    runner._cache = SimpleNamespace(
+        dtype=torch.bfloat16,
+        local_keys=torch.zeros(2, 1, PAGE_SIZE, 1, width, dtype=torch.bfloat16),
+        local_values=torch.zeros(2, 1, PAGE_SIZE, 1, width, dtype=torch.bfloat16),
+    )
+    plan = SimpleNamespace(
+        append_pages=torch.zeros(rows, dtype=torch.int64),
+        append_offsets=torch.arange(rows),
+    )
+    wrapper = SimpleNamespace(run=lambda query, _: query)
+    hidden = torch.arange(rows * width, dtype=torch.bfloat16).reshape(rows, width) / 16
+
+    def run():
+        return runner._run_transformer(
+            hidden, torch.arange(rows), plan, plan, wrapper, wrapper
+        )
+
+    operations = tuple(
+        lambda hidden, layer=layer: runner._feed_forward(layer, hidden)
+        for layer in layers
+    )
+    runner._prefill_feed_forward = operations
+    expected = run()
+    shared = torch.empty_like(hidden)
+
+    def replay(operation, hidden):
+        shared.copy_(operation(hidden))
+        return shared
+
+    runner._prefill_feed_forward = tuple(
+        lambda hidden, operation=operation: replay(operation, hidden)
+        for operation in operations
+    )
+    torch.testing.assert_close(run(), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("speculative_tokens", [0, 3])
@@ -219,7 +378,7 @@ def test_speculative_failure_after_state_update_is_not_retryable(
     runner = object.__new__(Gemma4CudaRunner)
     runner.speculative_tokens = 1
     runner.cache_layout = object()
-    runner._check_cuda_graphs = lambda: None
+    runner._check_cuda_graphs = lambda _phase: None
     runner._cuda_failure = CudaFailureGuard(
         lambda: synchronized.append(True), label="Gemma speculative decode"
     )

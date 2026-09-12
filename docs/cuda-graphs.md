@@ -1,0 +1,140 @@
+# CUDA graph policies
+
+The GPT-OSS, Gemma 4, DeepSeek V4, Qwen3.5, and Inkling CUDA runners accept:
+
+```python
+from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
+
+runner = Gemma4CudaRunner(
+    "/path/to/checkpoint",
+    device="cuda",
+    cuda_graph_prefill="breakable",
+    cuda_graph_decode="full",
+)
+runner.capture_cuda_graphs()
+# Construct the Engine and start accepting requests after capture succeeds.
+```
+
+These are the default policies. Capture is an explicit startup operation: it
+warms kernels, allocates fixed buffers, captures every configured shape, and
+checks replay against eager execution. A selected but uncaptured graph raises
+an error. The Modal harnesses perform capture before inference or HTTP startup.
+
+Both policies accept `"disabled"`. Decode also accepts `"breakable"`; prefill
+does not yet support `"full"`. For fully eager execution, disable both policies.
+
+## Scope
+
+Full decode captures the model's fixed-shape forward and sampling path. Models
+with tensor parallelism include their token broadcast. Input staging, attention
+planning, and Engine scheduling remain host work before replay. A full-decode
+program cannot contain an explicit eager region.
+
+Breakable decode permits explicit eager regions between captured regions. In
+DeepSeek's ordinary tensor-parallel decode, this keeps the token broadcast
+outside capture. Other paths currently use the same graph for both policies.
+
+Breakable prefill captures **stateless feed-forward regions** within the existing
+model forward. Each layer calls the shared graph runner for its MLP or MoE;
+normalization and residual operations are included where the model already
+groups them with that computation. Attention planning, attention, cache writes,
+recurrent updates, media processing, and sampling retain their existing paths.
+DeepSeek passes token IDs into its hash-routed experts. Qwen3.5 and Inkling keep
+their recurrent/convolution state outside these graphs.
+
+This is a bounded first implementation, not capture of the entire prefill
+transformer. It uses the existing `CudaGraphStep`/`CudaGraphProgram` runtime and
+adds no compiler or alternate model implementation. The policy names follow
+[SGLang's CUDA graph configuration](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/cuda_graph_config.py),
+but Resin's captured regions and model coverage are its own.
+
+## Shapes and memory
+
+When `cuda_graph_decode_shapes` is omitted, a shared batch bucket catalog uses
+the runner's physical history capacity. Larger buckets can serve smaller
+batches; inactive rows use reserved cache storage. Speculative decode uses
+denser batch buckets to limit repeated verification work. Attention still reads
+the live sequence lengths rather than doing work through the history capacity.
+
+An explicit shape list overrides the catalog. An explicit empty tuple preserves
+the older decode opt-out; it does not disable prefill. A nonempty list with
+`cuda_graph_decode="disabled"` is an error.
+
+Prefill uses power-of-two token buckets through the model's prefill chunk size.
+Regions of at most 128 tokens may pad their stateless inputs to the next bucket.
+Larger regions replay only exact buckets; partial chunks run at their actual
+size and record a `padding` fallback. This avoids doubling large feed-forward
+work merely to fit a graph. Attention and recurrent state always see the real
+token count. Inputs outside the captured token or dtype range also run eagerly
+and record a fallback. Graph inputs and outputs stay on the GPU.
+
+DeepSeek currently requires exact buckets even for short prefills: padding 17
+tokens to 32 failed its numerical comparison. Model integrations can restrict
+padding through the private region configuration without changing the public
+policy or creating another execution path.
+
+Prefill regions share input/output buffers per token bucket and one private
+capture memory pool, separate from decode. Larger buckets are captured first.
+Regions execute serially: a caller must consume a region's output before
+another region overwrites the shared buffer. Concurrent replay on multiple
+streams is unsupported. Each current model consumes the output into a new
+attention/residual tensor or persistent state before the next region.
+
+## Validation and statistics
+
+`runner.cuda_graph_stats` reports capture counts, replay counts, eager fallback
+reasons, shape capacities, capture time, and allocation deltas per mode. These
+deltas are not total retained/reserved graph memory. Prefill
+includes `capture_scope="feed_forward_regions"`. Its private shape keys are
+`(token_bucket, one_based_region_index)`. Explicit graph-break counts describe
+eager regions inside a `CudaGraphProgram`; they do not count host/model work
+between separate feed-forward graph calls.
+
+Run `uv run modal run deploy/modal_cuda_graphs.py` to exercise shared-buffer
+reuse, changed inputs, padding, and replay on a Blackwell GPU. The model smoke
+and profiling harnesses also compare first/last prefill regions against eager
+execution, including unpadded inputs, and report bounded timing probes.
+
+A missing prefill capture is rejected before model state changes. A capture or
+replay failure poisons the runner. Construct a fresh runner rather
+than falling back after CUDA may have changed persistent state. See
+[the model authoring contract](model-forward-pass.md#cuda-graphs) for cache,
+continuation, speculative decode, and real-history validation requirements.
+
+## Initial measurements
+
+The September 11, 2026 validation uses the pinned checkpoints and environments
+in the Modal scripts. The local suite passes 405 tests (40 GPU skips). All 12
+shared-runtime tests pass on
+[B300](https://modal.com/apps/ekzhang/main/ap-yQTbA9eHl5d4fqnRx58Nlz).
+
+The first policy padded every prefill to a power of two. That was a regression:
+Qwen's first feed-forward region at 129 live tokens took 789 µs with a 256-token
+graph versus 585 µs eager. Gemma on RTX PRO 6000 similarly took 743 µs versus
+617 µs. Inkling's final feed-forward region also failed numerical comparison
+between 129 and 256 rows. The final policy keeps these large partial chunks at
+their actual size rather than loosening the numerical checks.
+
+[GPT-OSS 120B on two H200s](https://modal.com/apps/ekzhang/main/ap-JilfRMfGHPmKsxGPHzr6Xs)
+passes first/last-region comparisons, exact large-bucket replay, a 9,001-token
+chunk-crossing workload, and exact greedy output parity for the first three
+requests when a fourth live request replaces a padded row. The parity probe
+uses 129 prompt tokens and eight output tokens, with seven decode graph replays
+for each batch size. Capture takes 7.73 seconds for three decode shapes and 504
+prefill region shapes with saved kernel artifacts.
+
+First-region median timings in microseconds, including configured-policy input
+staging, with immutable reuse of the FlashInfer tuning cache:
+
+| GPT-OSS live tokens | Eager at live size | Configured policy | Selected path |
+| ---: | ---: | ---: | --- |
+| 3 | 249.43 | 116.27 | Graph padded to 4 |
+| 128 | 491.87 | 483.85 | Exact graph |
+| 129 | 471.30 | 470.99 | Eager |
+| 4,097 | 4,067.96 | 4,064.13 | Eager |
+| 8,192 | 7,473.16 | 7,484.78 | Exact graph |
+
+Small cases use seven alternating rounds of 20 calls; large cases use three
+rounds of five calls. These are region measurements, not an end-to-end throughput
+claim. Small launch-bound work benefits; the largest compute-bound case is
+effectively unchanged. Validation replays are included in reported replay totals.

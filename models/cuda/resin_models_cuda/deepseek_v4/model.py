@@ -1611,6 +1611,7 @@ class Block(nn.Module):
         self.norm_eps = args.norm_eps
         self.attn = self.attention_cls(layer_id, args)
         self.ffn = MoE(layer_id, args)
+        self.prefill_ffn: Callable | None = None
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
         self.hc_mult = hc_mult = args.hc_mult
@@ -1704,7 +1705,7 @@ class Block(nn.Module):
             self.hc_ffn_base,
             self.ffn_norm.weight,
         )
-        x = self.ffn(x, input_ids)
+        x = (self.prefill_ffn or self.ffn)(x, input_ids)
         return mhc_post(x, residual, post, comb)
 
     def hc_head(

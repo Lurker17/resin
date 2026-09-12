@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from flashinfer.comm import (
@@ -30,10 +31,11 @@ from resin import (
 from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
 from resin.backend.cuda.failures import GraphInputError
 from resin.backend.cuda.graphs import (
+    DEFAULT_MAX_NUM_SEQS,
     CudaGraphMode,
     CudaGraphStep,
     GraphShape,
-    graph_shapes,
+    resolve_decode_graph_shapes,
 )
 from resin.backend.cuda.paged_kv import (
     DevicePagedAttentionBatch,
@@ -45,7 +47,11 @@ from resin.backend.cuda.paged_kv import (
     stage_paged_attention_batch,
 )
 from resin.backend.cuda.parallel import TensorParallelContext
-from resin.backend.cuda.runner import CudaRunner, capture_sampling_inputs
+from resin.backend.cuda.runner import (
+    CudaRunner,
+    capture_sampling_inputs,
+    pad_sampling_inputs,
+)
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.paged_attention import PagedAttentionBatch
 from resin.backend.quantization import QuantizationConfig
@@ -172,6 +178,8 @@ class GptOssCudaRunner(CudaRunner):
         quantization: QuantizationConfig | None = None,
         kernel_attention=None,
         kernel_moe=None,
+        cuda_graph_prefill: str = "breakable",
+        cuda_graph_decode: str = "full",
         cuda_graph_decode_shapes: object = None,
         tensor_parallel: TensorParallelContext | None = None,
         fast_allreduce: bool = True,
@@ -201,6 +209,8 @@ class GptOssCudaRunner(CudaRunner):
             device=device,
             label=self.model_label,
             kv_cache_dtype="bfloat16",
+            cuda_graph_prefill=cuda_graph_prefill,
+            cuda_graph_decode=cuda_graph_decode,
         )
 
         self._fa4 = kernel_attention
@@ -208,8 +218,6 @@ class GptOssCudaRunner(CudaRunner):
             raise RuntimeError(
                 f"the {self.model_label} FA4 runner requires an SM90 GPU"
             )
-        decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
-
         resolved_dtype = torch.bfloat16 if dtype is None else dtype
         if isinstance(resolved_dtype, str):
             resolved_dtype = getattr(torch, resolved_dtype.removeprefix("torch."), None)
@@ -355,6 +363,21 @@ class GptOssCudaRunner(CudaRunner):
             continuation_prefill=True,
             cache_layout=self.cache_layout,
         )
+        decode_graph_shapes = resolve_decode_graph_shapes(
+            cuda_graph_decode_shapes,
+            policy=self.cuda_graph_decode,
+            width=min(
+                self.cache_parent_capacity,
+                (checkpoint_args.max_position_embeddings + self.page_size - 1)
+                // self.page_size,
+            ),
+            speculative=False,
+            max_batch_size=DEFAULT_MAX_NUM_SEQS,
+        )
+        if any(batch > DEFAULT_MAX_NUM_SEQS for batch, _ in decode_graph_shapes):
+            raise ValueError(
+                f"CUDA graph batch capacity exceeds {DEFAULT_MAX_NUM_SEQS}"
+            )
         if any(width > self.cache_parent_capacity for _, width in decode_graph_shapes):
             raise ValueError("CUDA graph table width exceeds cache capacity")
         self._configure_cuda_graphs(
@@ -384,6 +407,16 @@ class GptOssCudaRunner(CudaRunner):
         for layer in self._model.model.layers:
             if layer.self_attn.sinks.dtype is not torch.bfloat16:
                 raise TypeError("FA4 learnable sink tensors must be bfloat16")
+        self._prefill_feed_forward = self._configure_prefill_graphs(
+            tuple(
+                lambda hidden, _ids, layer=layer: self._feed_forward(
+                    layer.mlp, hidden.unsqueeze(0)
+                ).squeeze(0)
+                for layer in self._model.model.layers
+            ),
+            hidden_size=self.hidden_size,
+            max_tokens=self.prefill_chunk_size,
+        )
 
     @classmethod
     def _graph_capture_inputs(
@@ -404,8 +437,8 @@ class GptOssCudaRunner(CudaRunner):
             "full_seqused_k": (1,) * batch_size,
             "sliding_page_table": (0,) * (batch_size * cls.window_table_width),
             "sliding_seqused_k": (1,) * batch_size,
-            "full_append_slots": zeros,
-            "sliding_append_slots": zeros,
+            "full_append_slots": rows,
+            "sliding_append_slots": rows,
             **capture_sampling_inputs(batch_size, vocab_size, stochastic=True),
         }
 
@@ -585,7 +618,9 @@ class GptOssCudaRunner(CudaRunner):
                 layer.post_attention_layernorm.weight,
                 layer.post_attention_layernorm.eps,
             )
-            feed_forward_output = self._feed_forward(layer.mlp, normalized_mlp_input)
+            feed_forward_output = self._prefill_feed_forward[layer_index](
+                normalized_mlp_input
+            )
             next_norm = (
                 layers[layer_index + 1].input_layernorm
                 if layer_index + 1 < len(layers)
@@ -671,7 +706,7 @@ class GptOssCudaRunner(CudaRunner):
             raise GraphInputError("plan is not a fixed-shape decode batch")
         shape = self._select_cuda_graph(
             "decode",
-            match=lambda candidate: candidate[0] == rows and candidate[1] >= full.width,
+            match=lambda candidate: candidate[0] >= rows and candidate[1] >= full.width,
         )
         if shape is None:
             return None
@@ -683,12 +718,36 @@ class GptOssCudaRunner(CudaRunner):
                 {"full": shape[1], "sliding": self.window_table_width},
             ),
         }
+        padding = shape[0] - rows
+        if padding:
+            for name in ("token_ids", "positions"):
+                inputs[name] = np.pad(inputs[name], (0, padding))
+            inactive_rows = np.arange(rows, shape[0], dtype=np.int64)
+            for name in ("token_indices", "sequence_indices"):
+                inputs[name] = np.concatenate((inputs[name], inactive_rows))
+            for name, width in (
+                ("full", shape[1]),
+                ("sliding", self.window_table_width),
+            ):
+                inputs[f"{name}_page_table"] = np.pad(
+                    inputs[f"{name}_page_table"], (0, padding * width)
+                )
+                inputs[f"{name}_seqused_k"] = np.pad(
+                    inputs[f"{name}_seqused_k"], (0, padding), constant_values=1
+                )
+                # Parent zero is reserved. Distinct offsets keep inactive
+                # writes from racing while leaving every live page untouched.
+                inputs[f"{name}_append_slots"] = np.concatenate(
+                    (inputs[f"{name}_append_slots"], inactive_rows)
+                )
         if hasattr(self._sampler, "host_inputs"):
-            inputs.update(self._sampler.host_inputs(plan, self.vocab_size))
-        return self._run_cuda_graph("decode", shape, inputs)
+            inputs.update(
+                pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding)
+            )
+        return self._run_cuda_graph("decode", shape, inputs)[:rows]
 
     def forward(self, plan: BatchPlan) -> list[int]:
-        self._check_cuda_graphs()
+        self._check_cuda_graphs(plan.phase)
         host_positions = plan.positions
 
         prefill_batches, decode_batch = build_attention_batches(plan, self.cache_layout)
@@ -717,10 +776,11 @@ class GptOssCudaRunner(CudaRunner):
                 device=self.device,
             )
             with torch.inference_mode():
-                for index, host_batch in enumerate(prefill_batches):
-                    batch = self._tensorize(host_batch, staging, f"prefill.{index}")
-                    last_hidden = self._forward_batch(token_ids, positions, batch)
-                    final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
+                with self._prefill_graphs():
+                    for index, host_batch in enumerate(prefill_batches):
+                        batch = self._tensorize(host_batch, staging, f"prefill.{index}")
+                        last_hidden = self._forward_batch(token_ids, positions, batch)
+                        final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
                 if decode_batch is not None:
                     batch = self._tensorize(decode_batch, staging, "decode")
                     last_hidden = self._forward_batch(token_ids, positions, batch)

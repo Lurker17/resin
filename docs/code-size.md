@@ -108,6 +108,16 @@ source lines** than the audit baseline. See [DeepSeek kernel reuse](deepseek-ker
 for measured kernel costs, numerical validation, and the replacements retained
 or rejected. Counts use the same Tokei method as above.
 
+## CUDA graph feature
+
+The subsequent [CUDA graph policy feature](cuda-graphs.md) adds **420 production
+lines** relative to `4ea6384`: 242 in the shared Python backend and 178 across
+the five CUDA model integrations. Rust is unchanged. Production now totals
+**31,251 lines**, 76 below the original audit baseline. Including CPU/GPU tests
+and deployment validation, all Rust/Python source grows by **1,787 lines**, from
+47,520 to **49,307**. This is feature and validation work, not another code-size
+reduction; the same counters and exclusions are used throughout.
+
 ## Further reductions
 
 Repeated checkpoint inventory checks and worker-launch scaffolding in deployment

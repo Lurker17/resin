@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -24,7 +25,7 @@ from resin.backend.cuda.graphs import (
     CudaGraphMode,
     CudaGraphStep,
     GraphShape,
-    graph_shapes,
+    resolve_decode_graph_shapes,
 )
 from resin.backend.cuda.runner import (
     CudaRunner,
@@ -174,6 +175,8 @@ class Gemma4CudaRunner(CudaRunner):
         device: str | torch.device,
         nvfp4_backend: str = "auto",
         kv_cache_dtype: str = "fp8",
+        cuda_graph_prefill: str = "breakable",
+        cuda_graph_decode: str = "full",
         cuda_graph_decode_shapes: object | None = None,
         static_memory_fraction: float = 0.95,
     ) -> None:
@@ -193,6 +196,8 @@ class Gemma4CudaRunner(CudaRunner):
             device=device,
             label="Gemma 4",
             kv_cache_dtype=kv_cache_dtype,
+            cuda_graph_prefill=cuda_graph_prefill,
+            cuda_graph_decode=cuda_graph_decode,
         )
         capability = torch.cuda.get_device_capability(self.device)
         if capability not in {(10, 0), (10, 3), (11, 0), (12, 0), (12, 1)}:
@@ -258,10 +263,19 @@ class Gemma4CudaRunner(CudaRunner):
             allocation_bytes=(local_capacity + 1) * capacity_plan.bytes_per_parent,
         )
 
-        decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
         maximum_history_pages = (
             self.config.max_position_embeddings + PAGE_SIZE - 1
         ) // PAGE_SIZE
+        decode_graph_shapes = resolve_decode_graph_shapes(
+            cuda_graph_decode_shapes,
+            policy=self.cuda_graph_decode,
+            width=min(
+                maximum_history_pages,
+                self.cache_parent_capacity * self.config.history_blocks_per_parent,
+            ),
+            speculative=bool(speculative_tokens),
+            max_batch_size=DEFAULT_MAX_NUM_SEQS,
+        )
         if any(batch > DEFAULT_MAX_NUM_SEQS for batch, _ in decode_graph_shapes):
             raise ValueError(
                 f"Gemma 4 CUDA graph batch capacity exceeds {DEFAULT_MAX_NUM_SEQS}"
@@ -318,6 +332,14 @@ class Gemma4CudaRunner(CudaRunner):
         self._media_features: dict[int, _MediaFeatures] = {}
         self._target_hidden: dict[int, Tensor] = {}
         self._build_attention_wrappers()
+        self._prefill_feed_forward = self._configure_prefill_graphs(
+            tuple(
+                lambda hidden, _ids, layer=layer: self._feed_forward(layer, hidden)
+                for layer in self._model.language_model.layers
+            ),
+            hidden_size=self.config.hidden_size,
+            max_tokens=PREFILL_CHUNK_SIZE,
+        )
 
     @property
     def model(self) -> Gemma4ForConditionalGeneration:
@@ -616,7 +638,7 @@ class Gemma4CudaRunner(CudaRunner):
         }
         local_layer = 0
         global_layer = 0
-        for layer in self._model.language_model.layers:
+        for layer_index, layer in enumerate(self._model.language_model.layers):
             residual = hidden
             normalized = layer.input_layernorm(hidden)
             cos, sin = embeddings[layer.self_attn.layer_type]
@@ -641,13 +663,18 @@ class Gemma4CudaRunner(CudaRunner):
             hidden = layer.self_attn.o_proj(attended.reshape(len(hidden), -1))
             hidden = residual + layer.post_attention_layernorm(hidden)
 
-            residual = hidden
-            hidden = layer.pre_feedforward_layernorm(hidden)
-            hidden = layer.mlp(hidden)
-            hidden = residual + layer.post_feedforward_layernorm(hidden)
-            hidden *= layer.layer_scalar
+            hidden = self._prefill_feed_forward[layer_index](hidden)
 
         return self._model.language_model.norm(hidden)
+
+    @staticmethod
+    def _feed_forward(layer, hidden: Tensor) -> Tensor:
+        residual = hidden
+        hidden = layer.pre_feedforward_layernorm(hidden)
+        hidden = layer.mlp(hidden)
+        hidden = residual + layer.post_feedforward_layernorm(hidden)
+        hidden *= layer.layer_scalar
+        return hidden
 
     def _graph_capture_inputs(
         self, shape: GraphShape, vocab_size: int = 262_208
@@ -1333,14 +1360,19 @@ class Gemma4CudaRunner(CudaRunner):
         local_wrapper, global_wrapper = self._plan_attention(
             batch, local, global_, local_mask
         )
-        return self._run_transformer(
-            hidden,
-            positions,
-            local,
-            global_,
-            local_wrapper,
-            global_wrapper,
-        )
+        with (
+            self._prefill_graphs()
+            if batch.phase == BatchPhase.PREFILL
+            else nullcontext()
+        ):
+            return self._run_transformer(
+                hidden,
+                positions,
+                local,
+                global_,
+                local_wrapper,
+                global_wrapper,
+            )
 
     def _store_last_hidden(
         self, native: BatchPlan, batch: Gemma4BatchPlan, hidden: Tensor
@@ -1453,7 +1485,7 @@ class Gemma4CudaRunner(CudaRunner):
 
     @torch.inference_mode()
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
-        self._check_cuda_graphs()
+        self._check_cuda_graphs(plan.phase)
         batch = build_gemma4_batch_plan(
             plan,
             self.cache_layout,

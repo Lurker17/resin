@@ -11,6 +11,7 @@ from typing import Any
 
 import modal
 
+from deploy.graph_validation import capture_cuda_graphs, validate_prefill_graphs
 from deploy.modal_image import build_modal_image
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
@@ -154,7 +155,9 @@ def download_models() -> dict[str, Any]:
     }
 
 
-def _build_runtime(*, context_length: int = MAX_CONTEXT_LENGTH):
+def _build_runtime(
+    *, context_length: int = MAX_CONTEXT_LENGTH, validate_graphs: bool = False
+):
     import torch
     from renderers import DefaultRendererConfig, create_renderer
     from transformers import AutoProcessor
@@ -177,8 +180,10 @@ def _build_runtime(*, context_length: int = MAX_CONTEXT_LENGTH):
         ),
     )
     graph_started = time.perf_counter()
-    graph_stats = runner.capture_cuda_graphs()
+    graph_stats = capture_cuda_graphs(runner)
     graph_capture_s = time.perf_counter() - graph_started
+    if validate_graphs:
+        validate_prefill_graphs(runner)
     processor = AutoProcessor.from_pretrained(
         TARGET_PATH, local_files_only=True, trust_remote_code=False
     )
@@ -233,7 +238,7 @@ def smoke_test(
     from resin import SamplingParams
 
     runner, processor, renderer, engine, report = _build_runtime(
-        context_length=context_length
+        context_length=context_length, validate_graphs=True
     )
     try:
         prompt_ids = _prompt_ids(

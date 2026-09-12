@@ -15,7 +15,7 @@ from resin.backend.cuda.graphs import (
     CudaGraphMode,
     CudaGraphStep,
     GraphShape,
-    graph_shapes,
+    resolve_decode_graph_shapes,
 )
 from resin.backend.cuda.runner import (
     CudaRunner,
@@ -77,6 +77,8 @@ class Qwen3_5CudaRunner(CudaRunner):
         cache_slab_capacity: int | None = None,
         kv_cache_dtype: str = "fp8",
         nvfp4_backend: str = "auto",
+        cuda_graph_prefill: str = "breakable",
+        cuda_graph_decode: str = "full",
         cuda_graph_decode_shapes: object | None = None,
     ) -> None:
         if (
@@ -106,6 +108,8 @@ class Qwen3_5CudaRunner(CudaRunner):
             device=device,
             label="Qwen3.5",
             kv_cache_dtype=kv_cache_dtype,
+            cuda_graph_prefill=cuda_graph_prefill,
+            cuda_graph_decode=cuda_graph_decode,
         )
         torch.cuda.set_device(self.device)
         if torch.cuda.get_device_capability(self.device)[0] < 9:
@@ -208,7 +212,13 @@ class Qwen3_5CudaRunner(CudaRunner):
             head_dim=self.config.head_dim,
             workspace_bytes=_CACHE_WORKSPACE_BYTES,
         )
-        decode_graph_shapes = graph_shapes(cuda_graph_decode_shapes, dimensions=2)
+        decode_graph_shapes = resolve_decode_graph_shapes(
+            cuda_graph_decode_shapes,
+            policy=self.cuda_graph_decode,
+            width=self.max_seq_len,
+            speculative=bool(speculative_tokens),
+            max_batch_size=max_batch_size,
+        )
         if any(shape[0] > max_batch_size for shape in decode_graph_shapes):
             raise ValueError("Qwen3.5 CUDA graph batch capacity exceeds max_batch_size")
         if any(shape[1] > self.max_seq_len for shape in decode_graph_shapes):
@@ -235,6 +245,16 @@ class Qwen3_5CudaRunner(CudaRunner):
             cache_write_lookahead_tokens=lookahead,
             cache_layout=self.cache_layout,
         )
+        layers = tuple(self._model.language_model.layers)
+        if self._model.mtp is not None:
+            layers += tuple(self._model.mtp.layers)
+        prefill_ffns = self._configure_prefill_graphs(
+            tuple(layer.feed_forward for layer in layers),
+            hidden_size=self.config.hidden_size,
+            max_tokens=self.prefill_chunk_size,
+        )
+        for layer, callback in zip(layers, prefill_ffns, strict=True):
+            layer.prefill_ffn = callback
 
     @property
     def speculative_stats(self) -> dict[str, int | float]:
@@ -985,7 +1005,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         return rows
 
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
-        self._check_cuda_graphs()
+        self._check_cuda_graphs(plan.phase)
         rows = self._validate_plan(plan)
         lookahead = (
             self.speculative_tokens + 1
@@ -1010,7 +1030,8 @@ class Qwen3_5CudaRunner(CudaRunner):
                 torch.device(self.device),
             ):
                 if plan.phase == BatchPhase.PREFILL:
-                    return self._prefill(plan, rows, cache, token_ids, positions)
+                    with self._prefill_graphs():
+                        return self._prefill(plan, rows, cache, token_ids, positions)
                 if self.speculative_tokens:
                     return self._speculative_decode(plan, cache, token_ids, positions)
                 return self._ordinary_decode(plan, cache, token_ids, positions)

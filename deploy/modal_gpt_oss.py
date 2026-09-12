@@ -19,6 +19,7 @@ from huggingface_hub import snapshot_download
 from renderers import GptOssRendererConfig, Message, Renderer, create_renderer
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from deploy.graph_validation import capture_cuda_graphs
 from deploy.jit_cache import (
     KERNEL_CACHE_ENV,
     KERNEL_CACHE_MOUNT,
@@ -36,7 +37,6 @@ from deploy.modal_image import build_modal_image
 from resin import Engine, SamplingParams, SchedulerConfig, TokenEvent
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
-    CudaGraphStats,
     default_decode_graph_shapes,
 )
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
@@ -352,7 +352,7 @@ def _new_cuda_runner(
     model_path: Path,
     cache_parent_capacity: int | None,
     tensor_parallel: TensorParallelContext,
-    cuda_graph_decode_shapes: tuple[tuple[int, int], ...] = (),
+    cuda_graph_decode_shapes: tuple[tuple[int, int], ...] | None = None,
 ) -> GptOssCudaRunner:
     kernel_moe = FlashInferSM90MXFP4Kernel()
     if tensor_parallel.rank == 0:
@@ -386,33 +386,6 @@ def _new_cuda_runner(
     return runner
 
 
-def _capture_cuda_graphs(
-    runner: GptOssCudaRunner,
-) -> dict[str, CudaGraphStats]:
-    stats = runner.cuda_graph_stats
-    shapes = stats["decode"]["configured_shapes"]
-    if not shapes:
-        return stats
-    if runner.tensor_parallel_rank == 0:
-        print(
-            f"[cuda-graphs] Capturing {len(shapes)} TP={runner.tensor_parallel_size} "
-            "decode shape(s)...",
-            flush=True,
-        )
-    capture_start = time.perf_counter()
-    stats = runner.capture_cuda_graphs()
-    decode_stats = stats["decode"]
-    runner.tensor_parallel.barrier()
-    capture_elapsed_s = time.perf_counter() - capture_start
-    if runner.tensor_parallel_rank == 0:
-        print(
-            f"[cuda-graphs] Captured {decode_stats['capture_count']} shape(s) in "
-            f"{capture_elapsed_s:.2f} seconds",
-            flush=True,
-        )
-    return stats
-
-
 def _run_prompt(
     model_key: str,
     model_path: Path,
@@ -435,6 +408,7 @@ def _run_prompt(
             (1, _required_history_width(len(prompt_ids), max_new_tokens)),
         ),
     )
+    capture_cuda_graphs(runner, validate=True)
     engine = Engine(
         runner,
         max_running_requests=1,
@@ -447,9 +421,6 @@ def _run_prompt(
     output_events: list[TokenEvent] = []
     first_token_time: float | None = None
     try:
-        # Graph capture is an explicit initialization phase and never consumes
-        # the first request batch.
-        _capture_cuda_graphs(runner)
         # Warm the real prefill path before timing request execution.
         warmup = engine.submit(
             prompt_ids,
@@ -568,6 +539,56 @@ def _render_prompt_report(
     return report
 
 
+def _validate_decode_padding(engine, runner, prompt_ids, max_new_tokens):
+    """Compare live requests with a fourth live row replacing graph padding."""
+    prompt = prompt_ids[:129]
+    output_tokens = min(8, max_new_tokens)
+    outputs = []
+    replay_counts = []
+    for batch_size in (3, 4):
+        before = runner.cuda_graph_stats["decode"]["replay_count"]
+        requests = [
+            engine.submit(
+                prompt,
+                max_new_tokens=output_tokens,
+                batch_key=len(prompt),
+                sampling_params=SamplingParams(temperature=0.0, seed=173 + row),
+                stop_token_ids=(),
+            )
+            for row in range(batch_size)
+        ]
+        while engine.has_work():
+            engine.step()
+        result = [request.take_result() for request in requests]
+        if any(len(row) != output_tokens for row in result):
+            raise RuntimeError(
+                "GPT-OSS padding validation returned the wrong token count"
+            )
+        replays = runner.cuda_graph_stats["decode"]["replay_count"] - before
+        if not replays:
+            raise RuntimeError(
+                "GPT-OSS padding validation did not replay decode graphs"
+            )
+        outputs.append(result)
+        replay_counts.append(replays)
+    if outputs[0] != outputs[1][:3]:
+        raise RuntimeError(
+            "GPT-OSS live greedy output differs between batches of three and four"
+        )
+    report = {
+        "batch_sizes": (3, 4),
+        "prompt_tokens": len(prompt),
+        "output_tokens": output_tokens,
+        "seeds": (173, 174, 175),
+        "first_three_exact": True,
+        "decode_replays": replay_counts,
+        "output_ids": outputs[0],
+    }
+    if runner.tensor_parallel_rank == 0:
+        print("[decode-padding-validation] " + json.dumps(report), flush=True)
+    return report
+
+
 def _bench_cuda(
     model_key: str,
     model_path: Path,
@@ -591,10 +612,11 @@ def _bench_cuda(
         model_path,
         cache_parent_capacity,
         tensor_parallel,
-        cuda_graph_decode_shapes=tuple(
-            (batch_size, graph_width) for batch_size in batch_sizes
+        cuda_graph_decode_shapes=default_decode_graph_shapes(
+            graph_width, speculative=False, max_batch_size=max(batch_sizes)
         ),
     )
+    capture_cuda_graphs(runner, validate=True)
     engine = Engine(
         runner,
         max_running_requests=max(batch_sizes),
@@ -728,7 +750,11 @@ def _bench_cuda(
         }
 
     try:
-        _capture_cuda_graphs(runner)
+        padding_validation = (
+            _validate_decode_padding(engine, runner, prompt_ids, max_new_tokens)
+            if max(batch_sizes) >= 4 and max_new_tokens >= 2
+            else None
+        )
         # Warm each batch shape once so the reported rows represent steady
         # execution rather than first-use allocation and kernel setup.
         for batch_size in batch_sizes:
@@ -744,6 +770,7 @@ def _bench_cuda(
             "checkpoint": model_cache,
             "cache_parent_capacity": cache_parent_capacity,
             "rows": rows,
+            "decode_padding_validation": padding_validation,
             "peak_memory_mib": torch.cuda.max_memory_allocated() / (1024 * 1024),
         }
         if profile_decode_steps > 0:
@@ -1131,7 +1158,7 @@ def _serve_http_rank(
             f"gpu_memory_utilization={cache.memory_utilization:.2f}",
             flush=True,
         )
-    _capture_cuda_graphs(runner)
+    capture_cuda_graphs(runner)
 
     if rank != 0:
         assert control_group is not None

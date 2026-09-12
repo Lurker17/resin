@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -13,6 +14,7 @@ from resin_models_cuda.qwen3_5.model import (
     Qwen3_5ForConditionalGeneration,
     Qwen35GatedDeltaNet,
     Qwen35RMSNorm,
+    Qwen35TextModel,
 )
 
 
@@ -68,6 +70,43 @@ def test_delta_net_chunk_matches_recurrent_steps() -> None:
     torch.testing.assert_close(torch.cat(pieces, dim=1), expected, atol=2e-5, rtol=2e-5)
     torch.testing.assert_close(recurrent, expected_recurrent, atol=2e-5, rtol=2e-5)
     torch.testing.assert_close(convolution, expected_convolution)
+
+
+def test_prefill_ffn_regions_preserve_recurrent_continuation_and_changed_tokens():
+    from test_cuda_runner_graph_policy import cpu_prefill_regions
+
+    torch.manual_seed(28)
+    # Isolate real recurrent layers so the test needs no paged attention backend.
+    config = replace(
+        _tiny_config(), num_hidden_layers=2, layer_types=("linear_attention",) * 2
+    )
+    model = Qwen35TextModel(config).to(torch.bfloat16)
+    token_ids = torch.tensor([[1, 4, 9, 3, 8, 2, 11]])
+    positions = torch.arange(7)[None]
+    with torch.no_grad():
+        expected, recurrent, convolution = model(token_ids, positions)
+        runner, callbacks, replays = cpu_prefill_regions(
+            (layer.feed_forward for layer in model.layers), config.hidden_size
+        )
+        for layer, callback in zip(model.layers, callbacks, strict=True):
+            layer.prefill_ffn = callback
+
+        # Outside prefill, installed callbacks execute the original operation.
+        torch.testing.assert_close(model(token_ids, positions)[0], expected)
+        assert replays == []
+        with runner._prefill_graphs():
+            first, state, conv = model(token_ids[:, :3], positions[:, :3])
+            second, state, conv = model(
+                token_ids[:, 3:],
+                positions[:, 3:],
+                recurrent_states=state,
+                convolution_states=conv,
+            )
+
+    torch.testing.assert_close(torch.cat((first, second), dim=1), expected)
+    torch.testing.assert_close(state, recurrent)
+    torch.testing.assert_close(conv, convolution)
+    assert replays == [(4, 1), (4, 2), (4, 1), (4, 2)]
 
 
 def test_interleaved_mrope_selects_temporal_height_and_width_axes() -> None:

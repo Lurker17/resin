@@ -20,6 +20,7 @@ from resin.backend.cuda.graphs import (
     CudaGraphStep,
     default_decode_graph_shapes,
     graph_shapes,
+    resolve_decode_graph_shapes,
 )
 from resin.backend.cuda.runner import CudaRunner, resolve_kv_cache_dtype
 from resin.backend.resources import CachePoolBinding
@@ -42,6 +43,15 @@ class _Tensor:
 
     def clone(self):
         return _Tensor(self.values, dtype=self.dtype)
+
+    def numel(self):
+        return self.values.size
+
+    def reshape(self, *shape):
+        return _Tensor(self.values.reshape(*shape), dtype=self.dtype)
+
+    def __getitem__(self, key):
+        return _Tensor(self.values[key], dtype=self.dtype)
 
     def view(self, shape):
         size = 1
@@ -84,6 +94,7 @@ class _Graph:
 class _Cuda:
     def __init__(self):
         self.graphs = []
+        self.pools = []
 
     def memory_allocated(self, _device):
         return 100
@@ -109,7 +120,13 @@ class _Cuda:
         self.graphs.append(graph)
         return graph
 
-    def graph(self, _graph):
+    def graph_pool_handle(self):
+        pool = object()
+        self.pools.append(pool)
+        return pool
+
+    def graph(self, graph, *, pool=None):
+        graph.pool = pool
         return _Context()
 
 
@@ -183,6 +200,8 @@ class TestCudaGraph:
 
             def __init__(self) -> None:
                 self.events = []
+                self.cuda_graph_decode = "full"
+                self._prefill_operations = ()
                 self._cuda_failure = lambda: None
                 self._cuda_graph_executor = None
 
@@ -222,6 +241,7 @@ class TestCudaGraph:
 
         runner = ModelRunner.__new__(ModelRunner)
         runner._cuda_graph_executor = None
+        runner.cuda_graph_decode = "full"
         with pytest.raises(ValueError, match="must not be empty"):
             runner._configure_cuda_graphs({})
         with pytest.raises(RuntimeError, match="not been configured"):
@@ -326,6 +346,33 @@ class TestCudaGraph:
             with pytest.raises(ValueError, match=name):
                 default_decode_graph_shapes(speculative=True, **arguments)
 
+    @pytest.mark.parametrize("policy", ["disabled", "full", "breakable"])
+    def test_decode_policy_resolves_defaults_and_explicit_overrides(self, policy):
+        arguments = dict(policy=policy, width=128, speculative=True, max_batch_size=9)
+        expected = (
+            ()
+            if policy == "disabled"
+            else default_decode_graph_shapes(128, speculative=True, max_batch_size=9)
+        )
+        assert resolve_decode_graph_shapes(None, **arguments) == expected
+        assert resolve_decode_graph_shapes((), **arguments) == ()
+        if policy == "disabled":
+            with pytest.raises(ValueError, match="nonempty"):
+                resolve_decode_graph_shapes(((1, 128),), **arguments)
+        else:
+            assert resolve_decode_graph_shapes({2: 64, 1: 128}, **arguments) == (
+                (1, 128),
+                (2, 64),
+            )
+        with pytest.raises(ValueError, match="duplicate"):
+            resolve_decode_graph_shapes(((1, 128), (1, 128)), **arguments)
+
+    def test_decode_policy_rejects_unknown_names(self):
+        with pytest.raises(ValueError, match="policy"):
+            resolve_decode_graph_shapes(
+                None, policy="automatic", width=128, speculative=False, max_batch_size=8
+            )
+
     def test_shapes_are_frozen_sorted_and_validated(self) -> None:
         assert graph_shapes(None, dimensions=2) == ()
         assert graph_shapes({2: 8, 1: 4}, dimensions=2) == ((1, 4), (2, 8))
@@ -371,6 +418,33 @@ class TestCudaGraph:
         assert graphs.stats["replay_count"] == 1
         assert graphs.stats["captured_shapes"] == ((1, 4),)
 
+    @pytest.mark.parametrize("builder", [CudaGraphStep, CudaGraphProgram])
+    def test_device_output_preserves_identity_without_host_conversion(
+        self, monkeypatch, builder
+    ):
+        torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
+        monkeypatch.setattr(graph_runtime, "torch", torch)
+        monkeypatch.setattr(
+            _Tensor, "tolist", lambda _: pytest.fail("unexpected host conversion")
+        )
+        output = _Tensor([0])
+        operation = (
+            (CudaGraphRegion("compute", lambda: None),)
+            if builder is CudaGraphProgram
+            else lambda: None
+        )
+        graphs = _cache(
+            ((1, 4),),
+            lambda _: builder(
+                {"value": output}, output, operation, output_to_host=False
+            ),
+        )
+        assert graphs.capture((1, 4), {"value": _Tensor([7])}) is output
+        assert graphs.run((1, 4), {"value": _Tensor([8])}) is output
+        assert output.values.tolist() == [8]
+        assert torch.host_allocations == 0
+
     def test_capture_all_owns_shape_iteration_and_model_state_hooks(
         self, monkeypatch
     ) -> None:
@@ -405,6 +479,56 @@ class TestCudaGraph:
             after_capture=lambda: events.append("after"),
         )
         assert events == ["before", "after"]
+
+    def test_shared_pools_are_lazy_isolated_by_mode_and_capture_largest_first(
+        self, monkeypatch
+    ):
+        torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
+        monkeypatch.setattr(graph_runtime, "torch", torch)
+        order = []
+
+        def mode(name, share_pool):
+            def build(shape):
+                order.append((name, shape))
+                state = _Tensor([0])
+                return CudaGraphProgram(
+                    {"value": state},
+                    state,
+                    (
+                        CudaGraphRegion("first", lambda: None),
+                        CudaGraphRegion("last", lambda: None),
+                    ),
+                )
+
+            return CudaGraphMode(
+                ((1, 4), (4, 4)), build, lambda _: {"value": [1]}, share_pool=share_pool
+            )
+
+        graphs = CudaGraphExecutor(
+            "cuda:0",
+            {
+                "prefill": mode("prefill", True),
+                "decode": mode("decode", False),
+                "other": mode("other", True),
+            },
+            synchronize_failure=lambda: None,
+        )
+        assert torch.cuda.pools == []
+        graphs.capture_all()
+        assert order == [
+            (name, shape)
+            for name in ("prefill", "decode", "other")
+            for shape in (((1, 4), (4, 4)) if name == "decode" else ((4, 4), (1, 4)))
+        ]
+        first, second = torch.cuda.pools
+        assert first is not second
+        assert [graph.pool for graph in torch.cuda.graphs] == [first] * 4 + [
+            None
+        ] * 4 + [second] * 4
+        graphs.capture_all()
+        assert len(torch.cuda.pools) == 2
+        assert graphs.mode("prefill").run((1, 4), {"value": [2]}) == [2]
 
     def test_replay_reuses_persistent_pinned_staging(self, monkeypatch) -> None:
         torch = _Torch()
@@ -506,6 +630,15 @@ class TestCudaGraph:
 
         assert graphs.capture((1, 4), {"value": source}) == [9]
 
+    def test_staging_the_same_input_mapping_does_not_copy_or_allocate(self) -> None:
+        tensor = _Tensor([3, 7])
+        tensor.copy_error = AssertionError("unnecessary self-copy")
+        inputs = {"value": tensor}
+        stager = staging.TensorStager("cuda:0")
+        stager.copy_into(inputs, inputs)
+        assert tensor.tolist() == [3, 7]
+        assert not stager.host_tensors
+
     def test_run_never_captures_dynamically(self) -> None:
         graphs = _cache(
             ((1, 4),),
@@ -514,6 +647,26 @@ class TestCudaGraph:
         with pytest.raises(RuntimeError, match="has not been captured"):
             graphs.run((1, 4), {})
         assert graphs.stats["capture_count"] == 0
+
+    def test_readiness_requires_successful_capture_of_every_configured_shape(
+        self, monkeypatch
+    ) -> None:
+        torch = _Torch()
+        monkeypatch.setattr(graph_runtime, "torch", torch)
+        graphs = _cache(
+            ((1, 4), (2, 4)),
+            lambda _shape: CudaGraphStep({}, _Tensor([0]), lambda: None),
+        )
+        with pytest.raises(RuntimeError, match="2 configured.*not been captured"):
+            graphs.check_ready()
+        graphs.capture((1, 4), {})
+        with pytest.raises(RuntimeError, match="1 configured.*not been captured"):
+            graphs.check_ready()
+        assert not graphs.stats["poisoned"]
+        graphs.capture((2, 4), {})
+        graphs.check_ready()
+        graphs.capture_all(lambda _: {})
+        graphs.check_ready()
 
     def test_host_shape_error_is_retryable_and_drops_fresh_step(
         self, monkeypatch
@@ -556,6 +709,47 @@ class TestCudaGraph:
         assert graphs.stats["poisoned"]
         with pytest.raises(RuntimeError, match="poisoned"):
             graphs.check()
+
+    @pytest.mark.parametrize("validate_eager_output", [False, True])
+    def test_large_parity_failures_report_only_bounded_samples(
+        self, monkeypatch, validate_eager_output
+    ) -> None:
+        output = _Tensor(np.zeros((128, 4096)), dtype="bfloat16")
+        torch = _Torch()
+        monkeypatch.setattr(graph_runtime, "torch", torch)
+        original_tolist = _Tensor.tolist
+        sampled_sizes = []
+
+        def bounded_tolist(tensor):
+            sampled_sizes.append(tensor.numel())
+            assert tensor.numel() <= 8, "diagnostics copied an entire hidden tensor"
+            return original_tolist(tensor)
+
+        monkeypatch.setattr(_Tensor, "tolist", bounded_tolist)
+
+        def increment():
+            output.values += 1
+
+        monkeypatch.setattr(
+            torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=increment)
+        )
+        graphs = _cache(
+            ((1, 4),),
+            lambda _shape: CudaGraphStep(
+                {},
+                output,
+                increment,
+                validate_eager_output=validate_eager_output,
+                output_to_host=False,
+            ),
+        )
+        with pytest.raises(PostAcceptCudaError) as caught:
+            graphs.capture((1, 4), {})
+        message = str(caught.value)
+        assert "shape=(128, 4096), dtype=bfloat16, elements=524288" in message
+        assert len(message) < 700
+        assert sampled_sizes == [8, 8]
+        assert graphs.stats["poisoned"]
 
     def test_device_copy_failure_poisons_before_capture(self, monkeypatch) -> None:
         state = _Tensor([0])
