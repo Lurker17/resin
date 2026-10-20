@@ -171,13 +171,23 @@ pub(super) fn runner_error_is_post_accept(py: Python<'_>, error: &PyErr) -> bool
     }
 }
 
+pub(super) struct RunnerCallbacks {
+    pub(super) forward: Py<PyAny>,
+    pub(super) release: Option<Py<PyAny>>,
+    pub(super) enqueue: Option<Py<PyAny>>,
+}
+
 pub(super) fn resolve_runner_contract(
     py: Python<'_>,
     runner: &Bound<'_, PyAny>,
-) -> PyResult<(Py<PyAny>, Option<Py<PyAny>>)> {
+) -> PyResult<RunnerCallbacks> {
     let forward = optional_runner_callable(py, runner, "forward")?
         .ok_or_else(|| PyTypeError::new_err("runner must define callable forward"))?;
-    Ok((forward, optional_runner_callable(py, runner, "release")?))
+    Ok(RunnerCallbacks {
+        forward,
+        release: optional_runner_callable(py, runner, "release")?,
+        enqueue: optional_runner_callable(py, runner, "enqueue")?,
+    })
 }
 
 pub(super) fn resolve_runner_config(

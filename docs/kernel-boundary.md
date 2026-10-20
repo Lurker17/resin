@@ -1,5 +1,14 @@
 # Runner boundary
 
+`Engine.enqueue_step()` selects and submits one batch; `complete_step()` collects
+and commits it. `step()` performs both. An optional `enqueue(plan)` callback
+returns an object owning submitted work with a `result()` method; otherwise the
+Engine calls `forward(plan)`. Both callbacks are resolved once. Requests, page
+leases and the completion object remain owned until collection and validation
+finish. A plain exception from `enqueue` is retryable only before acceptance;
+exceptions from `result()` are always post-accept. A second submission and
+cancellation are rejected while work is in flight. Close drains before cleanup.
+
 The Engine owns request scheduling, cache allocation, cache pressure, prefix
 reuse, and resource lifetime. A runner owns model execution and kernel
 scheduling.

@@ -108,9 +108,25 @@ class TensorParallelRunner:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._runner, name)
 
+    @property
+    def enqueue(self):
+        # Expose this capability only when the wrapped runner supports it.
+        enqueue = self._runner.enqueue
+        return lambda plan: self._execute_all(plan, enqueue)
+
     def forward(self, plan: BatchPlan):
-        self._broadcast({"operation": "forward", "plan": batch_plan_payload(plan)})
-        return self._runner.forward(plan)
+        return self._execute_all(plan, self._runner.forward)
+
+    def _execute_all(self, plan, execute):
+        try:
+            self._broadcast({"operation": "forward", "plan": batch_plan_payload(plan)})
+            return execute(plan)
+        except BaseException as error:
+            # Followers may already have changed their cache. A leader-side
+            # validation failure cannot make the distributed step retryable.
+            raise DistributedExecutionError(
+                "tensor-parallel execution failed"
+            ) from error
 
     def bind_resources(self, binding: Any):
         self._broadcast(
@@ -162,6 +178,10 @@ def follow_tensor_parallel_runner(
             runner.forward(batch_plan_from_payload(command["plan"]))
         else:
             raise RuntimeError(f"unknown tensor-parallel operation: {operation!r}")
+
+
+class DistributedExecutionError(RuntimeError):
+    _resin_post_accept = True
 
 
 __all__ = [

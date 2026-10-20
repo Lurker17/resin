@@ -29,6 +29,7 @@ from resin import (
     RunnerConfig,
 )
 from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
+from resin.backend.cuda.execution import CudaStep
 from resin.backend.cuda.failures import GraphInputError
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
@@ -688,11 +689,12 @@ class GptOssCudaRunner(CudaRunner):
             inputs=inputs,
             output=output_ids,
             launch=launch,
+            output_to_host=False,
         )
 
     def _graph_forward(
         self, plan: BatchPlan, host: PagedAttentionBatch
-    ) -> list[int] | None:
+    ) -> Tensor | None:
         if not self._cuda_graph_mode_enabled("decode"):
             return None
         rows = len(plan.sequence_ids)
@@ -747,6 +749,10 @@ class GptOssCudaRunner(CudaRunner):
         return self._run_cuda_graph("decode", shape, inputs)[:rows]
 
     def forward(self, plan: BatchPlan) -> list[int]:
+        return self.enqueue(plan).result()
+
+    def enqueue(self, plan: BatchPlan) -> CudaStep:
+        self._check_pending_step()
         self._check_cuda_graphs(plan.phase)
         host_positions = plan.positions
 
@@ -761,12 +767,12 @@ class GptOssCudaRunner(CudaRunner):
             )
 
         with self._cuda_failure:
+            staging = self._step_staging
             if not prefill_batches and decode_batch is not None:
                 graph_output = self._graph_forward(plan, decode_batch)
                 if graph_output is not None:
-                    return graph_output
+                    return self._retain_step(plan, graph_output, staging)
 
-            staging = TensorStager(self.device)
             token_ids = staging.device("token_ids", plan.token_ids, torch.long)
             positions = staging.device("positions", host_positions, torch.long)
             final_hidden = torch.empty(
@@ -787,7 +793,8 @@ class GptOssCudaRunner(CudaRunner):
                     final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
                 logits = self._model.lm_head(final_hidden)
 
-            return self._sampler(logits, plan).tolist()
+            output = self._sampler(logits, plan)
+            return self._retain_step(plan, output, staging)
 
 
 def _router_logits(router: TopKRouter, hidden: Tensor) -> Tensor:

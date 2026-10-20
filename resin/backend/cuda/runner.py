@@ -10,7 +10,8 @@ import numpy as np
 import torch
 
 from resin import BatchPhase, ResourceBinding
-from resin.backend.cuda.failures import CudaFailureGuard
+from resin.backend.cuda.execution import CudaStep
+from resin.backend.cuda.failures import CudaFailureGuard, GraphInputError
 from resin.backend.cuda.graphs import (
     CudaGraphExecutor,
     CudaGraphMode,
@@ -24,6 +25,7 @@ from resin.backend.cuda.sampling import (
     FlashInferSampler,
     SamplingTensors,
 )
+from resin.backend.cuda.staging import TensorStager
 from resin.backend.resources import CachePoolBinding
 from resin.protocols import Runner
 
@@ -87,6 +89,19 @@ class CudaRunner(Runner):
         self._sampler = FlashInferSampler()
         self._cache_binding: CachePoolBinding | None = None
         self._cuda_graph_executor: CudaGraphExecutor | None = None
+        self._pending_step: CudaStep | None = None
+        self._step_staging = TensorStager(self.device)
+
+    def _check_pending_step(self) -> None:
+        """Protect borrowed graph buffers and shared workspaces until collection."""
+
+        pending = getattr(self, "_pending_step", None)
+        if pending is not None and not pending.done:
+            raise GraphInputError("collect the pending CUDA step before another launch")
+
+    def _retain_step(self, plan, output, staging) -> CudaStep:
+        self._pending_step = CudaStep(plan, output, staging, self._cuda_failure)
+        return self._pending_step
 
     def _configure_cache_binding(self, binding: CachePoolBinding) -> None:
         """Attach the model-owned physical cache to the Engine resource seam."""
@@ -292,6 +307,7 @@ class CudaRunner(Runner):
     def capture_cuda_graphs(self) -> dict[str, CudaGraphStats]:
         """Capture every configured mode and return mode-scoped statistics."""
 
+        self._check_pending_step()
         self._require_cuda_graph_executor().capture_all(
             before_capture=self._before_cuda_graph_capture,
             after_capture=self._after_cuda_graph_capture,
@@ -301,6 +317,7 @@ class CudaRunner(Runner):
     def capture_cuda_graph(self, mode: str, shape: GraphShape) -> CudaGraphStats:
         """Capture one mode shape while honoring model-state hooks."""
 
+        self._check_pending_step()
         executor = self._require_cuda_graph_executor()
         self._before_cuda_graph_capture()
         try:

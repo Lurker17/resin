@@ -80,6 +80,22 @@ class Runner(Protocol):
     def forward(self, plan: BatchPlan) -> Sequence[int] | Sequence[Sequence[int]]: ...
 
 
+class PendingStep(Protocol):
+    """Own submitted work and its buffers until result collection completes."""
+
+    def result(self) -> Sequence[int] | Sequence[Sequence[int]]: ...
+
+
+class EnqueueRunner(Runner, Protocol):
+    """Optionally separate submission from completion of one Engine batch.
+
+    Returning from enqueue accepts the work. Every result-collection failure is
+    post-accept, even if the exception has no explicit failure marker.
+    """
+
+    def enqueue(self, plan: BatchPlan) -> PendingStep: ...
+
+
 class ManagedRunner(Runner, Protocol):
     """Declare cache resources and bind their arena once during construction.
 
@@ -95,10 +111,12 @@ class ManagedRunner(Runner, Protocol):
 
 __all__ = [
     "ConversationCodec",
+    "EnqueueRunner",
     "ManagedRunner",
     "MediaInput",
     "MediaTokenSpan",
     "ParserEvent",
+    "PendingStep",
     "RenderedPrompt",
     "ResponseParser",
     "Runner",

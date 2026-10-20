@@ -1,7 +1,7 @@
 # Architecture
 
 Resin separates request and resource ownership from model-specific execution.
-The dependency-free `resin-core` crate contains the complete synchronous
+The dependency-free `resin-core` crate contains the complete
 `EngineCore<P>` lifecycle. `P` is opaque frontend metadata: native code schedules
 tokens without knowing about Python sampling objects or model media. Payloads
 are cloned once per dispatched row; native applications should use `Arc` for
@@ -45,15 +45,21 @@ execute straightforwardly.
    and cache capacity.
 5. The cache coordinator grows each request, creates ordered group page tables,
    and acquires one batch lease.
-6. The Engine emits a `BatchPlan` and calls `forward()` synchronously.
+6. The Engine emits a `BatchPlan` and submits execution. It retains the selected
+   requests and their writer lease until result collection finishes.
 7. The Engine validates the complete raw result against the leased write span
    before applying stop tokens or generation limits. It prepares events, releases
    terminal model state, publishes aligned prefixes, retires cache leases, and
    commits progress before requeuing survivors.
 
-Internally, preparation owns the selected requests and cache capabilities until
-completion or rollback. `step()` remains the synchronous driver; there is no
-public API that commits arbitrary page IDs. Rust runners implement
+`step()` remains the synchronous driver over the same submission and completion
+path. Python callers may use `enqueue_step()` and `complete_step()` separately;
+an optional runner `enqueue(plan)` returns an owned object with `result()`.
+Returning that object accepts execution, so all collection failures quarantine
+resources. Ordinary `forward()` runners work through this path too. Cancellation
+requires collection first, preserving all token events; `close()` drains pending
+work before cleanup. There is no public API that commits arbitrary page IDs.
+Rust callers use `begin_step()` and `finish_step()`; Rust runners implement
 `engine::Runner<P>` and receive an owned `ExecutionPlan<P>`. The native
 [conformance tests](../crates/resin-core/tests/engine.rs) demonstrate this API
 without a Python interpreter. Native applications bind their arena to the core's
@@ -61,8 +67,19 @@ cache pool and use the same logical runner throughout its lifetime. They call
 `close(&mut runner)` for orderly shutdown; the core does not own the device
 runtime or call back into a runner when it is dropped.
 
-One batch is selected per `step()`. Multiple requests within that batch execute
-together and may decode concurrently.
+One batch may be in flight per Engine. Multiple requests within that batch
+execute together and may decode concurrently. GPT-OSS implements deferred CUDA
+completion with `CudaStep`, retaining the native plan, pinned staging, device
+tokens and a completion event covering the result copy. Its synchronous
+`forward()` collects that same step. The runner prevents another launch from
+overwriting borrowed graph outputs before collection.
+
+The owned step follows DeepInfer's
+[`WorkerStepState`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/worker/zos_status.py#L10).
+This prototype does not launch the next decode before committing the previous
+one. That requires device-side sampled-token/accepted-length feedback, sequence
+remapping and coordinated reservation of the next write span, as in DeepInfer's
+[`Worker.execute_model_step`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/worker/worker.py#L89).
 
 ## Cache geometry
 
@@ -115,7 +132,7 @@ path. See the [runner contract](kernel-boundary.md) for Python error handling.
 
 ## Current limits
 
-- one synchronous batch per Engine step;
+- one batch in flight per Engine; next-step device feedback is not implemented;
 - no prefill/decode disaggregation;
 - no expert parallel or data-parallel attention;
 - no multi-node serving;
