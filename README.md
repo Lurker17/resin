@@ -267,8 +267,11 @@ web deployment enables the native exact-token LRU prefix cache.
 Current limits include synchronous runner steps, no prefill/decode
 disaggregation and no production multi-node serving. A
 [distributed coordinator prototype](docs/distributed.md) covers explicit TP, CP,
-attention DP, and EP groups with synchronous steps; production CP/EP model
-adapters remain to be implemented. Device collectives remain model-owned.
+attention DP, and EP groups with synchronous steps.
+[DeepSeek-V4 Flash](docs/deepseek-v4-parallelism.md) and
+[GPT-OSS](docs/gpt-oss-parallelism.md) have eager EP and attention-DP paths.
+CP model execution and production multi-node serving remain unimplemented.
+Device collectives use explicit model rank groups.
 [Generated-token logprobs](docs/logprobs.md) use borrowed NumPy output columns.
 
 ## Public surface

@@ -24,6 +24,22 @@ prepared runtime. An attention layer uses `groups.attn_tp`; a sharded expert use
 `groups.expert_tp`; expert dispatch uses `groups.ep`. The coordinator never
 infers model weight layouts or uses the default world group for those operations.
 
+CUDA runners declare `parallelism_capabilities`; the shared base defaults to
+single-rank execution. GPT-OSS and DeepSeek-V4 declare EP, attention DP,
+and attention replication alongside their existing TP paths. Both new
+explicit-group paths currently require `attn_tp=cp=expert_tp=1`.
+GPT-OSS also declares expert TP for its legacy TP entry point. These
+declarations describe supported axes; preparation also checks combinations,
+graph policies, and speculative modes. GPT-OSS EP additionally requires a
+kernel advertising FP32 local expert partials so the cross-rank combine does
+not add an intermediate activation rounding step.
+`DistributedWorker` validates a declared capability set collectively before
+serving begins. Custom distributed runners may supply the same declaration.
+
+See [DeepSeek-V4 EP and attention DP](deepseek-v4-parallelism.md) and
+[GPT-OSS EP and attention DP](gpt-oss-parallelism.md) for the implemented
+model paths and real-GPU validation commands.
+
 ## Rank placement
 
 `world_size` is the total number of ranks. The five configuration fields are

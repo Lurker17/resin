@@ -82,6 +82,10 @@ image = build_modal_image(
         "TRITON_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/triton",
         "TILELANG_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/tilelang",
     },
+).add_local_file(
+    ROOT / "deploy/deepseek_v4_parallel_validation.py",
+    "/root/deploy/deepseek_v4_parallel_validation.py",
+    copy=True,
 )
 
 with image.imports():
@@ -1254,6 +1258,113 @@ def validate_kernels() -> dict[str, object]:
 
 
 @app.function(
+    image=image.uv_pip_install("pytest>=8,<9").add_local_file(
+        ROOT / "tests/test_expert_parallel_gpu.py",
+        "/opt/resin/validation/test_expert_parallel_gpu.py",
+        copy=True,
+    ),
+    gpu=["B300:4", "B200:4"],
+    env={"TORCH_CUDA_ARCH_LIST": "10.0;10.3"},
+    cpu=32,
+    memory=256 * 1024,
+    timeout=2 * 60 * 60,
+    single_use_containers=True,
+)
+def validate_parallel(
+    model_key: str = DEFAULT_MODEL_KEY,
+    include_tp_baseline: bool = False,
+) -> dict[str, object]:
+    """Validate NCCL routing and complete-checkpoint EP/attention-DP serving."""
+
+    import subprocess
+
+    from deploy.deepseek_v4_parallel_validation import run_parallel_validation
+
+    model = _model_spec(model_key)
+    model_path, checkpoint = _require_checkpoint(model)
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 4:
+        raise RuntimeError("parallel validation requires four available Blackwell GPUs")
+    tests = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-c",
+            "/dev/null",
+            "-q",
+            "-s",
+            "/opt/resin/validation/test_expert_parallel_gpu.py",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=8 * 60,
+        check=False,
+    )
+    print(tests.stdout, flush=True)
+    if tests.returncode or "skipped" in tests.stdout:
+        raise RuntimeError("four-GPU expert dispatch reference validation did not pass")
+    tokenizer = cast(
+        PreTrainedTokenizerBase,
+        AutoTokenizer.from_pretrained(
+            str(model_path), local_files_only=True, trust_remote_code=False
+        ),
+    )
+    encoding = _load_encoding(model_path)
+    texts = {
+        "short": "Continue the sequence with the next number: 2, 4, 6,",
+        "long": (
+            "Review this inference rule: every request owns its cache pages; "
+            "expert workers may process tokens from independent request replicas. "
+        )
+        * 6
+        + "Explain why those cache namespaces must remain independent.",
+        "late": "Give one practical reason to batch requests with unequal prompt lengths.",
+        "probe": "What is the next integer after 41? Answer briefly.",
+    }
+    prompts = {
+        name: _encode_prompt(tokenizer, encoding, text, "chat", "low")
+        for name, text in texts.items()
+    }
+    print(
+        "[deepseek-v4] validating full checkpoint with EP=4, attention DP=1 and 4",
+        flush=True,
+    )
+    report = run_parallel_validation(
+        model_path,
+        prompts,
+        vocab_size=len(tokenizer),
+        include_tp_baseline=include_tp_baseline,
+    )
+    report.update(
+        {
+            "checkpoint": checkpoint,
+            "dispatch_reference_tests": tests.stdout.strip(),
+            "prompt_token_counts": {name: len(ids) for name, ids in prompts.items()},
+        }
+    )
+    for case in report["cases"]:
+        for rank in case["ranks"]:
+            result = rank["driver_result"]
+            if result is not None:
+                for output in result["outputs"].values():
+                    output["text"] = tokenizer.decode(
+                        output["token_ids"], skip_special_tokens=False
+                    )
+                for probe in result["probes"]:
+                    probe["text"] = tokenizer.decode(
+                        probe["token_ids"], skip_special_tokens=False
+                    )
+    run_id = datetime.now(timezone.utc).strftime("parallel-%Y%m%dT%H%M%SZ")
+    remote_report = Path(PROFILE_MOUNT) / f"{run_id}.json"
+    remote_report.write_text(json.dumps(report, indent=2, sort_keys=True))
+    report["remote_report_path"] = str(remote_report)
+    profile_volume.commit()
+    kernel_cache_volume.commit()
+    return report
+
+
+@app.function(
     gpu="B300:4",
     cpu=32,
     memory=256 * 1024,
@@ -1378,12 +1489,16 @@ def main(
     input_tokens: int = 8192,
     speculative_tokens: int = DSPARK_TOKENS,
     model: str = DEFAULT_MODEL_KEY,
+    parallel_baseline: bool = False,
+    report_path: str | None = None,
 ) -> None:
     model_spec = _model_spec(model)
     if mode == "download":
         report = cache_checkpoint.remote(model_spec.key)
     elif mode in {"validate-kernels", "validate-window"}:
         report = validate_kernels.remote()
+    elif mode == "validate-parallel":
+        report = validate_parallel.remote(model_spec.key, parallel_baseline)
     elif mode == "bench-tp2":
         if model_spec.key != DEFAULT_MODEL_KEY:
             raise ValueError("bench-tp2 currently supports only flash-0731")
@@ -1412,7 +1527,24 @@ def main(
         )
     else:
         raise ValueError(
-            "mode must be 'download', 'validate-kernels', 'bench-tp2', 'bench-tp4', 'run', 'real', "
+            "mode must be 'download', 'validate-kernels', 'validate-parallel', 'bench-tp2', 'bench-tp4', 'run', 'real', "
             "or 'profile'"
         )
+    if mode == "validate-parallel" or report_path is not None:
+        destination = (
+            (
+                Path(report_path)
+                if report_path is not None
+                else ROOT
+                / "artifacts"
+                / datetime.now(timezone.utc).strftime(
+                    "deepseek-v4-parallel-%Y%m%dT%H%M%SZ.json"
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(report, indent=2, sort_keys=True))
+        print(f"Validation report: {destination}", flush=True)
     print(json.dumps(report, indent=2, sort_keys=True))
