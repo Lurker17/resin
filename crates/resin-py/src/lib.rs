@@ -9,10 +9,12 @@ use pyo3::types::PyTuple;
 mod arrays;
 mod cache;
 mod http;
+mod output;
 mod planning;
 mod runner;
 
 use cache::{CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention};
+use output::{BorrowedLogprobs, ForwardOutput};
 use resin_core::engine::{self as core, CompletionReason};
 use runner::{
     ResourceBinding, RunnerConfig, bind_runner_resources, resolve_runner_config,
@@ -141,6 +143,8 @@ struct SamplingParams {
     top_p: f64,
     top_k: Option<u32>,
     seed: Option<i64>,
+    logprobs: bool,
+    top_logprobs: usize,
     extra: Option<Arc<Py<PyAny>>>,
 }
 
@@ -151,6 +155,8 @@ impl Default for SamplingParams {
             top_p: 1.0,
             top_k: None,
             seed: None,
+            logprobs: false,
+            top_logprobs: 0,
             extra: None,
         }
     }
@@ -159,12 +165,14 @@ impl Default for SamplingParams {
 #[pymethods]
 impl SamplingParams {
     #[new]
-    #[pyo3(signature = (*, temperature = 1.0, top_p = 1.0, top_k = None, seed = None, extra = None))]
+    #[pyo3(signature = (*, temperature = 1.0, top_p = 1.0, top_k = None, seed = None, logprobs = false, top_logprobs = 0, extra = None))]
     fn new(
         temperature: f64,
         top_p: f64,
         top_k: Option<u32>,
         seed: Option<i64>,
+        logprobs: bool,
+        top_logprobs: usize,
         extra: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         if !temperature.is_finite() || temperature < 0.0 {
@@ -187,11 +195,18 @@ impl SamplingParams {
                 "seed must be non-negative when supplied",
             ));
         }
+        if top_logprobs > 1000 {
+            return Err(PyValueError::new_err(
+                "top_logprobs must be between 0 and 1000",
+            ));
+        }
         Ok(Self {
             temperature,
             top_p,
             top_k,
             seed,
+            logprobs: logprobs || top_logprobs > 0,
+            top_logprobs,
             extra: extra.map(Arc::new),
         })
     }
@@ -217,6 +232,16 @@ impl SamplingParams {
     }
 
     #[getter]
+    fn logprobs(&self) -> bool {
+        self.logprobs
+    }
+
+    #[getter]
+    fn top_logprobs(&self) -> usize {
+        self.top_logprobs
+    }
+
+    #[getter]
     fn extra(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         self.extra
             .as_ref()
@@ -225,11 +250,13 @@ impl SamplingParams {
 
     fn __repr__(&self) -> String {
         format!(
-            "SamplingParams(temperature={:?}, top_p={:?}, top_k={:?}, seed={:?}, extra={})",
+            "SamplingParams(temperature={:?}, top_p={:?}, top_k={:?}, seed={:?}, logprobs={}, top_logprobs={}, extra={})",
             self.temperature,
             self.top_p,
             self.top_k,
             self.seed,
+            self.logprobs,
+            self.top_logprobs,
             if self.extra.is_some() {
                 "<object>"
             } else {
@@ -640,10 +667,15 @@ struct TokenEvent {
     index: usize,
     finished: bool,
     finish_reason: Option<CompletionReason>,
+    logprobs: Option<core::TokenLogprobs>,
 }
 
 #[pymethods]
 impl TokenEvent {
+    #[getter]
+    fn logprobs(&self) -> Option<TokenLogprobs> {
+        self.logprobs.clone().map(|inner| TokenLogprobs { inner })
+    }
     #[getter]
     fn request_id(&self) -> u64 {
         self.request_id
@@ -681,12 +713,34 @@ impl TokenEvent {
     }
 }
 
-/// A caller-owned lifetime handle for one submitted request.
-///
-/// The Engine keeps the shared state only while the request is active. Once
-/// the request retires, its generated tokens are moved into this lease. If
-/// the caller drops the lease without taking the result, the token buffer is
-/// released when the last internal reference disappears.
+#[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
+#[derive(Clone)]
+struct TokenLogprobs {
+    inner: core::TokenLogprobs,
+}
+
+#[pymethods]
+impl TokenLogprobs {
+    #[new]
+    #[pyo3(signature = (logprob, top_logprobs = Vec::new()))]
+    fn new(logprob: f32, top_logprobs: Vec<(u32, f32)>) -> Self {
+        Self {
+            inner: core::TokenLogprobs {
+                logprob,
+                top_logprobs,
+            },
+        }
+    }
+    #[getter]
+    fn logprob(&self) -> f32 {
+        self.inner.logprob
+    }
+    #[getter]
+    fn top_logprobs(&self) -> Vec<(u32, f32)> {
+        self.inner.top_logprobs.clone()
+    }
+}
+
 #[pyclass(module = "resin._resin")]
 struct RequestLease {
     inner: core::RequestHandle,
@@ -761,6 +815,7 @@ struct PythonRunner<'a, 'py> {
     forward: &'a Py<PyAny>,
     release: Option<&'a Py<PyAny>>,
     error: Option<PyErr>,
+    logprobs: Option<BorrowedLogprobs<'py>>,
 }
 impl PythonRunner<'_, '_> {
     fn failed(&mut self, error: PyErr, accepted: bool) -> core::Error {
@@ -776,19 +831,29 @@ impl PythonRunner<'_, '_> {
         result.map_err(|error| self.error.take().unwrap_or_else(|| core_error(error)))
     }
 }
-impl core::Runner<RequestPayload> for PythonRunner<'_, '_> {
+impl<'py> core::Runner<RequestPayload> for PythonRunner<'_, 'py> {
     fn forward(
         &mut self,
         plan: core::ExecutionPlan<RequestPayload>,
     ) -> core::Result<Vec<Vec<u32>>> {
-        let rows = plan.sequence_ids.len();
         let plan = Py::new(self.py, planning::from_core(plan))
             .map_err(|error| self.failed(error, false))?;
-        let output = self.forward.bind(self.py).call1((plan,)).map_err(|error| {
-            let accepted = runner_error_is_post_accept(self.py, &error);
-            self.failed(error, accepted)
-        })?;
-        extract_runner_token_rows(&output, rows).map_err(|error| self.failed(error, true))
+        let output = self
+            .forward
+            .bind(self.py)
+            .call1((&plan,))
+            .map_err(|error| {
+                let accepted = runner_error_is_post_accept(self.py, &error);
+                self.failed(error, accepted)
+            })?;
+        let plan = plan.borrow(self.py);
+        let (tokens, logprobs) =
+            extract_runner_output(&output, &plan).map_err(|error| self.failed(error, true))?;
+        self.logprobs = logprobs;
+        Ok(tokens)
+    }
+    fn logprobs(&self) -> Option<core::LogprobView<'_>> {
+        self.logprobs.as_ref().map(BorrowedLogprobs::view)
     }
     fn release(&mut self, ids: &[u64]) -> core::Result<()> {
         if let Some(release) = self.release {
@@ -975,6 +1040,7 @@ impl Engine {
             forward: &self.runner_forward,
             release: self.runner_release.as_ref(),
             error: None,
+            logprobs: None,
         };
         let mut event_error = None;
         let result = self.core.step_with(&mut runner, |event| {
@@ -986,6 +1052,7 @@ impl Engine {
                     index: event.index,
                     finished: event.finished,
                     finish_reason: event.finish_reason,
+                    logprobs: event.logprobs,
                 },
             )
             .map_err(|error| {
@@ -1006,6 +1073,7 @@ impl Engine {
             forward: &self.runner_forward,
             release: self.runner_release.as_ref(),
             error: None,
+            logprobs: None,
         };
         let result = self.core.cancel(&mut runner, &request.inner);
         runner.result(result)
@@ -1016,6 +1084,7 @@ impl Engine {
             forward: &self.runner_forward,
             release: self.runner_release.as_ref(),
             error: None,
+            logprobs: None,
         };
         let result = self.core.close(&mut runner);
         runner.result(result)
@@ -1201,13 +1270,63 @@ fn extract_runner_token_rows(
     Ok(token_rows)
 }
 
+fn extract_runner_output<'py>(
+    output: &Bound<'py, PyAny>,
+    plan: &BatchPlan,
+) -> PyResult<(Vec<Vec<u32>>, Option<BorrowedLogprobs<'py>>)> {
+    let (tokens, logprobs) = if let Ok(output) = output.cast::<ForwardOutput>() {
+        output
+            .borrow()
+            .borrow(output.py(), plan.sequence_ids.len())?
+    } else {
+        (
+            extract_runner_token_rows(output, plan.sequence_ids.len())?,
+            None,
+        )
+    };
+    let view = logprobs.as_ref().map(BorrowedLogprobs::view);
+    for (row, params) in plan.sampling_params.iter().enumerate() {
+        if !params.logprobs || !plan.sampling_mask[row] {
+            continue;
+        }
+        let range = view.and_then(|scores| {
+            Some(*scores.indptr.get(row)? as usize..*scores.indptr.get(row + 1)? as usize)
+        });
+        if !range.as_ref().is_some_and(|range| {
+            !range.is_empty()
+                && range.len() == tokens[row].len()
+                && view.unwrap().values.get(range.clone()).is_some()
+        }) {
+            return Err(PyRuntimeError::new_err(
+                "runner did not return requested token logprobs",
+            ));
+        }
+        if params.top_logprobs > 0 {
+            let top = view.and_then(|scores| scores.top);
+            for index in range.unwrap() {
+                let count = top.and_then(|top| {
+                    let start = *top.indptr.get(index)?;
+                    let end = *top.indptr.get(index + 1)?;
+                    end.checked_sub(start).map(|count| count as usize)
+                });
+                if !count.is_some_and(|count| count > 0 && count <= params.top_logprobs) {
+                    return Err(PyRuntimeError::new_err(
+                        "runner did not return requested top logprobs",
+                    ));
+                }
+            }
+        }
+    }
+    Ok((tokens, logprobs))
+}
+
 #[pymodule(name = "_resin")]
 mod _resin {
     #[pymodule_export]
     use super::{
         BatchPhase, BatchPlan, CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout,
-        CacheRetention, Engine, RequestLease, ResourceBinding, RunnerConfig, SamplingParams,
-        SchedulerConfig, TokenEvent,
+        CacheRetention, Engine, ForwardOutput, RequestLease, ResourceBinding, RunnerConfig,
+        SamplingParams, SchedulerConfig, TokenEvent, TokenLogprobs,
     };
 
     #[pymodule_export]

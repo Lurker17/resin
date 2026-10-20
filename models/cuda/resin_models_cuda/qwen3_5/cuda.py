@@ -29,6 +29,7 @@ from resin.backend.cuda.sampling import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
+from resin.backend.sampling import format_output, wants_logprobs
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
 from resin.models.qwen3_5.media import Qwen35Media
@@ -52,7 +53,7 @@ from resin_models_cuda.qwen3_5.checkpoint import (
 )
 
 if TYPE_CHECKING:
-    from resin import BatchPlan
+    from resin import BatchPlan, ForwardOutput
 
 _CACHE_WORKSPACE_BYTES = 512 * 1024**2
 _GRAPH_WORKSPACE_BYTES = 128 * 1024**2
@@ -585,6 +586,9 @@ class Qwen3_5CudaRunner(CudaRunner):
     def _graph_forward(
         self, plan: BatchPlan, cache_plan: PagedCachePlan
     ) -> list[int] | list[list[int]] | None:
+        if wants_logprobs(plan):
+            self._cuda_graph_fallback("decode", "logprobs")
+            return None
         batch_size = plan.num_sequences
         required_length = int(plan.positions.max()) + self.speculative_tokens + 2
         if not self.speculative_tokens:
@@ -794,7 +798,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         cache: DeviceCache,
         token_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> list[int]:
+    ) -> list[int] | ForwardOutput:
         final_logits = []
         outputs = []
         states = []
@@ -834,7 +838,8 @@ class Qwen3_5CudaRunner(CudaRunner):
                     context,
                 )
             )
-        sampled = self._sample(torch.cat(final_logits), plan)
+        logits = torch.cat(final_logits)
+        sampled = self._sample(logits, plan)
         for row, state in enumerate(states):
             (
                 row_cache,
@@ -866,7 +871,7 @@ class Qwen3_5CudaRunner(CudaRunner):
                 hidden[:, -1],
             )
             outputs.append(int(sampled[row]))
-        return outputs
+        return format_output(logits, outputs, plan)
 
     def _ordinary_decode(
         self,
@@ -874,7 +879,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         cache: DeviceCache,
         anchors: torch.Tensor,
         positions: torch.Tensor,
-    ) -> list[int]:
+    ) -> list[int] | ForwardOutput:
         contexts = torch.as_tensor(
             plan.context_lengths, dtype=torch.long, device=self.device
         )
@@ -888,7 +893,8 @@ class Qwen3_5CudaRunner(CudaRunner):
             rotary_positions=self._decode_rotary_positions(plan, positions),
         )
         self._store_state(cache, positions, recurrent, convolution, hidden[:, -1])
-        return self._sample(self._model.logits(hidden[:, -1]), plan).tolist()
+        logits = self._model.logits(hidden[:, -1])
+        return format_output(logits, self._sample(logits, plan), plan)
 
     def _speculative_decode(
         self,
@@ -896,7 +902,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         cache: DeviceCache,
         anchors: torch.Tensor,
         positions: torch.Tensor,
-    ) -> list[list[int]]:
+    ) -> list[list[int]] | ForwardOutput:
         contexts = torch.as_tensor(
             plan.context_lengths, dtype=torch.long, device=self.device
         )
@@ -910,7 +916,8 @@ class Qwen3_5CudaRunner(CudaRunner):
             initial_convolution,
             rotary_positions=(positions + rope_deltas)[None, :, None].expand(3, -1, -1),
         )
-        first = self._sample(self._model.logits(anchor_hidden[:, -1]), plan, 0)
+        first_logits = self._model.logits(anchor_hidden[:, -1])
+        first = self._sample(first_logits, plan, 0)
 
         drafts = []
         draft_input = first
@@ -993,6 +1000,9 @@ class Qwen3_5CudaRunner(CudaRunner):
                 committed_hidden[:, processed - 1],
             )
             rows.append([int(first[row]), *acceptance.token_rows[row]])
+        if wants_logprobs(plan):
+            logits = torch.cat((first_logits[:, None], verify_logits), dim=1)
+            return format_output(logits, rows, plan)
         return rows
 
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:

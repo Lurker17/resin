@@ -8,7 +8,13 @@ import numpy as np
 import pytest
 import torch
 
-from resin import BatchPhase, CacheGroupLayout, CacheLayout, CacheRetention
+from resin import (
+    BatchPhase,
+    CacheGroupLayout,
+    CacheLayout,
+    CacheRetention,
+    SamplingParams,
+)
 from resin.backend.cuda.graphs import default_decode_graph_shapes
 from resin.backend.cuda.paged_kv import paged_attention_host_inputs
 from resin.backend.cuda.runner import CudaRunner
@@ -139,6 +145,7 @@ def _flat_plan(
         context_lengths=list(context_lengths),
         phase=phase,
         sampling_mask=[True] * sequence_count,
+        sampling_params=[SamplingParams() for _ in range(sequence_count)],
     )
 
 
@@ -283,7 +290,7 @@ class TestGptOssCudaNativePlan:
             [130 + 10 * row for row in range(rows)], [1] * rows, phase=BatchPhase.DECODE
         )
         plan.sampling_params = [
-            SimpleNamespace(temperature=0.7, top_p=0.9, top_k=5, seed=100 + row)
+            SamplingParams(temperature=0.7, top_p=0.9, top_k=5, seed=100 + row)
             for row in range(rows)
         ]
         _, batch = build_attention_batches(plan)

@@ -29,6 +29,7 @@ from resin.backend.cuda.sampling import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
+from resin.backend.sampling import format_output, wants_logprobs
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
 from resin.models.inkling.media import InklingMedia
@@ -53,7 +54,7 @@ from resin_models_cuda.inkling.model import (
 from resin_models_cuda.inkling.weights import load_draft_weights, load_target_weights
 
 if TYPE_CHECKING:
-    from resin import BatchPlan
+    from resin import BatchPlan, ForwardOutput
 
 
 class InklingCudaRunner(CudaRunner):
@@ -311,6 +312,9 @@ class InklingCudaRunner(CudaRunner):
         )
 
     def _graph_forward(self, plan: BatchPlan, cache_plan: Any):
+        if wants_logprobs(plan):
+            self._cuda_graph_fallback("decode", "logprobs")
+            return None
         batch_size = plan.num_sequences
         required_length = int(plan.positions.max()) + self.speculative_tokens + 1
         shape = self._select_cuda_graph(
@@ -379,7 +383,7 @@ class InklingCudaRunner(CudaRunner):
         cache: DeviceCache,
         token_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> list[int]:
+    ) -> list[int] | ForwardOutput:
         logits = []
         for row, (start, end) in enumerate(rows):
             row_cache = cache.row(row)
@@ -410,7 +414,8 @@ class InklingCudaRunner(CudaRunner):
             self._store_state(row_cache, row_positions[:, -1], final_state)
             self._draft.inject_target(taps, row_positions, row_cache)
             logits.append(row_logits[:, -1])
-        return self._sample(torch.cat(logits), plan).tolist()
+        values = torch.cat(logits)
+        return format_output(values, self._sample(values, plan), plan)
 
     def _features_for(self, sequence_id: int, media: InklingMedia) -> torch.Tensor:
         existing = self._media_features.get(sequence_id)
@@ -468,7 +473,7 @@ class InklingCudaRunner(CudaRunner):
         cache: DeviceCache,
         anchors: torch.Tensor,
         positions: torch.Tensor,
-    ) -> list[list[int]]:
+    ) -> list[list[int]] | ForwardOutput:
         drafts, _ = self._draft.propose(
             anchors,
             positions,
@@ -525,7 +530,7 @@ class InklingCudaRunner(CudaRunner):
         )
         self._store_state(cache, positions + processed - 1, final_state)
         self._draft.inject_target(taps, verify_positions, cache)
-        return acceptance.token_rows
+        return format_output(logits, acceptance.token_rows, plan)
 
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
         self._check_cuda_graphs(plan.phase)

@@ -15,6 +15,7 @@
 mod batch;
 pub mod engine;
 mod ids;
+pub mod logprobs;
 mod planning;
 pub mod resources;
 mod scheduler;

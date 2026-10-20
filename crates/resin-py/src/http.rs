@@ -414,6 +414,8 @@ fn admit(
                 job.request.top_p,
                 job.request.top_k,
                 job.request.seed,
+                false,
+                0,
                 Some(extra),
             )?,
         )?;

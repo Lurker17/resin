@@ -16,13 +16,13 @@ from resin.backend.loading import (
     resolve_model,
 )
 from resin.backend.plans import plan_rows
-from resin.backend.sampling import TorchSampler
+from resin.backend.sampling import TorchSampler, format_output
 from resin.protocols import Runner
 from resin_models_torch.lfm2.config import Lfm2Config
 from resin_models_torch.lfm2.model import Lfm2ForCausalLM, Lfm2State
 
 if TYPE_CHECKING:
-    from resin import BatchPlan
+    from resin import BatchPlan, ForwardOutput
 
 
 DEFAULT_MODEL = "LiquidAI/LFM2.5-230M"
@@ -86,7 +86,7 @@ class Lfm2TorchRunner(Runner):
         self._cache: dict[int, Lfm2State] = {}
         self.forward_calls = 0
 
-    def forward(self, plan: BatchPlan) -> list[int]:
+    def forward(self, plan: BatchPlan) -> list[int] | ForwardOutput:
         logits_rows = []
         self.forward_calls += 1
         rows = plan_rows(plan, self._cache, self.vocab_size)
@@ -117,7 +117,8 @@ class Lfm2TorchRunner(Runner):
         sampler = getattr(self, "_sampler", None)
         if sampler is None:
             sampler = self._sampler = TorchSampler()
-        return sampler(torch.cat(logits_rows), plan).tolist()
+        logits = torch.cat(logits_rows)
+        return format_output(logits, sampler(logits, plan), plan)
 
     def _forward_rows(self, rows, logits_rows) -> None:
         for row in rows:

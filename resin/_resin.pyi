@@ -503,6 +503,8 @@ class SamplingParams:
         top_p: float = 1.0,
         top_k: int | None = None,
         seed: int | None = None,
+        logprobs: bool = False,
+        top_logprobs: int = 0,
         extra: Any | None = None,
     ) -> SamplingParams: ...
     def __repr__(self, /) -> str: ...
@@ -510,6 +512,10 @@ class SamplingParams:
     def extra(self, /) -> Any | None: ...
     @property
     def seed(self, /) -> int | None: ...
+    @property
+    def logprobs(self, /) -> bool: ...
+    @property
+    def top_logprobs(self, /) -> int: ...
     @property
     def temperature(self, /) -> float: ...
     @property
@@ -540,6 +546,8 @@ class SchedulerConfig:
 
 @final
 class TokenEvent:
+    @property
+    def logprobs(self, /) -> TokenLogprobs | None: ...
     def __repr__(self, /) -> str: ...
     @property
     def finish_reason(self, /) -> str | None: ...
@@ -576,3 +584,45 @@ class _HttpServer:
         Request shutdown from another thread; serve returns after the current
         inference step has finished and its requests have been cancelled.
         """
+
+@final
+class TokenLogprobs:
+    def __new__(cls, logprob: float, top_logprobs: Sequence[tuple[int, float]] = ()) -> TokenLogprobs: ...
+    @property
+    def logprob(self) -> float: ...
+    @property
+    def top_logprobs(self) -> list[tuple[int, float]]: ...
+
+@final
+class ForwardOutput:
+    """Borrowed NumPy SoA output, valid until the synchronous step returns.
+
+    All arrays must have their exact declared dtype, one dimension, and contiguous
+    storage. Construction retains the arrays without copying. Do not mutate or
+    recycle their storage until step() returns. Token rows use token_indptr;
+    score rows use logprob_indptr (defaults to token_indptr). An empty score row
+    opts out; every other score row must cover the entire raw output token row.
+    top_indptr partitions top_token_ids/top_logprobs by scored token.
+    """
+    def __new__(
+        cls, token_ids: npt.NDArray[np.uint32], token_indptr: npt.NDArray[np.uint32], *,
+        logprobs: npt.NDArray[np.float32] | None = None,
+        logprob_indptr: npt.NDArray[np.uint32] | None = None,
+        top_indptr: npt.NDArray[np.uint32] | None = None,
+        top_token_ids: npt.NDArray[np.uint32] | None = None,
+        top_logprobs: npt.NDArray[np.float32] | None = None,
+    ) -> ForwardOutput: ...
+    @property
+    def token_ids(self) -> npt.NDArray[np.uint32]: ...
+    @property
+    def token_indptr(self) -> npt.NDArray[np.uint32]: ...
+    @property
+    def logprobs(self) -> npt.NDArray[np.float32] | None: ...
+    @property
+    def logprob_indptr(self) -> npt.NDArray[np.uint32] | None: ...
+    @property
+    def top_indptr(self) -> npt.NDArray[np.uint32] | None: ...
+    @property
+    def top_token_ids(self) -> npt.NDArray[np.uint32] | None: ...
+    @property
+    def top_logprobs(self) -> npt.NDArray[np.float32] | None: ...

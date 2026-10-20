@@ -3,6 +3,7 @@
 //! The engine owns requests and cache leases; a runner only executes a frozen
 //! plan and releases model-local state. Opaque payloads carry frontend metadata.
 
+pub use crate::logprobs::{LogprobView, TokenLogprobs};
 use crate::resources::RequestResourceRef;
 use crate::resources::kv::{KvGroupPlan, KvLayout};
 use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
@@ -170,6 +171,7 @@ pub struct TokenEvent {
     pub index: usize,
     pub finished: bool,
     pub finish_reason: Option<CompletionReason>,
+    pub logprobs: Option<TokenLogprobs>,
 }
 
 #[derive(Debug, Default)]
@@ -290,6 +292,9 @@ fn execution_call<T>(stage: &str, call: impl FnOnce() -> Result<T>) -> Result<T>
 
 pub trait Runner<P> {
     fn forward(&mut self, plan: ExecutionPlan<P>) -> Result<Vec<Vec<u32>>>;
+    fn logprobs(&self) -> Option<LogprobView<'_>> {
+        None
+    }
     fn release(&mut self, _request_ids: &[u64]) -> Result<()> {
         Ok(())
     }
@@ -944,7 +949,11 @@ impl<P: Clone> EngineCore<P> {
     ) -> Result<Vec<E>> {
         // Validate the complete execution result before terminal output limits
         // can hide writes beyond the leased capacity or extra prefill tokens.
-        if let Err(error) = self.validate_runner_output(&batch.rows, &output_token_ids) {
+        let logprobs = runner.logprobs();
+        if let Err(error) = self
+            .validate_runner_output(&batch.rows, &output_token_ids)
+            .and_then(|()| logprobs.map_or(Ok(()), |scores| scores.validate(&output_token_ids)))
+        {
             return self.quarantine(batch, "runner output exceeds its execution contract", error);
         }
         let decoded_batch = batch
@@ -957,7 +966,7 @@ impl<P: Clone> EngineCore<P> {
         let event_capacity = output_token_ids.iter().map(Vec::len).sum();
         let mut events = Vec::with_capacity(event_capacity);
         let mut committed_token_ids = Vec::with_capacity(batch.rows.len());
-        for (row, token_ids) in batch.rows.iter().zip(&output_token_ids) {
+        for (row_index, (row, token_ids)) in batch.rows.iter().zip(&output_token_ids).enumerate() {
             let request = &row.request;
             if !row.scheduled.sample {
                 retired.push(false);
@@ -969,7 +978,7 @@ impl<P: Clone> EngineCore<P> {
                 .saturating_sub(request.generated.len());
             let mut committed = Vec::with_capacity(token_ids.len().min(remaining));
             let mut finished = false;
-            for &token_id in token_ids.iter().take(remaining) {
+            for (token_index, &token_id) in token_ids.iter().take(remaining).enumerate() {
                 let finish_reason = if request.stop_token_ids.binary_search(&token_id).is_ok() {
                     Some(CompletionReason::Stop)
                 } else if request.generated.len() + committed.len() + 1 >= request.max_new_tokens {
@@ -985,6 +994,7 @@ impl<P: Clone> EngineCore<P> {
                         index: request.generated.len() + committed.len(),
                         finished,
                         finish_reason,
+                        logprobs: logprobs.and_then(|scores| scores.token(row_index, token_index)),
                     })
                 }) {
                     Ok(event) => event,
@@ -1118,6 +1128,7 @@ impl<P: Clone> EngineCore<P> {
         self.close_healthy(runner)
     }
 }
+
 impl<P: Clone> EngineCore<P> {
     fn prefix_alignment(&self) -> Option<u32> {
         self.kv_resources

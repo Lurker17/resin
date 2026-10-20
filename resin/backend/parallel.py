@@ -50,6 +50,8 @@ def batch_plan_payload(plan: BatchPlan) -> dict[str, Any]:
                 "top_p": params.top_p,
                 "top_k": params.top_k,
                 "seed": params.seed,
+                "logprobs": params.logprobs,
+                "top_logprobs": params.top_logprobs,
                 "extra": params.extra,
             }
             for params in plan.sampling_params

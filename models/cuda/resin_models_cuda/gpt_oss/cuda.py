@@ -55,6 +55,7 @@ from resin.backend.cuda.runner import (
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.paged_attention import PagedAttentionBatch
 from resin.backend.quantization import QuantizationConfig
+from resin.backend.sampling import format_output, wants_logprobs
 from resin.models.gpt_oss.config import GptOssConfig
 from resin.models.gpt_oss.plan import (
     PAGE_SIZE,
@@ -73,7 +74,7 @@ from resin_models_cuda.gpt_oss.cutile import top4_softmax
 from resin_models_cuda.gpt_oss.model import MLP, TopKRouter
 
 if TYPE_CHECKING:
-    from resin import BatchPlan
+    from resin import BatchPlan, ForwardOutput
 
 
 _BF16_BYTES = 2
@@ -693,6 +694,9 @@ class GptOssCudaRunner(CudaRunner):
     def _graph_forward(
         self, plan: BatchPlan, host: PagedAttentionBatch
     ) -> list[int] | None:
+        if wants_logprobs(plan):
+            self._cuda_graph_fallback("decode", "logprobs")
+            return None
         if not self._cuda_graph_mode_enabled("decode"):
             return None
         rows = len(plan.sequence_ids)
@@ -746,7 +750,7 @@ class GptOssCudaRunner(CudaRunner):
             )
         return self._run_cuda_graph("decode", shape, inputs)[:rows]
 
-    def forward(self, plan: BatchPlan) -> list[int]:
+    def forward(self, plan: BatchPlan) -> list[int] | ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         host_positions = plan.positions
 
@@ -787,7 +791,7 @@ class GptOssCudaRunner(CudaRunner):
                     final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
                 logits = self._model.lm_head(final_hidden)
 
-            return self._sampler(logits, plan).tolist()
+            return format_output(logits, self._sampler(logits, plan), plan)
 
 
 def _router_logits(router: TopKRouter, hidden: Tensor) -> Tensor:

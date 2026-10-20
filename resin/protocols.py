@@ -14,7 +14,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from resin._resin import BatchPlan, ResourceBinding, RunnerConfig
+    from resin._resin import BatchPlan, ForwardOutput, ResourceBinding, RunnerConfig
 
 
 class MediaTokenSpan(NamedTuple):
@@ -77,7 +77,9 @@ class ConversationCodec(Protocol):
 class Runner(Protocol):
     """Execute one Engine-owned immutable plan synchronously."""
 
-    def forward(self, plan: BatchPlan) -> Sequence[int] | Sequence[Sequence[int]]: ...
+    def forward(
+        self, plan: BatchPlan
+    ) -> ForwardOutput | Sequence[int] | Sequence[Sequence[int]]: ...
 
 
 class ManagedRunner(Runner, Protocol):
