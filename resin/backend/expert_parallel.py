@@ -25,6 +25,10 @@ class ExpertParallelDispatch:
     the same collectives; top-k indices stay global so the local expert kernel
     can filter its own contiguous expert interval. Counts are read on the host,
     making this a deliberately eager baseline rather than a graphable kernel.
+
+    The local callback must return one consistent dtype on all ranks, including
+    empty inputs. That dtype is retained through exchange and replica broadcast;
+    the combined rows are cast to the input dtype only at the final boundary.
     """
 
     def __init__(
@@ -78,7 +82,7 @@ class ExpertParallelDispatch:
         received_indices = exchange(send_indices)
         received_weights = exchange(send_weights)
         partial = self.local(received_hidden, received_indices, received_weights)
-        returned = hidden.new_empty((sum(send_splits), hidden.shape[1]))
+        returned = partial.new_empty((sum(send_splits), hidden.shape[1]))
         dist.all_to_all_single(
             returned,
             partial.contiguous(),
@@ -86,8 +90,8 @@ class ExpertParallelDispatch:
             input_split_sizes=recv_splits,
             group=group.handle,
         )
-        result = torch.zeros_like(hidden)
+        result = partial.new_zeros(hidden.shape)
         result.index_add_(0, rows, returned)
         if replication is not None and replication.size > 1 and result.numel():
             dist.broadcast(result, src=replication.source, group=replication.handle)
-        return result
+        return result.to(hidden.dtype)

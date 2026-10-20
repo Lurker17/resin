@@ -157,6 +157,16 @@ def kernel_expert_factory(
     *,
     parallel_groups: ParallelGroups | None = None,
 ):
+    if parallel_groups is not None and (
+        not getattr(
+            getattr(kernel, "capabilities", None), "supports_fp32_partial", False
+        )
+        or not callable(getattr(kernel, "forward_partial", None))
+    ):
+        raise ValueError(
+            "expert parallelism requires kernel FP32 forward_partial support"
+        )
+
     class KernelExperts(torch.nn.Module):
         storage_format = config.quantization
 
@@ -230,30 +240,20 @@ def kernel_expert_factory(
             if self._prepared_weights is None:
                 raise RuntimeError("packed expert weights have not been loaded")
             if hidden.shape[0] == 0:
-                return torch.zeros_like(hidden)
-            limit = getattr(getattr(kernel, "capabilities", None), "max_tokens", None)
-            if limit is not None and hidden.shape[0] > limit:
-                # EP gathers independent replica batches. A destination can
-                # exceed the kernel's token limit even when each source fits.
-                return torch.cat(
-                    [
-                        self.forward_local(
-                            hidden[start : start + limit],
-                            indices[start : start + limit],
-                            weights[start : start + limit],
-                        )
-                        for start in range(0, hidden.shape[0], limit)
-                    ]
-                )
+                return torch.zeros_like(hidden, dtype=torch.float32)
             local = indices - self._expert_start
             owned = (local >= 0) & (local < config.num_experts)
             routing = MoERouting(
                 # The kernel consumes precomputed routes, not these logits.
                 router_logits=hidden.new_zeros((hidden.shape[0], config.num_experts)),
-                selected_experts=torch.where(owned, local, 0),
+                # MoERouting's inactive sentinel preserves the owned routes
+                # without substituting another expert for foreign assignments.
+                selected_experts=torch.where(owned, local, config.num_experts),
                 expert_weights=weights.masked_fill(~owned, 0),
             )
-            return kernel.forward(hidden, routing, self._prepared_weights, config)
+            return kernel.forward_partial(
+                hidden, routing, self._prepared_weights, config
+            )
 
         def forward_empty(self) -> None:
             """Participate in EP while this attention replica has no token rows."""

@@ -153,6 +153,7 @@ class MoEKernelCapabilities:
     min_tokens: int = 1
     max_tokens: int | None = None
     gate_up_layouts: frozenset[str] = frozenset({"interleaved_gate_up"})
+    supports_fp32_partial: bool = False
 
     def __post_init__(self) -> None:
         _require_name("kernel_id", self.kernel_id)
@@ -181,6 +182,8 @@ class MoEKernelCapabilities:
 
         if not isinstance(self.supports_expert_bias, bool):
             raise TypeError("supports_expert_bias must be a boolean")
+        if not isinstance(self.supports_fp32_partial, bool):
+            raise TypeError("supports_fp32_partial must be a boolean")
         _require_positive_int("min_experts", self.min_experts)
         if self.max_experts is not None:
             _require_positive_int("max_experts", self.max_experts)
@@ -274,6 +277,11 @@ class MoERouting(Generic[TensorT]):
     ``expert_weights`` are both ``[tokens, top_k]``.  Supplying all three keeps
     routing policy in model code while accommodating kernels that build their
     own gather/scatter metadata from the full logits.
+
+    For a configuration with ``E`` experts, selected ID ``E`` with zero weight
+    denotes an inactive assignment. Adapters must ignore these slots without
+    rerouting or renormalizing the remaining weights. Active IDs are in
+    ``[0, E)``. This allows an EP owner to execute its subset of global routes.
     """
 
     router_logits: TensorT
@@ -283,7 +291,14 @@ class MoERouting(Generic[TensorT]):
 
 @runtime_checkable
 class MoEKernel(Protocol[TensorT, PreparedWeightsT]):
-    """Structural interface implemented by fused-MoE kernel adapters."""
+    """Structural interface implemented by fused-MoE kernel adapters.
+
+    Adapters advertising ``supports_fp32_partial`` also implement
+    ``forward_partial`` with the same signature as ``forward``. It returns
+    weighted local expert sums in FP32, including for empty inputs, without
+    rounding the sum to the activation dtype before cross-rank combination.
+    The adapter owns any expansion/chunking needed to respect its token limit.
+    """
 
     capabilities: MoEKernelCapabilities
 

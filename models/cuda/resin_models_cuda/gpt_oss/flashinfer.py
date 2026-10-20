@@ -17,7 +17,7 @@ model-facing kernel interface.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -55,6 +55,7 @@ class PreparedFlashInferMXFP4Weights:
     intermediate_size: int
     padded_intermediate_size: int
     config_key: tuple[object, ...]
+    fc2_zero_bias: Any | None = None
 
 
 def _config_key(config: MoEKernelConfig) -> tuple[object, ...]:
@@ -167,6 +168,7 @@ class FlashInferSM90MXFP4Kernel:
         min_tokens=1,
         max_tokens=_MAX_TOKENS,
         gate_up_layouts={"interleaved_gate_up"},
+        supports_fp32_partial=True,
     )
 
     def supports(
@@ -378,7 +380,75 @@ class FlashInferSM90MXFP4Kernel:
             intermediate_size=intermediate,
             padded_intermediate_size=padded_intermediate,
             config_key=_config_key(config),
+            fc2_zero_bias=(
+                torch.full(
+                    (experts, padded_hidden),
+                    fill_value=0,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                if fc2_bias is not None
+                else None
+            ),
         )
+
+    def forward_partial(
+        self,
+        hidden_states: Any,
+        routing: MoERouting[Any],
+        weights: PreparedFlashInferMXFP4Weights,
+        config: MoEKernelConfig,
+    ):
+        """Keep weighted expert sums in FP32 until EP has combined all owners.
+
+        The pinned W4 kernel returns BF16. Give each selected assignment its
+        own row with unit weight and zero output bias, preserving its BF16
+        GEMM result. Apply output bias and routing weights in FP32 afterward,
+        matching CUTLASS's finalizer order without rounding an owner sum.
+        """
+
+        self.validate(config)
+        result = hidden_states.new_zeros(hidden_states.shape, dtype=torch.float32)
+        active = (
+            (routing.selected_experts >= 0)
+            & (routing.selected_experts < config.num_experts)
+            & (routing.expert_weights != 0)
+        )
+        rows, slots = active.nonzero(as_tuple=True)
+        # Both bias arguments must exist when FC1 has bias in the pinned ABI.
+        # This view shares all packed weights; only the small zero bias is new.
+        unbiased = replace(weights, fc2_bias=weights.fc2_zero_bias)
+        limit = self.capabilities.max_tokens or len(rows)
+        for start in range(0, len(rows), limit or 1):
+            token_rows, token_slots = (
+                rows[start : start + limit],
+                slots[start : start + limit],
+            )
+            experts = routing.selected_experts[token_rows, token_slots].long()
+            indices = torch.full(
+                (len(token_rows), config.top_k),
+                config.num_experts,
+                device=hidden_states.device,
+                dtype=torch.int32,
+            )
+            indices[:, 0] = experts.int()
+            scales = torch.zeros(
+                indices.shape, device=hidden_states.device, dtype=torch.float32
+            )
+            scales[:, 0] = 1
+            selected = MoERouting(
+                hidden_states.new_zeros((len(token_rows), config.num_experts)),
+                indices,
+                scales,
+            )
+            output = self.forward(
+                hidden_states[token_rows], selected, unbiased, config
+            ).float()
+            if weights.fc2_bias is not None:
+                output += weights.fc2_bias[experts, : config.hidden_size].float()
+            output *= routing.expert_weights[token_rows, token_slots, None].float()
+            result.index_add_(0, token_rows, output)
+        return result
 
     def forward(
         self,
@@ -437,6 +507,9 @@ class FlashInferSM90MXFP4Kernel:
         if routing.expert_weights.dtype not in floating:
             raise ValueError("expert_weights must have a floating dtype")
 
+        # Preserve the inactive ID config.num_experts for CUTLASS's range filter.
+        # Its W4 prologue stores one row per (token, expert), stopping at the
+        # first matching slot. A zero-weight duplicate can hide a real route.
         selected_experts = routing.selected_experts.to(
             device=hidden_states.device, dtype=torch.int32
         ).contiguous()

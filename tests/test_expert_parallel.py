@@ -90,6 +90,25 @@ def _ep_worker(rank: int, rendezvous: str) -> None:
         # Non-source ranks remain expert owners and receive remote tokens.
         check([3, 1], replication=replication)
         check([0, 2], replication=replication)
+
+        def precise_local(hidden, indices, weights):
+            result = torch.zeros_like(hidden, dtype=torch.float32)
+            # BF16 owner sums would lose this 2.0 residual. Idle owners must
+            # also return FP32 so every reverse exchange uses the same dtype.
+            for expert, value in [(0, 1000.75), (2, -998.75)]:
+                if expert // 2 == rank:
+                    coefficient = ((indices == expert) * weights).sum(1)
+                    result += hidden.float() * coefficient[:, None] * value
+            return result
+
+        count = int(rank == 0)
+        hidden = torch.ones(count, 4, dtype=torch.bfloat16)
+        indices = torch.tensor([[0, 2]], dtype=torch.int64)[:count]
+        weights = torch.ones(count, 2, dtype=torch.float32)
+        precise = ExpertParallelDispatch(precise_local, num_experts=8, group=group)
+        result = precise(hidden, indices, weights)
+        assert result.dtype == hidden.dtype
+        torch.testing.assert_close(result, torch.full_like(hidden, 2))
         for handle in handles:
             if handle != dist.GroupMember.NON_GROUP_MEMBER:
                 dist.destroy_process_group(handle)

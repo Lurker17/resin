@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -347,3 +348,125 @@ class TestFlashInferMXFP4Adapter:
         )
         with pytest.raises(UnsupportedMoEConfiguration, match="requires SM90"):
             wrong_arch_kernel.prepare_weights(_weights(wrong_arch_torch), config)
+
+    def test_inactive_route_sentinel_reaches_cutlass_without_rerouting(
+        self, monkeypatch
+    ):
+        import torch
+
+        import resin_models_cuda.gpt_oss.flashinfer as adapter
+
+        config = _config(num_experts=4, hidden_size=32, intermediate_size=32)
+        kernel = adapter.FlashInferSM90MXFP4Kernel()
+        monkeypatch.setattr(kernel, "_validate_sm90_tensor", lambda *args: None)
+        indices = torch.tensor([[4, 0, 1, 2], [0, 4, 4, 4]], dtype=torch.int64)
+        weights = torch.tensor(
+            [[0, 0.5, 0.25, 0.25], [1, 0, 0, 0]], dtype=torch.float32
+        )
+        hidden = torch.ones(2, 32, dtype=torch.bfloat16)
+
+        def cutlass(**kwargs):
+            actual_ids = kwargs["token_selected_experts"]
+            actual_weights = kwargs["token_final_scales"]
+            assert actual_ids.dtype == torch.int32
+            assert torch.equal(actual_ids, indices.int())
+            assert torch.equal(actual_weights, weights)
+            active = actual_ids < config.num_experts
+            scales = ((actual_ids + 1) * actual_weights * active).sum(1)
+            kwargs["output"].copy_(hidden * scales[:, None])
+
+        monkeypatch.setattr(
+            kernel,
+            "_get_fused_moe",
+            lambda: SimpleNamespace(
+                ActivationType=SimpleNamespace(Swiglu=object()),
+                cutlass_fused_moe=cutlass,
+            ),
+        )
+        prepared = SimpleNamespace(
+            config_key=adapter._config_key(config),
+            fc1_weights=torch.empty(1),
+            fc2_weights=torch.empty(1),
+            fc1_scales=None,
+            fc2_scales=None,
+            fc1_bias=None,
+            fc2_bias=None,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            swiglu_limit=None,
+            padded_hidden_size=32,
+        )
+        routing = MoERouting(torch.zeros(2, 4), indices, weights)
+        output = kernel.forward(hidden, routing, prepared, config)
+        torch.testing.assert_close(
+            output[:, 0], torch.tensor([1.75, 1.0], dtype=torch.bfloat16)
+        )
+
+    def test_fp32_partials_preserve_cancellation_and_chunk_expanded_routes(
+        self, monkeypatch
+    ):
+        import torch
+
+        import resin_models_cuda.gpt_oss.flashinfer as adapter
+
+        config = _config(num_experts=4, hidden_size=32, intermediate_size=32)
+        kernel = adapter.FlashInferSM90MXFP4Kernel()
+        kernel.capabilities = replace(kernel.capabilities, max_tokens=2)
+        packed = torch.empty(1, dtype=torch.uint8)
+        bias = torch.zeros(4, 32, dtype=torch.bfloat16)
+        bias[0] = 0.75
+        bias[1] = 1.25
+        prepared = adapter.PreparedFlashInferMXFP4Weights(
+            packed,
+            packed,
+            packed,
+            packed,
+            torch.zeros(4, 64, dtype=torch.bfloat16),
+            bias,
+            None,
+            None,
+            None,
+            32,
+            32,
+            32,
+            32,
+            adapter._config_key(config),
+            torch.zeros_like(bias),
+        )
+        calls = []
+
+        def unweighted(hidden, routing, weights, actual):
+            assert actual is config
+            assert len(hidden) <= 2
+            assert weights.fc1_weights is packed and weights.fc2_weights is packed
+            assert weights.fc1_bias is prepared.fc1_bias
+            assert not weights.fc2_bias.any()
+            assert routing.selected_experts[:, 1:].eq(config.num_experts).all()
+            assert routing.expert_weights[:, 0].eq(1).all()
+            assert not routing.expert_weights[:, 1:].any()
+            calls.append(len(hidden))
+            values = torch.tensor([1000, -1000, 4, 0], dtype=torch.bfloat16)
+            return values[routing.selected_experts[:, 0].long(), None].expand(-1, 32)
+
+        monkeypatch.setattr(kernel, "forward", unweighted)
+        hidden = torch.ones(3, 32, dtype=torch.bfloat16)
+        ids = torch.tensor([[0, 4, 4, 4], [1, 4, 4, 4], [0, 1, 2, 4]])
+        scales = torch.tensor([[1, 0, 0, 0], [1, 0, 0, 0], [0.25, 0.5, 0.25, 0]])
+        routing = MoERouting(torch.zeros(3, 4), ids, scales)
+        output = kernel.forward_partial(hidden, routing, prepared, config)
+        assert output.dtype == torch.float32
+        torch.testing.assert_close(
+            output[:, 0], torch.tensor([1000.75, -998.75, -248.1875])
+        )
+        assert calls == [2, 2, 1]
+        assert output[0, 0] + output[1, 0] == 2
+        assert output[:2, 0].bfloat16().float().sum() == 0
+        assert prepared.fc2_bias is bias and bias[0, 0] == 0.75
+        empty = kernel.forward_partial(
+            hidden[:0],
+            MoERouting(torch.empty(0, 4), ids[:0], scales[:0]),
+            prepared,
+            config,
+        )
+        assert empty.shape == (0, 32) and empty.dtype == torch.float32
+        assert calls == [2, 2, 1]

@@ -90,13 +90,22 @@ def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty():
     storage = object()
 
     class Kernel:
-        def forward(self, hidden, routing, weights, actual):
+        capabilities = SimpleNamespace(supports_fp32_partial=True)
+
+        def forward_partial(self, hidden, routing, weights, actual):
             assert actual is config and weights is storage
             calls.append(routing)
-            # Global expert ID + 1 is a deterministic expert transform.
-            coefficients = routing.selected_experts + 5
-            total = (coefficients * routing.expert_weights).sum(1)
-            return hidden * total[:, None]
+            result = torch.zeros_like(hidden, dtype=torch.float32)
+            for expert in range(config.num_experts):
+                # CUTLASS's W4 expert map stops at the first matching slot.
+                # A foreign zero-weight expert-0 placeholder would conceal
+                # the real owned expert-0 route later in the same row.
+                matches = routing.selected_experts == expert
+                first = matches.int().argmax(1)
+                scales = routing.expert_weights.gather(1, first[:, None])
+                scales = scales * matches.any(1)[:, None]
+                result += hidden * scales * (expert + 5)
+            return result
 
     module = kernel_expert_factory(Kernel(), config, parallel_groups=groups)(args)
     module.install_prepared_weights(storage, device=torch.device("cpu"))
@@ -105,7 +114,7 @@ def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty():
     weights = torch.tensor([[0.2, 0.8], [0.4, 0.6], [0.3, 0.7]])
     output = module.forward_local(hidden, indices, weights)
     torch.testing.assert_close(output[:, 0], torch.tensor([4.0, 3.2, 6.7]))
-    assert calls[0].selected_experts.tolist() == [[0, 0], [3, 0], [1, 2]]
+    assert calls[0].selected_experts.tolist() == [[4, 0], [3, 4], [1, 2]]
     torch.testing.assert_close(
         calls[0].expert_weights,
         torch.tensor([[0.0, 0.8], [0.4, 0.0], [0.3, 0.7]]),
@@ -132,41 +141,8 @@ def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty():
     assert routed[1][1].shape == routed[1][2].shape == (0, 2)
 
 
-def test_received_expert_rows_are_chunked_to_the_kernel_token_limit():
+def test_ep_rejects_kernels_without_fp32_partial_execution():
     args = _args()
-    local_args = SimpleNamespace(**vars(args))
-    local_args.num_local_experts = 4
-    config = moe_kernel_config(local_args, "sm90")
-    groups = SimpleNamespace(
-        ep=RankGroup((0, 1), object(), 1),
-        attn_replication=RankGroup((1,), object(), 0),
-    )
-    calls = []
-
-    class Kernel:
-        capabilities = SimpleNamespace(max_tokens=2)
-
-        def forward(self, hidden, routing, storage, actual):
-            assert hidden.shape[0] <= self.capabilities.max_tokens
-            assert actual is config
-            calls.append(routing)
-            total = ((routing.selected_experts + 5) * routing.expert_weights).sum(1)
-            return hidden * total[:, None]
-
-    module = kernel_expert_factory(Kernel(), config, parallel_groups=groups)(args)
-    module.install_prepared_weights(object(), device=torch.device("cpu"))
-    hidden = torch.arange(5 * 32, dtype=torch.float32).view(5, 32)
-    indices = torch.tensor([[0, 4], [7, 3], [5, 6], [2, 7], [4, 1]])
-    weights = torch.tensor([[0.2, 0.8], [0.4, 0.6], [0.3, 0.7], [0.5, 0.5], [0.9, 0.1]])
-    owned = (indices >= 4) & (indices < 8)
-    expected = hidden * ((indices + 1) * weights * owned).sum(1)[:, None]
-    torch.testing.assert_close(module.forward_local(hidden, indices, weights), expected)
-    assert [call.router_logits.shape[0] for call in calls] == [2, 2, 1]
-    torch.testing.assert_close(
-        torch.cat([call.expert_weights for call in calls]),
-        weights.masked_fill(~owned, 0),
-    )
-    assert torch.equal(
-        torch.cat([call.selected_experts for call in calls]),
-        torch.where(owned, indices - 4, 0),
-    )
+    config = moe_kernel_config(args, "sm90")
+    with pytest.raises(ValueError, match="FP32 forward_partial"):
+        kernel_expert_factory(object(), config, parallel_groups=object())
