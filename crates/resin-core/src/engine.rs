@@ -10,7 +10,7 @@ use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
 use crate::resources::paged_kv::{PagedKvBatchView, PagedKvError, PagedKvResources};
 use crate::{
     Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable, Scheduler,
-    SequenceStep, schedule_ready_prefix,
+    Selection, SequenceStep, schedule_ready_prefix,
 };
 use std::cmp::Reverse;
 use std::fmt;
@@ -758,7 +758,17 @@ impl<P: Clone> EngineCore<P> {
         runner: &mut impl Runner<P>,
         make_event: impl FnMut(TokenEvent) -> Result<E>,
     ) -> Result<Vec<E>> {
-        let Some((mut batch, plan)) = self.prepare_batch(runner)? else {
+        self.step_phase_with(runner, None, make_event)
+    }
+
+    /// A coordinator may gate dispatch without reserving or exposing a pending batch.
+    pub fn step_phase_with<E>(
+        &mut self,
+        runner: &mut impl Runner<P>,
+        phase: Option<Phase>,
+        make_event: impl FnMut(TokenEvent) -> Result<E>,
+    ) -> Result<Vec<E>> {
+        let Some((mut batch, plan)) = self.prepare_batch(runner, phase)? else {
             return Ok(Vec::new());
         };
         // A rejection promises that persistent state is unchanged. Every other
@@ -778,9 +788,32 @@ impl<P: Clone> EngineCore<P> {
         self.complete_batch(runner, batch, output, make_event)
     }
 
+    fn selected_cohort(&self) -> Result<(Vec<&Request<P>>, Selection)> {
+        let (mut requests, mut selection) = self.scheduler.selected();
+        let admitted = self.admission_prefix_len(&requests)?;
+        if admitted == 0 {
+            (requests, selection) = self.scheduler.selected_running();
+        } else {
+            requests.truncate(admitted);
+            selection.truncate(admitted);
+        }
+        Ok((requests, selection))
+    }
+
+    /// Read-only proposal using the same admission fallback as actual dispatch.
+    pub fn next_phase(&self) -> Result<Option<Phase>> {
+        self.raise_if_open()?;
+        Ok(self
+            .selected_cohort()?
+            .0
+            .first()
+            .map(|request| request.phase()))
+    }
+
     fn prepare_batch(
         &mut self,
         runner: &mut impl Runner<P>,
+        phase: Option<Phase>,
     ) -> Result<Option<(Batch<P>, ExecutionPlan<P>)>> {
         self.raise_if_open()?;
         if self.scheduler.is_empty() {
@@ -788,15 +821,11 @@ impl<P: Clone> EngineCore<P> {
         }
 
         let (scheduled_rows, selection) = {
-            let (mut selected_requests, mut selection) = self.scheduler.selected();
-            let admitted = self.admission_prefix_len(&selected_requests)?;
-            if admitted == 0 {
-                (selected_requests, selection) = self.scheduler.selected_running();
-            } else {
-                selected_requests.truncate(admitted);
-                selection.truncate(admitted);
-            }
+            let (selected_requests, mut selection) = self.selected_cohort()?;
             if selected_requests.is_empty() {
+                return Ok(None);
+            }
+            if phase.is_some_and(|phase| selected_requests[0].phase() != phase) {
                 return Ok(None);
             }
             let scheduled_rows = schedule_requests(&selected_requests, self.planning_config())?;
@@ -865,7 +894,7 @@ impl<P: Clone> EngineCore<P> {
             if matches!(error, CachePoolError::InsufficientCapacity { .. })
                 && self.retract_one(runner)?
             {
-                return self.prepare_batch(runner);
+                return self.prepare_batch(runner, phase);
             }
             return Err(Error::from(error));
         }

@@ -130,6 +130,13 @@ impl BatchPhase {
             Self::Decode => "DECODE",
         }
     }
+
+    const fn core(self) -> resin_core::Phase {
+        match self {
+            Self::Prefill => resin_core::Phase::Prefill,
+            Self::Decode => resin_core::Phase::Decode,
+        }
+    }
 }
 
 /// Per-request output-token sampling policy.
@@ -1034,7 +1041,8 @@ impl Engine {
             .map_err(|error| handle_error.unwrap_or_else(|| core_error(error)))
     }
 
-    fn step(&mut self, py: Python<'_>) -> PyResult<Vec<Py<TokenEvent>>> {
+    #[pyo3(signature = (*, phase = None))]
+    fn step(&mut self, py: Python<'_>, phase: Option<BatchPhase>) -> PyResult<Vec<Py<TokenEvent>>> {
         let mut runner = PythonRunner {
             py,
             forward: &self.runner_forward,
@@ -1043,29 +1051,43 @@ impl Engine {
             logprobs: None,
         };
         let mut event_error = None;
-        let result = self.core.step_with(&mut runner, |event| {
-            Py::new(
-                py,
-                TokenEvent {
-                    request_id: event.request_id,
-                    token_id: event.token_id,
-                    index: event.index,
-                    finished: event.finished,
-                    finish_reason: event.finish_reason,
-                    logprobs: event.logprobs,
-                },
-            )
-            .map_err(|error| {
-                event_error = Some(error);
-                core::Error::memory("could not allocate token event")
-            })
-        });
+        let result = self
+            .core
+            .step_phase_with(&mut runner, phase.map(BatchPhase::core), |event| {
+                Py::new(
+                    py,
+                    TokenEvent {
+                        request_id: event.request_id,
+                        token_id: event.token_id,
+                        index: event.index,
+                        finished: event.finished,
+                        finish_reason: event.finish_reason,
+                        logprobs: event.logprobs,
+                    },
+                )
+                .map_err(|error| {
+                    event_error = Some(error);
+                    core::Error::memory("could not allocate token event")
+                })
+            });
         result.map_err(|error| {
             runner
                 .error
                 .or(event_error)
                 .unwrap_or_else(|| core_error(error))
         })
+    }
+
+    fn next_phase(&self) -> PyResult<Option<BatchPhase>> {
+        self.core
+            .next_phase()
+            .map(|phase| {
+                phase.map(|phase| match phase {
+                    resin_core::Phase::Prefill => BatchPhase::Prefill,
+                    resin_core::Phase::Decode => BatchPhase::Decode,
+                })
+            })
+            .map_err(core_error)
     }
     fn cancel(&mut self, py: Python<'_>, request: PyRef<'_, RequestLease>) -> PyResult<bool> {
         let mut runner = PythonRunner {

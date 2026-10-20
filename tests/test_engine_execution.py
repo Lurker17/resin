@@ -276,3 +276,39 @@ class TestRunnerContractConstruction:
             Engine(BadRelease())
         with pytest.raises(RuntimeError, match="release descriptor failed"):
             Engine(RaisingRelease())
+
+
+class TestPhaseCoordination:
+    def test_proposal_and_mismatched_gate_do_not_reserve_or_execute(self):
+        from resin import BatchPhase
+
+        runner = RecordingRunner(cache_layout=history_layout(4))
+        engine = Engine(runner)
+        assert engine.next_phase() is None
+        request = engine.submit([1, 2], max_new_tokens=2)
+        before = engine.cache_occupied_block_count
+        assert engine.next_phase() == BatchPhase.PREFILL
+        assert engine.next_phase() == BatchPhase.PREFILL
+        assert engine.step(phase=BatchPhase.DECODE) == []
+        assert engine.cache_occupied_block_count == before
+        assert runner.plans == [] and not request.done
+        engine.step(phase=BatchPhase.PREFILL)
+        assert runner.plans[0].batch_id == 1
+        assert engine.next_phase() == BatchPhase.DECODE
+        assert engine.step(phase=BatchPhase.PREFILL) == []
+        engine.step(phase=BatchPhase.DECODE)
+        assert request.done and engine.next_phase() is None
+
+    def test_proposal_uses_sticky_admission_instead_of_waiting_prefill(self):
+        from resin import BatchPhase
+
+        engine = Engine(RecordingRunner(), max_running_requests=1)
+        first = engine.submit([1], max_new_tokens=2)
+        engine.step()
+        second = engine.submit([10], max_new_tokens=1)
+        assert engine.next_phase() == BatchPhase.DECODE
+        engine.step(phase=BatchPhase.DECODE)
+        assert first.done and not second.done
+        assert engine.next_phase() == BatchPhase.PREFILL
+        engine.step(phase=BatchPhase.PREFILL)
+        assert second.done
