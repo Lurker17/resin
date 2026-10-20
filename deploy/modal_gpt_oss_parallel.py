@@ -42,6 +42,11 @@ image = (
         "/opt/resin/validation/test_expert_parallel_gpu.py",
         copy=True,
     )
+    .add_local_file(
+        ROOT / "models/cuda/tests/test_gpt_oss_flashinfer_gpu.py",
+        "/opt/resin/validation/test_gpt_oss_flashinfer_gpu.py",
+        copy=True,
+    )
 )
 model_volume = modal.Volume.from_name(
     "resin-gpt-oss-models-v2", create_if_missing=False, version=2
@@ -128,7 +133,7 @@ def _stream_subprocess(command, *, env, timeout):
     timeout=100 * 60,
     single_use_containers=True,
 )
-def validate_parallel():
+def validate_parallel(graphs: bool = False):
     import torch
     from renderers import GptOssRendererConfig, create_renderer
     from transformers import AutoTokenizer
@@ -158,6 +163,7 @@ def validate_parallel():
             "-q",
             "-s",
             "/opt/resin/validation/test_expert_parallel_gpu.py",
+            "/opt/resin/validation/test_gpt_oss_flashinfer_gpu.py",
         ],
         env={**os.environ, "RESIN_EP_TEST_WORLD_SIZE": "2", "PYTHONUNBUFFERED": "1"},
         timeout=6 * 60,
@@ -194,7 +200,8 @@ def validate_parallel():
         )
         for name, text in texts.items()
     }
-    run_id = datetime.now(timezone.utc).strftime("gpt-oss-ep-%Y%m%dT%H%M%SZ")
+    prefix = "gpt-oss-ep-graphs" if graphs else "gpt-oss-ep"
+    run_id = datetime.now(timezone.utc).strftime(f"{prefix}-%Y%m%dT%H%M%SZ")
     path = Path(PROFILE_MOUNT) / f"{run_id}.json"
     print(f"[parallel-validation] diagnostic report: {path}", flush=True)
     try:
@@ -203,6 +210,7 @@ def validate_parallel():
             prompts,
             vocab_size=len(tokenizer),
             diagnostic_path=path,
+            graphs=graphs,
         )
     except Exception as error:
         if path.is_file():
@@ -246,8 +254,11 @@ def validate_parallel():
 
 
 @app.local_entrypoint()
-def main(report_path: str = "artifacts/gpt-oss-parallel-validation.json"):
-    report = validate_parallel.remote()
+def main(
+    report_path: str = "artifacts/gpt-oss-parallel-validation.json",
+    graphs: bool = False,
+):
+    report = validate_parallel.remote(graphs=graphs)
     path = Path(report_path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, indent=2, sort_keys=True))

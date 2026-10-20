@@ -41,19 +41,24 @@ def _initialize(rank, port):
     install_flashinfer_hash_cache()
 
 
-def _new_runner(rank, model_path, *, groups=None):
+def _new_runner(rank, model_path, *, groups=None, graphs=False):
     from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
     from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
 
+    class ValidationGptRunner(GptOssCudaRunner):
+        prefill_chunk_size = PREFILL_CHUNK_SIZE
+
     options = {} if groups is None else {"parallel_groups": groups}
-    return GptOssCudaRunner(
+    if graphs:
+        options["cuda_graph_decode_shapes"] = ((1, 4), (2, 4))
+    return ValidationGptRunner(
         model_path,
         device=f"cuda:{rank}",
         cache_parent_capacity=CACHE_PARENTS,
         kernel_moe=FlashInferSM90MXFP4Kernel(),
         fast_allreduce=False,
-        cuda_graph_prefill="disabled",
-        cuda_graph_decode="disabled",
+        cuda_graph_prefill="breakable" if graphs else "disabled",
+        cuda_graph_decode="full" if graphs else "disabled",
         **options,
     )
 
@@ -68,7 +73,7 @@ def _engine_options():
         "context_length": CONTEXT_LENGTH,
         "eos_token_id": None,
         "scheduler_config": SchedulerConfig(
-            max_batch_tokens=2 * PREFILL_CHUNK_SIZE,
+            max_batch_tokens=PREFILL_CHUNK_SIZE,
             prefill_chunk_size=PREFILL_CHUNK_SIZE,
         ),
     }
@@ -104,6 +109,8 @@ class _Capture:
         self.history = []
         self.logits = None
         self.expert = None
+        self.expected_tokens = None
+        self.force_tokens = True
 
         def head_hook(_module, _inputs, output):
             self.logits = output.detach().float().cpu()
@@ -129,10 +136,35 @@ class _Capture:
                 )
             )
 
-    def begin_history(self, forced_tokens=None):
+    def record(self, logits, plan, tokens):
+        self.logits = logits.detach().float().cpu()
+        if (
+            self.original_sampler is not None
+            and plan is not None
+            and plan.num_sequences == 1
+            and plan.sampling_mask[0]
+        ):
+            index = len(self.history)
+            self.history.append(self.logits.clone())
+            if self.expected_tokens is not None:
+                if index >= len(self.expected_tokens):
+                    raise RuntimeError("decode exceeded baseline history")
+                if not self.force_tokens:
+                    ids = getattr(tokens, "token_ids", tokens)
+                    actual = int(ids[0])
+                    expected = self.expected_tokens[index]
+                    if actual != expected:
+                        raise AssertionError(
+                            f"greedy graph token {index} changed baseline context: "
+                            f"{actual} != {expected}"
+                        )
+
+    def begin_history(self, forced_tokens=None, *, force=True):
         if self.original_sampler is not None:
             raise RuntimeError("sampler history capture is already active")
         self.history = []
+        self.expected_tokens = forced_tokens
+        self.force_tokens = force
         self.original_sampler = self.runner._sampler
         capture = self
 
@@ -142,20 +174,16 @@ class _Capture:
 
             def __call__(self, logits, plan=None, **kwargs):
                 tokens = capture.original_sampler(logits, plan, **kwargs)
+                capture.record(logits, plan, tokens)
                 if (
-                    plan is not None
+                    force
+                    and forced_tokens is not None
+                    and plan is not None
                     and plan.num_sequences == 1
                     and plan.sampling_mask[0]
                 ):
-                    index = len(capture.history)
-                    capture.history.append(logits.detach().float().cpu())
-                    if forced_tokens is not None:
-                        if index >= len(forced_tokens):
-                            raise RuntimeError(
-                                "teacher-forced decode exceeded baseline history"
-                            )
-                        tokens = tokens.clone()
-                        tokens[0] = forced_tokens[index]
+                    tokens = tokens.clone()
+                    tokens[0] = forced_tokens[len(capture.history) - 1]
                 return tokens
 
         self.runner._sampler = Sampler()
@@ -173,8 +201,9 @@ class _Capture:
 
 
 class _ObservedRunner:
-    def __init__(self, runner):
+    def __init__(self, runner, capture):
         self.runner = runner
+        self.capture = capture
         self.calls, self.pool_ids, self.released = [], [], []
 
     def __getattr__(self, name):
@@ -194,20 +223,30 @@ class _ObservedRunner:
         return self.runner.validate_distributed(plan, context)
 
     def forward_distributed(self, plan, context):
-        self.calls.append(
-            {
-                "step": context.step_id,
-                "phase": "prefill" if context.phase == BatchPhase.PREFILL else "decode",
-                "placeholder": context.placeholder,
-                "rows": context.num_sequences,
-                "tokens": context.num_tokens,
-                "replica_sizes": context.replica_sizes,
-                "sequence_ids": []
-                if plan is None
-                else list(map(int, plan.sequence_ids)),
-            }
-        )
-        return self.runner.forward_distributed(plan, context)
+        before = {
+            mode: stats["replay_count"]
+            for mode, stats in self.runner.cuda_graph_stats.items()
+        }
+        call = {
+            "step": context.step_id,
+            "phase": "prefill" if context.phase == BatchPhase.PREFILL else "decode",
+            "placeholder": context.placeholder,
+            "rows": context.num_sequences,
+            "tokens": context.num_tokens,
+            "replica_sizes": context.replica_sizes,
+            "sequence_ids": [] if plan is None else list(map(int, plan.sequence_ids)),
+        }
+        self.calls.append(call)
+        self.runner._last_graph_logits = None
+        result = self.runner.forward_distributed(plan, context)
+        call["graph_replays"] = {
+            mode: stats["replay_count"] - before[mode]
+            for mode, stats in self.runner.cuda_graph_stats.items()
+        }
+        logits = self.runner._last_graph_logits
+        if plan is not None and logits is not None:
+            self.capture.record(logits[: plan.num_sequences], plan, result)
+        return result
 
 
 def _metrics(actual, expected, *, maximum, relative):
@@ -407,7 +446,7 @@ def _expert_comparisons(runner, groups, reference):
     return results
 
 
-def _driver_workload(worker, capture, reference, prompts, baseline):
+def _driver_workload(worker, capture, reference, prompts, baseline, *, graphs=False):
     groups = worker.groups
     dp = groups.topology.coordinates(groups.rank)[0]
     engine = DistributedEngine(worker, **_engine_options())
@@ -435,7 +474,9 @@ def _driver_workload(worker, capture, reference, prompts, baseline):
                 == baseline["teacher_forced"][name]["token_ids"]
             )
 
-        capture.begin_history(forced_tokens=baseline["generation"]["token_ids"])
+        capture.begin_history(
+            forced_tokens=baseline["generation"]["token_ids"], force=not graphs
+        )
         forced_request = engine.submit(
             prompts["probe"],
             max_new_tokens=GENERATION_TOKENS,
@@ -444,8 +485,8 @@ def _driver_workload(worker, capture, reference, prompts, baseline):
         forced_progress = _drain(engine)
         forced_ids = forced_request.take_result()
         decode_logits = capture.end_history()
-        # The original sampler is restored before independent workloads and
-        # ordinary greedy generation; only this numerical probe is forced.
+        # Graph decode uses the ordinary captured sampler and checks each
+        # greedy token before comparing logits for the same baseline context.
         decode_comparisons = [
             {
                 "token_index": index,
@@ -516,6 +557,7 @@ def _driver_workload(worker, capture, reference, prompts, baseline):
             "dp": dp,
             "teacher_forced": teachers,
             "teacher_forced_decode": {
+                "history_mode": "checked_greedy" if graphs else "teacher_forced",
                 "token_ids": forced_ids,
                 "matches_forced_history": forced_ids
                 == baseline["generation"]["token_ids"],
@@ -534,22 +576,28 @@ def _driver_workload(worker, capture, reference, prompts, baseline):
         engine.close()
 
 
-def _ep_rank(rank, port, directory, model_path, prompts, attn_dp):
+def _ep_rank(rank, port, directory, model_path, prompts, attn_dp, graphs=False):
     _initialize(rank, port)
     groups = ParallelGroups.create(
         Parallelism(world_size=WORLD_SIZE, ep=WORLD_SIZE, attn_dp=attn_dp)
     )
     start = time.perf_counter()
+    runner = capture = None
     try:
-        runner = _new_runner(rank, model_path, groups=groups)
+        runner = _new_runner(rank, model_path, groups=groups, graphs=graphs)
         reference = torch.load(Path(directory, "baseline-0.pt"), weights_only=True)
         baseline = json.loads(Path(directory, "baseline-0.json").read_text())
         expert = _expert_comparisons(runner, groups, reference["expert"])
+        # Hooks that transfer tensors to the host are installed only after
+        # capture. Every rank captures the same catalog before serving steps.
+        captured = runner.capture_cuda_graphs() if graphs else runner.cuda_graph_stats
         capture = _Capture(runner)
-        observed = _ObservedRunner(runner)
+        observed = _ObservedRunner(runner, capture)
         worker = DistributedWorker(observed, groups)
         if groups.is_driver:
-            result = _driver_workload(worker, capture, reference, prompts, baseline)
+            result = _driver_workload(
+                worker, capture, reference, prompts, baseline, graphs=graphs
+            )
         else:
             worker.serve()
             result = None
@@ -566,12 +614,17 @@ def _ep_rank(rank, port, directory, model_path, prompts, attn_dp):
                     "pool_ids": observed.pool_ids,
                     "released_ids": observed.released,
                     "calls": observed.calls,
+                    "graphs_after_capture": captured,
+                    "graphs_after_workload": runner.cuda_graph_stats,
                     "driver_result": result,
                 }
             )
         )
-        capture.close()
     finally:
+        if capture is not None:
+            capture.close()
+        if runner is not None:
+            runner.close_cuda_graphs()
         groups.close()
         dist.destroy_process_group()
 
@@ -601,7 +654,7 @@ def _spawn(target, directory, model_path, prompts, *extra):
             process.join(timeout=5)
 
 
-def _check_case(records, attn_dp, vocab_size, *, collect_numerical=False):
+def _check_case(records, attn_dp, vocab_size, *, graphs=False, collect_numerical=False):
     numerical_errors = []
     phases = [(call["step"], call["phase"]) for call in records[0]["calls"]]
     if not phases or any(
@@ -613,6 +666,23 @@ def _check_case(records, attn_dp, vocab_size, *, collect_numerical=False):
         raise AssertionError("Hopper validation did not exercise both phases")
     drivers = [record["driver_result"] for record in records if record["driver"]]
     for record in records:
+        if graphs:
+            for mode in ("prefill", "decode"):
+                capture = record["graphs_after_capture"][mode]
+                final = record["graphs_after_workload"][mode]
+                if (
+                    not capture["capture_count"]
+                    or capture["captured_shapes"] != capture["configured_shapes"]
+                    or final["replay_count"] <= capture["replay_count"]
+                ):
+                    raise AssertionError(
+                        f"rank {record['rank']} did not capture and replay {mode} graphs"
+                    )
+                if final["eager_fallback_count"]:
+                    raise AssertionError(
+                        f"rank {record['rank']} {mode} silently fell back to eager: "
+                        f"{final['fallback_counts']}"
+                    )
         for comparison in record["expert_comparisons"]:
             if not comparison["passed"]:
                 numerical_errors.append(
@@ -630,6 +700,19 @@ def _check_case(records, attn_dp, vocab_size, *, collect_numerical=False):
         call["placeholder"] for record in records for call in record["calls"]
     ):
         raise AssertionError("attention-DP empty participation was not exercised")
+    if graphs and attn_dp > 1:
+        idle_modes = {
+            mode
+            for record in records
+            for call in record["calls"]
+            if call["placeholder"]
+            for mode, replays in call["graph_replays"].items()
+            if replays
+        }
+        if idle_modes != {"prefill", "decode"}:
+            raise AssertionError(
+                "idle attention-DP ranks did not replay both graph modes"
+            )
     for driver in drivers:
         for teacher in driver["teacher_forced"].values():
             if not teacher["logits"]["passed"]:
@@ -707,6 +790,14 @@ def _case_summary(records, attn_dp):
             {
                 "rank": record["rank"],
                 "expert_comparisons": record["expert_comparisons"],
+                "graphs": {
+                    mode: {
+                        "captures": stats["capture_count"],
+                        "replays": stats["replay_count"],
+                        "eager_fallbacks": stats["eager_fallback_count"],
+                    }
+                    for mode, stats in record["graphs_after_workload"].items()
+                },
                 **(
                     {}
                     if record["driver_result"] is None
@@ -739,7 +830,9 @@ def _case_summary(records, attn_dp):
     }
 
 
-def run_validation(model_path, prompts, *, vocab_size, diagnostic_path=None):
+def run_validation(
+    model_path, prompts, *, vocab_size, diagnostic_path=None, graphs=False
+):
     if torch.cuda.device_count() != WORLD_SIZE:
         raise RuntimeError("Hopper validation requires exactly two visible GPUs")
     if any(
@@ -768,7 +861,7 @@ def run_validation(model_path, prompts, *, vocab_size, diagnostic_path=None):
             )
         diagnostic = {
             "world_size": WORLD_SIZE,
-            "graphs": "disabled",
+            "graphs": "prefill_breakable_decode_full" if graphs else "disabled",
             "baseline": baseline,
             "cases": [],
             "status": "running",
@@ -798,7 +891,7 @@ def run_validation(model_path, prompts, *, vocab_size, diagnostic_path=None):
                 f"[parallel-validation] loading checkpoint EP={WORLD_SIZE}, attention DP={attn_dp}",
                 flush=True,
             )
-            _spawn(_ep_rank, directory, model_path, prompts, attn_dp)
+            _spawn(_ep_rank, directory, model_path, prompts, attn_dp, graphs)
             records = [
                 json.loads(Path(directory, f"ep{attn_dp}-{rank}.json").read_text())
                 for rank in range(WORLD_SIZE)
@@ -812,7 +905,13 @@ def run_validation(model_path, prompts, *, vocab_size, diagnostic_path=None):
             save_diagnostic()
             try:
                 cases.append(
-                    _check_case(records, attn_dp, vocab_size, collect_numerical=True)
+                    _check_case(
+                        records,
+                        attn_dp,
+                        vocab_size,
+                        graphs=graphs,
+                        collect_numerical=True,
+                    )
                 )
             except Exception as error:
                 diagnostic["status"] = "failed"
@@ -834,7 +933,7 @@ def run_validation(model_path, prompts, *, vocab_size, diagnostic_path=None):
             raise AssertionError(diagnostic["validation_error"])
         return {
             "world_size": WORLD_SIZE,
-            "graphs": "disabled",
+            "graphs": "prefill_breakable_decode_full" if graphs else "disabled",
             "baseline": baseline,
             "cases": cases,
             "comparison_policy": "same-context checkpoint logits and real fused expert outputs use fixed BF16 tolerances; greedy token matches are reported",

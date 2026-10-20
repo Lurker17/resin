@@ -16,16 +16,21 @@ runner = DeepSeekV4CudaRunner(
     max_batch_size=16,
     parallel_groups=groups,
     device=f"cuda:{local_rank}",
-    cuda_graph_prefill="disabled",
-    cuda_graph_decode="disabled",
+    cuda_graph_prefill="breakable",
+    cuda_graph_decode="full",
     speculative_tokens=0,
 )
+# Collective startup operation, before any rank starts serving requests.
+runner.capture_cuda_graphs()
 worker = DistributedWorker(runner, groups)
 if groups.is_driver:
     engine = DistributedEngine(worker)
     # Submit this replica's requests, then collectively step/close all drivers.
 else:
     worker.serve()
+# All ranks reach this after their serving loops have stopped.
+runner.close_cuda_graphs()
+groups.close()
 ```
 
 The current explicit-group path requires full-width EP (`ep == world_size`),
@@ -53,13 +58,37 @@ summed together.
 Every attention-DP replica has its own Rust scheduler, logical cache pool, and
 request namespace. Physical cache capacity is agreed within that request
 replica. Prefill aligns the number of per-sequence model calls across replicas;
-missing rows and completely idle replicas join zero-token expert rounds without
-running attention or modifying KV state. Decode retains each replica's own
+missing rows and completely idle replicas join matching expert rounds. Eager
+empty rounds do not run attention or modify KV state. Captured empty prefill
+replays only FFN regions; captured empty decode runs padded rows backed by
+reserved null/scratch cache storage. Decode retains each replica's own logical
 batch size.
 
 `parallelism_capabilities` declares supported axes. Preparation additionally
 rejects unsupported combinations before CUDA work, including CP, expert TP,
-attention TP in the explicit-group path, CUDA graphs, and speculative decoding.
+attention TP in the explicit-group path, and speculative decoding.
+
+## CUDA graphs
+
+The explicit-group runner uses the shared CUDA graph machinery for prefill FFN
+regions and full decode. Every rank captures the same catalog collectively at
+startup. Replicas agree on physical buckets before GPU work; if any replica
+cannot use a configured shape, all use eager execution for that step. DeepSeek's
+per-sequence prefill calls and empty participation remain aligned across the
+domain. Requested decode logprobs use logits retained from graph replay.
+
+Graph expert dispatch all-gathers a fixed capacity of source rows and
+reduce-scatters local weighted expert partials back to their sources. A device
+valid-row scalar masks padding, and routing metadata stays on the GPU. Attention
+replication still dispatches once and broadcasts complete rows. This transport
+is shared with GPT-OSS; the DeepSeek model retains its own FP4 kernel and cache
+adapters.
+
+The dense transport sends every padded row to every expert owner, giving each
+owner `EP * capacity` rows. It makes shapes and collectives capturable but adds
+bandwidth, scratch memory, and padded expert work. Sparse graph-safe routing and
+communication overlap remain separate work. The eager path continues to pack
+only selected owners and reads variable split counts on the host.
 
 ## Validation
 
@@ -79,13 +108,16 @@ An optional eager TP4 run records a baseline token comparison; different
 quantized execution layouts can change greedy tokens, so that comparison is
 reported separately from the routing and lifecycle assertions.
 
-This is an eager correctness implementation. Dispatch reads variable split
-counts on the host and allocates communication buffers per layer. CUDA graph
-capture, asynchronous communication overlap, expert TP, CP, DSpark, and a
-cross-replica HTTP request router remain outside this path.
+The current DeepSeek Modal validation command runs eager execution. Captured
+DeepSeek execution is implemented but has not been validated on Blackwell.
+Asynchronous communication overlap, expert TP, CP, DSpark, and a cross-replica
+HTTP request router remain outside this explicit-group path.
 
 Blackwell validation remains pending: the attempted four-GPU jobs did not
 receive an allocation. The shared dispatcher and independent request engines
-have passed [full GPT-OSS-20B validation on two H200s](gpt-oss-parallelism.md#completed-run).
+have passed [eager GPT-OSS-20B validation on two H200s](gpt-oss-parallelism.md#completed-eager-run).
+The shared graph orchestration and transport also passed
+[captured GPT-OSS-20B validation](gpt-oss-parallelism.md#completed-graph-run),
+including independent attention-DP queues and idle-rank replay in both phases.
 That evidence does not validate DeepSeek-V4's model, cache state, or Blackwell
 kernel integration.

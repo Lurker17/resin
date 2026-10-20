@@ -30,15 +30,57 @@ and attention replication alongside their existing TP paths. Both new
 explicit-group paths currently require `attn_tp=cp=expert_tp=1`.
 GPT-OSS also declares expert TP for its legacy TP entry point. These
 declarations describe supported axes; preparation also checks combinations,
-graph policies, and speculative modes. GPT-OSS EP additionally requires a
-kernel advertising FP32 local expert partials so the cross-rank combine does
-not add an intermediate activation rounding step.
+graph policies, and speculative modes. Both explicit-group paths provide
+captured prefill FFN regions and full decode graphs. GPT-OSS EP additionally
+requires a kernel advertising FP32 local expert partials so the cross-rank
+combine does not add an intermediate activation rounding step.
 `DistributedWorker` validates a declared capability set collectively before
 serving begins. Custom distributed runners may supply the same declaration.
 
 See [DeepSeek-V4 EP and attention DP](deepseek-v4-parallelism.md) and
 [GPT-OSS EP and attention DP](gpt-oss-parallelism.md) for the implemented
 model paths and real-GPU validation commands.
+
+## CUDA graphs across expert owners
+
+Graph-enabled CUDA runners call `runner.capture_cuda_graphs()` on every rank
+before constructing workers or entering serving loops. All ranks must configure
+the same graph catalog and capture shapes in the same order. The shared CUDA
+runner checks those catalogs collectively, owns capture/replay, and chooses
+common physical buckets from the logical sizes in `StepContext`.
+
+Prefill captures the FFN regions while attention executes outside those regions.
+Decode captures the model forward and sampling. Each step votes on graph
+eligibility and capacity across the serving domain before issuing device work.
+If any replica needs an unsupported shape, every replica uses the eager path
+for that step. This keeps expert collectives in the same order even when request
+queues and batch sizes differ. Graph counters expose captures, replays, and
+eager fallback reasons.
+
+After workers stop, call `runner.close_cuda_graphs()` on every rank before
+destroying process groups. This waits for device work and releases captured
+NCCL references; keeping graphs alive during group destruction can hang shutdown.
+
+`ExpertParallelDispatch` has two transports behind the same local expert
+callback. Eager execution packs only rows with selected experts on each owner,
+reading split counts on the host. Captured execution all-gathers a fixed token
+capacity per source, executes local experts on the gathered rows, and
+reduce-scatters their weighted partials back to the source. Routing IDs and a
+device valid-row scalar determine active assignments without host reads or
+dynamic tensor shapes. Attention replication still dispatches once and
+broadcasts the combined rows. GPT-OSS retains FP32 partials through the combine.
+
+This dense graph transport is a correctness prototype. Every expert owner
+receives `EP * capacity` rows, including padding and rows whose selected experts
+are elsewhere. It adds bandwidth, scratch memory, and padded kernel work;
+capture does not establish efficient wide-EP dispatch or communication overlap.
+The model and kernel adapters remain responsible for capture-safe local expert
+execution and their own weight layouts.
+
+Idle replicas replay the same expert collectives. Empty prefill replays FFN
+regions without attention. Empty decode replays padded model rows using reserved
+null or scratch cache storage, leaving live request pages untouched. Graph
+decode can still return the normal NumPy logprob columns after replay.
 
 ## Rank placement
 
@@ -206,6 +248,8 @@ must use its supplied groups before it can support a composed TP/CP/EP/DP layout
 After initializing distributed communication and preparing each rank's runtime:
 
 ```python
+# For a CUDA runner with graphs enabled, all ranks capture before serving.
+runner.capture_cuda_graphs()
 worker = DistributedWorker(runner, groups)
 if groups.is_driver:
     engine = DistributedEngine(worker, max_running_requests=256)

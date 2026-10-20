@@ -156,6 +156,14 @@ def test_nccl_expert_dispatch_matches_reference_with_unequal_and_empty_rows(
 def _graph_dispatch_rank(rank, rendezvous, directory, replicated):
     from resin.backend.expert_parallel import ExpertParallelDispatch
 
+    faulthandler.dump_traceback_later(30, repeat=True)
+
+    def progress(message):
+        print(
+            f"[NCCL graph rank={rank}, replicated={replicated}] {message}",
+            flush=True,
+        )
+
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     dist.init_process_group(
@@ -166,6 +174,7 @@ def _graph_dispatch_rank(rank, rendezvous, directory, replicated):
         timeout=timedelta(minutes=2),
         device_id=device,
     )
+    progress("world ready")
     groups = ParallelGroups.create(
         Parallelism(
             world_size=WORLD_SIZE,
@@ -173,6 +182,8 @@ def _graph_dispatch_rank(rank, rendezvous, directory, replicated):
             attn_dp=WORLD_SIZE // 2 if replicated else WORLD_SIZE,
         )
     )
+    progress("groups ready")
+    graph = None
     try:
         capacity, width, top_k = 5, 16, 3
         local_experts = 8 // WORLD_SIZE
@@ -233,20 +244,31 @@ def _graph_dispatch_rank(rank, rendezvous, directory, replicated):
             torch.cuda.stream(stream),
             dispatch.fixed_capacity(capacity, valid_rows=valid_rows),
         ):
-            for _ in range(3):
+            for warmup in range(3):
+                progress(f"warmup {warmup}: launch")
                 dispatch(hidden, indices, weights)
+                progress(f"warmup {warmup}: enqueued")
+        progress("warmup: synchronizing")
         stream.synchronize()
+        progress("warmup: synchronized; entering barrier")
         dist.barrier()
+        progress("warmup: barrier complete; entering capture")
         graph = torch.cuda.CUDAGraph()
         with (
             torch.cuda.graph(graph, stream=stream),
             dispatch.fixed_capacity(capacity, valid_rows=valid_rows),
         ):
+            progress("capture: dispatch")
             actual = dispatch(hidden, indices, weights)
+            progress("capture: dispatch enqueued")
+        progress("capture: complete")
         errors = []
         for phase in (0, 1, 2, 3):
+            progress(f"replay {phase}: staging")
             stage(phase)
+            progress(f"replay {phase}: launch")
             graph.replay()
+            progress(f"replay {phase}: enqueued; comparing")
             expected = (
                 hidden.float()
                 * (coefficients[indices.long()] * weights).sum(1, keepdim=True)
@@ -255,15 +277,28 @@ def _graph_dispatch_rank(rank, rendezvous, directory, replicated):
                 (torch.arange(capacity, device=device) >= valid_rows)[:, None], 0
             )
             torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+            progress(f"replay {phase}: assertion passed")
             errors.append(float((actual.float() - expected.float()).abs().max()))
+        progress("replays: synchronizing")
         torch.cuda.synchronize()
+        progress("replays: synchronized; entering barrier")
         dist.barrier()
+        progress("replays: barrier complete")
         Path(directory, f"{rank}.json").write_text(
             json.dumps({"rank": rank, "replays": 4, "max_abs_errors": errors})
         )
     finally:
+        if graph is not None:
+            progress("releasing captured NCCL graph")
+            torch.cuda.synchronize()
+            graph.reset()
+            progress("captured NCCL graph released")
+        progress("closing groups")
         groups.close()
+        progress("groups closed; closing world")
         dist.destroy_process_group()
+        progress("world closed")
+        faulthandler.cancel_dump_traceback_later()
 
 
 @pytest.mark.parametrize("replicated", [False, True])
