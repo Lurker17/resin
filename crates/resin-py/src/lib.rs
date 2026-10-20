@@ -1098,6 +1098,12 @@ impl Engine {
             })
             .map_err(core_error)
     }
+
+    /// Contain a failure reported by a peer without releasing local resources.
+    fn poison(&mut self, reason: &str) {
+        self.core.poison_message(reason);
+    }
+
     fn cancel(&mut self, py: Python<'_>, request: PyRef<'_, RequestLease>) -> PyResult<bool> {
         let mut runner = PythonRunner {
             py,

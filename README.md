@@ -265,9 +265,11 @@ so aligned prefix snapshots share them exactly like attention pages. The Modal
 web deployment enables the native exact-token LRU prefix cache.
 
 Current limits include synchronous runner steps, no prefill/decode
-disaggregation, no expert parallel or data-parallel attention, and no multi-node
-serving. Tensor parallelism remains a model-backend concern rather than part of
-the native scheduler.
+disaggregation and no production multi-node serving. A
+[distributed coordinator prototype](docs/distributed.md) covers explicit TP, CP,
+attention DP, and EP groups with synchronous steps; production CP/EP model
+adapters remain to be implemented. Device collectives remain model-owned.
+[Generated-token logprobs](docs/logprobs.md) use borrowed NumPy output columns.
 
 ## Public surface
 
@@ -280,6 +282,8 @@ ManagedRunner
 BatchPlan
 BatchPhase
 TokenEvent
+ForwardOutput
+TokenLogprobs
 RequestLease
 SamplingParams
 SchedulerConfig

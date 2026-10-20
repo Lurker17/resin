@@ -213,19 +213,29 @@ fn cancellation_checks_engine_identity_and_returns_native_cache() {
 
 #[test]
 fn a_panicking_native_runner_cannot_leave_a_healthy_engine() {
-    struct PanickingRunner;
+    struct PanickingRunner {
+        score_access: bool,
+    }
     impl Runner<&'static str> for PanickingRunner {
         fn forward(&mut self, _plan: ExecutionPlan<&'static str>) -> Result<Vec<Vec<u32>>, Error> {
-            panic!("model state may already have changed");
+            assert!(self.score_access, "model state may already have changed");
+            Ok(vec![vec![2]])
+        }
+        fn logprobs(&self) -> Option<resin_core::logprobs::LogprobView<'_>> {
+            panic!("score storage access failed after model execution");
         }
     }
-    let mut engine = engine(0, 8);
-    let request = engine.submit(input(vec![1], 1)).unwrap();
-    let error = engine.step(&mut PanickingRunner).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Execution);
-    assert!(engine.poisoned());
-    assert!(!request.done());
-    assert_eq!(engine.cache_occupied_block_count(), Some(1));
+    for score_access in [false, true] {
+        let mut engine = engine(0, 8);
+        let request = engine.submit(input(vec![1], 1)).unwrap();
+        let error = engine
+            .step(&mut PanickingRunner { score_access })
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Execution);
+        assert!(engine.poisoned());
+        assert!(!request.done());
+        assert_eq!(engine.cache_occupied_block_count(), Some(1));
+    }
 }
 
 #[test]

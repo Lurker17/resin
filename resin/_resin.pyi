@@ -407,6 +407,8 @@ class Engine:
     def step(self, /, *, phase: BatchPhase | None = None) -> list[TokenEvent]: ...
     def next_phase(self, /) -> BatchPhase | None:
         """Read-only admission-aware proposal; reserves no requests or resources."""
+    def poison(self, /, reason: str) -> None:
+        """Permanently contain a peer/runtime failure without releasing resources."""
     def submit(
         self,
         /,

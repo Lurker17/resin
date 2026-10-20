@@ -113,11 +113,19 @@ quarantines its resources. Successful device synchronization cannot undo an
 in-place recurrent update. Native callbacks that panic also take this failure
 path. See the [runner contract](kernel-boundary.md) for Python error handling.
 
+## Distributed coordination and output
+
+The [distributed prototype](distributed.md) adds explicit attention TP/CP/DP and
+expert EP/TP meshes, one request Engine per attention-DP replica, and synchronous
+phase agreement across communicating replicas. It leaves model partitioning and
+kernel collectives in prepared runtimes. [Generated-token logprobs](logprobs.md)
+cross the Python-to-Rust boundary as borrowed NumPy columns.
+
 ## Current limits
 
 - one synchronous batch per Engine step;
 - no prefill/decode disaggregation;
-- no expert parallel or data-parallel attention;
+- production CUDA model adapters do not yet implement the prototype CP/EP contract;
 - no multi-node serving;
-- tensor parallelism is implemented by model backends rather than the native
-  scheduler.
+- model runtimes implement device collectives; the native scheduler owns local
+  request and page lifetimes.

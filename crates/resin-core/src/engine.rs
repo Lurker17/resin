@@ -978,7 +978,10 @@ impl<P: Clone> EngineCore<P> {
     ) -> Result<Vec<E>> {
         // Validate the complete execution result before terminal output limits
         // can hide writes beyond the leased capacity or extra prefill tokens.
-        let logprobs = runner.logprobs();
+        let logprobs = match execution_call("logprob access", || Ok(runner.logprobs())) {
+            Ok(scores) => scores,
+            Err(error) => return self.quarantine(batch, "runner logprob access failed", error),
+        };
         if let Err(error) = self
             .validate_runner_output(&batch.rows, &output_token_ids)
             .and_then(|()| logprobs.map_or(Ok(()), |scores| scores.validate(&output_token_ids)))
