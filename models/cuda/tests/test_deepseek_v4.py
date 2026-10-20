@@ -11,7 +11,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from resin.backend.cuda.parallel import FlashInferAllReduce
+from resin.backend.cuda.parallel import FlashInferAllReduce, TensorParallelLayout
 from resin.models.deepseek_v4.config import DeepSeekV4Config
 from resin_models_cuda.deepseek_v4.checkpoint import resolve_model_path
 from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
@@ -364,8 +364,6 @@ class TestDeepSeekV4Weights:
         assert attention.window_capacity == 10
         assert not hasattr(attention, "kv_cache")
         assert "paged_cache" not in native_model.ModelArgs.__dataclass_fields__
-        native_model.world_size = 2
-        native_model.rank = 1
         args = native_model.ModelArgs(
             vocab_size=256,
             dim=128,
@@ -377,7 +375,9 @@ class TestDeepSeekV4Weights:
             expert_dtype="fp4",
         )
 
-        moe = native_model.MoEWeights(0, args)
+        moe = native_model.MoEWeights(
+            0, args, expert_parallel=TensorParallelLayout(rank=1, size=2)
+        )
 
         assert moe.experts[0] is None
         assert moe.experts[1] is None
@@ -413,8 +413,8 @@ class TestDeepSeekV4Weights:
 
     def test_prepared_routed_experts_adopt_storage_and_own_reduction(self, monkeypatch):
         native = self._native_model(monkeypatch)
-        execution = sys.modules["resin_models_cuda.deepseek_v4.experts"]
-        native.world_size, native.rank = 2, 1
+        gemm = sys.modules["resin_models_cuda.deepseek_v4.gemm"]
+        cutile = sys.modules["resin_models_cuda.deepseek_v4.cutile"]
         args = native.ModelArgs(
             vocab_size=256,
             dim=128,
@@ -425,13 +425,15 @@ class TestDeepSeekV4Weights:
             n_activated_experts=2,
             expert_dtype="fp4",
         )
-        source = native.MoEWeights(0, args)
+        source = native.MoEWeights(
+            0, args, expert_parallel=TensorParallelLayout(rank=1, size=2)
+        )
         loaded_weight = source._fused_w13_weight
         calls = []
         monkeypatch.setattr(
-            execution, "prepare_fp4_fused_moe_weights", lambda *w: calls.append("pack")
+            gemm, "prepare_fp4_fused_moe_weights", lambda *w: calls.append("pack")
         )
-        monkeypatch.setattr(execution, "moe_act_quant", lambda x, *a: (x, None))
+        monkeypatch.setattr(cutile, "moe_act_quant", lambda x, *a: (x, None))
 
         def kernel(x, scales, indices, weights, *storage, **options):
             assert storage[0] is loaded_weight
@@ -443,7 +445,7 @@ class TestDeepSeekV4Weights:
             calls.append("reduce")
             return partial * 10
 
-        monkeypatch.setattr(execution, "fp4_fused_moe", kernel)
+        monkeypatch.setattr(gemm, "fp4_fused_moe", kernel)
         with pytest.raises(RuntimeError, match="prepared"):
             source(torch.ones(2, 128), torch.zeros(2, dtype=torch.long))
         model = torch.nn.ModuleList([source])
@@ -462,8 +464,9 @@ class TestDeepSeekV4Weights:
 
         moe.gate = Gate()
         moe.shared_experts = torch.nn.Identity()
-        # Runtime ownership is captured; another model's topology cannot change it.
-        native.world_size, native.rank = 1, 0
+        other = native.MoEWeights(0, args, expert_parallel=TensorParallelLayout())
+        assert other.experts_start_idx == 0 and other.experts_end_idx == 4
+        assert moe.routed.start == 2 and moe.routed.stop == 4
         output = moe(
             torch.ones(2, 128, dtype=torch.bfloat16), torch.zeros(2, dtype=torch.long)
         )

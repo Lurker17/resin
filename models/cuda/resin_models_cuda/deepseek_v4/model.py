@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 import torch
 import torch.distributed as dist
@@ -16,6 +16,7 @@ from flashinfer.mhc import mhc_post
 from flashinfer.topk import top_k as flashinfer_top_k
 from torch import nn
 
+from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.backend.loading import prepare_model
 from resin.backend.torch import use_default_dtype
 from resin.backend.transformer import RMSNorm as SharedRMSNorm
@@ -58,8 +59,9 @@ from resin_models_cuda.deepseek_v4.gemm import (
 )
 from resin_models_cuda.deepseek_v4.tilelang_kernels import mhc_pre_norm
 
-world_size = 1
-rank = 0
+if TYPE_CHECKING:
+    from resin.backend.topology import ParallelGroups
+
 block_size = 128
 fp4_block_size = 32
 default_dtype = torch.bfloat16
@@ -68,12 +70,15 @@ scale_dtype = torch.float32
 _MHC_PRE_NUM_SPLITS = 64
 
 
-def _distributed_sum(tensor: torch.Tensor) -> torch.Tensor:
-    """Default in-place tensor-parallel reduction."""
+def _default_tensor_parallel() -> TensorParallelContext:
+    """Compatibility for callers using the default process group as TP."""
 
-    if world_size > 1:
-        dist.all_reduce(tensor)
-    return tensor
+    size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    return TensorParallelContext(
+        TensorParallelLayout(rank=rank, size=size),
+        dist.group.WORLD if size > 1 else None,
+    )
 
 
 @dataclass
@@ -132,29 +137,39 @@ class ModelArgs:
 
 
 class ParallelEmbedding(nn.Module):
-    """Embedding sharded along the vocab dimension. Each rank holds vocab_size // world_size rows.
+    """Embedding sharded along the vocab dimension. Each attention-TP rank holds one contiguous vocabulary shard.
     Out-of-range indices are zero-masked before all_reduce to combine partial embeddings."""
 
-    def __init__(self, vocab_size: int, dim: int):
+    def __init__(
+        self,
+        vocab_size: int,
+        dim: int,
+        *,
+        tensor_parallel: TensorParallelContext | None = None,
+    ):
         super().__init__()
+        self.tensor_parallel = tensor_parallel or _default_tensor_parallel()
+        size, rank = self.tensor_parallel.size, self.tensor_parallel.rank
         self.vocab_size = vocab_size
         self.dim = dim
-        assert vocab_size % world_size == 0, (
-            f"Vocabulary size must be divisible by world size (world_size={world_size})"
+        assert vocab_size % size == 0, (
+            f"Vocabulary size must be divisible by attention TP (size={size})"
         )
-        self.part_vocab_size = vocab_size // world_size
+        self.part_vocab_size = vocab_size // size
         self.vocab_start_idx = rank * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
-        self.allreduce: Callable[[torch.Tensor], torch.Tensor] = _distributed_sum
+        self.allreduce: Callable[[torch.Tensor], torch.Tensor] = (
+            self.tensor_parallel.sum
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if world_size > 1:
+        if self.tensor_parallel.enabled:
             mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
             x = x - self.vocab_start_idx
             x[mask] = 0
         y = F.embedding(x, self.weight)
-        if world_size > 1:
+        if self.tensor_parallel.enabled:
             y[mask] = 0
         return self.allreduce(y)
 
@@ -284,12 +299,20 @@ class ColumnParallelLinear(Linear):
     """Shards output dim across TP ranks. No all-reduce needed on output."""
 
     def __init__(
-        self, in_features: int, out_features: int, bias: bool = False, dtype=None
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        dtype=None,
+        *,
+        tensor_parallel: TensorParallelContext | None = None,
     ):
-        assert out_features % world_size == 0, (
-            f"Output features must be divisible by world size (world_size={world_size})"
+        self.tensor_parallel = tensor_parallel or _default_tensor_parallel()
+        size = self.tensor_parallel.size
+        assert out_features % size == 0, (
+            f"Output features must be divisible by attention TP (size={size})"
         )
-        self.part_out_features = out_features // world_size
+        self.part_out_features = out_features // size
         super().__init__(in_features, self.part_out_features, bias, dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -300,18 +323,28 @@ class RowParallelLinear(Linear):
     """Shards input dim across TP ranks. All-reduce on output to sum partial results."""
 
     def __init__(
-        self, in_features: int, out_features: int, bias: bool = False, dtype=None
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        dtype=None,
+        *,
+        tensor_parallel: TensorParallelContext | None = None,
     ):
-        assert in_features % world_size == 0, (
-            f"Input features must be divisible by world size (world_size={world_size})"
+        self.tensor_parallel = tensor_parallel or _default_tensor_parallel()
+        size = self.tensor_parallel.size
+        assert in_features % size == 0, (
+            f"Input features must be divisible by attention TP (size={size})"
         )
-        self.part_in_features = in_features // world_size
+        self.part_in_features = in_features // size
         super().__init__(self.part_in_features, out_features, bias, dtype)
-        self.allreduce: Callable[[torch.Tensor], torch.Tensor] = _distributed_sum
+        self.allreduce: Callable[[torch.Tensor], torch.Tensor] = (
+            self.tensor_parallel.sum
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = linear(x, self.weight, None)
-        if world_size > 1:
+        if self.tensor_parallel.enabled:
             y = self.allreduce(y)
         if self.bias is not None:
             y += self.bias
@@ -664,23 +697,40 @@ class Indexer(torch.nn.Module):
     """Selects top-k compressed KV positions for sparse attention via learned scoring.
     Has its own Compressor (with Hadamard rotation) to build compressed KV for scoring."""
 
-    def __init__(self, layer_id: int, args: ModelArgs, compress_ratio: int = 4):
+    def __init__(
+        self,
+        layer_id: int,
+        args: ModelArgs,
+        compress_ratio: int = 4,
+        *,
+        tensor_parallel: TensorParallelContext | None = None,
+    ):
         super().__init__()
+        self.tensor_parallel = tensor_parallel or _default_tensor_parallel()
         self.layer_id = layer_id
         self.dim = args.dim
         self.n_heads = args.index_n_heads
-        self.n_local_heads = args.index_n_heads // world_size
+        self.n_local_heads = args.index_n_heads // self.tensor_parallel.size
         self.head_dim = args.index_head_dim
         self.rope_head_dim = args.rope_head_dim
         self.index_topk = args.index_topk
         self.q_lora_rank = args.q_lora_rank
-        self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.head_dim)
+        self.wq_b = ColumnParallelLinear(
+            self.q_lora_rank,
+            self.n_heads * self.head_dim,
+            tensor_parallel=self.tensor_parallel,
+        )
         self.weights_proj = ColumnParallelLinear(
-            self.dim, self.n_heads, dtype=torch.bfloat16
+            self.dim,
+            self.n_heads,
+            dtype=torch.bfloat16,
+            tensor_parallel=self.tensor_parallel,
         )
         self.softmax_scale = self.head_dim**-0.5
         self.compress_ratio = compress_ratio
-        self.allreduce: Callable[[torch.Tensor], torch.Tensor] = _distributed_sum
+        self.allreduce: Callable[[torch.Tensor], torch.Tensor] = (
+            self.tensor_parallel.sum
+        )
 
         self.compressor = Compressor(args, compress_ratio, self.head_dim, True)
         self.freqs_cis: torch.Tensor | None = None
@@ -758,7 +808,7 @@ class Indexer(torch.nn.Module):
             cache_mapping=cache.index_mapping(self.layer_id),
             cache_width=width,
         )
-        if world_size > 1:
+        if self.tensor_parallel.enabled:
             index_score = self.allreduce(index_score)
         topk_width = min(self.index_topk, width)
         topk_indices = torch.topk(index_score, topk_width, dim=-1, sorted=True).indices
@@ -811,7 +861,7 @@ class Indexer(torch.nn.Module):
             cache_mapping=cache.index_mapping(self.layer_id),
             cache_width=width,
         )
-        if world_size > 1:
+        if self.tensor_parallel.enabled:
             index_score = self.allreduce(index_score)
         topk_width = min(self.index_topk, width)
         topk_idxs = _compact_topk_indices(index_score.flatten(0, 1), topk_width)
@@ -830,19 +880,26 @@ class Attention(nn.Module):
     """Multi-head Latent Attention (MLA) with sliding window + optional KV compression.
     Uses low-rank Q projection (wq_a -> q_norm -> wq_b) and grouped low-rank O projection."""
 
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(
+        self,
+        layer_id: int,
+        args: ModelArgs,
+        *,
+        tensor_parallel: TensorParallelContext | None = None,
+    ):
         super().__init__()
+        self.tensor_parallel = tensor_parallel or _default_tensor_parallel()
         self.layer_id = layer_id
         self.dim = args.dim
         self.n_heads = args.n_heads
-        self.n_local_heads = args.n_heads // world_size
+        self.n_local_heads = args.n_heads // self.tensor_parallel.size
         self.q_lora_rank = args.q_lora_rank
         self.o_lora_rank = args.o_lora_rank
         self.head_dim = args.head_dim
         self.rope_head_dim = args.rope_head_dim
         self.nope_head_dim = args.head_dim - args.rope_head_dim
         self.n_groups = args.o_groups
-        self.n_local_groups = self.n_groups // world_size
+        self.n_local_groups = self.n_groups // self.tensor_parallel.size
         self.window_size = args.window_size
         # Verification writes a whole speculative block before acceptance is
         # known. A small physical guard band keeps those future writes from
@@ -883,7 +940,11 @@ class Attention(nn.Module):
         else:
             self.wq_a = Linear(self.dim, self.q_lora_rank)
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.head_dim)
+        self.wq_b = ColumnParallelLinear(
+            self.q_lora_rank,
+            self.n_heads * self.head_dim,
+            tensor_parallel=self.tensor_parallel,
+        )
         if self._fused_wqkv:
             self.wkv = Linear(
                 self.dim,
@@ -898,14 +959,24 @@ class Attention(nn.Module):
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * args.o_lora_rank,
             dtype=torch.bfloat16,
+            tensor_parallel=self.tensor_parallel,
         )
-        self.wo_b = RowParallelLinear(self.n_groups * args.o_lora_rank, self.dim)
+        self.wo_b = RowParallelLinear(
+            self.n_groups * args.o_lora_rank,
+            self.dim,
+            tensor_parallel=self.tensor_parallel,
+        )
         self.softmax_scale = self.head_dim**-0.5
 
         if self.compress_ratio:
             self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
             if self.compress_ratio == 4:
-                self.indexer = Indexer(layer_id, args, self.compress_ratio)
+                self.indexer = Indexer(
+                    layer_id,
+                    args,
+                    self.compress_ratio,
+                    tensor_parallel=self.tensor_parallel,
+                )
             else:
                 self.indexer = None
 
@@ -1409,19 +1480,26 @@ class Expert(nn.Module):
 class MoEWeights(nn.Module):
     """Checkpoint-shaped gate, shared expert and rank-local routed storage."""
 
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(
+        self,
+        layer_id: int,
+        args: ModelArgs,
+        *,
+        expert_parallel: TensorParallelLayout | None = None,
+    ):
         super().__init__()
+        expert_parallel = expert_parallel or _default_tensor_parallel().layout
         self.layer_id = layer_id
         self.dim = args.dim
-        assert args.n_routed_experts % world_size == 0, (
-            f"Number of experts must be divisible by world size (world_size={world_size})"
+        assert args.n_routed_experts % expert_parallel.size == 0, (
+            f"Number of experts must be divisible by EP (size={expert_parallel.size})"
         )
         self.n_routed_experts = args.n_routed_experts
-        self.n_local_experts = args.n_routed_experts // world_size
+        self.n_local_experts = args.n_routed_experts // expert_parallel.size
         self.n_activated_experts = args.n_activated_experts
         self.swiglu_limit = args.swiglu_limit
         self.decode_overlap_stream: torch.cuda.Stream | None = None
-        self.experts_start_idx = rank * self.n_local_experts
+        self.experts_start_idx = expert_parallel.rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(layer_id, args)
         expert_dtype = torch.float4_e2m1fn_x2 if args.expert_dtype == "fp4" else None
@@ -1568,12 +1646,19 @@ class Block(nn.Module):
 
     attention_cls = Attention
 
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(
+        self,
+        layer_id: int,
+        args: ModelArgs,
+        *,
+        tensor_parallel: TensorParallelContext | None = None,
+        expert_parallel: TensorParallelLayout | None = None,
+    ):
         super().__init__()
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
-        self.attn = self.attention_cls(layer_id, args)
-        self.ffn = MoEWeights(layer_id, args)
+        self.attn = self.attention_cls(layer_id, args, tensor_parallel=tensor_parallel)
+        self.ffn = MoEWeights(layer_id, args, expert_parallel=expert_parallel)
         self.prefill_ffn: Callable | None = None
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
@@ -1688,9 +1773,16 @@ class Block(nn.Module):
 
 
 class ParallelHead(nn.Module):
-    def __init__(self, vocab_size: int, dim: int):
+    def __init__(
+        self,
+        vocab_size: int,
+        dim: int,
+        *,
+        tensor_parallel: TensorParallelContext | None = None,
+    ):
         super().__init__()
-        part_vocab_size = vocab_size // world_size
+        self.tensor_parallel = tensor_parallel or _default_tensor_parallel()
+        part_vocab_size = vocab_size // self.tensor_parallel.size
         # The checkpoint stores lm_head in BF16; FP32 accumulation keeps the
         # final sampling logits stable across tensor-parallel ranks.
         self.weight = nn.Parameter(
@@ -1701,9 +1793,13 @@ class ParallelHead(nn.Module):
         if not full_logits:
             x = x[:, -1]
         logits = F.linear(x.float(), self.weight)
-        if world_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(world_size)]
-            dist.all_gather(all_logits, logits)
+        if self.tensor_parallel.enabled:
+            all_logits = [
+                torch.empty_like(logits) for _ in range(self.tensor_parallel.size)
+            ]
+            dist.all_gather(
+                all_logits, logits, group=self.tensor_parallel.process_group
+            )
             logits = torch.cat(all_logits, dim=-1)
         return logits
 
@@ -1711,8 +1807,14 @@ class ParallelHead(nn.Module):
 class DSparkAttention(Attention):
     """Dense-window attention for one parallel DSpark draft block."""
 
-    def __init__(self, layer_id: int, args: ModelArgs):
-        super().__init__(layer_id, args)
+    def __init__(
+        self,
+        layer_id: int,
+        args: ModelArgs,
+        *,
+        tensor_parallel: TensorParallelContext | None = None,
+    ):
+        super().__init__(layer_id, args, tensor_parallel=tensor_parallel)
         if self.compress_ratio:
             raise ValueError("DSpark layers must use uncompressed attention")
 
@@ -1810,10 +1912,20 @@ class DSparkAttention(Attention):
 class DSparkMarkovHead(nn.Module):
     """Low-rank autoregressive correction over parallel draft logits."""
 
-    def __init__(self, vocab_size: int, markov_rank: int):
+    def __init__(
+        self,
+        vocab_size: int,
+        markov_rank: int,
+        *,
+        tensor_parallel: TensorParallelContext | None = None,
+    ):
         super().__init__()
-        self.markov_w1 = ParallelEmbedding(vocab_size, markov_rank)
-        self.markov_w2 = ParallelHead(vocab_size, markov_rank)
+        self.markov_w1 = ParallelEmbedding(
+            vocab_size, markov_rank, tensor_parallel=tensor_parallel
+        )
+        self.markov_w2 = ParallelHead(
+            vocab_size, markov_rank, tensor_parallel=tensor_parallel
+        )
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w2(self.markov_w1(token_ids), full_logits=True)
@@ -1824,8 +1936,20 @@ class DSparkBlock(Block):
 
     attention_cls = DSparkAttention
 
-    def __init__(self, layer_id: int, args: ModelArgs):
-        super().__init__(layer_id, args)
+    def __init__(
+        self,
+        layer_id: int,
+        args: ModelArgs,
+        *,
+        tensor_parallel: TensorParallelContext | None = None,
+        expert_parallel: TensorParallelLayout | None = None,
+    ):
+        super().__init__(
+            layer_id,
+            args,
+            tensor_parallel=tensor_parallel,
+            expert_parallel=expert_parallel,
+        )
         self.stage_id = layer_id - args.n_layers
         if self.stage_id == 0:
             if not args.dspark_target_layer_ids:
@@ -1837,7 +1961,9 @@ class DSparkBlock(Block):
         if self.stage_id == args.n_mtp_layers - 1:
             self.norm = RMSNorm(args.dim, args.norm_eps)
             self.markov_head = DSparkMarkovHead(
-                args.vocab_size, args.dspark_markov_rank
+                args.vocab_size,
+                args.dspark_markov_rank,
+                tensor_parallel=tensor_parallel,
             )
             hc_dim = self.hc_mult * args.dim
             with use_default_dtype(torch.float32):
@@ -1862,24 +1988,57 @@ class DSparkBlock(Block):
 
 class Transformer(nn.Module):
     """Full DeepSeek-V4 model: embed -> HC-expand -> N blocks -> HC-head -> logits.
-    Sets global state (world_size, rank, default_dtype, scale_fmt, scale_dtype) in __init__."""
+    Attention TP and expert ownership are bound independently at construction."""
 
-    def __init__(self, args: ModelArgs):
-        global world_size, rank, default_dtype, scale_fmt, scale_dtype
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
+    def __init__(
+        self,
+        args: ModelArgs,
+        *,
+        tensor_parallel: TensorParallelContext | None = None,
+        parallel_groups: ParallelGroups | None = None,
+    ):
+        global default_dtype, scale_fmt, scale_dtype
+        if tensor_parallel is None and parallel_groups is not None:
+            group = parallel_groups.attn_tp
+            tensor_parallel = TensorParallelContext(
+                TensorParallelLayout(rank=group.local_rank, size=group.size),
+                group.handle if group.size > 1 else None,
+            )
+        tensor_parallel = tensor_parallel or _default_tensor_parallel()
+        expert_parallel = (
+            TensorParallelLayout(
+                rank=parallel_groups.ep.local_rank, size=parallel_groups.ep.size
+            )
+            if parallel_groups is not None
+            else tensor_parallel.layout
+        )
         default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         scale_fmt = "ue8m0" if args.scale_dtype == "fp8" else args.scale_fmt
         scale_dtype = (
             torch.float8_e8m0fnu if args.scale_dtype == "fp8" else torch.float32
         )
         super().__init__()
-        self.embed = ParallelEmbedding(args.vocab_size, args.dim)
+        self.parallel_groups = parallel_groups
+        self.embed = ParallelEmbedding(
+            args.vocab_size, args.dim, tensor_parallel=tensor_parallel
+        )
         self.layers = torch.nn.ModuleList()
         for layer_id in range(args.n_layers):
-            self.layers.append(Block(layer_id, args))
+            self.layers.append(
+                Block(
+                    layer_id,
+                    args,
+                    tensor_parallel=tensor_parallel,
+                    expert_parallel=expert_parallel,
+                )
+            )
         self.mtp = torch.nn.ModuleList(
-            DSparkBlock(args.n_layers + stage_id, args)
+            DSparkBlock(
+                args.n_layers + stage_id,
+                args,
+                tensor_parallel=tensor_parallel,
+                expert_parallel=expert_parallel,
+            )
             for stage_id in range(args.n_mtp_layers)
         )
         self.dspark_block_size = args.dspark_block_size
@@ -1898,7 +2057,9 @@ class Transformer(nn.Module):
             layer.attn.decode_overlap_stream = self._decode_overlap_stream
             layer.ffn.decode_overlap_stream = self._decode_overlap_stream
         self.norm = RMSNorm(args.dim, args.norm_eps)
-        self.head = ParallelHead(args.vocab_size, args.dim)
+        self.head = ParallelHead(
+            args.vocab_size, args.dim, tensor_parallel=tensor_parallel
+        )
         self.hc_mult = hc_mult = args.hc_mult
         hc_dim = hc_mult * args.dim
         with use_default_dtype(torch.float32):
@@ -1907,8 +2068,9 @@ class Transformer(nn.Module):
             self.hc_head_scale = nn.Parameter(torch.empty(1))
 
     def prepare_weights(self, reducer: Callable[[torch.Tensor], torch.Tensor]) -> None:
-        """Lower loaded expert containers into runtime modules owning reduction."""
+        """Lower loaded expert containers into local kernels and communication."""
 
+        groups = getattr(self, "parallel_groups", None)
         prepare_model(
             self,
             lambda source: (
@@ -1920,12 +2082,34 @@ class Transformer(nn.Module):
                         block_size=block_size,
                         scale_fmt=scale_fmt,
                         scale_dtype=scale_dtype,
+                        expert_parallel=groups.ep if groups is not None else None,
+                        replication=groups.attn_replication
+                        if groups is not None
+                        else None,
                     ),
                 )
                 if isinstance(source, MoEWeights)
                 else source
             ),
         )
+
+    def forward_experts_empty(self) -> None:
+        """Join one EP model round without attention, sampling, or cache writes.
+
+        Other attention-DP replicas may have work while this replica is idle.
+        Its experts still receive and execute their tokens in every layer.
+        """
+
+        if self.parallel_groups is None:
+            raise RuntimeError("empty expert rounds require explicit parallel groups")
+        hidden = self.embed.weight.new_empty((0, self.embed.dim))
+        for layer in self.layers:
+            ffn = layer.ffn
+            indices = torch.empty(
+                (0, ffn.gate.topk), device=hidden.device, dtype=torch.int32
+            )
+            weights = hidden.new_empty(indices.shape)
+            ffn.routed(hidden, indices, weights)
 
     def set_allreduce(
         self,

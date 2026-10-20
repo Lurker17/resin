@@ -1,4 +1,4 @@
-"""Native DeepSeek-V4-Flash-0731 CUDA execution with TP sharding.
+"""Native DeepSeek-V4-Flash-0731 CUDA execution with explicit rank groups.
 
 Resin owns the model hierarchy, kernels, request lifetime, sampling, and
 scheduling. SWA, compressed history, and recurrent compressor tails are
@@ -27,7 +27,11 @@ from resin.backend.cuda.graphs import (
     GraphShape,
     resolve_decode_graph_shapes,
 )
-from resin.backend.cuda.parallel import FlashInferAllReduce, TensorParallelContext
+from resin.backend.cuda.parallel import (
+    FlashInferAllReduce,
+    TensorParallelContext,
+    TensorParallelLayout,
+)
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
@@ -41,6 +45,7 @@ from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import BatchView, PagedCachePlan
 from resin.backend.sampling import format_output
 from resin.backend.speculative import SpeculativeStats
+from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
 from resin_models_cuda.deepseek_v4.cache import (
     GRAPH_SCRATCH_PARENTS,
@@ -56,10 +61,15 @@ from resin_models_cuda.deepseek_v4.weights import load_deepseek_v4_weights
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
+    from resin.backend.distributed import StepContext
 
 
 class DeepSeekV4CudaRunner(CudaRunner):
     """Dynamically batched runner over Resin's DeepSeek-V4 implementation."""
+
+    parallelism_capabilities = ParallelismCapabilities(
+        attn_tp=True, attn_dp=True, ep=True, attn_replication=True
+    )
 
     def __init__(
         self,
@@ -67,7 +77,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
         *,
         max_seq_len: int,
         max_batch_size: int = 1,
-        tensor_parallel: TensorParallelContext,
+        tensor_parallel: TensorParallelContext | None = None,
+        parallel_groups: ParallelGroups | None = None,
         device: str | torch.device,
         cuda_graph_prefill: str = "breakable",
         cuda_graph_decode: str = "full",
@@ -110,6 +121,34 @@ class DeepSeekV4CudaRunner(CudaRunner):
         ):
             raise ValueError("cache_parent_capacity must be a positive integer")
 
+        if parallel_groups is not None:
+            if tensor_parallel is not None:
+                raise ValueError("pass either tensor_parallel or parallel_groups")
+            self.parallelism_capabilities.validate(
+                parallel_groups.topology, model="DeepSeek-V4"
+            )
+            if parallel_groups.topology.attn_tp != 1:
+                raise ValueError("DeepSeek-V4 expert dispatch requires attn_tp=1")
+            if speculative_tokens:
+                raise ValueError(
+                    "DeepSeek-V4 expert dispatch requires speculative_tokens=0"
+                )
+            if cuda_graph_prefill != "disabled" or cuda_graph_decode != "disabled":
+                raise ValueError(
+                    "DeepSeek-V4 expert dispatch requires disabled CUDA graphs"
+                )
+            tensor_parallel = TensorParallelContext(
+                TensorParallelLayout(
+                    rank=parallel_groups.attn_tp.local_rank,
+                    size=parallel_groups.attn_tp.size,
+                ),
+                parallel_groups.attn_tp.handle
+                if parallel_groups.attn_tp.size > 1
+                else None,
+            )
+        elif tensor_parallel is None:
+            tensor_parallel = TensorParallelContext()
+        self.parallel_groups = parallel_groups
         self.tensor_parallel = tensor_parallel
         self.tensor_parallel_rank = tensor_parallel.rank
         self.tensor_parallel_size = tensor_parallel.size
@@ -123,7 +162,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         torch.cuda.set_device(self.device)
         if torch.cuda.get_device_capability(self.device)[0] < 10:
             raise RuntimeError("the DeepSeek-V4 runner requires Blackwell")
-        if self.tensor_parallel_size > 1:
+        if parallel_groups is None and self.tensor_parallel_size > 1:
             if not dist.is_initialized():
                 raise RuntimeError(
                     "DeepSeek-V4 TP requires an initialized process group"
@@ -214,7 +253,11 @@ class DeepSeekV4CudaRunner(CudaRunner):
             }
         )
         with use_default_dtype(torch.bfloat16), torch.device(self.device):
-            self._model = native_model.Transformer(args)
+            self._model = native_model.Transformer(
+                args,
+                tensor_parallel=self.tensor_parallel,
+                parallel_groups=parallel_groups,
+            )
         self._allreduce = FlashInferAllReduce(
             self.tensor_parallel,
             max_token_num=max_batch_size * max(1, speculative_tokens + 1),
@@ -286,7 +329,17 @@ class DeepSeekV4CudaRunner(CudaRunner):
         local_capacity = capacity_plan.parent_capacity
         if cache_parent_capacity is not None:
             local_capacity = min(local_capacity, cache_parent_capacity)
-        if self.tensor_parallel.enabled:
+        if parallel_groups is not None and parallel_groups.replica.size > 1:
+            # Replica control groups use Gloo, including ranks that replicate
+            # attention. Every copy must back the same logical cache capacity.
+            capacity_tensor = torch.tensor(local_capacity, dtype=torch.int64)
+            parallel_groups.distributed.all_reduce(
+                capacity_tensor,
+                op=dist.ReduceOp.MIN,
+                group=parallel_groups.replica.handle,
+            )
+            local_capacity = int(capacity_tensor.item())
+        elif self.tensor_parallel.enabled:
             capacity_tensor = torch.tensor(
                 local_capacity, dtype=torch.int64, device=self.device
             )
@@ -612,7 +665,15 @@ class DeepSeekV4CudaRunner(CudaRunner):
         return torch.cat(logits, dim=0)
 
     def _broadcast_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
-        if self.tensor_parallel.enabled:
+        groups = self.parallel_groups
+        if groups is not None:
+            if groups.attn_replication.size > 1:
+                groups.distributed.broadcast(
+                    token_ids,
+                    src=groups.attn_replication.source,
+                    group=groups.attn_replication.handle,
+                )
+        elif self.tensor_parallel.enabled:
             dist.broadcast(
                 token_ids,
                 src=0,
@@ -690,6 +751,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
         """Run one dynamically batched prefill or decode sampling step."""
 
         self._check_cuda_graphs(plan.phase)
+        if self.parallel_groups is not None:
+            raise RuntimeError("explicit rank groups require forward_distributed")
         rows = self._validate_plan(plan)
         cache_plan = self._cache_plan(plan)
         with self._cuda_failure:
@@ -721,6 +784,75 @@ class DeepSeekV4CudaRunner(CudaRunner):
                     )
                 output = self._sample_target(logits, plan, 0)
             return format_output(logits, output, plan)
+
+    def validate_distributed(
+        self, plan: BatchPlan | None, context: StepContext
+    ) -> None:
+        """Reject incompatible batches before the coordinator's readiness vote."""
+
+        if self.parallel_groups is None or context.groups is not self.parallel_groups:
+            raise ValueError("distributed step groups do not match this runner")
+        if context.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
+            raise ValueError("DeepSeek-V4 plan phase must be prefill or decode")
+        if plan is None:
+            if context.num_sequences or context.num_tokens:
+                raise ValueError("a nonempty replica requires a batch plan")
+        else:
+            self._validate_plan(plan)
+            if (
+                plan.phase != context.phase
+                or plan.num_sequences != context.num_sequences
+                or plan.num_tokens != context.num_tokens
+            ):
+                raise ValueError("distributed step metadata does not match the plan")
+
+    def forward_distributed(
+        self, plan: BatchPlan | None, context: StepContext
+    ) -> list[int] | ForwardOutput | None:
+        """Join every EP layer even when this attention replica has no work.
+
+        Prefill executes one sequence per model call. Replicas with shorter
+        queues still enter each routed-expert round, without touching a cache.
+        Token counts within a round may differ; expert dispatch carries them.
+        """
+
+        self.validate_distributed(plan, context)
+        rows = () if plan is None else self._validate_plan(plan)
+        with self._cuda_failure:
+            staging = TensorStager(self.device)
+            if plan is not None:
+                cache = self._cache.tensorize(self._cache_plan(plan), staging)
+                token_ids = staging.device("token_ids", plan.token_ids, torch.long)
+                positions = staging.device("positions", plan.positions, torch.long)
+            with (
+                torch.inference_mode(),
+                self._prefill_compute_context(),
+            ):
+                if context.phase == BatchPhase.PREFILL:
+                    output_logits = (
+                        self._prefill(plan, rows, cache, token_ids, positions)
+                        if plan is not None
+                        else None
+                    )
+                    for _ in range(context.max_num_sequences - len(rows)):
+                        self._model.forward_experts_empty()
+                elif plan is not None:
+                    output_logits = self._model.forward_decode(
+                        token_ids.view(plan.num_sequences, 1),
+                        positions,
+                        int(plan.positions.max()) + 1,
+                        cache=cache,
+                    )
+                else:
+                    self._model.forward_experts_empty()
+                    output_logits = None
+                if plan is None:
+                    # Active replicas synchronize when copying sampled tokens
+                    # to the host. Empty replicas have no output transfer.
+                    self._cuda_failure()
+                    return None
+                output = self._sample_target(output_logits, plan, 0)
+            return format_output(output_logits, output, plan)
 
 
 __all__ = ["DeepSeekV4CudaRunner"]

@@ -1,4 +1,4 @@
-"""Stream and tensor-parallel shard the official DeepSeek-V4 checkpoint."""
+"""Stream the official checkpoint into prepared attention and expert shards."""
 
 from __future__ import annotations
 
@@ -68,11 +68,12 @@ def load_deepseek_v4_weights(
     tensor_parallel_size: int,
     device: Any,
 ) -> dict[str, int]:
-    """Load one TP rank directly from the original safetensor shards.
+    """Load one attention-TP rank directly from the original safetensor shards.
 
     This avoids materializing DeepSeek's four converted checkpoint copies.
-    Only the experts owned by ``model`` are read; replicated tensors and the
-    conventional tensor-parallel axes follow the official ``convert.py``.
+    Only the experts already owned by ``model`` are read, independently of the
+    attention-TP coordinate. Replicated tensors and the conventional attention
+    tensor-parallel axes follow the official ``convert.py``.
     """
 
     if not 0 <= rank < tensor_parallel_size:
