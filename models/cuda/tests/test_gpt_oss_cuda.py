@@ -363,8 +363,12 @@ class TestGptOssCudaNativePlan:
         monkeypatch.setattr(
             gpt_oss_runtime, "build_attention_batches", lambda *_: batches
         )
-        runner._step_staging = SimpleNamespace(
-            device=lambda _name, values, dtype: torch.tensor(values, dtype=dtype)
+        monkeypatch.setattr(
+            gpt_oss_runtime,
+            "TensorStager",
+            lambda _: SimpleNamespace(
+                device=lambda _name, values, dtype: torch.tensor(values, dtype=dtype)
+            ),
         )
         assert runner.forward(plan) == [1, 0]
         assert events == [phase == BatchPhase.PREFILL]

@@ -62,58 +62,6 @@ fn input(tokens: Vec<u32>, limit: usize) -> Submission<&'static str> {
 }
 
 #[test]
-fn pending_execution_retains_ownership_until_commit() {
-    let mut engine = engine(0, 8);
-    let mut model = Model::default();
-    let request = engine.submit(input(vec![1, 2], 2)).unwrap();
-    let plan = engine.begin_step(&mut model).unwrap().unwrap();
-    assert_eq!(plan.sequence_ids, [request.id()]);
-    assert!(engine.step_in_flight());
-    assert!(engine.has_work());
-    assert_eq!(engine.ready_request_count(), 0);
-    assert_eq!(engine.cache_free_parent_count(), Some(15));
-    assert!(engine.begin_step(&mut model).is_err());
-    assert!(engine.cancel(&mut model, &request).is_err());
-    assert!(engine.close(&mut model).is_err());
-    assert!(model.released.is_empty());
-    let events = engine.finish_step(&mut model, Ok(vec![vec![3]])).unwrap();
-    assert_eq!(events[0].token_id, 3);
-    assert!(!engine.step_in_flight());
-    assert_eq!(engine.ready_request_count(), 1);
-    // The synchronous driver uses the same completion path.
-    engine.step(&mut model).unwrap();
-    assert_eq!(request.take_result().unwrap(), [3, 4]);
-    assert_eq!(engine.cache_free_parent_count(), Some(16));
-    assert!(engine.finish_step(&mut model, Ok(vec![])).is_err());
-}
-
-#[test]
-fn pending_execution_distinguishes_rejection_from_completion_failure() {
-    let mut engine = engine(0, 8);
-    let mut model = Model::default();
-    let request = engine.submit(input(vec![1, 2], 1)).unwrap();
-    let rejected = engine.begin_step(&mut model).unwrap().unwrap();
-    assert!(
-        engine
-            .finish_step(&mut model, Err(Error::rejected("before launch")))
-            .is_err()
-    );
-    assert!(!engine.poisoned());
-    let accepted = engine.begin_step(&mut model).unwrap().unwrap();
-    assert_eq!(rejected.sequence_ids, accepted.sequence_ids);
-    assert_ne!(rejected.batch_id, accepted.batch_id);
-    assert!(
-        engine
-            .finish_step(&mut model, Err(Error::execution("completion failed")))
-            .is_err()
-    );
-    assert!(engine.poisoned());
-    assert_eq!(engine.cache_free_parent_count(), Some(15));
-    assert!(!request.done());
-    assert!(model.released.is_empty());
-}
-
-#[test]
 fn a_native_model_uses_the_complete_lifecycle_without_python() {
     let mut engine = engine(0, 2);
     let mut model = Model::default();

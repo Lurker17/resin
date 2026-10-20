@@ -438,7 +438,6 @@ struct Batch<P> {
 }
 
 pub struct EngineCore<P> {
-    in_flight: Option<Batch<P>>,
     quarantined: Option<Batch<P>>,
     runner_config: RunnerConfig,
     scheduler: Scheduler<Request<P>>,
@@ -506,7 +505,6 @@ impl<P: Clone> EngineCore<P> {
         let new_token_ratio_decay =
             (new_token_ratio - minimum_new_token_ratio) / NEW_TOKEN_RATIO_DECAY_STEPS;
         Ok(Self {
-            in_flight: None,
             quarantined: None,
             runner_config,
             scheduler: Scheduler::new(max_running_requests),
@@ -541,16 +539,10 @@ impl<P: Clone> EngineCore<P> {
         self.context_length.get()
     }
     pub fn has_work(&self) -> bool {
-        self.in_flight.is_some() || !self.scheduler.is_empty()
-    }
-    pub fn step_in_flight(&self) -> bool {
-        self.in_flight.is_some()
+        !self.scheduler.is_empty()
     }
     pub fn ready_request_count(&self) -> usize {
         self.scheduler.len()
-    }
-    pub fn active_request_count(&self) -> usize {
-        self.scheduler.len() + self.in_flight.as_ref().map_or(0, |batch| batch.rows.len())
     }
     pub fn max_running_requests(&self) -> usize {
         self.scheduler.max_running_requests()
@@ -761,51 +753,12 @@ impl<P: Clone> EngineCore<P> {
         runner: &mut impl Runner<P>,
         make_event: impl FnMut(TokenEvent) -> Result<E>,
     ) -> Result<Vec<E>> {
-        let Some(plan) = self.begin_step(runner)? else {
+        let Some((mut batch, plan)) = self.prepare_batch(runner)? else {
             return Ok(Vec::new());
         };
-        let output = execution_call("forward", || runner.forward(plan));
-        self.finish_step_with(runner, output, make_event)
-    }
-
-    /// Reserve one cohort and retain its writer lease until `finish_step`.
-    /// The caller owns execution; the Engine owns requests and physical pages.
-    pub fn begin_step(&mut self, runner: &mut impl Runner<P>) -> Result<Option<ExecutionPlan<P>>> {
-        self.raise_if_open()?;
-        if self.in_flight.is_some() {
-            return Err(Error::invalid("an Engine step is already in flight"));
-        }
-        let Some((batch, plan)) = self.prepare_batch(runner)? else {
-            return Ok(None);
-        };
-        self.in_flight = Some(batch);
-        Ok(Some(plan))
-    }
-
-    pub fn finish_step(
-        &mut self,
-        runner: &mut impl Runner<P>,
-        output: Result<Vec<Vec<u32>>>,
-    ) -> Result<Vec<TokenEvent>> {
-        self.finish_step_with(runner, output, Ok)
-    }
-
-    /// Complete only the Engine's retained cohort. Rejection is legal solely
-    /// before execution changes persistent state; all later failures quarantine.
-    pub fn finish_step_with<E>(
-        &mut self,
-        runner: &mut impl Runner<P>,
-        output: Result<Vec<Vec<u32>>>,
-        make_event: impl FnMut(TokenEvent) -> Result<E>,
-    ) -> Result<Vec<E>> {
-        self.raise_if_open()?;
-        let mut batch = self
-            .in_flight
-            .take()
-            .ok_or_else(|| Error::invalid("no Engine step is in flight"))?;
         // A rejection promises that persistent state is unchanged. Every other
         // execution failure keeps the exact requests and writer lease quarantined.
-        let output = match output {
+        let output = match execution_call("forward", || runner.forward(plan)) {
             Err(error) if error.kind == ErrorKind::Rejected => {
                 self.release_kv_access(batch.resources.take());
                 self.scheduler
@@ -1128,11 +1081,6 @@ impl<P: Clone> EngineCore<P> {
         if request.engine_id != self.engine_id {
             return Err(Error::invalid("RequestLease belongs to a different Engine"));
         }
-        if self.in_flight.is_some() {
-            return Err(Error::invalid(
-                "finish the in-flight step before cancellation",
-            ));
-        }
         let request_id = request.request_id;
         if let Some(index) = self.scheduler.position(|request| request.id == request_id) {
             let mut request = self.scheduler.remove(index);
@@ -1167,9 +1115,6 @@ impl<P: Clone> EngineCore<P> {
             return Ok(());
         }
         self.raise_if_poisoned()?;
-        if self.in_flight.is_some() {
-            return Err(Error::invalid("finish the in-flight step before closing"));
-        }
         self.close_healthy(runner)
     }
 }

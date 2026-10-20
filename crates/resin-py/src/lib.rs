@@ -15,7 +15,7 @@ mod runner;
 use cache::{CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention};
 use resin_core::engine::{self as core, CompletionReason};
 use runner::{
-    ResourceBinding, RunnerCallbacks, RunnerConfig, bind_runner_resources, resolve_runner_config,
+    ResourceBinding, RunnerConfig, bind_runner_resources, resolve_runner_config,
     resolve_runner_contract, runner_error_is_post_accept,
 };
 
@@ -763,40 +763,6 @@ struct PythonRunner<'a, 'py> {
     error: Option<PyErr>,
 }
 impl PythonRunner<'_, '_> {
-    fn enqueue(
-        &mut self,
-        plan: core::ExecutionPlan<RequestPayload>,
-        enqueue: Option<&Py<PyAny>>,
-    ) -> core::Result<PendingStep> {
-        let Some(enqueue) = enqueue else {
-            return core::Runner::forward(self, plan).map(PendingStep::Ready);
-        };
-        let rows = plan.sequence_ids.len();
-        let plan = Py::new(self.py, planning::from_core(plan))
-            .map_err(|error| self.failed(error, false))?;
-        let pending = enqueue.bind(self.py).call1((plan,)).map_err(|error| {
-            let accepted = runner_error_is_post_accept(self.py, &error);
-            self.failed(error, accepted)
-        })?;
-        Ok(PendingStep::Device {
-            pending: pending.unbind(),
-            rows,
-        })
-    }
-
-    fn complete(&mut self, pending: &mut PendingStep) -> core::Result<Vec<Vec<u32>>> {
-        match pending {
-            PendingStep::Ready(output) => Ok(std::mem::take(output)),
-            PendingStep::Device { pending, rows } => {
-                let output = pending
-                    .bind(self.py)
-                    .call_method0("result")
-                    .map_err(|error| self.failed(error, true))?;
-                extract_runner_token_rows(&output, *rows).map_err(|error| self.failed(error, true))
-            }
-        }
-    }
-
     fn failed(&mut self, error: PyErr, accepted: bool) -> core::Error {
         let message = error.to_string();
         self.error = Some(error);
@@ -838,14 +804,9 @@ impl core::Runner<RequestPayload> for PythonRunner<'_, '_> {
 #[pyclass(module = "resin._resin")]
 struct Engine {
     core: core::EngineCore<RequestPayload>,
-    runner: RunnerCallbacks,
-    pending_step: Option<PendingStep>,
+    runner_forward: Py<PyAny>,
+    runner_release: Option<Py<PyAny>>,
     runner_config: RunnerConfig,
-}
-
-enum PendingStep {
-    Ready(Vec<Vec<u32>>),
-    Device { pending: Py<PyAny>, rows: usize },
 }
 
 #[pymethods]
@@ -861,7 +822,7 @@ impl Engine {
         eos_token_id: Option<u32>,
         prefix_cache: bool,
     ) -> PyResult<Self> {
-        let callbacks = resolve_runner_contract(py, runner.bind(py))?;
+        let (runner_forward, runner_release) = resolve_runner_contract(py, runner.bind(py))?;
         let resolved = resolve_runner_config(py, runner.bind(py))?;
         let config = &resolved.config;
         let scheduler = scheduler_config
@@ -893,8 +854,8 @@ impl Engine {
         let runner_config = bind_runner_resources(py, resolved, core.cache_pool_id())?;
         Ok(Self {
             core,
-            runner: callbacks,
-            pending_step: None,
+            runner_forward,
+            runner_release,
             runner_config,
         })
     }
@@ -1009,51 +970,14 @@ impl Engine {
     }
 
     fn step(&mut self, py: Python<'_>) -> PyResult<Vec<Py<TokenEvent>>> {
-        if !self.core.step_in_flight() && !self.enqueue_step(py)? {
-            return Ok(Vec::new());
-        }
-        self.complete_step(py)
-    }
-
-    /// Submit one batch; keep requests and cache leases until completion.
-    fn enqueue_step(&mut self, py: Python<'_>) -> PyResult<bool> {
         let mut runner = PythonRunner {
             py,
-            forward: &self.runner.forward,
-            release: self.runner.release.as_ref(),
-            error: None,
-        };
-        let prepared = self.core.begin_step(&mut runner);
-        let Some(plan) = runner.result(prepared)? else {
-            return Ok(false);
-        };
-        match runner.enqueue(plan, self.runner.enqueue.as_ref()) {
-            Ok(pending) => {
-                self.pending_step = Some(pending);
-                Ok(true)
-            }
-            Err(error) => {
-                let result = self.core.finish_step(&mut runner, Err(error));
-                runner.result(result).map(|_| false)
-            }
-        }
-    }
-
-    fn complete_step(&mut self, py: Python<'_>) -> PyResult<Vec<Py<TokenEvent>>> {
-        self.core.raise_if_open().map_err(core_error)?;
-        let mut pending = self
-            .pending_step
-            .take()
-            .ok_or_else(|| PyValueError::new_err("no Engine step is in flight"))?;
-        let mut runner = PythonRunner {
-            py,
-            forward: &self.runner.forward,
-            release: self.runner.release.as_ref(),
+            forward: &self.runner_forward,
+            release: self.runner_release.as_ref(),
             error: None,
         };
         let mut event_error = None;
-        let output = runner.complete(&mut pending);
-        let result = self.core.finish_step_with(&mut runner, output, |event| {
+        let result = self.core.step_with(&mut runner, |event| {
             Py::new(
                 py,
                 TokenEvent {
@@ -1069,10 +993,6 @@ impl Engine {
                 core::Error::memory("could not allocate token event")
             })
         });
-        if result.is_err() {
-            // Retain device buffers even when completion or commit failed.
-            self.pending_step = Some(pending);
-        }
         result.map_err(|error| {
             runner
                 .error
@@ -1083,21 +1003,18 @@ impl Engine {
     fn cancel(&mut self, py: Python<'_>, request: PyRef<'_, RequestLease>) -> PyResult<bool> {
         let mut runner = PythonRunner {
             py,
-            forward: &self.runner.forward,
-            release: self.runner.release.as_ref(),
+            forward: &self.runner_forward,
+            release: self.runner_release.as_ref(),
             error: None,
         };
         let result = self.core.cancel(&mut runner, &request.inner);
         runner.result(result)
     }
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        if self.core.step_in_flight() {
-            self.complete_step(py)?;
-        }
         let mut runner = PythonRunner {
             py,
-            forward: &self.runner.forward,
-            release: self.runner.release.as_ref(),
+            forward: &self.runner_forward,
+            release: self.runner_release.as_ref(),
             error: None,
         };
         let result = self.core.close(&mut runner);
@@ -1106,11 +1023,6 @@ impl Engine {
     fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
         slf.core.raise_if_open().map_err(core_error)?;
         Ok(slf)
-    }
-
-    #[getter]
-    fn step_in_flight(&self) -> bool {
-        self.core.step_in_flight()
     }
 
     fn __exit__(
@@ -1130,7 +1042,7 @@ impl Engine {
 
     #[getter]
     fn active_request_count(&self) -> usize {
-        self.core.active_request_count()
+        self.core.ready_request_count()
     }
 
     #[getter]
