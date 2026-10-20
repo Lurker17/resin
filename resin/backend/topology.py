@@ -10,6 +10,27 @@ from resin import Parallelism
 
 
 @dataclass(frozen=True)
+class ParallelismCapabilities:
+    """Supported axes; preparation also validates model-specific combinations."""
+
+    attn_dp: bool = False
+    attn_tp: bool = False
+    cp: bool = False
+    ep: bool = False
+    expert_tp: bool = False
+    attn_replication: bool = False
+
+    def validate(self, parallelism: Parallelism, *, model: str) -> None:
+        unsupported = [
+            f"{axis}={getattr(parallelism, axis)}"
+            for axis in self.__dataclass_fields__
+            if getattr(parallelism, axis) > 1 and not getattr(self, axis)
+        ]
+        if unsupported:
+            raise ValueError(f"{model} does not support {', '.join(unsupported)}")
+
+
+@dataclass(frozen=True)
 class RankGroup:
     ranks: tuple[int, ...]
     handle: Any = field(repr=False)
@@ -101,4 +122,4 @@ class ParallelGroups:
             self.distributed.destroy_process_group(self._owned.pop())
 
 
-__all__ = ["ParallelGroups", "RankGroup"]
+__all__ = ["ParallelGroups", "ParallelismCapabilities", "RankGroup"]

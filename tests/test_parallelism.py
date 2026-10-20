@@ -5,6 +5,7 @@ import pickle
 import pytest
 
 from resin import Parallelism
+from resin.backend.topology import ParallelismCapabilities
 
 
 def test_topology_composes_all_parallel_axes_without_multiplying_ep():
@@ -155,3 +156,21 @@ def test_parallelism_rejects_invalid_rank(rank):
 def test_parallelism_rejects_invalid_coordinates(coordinates):
     with pytest.raises(ValueError):
         Parallelism(world_size=16, attn_dp=2, attn_tp=2, cp=2).rank(*coordinates)
+
+
+def test_capabilities_declare_axes_and_reject_unsupported_combinations():
+    single_gpu = ParallelismCapabilities()
+    single_gpu.validate(Parallelism(), model="Single GPU")
+    with pytest.raises(ValueError, match="Single GPU does not support attn_tp=2"):
+        single_gpu.validate(Parallelism(world_size=2, attn_tp=2), model="Single GPU")
+    tp = ParallelismCapabilities(attn_tp=True, expert_tp=True)
+    tp.validate(Parallelism(world_size=4, attn_tp=4), model="TP")
+    with pytest.raises(ValueError, match="attn_dp=4"):
+        tp.validate(Parallelism(world_size=4, attn_dp=4), model="TP")
+    ep_dp = ParallelismCapabilities(ep=True, attn_dp=True, attn_replication=True)
+    ep_dp.validate(Parallelism(world_size=4, ep=4, attn_dp=4), model="EP/DP")
+    ep_dp.validate(Parallelism(world_size=4, ep=4), model="EP/DP")
+    with pytest.raises(ValueError, match="expert_tp=2"):
+        ep_dp.validate(Parallelism(world_size=4, ep=2, attn_dp=4), model="EP/DP")
+    with pytest.raises(ValueError, match="cp=2"):
+        ep_dp.validate(Parallelism(world_size=4, ep=4, cp=2), model="EP/DP")

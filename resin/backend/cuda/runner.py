@@ -25,6 +25,7 @@ from resin.backend.cuda.sampling import (
     SamplingTensors,
 )
 from resin.backend.resources import CachePoolBinding
+from resin.backend.topology import ParallelismCapabilities
 from resin.protocols import Runner
 
 _SAMPLING_DEFAULTS = (1.0, 1.0, None, 0, 0, False)
@@ -49,6 +50,8 @@ class CudaRunner(Runner):
     shape selection, fallback accounting, and replay without knowing anything
     about transformer layers, cache geometry, kernels, or quantization.
     """
+
+    parallelism_capabilities = ParallelismCapabilities()
 
     def __init__(
         self,

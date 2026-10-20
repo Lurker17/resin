@@ -17,6 +17,7 @@ from resin.backend.loading import (
 )
 from resin.backend.plans import plan_rows
 from resin.backend.sampling import TorchSampler, format_output
+from resin.backend.topology import ParallelismCapabilities
 from resin.protocols import Runner
 from resin_models_torch.lfm2.config import Lfm2Config
 from resin_models_torch.lfm2.model import Lfm2ForCausalLM, Lfm2State
@@ -66,6 +67,7 @@ class Lfm2TorchRunner(Runner):
     """LFM2 runner consuming Rust-built integer-token batches."""
 
     runner_config = RunnerConfig(continuation_prefill=True)
+    parallelism_capabilities = ParallelismCapabilities()
 
     def __init__(
         self,

@@ -26,7 +26,7 @@ from resin.backend.distributed import (
     DistributedExecutionError,
     DistributedWorker,
 )
-from resin.backend.topology import ParallelGroups
+from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 
 
 class CollectiveRunner:
@@ -328,6 +328,10 @@ def _distributed_process(rank, world_size, rendezvous, directory):
     )
     with pytest.raises(DistributedExecutionError, match="forward_distributed"):
         DistributedWorker(SimpleNamespace(forward=lambda plan: [1]), groups)
+    unsupported = CollectiveRunner(groups, "normal")
+    unsupported.parallelism_capabilities = ParallelismCapabilities()
+    with pytest.raises(DistributedExecutionError, match="does not support attn_dp"):
+        DistributedWorker(unsupported, groups)
     divergent = CollectiveRunner(groups, "normal")
     if rank == 1:
         divergent.runner_config = RunnerConfig(

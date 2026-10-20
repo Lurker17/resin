@@ -123,6 +123,9 @@ class DistributedWorker:
             self._forward = getattr(runner, "forward_distributed", None)
             self._validate = getattr(runner, "validate_distributed", None)
             self.runner_config = getattr(runner, "runner_config", RunnerConfig())
+            capabilities = getattr(runner, "parallelism_capabilities", None)
+            if capabilities is not None:
+                capabilities.validate(groups.topology, model=type(runner).__name__)
             if (
                 groups.topology.cp > 1
                 or groups.topology.ep > 1

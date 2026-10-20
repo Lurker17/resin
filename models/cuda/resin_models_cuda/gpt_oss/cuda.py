@@ -56,6 +56,7 @@ from resin.backend.cuda.staging import TensorStager
 from resin.backend.paged_attention import PagedAttentionBatch
 from resin.backend.quantization import QuantizationConfig
 from resin.backend.sampling import format_output
+from resin.backend.topology import ParallelismCapabilities
 from resin.models.gpt_oss.config import GptOssConfig
 from resin.models.gpt_oss.plan import (
     PAGE_SIZE,
@@ -161,6 +162,7 @@ class GptOssCudaRunner(CudaRunner):
     """GPT-OSS BF16 attention on FA4 over one native cache pool."""
 
     model_label = "GPT-OSS"
+    parallelism_capabilities = ParallelismCapabilities(attn_tp=True, expert_tp=True)
     page_size = PAGE_SIZE
     sliding_window = SLIDING_WINDOW
     prefill_chunk_size = PREFILL_CHUNK_SIZE
