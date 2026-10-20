@@ -296,10 +296,12 @@ class TestGptOssCudaNativePlan:
         ]
         _, batch = build_attention_batches(plan)
         runner = object.__new__(GptOssCudaRunner)
+        runner.parallel_groups = None
         runner.vocab_size = 16
         runner._sampler = FlashInferSampler
         runner._cuda_graph_mode_enabled = lambda _: True
         shapes = default_decode_graph_shapes(4, speculative=False, max_batch_size=128)
+        runner._graph_logits = {shape: torch.empty(shape[0], 16) for shape in shapes}
         runner._select_cuda_graph = lambda _, match: next(
             shape for shape in shapes if match(shape)
         )
@@ -755,8 +757,11 @@ class TestGptOssCudaTinyOracle:
 
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
         runner._sampler = TorchSampler()
+        runner.parallel_groups = None
         runner.device = "cpu"
         runner.hidden_size = 3
+        runner.vocab_size = 3
+        runner._graph_logits = {}
         runner._model = SimpleNamespace(lm_head=lambda hidden: hidden)
         runner._forward_batch = lambda *_args: torch.tensor(
             [[0.0, 5.0, 1.0], [4.0, 0.0, 1.0]], dtype=torch.bfloat16

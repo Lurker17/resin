@@ -202,10 +202,6 @@ class GptOssCudaRunner(CudaRunner):
                 raise ValueError("GPT-OSS expert dispatch requires attn_tp=1")
             if parallel_groups.topology.expert_tp != 1:
                 raise ValueError("GPT-OSS expert dispatch requires expert_tp=1")
-            if cuda_graph_prefill != "disabled" or cuda_graph_decode != "disabled":
-                raise ValueError(
-                    "GPT-OSS expert dispatch requires disabled CUDA graphs"
-                )
         self.parallel_groups = parallel_groups
         if kernel_attention is None:
             from flash_attn.cute import flash_attn_varlen_func
@@ -264,6 +260,9 @@ class GptOssCudaRunner(CudaRunner):
             tensor_parallel=self.tensor_parallel.layout,
             parallel_groups=parallel_groups,
         )
+        self._configure_expert_parallel_graphs(self._model, parallel_groups)
+        self._graph_logits = {}
+        self._last_graph_logits = None
         args = self._model.args
         checkpoint_args = GptOssConfig.from_dict(self.config)
         expected_attention = (
@@ -416,7 +415,7 @@ class GptOssCudaRunner(CudaRunner):
                 "decode": CudaGraphMode(
                     decode_graph_shapes,
                     self._new_decode_graph_step,
-                    lambda shape: self._graph_capture_inputs(shape, self.vocab_size),
+                    self._decode_graph_capture_inputs,
                 )
             }
         )
@@ -479,6 +478,12 @@ class GptOssCudaRunner(CudaRunner):
         # before a request can reach the runner.
         self._kv.storage[:, :, 0].zero_()
         torch.cuda.synchronize(self.device)
+
+    def _decode_graph_capture_inputs(self, shape):
+        inputs = self._graph_capture_inputs(shape, self.vocab_size)
+        if self.parallel_groups is not None:
+            inputs["ep_valid_rows"] = shape[0]
+        return inputs
 
     def _tensorize(
         self, batch: PagedAttentionBatch, staging: TensorStager, prefix: str
@@ -693,6 +698,13 @@ class GptOssCudaRunner(CudaRunner):
         positions = empty(torch.long, batch_size)
         final_hidden = empty(torch.bfloat16, batch_size, self.hidden_size)
         output_ids = empty(torch.long, batch_size)
+        logits_buffer = empty(torch.float32, batch_size, self.vocab_size)
+        self._graph_logits[shape] = logits_buffer
+        valid_rows = (
+            torch.empty((), dtype=torch.int32, device=self.device)
+            if self.parallel_groups is not None
+            else None
+        )
         sampling = (
             self._sampler.empty(batch_size, self.device)
             if hasattr(self._sampler, "empty")
@@ -700,19 +712,30 @@ class GptOssCudaRunner(CudaRunner):
         )
 
         def launch() -> None:
-            hidden = self._forward_batch(token_ids, positions, batch)
-            final_hidden.index_copy_(0, batch.sequence_indices, hidden)
-            logits = self._model.lm_head(final_hidden)
-            if sampling is None:
-                self._sampler(logits, out=output_ids)
-            else:
-                self._sampler.sample_tensors(logits, sampling, out=output_ids)
+            with self._expert_graph_capacity(batch_size, valid_rows=valid_rows):
+                hidden = self._forward_batch(token_ids, positions, batch)
+                final_hidden.index_copy_(0, batch.sequence_indices, hidden)
+                logits = self._model.lm_head(final_hidden)
+                logits_buffer.copy_(logits)
+                if sampling is None:
+                    self._sampler(logits, out=output_ids)
+                else:
+                    self._sampler.sample_tensors(logits, sampling, out=output_ids)
+                groups = self.parallel_groups
+                if groups is not None and groups.attn_replication.size > 1:
+                    groups.distributed.broadcast(
+                        output_ids,
+                        src=groups.attn_replication.source,
+                        group=groups.attn_replication.handle,
+                    )
 
         inputs = {
             "token_ids": token_ids,
             "positions": positions,
             **paged_attention_graph_inputs(batch),
         }
+        if valid_rows is not None:
+            inputs["ep_valid_rows"] = valid_rows
         if sampling is not None:
             inputs.update(self._sampler.graph_inputs(sampling))
         return CudaGraphStep(
@@ -722,11 +745,12 @@ class GptOssCudaRunner(CudaRunner):
         )
 
     def _graph_forward(
-        self, plan: BatchPlan, host: PagedAttentionBatch
-    ) -> list[int] | None:
-        if plan.needs_logprobs:
-            self._cuda_graph_fallback("decode", "logprobs")
-            return None
+        self,
+        plan: BatchPlan,
+        host: PagedAttentionBatch,
+        *,
+        shape: GraphShape | None = None,
+    ) -> list[int] | ForwardOutput | None:
         if not self._cuda_graph_mode_enabled("decode"):
             return None
         rows = len(plan.sequence_ids)
@@ -738,10 +762,13 @@ class GptOssCudaRunner(CudaRunner):
             or sliding.width != self.window_table_width
         ):
             raise GraphInputError("plan is not a fixed-shape decode batch")
-        shape = self._select_cuda_graph(
-            "decode",
-            match=lambda candidate: candidate[0] >= rows and candidate[1] >= full.width,
-        )
+        if shape is None:
+            shape = self._select_cuda_graph(
+                "decode",
+                match=lambda candidate: (
+                    candidate[0] >= rows and candidate[1] >= full.width
+                ),
+            )
         if shape is None:
             return None
         inputs = {
@@ -752,6 +779,8 @@ class GptOssCudaRunner(CudaRunner):
                 {"full": shape[1], "sliding": self.window_table_width},
             ),
         }
+        if self.parallel_groups is not None:
+            inputs["ep_valid_rows"] = rows
         padding = shape[0] - rows
         if padding:
             for name in ("token_ids", "positions"):
@@ -778,7 +807,9 @@ class GptOssCudaRunner(CudaRunner):
             inputs.update(
                 pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding)
             )
-        return self._run_cuda_graph("decode", shape, inputs)[:rows]
+        output = self._run_cuda_graph("decode", shape, inputs)[:rows]
+        self._last_graph_logits = self._graph_logits[shape][:rows]
+        return format_output(self._last_graph_logits, output, plan)
 
     def forward(self, plan: BatchPlan) -> list[int] | ForwardOutput:
         if getattr(self, "parallel_groups", None) is not None:
@@ -797,14 +828,16 @@ class GptOssCudaRunner(CudaRunner):
             )
         return prefill_batches, decode_batch
 
-    def _forward_plan(self, plan: BatchPlan) -> list[int] | ForwardOutput:
+    def _forward_plan(
+        self, plan: BatchPlan, *, use_graph=True
+    ) -> list[int] | ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         host_positions = plan.positions
 
         prefill_batches, decode_batch = self._attention_batches(plan)
 
         with self._cuda_failure:
-            if not prefill_batches and decode_batch is not None:
+            if use_graph and not prefill_batches and decode_batch is not None:
                 graph_output = self._graph_forward(plan, decode_batch)
                 if graph_output is not None:
                     return graph_output
@@ -862,6 +895,11 @@ class GptOssCudaRunner(CudaRunner):
                 raise ValueError(
                     "distributed GPT-OSS requires one packed attention batch"
                 )
+        # Worker readiness votes on validation errors before any rank enters
+        # a graph-selection collective or launches captured expert exchanges.
+        self._check_cuda_graphs(context.phase)
+        if context.phase == BatchPhase.DECODE and self.cuda_graph_decode != "disabled":
+            self._require_cuda_graph_executor().mode("decode").check_ready()
 
     def forward_distributed(
         self, plan: BatchPlan | None, context: StepContext
@@ -869,14 +907,45 @@ class GptOssCudaRunner(CudaRunner):
         """Run one packed batch, or join its expert layers without KV work."""
 
         self.validate_distributed(plan, context)
-        if plan is not None:
-            return self._forward_plan(plan)
-        with self._cuda_failure, torch.inference_mode():
-            for layer in self._model.model.layers:
-                layer.mlp.experts.forward_empty()
-            # There is no sampled-token transfer to wait for empty CUDA work.
+        self._last_graph_logits = None
+        with self._cuda_failure:
+            if context.phase == BatchPhase.DECODE:
+                host = None if plan is None else self._attention_batches(plan)[1]
+                shape = self._select_distributed_cuda_graph(
+                    "decode",
+                    context,
+                    required_shape=(
+                        context.num_sequences,
+                        0 if host is None else host.group("full").width,
+                    ),
+                )
+                if shape is not None:
+                    if plan is not None:
+                        return self._graph_forward(plan, host, shape=shape)
+                    inputs = self._decode_graph_capture_inputs(shape)
+                    inputs["ep_valid_rows"] = 0
+                    self._run_cuda_graph("decode", shape, inputs)
+                    return None
+            if context.phase == BatchPhase.PREFILL:
+                with self._distributed_prefill_graphs(context):
+                    if plan is not None:
+                        return self._forward_plan(plan)
+                    with torch.inference_mode():
+                        if self._prefill_graph_active:
+                            self._empty_prefill_regions()
+                        else:
+                            self._forward_experts_empty()
+            elif plan is not None:
+                return self._forward_plan(plan, use_graph=False)
+            else:
+                with torch.inference_mode():
+                    self._forward_experts_empty()
             self._cuda_failure()
-        return None
+            return None
+
+    def _forward_experts_empty(self):
+        for layer in self._model.model.layers:
+            layer.mlp.experts.forward_empty()
 
 
 def _router_logits(router: TopKRouter, hidden: Tensor) -> Tensor:

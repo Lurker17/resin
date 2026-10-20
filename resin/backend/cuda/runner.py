@@ -24,6 +24,7 @@ from resin.backend.cuda.sampling import (
     FlashInferSampler,
     SamplingTensors,
 )
+from resin.backend.expert_parallel import fixed_expert_capacity
 from resin.backend.resources import CachePoolBinding
 from resin.backend.topology import ParallelismCapabilities
 from resin.protocols import Runner
@@ -90,6 +91,107 @@ class CudaRunner(Runner):
         self._sampler = FlashInferSampler()
         self._cache_binding: CachePoolBinding | None = None
         self._cuda_graph_executor: CudaGraphExecutor | None = None
+        self._expert_graph_model = None
+        self._expert_graph_groups = None
+        self._distributed_prefill_bucket = None
+        self._distributed_prefill_scope = False
+
+    def _configure_expert_parallel_graphs(self, model, groups) -> None:
+        """Attach explicit expert collectives to the ordinary graph machinery."""
+
+        self._expert_graph_model, self._expert_graph_groups = model, groups
+
+    def _expert_graph_capacity(self, capacity: int, *, valid_rows=None):
+        if getattr(self, "_expert_graph_groups", None) is None:
+            return nullcontext()
+        return fixed_expert_capacity(
+            self._expert_graph_model, capacity, valid_rows=valid_rows
+        )
+
+    def _graph_domain_values(self, value):
+        groups = getattr(self, "_expert_graph_groups", None)
+        if groups is None or groups.domain.size == 1:
+            return [value]
+        values = [None] * groups.domain.size
+        groups.distributed.all_gather_object(values, value, group=groups.domain.handle)
+        return values
+
+    def _validate_distributed_graph_catalogs(self, request=None) -> None:
+        if getattr(self, "_expert_graph_groups", None) is None:
+            return
+        catalog = tuple(
+            (mode, stats["configured_shapes"], stats["captured_shapes"])
+            for mode, stats in self.cuda_graph_stats.items()
+        )
+        signature = (
+            type(self).__qualname__,
+            self.cuda_graph_prefill,
+            self.cuda_graph_decode,
+            request,
+            catalog,
+        )
+        values = self._graph_domain_values(signature)
+        if any(value != values[0] for value in values):
+            raise ValueError(
+                "distributed CUDA graph catalogs and capture order must agree"
+            )
+
+    def _select_distributed_cuda_graph(
+        self, mode, context, *, required_shape, eligible=True, fallback="shape"
+    ):
+        """Vote before GPU work so every attention replica chooses the same path."""
+
+        cache = self._require_cuda_graph_executor().mode(mode)
+        values = self._graph_domain_values(
+            (bool(eligible), tuple(required_shape), cache.shapes)
+        )
+        if any(value[2] != values[0][2] for value in values):
+            raise ValueError("distributed CUDA graph catalogs must agree")
+        if not all(value[0] for value in values):
+            cache.fallback("distributed_eligibility")
+            return None
+        required = tuple(max(parts) for parts in zip(*(v[1] for v in values)))
+        return self._select_cuda_graph(
+            mode,
+            match=lambda shape: all(a >= b for a, b in zip(shape, required)),
+            fallback=fallback,
+        )
+
+    @contextmanager
+    def _distributed_prefill_graphs(self, context, *, per_sequence=False):
+        """Align FFN buckets across unequal and empty attention-DP replicas."""
+
+        tokens = context.max_num_tokens
+        if per_sequence:
+            tokens = min(tokens, self.prefill_chunk_size)
+        shape = self._select_distributed_cuda_graph(
+            "prefill",
+            context,
+            required_shape=(tokens, 1),
+        )
+        previous = getattr(self, "_distributed_prefill_bucket", None)
+        previous_scope = getattr(self, "_distributed_prefill_scope", False)
+        self._distributed_prefill_bucket = None if shape is None else shape[0]
+        self._distributed_prefill_scope = True
+        try:
+            with self._prefill_graphs():
+                self._prefill_graph_active = shape is not None
+                yield
+        finally:
+            self._distributed_prefill_bucket = previous
+            self._distributed_prefill_scope = previous_scope
+
+    def _empty_prefill_regions(self) -> None:
+        """Join each captured FFN without running attention or touching live KV."""
+
+        if not self._prefill_graph_active:
+            raise RuntimeError("empty prefill regions require an aligned graph bucket")
+        hidden = torch.empty(
+            (0, self._prefill_hidden_size), dtype=torch.bfloat16, device=self.device
+        )
+        ids = torch.empty(0, dtype=torch.long, device=self.device)
+        for region in range(len(self._prefill_operations)):
+            self._run_prefill_region(region, hidden, ids)
 
     def _configure_cache_binding(self, binding: CachePoolBinding) -> None:
         """Attach the model-owned physical cache to the Engine resource seam."""
@@ -206,6 +308,10 @@ class CudaRunner(Runner):
                 device=self.device,
             )
             inputs = {"hidden": hidden}
+            if getattr(self, "_expert_graph_groups", None) is not None:
+                inputs["ep_valid_rows"] = torch.tensor(
+                    tokens, dtype=torch.int32, device=self.device
+                )
             if self._prefill_token_ids:
                 inputs["token_ids"] = torch.zeros(
                     tokens, dtype=torch.int64, device=self.device
@@ -219,7 +325,12 @@ class CudaRunner(Runner):
         operation = self._prefill_operations[region - 1]
 
         def launch():
-            with self._prefill_capture_context():
+            with (
+                self._expert_graph_capacity(
+                    tokens, valid_rows=inputs.get("ep_valid_rows")
+                ),
+                self._prefill_capture_context(),
+            ):
                 output.copy_(operation(inputs["hidden"], inputs.get("token_ids")))
 
         return CudaGraphStep(
@@ -232,7 +343,10 @@ class CudaRunner(Runner):
     @contextmanager
     def _prefill_graphs(self):
         active = self._prefill_graph_active
-        self._prefill_graph_active = self.cuda_graph_prefill == "breakable"
+        self._prefill_graph_active = self.cuda_graph_prefill == "breakable" and (
+            not getattr(self, "_distributed_prefill_scope", False)
+            or self._distributed_prefill_bucket is not None
+        )
         try:
             yield
         finally:
@@ -251,17 +365,26 @@ class CudaRunner(Runner):
             output = operation(flattened, ids)
             return output if flat_input else output.view_as(hidden)
         tokens = flattened.shape[0]
-        bucket = next((size for size in self._prefill_buckets if size >= tokens), None)
+        common_bucket = getattr(self, "_distributed_prefill_bucket", None)
+        bucket = common_bucket or next(
+            (size for size in self._prefill_buckets if size >= tokens), None
+        )
         fallback = None
         if bucket is None or flattened.dtype != torch.bfloat16:
             fallback = "tokens_or_dtype"
-        elif tokens > self._prefill_pad_up_to and tokens != bucket:
+        elif (
+            common_bucket is None
+            and tokens > self._prefill_pad_up_to
+            and tokens != bucket
+        ):
             fallback = "padding"
         if fallback is not None:
             self._cuda_graph_fallback("prefill", fallback)
             output = operation(flattened, ids)
         else:
             inputs, _ = self._prefill_graph_buffers(bucket)
+            if "ep_valid_rows" in inputs:
+                inputs["ep_valid_rows"].fill_(tokens)
             if tokens == bucket:
                 inputs["hidden"].copy_(flattened)
                 if self._prefill_token_ids:
@@ -295,6 +418,7 @@ class CudaRunner(Runner):
     def capture_cuda_graphs(self) -> dict[str, CudaGraphStats]:
         """Capture every configured mode and return mode-scoped statistics."""
 
+        self._validate_distributed_graph_catalogs()
         self._require_cuda_graph_executor().capture_all(
             before_capture=self._before_cuda_graph_capture,
             after_capture=self._after_cuda_graph_capture,
@@ -304,6 +428,7 @@ class CudaRunner(Runner):
     def capture_cuda_graph(self, mode: str, shape: GraphShape) -> CudaGraphStats:
         """Capture one mode shape while honoring model-state hooks."""
 
+        self._validate_distributed_graph_catalogs((mode, shape))
         executor = self._require_cuda_graph_executor()
         self._before_cuda_graph_capture()
         try:

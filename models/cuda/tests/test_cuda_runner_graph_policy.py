@@ -99,10 +99,13 @@ def test_deepseek_decode_policy_places_broadcast_inside_or_between_graphs(
 ):
     runner = object.__new__(DeepSeekV4CudaRunner)
     runner.speculative_tokens = 0
+    runner.parallel_groups = None
+    runner.vocab_size = 2
     runner.cuda_graph_decode = policy
     runner.device = torch.device("cpu")
     runner.tensor_parallel = SimpleNamespace(enabled=parallel, process_group=object())
     runner._graph_device_caches = {}
+    runner._graph_logits = {}
     runner._cache = SimpleNamespace(
         graph_cache=lambda *_args: object(),
         graph_device_inputs=lambda _cache: {},

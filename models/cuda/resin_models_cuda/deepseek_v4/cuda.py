@@ -133,10 +133,6 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 raise ValueError(
                     "DeepSeek-V4 expert dispatch requires speculative_tokens=0"
                 )
-            if cuda_graph_prefill != "disabled" or cuda_graph_decode != "disabled":
-                raise ValueError(
-                    "DeepSeek-V4 expert dispatch requires disabled CUDA graphs"
-                )
             tensor_parallel = TensorParallelContext(
                 TensorParallelLayout(
                     rank=parallel_groups.attn_tp.local_rank,
@@ -192,6 +188,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         self._dspark_phase_events: dict[GraphShape, tuple[torch.cuda.Event, ...]] = {}
         self._last_dspark_phase_ms: dict[str, float] | None = None
         self._graph_device_caches = {}
+        self._graph_logits = {}
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = 1
         self._speculation = SpeculativeStats(speculative_tokens)
@@ -308,6 +305,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             device=self.device,
         )
         self._model.prepare_weights(self._allreduce.sum)
+        self._configure_expert_parallel_graphs(self._model, parallel_groups)
 
         self.cache_geometry = CacheGeometry.build(
             args.compress_ratios,
@@ -440,6 +438,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
     def _decode_graph_capture_inputs(self, shape: GraphShape) -> dict[str, object]:
         inputs = self._graph_capture_inputs(shape, self.vocab_size)
         inputs.update(self._cache.graph_shape_capture_inputs(*shape))
+        if self.parallel_groups is not None:
+            inputs["ep_valid_rows"] = shape[0]
         return inputs
 
     def _new_decode_graph_step(
@@ -453,17 +453,33 @@ class DeepSeekV4CudaRunner(CudaRunner):
         token_ids = torch.empty((batch_size, 1), dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
         output_ids = torch.empty(batch_size, dtype=torch.long, device=self.device)
+        logits_buffer = torch.empty(
+            (batch_size, self.vocab_size), dtype=torch.float32, device=self.device
+        )
+        self._graph_logits[shape] = logits_buffer
+        valid_rows = (
+            torch.empty((), dtype=torch.int32, device=self.device)
+            if self.parallel_groups is not None
+            else None
+        )
         sampling = self._sampler.empty(batch_size, self.device)
 
         def launch() -> None:
-            with use_default_dtype(torch.bfloat16), torch.device(self.device):
+            with (
+                self._expert_graph_capacity(batch_size, valid_rows=valid_rows),
+                use_default_dtype(torch.bfloat16),
+                torch.device(self.device),
+            ):
                 logits = self._model.forward_decode(
                     token_ids,
                     positions,
                     graph_seq_len,
                     cache=cache,
                 )
+                logits_buffer.copy_(logits)
                 self._sampler.sample_tensors(logits, sampling, out=output_ids)
+                if self.parallel_groups is not None:
+                    self._broadcast_tokens(output_ids)
 
         def broadcast() -> None:
             dist.broadcast(
@@ -473,6 +489,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
             )
 
         inputs = {"token_ids": token_ids, "positions": positions}
+        if valid_rows is not None:
+            inputs["ep_valid_rows"] = valid_rows
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(self._sampler.graph_inputs(sampling))
         kwargs = dict(inputs=inputs, output=output_ids, prepare=self._reset_model_state)
@@ -559,21 +577,22 @@ class DeepSeekV4CudaRunner(CudaRunner):
         )
 
     def _graph_forward(
-        self, plan: BatchPlan, cache_plan
-    ) -> list[int] | list[list[int]] | None:
-        if plan.needs_logprobs:
+        self, plan: BatchPlan, cache_plan, *, shape: GraphShape | None = None
+    ) -> list[int] | list[list[int]] | ForwardOutput | None:
+        if plan.needs_logprobs and self.speculative_tokens:
             self._cuda_graph_fallback("decode", "logprobs")
             return None
         batch_size = plan.num_sequences
         positions = plan.positions
         sequence_length = int(positions.max()) + 1
-        shape = self._select_cuda_graph(
-            "decode",
-            match=lambda candidate: (
-                candidate[0] >= batch_size
-                and candidate[1] >= sequence_length + self.speculative_tokens
-            ),
-        )
+        if shape is None:
+            shape = self._select_cuda_graph(
+                "decode",
+                match=lambda candidate: (
+                    candidate[0] >= batch_size
+                    and candidate[1] >= sequence_length + self.speculative_tokens
+                ),
+            )
         if shape is None:
             return None
         padding_rows = shape[0] - batch_size
@@ -586,6 +605,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
         inputs.update(
             pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding_rows)
         )
+        if getattr(self, "parallel_groups", None) is not None:
+            inputs["ep_valid_rows"] = batch_size
         output = self._run_cuda_graph("decode", shape, inputs)[:batch_size]
         phase_events = self._dspark_phase_events.get(shape)
         if phase_events is not None:
@@ -597,6 +618,10 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 "device_total": start.elapsed_time(step_end),
             }
         if not self.speculative_tokens:
+            if plan.needs_logprobs:
+                return format_output(
+                    self._graph_logits[shape][:batch_size], output, plan
+                )
             return output
         block_size = self.speculative_tokens
         drafts = [row[:block_size] for row in output]
@@ -806,6 +831,11 @@ class DeepSeekV4CudaRunner(CudaRunner):
             ):
                 raise ValueError("distributed step metadata does not match the plan")
             self._cache_plan(plan)
+        # Worker readiness votes on validation errors before any rank enters
+        # a graph-selection collective or launches captured expert exchanges.
+        self._check_cuda_graphs(context.phase)
+        if context.phase == BatchPhase.DECODE and self.cuda_graph_decode != "disabled":
+            self._require_cuda_graph_executor().mode("decode").check_ready()
 
     def forward_distributed(
         self, plan: BatchPlan | None, context: StepContext
@@ -820,6 +850,10 @@ class DeepSeekV4CudaRunner(CudaRunner):
         self.validate_distributed(plan, context)
         rows = () if plan is None else self._validate_plan(plan)
         with self._cuda_failure:
+            if context.phase == BatchPhase.DECODE:
+                used_graph, graph_output = self._distributed_decode_graph(plan, context)
+                if used_graph:
+                    return graph_output
             staging = TensorStager(self.device)
             if plan is not None:
                 cache = self._cache.tensorize(self._cache_plan(plan), staging)
@@ -830,13 +864,17 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 self._prefill_compute_context(),
             ):
                 if context.phase == BatchPhase.PREFILL:
-                    output_logits = (
-                        self._prefill(plan, rows, cache, token_ids, positions)
-                        if plan is not None
-                        else None
-                    )
-                    for _ in range(context.max_num_sequences - len(rows)):
-                        self._model.forward_experts_empty()
+                    with self._distributed_prefill_graphs(context, per_sequence=True):
+                        output_logits = (
+                            self._prefill(plan, rows, cache, token_ids, positions)
+                            if plan is not None
+                            else None
+                        )
+                        for _ in range(context.max_num_sequences - len(rows)):
+                            if self._prefill_graph_active:
+                                self._empty_prefill_regions()
+                            else:
+                                self._model.forward_experts_empty()
                 elif plan is not None:
                     output_logits = self._model.forward_decode(
                         token_ids.view(plan.num_sequences, 1),
@@ -854,6 +892,31 @@ class DeepSeekV4CudaRunner(CudaRunner):
                     return None
                 output = self._sample_target(output_logits, plan, 0)
             return format_output(output_logits, output, plan)
+
+    def _distributed_decode_graph(
+        self, plan: BatchPlan | None, context: StepContext
+    ) -> tuple[bool, list[int] | ForwardOutput | None]:
+        """Replay one common graph bucket across independent attention replicas."""
+
+        shape = self._select_distributed_cuda_graph(
+            "decode",
+            context,
+            required_shape=(
+                0 if plan is None else plan.num_sequences,
+                0 if plan is None else int(plan.positions.max()) + 1,
+            ),
+        )
+        if shape is None:
+            return False, None
+        if plan is not None:
+            return True, self._graph_forward(plan, self._cache_plan(plan), shape=shape)
+
+        # Idle replicas use only reserved scratch parents and send zero-weight
+        # expert rows. Their local experts still execute work for active peers.
+        inputs = self._decode_graph_capture_inputs(shape)
+        inputs["ep_valid_rows"] = 0
+        self._run_cuda_graph("decode", shape, inputs)
+        return True, None
 
 
 __all__ = ["DeepSeekV4CudaRunner"]
