@@ -1,4 +1,4 @@
-"""Real CPU collectives exercise the CUDA model's eager EP routing contract."""
+"""Real CPU collectives exercise the shared eager expert-routing contract."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from resin.backend.expert_parallel import ExpertParallelDispatch
 from resin.backend.topology import RankGroup
-from resin_models_cuda.deepseek_v4.experts import ExpertParallelDispatch
 
 
 def _inputs(source: int, rows: int, *, one_owner: bool = False):
