@@ -145,6 +145,7 @@ def _flat_plan(
         context_lengths=list(context_lengths),
         phase=phase,
         sampling_mask=[True] * sequence_count,
+        needs_logprobs=False,
         sampling_params=[SamplingParams() for _ in range(sequence_count)],
     )
 

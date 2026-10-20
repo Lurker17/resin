@@ -36,7 +36,7 @@ from resin.backend.cuda.sampling import (
     SamplingTensors,
 )
 from resin.backend.resources import CachePoolBinding
-from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, format_output, wants_logprobs
+from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, format_output
 from resin.backend.speculative import SpeculativeStats
 from resin.models.gemma4.config import SLIDING_ATTENTION
 from resin.models.gemma4.media import Gemma4Media
@@ -1198,7 +1198,7 @@ class Gemma4CudaRunner(CudaRunner):
     def _graph_forward(
         self, native: BatchPlan, batch: Gemma4BatchPlan
     ) -> list[int] | None:
-        if wants_logprobs(native):
+        if native.needs_logprobs:
             self._cuda_graph_fallback("decode", "logprobs")
             return None
         if not self._cuda_graph_mode_enabled("decode"):
@@ -1251,7 +1251,7 @@ class Gemma4CudaRunner(CudaRunner):
     def _speculative_graph_forward(
         self, native: BatchPlan, batch: Gemma4BatchPlan
     ) -> list[list[int]] | None:
-        if wants_logprobs(native):
+        if native.needs_logprobs:
             self._cuda_graph_fallback("decode", "logprobs")
             return None
         if not self._cuda_graph_mode_enabled("decode"):

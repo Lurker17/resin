@@ -108,6 +108,40 @@ class TestLfm2Torch:
                         expected_tensor, actual_tensor, rtol=1e-5, atol=1e-5
                     )
 
+    def test_engine_scores_match_full_context_model_logits(self) -> None:
+        from resin import Engine, SamplingParams
+        from resin_models_torch.lfm2 import Lfm2TorchRunner
+
+        runner = Lfm2TorchRunner.__new__(Lfm2TorchRunner)
+        runner.device = torch.device("cpu")
+        runner._model = self.model
+        runner.vocab_size = self.args.vocab_size
+        runner._cache = {}
+        runner.forward_calls = 0
+        engine = Engine(runner)
+        tokens = [1, 2, 3]
+        request = engine.submit(
+            tokens,
+            max_new_tokens=2,
+            sampling_params=SamplingParams(temperature=0, top_logprobs=3),
+        )
+        for _ in range(2):
+            with torch.inference_mode():
+                expected = self.model(torch.tensor([tokens]), self.model.make_cache())[
+                    0, -1
+                ].log_softmax(-1)
+            (event,) = engine.step()
+            assert event.token_id == expected.argmax().item()
+            assert event.logprobs.logprob == pytest.approx(
+                expected[event.token_id].item(), abs=1e-5
+            )
+            assert [token for token, _ in event.logprobs.top_logprobs] == expected.topk(
+                3
+            ).indices.tolist()
+            tokens.append(event.token_id)
+        assert request.take_result() == tokens[-2:]
+        assert runner.live_cache_count == 0
+
     def test_checkpoint_parameter_paths_match_the_released_layout(self) -> None:
         keys = set(self.model.state_dict())
         assert "model.layers.0.conv.in_proj.weight" in keys

@@ -8,13 +8,6 @@ import torch
 SAMPLING_OFFSET_STRIDE = 32
 
 
-def wants_logprobs(plan) -> bool:
-    return any(
-        mask and params.logprobs
-        for mask, params in zip(plan.sampling_mask, plan.sampling_params, strict=True)
-    )
-
-
 def format_output(logits, token_ids, plan):
     """Attach raw-model logprobs to generated tokens, including verified blocks.
 
@@ -26,7 +19,7 @@ def format_output(logits, token_ids, plan):
 
     from resin import ForwardOutput
 
-    if not wants_logprobs(plan):
+    if not plan.needs_logprobs:
         return token_ids.tolist() if isinstance(token_ids, torch.Tensor) else token_ids
 
     if isinstance(token_ids, torch.Tensor):
@@ -53,12 +46,11 @@ def format_output(logits, token_ids, plan):
     if np.any(lengths > logits.shape[1]):
         raise ValueError("verification logits do not cover the accepted token row")
 
+    policies = plan.sampling_params
     requested = np.fromiter(
         (
             sample and params.logprobs
-            for sample, params in zip(
-                plan.sampling_mask, plan.sampling_params, strict=True
-            )
+            for sample, params in zip(plan.sampling_mask, policies, strict=True)
         ),
         dtype=np.bool_,
     )
@@ -86,7 +78,7 @@ def format_output(logits, token_ids, plan):
     # The .numpy() views retain the CPU tensors that own their buffers.
     columns = {}
     counts = np.fromiter(
-        (min(params.top_logprobs, values.shape[-1]) for params in plan.sampling_params),
+        (min(params.top_logprobs, values.shape[-1]) for params in policies),
         dtype=np.uint32,
     )[row_ids]
     max_k = int(counts.max(initial=0))
@@ -210,5 +202,4 @@ __all__ = [
     "TorchSampler",
     "batch_sampling_inputs",
     "format_output",
-    "wants_logprobs",
 ]

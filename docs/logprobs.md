@@ -11,7 +11,9 @@ Model runners use `resin.backend.sampling.format_output(logits, tokens, plan)`
 for ordinary and speculative output. Verification positions must align with the
 returned accepted tokens. Unrequested and continuation-prefill rows carry no
 scores. CUDA runners currently use eager execution for scored requests; captured
-graphs retain their existing token-only output contract.
+graphs retain their existing token-only output contract. `BatchPlan.needs_logprobs`
+checks the score flag natively, so unscored graph replay does not create Python
+sampling-policy objects merely to decide whether scores are needed.
 
 ## Array boundary
 

@@ -70,6 +70,10 @@ def test_logprob_options_survive_broadcast_and_do_not_change_sampling():
     plan = BatchPlan([1], [0], [0], [0, 1], sampling_params=[params])
     restored = batch_plan_from_payload(batch_plan_payload(plan))
     assert restored.sampling_params[0].top_logprobs == 3
+    assert restored.needs_logprobs
+    assert not BatchPlan(
+        [1], [0], [0], [0, 1], sampling_params=[params], sampling_mask=[False]
+    ).needs_logprobs
     logits = torch.tensor([[2.0, 4.0, 1.0]])
     tokens = TorchSampler()(logits, plan)
     output = format_output(logits, tokens, plan)

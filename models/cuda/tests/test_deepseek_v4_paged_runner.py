@@ -109,6 +109,7 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
     plan = SimpleNamespace(
         num_sequences=3,
         sampling_mask=[True] * 3,
+        needs_logprobs=False,
         sampling_params=[SimpleNamespace(logprobs=False)] * 3,
         sequence_ids=[1, 2, 3],
         context_lengths=[11, 12, 13],

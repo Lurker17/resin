@@ -604,6 +604,15 @@ impl BatchPlan {
         arrays::readonly_view(this.clone().into_any(), &this.get().sampling_mask)
     }
 
+    /// Check natively so token-only graph replay does not box per-row policies.
+    #[getter]
+    fn needs_logprobs(&self) -> bool {
+        self.sampling_mask
+            .iter()
+            .zip(&self.sampling_params)
+            .any(|(sample, params)| *sample && params.logprobs)
+    }
+
     /// Effective sampling parameters, one per sequence.
     #[getter]
     fn sampling_params(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {

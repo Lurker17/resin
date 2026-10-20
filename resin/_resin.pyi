@@ -102,6 +102,9 @@ class BatchPlan:
         prefill, when some sequences only advance the cache.
         """
     @property
+    def needs_logprobs(self, /) -> bool:
+        """Whether any sampled row requests scores, checked without boxing policies."""
+    @property
     def sampling_params(self, /) -> tuple[SamplingParams, ...]:
         """
         Effective sampling parameters, one per sequence.

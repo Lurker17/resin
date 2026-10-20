@@ -55,7 +55,7 @@ from resin.backend.cuda.runner import (
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.paged_attention import PagedAttentionBatch
 from resin.backend.quantization import QuantizationConfig
-from resin.backend.sampling import format_output, wants_logprobs
+from resin.backend.sampling import format_output
 from resin.models.gpt_oss.config import GptOssConfig
 from resin.models.gpt_oss.plan import (
     PAGE_SIZE,
@@ -694,7 +694,7 @@ class GptOssCudaRunner(CudaRunner):
     def _graph_forward(
         self, plan: BatchPlan, host: PagedAttentionBatch
     ) -> list[int] | None:
-        if wants_logprobs(plan):
+        if plan.needs_logprobs:
             self._cuda_graph_fallback("decode", "logprobs")
             return None
         if not self._cuda_graph_mode_enabled("decode"):

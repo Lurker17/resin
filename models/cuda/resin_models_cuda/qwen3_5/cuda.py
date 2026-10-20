@@ -29,7 +29,7 @@ from resin.backend.cuda.sampling import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
-from resin.backend.sampling import format_output, wants_logprobs
+from resin.backend.sampling import format_output
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
 from resin.models.qwen3_5.media import Qwen35Media
@@ -586,7 +586,7 @@ class Qwen3_5CudaRunner(CudaRunner):
     def _graph_forward(
         self, plan: BatchPlan, cache_plan: PagedCachePlan
     ) -> list[int] | list[list[int]] | None:
-        if wants_logprobs(plan):
+        if plan.needs_logprobs:
             self._cuda_graph_fallback("decode", "logprobs")
             return None
         batch_size = plan.num_sequences
@@ -1000,7 +1000,7 @@ class Qwen3_5CudaRunner(CudaRunner):
                 committed_hidden[:, processed - 1],
             )
             rows.append([int(first[row]), *acceptance.token_rows[row]])
-        if wants_logprobs(plan):
+        if plan.needs_logprobs:
             logits = torch.cat((first_logits[:, None], verify_logits), dim=1)
             return format_output(logits, rows, plan)
         return rows
