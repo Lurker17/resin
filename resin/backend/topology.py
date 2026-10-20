@@ -91,7 +91,8 @@ class ParallelGroups:
             )
         cache, local, owned = {}, {}, []
         world = tuple(range(world_size))
-        cache[world, str(distributed.get_backend())] = distributed.group.WORLD
+        default_backend = str(distributed.get_backend())
+        cache[world, default_backend] = distributed.group.WORLD
         for name, partitions in topology.partitions().items():
             backend = (
                 "gloo" if name in ("replica", "domain", "drivers") else device_backend
@@ -99,8 +100,15 @@ class ParallelGroups:
             for ranks in partitions:
                 key = ranks, backend
                 if key not in cache:
+                    # Gloo nonmembers must bypass the bound NCCL world's
+                    # unmatched comm-split path. All ranks keep this loop order.
                     handle = distributed.new_group(
-                        list(ranks), backend=backend, timeout=timeout
+                        list(ranks),
+                        backend=backend,
+                        timeout=timeout,
+                        use_local_synchronization=(
+                            backend == "gloo" and default_backend == "nccl"
+                        ),
                     )
                     cache[key] = handle
                     if rank in ranks:

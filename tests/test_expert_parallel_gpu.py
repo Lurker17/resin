@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import json
 import os
 import time
@@ -27,6 +28,14 @@ pytestmark = pytest.mark.skipif(
 def _dispatch_rank(rank, rendezvous, directory, replicated):
     from resin.backend.expert_parallel import ExpertParallelDispatch
 
+    faulthandler.dump_traceback_later(45, repeat=True)
+
+    def progress(message):
+        print(
+            f"[NCCL reference rank={rank}, replicated={replicated}] {message}",
+            flush=True,
+        )
+
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     dist.init_process_group(
@@ -37,6 +46,7 @@ def _dispatch_rank(rank, rendezvous, directory, replicated):
         timeout=timedelta(minutes=2),
         device_id=device,
     )
+    progress("world ready")
     groups = ParallelGroups.create(
         Parallelism(
             world_size=WORLD_SIZE,
@@ -44,6 +54,7 @@ def _dispatch_rank(rank, rendezvous, directory, replicated):
             attn_dp=WORLD_SIZE // 2 if replicated else WORLD_SIZE,
         )
     )
+    progress("groups ready")
     try:
         local_experts = 8 // WORLD_SIZE
         start = local_experts * groups.ep.local_rank
@@ -75,7 +86,8 @@ def _dispatch_rank(rank, rendezvous, directory, replicated):
             else (0, 5, 1, 3)[:WORLD_SIZE]
         )
         errors = []
-        for count in (sizes[owner], 0, sizes[owner]):
+        for phase, count in enumerate((sizes[owner], 0, sizes[owner])):
+            progress(f"phase {phase}: {count} local rows")
             hidden = (
                 torch.arange(count * 16, device=device, dtype=torch.float32).reshape(
                     count, 16
@@ -95,16 +107,21 @@ def _dispatch_rank(rank, rendezvous, directory, replicated):
                 hidden[:, None, :] * (indices + 1)[:, :, None] * weights[:, :, None]
             ).sum(dim=1)
             actual = dispatch(hidden, indices, weights)
+            progress(f"phase {phase}: dispatch returned")
             torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
             errors.append(0.0 if not count else float((actual - expected).abs().max()))
         torch.cuda.synchronize()
+        progress("device synchronized")
         dist.barrier()
+        progress("barrier complete")
         Path(directory, f"{rank}.json").write_text(
             json.dumps({"rank": rank, "max_abs_errors": errors, "received_rows": calls})
         )
     finally:
         groups.close()
+        progress("groups closed")
         dist.destroy_process_group()
+        faulthandler.cancel_dump_traceback_later()
 
 
 @pytest.mark.parametrize("replicated", [False, True])
