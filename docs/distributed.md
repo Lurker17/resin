@@ -3,13 +3,13 @@
 `resin.backend.topology` describes rank placement and owns explicit process
 groups. `resin.backend.distributed` coordinates synchronous Engine steps. Each
 rank owns a model runtime; each attention-DP replica has one native request
-Engine, on its lowest global rank. The other TP/CP ranks follow that driver.
+Engine, on its lowest global rank. The other attention-TP/CP ranks follow that driver.
 
 The boundaries are:
 
 | Component | Responsibility |
 | --- | --- |
-| `ParallelTopology` | Attention and expert rank meshes; serving domains |
+| `ParallelTopology` | Total TP width and derived attention/expert meshes |
 | `ParallelGroups` | Explicit device groups and Gloo control groups |
 | `DistributedEngine` | Phase agreement, normal local Engine steps, empty participation, failure propagation |
 | Native `Engine` | Local admission, requests, pages, leases, output validation, commit |
@@ -18,26 +18,28 @@ The boundaries are:
 
 This preserves the existing checkpoint-to-runtime preparation boundary. Create
 groups before preparing model weights and inject the appropriate group into each
-prepared runtime. An attention layer uses `groups.tp`; a sharded expert uses
+prepared runtime. An attention layer uses `groups.attn_tp`; a sharded expert uses
 `groups.expert_tp`; expert dispatch uses `groups.ep`. The coordinator never
 infers model weight layouts or uses the default world group for those operations.
 
 ## Rank placement
 
-Attention uses a `[attention_dp, cp, tp]` mesh:
+`tp` is the total number of ranks. The four configuration fields are `tp`, `ep`,
+`cp`, and `attn_dp`; the two tensor-parallel widths are derived:
 
+```python
+world_size = tp
+expert_tp = tp // ep
+attn_tp = tp // (attn_dp * cp)
 ```
-world_size = attention_dp * cp * tp
-rank = (dp * cp_size + cp) * tp_size + tp
-```
 
-Experts independently use `[expert_replica, ep, expert_tp]` over those same
-ranks. `ep * expert_tp` must divide the world size. EP is not a fourth multiplier.
-Expert TP defaults to one, independently of attention TP: `tp=8, ep=8` is a valid
-layout on eight ranks. This allows attention TP and expert parallelism to overlap.
+All sizes must be positive integers, and `ep` and `attn_dp * cp` must divide `tp`.
+Attention uses an `[ATTN_DP, CP, ATTN_TP]` mesh; experts use `[EP, EXPERT_TP]`
+over the same ranks. There is no separate expert-replica axis. For example,
+`tp=8, ep=8` gives attention TP eight and expert TP one on eight ranks.
 
-For `tp=2, cp=2, attention_dp=2, ep=4, expert_tp=2`, eight ranks form these groups
-containing rank zero:
+For `ParallelTopology(tp=8, ep=4, cp=2, attn_dp=2)`, both derived TP widths are
+two. The groups containing rank zero are:
 
 | Group | Ranks |
 | --- | --- |
@@ -47,15 +49,14 @@ containing rank zero:
 | EP | 0, 2, 4, 6 |
 | Expert TP | 0, 1 |
 | Request replica | 0, 1, 2, 3 |
-| Connected serving domain | 0–7 |
+| TP-world serving domain | 0–7 |
 | Domain drivers | 0, 4 |
 
-Serving domains are connected components of attention replicas, EP groups, and
-expert-TP groups. Only drivers in the same domain synchronize their serving
-loops. Independent attention-DP replicas can run different numbers of steps.
-Attention-DP groups are available for initialization and replica metadata;
-per-step collectives spanning otherwise independent domains require a topology
-that connects those domains.
+The complete expert mesh connects every attention replica in this TP world, so
+all its drivers synchronize their serving loops. This also holds with `ep=1`,
+where expert TP spans the entire world. A replica with no requests participates
+in empty execution while its peers have work. The serving domain is therefore
+the TP world directly; no connected-component inference is needed.
 
 `ParallelGroups.create()` is collective over an initialized default world group,
 checks agreement on topology/backend, creates groups in deterministic order, and
@@ -65,11 +66,11 @@ only the groups it created, after workers stop; the caller owns the default worl
 
 ## One synchronous step
 
-Drivers in a domain call `has_work()`, `step()`, and `close()` in matching order.
-`submit()` and `cancel()` remain local operations; there is no request router.
+Drivers in the TP world call `has_work()`, `step()`, and `close()` in matching
+order. `submit()` and `cancel()` remain local operations; there is no request router.
 
-1. Drivers exchange read-only `Engine.next_phase()` proposals. Mixed domains
-   alternate prefill and decode. The proposal shares the native admission
+1. Drivers exchange read-only `Engine.next_phase()` proposals. When replicas
+   propose different phases, drivers alternate prefill and decode. The proposal shares the native admission
    fallback used by actual dispatch and reserves nothing.
 2. Each driver calls `Engine.step(phase=agreed_phase)`. A mismatched local cohort
    remains queued. Cache pressure and retraction still belong to the native Engine.
@@ -97,7 +98,7 @@ collectives spanning other drivers. Cross-replica collectives belong in forward.
 
 ## Model callback
 
-A CP, EP, or expert-TP runtime implements:
+A CP, EP, or attention-DP runtime implements:
 
 ```python
 def forward_distributed(self, plan: BatchPlan | None, context: StepContext):
@@ -122,10 +123,11 @@ commit. Failure marks all native Engines poisoned, preserving resources and
 preventing cleanup/reuse through normal Engine operations.
 
 Existing TP-only runtimes that use an injected TP group can continue implementing
-`forward(plan)` when CP, EP, and expert TP are one. GPT-OSS's `TensorParallelContext` can be constructed from
-`groups.tp.local_rank`, `groups.tp.size`, and `groups.tp.handle` (use `None` for a
-single-rank context). This prototype does not change current deployment entry
-points or rewrite default-world assumptions inside existing models. Each model
+`forward(plan)` when `cp=ep=attn_dp=1`; attention TP and expert TP then both equal
+the total `tp`. GPT-OSS's `TensorParallelContext` can be constructed from
+`groups.attn_tp.local_rank`, `groups.attn_tp.size`, and `groups.attn_tp.handle`
+(use `None` for a single-rank context). This prototype does not change current
+deployment entry points or rewrite default-world assumptions inside existing models. Each model
 must use its supplied groups before it can support a composed TP/CP/EP/DP layout.
 
 ## Process integration
@@ -169,7 +171,8 @@ DeepInfer's deferred previous-step postprocessing or global process-group regist
 [`test_distributed.py`](../tests/test_distributed.py) launches eight real processes
 and checks numerical TP/CP reductions and variable-sized EP dispatch/combine,
 including empty senders, mixed phases, unequal request queues, cancellation,
-array score output, shutdown, independent DP loops, TP-only compatibility, and
-failures in initialization, preparation, serialization, preflight, execution,
-output validation, release, and control failure after model execution. These are CPU Gloo conformance tests; GPU kernel
-and multi-node behavior are not established by them.
+array score output, shutdown, idle DP replicas sharing expert TP, TP-only
+compatibility, and failures in initialization, preparation, serialization,
+preflight, execution, output validation, release, and control failure after model
+execution. These are CPU Gloo conformance tests; GPU kernel and multi-node
+behavior are not established by them.

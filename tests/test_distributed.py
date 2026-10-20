@@ -28,30 +28,59 @@ from resin.backend.topology import ParallelGroups, ParallelTopology
 
 
 def test_topology_composes_all_parallel_axes_without_multiplying_ep():
-    topology = ParallelTopology(tp=2, cp=2, attention_dp=2, ep=4, expert_tp=2)
-    assert topology.world_size == 8
+    topology = ParallelTopology(tp=8, cp=2, attn_dp=2, ep=4)
+    assert topology.world_size == topology.tp == 8
+    assert topology.attn_tp == topology.expert_tp == 2
     groups = topology.partitions()
-    assert groups["tp"] == ((0, 1), (2, 3), (4, 5), (6, 7))
+    assert groups["attn_tp"] == ((0, 1), (2, 3), (4, 5), (6, 7))
     assert groups["cp"] == ((0, 2), (1, 3), (4, 6), (5, 7))
-    assert groups["attention_dp"] == ((0, 4), (1, 5), (2, 6), (3, 7))
+    assert groups["attn_dp"] == ((0, 4), (1, 5), (2, 6), (3, 7))
     assert groups["ep"] == ((0, 2, 4, 6), (1, 3, 5, 7))
-    assert groups["expert_tp"] == groups["tp"]
+    assert groups["expert_tp"] == groups["attn_tp"]
     overlap = ParallelTopology(tp=8, ep=8).partitions()
-    assert overlap["tp"] == overlap["ep"] == (tuple(range(8)),)
+    assert overlap["attn_tp"] == overlap["ep"] == (tuple(range(8)),)
     assert overlap["expert_tp"] == tuple((rank,) for rank in range(8))
     assert groups["drivers"] == ((0, 4),)
     assert groups["domain"] == (tuple(range(8)),)
     for rank in range(8):
         assert topology.rank(*topology.coordinates(rank)) == rank
-    independent = ParallelTopology(tp=2, cp=2, attention_dp=2).partitions()
-    assert independent["domain"] == ((0, 1, 2, 3), (4, 5, 6, 7))
-    # CP joins expert groups transitively even when their boundaries cross replicas.
-    assert len(ParallelTopology(cp=3, attention_dp=2, ep=2).partitions()["domain"]) == 1
+    shared = ParallelTopology(tp=8, cp=2, attn_dp=2).partitions()
+    assert shared["expert_tp"] == shared["domain"] == (tuple(range(8)),)
+    assert shared["drivers"] == ((0, 4),)
+
+
+@pytest.mark.parametrize(
+    "options,attention,expert",
+    [
+        ({}, 1, 1),
+        ({"tp": 8}, 8, 8),
+        ({"tp": 8, "ep": 8}, 8, 1),
+        ({"tp": 8, "attn_dp": 8, "ep": 8}, 1, 1),
+        ({"tp": 12, "attn_dp": 3, "cp": 2, "ep": 4}, 2, 3),
+    ],
+)
+def test_tensor_parallel_widths_are_derived_from_the_same_total(
+    options, attention, expert
+):
+    topology = ParallelTopology(**options)
+    assert topology.attn_tp == attention and topology.expert_tp == expert
+    assert topology.attn_dp * topology.cp * topology.attn_tp == topology.tp
+    assert topology.ep * topology.expert_tp == topology.tp
+    for rank in range(topology.tp):
+        assert topology.rank(*topology.coordinates(rank)) == rank
 
 
 @pytest.mark.parametrize(
     "options",
-    [{"ep": 3, "attention_dp": 2}, {"cp": 0}, {"tp": True}, {"attention_dp": 1.5}],
+    [
+        {"tp": 8, "ep": 3},
+        {"tp": 8, "cp": 3},
+        {"tp": 8, "attn_dp": 3},
+        {"tp": 12, "attn_dp": 4, "cp": 2},
+        {"cp": 0},
+        {"tp": True},
+        {"attn_dp": 1.5},
+    ],
 )
 def test_invalid_topologies_are_rejected(options):
     with pytest.raises(ValueError):
@@ -133,8 +162,9 @@ class CollectiveRunner:
         contributions = torch.zeros(max(context.num_sequences, 1), dtype=torch.int64)
         for index, value in zip(order, returned.tolist(), strict=True):
             contributions[rows[index]] += value * (tp + 1)
-        dist.all_reduce(contributions, group=groups.tp.handle)
+        dist.all_reduce(contributions, group=groups.attn_tp.handle)
         dist.all_reduce(contributions, group=groups.cp.handle)
+        dist.barrier(group=groups.expert_tp.handle)
         self.calls.append(
             {
                 "step": context.step_id,
@@ -153,7 +183,7 @@ class CollectiveRunner:
                 2 * int(token) + int(token) % groups.ep.size + 1
                 for token in plan.token_ids[start:end]
             )
-            * (groups.tp.size * (groups.tp.size + 1) // 2)
+            * (groups.attn_tp.size * (groups.attn_tp.size + 1) // 2)
             % 127
             for start, end in zip(
                 plan.token_indptr[:-1], plan.token_indptr[1:], strict=True
@@ -275,7 +305,7 @@ def _run_case(groups, case):
     }
 
 
-def _independent_case(groups):
+def _shared_experts_case(groups):
     runner = CollectiveRunner(groups, "normal")
     worker = DistributedWorker(runner, groups)
     if groups.is_driver:
@@ -288,7 +318,7 @@ def _independent_case(groups):
         engine.close()
     else:
         worker.serve()
-    return len(runner.calls)
+    return runner.calls
 
 
 def _tensor_only_case(groups):
@@ -301,21 +331,20 @@ def _tensor_only_case(groups):
                 [int(plan.token_ids[end - 1]) for end in plan.token_indptr[1:]],
                 dtype=torch.int64,
             )
-            values *= groups.tp.local_rank + 1
-            dist.all_reduce(values, group=groups.tp.handle)
+            values *= groups.attn_tp.local_rank + 1
+            dist.all_reduce(values, group=groups.attn_tp.handle)
             return (values % 127).tolist()
 
     runner = ForwardOnly()
     worker = DistributedWorker(runner, groups)
     if groups.is_driver:
         engine = DistributedEngine(worker)
-        dp = groups.topology.coordinates(groups.rank)[0]
-        request = engine.submit([2], max_new_tokens=dp + 1)
+        request = engine.submit([2], max_new_tokens=3)
         while engine.has_work():
             engine.step()
         expected, value = [], 2
-        for _ in range(dp + 1):
-            value = value * 3 % 127
+        for _ in range(3):
+            value = value * (groups.attn_tp.size * (groups.attn_tp.size + 1) // 2) % 127
             expected.append(value)
         assert request.take_result() == expected
         engine.close()
@@ -337,11 +366,13 @@ def _distributed_process(rank, world_size, rendezvous, directory):
         ParallelGroups.create(
             ParallelTopology(tp=8)
             if rank == 0
-            else ParallelTopology(tp=2, cp=2, attention_dp=2, ep=4, expert_tp=2),
+            else ParallelTopology(tp=8, cp=2, attn_dp=2, ep=4),
             device_backend="gloo",
         )
+    with pytest.raises(ValueError, match="world size"):
+        ParallelGroups.create(ParallelTopology(tp=4), device_backend="gloo")
     groups = ParallelGroups.create(
-        ParallelTopology(tp=2, cp=2, attention_dp=2, ep=4, expert_tp=2),
+        ParallelTopology(tp=8, cp=2, attn_dp=2, ep=4),
         device_backend="gloo",
         timeout=timedelta(seconds=20),
     )
@@ -373,18 +404,18 @@ def _distributed_process(rank, world_size, rendezvous, directory):
             dist.barrier()
     finally:
         groups.close()
-    independent = ParallelGroups.create(
-        ParallelTopology(tp=2, cp=2, attention_dp=2),
+    shared = ParallelGroups.create(
+        ParallelTopology(tp=8, cp=2, attn_dp=2),
         device_backend="gloo",
         timeout=timedelta(seconds=20),
     )
     try:
-        records["independent_steps"] = _independent_case(independent)
+        records["shared_experts"] = _shared_experts_case(shared)
         dist.barrier()
     finally:
-        independent.close()
+        shared.close()
     tensor_only = ParallelGroups.create(
-        ParallelTopology(tp=2, attention_dp=4),
+        ParallelTopology(tp=8),
         device_backend="gloo",
         timeout=timedelta(seconds=20),
     )
@@ -394,7 +425,7 @@ def _distributed_process(rank, world_size, rendezvous, directory):
     finally:
         tensor_only.close()
     overlap = ParallelGroups.create(
-        ParallelTopology(tp=2, ep=8, attention_dp=4),
+        ParallelTopology(tp=8, ep=8, attn_dp=4),
         device_backend="gloo",
         timeout=timedelta(seconds=20),
     )
@@ -410,7 +441,7 @@ def _distributed_process(rank, world_size, rendezvous, directory):
 @pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(), reason="Gloo is required"
 )
-def test_real_tp_cp_ep_and_attention_dp_processes(tmp_path):
+def test_real_tp_cp_ep_and_attn_dp_processes(tmp_path):
     world_size = 8
     process = mp.start_processes(
         _distributed_process,
@@ -461,9 +492,17 @@ def test_real_tp_cp_ep_and_attention_dp_processes(tmp_path):
     assert all(not record["prepare_failure"]["calls"] for record in records)
     assert records[0]["forward_failure"]["local_poisoned"]
     assert records[4]["forward_failure"]["local_poisoned"]
-    assert records[0]["independent_steps"] == 1
-    assert records[4]["independent_steps"] == 4
-    assert [records[rank]["tensor_only_steps"] for rank in (0, 2, 4, 6)] == [1, 2, 3, 4]
+    assert all(len(record["shared_experts"]) == 4 for record in records)
+    assert [call["placeholder"] for call in records[0]["shared_experts"]] == [
+        False,
+        True,
+        True,
+        True,
+    ]
+    assert all(not call["placeholder"] for call in records[4]["shared_experts"])
+    assert all(record["tensor_only_steps"] == 3 for record in records)
+    assert list(map(len, records[0]["overlap"]["results"])) == [3, 2]
+    assert list(map(len, records[2]["overlap"]["results"])) == [3]
     assert all(not record["serialize_failure"]["calls"] for record in records)
 
 

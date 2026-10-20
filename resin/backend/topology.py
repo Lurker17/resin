@@ -9,100 +9,91 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ParallelTopology:
-    """Attention ranks are [DP, CP, TP]; experts use [replica, EP, expert TP].
+    """Attention ranks are [ATTN_DP, CP, ATTN_TP]; experts use [EP, EXPERT_TP].
 
-    EP is an alternative placement of the same ranks, not another multiplier.
-    Expert TP is independent of attention TP. The communication groups connect
-    precisely the attention-DP replicas that must step together.
+    Both meshes partition the same ``tp`` ranks. Attention TP and expert TP
+    are derived independently from the total width.
     """
 
-    tp: int = 1
-    ep: int = 1
-    cp: int = 1
-    attention_dp: int = 1
-    expert_tp: int = 1
+    tp: int = 1  # Total ranks shared by the attention and expert meshes.
+    ep: int = 1  # Expert parallelism
+    cp: int = 1  # Context parallelism - only for prefill, replicated on decode
+    attn_dp: int = 1  # Attention data parallel
 
     def __post_init__(self):
-        for value in (self.tp, self.ep, self.cp, self.attention_dp, self.expert_tp):
+        for value in (self.tp, self.ep, self.cp, self.attn_dp):
             if type(value) is not int or value < 1:
                 raise ValueError("parallel sizes must be positive integers")
-        if self.world_size % (self.ep * self.expert_tp):
-            raise ValueError("EP * expert_tp must divide the world size")
+        if self.tp % self.ep:
+            raise ValueError("tp must be divisible by ep")
+        if self.tp % (self.attn_dp * self.cp):
+            raise ValueError("tp must be divisible by attn_dp * cp")
 
     @property
     def world_size(self) -> int:
-        return self.attention_dp * self.cp * self.tp
+        return self.tp
+
+    @property
+    def expert_tp(self) -> int:
+        return self.tp // self.ep
+
+    @property
+    def attn_tp(self) -> int:
+        return self.tp // (self.attn_dp * self.cp)
 
     def coordinates(self, rank: int) -> tuple[int, int, int]:
-        if type(rank) is not int or not 0 <= rank < self.world_size:
+        if type(rank) is not int or not 0 <= rank < self.tp:
             raise ValueError("rank is outside the topology")
-        slot, tp = divmod(rank, self.tp)
-        dp, cp = divmod(slot, self.cp)
-        return dp, cp, tp
+        slot, attn_tp = divmod(rank, self.attn_tp)
+        attn_dp, cp = divmod(slot, self.cp)
+        return attn_dp, cp, attn_tp
 
-    def rank(self, dp: int, cp: int, tp: int) -> int:
-        if any(type(value) is not int for value in (dp, cp, tp)) or not (
-            0 <= dp < self.attention_dp and 0 <= cp < self.cp and 0 <= tp < self.tp
+    def rank(self, attn_dp: int, cp: int, attn_tp: int) -> int:
+        if any(type(value) is not int for value in (attn_dp, cp, attn_tp)) or not (
+            0 <= attn_dp < self.attn_dp
+            and 0 <= cp < self.cp
+            and 0 <= attn_tp < self.attn_tp
         ):
             raise ValueError("coordinates are outside the topology")
-        return (dp * self.cp + cp) * self.tp + tp
+        return (attn_dp * self.cp + cp) * self.attn_tp + attn_tp
 
     def partitions(self) -> dict[str, tuple[tuple[int, ...], ...]]:
         replicas = tuple(
             tuple(
-                self.rank(dp, cp, tp) for cp in range(self.cp) for tp in range(self.tp)
+                self.rank(dp, cp, tp)
+                for cp in range(self.cp)
+                for tp in range(self.attn_tp)
             )
-            for dp in range(self.attention_dp)
-        )
-        experts = tuple(
-            tuple(start + expert * self.expert_tp + tp for expert in range(self.ep))
-            for start in range(0, self.world_size, self.ep * self.expert_tp)
-            for tp in range(self.expert_tp)
-        )
-        expert_tensor = tuple(
-            tuple(range(start, start + self.expert_tp))
-            for start in range(0, self.world_size, self.expert_tp)
-        )
-        # Connected components of replica ownership and expert communication.
-        # DP replicas outside the same component have independent serving loops.
-        owners = list(range(self.attention_dp))
-        for group in (*experts, *expert_tensor):
-            labels = {owners[self.coordinates(rank)[0]] for rank in group}
-            target = min(labels)
-            owners = [target if owner in labels else owner for owner in owners]
-        domains = tuple(
-            tuple(
-                rank
-                for dp, replica in enumerate(replicas)
-                if owners[dp] == owner
-                for rank in replica
-            )
-            for owner in sorted(set(owners))
+            for dp in range(self.attn_dp)
         )
         return {
-            "tp": tuple(
-                tuple(self.rank(dp, cp, tp) for tp in range(self.tp))
-                for dp in range(self.attention_dp)
+            "attn_tp": tuple(
+                tuple(self.rank(dp, cp, tp) for tp in range(self.attn_tp))
+                for dp in range(self.attn_dp)
                 for cp in range(self.cp)
             ),
             "cp": tuple(
                 tuple(self.rank(dp, cp, tp) for cp in range(self.cp))
-                for dp in range(self.attention_dp)
-                for tp in range(self.tp)
+                for dp in range(self.attn_dp)
+                for tp in range(self.attn_tp)
             ),
-            "ep": experts,
-            "expert_tp": expert_tensor,
-            "attention_dp": tuple(
-                tuple(self.rank(dp, cp, tp) for dp in range(self.attention_dp))
+            "ep": tuple(
+                tuple(expert * self.expert_tp + tp for expert in range(self.ep))
+                for tp in range(self.expert_tp)
+            ),
+            "expert_tp": tuple(
+                tuple(range(start, start + self.expert_tp))
+                for start in range(0, self.tp, self.expert_tp)
+            ),
+            "attn_dp": tuple(
+                tuple(self.rank(dp, cp, tp) for dp in range(self.attn_dp))
                 for cp in range(self.cp)
-                for tp in range(self.tp)
+                for tp in range(self.attn_tp)
             ),
             "replica": replicas,
-            "domain": domains,
-            "drivers": tuple(
-                tuple(rank for rank in domain if rank % (self.cp * self.tp) == 0)
-                for domain in domains
-            ),
+            # The complete [EP, EXPERT_TP] mesh connects every attention replica.
+            "domain": (tuple(range(self.tp)),),
+            "drivers": (tuple(replica[0] for replica in replicas),),
         }
 
 
@@ -125,11 +116,11 @@ class RankGroup:
 class ParallelGroups:
     topology: ParallelTopology
     rank: int
-    tp: RankGroup
+    attn_tp: RankGroup
     ep: RankGroup
     expert_tp: RankGroup
     cp: RankGroup
-    attention_dp: RankGroup
+    attn_dp: RankGroup
     replica: RankGroup
     domain: RankGroup
     drivers: RankGroup | None

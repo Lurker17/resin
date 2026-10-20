@@ -1,4 +1,4 @@
-"""Synchronous serving across explicit TP/CP replicas and EP-connected drivers.
+"""Synchronous serving over a shared TP world with attention and expert meshes.
 
 The Rust Engine retains scheduling and page ownership. This module coordinates
 its existing step boundary; model runtimes own partitioning and device collectives.
@@ -104,7 +104,7 @@ class DistributedRunner(Protocol):
 class DistributedWorker:
     """One model runtime per rank; only the replica source is called by an Engine.
 
-    CP/EP/expert-TP runtimes implement forward_distributed(plan_or_none, context),
+    CP/EP/attention-DP runtimes implement forward_distributed(plan_or_none, context),
     including empty participation. Optional validate_distributed performs host
     checks before a domain-wide readiness vote. The forward callback must finish
     device work before returning. Bind/release may communicate within a replica;
@@ -126,10 +126,10 @@ class DistributedWorker:
             if (
                 groups.topology.cp > 1
                 or groups.topology.ep > 1
-                or groups.topology.expert_tp > 1
+                or groups.topology.attn_dp > 1
             ) and not callable(self._forward):
                 raise ValueError(
-                    "CP, EP, and expert TP require forward_distributed(plan_or_none, context)"
+                    "CP, EP, and attention DP require forward_distributed(plan_or_none, context)"
                 )
             signature = _runner_signature(self.runner_config)
         except BaseException as exc:
@@ -137,7 +137,7 @@ class DistributedWorker:
         configs = self._gather(groups.replica, (signature, error))
         error = next((item[1] for item in configs if item[1]), error)
         if any(item[0] != configs[0][0] for item in configs):
-            error = "runner configurations must agree within each TP/CP replica"
+            error = "runner configurations must agree within each attention replica"
         self._consensus(groups.domain, error)
 
     def _gather(self, group: RankGroup, value):
@@ -326,9 +326,9 @@ class DistributedWorker:
 class DistributedEngine:
     """One native request engine per attention-DP replica, plus coordinated steps.
 
-    Drivers in an EP-connected domain call has_work(), step(), and close() in the
-    same order. submit/cancel are local to a replica. Unconnected DP replicas have
-    independent loops. There is no distributed request router or pending step API.
+    Drivers in the same TP world call has_work(), step(), and close() in the
+    same order. submit/cancel are local to an attention replica. There is no
+    distributed request router or pending step API.
     """
 
     def __init__(self, worker: DistributedWorker, **engine_options):
