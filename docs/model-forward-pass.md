@@ -5,6 +5,29 @@ arrays, executes the model, and returns sampled token IDs. The Engine already
 owns admission, batching, cache allocation, prefix reuse, and request lifetime;
 do not recreate those policies in the forward pass.
 
+## Weight preparation
+
+Checkpoint storage and executable layers may have different structures. Build
+checkpoint containers on meta, validate and load their named tensors, then lower
+them with `resin.backend.loading.prepare_model`. Its child-first traversal
+preserves shared module identity. A lowering rule can pack a projection or fuse
+loaded children; ordinary modules pass through unchanged. Return the prepared
+model from the checkpoint loader before allocating execution workspaces or
+capturing graphs.
+
+Qwen and Gemma use `Nvfp4LinearWeights` for ModelOpt names and linear scales,
+then replace them with `Nvfp4Linear` containing the selected kernel and its final
+layout. Runtime linears retain only execution weights. GPT-OSS already prepares
+expert weights incrementally while streaming its checkpoint; large weights need
+not be duplicated to establish this boundary.
+
+This follows DeepInfer's parameter-container to runtime adaptation in
+[`DeepseekForCausalLM.load_model`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/models/deepseek.py#L445)
+and its separate
+[`containers.py`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/models/v4_modules/containers.py).
+Keep the model's lowering rule explicit: checkpoint encoding, kernel support,
+and transformations such as projection fusion are different decisions.
+
 ## Shape rules
 
 - Write persistent kernels whose work is bounded by runtime metadata. Attention

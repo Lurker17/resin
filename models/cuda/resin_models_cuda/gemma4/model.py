@@ -11,7 +11,7 @@ from torch.nn import functional as F
 
 from resin.models.gemma4.config import SLIDING_ATTENTION, Gemma4Nvfp4Config
 from resin.models.gemma4.model import RMSNorm, RotaryEmbedding, apply_rotary
-from resin_models_cuda.nvfp4 import Nvfp4Linear
+from resin_models_cuda.nvfp4 import Nvfp4LinearWeights
 
 if TYPE_CHECKING:
     from transformers.models.gemma4.configuration_gemma4 import Gemma4Config
@@ -111,13 +111,13 @@ class Gemma4Attention(nn.Module):
 class Gemma4MLP(nn.Module):
     def __init__(self, config: Gemma4Nvfp4Config) -> None:
         super().__init__()
-        self.gate_proj = Nvfp4Linear(
+        self.gate_proj = Nvfp4LinearWeights(
             config.hidden_size, config.intermediate_size, config.group_size
         )
-        self.up_proj = Nvfp4Linear(
+        self.up_proj = Nvfp4LinearWeights(
             config.hidden_size, config.intermediate_size, config.group_size
         )
-        self.down_proj = Nvfp4Linear(
+        self.down_proj = Nvfp4LinearWeights(
             config.intermediate_size, config.hidden_size, config.group_size
         )
 

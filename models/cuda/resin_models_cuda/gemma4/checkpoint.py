@@ -17,6 +17,7 @@ from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 from resin.backend.torch import use_default_dtype
 from resin.models.gemma4.config import Gemma4Nvfp4Config
 from resin_models_cuda.gemma4.model import Gemma4ForConditionalGeneration
+from resin_models_cuda.nvfp4 import prepare_nvfp4_modules, select_nvfp4_backend
 
 DEFAULT_MODEL = "nvidia/Gemma-4-31B-IT-NVFP4"
 DEFAULT_REVISION = "4135a98a9b728a548947683219633b25682223ac"
@@ -71,6 +72,7 @@ def load_model(
     model_path: str | Path,
     *,
     device: str | torch.device,
+    nvfp4_backend: str = "auto",
 ) -> tuple[Gemma4ForConditionalGeneration, Gemma4Nvfp4Config, dict[str, Any]]:
     root = Path(model_path).expanduser().resolve()
     raw_config = read_config(root)
@@ -96,6 +98,10 @@ def load_model(
         for key, path in tensor_files.items():
             assign_model_tensor(model, key, reader.read(path, key), device=target)
     model.materialize_buffers(target)
+    model.prepare_attention()
+    model = prepare_nvfp4_modules(
+        model, select_nvfp4_backend(nvfp4_backend, torch.backends.cudnn.version())
+    )
     model.eval()
     return model, config, raw_config
 

@@ -32,7 +32,7 @@ from resin.backend.plans import PagedCachePlan
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
 from resin.models.qwen3_5.media import Qwen35Media
-from resin_models_cuda.nvfp4 import prepare_nvfp4_modules
+from resin_models_cuda.nvfp4 import select_nvfp4_backend
 from resin_models_cuda.qwen3_5.attention import (
     GraphAttentionSpec,
     GraphPagedAttentionRuntime,
@@ -125,11 +125,15 @@ class Qwen3_5CudaRunner(CudaRunner):
 
         self.model_path = resolve_model_path(model, revision)
         self.speculative_tokens = speculative_tokens
+        nvfp4_backend = select_nvfp4_backend(
+            nvfp4_backend, torch.backends.cudnn.version()
+        )
         self._model, self.config, self.raw_config = load_model(
             self.model_path,
             device=self.device,
             include_mtp=speculative_tokens > 0,
             include_vision=True,
+            nvfp4_backend=nvfp4_backend,
         )
         self.image_token_id = self.raw_config.get("image_token_id")
         vision_config = self.raw_config.get("vision_config") or {}
@@ -138,22 +142,9 @@ class Qwen3_5CudaRunner(CudaRunner):
         self.weight_quantization = (
             "modelopt-fp8-nvfp4" if is_modelopt_nvfp4(self.raw_config) else "bfloat16"
         )
-        self.nvfp4_backend: str | None = None
-        if self.weight_quantization != "bfloat16":
-            capability = torch.cuda.get_device_capability(self.device)
-            if capability not in {(10, 0), (10, 3), (11, 0), (12, 0), (12, 1)}:
-                raise RuntimeError(
-                    "Qwen3.5 NVFP4 weights require Blackwell-class FP4 hardware, "
-                    f"got sm{capability[0]}{capability[1]}"
-                )
-            if nvfp4_backend == "auto":
-                nvfp4_backend = (
-                    "cudnn"
-                    if (torch.backends.cudnn.version() or 0) >= 92301
-                    else "cute-dsl"
-                )
-            prepare_nvfp4_modules(self._model, nvfp4_backend)
-            self.nvfp4_backend = nvfp4_backend
+        self.nvfp4_backend = (
+            nvfp4_backend if self.weight_quantization != "bfloat16" else None
+        )
         selected_max_seq_len = (
             self.config.max_position_embeddings if max_seq_len is None else max_seq_len
         )

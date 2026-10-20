@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from resin_models_cuda.nvfp4 import (
     Nvfp4Linear,
+    Nvfp4LinearWeights,
     prepare_nvfp4_moe_weights,
     quantize_nvfp4,
     swizzle_block_scales,
@@ -26,12 +28,15 @@ def test_block_scale_swizzle_matches_128x4_byte_layout() -> None:
         assert swizzled[offset(row, column)] == linear[row, column]
 
 
-def test_nvfp4_linear_prepares_once_and_uses_w4a16_contract() -> None:
-    linear = Nvfp4Linear(16, 8)
-    linear.weight.zero_()
-    linear.weight_scale.fill_(1.0)
-    linear.input_scale.fill_(123.0)
-    linear.weight_scale_2.fill_(0.25)
+def test_nvfp4_lowering_preserves_checkpoint_and_uses_w4a16_contract() -> None:
+    source = Nvfp4LinearWeights(16, 8)
+    source.weight.zero_()
+    source.weight_scale.fill_(1.0)
+    source.input_scale.fill_(123.0)
+    source.weight_scale_2.fill_(0.25)
+    checkpoint_shapes = {
+        name: value.shape for name, value in source.state_dict().items()
+    }
     calls = []
 
     def prepare(weight, scales, alpha, **kwargs):
@@ -47,7 +52,9 @@ def test_nvfp4_linear_prepares_once_and_uses_w4a16_contract() -> None:
             (hidden.shape[0], 8), 7.0, dtype=torch.bfloat16, device=hidden.device
         )
 
-    linear.prepare("cudnn", prepare=prepare, mm=mm)
+    with pytest.raises(RuntimeError, match="lowered"):
+        source(torch.ones(3, 16, dtype=torch.bfloat16))
+    linear = Nvfp4Linear(source, "cudnn", prepare=prepare, mm=mm)
     result = linear(torch.ones(3, 16, dtype=torch.bfloat16))
 
     assert calls == [
@@ -60,7 +67,11 @@ def test_nvfp4_linear_prepares_once_and_uses_w4a16_contract() -> None:
     ]
     assert result.shape == (3, 8)
     assert result.tolist() == [[7.0] * 8] * 3
-    assert linear.input_scale is None
+    assert not hasattr(linear, "input_scale")
+    assert {
+        name: value.shape for name, value in source.state_dict().items()
+    } == checkpoint_shapes
+    assert linear.weight is source.weight
 
 
 def test_nvfp4_moe_activation_quantization_uses_group16_linear_scales() -> None:

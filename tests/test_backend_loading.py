@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from resin.backend.loading import load_safetensor_weights, resolve_dtype
+from resin.backend.loading import load_safetensor_weights, prepare_model, resolve_dtype
 
 
 def test_resolve_dtype_accepts_torch_dtypes_names_and_none() -> None:
@@ -54,3 +54,28 @@ def test_load_safetensor_weights_rejects_missing_model_state(tmp_path) -> None:
             torch.nn.Linear(3, 2, device="meta"),
             device="cpu",
         )
+
+
+def test_preparation_preserves_aliases_and_can_fuse_loaded_children() -> None:
+    shared = torch.nn.Linear(3, 3, bias=False)
+    model = torch.nn.ModuleList([shared, shared, torch.nn.Sequential(shared)])
+    hidden = torch.randn(2, 3)
+    expected = shared(hidden)
+    lowered = []
+
+    def lower(module):
+        if isinstance(module, torch.nn.Linear):
+            lowered.append(module)
+            replacement = torch.nn.Linear(3, 3, bias=False)
+            replacement.weight = module.weight
+            return replacement
+        if isinstance(module, torch.nn.Sequential):
+            return module[0]
+        return module
+
+    runtime = prepare_model(model, lower)
+
+    assert lowered == [shared]
+    assert runtime[0] is runtime[1] is runtime[2]
+    assert runtime[0].weight is shared.weight
+    torch.testing.assert_close(runtime[2](hidden), expected)

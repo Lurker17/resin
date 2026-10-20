@@ -16,6 +16,7 @@ from resin.backend.loading import (
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 from resin.backend.torch import use_default_dtype
 from resin.models.qwen3_5.config import Qwen35Config
+from resin_models_cuda.nvfp4 import prepare_nvfp4_modules, select_nvfp4_backend
 from resin_models_cuda.qwen3_5.model import Qwen3_5ForConditionalGeneration
 
 DEFAULT_MODEL = "RadixArk/Qwen3.8-27B-NVFP4"
@@ -129,6 +130,7 @@ def load_model(
     device: str | torch.device,
     include_mtp: bool,
     include_vision: bool = True,
+    nvfp4_backend: str = "auto",
 ) -> tuple[Qwen3_5ForConditionalGeneration, Qwen35Config, dict[str, Any]]:
     """Stream the target, visual tower, and optional bundled MTP weights."""
 
@@ -140,6 +142,13 @@ def load_model(
     target = torch.device(device)
     if target.type != "cuda":
         raise ValueError("the Qwen3.5 CUDA runner can only load weights on CUDA")
+    if is_modelopt_nvfp4(raw_config):
+        capability = torch.cuda.get_device_capability(target)
+        if capability not in {(10, 0), (10, 3), (11, 0), (12, 0), (12, 1)}:
+            raise RuntimeError(
+                "Qwen3.5 NVFP4 weights require Blackwell-class FP4 hardware, "
+                f"got sm{capability[0]}{capability[1]}"
+            )
     model.to_empty(device=target)
 
     expected = set(model.state_dict())
@@ -162,6 +171,9 @@ def load_model(
                 / rotary.dim
             )
         )
+    model = prepare_nvfp4_modules(
+        model, select_nvfp4_backend(nvfp4_backend, torch.backends.cudnn.version())
+    )
     model.eval()
     return model, config, raw_config
 

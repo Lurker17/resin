@@ -148,7 +148,6 @@ def test_default_graph_history_uses_packed_cache_and_context_bounds(
     monkeypatch.setattr(
         gemma4_runtime, "load_assistant", lambda *a, **k: (object(), assistant_config)
     )
-    monkeypatch.setattr(gemma4_runtime, "prepare_nvfp4_modules", lambda *a: None)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (10, 0))
     monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _: (100 * 1024**3,) * 2)

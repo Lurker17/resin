@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from resin.models.qwen3_5.config import Qwen35Config
-from resin_models_cuda.nvfp4 import Nvfp4Linear
+from resin_models_cuda.nvfp4 import Nvfp4LinearWeights
 from resin_models_cuda.qwen3_5.attention import (
     PagedAttentionRuntime,
     PreparedPagedAttention,
@@ -28,7 +28,7 @@ def _projection(in_features: int, out_features: int, *, quantized: bool) -> nn.M
 
 def _feed_forward(in_features: int, out_features: int, *, quantized: bool) -> nn.Module:
     if quantized:
-        return Nvfp4Linear(in_features, out_features)
+        return Nvfp4LinearWeights(in_features, out_features)
     return nn.Linear(in_features, out_features, bias=False)
 
 

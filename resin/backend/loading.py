@@ -12,6 +12,31 @@ import torch
 MODEL_FILES = ("config.json", "model*.safetensors", "model.safetensors.index.json")
 
 
+def prepare_model(
+    model: torch.nn.Module,
+    lower: Callable[[torch.nn.Module], torch.nn.Module],
+) -> torch.nn.Module:
+    """Lower loaded checkpoint containers into execution-ready modules.
+
+    Visit children first and preserve shared module identity. A rule returns
+    ordinary modules unchanged, or replaces a checkpoint container with its
+    prepared implementation. Weight layout and fusion belong in that rule;
+    the executable model need not retain the checkpoint's module structure.
+    """
+
+    prepared: dict[int, torch.nn.Module] = {}
+
+    def visit(module: torch.nn.Module) -> torch.nn.Module:
+        if id(module) not in prepared:
+            for name, child in tuple(module._modules.items()):
+                if child is not None:
+                    module._modules[name] = visit(child)
+            prepared[id(module)] = lower(module)
+        return prepared[id(module)]
+
+    return visit(model)
+
+
 def resolve_dtype(dtype: str | torch.dtype | None) -> torch.dtype | None:
     if dtype is None or isinstance(dtype, torch.dtype):
         return dtype

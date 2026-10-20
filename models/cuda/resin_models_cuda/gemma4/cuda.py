@@ -62,7 +62,7 @@ from resin_models_cuda.gemma4.checkpoint import (
     resolve_model_path,
 )
 from resin_models_cuda.gemma4.model import Gemma4ForConditionalGeneration
-from resin_models_cuda.nvfp4 import prepare_nvfp4_modules
+from resin_models_cuda.nvfp4 import select_nvfp4_backend as _select_nvfp4_backend
 
 if TYPE_CHECKING:
     from resin import BatchPlan
@@ -76,14 +76,6 @@ _DEFAULT_WORKSPACE_BYTES = 2 * _GRAPH_WORKSPACE_BYTES + _DEFAULT_PREFILL_WORKSPA
 _LOCAL_GRAPH_PAGE_CAPACITY = (
     1 + (WINDOW_RETENTION_TOKENS - 1 + PAGE_SIZE - 1) // PAGE_SIZE
 )
-
-
-def _select_nvfp4_backend(requested: str, cudnn_version: int | None) -> str:
-    if requested not in {"auto", "cudnn", "cute-dsl"}:
-        raise ValueError("nvfp4_backend must be 'auto', 'cudnn', or 'cute-dsl'")
-    if requested == "auto":
-        return "cudnn" if (cudnn_version or 0) >= 92301 else "cute-dsl"
-    return requested
 
 
 def plan_gemma4_kv_capacity(
@@ -212,10 +204,8 @@ class Gemma4CudaRunner(CudaRunner):
 
         self.model_path = resolve_model_path(model, revision)
         self._model, self.config, self.raw_config = load_model(
-            self.model_path, device=self.device
+            self.model_path, device=self.device, nvfp4_backend=nvfp4_backend
         )
-        self._model.prepare_attention()
-        prepare_nvfp4_modules(self._model, nvfp4_backend)
         self.nvfp4_backend = nvfp4_backend
         self.speculative_tokens = speculative_tokens
         self._assistant = None

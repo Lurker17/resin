@@ -7,6 +7,16 @@ from collections.abc import Callable
 import torch
 from torch import Tensor, nn
 
+from resin.backend.loading import prepare_model
+
+
+def select_nvfp4_backend(requested: str, cudnn_version: int | None) -> str:
+    if requested not in {"auto", "cudnn", "cute-dsl"}:
+        raise ValueError("nvfp4_backend must be 'auto', 'cudnn', or 'cute-dsl'")
+    if requested == "auto":
+        return "cudnn" if (cudnn_version or 0) >= 92301 else "cute-dsl"
+    return requested
+
 
 def swizzle_block_scales(scales: Tensor) -> Tensor:
     """Convert linear ModelOpt scales to the canonical 128x4 layout."""
@@ -30,8 +40,8 @@ def swizzle_block_scales(scales: Tensor) -> Tensor:
     )
 
 
-class Nvfp4Linear(nn.Module):
-    """One checkpoint-shaped NVFP4 linear prepared once for BF16 activations."""
+class Nvfp4LinearWeights(nn.Module):
+    """ModelOpt checkpoint storage; replaced before serving or graph capture."""
 
     def __init__(self, in_features: int, out_features: int, group_size: int = 16):
         super().__init__()
@@ -40,8 +50,6 @@ class Nvfp4Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.group_size = group_size
-        self.backend: str | None = None
-        self._mm: Callable[..., Tensor] | None = None
         self.register_buffer(
             "weight", torch.empty(out_features, in_features // 2, dtype=torch.uint8)
         )
@@ -54,38 +62,45 @@ class Nvfp4Linear(nn.Module):
         self.register_buffer("input_scale", torch.empty((), dtype=torch.float32))
         self.register_buffer("weight_scale_2", torch.empty((), dtype=torch.float32))
 
-    def prepare(
+    def forward(self, *args, **kwargs):
+        raise RuntimeError("NVFP4 checkpoint weights must be lowered before inference")
+
+
+class Nvfp4Linear(nn.Module):
+    """Execution-only W4A16 linear with a fixed kernel and prepared layout."""
+
+    def __init__(
         self,
+        source: Nvfp4LinearWeights,
         backend: str,
         *,
         prepare: Callable[..., tuple[Tensor, Tensor, Tensor | None]] | None = None,
         mm: Callable[..., Tensor] | None = None,
     ) -> None:
-        if self.backend is not None:
-            raise RuntimeError("NVFP4 weights were already prepared")
+        super().__init__()
+        self.in_features = source.in_features
+        self.out_features = source.out_features
+        self.group_size = source.group_size
         if prepare is None or mm is None:
             from flashinfer.gemm import mm_bf16_fp4, prepare_bf16_fp4_weights
 
             prepare = prepare_bf16_fp4_weights
             mm = mm_bf16_fp4
-        scales = swizzle_block_scales(self.weight_scale)
+        scales = swizzle_block_scales(source.weight_scale)
         weight, scales, alpha = prepare(
-            self.weight,
+            source.weight,
             scales,
-            self.weight_scale_2.float().reshape(1),
+            source.weight_scale_2.float().reshape(1),
             backend=backend,
             block_size=self.group_size,
         )
-        self.weight = weight
-        self.weight_scale = scales
-        self.weight_scale_2 = alpha
-        self.input_scale = None
+        self.register_buffer("weight", weight)
+        self.register_buffer("weight_scale", scales)
+        self.register_buffer("weight_scale_2", alpha)
         self.backend = backend
         self._mm = mm
 
     def forward(self, hidden: Tensor, *, out: Tensor | None = None) -> Tensor:
-        if self._mm is None or self.backend is None:
-            raise RuntimeError("NVFP4 weights must be prepared before inference")
         if hidden.dtype != torch.bfloat16:
             raise TypeError("NVFP4 W4A16 linears require bfloat16 activations")
         shape = (*hidden.shape[:-1], self.out_features)
@@ -104,12 +119,17 @@ class Nvfp4Linear(nn.Module):
         return result.reshape(shape)
 
 
-def prepare_nvfp4_modules(model: nn.Module, backend: str) -> None:
-    """Prepare every dense NVFP4 module in a model exactly once."""
+def prepare_nvfp4_modules(model: nn.Module, backend: str) -> nn.Module:
+    """Lower checkpoint containers; already prepared modules pass through."""
 
-    for module in model.modules():
-        if isinstance(module, Nvfp4Linear):
-            module.prepare(backend)
+    return prepare_model(
+        model,
+        lambda module: (
+            Nvfp4Linear(module, backend)
+            if isinstance(module, Nvfp4LinearWeights)
+            else module
+        ),
+    )
 
 
 def quantize_nvfp4(
@@ -243,8 +263,10 @@ def prepare_nvfp4_moe_weights(
 
 __all__ = [
     "Nvfp4Linear",
+    "Nvfp4LinearWeights",
     "prepare_nvfp4_modules",
     "prepare_nvfp4_moe_weights",
     "quantize_nvfp4",
     "swizzle_block_scales",
+    "select_nvfp4_backend",
 ]
