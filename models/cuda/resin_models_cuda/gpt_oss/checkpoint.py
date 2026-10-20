@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -28,6 +29,9 @@ from resin_models_cuda.gpt_oss.mxfp4 import (
     shard_model_config,
 )
 from resin_models_cuda.gpt_oss.weights import load_gpt_oss_weights
+
+if TYPE_CHECKING:
+    from resin.backend.topology import ParallelGroups
 
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 MODEL_20B = "openai/gpt-oss-20b"
@@ -114,6 +118,7 @@ def load_model(
     quantization: QuantizationConfig | None = None,
     kernel_moe=None,
     tensor_parallel: TensorParallelLayout | None = None,
+    parallel_groups: ParallelGroups | None = None,
 ) -> tuple[MoEForCausalLM, dict[str, Any]]:
     root = Path(model_path).expanduser().resolve()
     config = read_config(root)
@@ -123,18 +128,45 @@ def load_model(
         quantization=quantization,
         kernel_moe=kernel_moe,
     )
-    tensor_parallel = tensor_parallel or TensorParallelLayout()
+    if parallel_groups is not None:
+        group = parallel_groups.attn_tp
+        attention_layout = TensorParallelLayout(rank=group.local_rank, size=group.size)
+        if tensor_parallel is not None and tensor_parallel != attention_layout:
+            raise ValueError("tensor_parallel does not match the attention TP group")
+        tensor_parallel = attention_layout
+        expert_parallel = TensorParallelLayout(
+            rank=parallel_groups.ep.local_rank, size=parallel_groups.ep.size
+        )
+        if parallel_groups.topology.expert_tp != 1 or parallel_groups.topology.cp != 1:
+            raise ValueError("GPT-OSS expert dispatch requires expert_tp=1 and cp=1")
+        if tensor_parallel.enabled:
+            raise ValueError("GPT-OSS expert dispatch requires attn_tp=1")
+    else:
+        expert_parallel = None
+        tensor_parallel = tensor_parallel or TensorParallelLayout()
     target = torch.device(device)
     resolved_dtype = resolve_dtype(dtype)
     if resolved_dtype not in {None, torch.bfloat16}:
         raise ValueError("the packed SM90 GPT-OSS path requires bfloat16 activations")
     local_args = shard_model_config(args, tensor_parallel)
-    kernel_config = moe_kernel_config(local_args, cuda_architecture(target))
+    expert_args = (
+        replace(
+            local_args,
+            num_local_experts=expert_parallel.even_shard(
+                args.num_local_experts, name="num_experts"
+            ).size,
+        )
+        if expert_parallel is not None
+        else local_args
+    )
+    kernel_config = moe_kernel_config(expert_args, cuda_architecture(target))
     kernel_moe.validate(kernel_config)
     with torch.device("meta"):
         model = MoEForCausalLM(
             local_args,
-            kernel_expert_factory(kernel_moe, kernel_config),
+            kernel_expert_factory(
+                kernel_moe, kernel_config, parallel_groups=parallel_groups
+            ),
         )
 
     load_gpt_oss_weights(
@@ -149,6 +181,7 @@ def load_model(
             tensor,
             args=args,
             tensor_parallel=tensor_parallel,
+            expert_parallel=expert_parallel,
         ),
         install_expert_layer=lambda layer, tensors: install_expert_layer(
             model,

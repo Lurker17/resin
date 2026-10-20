@@ -56,7 +56,7 @@ from resin.backend.cuda.staging import TensorStager
 from resin.backend.paged_attention import PagedAttentionBatch
 from resin.backend.quantization import QuantizationConfig
 from resin.backend.sampling import format_output
-from resin.backend.topology import ParallelismCapabilities
+from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.models.gpt_oss.config import GptOssConfig
 from resin.models.gpt_oss.plan import (
     PAGE_SIZE,
@@ -76,6 +76,7 @@ from resin_models_cuda.gpt_oss.model import MLP, TopKRouter
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
+    from resin.backend.distributed import StepContext
 
 
 _BF16_BYTES = 2
@@ -162,7 +163,9 @@ class GptOssCudaRunner(CudaRunner):
     """GPT-OSS BF16 attention on FA4 over one native cache pool."""
 
     model_label = "GPT-OSS"
-    parallelism_capabilities = ParallelismCapabilities(attn_tp=True, expert_tp=True)
+    parallelism_capabilities = ParallelismCapabilities(
+        attn_tp=True, attn_dp=True, ep=True, expert_tp=True, attn_replication=True
+    )
     page_size = PAGE_SIZE
     sliding_window = SLIDING_WINDOW
     prefill_chunk_size = PREFILL_CHUNK_SIZE
@@ -185,9 +188,25 @@ class GptOssCudaRunner(CudaRunner):
         cuda_graph_decode: str = "full",
         cuda_graph_decode_shapes: object = None,
         tensor_parallel: TensorParallelContext | None = None,
+        parallel_groups: ParallelGroups | None = None,
         fast_allreduce: bool = True,
         gpu_memory_utilization: float = 0.95,
     ) -> None:
+        if parallel_groups is not None:
+            if tensor_parallel is not None:
+                raise ValueError("pass either tensor_parallel or parallel_groups")
+            self.parallelism_capabilities.validate(
+                parallel_groups.topology, model=self.model_label
+            )
+            if parallel_groups.topology.attn_tp != 1:
+                raise ValueError("GPT-OSS expert dispatch requires attn_tp=1")
+            if parallel_groups.topology.expert_tp != 1:
+                raise ValueError("GPT-OSS expert dispatch requires expert_tp=1")
+            if cuda_graph_prefill != "disabled" or cuda_graph_decode != "disabled":
+                raise ValueError(
+                    "GPT-OSS expert dispatch requires disabled CUDA graphs"
+                )
+        self.parallel_groups = parallel_groups
         if kernel_attention is None:
             from flash_attn.cute import flash_attn_varlen_func
 
@@ -243,6 +262,7 @@ class GptOssCudaRunner(CudaRunner):
             quantization=quantization,
             kernel_moe=kernel_moe,
             tensor_parallel=self.tensor_parallel.layout,
+            parallel_groups=parallel_groups,
         )
         args = self._model.args
         checkpoint_args = GptOssConfig.from_dict(self.config)
@@ -330,7 +350,15 @@ class GptOssCudaRunner(CudaRunner):
         local_capacity = capacity_plan.parent_capacity
         if cache_parent_capacity is not None:
             local_capacity = min(local_capacity, cache_parent_capacity)
-        if self.tensor_parallel.enabled:
+        if parallel_groups is not None and parallel_groups.replica.size > 1:
+            capacity_tensor = torch.tensor(local_capacity, dtype=torch.int64)
+            parallel_groups.distributed.all_reduce(
+                capacity_tensor,
+                op=dist.ReduceOp.MIN,
+                group=parallel_groups.replica.handle,
+            )
+            local_capacity = int(capacity_tensor.item())
+        elif self.tensor_parallel.enabled:
             capacity_tensor = torch.tensor(
                 local_capacity, dtype=torch.int64, device=self.device
             )
@@ -753,9 +781,11 @@ class GptOssCudaRunner(CudaRunner):
         return self._run_cuda_graph("decode", shape, inputs)[:rows]
 
     def forward(self, plan: BatchPlan) -> list[int] | ForwardOutput:
-        self._check_cuda_graphs(plan.phase)
-        host_positions = plan.positions
+        if getattr(self, "parallel_groups", None) is not None:
+            raise RuntimeError("explicit rank groups require forward_distributed")
+        return self._forward_plan(plan)
 
+    def _attention_batches(self, plan: BatchPlan):
         prefill_batches, decode_batch = build_attention_batches(plan, self.cache_layout)
         host_batches = prefill_batches + (
             () if decode_batch is None else (decode_batch,)
@@ -765,6 +795,13 @@ class GptOssCudaRunner(CudaRunner):
             raise ValueError(
                 "native attention batches do not cover every plan sequence"
             )
+        return prefill_batches, decode_batch
+
+    def _forward_plan(self, plan: BatchPlan) -> list[int] | ForwardOutput:
+        self._check_cuda_graphs(plan.phase)
+        host_positions = plan.positions
+
+        prefill_batches, decode_batch = self._attention_batches(plan)
 
         with self._cuda_failure:
             if not prefill_batches and decode_batch is not None:
@@ -793,7 +830,53 @@ class GptOssCudaRunner(CudaRunner):
                     final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
                 logits = self._model.lm_head(final_hidden)
 
-            return format_output(logits, self._sampler(logits, plan), plan)
+            tokens = self._sampler(logits, plan)
+            groups = getattr(self, "parallel_groups", None)
+            if groups is not None and groups.attn_replication.size > 1:
+                groups.distributed.broadcast(
+                    tokens,
+                    src=groups.attn_replication.source,
+                    group=groups.attn_replication.handle,
+                )
+            return format_output(logits, tokens, plan)
+
+    def validate_distributed(
+        self, plan: BatchPlan | None, context: StepContext
+    ) -> None:
+        if self.parallel_groups is None or context.groups is not self.parallel_groups:
+            raise ValueError("distributed step groups do not match this runner")
+        if context.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
+            raise ValueError("GPT-OSS plan phase must be prefill or decode")
+        if plan is None:
+            if context.num_sequences or context.num_tokens:
+                raise ValueError("a nonempty replica requires a batch plan")
+        else:
+            if (
+                plan.phase != context.phase
+                or plan.num_sequences != context.num_sequences
+                or len(plan.token_ids) != context.num_tokens
+            ):
+                raise ValueError("distributed step metadata does not match the plan")
+            prefills, decode = self._attention_batches(plan)
+            if len(prefills) + (decode is not None) != 1:
+                raise ValueError(
+                    "distributed GPT-OSS requires one packed attention batch"
+                )
+
+    def forward_distributed(
+        self, plan: BatchPlan | None, context: StepContext
+    ) -> list[int] | ForwardOutput | None:
+        """Run one packed batch, or join its expert layers without KV work."""
+
+        self.validate_distributed(plan, context)
+        if plan is not None:
+            return self._forward_plan(plan)
+        with self._cuda_failure, torch.inference_mode():
+            for layer in self._model.model.layers:
+                layer.mlp.experts.forward_empty()
+            # There is no sampled-token transfer to wait for empty CUDA work.
+            self._cuda_failure()
+        return None
 
 
 def _router_logits(router: TopKRouter, hidden: Tensor) -> Tensor:

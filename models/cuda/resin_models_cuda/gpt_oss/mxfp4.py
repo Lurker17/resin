@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from resin.backend.cuda.parallel import TensorParallelLayout, TensorShard
+from resin.backend.expert_parallel import ExpertParallelDispatch
 from resin.moe_kernels import (
     MoEExpertWeights,
     MoEKernelConfig,
     MoERouting,
 )
+
+if TYPE_CHECKING:
+    from resin.backend.topology import ParallelGroups
 
 _CHECKPOINT_TO_STANDARD = {
     "gate_up_proj_blocks": "gate_up",
@@ -57,9 +61,14 @@ def shard_checkpoint_tensor(
     *,
     args,
     tensor_parallel: TensorParallelLayout,
+    expert_parallel: TensorParallelLayout | None = None,
 ):
     """Return one rank's canonical contiguous checkpoint shard."""
 
+    expert_name = key.rsplit(".", 1)[-1]
+    if expert_name in EXPERT_CHECKPOINT_NAMES and expert_parallel is not None:
+        shard = expert_parallel.even_shard(args.num_local_experts, name="num_experts")
+        tensor = _slice_axis(tensor, 0, shard)
     if not tensor_parallel.enabled:
         return tensor
 
@@ -102,7 +111,6 @@ def shard_checkpoint_tensor(
     if key.endswith(".self_attn.o_proj.bias"):
         return tensor if tensor_parallel.rank == 0 else torch.zeros_like(tensor)
 
-    expert_name = key.rsplit(".", 1)[-1]
     if expert_name in {
         "gate_up_proj_blocks",
         "gate_up_proj_scales",
@@ -143,7 +151,12 @@ def moe_kernel_config(args, architecture: str) -> MoEKernelConfig:
     )
 
 
-def kernel_expert_factory(kernel, config: MoEKernelConfig):
+def kernel_expert_factory(
+    kernel,
+    config: MoEKernelConfig,
+    *,
+    parallel_groups: ParallelGroups | None = None,
+):
     class KernelExperts(torch.nn.Module):
         storage_format = config.quantization
 
@@ -156,7 +169,9 @@ def kernel_expert_factory(kernel, config: MoEKernelConfig):
                 args.num_experts_per_tok,
             )
             expected = (
-                config.num_experts,
+                config.num_experts * parallel_groups.ep.size
+                if parallel_groups is not None
+                else config.num_experts,
                 config.hidden_size,
                 config.intermediate_size,
                 config.top_k,
@@ -166,11 +181,28 @@ def kernel_expert_factory(kernel, config: MoEKernelConfig):
                     f"expert module dimensions {actual} do not match kernel {expected}"
                 )
             self._prepared_weights = None
+            self._device = None
+            self._expert_start = (
+                parallel_groups.ep.local_rank * config.num_experts
+                if parallel_groups is not None
+                else 0
+            )
+            self._dispatch = (
+                ExpertParallelDispatch(
+                    self.forward_local,
+                    num_experts=args.num_local_experts,
+                    group=parallel_groups.ep,
+                    replication=parallel_groups.attn_replication,
+                )
+                if parallel_groups is not None
+                else None
+            )
 
-        def install_prepared_weights(self, weights) -> None:
+        def install_prepared_weights(self, weights, *, device=None) -> None:
             if self._prepared_weights is not None:
                 raise RuntimeError("packed expert weights are already installed")
             self._prepared_weights = weights
+            self._device = device
 
         @property
         def is_prepared(self) -> bool:
@@ -179,12 +211,65 @@ def kernel_expert_factory(kernel, config: MoEKernelConfig):
         def forward(self, hidden, indices, weights, logits):
             if self._prepared_weights is None:
                 raise RuntimeError("packed expert weights have not been loaded")
+            if self._dispatch is not None:
+                # Keep the collective ABI identical for cuTile and torch
+                # routers, and for ranks entering an empty expert round.
+                return self._dispatch(
+                    hidden, indices.to(torch.int32), weights.to(torch.float32)
+                )
             routing = MoERouting(
                 router_logits=logits,
                 selected_experts=indices,
                 expert_weights=weights,
             )
             return kernel.forward(hidden, routing, self._prepared_weights, config)
+
+        def forward_local(self, hidden, indices, weights):
+            """Execute owned experts with their original global routing weights."""
+
+            if self._prepared_weights is None:
+                raise RuntimeError("packed expert weights have not been loaded")
+            if hidden.shape[0] == 0:
+                return torch.zeros_like(hidden)
+            limit = getattr(getattr(kernel, "capabilities", None), "max_tokens", None)
+            if limit is not None and hidden.shape[0] > limit:
+                # EP gathers independent replica batches. A destination can
+                # exceed the kernel's token limit even when each source fits.
+                return torch.cat(
+                    [
+                        self.forward_local(
+                            hidden[start : start + limit],
+                            indices[start : start + limit],
+                            weights[start : start + limit],
+                        )
+                        for start in range(0, hidden.shape[0], limit)
+                    ]
+                )
+            local = indices - self._expert_start
+            owned = (local >= 0) & (local < config.num_experts)
+            routing = MoERouting(
+                # The kernel consumes precomputed routes, not these logits.
+                router_logits=hidden.new_zeros((hidden.shape[0], config.num_experts)),
+                selected_experts=torch.where(owned, local, 0),
+                expert_weights=weights.masked_fill(~owned, 0),
+            )
+            return kernel.forward(hidden, routing, self._prepared_weights, config)
+
+        def forward_empty(self) -> None:
+            """Participate in EP while this attention replica has no token rows."""
+
+            if self._dispatch is None or self._device is None:
+                raise RuntimeError("empty expert rounds require prepared EP weights")
+            hidden = torch.empty(
+                (0, config.hidden_size), device=self._device, dtype=torch.bfloat16
+            )
+            indices = torch.empty(
+                (0, config.top_k), device=self._device, dtype=torch.int32
+            )
+            weights = torch.empty(
+                (0, config.top_k), device=self._device, dtype=torch.float32
+            )
+            self._dispatch(hidden, indices, weights)
 
     return lambda args: KernelExperts(args)
 
@@ -217,7 +302,9 @@ def install_expert_layer(
         down_bias=raw_tensors["down_bias"],
     )
     prepared = kernel.prepare_weights(raw, config)
-    model.model.layers[layer_index].mlp.experts.install_prepared_weights(prepared)
+    model.model.layers[layer_index].mlp.experts.install_prepared_weights(
+        prepared, device=raw.gate_up.device
+    )
     # Released raw tensors become unreachable after this call, allowing the
     # allocator to reuse their storage while the next layer is streamed.
 
