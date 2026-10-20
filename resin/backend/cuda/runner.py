@@ -425,6 +425,13 @@ class CudaRunner(Runner):
         )
         return self.cuda_graph_stats
 
+    def close_cuda_graphs(self) -> None:
+        """Release captured collectives before closing distributed process groups."""
+
+        if self._cuda_graph_executor is not None:
+            self._cuda_graph_executor.close()
+        self._prefill_buffers.clear()
+
     def capture_cuda_graph(self, mode: str, shape: GraphShape) -> CudaGraphStats:
         """Capture one mode shape while honoring model-state hooks."""
 

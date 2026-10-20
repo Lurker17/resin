@@ -296,17 +296,23 @@ class CudaGraphCache:
         self._poison: str | None = None
         self._share_pool = share_pool
         self._pool: Any | None = None
+        self._closed = False
+        self._closed_stats: CudaGraphStats | None = None
 
     def match(self, predicate: Callable[[GraphShape], bool]) -> GraphShape | None:
         """Return the first configured shape accepted by ``predicate``."""
 
+        self.check()
         return next((shape for shape in self.shapes if predicate(shape)), None)
 
     def fallback(self, reason: str) -> None:
+        self.check()
         if self.shapes:
             self._fallbacks[reason] += 1
 
     def check(self) -> None:
+        if self._closed:
+            raise RuntimeError("CUDA graph cache is closed")
         if self._poison is not None:
             raise RuntimeError(
                 "this runner is poisoned after a CUDA graph failure; "
@@ -322,6 +328,32 @@ class CudaGraphCache:
                 f"{self._pending_captures} configured CUDA graph shapes have not "
                 "been captured; call runner.capture_cuda_graphs() before inference"
             )
+
+    def close(self) -> None:
+        """Release captured CUDA/NCCL resources before process-group teardown."""
+
+        if self._closed:
+            return
+        if any(entry.graphs for entry in self._entries.values()):
+            torch.cuda.synchronize(self.device)
+        self._release()
+
+    def _release(self) -> None:
+        """Release an already synchronized cache; shared by executor shutdown."""
+
+        if self._closed:
+            return
+        stats = self.stats
+        for entry in self._entries.values():
+            for graph in entry.graphs:
+                if graph is not None:
+                    graph.reset()
+            entry.graphs = ()
+            entry.program = None
+            entry.staging = None
+        self._pool = None
+        self._closed_stats = stats
+        self._closed = True
 
     def capture_all(
         self,
@@ -453,7 +485,7 @@ class CudaGraphCache:
         with torch.cuda.device(self.device):
             if program.prepare is not None:
                 program.prepare()
-            graphs = self._capture_regions(program)
+            graphs = self._capture_regions(entry)
             if program.prepare is not None:
                 program.prepare()
             self._replay(program, graphs)
@@ -488,19 +520,25 @@ class CudaGraphCache:
         for region in program.regions:
             region.launch()
 
-    def _capture_regions(self, program: CudaGraphProgram) -> tuple[Any | None, ...]:
+    def _capture_regions(self, entry: _GraphEntry) -> tuple[Any | None, ...]:
+        program = entry.program
+        assert program is not None
         if self._share_pool and self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
         graphs: list[Any | None] = []
         for region in program.regions:
             if not region.capture:
-                region.launch()
                 graphs.append(None)
+                entry.graphs = tuple(graphs)
+                region.launch()
                 continue
             graph = torch.cuda.CUDAGraph()
+            graphs.append(graph)
+            # Keep ownership even when capture or parity validation fails, so
+            # close() can release NCCL graph references before communicator teardown.
+            entry.graphs = tuple(graphs)
             with torch.cuda.graph(graph, pool=self._pool), torch.inference_mode():
                 region.launch()
-            graphs.append(graph)
         return tuple(graphs)
 
     @staticmethod
@@ -515,6 +553,8 @@ class CudaGraphCache:
 
     @property
     def stats(self) -> CudaGraphStats:
+        if self._closed_stats is not None:
+            return self._closed_stats
         rows: tuple[CudaGraphShapeStats, ...] = tuple(
             {
                 "shape": entry.shape,
@@ -569,12 +609,15 @@ class CudaGraphExecutor:
         self._synchronize_failure = synchronize_failure
         self._modes: dict[str, CudaGraphMode] = {}
         self._caches: dict[str, CudaGraphCache] = {}
+        self._closed = False
         for name, mode in modes.items():
             self.add_mode(name, mode)
 
     def add_mode(self, name: str, mode: CudaGraphMode) -> None:
         """Register a model phase after its modules and buffers are available."""
 
+        if self._closed:
+            raise RuntimeError("CUDA graph executor is closed")
         if not isinstance(name, str) or not name.strip() or name in self._modes:
             raise ValueError(f"invalid or duplicate CUDA graph mode: {name!r}")
         self._modes[name] = mode
@@ -587,18 +630,39 @@ class CudaGraphExecutor:
         )
 
     def mode(self, name: str) -> CudaGraphCache:
+        if self._closed:
+            raise RuntimeError("CUDA graph executor is closed")
         try:
             return self._caches[name]
         except KeyError as error:
             raise KeyError(f"unknown CUDA graph mode: {name}") from error
 
     def check(self) -> None:
+        if self._closed:
+            raise RuntimeError("CUDA graph executor is closed")
         for cache in self._caches.values():
             cache.check()
+
+    def close(self) -> None:
+        """Synchronize once and destroy graphs before their communicators."""
+
+        if self._closed:
+            return
+        if any(
+            entry.graphs
+            for cache in self._caches.values()
+            for entry in cache._entries.values()
+        ):
+            torch.cuda.synchronize(self.device)
+        for cache in self._caches.values():
+            cache._release()
+        self._modes.clear()
+        self._closed = True
 
     def capture(self, name: str, shape: GraphShape) -> CudaGraphStats:
         """Capture one configured shape using its mode-owned synthetic inputs."""
 
+        self.check()
         try:
             mode = self._modes[name]
         except KeyError as error:

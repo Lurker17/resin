@@ -84,11 +84,15 @@ class _Graph:
     def __init__(self):
         self.error = None
         self.replay_count = 0
+        self.reset_count = 0
 
     def replay(self):
         if self.error is not None:
             raise self.error
         self.replay_count += 1
+
+    def reset(self):
+        self.reset_count += 1
 
 
 class _Cuda:
@@ -530,6 +534,139 @@ class TestCudaGraph:
         assert len(torch.cuda.pools) == 2
         assert graphs.mode("prefill").run((1, 4), {"value": [2]}) == [2]
 
+    def test_cache_close_resets_graphs_after_synchronizing_and_is_idempotent(
+        self, monkeypatch
+    ):
+        torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
+        monkeypatch.setattr(graph_runtime, "torch", torch)
+
+        def build(_shape):
+            state = _Tensor([0])
+            return CudaGraphProgram(
+                {"value": state},
+                state,
+                (
+                    CudaGraphRegion("first", lambda: None),
+                    CudaGraphRegion("break", lambda: None, capture=False),
+                    CudaGraphRegion("last", lambda: None),
+                ),
+            )
+
+        cache = CudaGraphCache(
+            "cuda:0",
+            ((1, 4), (2, 4)),
+            build=build,
+            synchronize_failure=lambda: None,
+            share_pool=True,
+        )
+        cache.capture_all(lambda _: {"value": [1]})
+        stats = cache.stats
+        events = []
+        monkeypatch.setattr(
+            torch.cuda, "synchronize", lambda device: events.append("sync")
+        )
+        original_reset = _Graph.reset
+
+        def reset(graph):
+            events.append("reset")
+            original_reset(graph)
+
+        monkeypatch.setattr(_Graph, "reset", reset)
+        cache.close()
+        cache.close()
+
+        assert events == ["sync", "reset", "reset", "reset", "reset"]
+        assert [graph.reset_count for graph in torch.cuda.graphs] == [1] * 4
+        assert cache._pool is None
+        assert all(
+            not entry.graphs and entry.program is None and entry.staging is None
+            for entry in cache._entries.values()
+        )
+        assert cache.stats == stats
+        for operation in (
+            cache.check_ready,
+            lambda: cache.match(lambda _: True),
+            lambda: cache.fallback("shape"),
+            lambda: cache.capture((1, 4), {"value": [1]}),
+            lambda: cache.capture_all(lambda _: {"value": [1]}),
+            lambda: cache.run((1, 4), {"value": [1]}),
+        ):
+            with pytest.raises(RuntimeError, match="closed"):
+                operation()
+
+    def test_runner_close_synchronizes_once_across_modes_before_group_teardown(
+        self, monkeypatch
+    ):
+        torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
+        monkeypatch.setattr(graph_runtime, "torch", torch)
+
+        def mode():
+            def build(_shape):
+                state = _Tensor([0])
+                return CudaGraphStep({"value": state}, state, lambda: None)
+
+            return CudaGraphMode(((1, 4),), build, lambda _: {"value": [1]})
+
+        executor = CudaGraphExecutor(
+            "cuda:0",
+            {"prefill": mode(), "decode": mode()},
+            synchronize_failure=lambda: None,
+        )
+        executor.capture_all()
+        caches = [executor.mode(name) for name in ("prefill", "decode")]
+        stats = executor.stats
+        synchronized = []
+        monkeypatch.setattr(
+            torch.cuda, "synchronize", lambda device: synchronized.append(device)
+        )
+        runner = CudaRunner.__new__(CudaRunner)
+        runner._cuda_graph_executor = executor
+        runner._prefill_buffers = {"retained": object()}
+
+        runner.close_cuda_graphs()
+        runner.close_cuda_graphs()
+
+        assert synchronized == ["cuda:0"]
+        assert [graph.reset_count for graph in torch.cuda.graphs] == [1, 1]
+        assert not runner._prefill_buffers
+        assert executor.stats == stats
+        for operation in (
+            executor.check,
+            lambda: executor.mode("decode"),
+            lambda: executor.add_mode("other", mode()),
+            lambda: executor.capture("decode", (1, 4)),
+            executor.capture_all,
+            *(
+                lambda cache=cache: cache.run((1, 4), {"value": [1]})
+                for cache in caches
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="closed"):
+                operation()
+
+    def test_closing_uncaptured_modes_needs_no_cuda_context(self, monkeypatch):
+        torch = _Torch()
+        monkeypatch.setattr(graph_runtime, "torch", torch)
+        monkeypatch.setattr(
+            torch.cuda,
+            "synchronize",
+            lambda _: pytest.fail("no graph or pending device work exists"),
+        )
+        cache = _cache(((1, 4),), lambda _: pytest.fail("must not build"))
+        cache.close()
+        cache.close()
+        executor = CudaGraphExecutor(
+            "cuda:0",
+            {"decode": CudaGraphMode((), lambda _: None, lambda _: {})},
+            synchronize_failure=lambda: None,
+        )
+        executor.close()
+        executor.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            executor.capture_all()
+
     def test_replay_reuses_persistent_pinned_staging(self, monkeypatch) -> None:
         torch = _Torch()
         monkeypatch.setattr(staging, "torch", torch)
@@ -709,6 +846,10 @@ class TestCudaGraph:
         assert graphs.stats["poisoned"]
         with pytest.raises(RuntimeError, match="poisoned"):
             graphs.check()
+        # Even failed capture retains its graph until explicit cleanup, so a
+        # captured NCCL user object cannot outlive communicator teardown.
+        graphs.close()
+        assert [graph.reset_count for graph in torch.cuda.graphs] == [1]
 
     @pytest.mark.parametrize("validate_eager_output", [False, True])
     def test_large_parity_failures_report_only_bounded_samples(
