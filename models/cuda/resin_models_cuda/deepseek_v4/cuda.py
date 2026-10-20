@@ -805,6 +805,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 or plan.num_tokens != context.num_tokens
             ):
                 raise ValueError("distributed step metadata does not match the plan")
+            self._cache_plan(plan)
 
     def forward_distributed(
         self, plan: BatchPlan | None, context: StepContext

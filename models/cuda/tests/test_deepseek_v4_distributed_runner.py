@@ -6,7 +6,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from resin import BatchPhase, BatchPlan, Parallelism
+from resin import (
+    BatchPhase,
+    BatchPlan,
+    CacheGroupLayout,
+    CacheGroupPlan,
+    CacheLayout,
+    Parallelism,
+)
 from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.distributed import StepContext
 from resin.backend.topology import RankGroup
@@ -187,6 +194,46 @@ def test_distributed_metadata_is_validated_before_model_or_cache_work(monkeypatc
 
     assert runner._model.calls == []
     assert runner._cache.plans == []
+
+
+@pytest.mark.parametrize(
+    ("slab", "error"),
+    [(2, None), (5, "outside its layout")],
+)
+def test_managed_cache_addresses_are_validated_before_expert_rounds(
+    monkeypatch, slab, error
+):
+    groups = _groups(Parallelism(world_size=4, ep=4, attn_dp=4))
+    runner = _runner(monkeypatch, groups)
+    runner.cache_layout = CacheLayout(4, [CacheGroupLayout(128)])
+    del runner._cache_plan  # Exercise the production cache-plan validator.
+    group = CacheGroupPlan(
+        0,
+        block_indptr=[0, 1],
+        block_slab_ids=[slab],
+        block_slotnums=[0],
+        block_table_start_indices=[0],
+        append_slab_ids=[slab],
+        append_slotnums=[0],
+        append_block_offsets=[0],
+    )
+    plan = BatchPlan(
+        [7], [0], [2], [0, 1], phase=BatchPhase.PREFILL, cache_groups=[group]
+    )
+    context = _context(
+        groups, BatchPhase.PREFILL, ((1, 1), (0, 0), (0, 0), (0, 0)), plan
+    )
+
+    if error is None:
+        assert runner.validate_distributed(plan, context) is None
+        assert runner.forward_distributed(plan, context) == [2]
+        assert runner._model.calls == [("prefill", [[2]], 0, "row-0")]
+    else:
+        with pytest.raises(ValueError, match=error):
+            runner.validate_distributed(plan, context)
+        assert runner._model.calls == []
+        assert runner._cache.plans == []
+        assert runner._cuda_failure.synchronizations == 0
 
 
 @pytest.mark.parametrize(
