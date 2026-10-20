@@ -16,11 +16,13 @@ mod batch;
 pub mod engine;
 mod ids;
 pub mod logprobs;
+pub mod parallelism;
 mod planning;
 pub mod resources;
 mod scheduler;
 
 pub use batch::{SequenceStep, TokenRange};
 pub use ids::RequestId;
+pub use parallelism::{Parallelism, ParallelismError};
 pub use planning::{PlanningConfig, PlanningError, RequestProgress, schedule_ready_prefix};
 pub use scheduler::{Phase, Schedulable, Scheduler, Selection};

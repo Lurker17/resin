@@ -11,15 +11,16 @@ class TestImport:
         code = (
             "import sys; sys.path[:0] = ['models/cuda', 'models/torch']; "
             "import resin; import resin.backend; "
+            "from resin import Parallelism; Parallelism(world_size=4, attn_dp=4); "
             "import resin.backend.cuda; import resin_models_cuda; "
             "import resin_models_torch; "
             "print(*(int(name in sys.modules) for name in "
-            "('flashinfer', 'flash_attn')))"
+            "('torch', 'flashinfer', 'flash_attn')))"
         )
         result = subprocess.run(
             [sys.executable, "-c", code], check=True, capture_output=True, text=True
         )
-        assert result.stdout.strip() == "0 0"
+        assert result.stdout.strip() == "0 0 0"
 
     def test_torch_is_required_and_cuda_dependencies_are_optional(self) -> None:
         project = tomllib.loads(Path("pyproject.toml").read_text())["project"]

@@ -5,6 +5,15 @@ from pathlib import Path
 
 STUB_PATH = Path(__file__).resolve().parents[1] / "resin" / "_resin.pyi"
 U32_INPUT = "Sequence[int] | npt.NDArray[np.uint32]"
+OUTPUT_COLUMNS = {
+    "token_ids": "npt.NDArray[np.uint32]",
+    "token_indptr": "npt.NDArray[np.uint32]",
+    "logprobs": "npt.NDArray[np.float32] | None",
+    "logprob_indptr": "npt.NDArray[np.uint32] | None",
+    "top_indptr": "npt.NDArray[np.uint32] | None",
+    "top_token_ids": "npt.NDArray[np.uint32] | None",
+    "top_logprobs": "npt.NDArray[np.float32] | None",
+}
 
 PARAMETERS = {
     ("BatchPlan", "__new__"): {
@@ -30,6 +39,7 @@ PARAMETERS = {
     ("Engine", "__new__"): {"runner": "Runner"},
     ("Engine", "cancel"): {"request": "RequestLease"},
     ("Engine", "submit"): {"media": "MediaInput | None"},
+    ("ForwardOutput", "__new__"): OUTPUT_COLUMNS,
     ("_HttpServer", "__new__"): {"codec": "ConversationCodec"},
 }
 
@@ -67,6 +77,10 @@ RETURNS = {
     ("BatchPlan", "sampling_params"): "tuple[SamplingParams, ...]",
     ("BatchPlan", "media"): "tuple[MediaInput | None, ...]",
     ("CacheLayout", "groups"): "tuple[CacheGroupLayout, ...]",
+    **{
+        ("ForwardOutput", name): annotation
+        for name, annotation in OUTPUT_COLUMNS.items()
+    },
 }
 
 

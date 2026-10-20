@@ -10,11 +10,13 @@ mod arrays;
 mod cache;
 mod http;
 mod output;
+mod parallelism;
 mod planning;
 mod runner;
 
 use cache::{CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention};
 use output::{BorrowedLogprobs, ForwardOutput};
+use parallelism::Parallelism;
 use resin_core::engine::{self as core, CompletionReason};
 use runner::{
     ResourceBinding, RunnerConfig, bind_runner_resources, resolve_runner_config,
@@ -757,6 +759,12 @@ impl TokenLogprobs {
     }
 }
 
+/// A caller-owned lifetime handle for one submitted request.
+///
+/// The Engine keeps the shared state only while the request is active. Once
+/// the request retires, its generated tokens are moved into this lease. If
+/// the caller drops the lease without taking the result, the token buffer is
+/// released when the last internal reference disappears.
 #[pyclass(module = "resin._resin")]
 struct RequestLease {
     inner: core::RequestHandle,
@@ -1087,6 +1095,7 @@ impl Engine {
         })
     }
 
+    /// Read-only admission-aware proposal; reserves no requests or resources.
     fn next_phase(&self) -> PyResult<Option<BatchPhase>> {
         self.core
             .next_phase()
@@ -1362,8 +1371,8 @@ mod _resin {
     #[pymodule_export]
     use super::{
         BatchPhase, BatchPlan, CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout,
-        CacheRetention, Engine, ForwardOutput, RequestLease, ResourceBinding, RunnerConfig,
-        SamplingParams, SchedulerConfig, TokenEvent, TokenLogprobs,
+        CacheRetention, Engine, ForwardOutput, Parallelism, RequestLease, ResourceBinding,
+        RunnerConfig, SamplingParams, SchedulerConfig, TokenEvent, TokenLogprobs,
     };
 
     #[pymodule_export]

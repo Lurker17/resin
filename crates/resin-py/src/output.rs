@@ -7,11 +7,15 @@ use resin_core::logprobs::{LogprobView, TopLogprobView, validate_indptr};
 
 use crate::core_error;
 
-/// Contiguous NumPy columns borrowed until Engine.step() returns.
+/// Borrowed NumPy SoA output, valid until the synchronous step returns.
 ///
-/// Token and score rows use CSR offsets. Empty score rows opt out; other rows
-/// cover the complete raw output. All three top_* arrays are optional together.
-/// Arrays are retained without copying and must not be mutated during the step.
+/// All arrays must have their exact declared dtype, one dimension, and contiguous
+/// storage. Construction retains the arrays without copying. Do not mutate or
+/// recycle their storage until step() returns. Token rows use token_indptr;
+/// score rows use logprob_indptr (defaults to token_indptr). An empty score row
+/// opts out; every other score row must cover the entire raw output token row.
+/// top_indptr partitions top_token_ids/top_logprobs by scored token. All three
+/// top_* arrays are optional together.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 pub struct ForwardOutput {
     #[pyo3(get)]

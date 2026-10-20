@@ -287,6 +287,7 @@ TokenLogprobs
 RequestLease
 SamplingParams
 SchedulerConfig
+Parallelism
 RunnerConfig
 ResourceBinding
 CacheGroupLayout

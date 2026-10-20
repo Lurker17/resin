@@ -17,6 +17,7 @@ from resin import (
     CacheGroupLayout,
     CacheLayout,
     ForwardOutput,
+    Parallelism,
     RunnerConfig,
     SamplingParams,
 )
@@ -25,105 +26,7 @@ from resin.backend.distributed import (
     DistributedExecutionError,
     DistributedWorker,
 )
-from resin.backend.topology import ParallelGroups, ParallelTopology
-
-
-def test_topology_composes_all_parallel_axes_without_multiplying_ep():
-    topology = ParallelTopology(world_size=8, cp=2, attn_dp=2, attn_tp=2, ep=4)
-    assert topology.world_size == 8
-    assert topology.attn_tp == topology.expert_tp == 2
-    groups = topology.partitions()
-    assert groups["attn_tp"] == ((0, 1), (2, 3), (4, 5), (6, 7))
-    assert groups["cp"] == ((0, 2), (1, 3), (4, 6), (5, 7))
-    assert groups["attn_dp"] == ((0, 4), (1, 5), (2, 6), (3, 7))
-    assert groups["ep"] == ((0, 2, 4, 6), (1, 3, 5, 7))
-    assert groups["expert_tp"] == groups["attn_tp"]
-    overlap = ParallelTopology(world_size=8, attn_tp=8, ep=8).partitions()
-    assert overlap["attn_tp"] == overlap["ep"] == (tuple(range(8)),)
-    assert overlap["expert_tp"] == tuple((rank,) for rank in range(8))
-    assert groups["drivers"] == ((0, 4),)
-    assert groups["domain"] == (tuple(range(8)),)
-    for rank in range(8):
-        assert topology.rank(*topology.coordinates(rank)) == rank
-    shared = ParallelTopology(world_size=8, cp=2, attn_dp=2, attn_tp=2).partitions()
-    assert shared["expert_tp"] == shared["domain"] == (tuple(range(8)),)
-    assert shared["drivers"] == ((0, 4),)
-
-
-@pytest.mark.parametrize(
-    "options,replication,expert",
-    [
-        ({}, 1, 1),
-        ({"world_size": 8}, 8, 8),
-        ({"world_size": 8, "attn_tp": 8}, 1, 8),
-        ({"world_size": 8, "ep": 8}, 8, 1),
-        ({"world_size": 4, "attn_dp": 4}, 1, 4),
-        ({"world_size": 2, "attn_tp": 2}, 1, 2),
-        ({"world_size": 8, "attn_dp": 8, "ep": 8}, 1, 1),
-        ({"world_size": 12, "attn_dp": 3, "cp": 2, "ep": 4}, 2, 3),
-        ({"world_size": 16, "attn_dp": 2, "cp": 2, "attn_tp": 2}, 2, 16),
-    ],
-)
-def test_attention_replication_and_expert_tp_cover_the_same_ranks(
-    options, replication, expert
-):
-    topology = ParallelTopology(**options)
-    assert topology.attn_replication == replication and topology.expert_tp == expert
-    assert (
-        topology.attn_dp * topology.cp * topology.attn_replication * topology.attn_tp
-        == topology.world_size
-    )
-    assert topology.ep * topology.expert_tp == topology.world_size
-    for rank in range(topology.world_size):
-        assert topology.rank(*topology.coordinates(rank)) == rank
-    groups = topology.partitions()
-    for name, partitions in groups.items():
-        if name != "drivers":
-            assert sorted(rank for group in partitions for rank in group) == list(
-                range(topology.world_size)
-            )
-    assert len(groups["replica"]) == topology.attn_dp
-    assert len(groups["drivers"][0]) == topology.attn_dp
-
-
-def test_remaining_attention_ranks_replicate_the_same_request():
-    topology = ParallelTopology(world_size=16, attn_dp=2, cp=2, attn_tp=2, ep=4)
-    groups = topology.partitions()
-    assert groups["attn_tp"][:2] == ((0, 1), (2, 3))
-    assert groups["attn_replication"][:2] == ((0, 2), (1, 3))
-    assert groups["cp"][:2] == ((0, 4), (1, 5))
-    assert groups["attn_dp"][:2] == ((0, 8), (1, 9))
-    assert groups["replica"] == (tuple(range(8)), tuple(range(8, 16)))
-    assert groups["drivers"] == ((0, 8),)
-    assert groups["expert_tp"] == tuple(
-        tuple(range(start, start + 4)) for start in range(0, 16, 4)
-    )
-
-
-def test_topology_requires_keywords():
-    with pytest.raises(TypeError):
-        ParallelTopology(2)
-
-
-@pytest.mark.parametrize(
-    "options",
-    [
-        {"world_size": 8, "ep": 3},
-        {"world_size": 8, "cp": 3},
-        {"world_size": 8, "attn_dp": 3},
-        {"world_size": 8, "attn_tp": 3},
-        {"world_size": 12, "attn_dp": 4, "cp": 2},
-        {"world_size": 4, "attn_dp": 2, "cp": 2, "attn_tp": 2},
-        {"cp": 0},
-        {"world_size": True},
-        {"attn_dp": 1.5},
-        {"attn_tp": 0},
-        {"attn_tp": True},
-    ],
-)
-def test_invalid_topologies_are_rejected(options):
-    with pytest.raises(ValueError):
-        ParallelTopology(**options)
+from resin.backend.topology import ParallelGroups
 
 
 class CollectiveRunner:
@@ -411,15 +314,15 @@ def _distributed_process(rank, world_size, rendezvous, directory):
     )
     with pytest.raises(ValueError, match="agree"):
         ParallelGroups.create(
-            ParallelTopology(world_size=8, attn_tp=8)
+            Parallelism(world_size=8, attn_tp=8)
             if rank == 0
-            else ParallelTopology(world_size=8, cp=2, attn_dp=2, attn_tp=2, ep=4),
+            else Parallelism(world_size=8, cp=2, attn_dp=2, attn_tp=2, ep=4),
             device_backend="gloo",
         )
     with pytest.raises(ValueError, match="world size"):
-        ParallelGroups.create(ParallelTopology(world_size=4), device_backend="gloo")
+        ParallelGroups.create(Parallelism(world_size=4), device_backend="gloo")
     groups = ParallelGroups.create(
-        ParallelTopology(world_size=8, cp=2, attn_dp=2, attn_tp=2, ep=4),
+        Parallelism(world_size=8, cp=2, attn_dp=2, attn_tp=2, ep=4),
         device_backend="gloo",
         timeout=timedelta(seconds=20),
     )
@@ -452,7 +355,7 @@ def _distributed_process(rank, world_size, rendezvous, directory):
     finally:
         groups.close()
     shared = ParallelGroups.create(
-        ParallelTopology(world_size=8, cp=2, attn_dp=2, attn_tp=2),
+        Parallelism(world_size=8, cp=2, attn_dp=2, attn_tp=2),
         device_backend="gloo",
         timeout=timedelta(seconds=20),
     )
@@ -462,7 +365,7 @@ def _distributed_process(rank, world_size, rendezvous, directory):
     finally:
         shared.close()
     tensor_only = ParallelGroups.create(
-        ParallelTopology(world_size=8, attn_tp=8),
+        Parallelism(world_size=8, attn_tp=8),
         device_backend="gloo",
         timeout=timedelta(seconds=20),
     )
@@ -472,7 +375,7 @@ def _distributed_process(rank, world_size, rendezvous, directory):
     finally:
         tensor_only.close()
     overlap = ParallelGroups.create(
-        ParallelTopology(world_size=8, ep=8, attn_dp=4, attn_tp=2),
+        Parallelism(world_size=8, ep=8, attn_dp=4, attn_tp=2),
         device_backend="gloo",
         timeout=timedelta(seconds=20),
     )
@@ -482,7 +385,7 @@ def _distributed_process(rank, world_size, rendezvous, directory):
     finally:
         overlap.close()
     replicated = ParallelGroups.create(
-        ParallelTopology(world_size=8, ep=4, attn_dp=2, cp=2),
+        Parallelism(world_size=8, ep=4, attn_dp=2, cp=2),
         device_backend="gloo",
         timeout=timedelta(seconds=20),
     )
@@ -603,7 +506,7 @@ def test_control_failure_after_model_work_keeps_the_accepted_batch(monkeypatch):
 
     singleton = RankGroup((0,), None, 0)
     groups = ParallelGroups(
-        ParallelTopology(),
+        Parallelism(),
         0,
         singleton,
         singleton,

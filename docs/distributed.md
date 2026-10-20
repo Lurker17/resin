@@ -1,15 +1,17 @@
 # Distributed execution prototype
 
-`resin.backend.topology` describes rank placement and owns explicit process
-groups. `resin.backend.distributed` coordinates synchronous Engine steps. Each
-rank owns a model runtime; each attention-DP replica has one native request
-Engine, on its lowest global rank. The other ranks in that replica follow its driver.
+`resin.Parallelism` defines rank placement in the Rust core and exposes that
+immutable configuration to Python. `resin.backend.topology.ParallelGroups` owns
+the Python process-group handles. `resin.backend.distributed` coordinates
+synchronous Engine steps. Each rank owns a model runtime; each attention-DP
+replica has one native request Engine, on its lowest global rank. The other
+ranks in that replica follow its driver.
 
 The boundaries are:
 
 | Component | Responsibility |
 | --- | --- |
-| `ParallelTopology` | Total rank count, attention mesh, and derived replication/expert TP widths |
+| `Parallelism` | Rust-defined dimensions, validation, rank placement, and partitions |
 | `ParallelGroups` | Explicit device groups and Gloo control groups |
 | `DistributedEngine` | Phase agreement, normal local Engine steps, empty participation, failure propagation |
 | Native `Engine` | Local admission, requests, pages, leases, output validation, commit |
@@ -26,8 +28,15 @@ infers model weight layouts or uses the default world group for those operations
 
 `world_size` is the total number of ranks. The five configuration fields are
 `world_size`, `attn_dp`, `attn_tp`, `cp`, and `ep`, each defaulting to one.
-`ParallelTopology` is frozen and accepts keyword arguments only. Attention TP is
-explicit; attention replication and expert TP are derived:
+`Parallelism` is immutable and accepts keyword arguments only:
+
+```python
+from resin import Parallelism
+
+parallelism = Parallelism(world_size=4, attn_dp=4)
+```
+
+Attention TP is explicit; attention replication and expert TP are derived:
 
 ```python
 attn_replication = world_size // (attn_dp * cp * attn_tp)
@@ -43,17 +52,17 @@ Experts use `[EP, EXPERT_TP]` over the same ranks. Expert weights are sharded
 across that complete mesh, with no separate expert-replica axis. CP describes
 attention token partitioning within those ranks; it is not an additional
 multiplier in the expert mesh. For example,
-`ParallelTopology(world_size=8, ep=8, attn_tp=8)` gives attention TP eight and
+`Parallelism(world_size=8, ep=8, attn_tp=8)` gives attention TP eight and
 expert TP one on eight ranks.
 
-`topology.coordinates(rank)` returns `(dp_index, cp_index, replication_index,
-tp_index)`, and `topology.rank(...)` maps those four coordinates back to the
-global rank. `topology.attn_replication` is the derived replication count;
+`parallelism.coordinates(rank)` returns `(dp_index, cp_index, replication_index,
+tp_index)`, and `parallelism.rank(...)` maps those four coordinates back to the
+global rank. `parallelism.attn_replication` is the derived replication count;
 `groups.attn_replication` contains ranks with the same attention shard at fixed
 DP, CP, and TP coordinates. The runner owns any device communication across
 that group.
 
-For `ParallelTopology(world_size=8, ep=4, cp=2, attn_dp=2, attn_tp=2)`, both
+For `Parallelism(world_size=8, ep=4, cp=2, attn_dp=2, attn_tp=2)`, both
 attention TP and expert TP are two, and attention replication is one. The groups
 containing rank zero are:
 
@@ -69,11 +78,11 @@ containing rank zero are:
 | Serving domain | 0–7 |
 | Domain drivers | 0, 4 |
 
-`ParallelTopology(world_size=4, attn_dp=4)` gives four attention replicas with
+`Parallelism(world_size=4, attn_dp=4)` gives four attention replicas with
 attention TP one, CP one, and expert TP four. Each rank drives its own request
 Engine while the experts span all four ranks.
 
-`ParallelTopology(world_size=8, attn_tp=2)` gives attention replication four and
+`Parallelism(world_size=8, attn_tp=2)` gives attention replication four and
 expert TP eight. There is one request replica and one driver for all eight
 ranks. Its four attention-TP groups receive the same logical plan. In general,
 each request replica contains `cp * attn_replication * attn_tp` ranks, and there
@@ -85,11 +94,22 @@ spans the entire world. A replica with no requests participates in empty
 execution while its peers have work. The serving domain is the complete world;
 no connected-component inference is needed.
 
-`ParallelGroups.create()` is collective over an initialized default world group,
-checks agreement on topology/backend, creates groups in deterministic order, and
-reuses identical groups. Device collectives default to NCCL; control collectives
-use Gloo. The CPU conformance test uses Gloo for both. `groups.close()` destroys
-only the groups it created, after workers stop; the caller owns the default world.
+The Rust `Parallelism` value contains numeric configuration and rank layouts;
+Python `ParallelGroups` creates and owns the communication handles.
+`ParallelGroups.create(parallelism)` is collective over an initialized default
+world group, checks agreement on configuration/backend, creates groups in
+deterministic order, and reuses identical groups. Its `.topology` field refers
+to the supplied `Parallelism`. Device collectives default to NCCL; control
+collectives use Gloo. The CPU conformance test uses Gloo for both.
+`groups.close()` destroys only the groups it created, after workers stop; the
+caller owns the default world.
+
+Each attention-DP replica still has its own native scheduler, request queue, and
+logical cache pool. Request limits, token budgets, and cache-parent capacity are
+per replica; `attn_dp` does not scale one shared cache pool. The runner supplies
+a logical cache layout and capacity backed by its physical TP/CP shards on all
+ranks in that replica. The native configuration type does not add a global
+request router or move the current Python serving coordinator into Rust.
 
 ## One synchronous step
 
@@ -153,7 +173,7 @@ commit. Failure marks all native Engines poisoned, preserving resources and
 preventing cleanup/reuse through normal Engine operations.
 
 Existing TP-only runtimes that use an injected TP group can continue implementing
-`forward(plan)` with `ParallelTopology(world_size=2, attn_tp=2)`, for example when
+`forward(plan)` with `Parallelism(world_size=2, attn_tp=2)`, for example when
 running GPT-OSS 120B over two ranks. Here `cp`, `ep`, and `attn_dp` remain one,
 and attention TP and expert TP both equal `world_size`. GPT-OSS's
 `TensorParallelContext` can be constructed from

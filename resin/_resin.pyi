@@ -76,6 +76,11 @@ class BatchPlan:
         Opaque runner inputs, one per sequence. The scheduler never inspects them.
         """
     @property
+    def needs_logprobs(self, /) -> bool:
+        """
+        Check natively so token-only graph replay does not box per-row policies.
+        """
+    @property
     def num_sequences(self, /) -> int:
         """
         Number of sequences (batch size).
@@ -101,9 +106,6 @@ class BatchPlan:
         Which sequences should generate a sampled token. Used for chunked
         prefill, when some sequences only advance the cache.
         """
-    @property
-    def needs_logprobs(self, /) -> bool:
-        """Whether any sampled row requests scores, checked without boxing policies."""
     @property
     def sampling_params(self, /) -> tuple[SamplingParams, ...]:
         """
@@ -391,6 +393,14 @@ class Engine:
     def max_running_requests(self, /) -> int: ...
     @property
     def new_token_ratio(self, /) -> float: ...
+    def next_phase(self, /) -> BatchPhase | None:
+        """
+        Read-only admission-aware proposal; reserves no requests or resources.
+        """
+    def poison(self, /, reason: str) -> None:
+        """
+        Contain a failure reported by a peer without releasing local resources.
+        """
     @property
     def poison_error(self, /) -> str | None: ...
     @property
@@ -405,10 +415,6 @@ class Engine:
     @property
     def scheduler_config(self, /) -> SchedulerConfig: ...
     def step(self, /, *, phase: BatchPhase | None = None) -> list[TokenEvent]: ...
-    def next_phase(self, /) -> BatchPhase | None:
-        """Read-only admission-aware proposal; reserves no requests or resources."""
-    def poison(self, /, reason: str) -> None:
-        """Permanently contain a peer/runtime failure without releasing resources."""
     def submit(
         self,
         /,
@@ -421,6 +427,90 @@ class Engine:
         stop_token_ids: Sequence[int] | None = None,
         media: MediaInput | None = None,
     ) -> RequestLease: ...
+
+@final
+class ForwardOutput:
+    """
+    Borrowed NumPy SoA output, valid until the synchronous step returns.
+
+    All arrays must have their exact declared dtype, one dimension, and contiguous
+    storage. Construction retains the arrays without copying. Do not mutate or
+    recycle their storage until step() returns. Token rows use token_indptr;
+    score rows use logprob_indptr (defaults to token_indptr). An empty score row
+    opts out; every other score row must cover the entire raw output token row.
+    top_indptr partitions top_token_ids/top_logprobs by scored token. All three
+    top_* arrays are optional together.
+    """
+    def __new__(
+        cls,
+        /,
+        token_ids: npt.NDArray[np.uint32],
+        token_indptr: npt.NDArray[np.uint32],
+        *,
+        logprobs: npt.NDArray[np.float32] | None = None,
+        logprob_indptr: npt.NDArray[np.uint32] | None = None,
+        top_indptr: npt.NDArray[np.uint32] | None = None,
+        top_token_ids: npt.NDArray[np.uint32] | None = None,
+        top_logprobs: npt.NDArray[np.float32] | None = None,
+    ) -> ForwardOutput: ...
+    @property
+    def logprob_indptr(self, /) -> npt.NDArray[np.uint32] | None: ...
+    @property
+    def logprobs(self, /) -> npt.NDArray[np.float32] | None: ...
+    @property
+    def token_ids(self, /) -> npt.NDArray[np.uint32]: ...
+    @property
+    def token_indptr(self, /) -> npt.NDArray[np.uint32]: ...
+    @property
+    def top_indptr(self, /) -> npt.NDArray[np.uint32] | None: ...
+    @property
+    def top_logprobs(self, /) -> npt.NDArray[np.float32] | None: ...
+    @property
+    def top_token_ids(self, /) -> npt.NDArray[np.uint32] | None: ...
+
+@final
+class Parallelism:
+    """
+    Attention and expert meshes over the same GPU ranks.
+
+    Attention uses [ATTN_DP, CP, REPLICATION, ATTN_TP]; unassigned attention
+    ranks replicate the same request. Experts use [EP, EXPERT_TP], where
+    EXPERT_TP is world_size // ep. CP shards prefill and replicates decode.
+    """
+    def __eq__(self, value: object, /) -> bool: ...
+    def __getnewargs_ex__(self, /) -> "tuple[tuple[()], dict[str, int]]": ...
+    def __hash__(self, /) -> int: ...
+    def __ne__(self, value: object, /) -> bool: ...
+    def __new__(
+        cls,
+        /,
+        *,
+        world_size: "int" = 1,
+        attn_dp: "int" = 1,
+        attn_tp: "int" = 1,
+        cp: "int" = 1,
+        ep: "int" = 1,
+    ) -> Parallelism: ...
+    def __repr__(self, /) -> str: ...
+    @property
+    def attn_dp(self, /) -> int: ...
+    @property
+    def attn_replication(self, /) -> int: ...
+    @property
+    def attn_tp(self, /) -> int: ...
+    def coordinates(self, /, rank: "int") -> tuple[int, int, int, int]: ...
+    @property
+    def cp(self, /) -> int: ...
+    @property
+    def ep(self, /) -> int: ...
+    @property
+    def expert_tp(self, /) -> int: ...
+    def partitions(self, /) -> "dict[str, tuple[tuple[int, ...], ...]]": ...
+    def rank(
+        self, /, attn_dp: "int", cp: "int", replication: "int", attn_tp: "int"
+    ) -> int: ...
+    @property
+    def world_size(self, /) -> int: ...
 
 @final
 class RequestLease:
@@ -518,15 +608,15 @@ class SamplingParams:
     @property
     def extra(self, /) -> Any | None: ...
     @property
-    def seed(self, /) -> int | None: ...
-    @property
     def logprobs(self, /) -> bool: ...
     @property
-    def top_logprobs(self, /) -> int: ...
+    def seed(self, /) -> int | None: ...
     @property
     def temperature(self, /) -> float: ...
     @property
     def top_k(self, /) -> int | None: ...
+    @property
+    def top_logprobs(self, /) -> int: ...
     @property
     def top_p(self, /) -> float: ...
 
@@ -553,8 +643,6 @@ class SchedulerConfig:
 
 @final
 class TokenEvent:
-    @property
-    def logprobs(self, /) -> TokenLogprobs | None: ...
     def __repr__(self, /) -> str: ...
     @property
     def finish_reason(self, /) -> str | None: ...
@@ -563,9 +651,21 @@ class TokenEvent:
     @property
     def index(self, /) -> int: ...
     @property
+    def logprobs(self, /) -> TokenLogprobs | None: ...
+    @property
     def request_id(self, /) -> int: ...
     @property
     def token_id(self, /) -> int: ...
+
+@final
+class TokenLogprobs:
+    def __new__(
+        cls, /, logprob: float, top_logprobs: Sequence[tuple[int, float]] = ...
+    ) -> TokenLogprobs: ...
+    @property
+    def logprob(self, /) -> float: ...
+    @property
+    def top_logprobs(self, /) -> list[tuple[int, float]]: ...
 
 @final
 class _HttpServer:
@@ -591,45 +691,3 @@ class _HttpServer:
         Request shutdown from another thread; serve returns after the current
         inference step has finished and its requests have been cancelled.
         """
-
-@final
-class TokenLogprobs:
-    def __new__(cls, logprob: float, top_logprobs: Sequence[tuple[int, float]] = ()) -> TokenLogprobs: ...
-    @property
-    def logprob(self) -> float: ...
-    @property
-    def top_logprobs(self) -> list[tuple[int, float]]: ...
-
-@final
-class ForwardOutput:
-    """Borrowed NumPy SoA output, valid until the synchronous step returns.
-
-    All arrays must have their exact declared dtype, one dimension, and contiguous
-    storage. Construction retains the arrays without copying. Do not mutate or
-    recycle their storage until step() returns. Token rows use token_indptr;
-    score rows use logprob_indptr (defaults to token_indptr). An empty score row
-    opts out; every other score row must cover the entire raw output token row.
-    top_indptr partitions top_token_ids/top_logprobs by scored token.
-    """
-    def __new__(
-        cls, token_ids: npt.NDArray[np.uint32], token_indptr: npt.NDArray[np.uint32], *,
-        logprobs: npt.NDArray[np.float32] | None = None,
-        logprob_indptr: npt.NDArray[np.uint32] | None = None,
-        top_indptr: npt.NDArray[np.uint32] | None = None,
-        top_token_ids: npt.NDArray[np.uint32] | None = None,
-        top_logprobs: npt.NDArray[np.float32] | None = None,
-    ) -> ForwardOutput: ...
-    @property
-    def token_ids(self) -> npt.NDArray[np.uint32]: ...
-    @property
-    def token_indptr(self) -> npt.NDArray[np.uint32]: ...
-    @property
-    def logprobs(self) -> npt.NDArray[np.float32] | None: ...
-    @property
-    def logprob_indptr(self) -> npt.NDArray[np.uint32] | None: ...
-    @property
-    def top_indptr(self) -> npt.NDArray[np.uint32] | None: ...
-    @property
-    def top_token_ids(self) -> npt.NDArray[np.uint32] | None: ...
-    @property
-    def top_logprobs(self) -> npt.NDArray[np.float32] | None: ...
