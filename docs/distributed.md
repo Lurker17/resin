@@ -3,13 +3,13 @@
 `resin.backend.topology` describes rank placement and owns explicit process
 groups. `resin.backend.distributed` coordinates synchronous Engine steps. Each
 rank owns a model runtime; each attention-DP replica has one native request
-Engine, on its lowest global rank. The other attention-TP/CP ranks follow that driver.
+Engine, on its lowest global rank. The other ranks in that replica follow its driver.
 
 The boundaries are:
 
 | Component | Responsibility |
 | --- | --- |
-| `ParallelTopology` | Total TP width and derived attention/expert meshes |
+| `ParallelTopology` | Total rank count, attention mesh, and derived replication/expert TP widths |
 | `ParallelGroups` | Explicit device groups and Gloo control groups |
 | `DistributedEngine` | Phase agreement, normal local Engine steps, empty participation, failure propagation |
 | Native `Engine` | Local admission, requests, pages, leases, output validation, commit |
@@ -24,39 +24,66 @@ infers model weight layouts or uses the default world group for those operations
 
 ## Rank placement
 
-`tp` is the total number of ranks. The four configuration fields are `tp`, `ep`,
-`cp`, and `attn_dp`; the two tensor-parallel widths are derived:
+`world_size` is the total number of ranks. The five configuration fields are
+`world_size`, `attn_dp`, `attn_tp`, `cp`, and `ep`, each defaulting to one.
+`ParallelTopology` is frozen and accepts keyword arguments only. Attention TP is
+explicit; attention replication and expert TP are derived:
 
 ```python
-world_size = tp
-expert_tp = tp // ep
-attn_tp = tp // (attn_dp * cp)
+attn_replication = world_size // (attn_dp * cp * attn_tp)
+expert_tp = world_size // ep
 ```
 
-All sizes must be positive integers, and `ep` and `attn_dp * cp` must divide `tp`.
-Attention uses an `[ATTN_DP, CP, ATTN_TP]` mesh; experts use `[EP, EXPERT_TP]`
-over the same ranks. There is no separate expert-replica axis. For example,
-`tp=8, ep=8` gives attention TP eight and expert TP one on eight ranks.
+All sizes must be positive integers. Both `attn_dp * cp * attn_tp` and `ep` must
+divide `world_size`. Attention uses an
+`[ATTN_DP, CP, ATTN_REPLICATION, ATTN_TP]` mesh, keeping each attention-TP group
+contiguous. The derived replication axis repeats the same attention shard and
+receives the same logical plan; it does not create additional request Engines.
+Experts use `[EP, EXPERT_TP]` over the same ranks. Expert weights are sharded
+across that complete mesh, with no separate expert-replica axis. CP describes
+attention token partitioning within those ranks; it is not an additional
+multiplier in the expert mesh. For example,
+`ParallelTopology(world_size=8, ep=8, attn_tp=8)` gives attention TP eight and
+expert TP one on eight ranks.
 
-For `ParallelTopology(tp=8, ep=4, cp=2, attn_dp=2)`, both derived TP widths are
-two. The groups containing rank zero are:
+`topology.coordinates(rank)` returns `(dp_index, cp_index, replication_index,
+tp_index)`, and `topology.rank(...)` maps those four coordinates back to the
+global rank. `topology.attn_replication` is the derived replication count;
+`groups.attn_replication` contains ranks with the same attention shard at fixed
+DP, CP, and TP coordinates. The runner owns any device communication across
+that group.
+
+For `ParallelTopology(world_size=8, ep=4, cp=2, attn_dp=2, attn_tp=2)`, both
+attention TP and expert TP are two, and attention replication is one. The groups
+containing rank zero are:
 
 | Group | Ranks |
 | --- | --- |
 | Attention TP | 0, 1 |
 | CP | 0, 2 |
 | Attention DP | 0, 4 |
+| Attention replication | 0 |
 | EP | 0, 2, 4, 6 |
 | Expert TP | 0, 1 |
 | Request replica | 0, 1, 2, 3 |
-| TP-world serving domain | 0–7 |
+| Serving domain | 0–7 |
 | Domain drivers | 0, 4 |
 
-The complete expert mesh connects every attention replica in this TP world, so
-all its drivers synchronize their serving loops. This also holds with `ep=1`,
-where expert TP spans the entire world. A replica with no requests participates
-in empty execution while its peers have work. The serving domain is therefore
-the TP world directly; no connected-component inference is needed.
+`ParallelTopology(world_size=4, attn_dp=4)` gives four attention replicas with
+attention TP one, CP one, and expert TP four. Each rank drives its own request
+Engine while the experts span all four ranks.
+
+`ParallelTopology(world_size=8, attn_tp=2)` gives attention replication four and
+expert TP eight. There is one request replica and one driver for all eight
+ranks. Its four attention-TP groups receive the same logical plan. In general,
+each request replica contains `cp * attn_replication * attn_tp` ranks, and there
+are exactly `attn_dp` request Engines.
+
+The complete expert mesh connects every attention replica, so all drivers
+synchronize their serving loops. This also holds with `ep=1`, where expert TP
+spans the entire world. A replica with no requests participates in empty
+execution while its peers have work. The serving domain is the complete world;
+no connected-component inference is needed.
 
 `ParallelGroups.create()` is collective over an initialized default world group,
 checks agreement on topology/backend, creates groups in deterministic order, and
@@ -66,7 +93,7 @@ only the groups it created, after workers stop; the caller owns the default worl
 
 ## One synchronous step
 
-Drivers in the TP world call `has_work()`, `step()`, and `close()` in matching
+Drivers in the same world call `has_work()`, `step()`, and `close()` in matching
 order. `submit()` and `cancel()` remain local operations; there is no request router.
 
 1. Drivers exchange read-only `Engine.next_phase()` proposals. When replicas
@@ -77,7 +104,7 @@ order. `submit()` and `cancel()` remain local operations; there is no request ro
 3. Actual plans rendezvous with empty or failed preparation on other drivers.
    This second exchange determines whether there is real work, computes logical
    replica capacities, and catches plan serialization errors before execution.
-4. Each driver broadcasts its logical plan to its TP/CP followers. All workers
+4. Each driver broadcasts its logical plan to all ranks in its request replica. All workers
    validate inputs and vote readiness before calling the model. An idle replica
    receives `plan=None` and participates in the model's empty execution path.
 5. Workers finish the forward callback and exchange execution status. The native
@@ -111,8 +138,11 @@ def forward_distributed(self, plan: BatchPlan | None, context: StepContext):
 and token counts, and `(sequence_count, token_count)` for each replica in driver
 rank order. `max_num_sequences` and `max_num_tokens` describe logical per-replica
 capacity. The model derives physical shard sizes and graph buckets from them.
-The coordinator broadcasts a logical plan; it does not mistake copying a plan
-for implementing CP attention or EP routing.
+CP groups are static across phases. The runner uses `context.phase` to shard
+attention tokens across CP ranks during prefill and replicate attention
+execution across those ranks during decode. The coordinator broadcasts the same
+logical plan within a replica; phase-specific CP behavior and expert routing
+belong to the model callback.
 
 An optional `validate_distributed(plan, context)` performs host checks before the
 readiness vote. The forward callback must preserve collective ordering and finish
@@ -123,10 +153,15 @@ commit. Failure marks all native Engines poisoned, preserving resources and
 preventing cleanup/reuse through normal Engine operations.
 
 Existing TP-only runtimes that use an injected TP group can continue implementing
-`forward(plan)` when `cp=ep=attn_dp=1`; attention TP and expert TP then both equal
-the total `tp`. GPT-OSS's `TensorParallelContext` can be constructed from
+`forward(plan)` with `ParallelTopology(world_size=2, attn_tp=2)`, for example when
+running GPT-OSS 120B over two ranks. Here `cp`, `ep`, and `attn_dp` remain one,
+and attention TP and expert TP both equal `world_size`. GPT-OSS's
+`TensorParallelContext` can be constructed from
 `groups.attn_tp.local_rank`, `groups.attn_tp.size`, and `groups.attn_tp.handle`
-(use `None` for a single-rank context). This prototype does not change current
+(use `None` for a single-rank context). The ordinary `forward(plan)` callback
+also remains allowed whenever `cp=ep=attn_dp=1`, including attention replication
+greater than one; the runtime owns weight preparation and communication across
+its attention and expert groups. This prototype does not change current
 deployment entry points or rewrite default-world assumptions inside existing models. Each model
 must use its supplied groups before it can support a composed TP/CP/EP/DP layout.
 

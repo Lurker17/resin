@@ -1,4 +1,4 @@
-"""Synchronous serving over a shared TP world with attention and expert meshes.
+"""Synchronous serving over shared ranks with attention and expert meshes.
 
 The Rust Engine retains scheduling and page ownership. This module coordinates
 its existing step boundary; model runtimes own partitioning and device collectives.
@@ -326,7 +326,7 @@ class DistributedWorker:
 class DistributedEngine:
     """One native request engine per attention-DP replica, plus coordinated steps.
 
-    Drivers in the same TP world call has_work(), step(), and close() in the
+    Drivers in the same topology call has_work(), step(), and close() in the
     same order. submit/cancel are local to an attention replica. There is no
     distributed request router or pending step API.
     """
