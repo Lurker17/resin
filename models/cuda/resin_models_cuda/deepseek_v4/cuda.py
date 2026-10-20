@@ -263,9 +263,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             tensor_parallel_size=self.tensor_parallel_size,
             device=self.device,
         )
-        for module in self._model.modules():
-            if isinstance(module, native_model.MoE):
-                module.prepare_fused_weights()
+        self._model.prepare_weights(self._allreduce.sum)
 
         self.cache_geometry = CacheGeometry.build(
             args.compress_ratios,

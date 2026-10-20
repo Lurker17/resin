@@ -16,6 +16,7 @@ from flashinfer.mhc import mhc_post
 from flashinfer.topk import top_k as flashinfer_top_k
 from torch import nn
 
+from resin.backend.loading import prepare_model
 from resin.backend.torch import use_default_dtype
 from resin.backend.transformer import RMSNorm as SharedRMSNorm
 from resin_models_cuda.deepseek_v4.attention import (
@@ -41,7 +42,6 @@ from resin_models_cuda.deepseek_v4.cutile import (
     hash_sqrt_softplus,
     index_scores,
     kv_norm_rope_store,
-    moe_act_quant,
     qk_norm_rope_block,
     qk_norm_rope_store,
     rope_last_block_inplace,
@@ -49,13 +49,12 @@ from resin_models_cuda.deepseek_v4.cutile import (
     top6_sqrt_softplus,
     verify_attention_metadata,
 )
+from resin_models_cuda.deepseek_v4.experts import RoutedExperts
 from resin_models_cuda.deepseek_v4.gemm import (
     dynamic_gemm_rows,
-    fp4_fused_moe,
     fp4_gemm,
     fp8_gemm,
     fp8_gemm_uses_packed_scales,
-    prepare_fp4_fused_moe_weights,
 )
 from resin_models_cuda.deepseek_v4.tilelang_kernels import mhc_pre_norm
 
@@ -1407,9 +1406,8 @@ class Expert(nn.Module):
         return self.w2(x.to(dtype))
 
 
-class MoE(nn.Module):
-    """Mixture-of-Experts: gate routes each token to top-k routed experts + 1 shared expert.
-    Experts are sharded across TP ranks; each rank handles n_routed_experts // world_size experts."""
+class MoEWeights(nn.Module):
+    """Checkpoint-shaped gate, shared expert and rank-local routed storage."""
 
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
@@ -1422,7 +1420,6 @@ class MoE(nn.Module):
         self.n_local_experts = args.n_routed_experts // world_size
         self.n_activated_experts = args.n_activated_experts
         self.swiglu_limit = args.swiglu_limit
-        self.allreduce: Callable[[torch.Tensor], torch.Tensor] = _distributed_sum
         self.decode_overlap_stream: torch.cuda.Stream | None = None
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
@@ -1524,40 +1521,20 @@ class MoE(nn.Module):
             args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit
         )
 
-    def _fused_experts(
-        self,
-        x: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        quantized, scales = moe_act_quant(x, block_size, scale_fmt, scale_dtype)
-        output = fp4_fused_moe(
-            quantized,
-            scales,
-            indices,
-            weights,
-            self._fused_w13_weight,
-            self._fused_w13_scale,
-            self._fused_w2_weight,
-            self._fused_w2_scale,
-            self._fused_output_scales,
-            self._fused_clamp_limits,
-            num_experts=self.n_routed_experts,
-            local_expert_offset=self.experts_start_idx,
-            scale_dtype=scale_dtype,
-        )
-        return output
+    def forward(self, *args, **kwargs):
+        raise RuntimeError("routed expert weights must be prepared before inference")
 
-    def prepare_fused_weights(self) -> None:
-        """Put loaded FP4 checkpoint weights in FlashInfer's runtime layout."""
 
-        if self._fused_fp4:
-            prepare_fp4_fused_moe_weights(
-                self._fused_w13_weight,
-                self._fused_w13_scale,
-                self._fused_w2_weight,
-                self._fused_w2_scale,
-            )
+class MoE(nn.Module):
+    """Architectural gating, routed execution and shared-expert composition."""
+
+    def __init__(self, source: MoEWeights, routed: nn.Module):
+        super().__init__()
+        self.dim = source.dim
+        self.gate = source.gate
+        self.shared_experts = source.shared_experts
+        self.routed = routed
+        self.decode_overlap_stream = source.decode_overlap_stream
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
@@ -1573,21 +1550,7 @@ class MoE(nn.Module):
                 shared = self.shared_experts(x)
 
         weights, indices = self.gate(x, input_ids.flatten())
-        if self._fused_fp4:
-            y = self._fused_experts(x, weights, indices)
-        else:
-            y = torch.zeros_like(x, dtype=torch.bfloat16)
-            counts = torch.bincount(
-                indices.flatten(), minlength=self.n_routed_experts
-            ).tolist()
-            for i in range(self.experts_start_idx, self.experts_end_idx):
-                if counts[i] == 0:
-                    continue
-                expert = self.experts[i]
-                idx, top = torch.where(indices == i)
-                y[idx] += expert(x[idx], weights[idx, top, None])
-        if world_size > 1:
-            y = self.allreduce(y)
+        y = self.routed(x, indices, weights)
         if main_stream is None:
             shared = self.shared_experts(x)
         else:
@@ -1610,7 +1573,7 @@ class Block(nn.Module):
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
         self.attn = self.attention_cls(layer_id, args)
-        self.ffn = MoE(layer_id, args)
+        self.ffn = MoEWeights(layer_id, args)
         self.prefill_ffn: Callable | None = None
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
@@ -1943,15 +1906,39 @@ class Transformer(nn.Module):
             self.hc_head_base = nn.Parameter(torch.empty(hc_mult))
             self.hc_head_scale = nn.Parameter(torch.empty(1))
 
+    def prepare_weights(self, reducer: Callable[[torch.Tensor], torch.Tensor]) -> None:
+        """Lower loaded expert containers into runtime modules owning reduction."""
+
+        prepare_model(
+            self,
+            lambda source: (
+                MoE(
+                    source,
+                    RoutedExperts(
+                        source,
+                        reduce=reducer,
+                        block_size=block_size,
+                        scale_fmt=scale_fmt,
+                        scale_dtype=scale_dtype,
+                    ),
+                )
+                if isinstance(source, MoEWeights)
+                else source
+            ),
+        )
+
     def set_allreduce(
         self,
         reducer: Callable[[torch.Tensor], torch.Tensor],
         *,
         indexer_reducer: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
-        """Install one runner-owned TP reduction policy on every collective."""
+        """Install TP reduction on embeddings, projections and indexers.
 
-        collective_types = (ParallelEmbedding, RowParallelLinear, Indexer, MoE)
+        Routed experts receive their reduction policy during weight preparation.
+        """
+
+        collective_types = (ParallelEmbedding, RowParallelLinear, Indexer)
         for module in self.modules():
             if isinstance(module, collective_types):
                 module.allreduce = (

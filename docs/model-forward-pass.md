@@ -28,6 +28,28 @@ and its separate
 Keep the model's lowering rule explicit: checkpoint encoding, kernel support,
 and transformations such as projection fusion are different decisions.
 
+DeepSeek's `MoEWeights` similarly exposes checkpoint expert names and aliased
+packed storage. `Transformer.prepare_weights()` lowers it to architectural
+`MoE(gate, routed, shared)` composition. The prepared `RoutedExperts` adopts the
+loaded buffers without copying, packs them once and owns the injected reduction
+policy. Checkpoint expert wrappers do not remain in the executable tree.
+
+Its call is `routed(hidden_rows, selected_experts, routing_weights)`, returning
+complete rows in the caller's order. The current implementation takes replicated
+token rows and sums rank-local expert contributions. A dispatched EP module
+would own communication buffers and its EP group behind the same layer call;
+the request scheduler and cache plan would not perform expert dispatch. Group
+participation is mandatory even when a rank has no selected local experts.
+Attention-DP serving additionally needs coordinated placeholder steps when a
+rank has no requests; that coordinator is not part of this prototype.
+
+This ownership follows DeepInfer's
+[`DeepseekMoE`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/models/v4_modules/mlp.py)
+and
+[`FusedExperts`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/models/v4_modules/moe.py).
+Resin keeps reduction injection explicit rather than reading a process-global
+group from the architectural forward.
+
 ## Shape rules
 
 - Write persistent kernels whose work is bounded by runtime metadata. Attention

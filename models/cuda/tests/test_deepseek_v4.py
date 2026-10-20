@@ -297,6 +297,15 @@ class TestDeepSeekV4Weights:
         module_path = (
             Path(__file__).parents[1] / "resin_models_cuda/deepseek_v4/model.py"
         )
+        experts_spec = importlib.util.spec_from_file_location(
+            "_resin_test_deepseek_v4_experts", module_path.with_name("experts.py")
+        )
+        assert experts_spec is not None and experts_spec.loader is not None
+        experts = importlib.util.module_from_spec(experts_spec)
+        experts_spec.loader.exec_module(experts)
+        monkeypatch.setitem(
+            sys.modules, "resin_models_cuda.deepseek_v4.experts", experts
+        )
         spec = importlib.util.spec_from_file_location(
             "_resin_test_deepseek_v4_model", module_path
         )
@@ -368,7 +377,7 @@ class TestDeepSeekV4Weights:
             expert_dtype="fp4",
         )
 
-        moe = native_model.MoE(0, args)
+        moe = native_model.MoEWeights(0, args)
 
         assert moe.experts[0] is None
         assert moe.experts[1] is None
@@ -401,6 +410,108 @@ class TestDeepSeekV4Weights:
         )
         assert routing_weights.dtype == torch.bfloat16
         assert expert_ids.dtype == torch.int32
+
+    def test_prepared_routed_experts_adopt_storage_and_own_reduction(self, monkeypatch):
+        native = self._native_model(monkeypatch)
+        execution = sys.modules["resin_models_cuda.deepseek_v4.experts"]
+        native.world_size, native.rank = 2, 1
+        args = native.ModelArgs(
+            vocab_size=256,
+            dim=128,
+            moe_inter_dim=128,
+            n_hash_layers=0,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            n_activated_experts=2,
+            expert_dtype="fp4",
+        )
+        source = native.MoEWeights(0, args)
+        loaded_weight = source._fused_w13_weight
+        calls = []
+        monkeypatch.setattr(
+            execution, "prepare_fp4_fused_moe_weights", lambda *w: calls.append("pack")
+        )
+        monkeypatch.setattr(execution, "moe_act_quant", lambda x, *a: (x, None))
+
+        def kernel(x, scales, indices, weights, *storage, **options):
+            assert storage[0] is loaded_weight
+            assert options["num_experts"] == 4
+            assert options["local_expert_offset"] == 2
+            return torch.full_like(x, 2)
+
+        def reduce(partial):
+            calls.append("reduce")
+            return partial * 10
+
+        monkeypatch.setattr(execution, "fp4_fused_moe", kernel)
+        with pytest.raises(RuntimeError, match="prepared"):
+            source(torch.ones(2, 128), torch.zeros(2, dtype=torch.long))
+        model = torch.nn.ModuleList([source])
+        native.Transformer.prepare_weights(model, reduce)
+        moe = model[0]
+        assert moe.routed.w13_weight is loaded_weight
+        assert not hasattr(moe, "experts") and not hasattr(moe, "_fused_w13_weight")
+        assert calls == ["pack"]
+        native.Transformer.prepare_weights(model, reduce)
+        assert model[0] is moe and calls == ["pack"]
+        assert source._fused_w13_weight is loaded_weight
+
+        class Gate(torch.nn.Module):
+            def forward(self, x, ids):
+                return torch.ones(2, 2), torch.tensor([[2, 3], [0, 1]])
+
+        moe.gate = Gate()
+        moe.shared_experts = torch.nn.Identity()
+        # Runtime ownership is captured; another model's topology cannot change it.
+        native.world_size, native.rank = 1, 0
+        output = moe(
+            torch.ones(2, 128, dtype=torch.bfloat16), torch.zeros(2, dtype=torch.long)
+        )
+        torch.testing.assert_close(output, torch.full_like(output, 21))
+        assert calls == ["pack", "reduce"]
+
+    def test_unfused_expert_shard_reduces_even_with_no_local_assignments(
+        self, monkeypatch
+    ):
+        native = self._native_model(monkeypatch)
+
+        class Expert(torch.nn.Module):
+            def forward(self, x, weights):
+                return x * weights * 3
+
+        source = SimpleNamespace(
+            n_routed_experts=4,
+            experts_start_idx=2,
+            experts_end_idx=3,
+            _fused_fp4=False,
+            experts=torch.nn.ModuleList([None, None, Expert(), None]),
+        )
+        partials = []
+
+        def reduce(partial):
+            partials.append(partial.clone())
+            return partial + 1
+
+        runtime = native.RoutedExperts(
+            source,
+            reduce=reduce,
+            block_size=128,
+            scale_fmt=None,
+            scale_dtype=torch.float32,
+        )
+        hidden = torch.ones(2, 8, dtype=torch.bfloat16)
+        result = runtime(
+            hidden,
+            torch.tensor([[2, 0], [1, 2]]),
+            torch.tensor([[0.25, 0.75], [0.5, 0.5]]),
+        )
+        torch.testing.assert_close(
+            result[:, 0], torch.tensor([1.75, 2.5], dtype=torch.bfloat16)
+        )
+        result = runtime(hidden, torch.zeros(2, 2, dtype=torch.long), torch.ones(2, 2))
+        assert torch.equal(partials[-1], torch.zeros_like(hidden))
+        assert torch.equal(result, torch.ones_like(hidden))
+        assert len(partials) == 2
 
 
 class TestDeepSeekV4Gemms:
