@@ -1,16 +1,17 @@
-"""Real CPU collectives exercise the shared eager expert-routing contract."""
+"""Real CPU collectives exercise variable and fixed-capacity expert dispatch."""
 
 from __future__ import annotations
 
 import multiprocessing
 import time
+from contextlib import nullcontext
 from datetime import timedelta
 
 import pytest
 import torch
 import torch.distributed as dist
 
-from resin.backend.expert_parallel import ExpertParallelDispatch
+from resin.backend.expert_parallel import ExpertParallelDispatch, fixed_expert_capacity
 from resin.backend.topology import RankGroup
 
 
@@ -55,17 +56,38 @@ def _ep_worker(rank: int, rendezvous: str) -> None:
                 result += (hidden + 0.125) * coefficient
             return result
 
-        def check(row_counts, *, replication=None, one_owner=False):
+        def check(
+            row_counts,
+            *,
+            replication=None,
+            one_owner=False,
+            capacity=None,
+            masked=False,
+        ):
             source = rank if replication is None else rank // 2
             rows = row_counts[source]
             hidden, indices, weights = _inputs(source, rows, one_owner=one_owner)
             dispatch = ExpertParallelDispatch(
                 local, num_experts=8, group=group, replication=replication
             )
-            output = dispatch(hidden, indices, weights)
+            context = (
+                nullcontext()
+                if capacity is None
+                else dispatch.fixed_capacity(
+                    capacity,
+                    valid_rows=torch.tensor(max(0, rows - 1)) if masked else None,
+                )
+            )
+            with context:
+                output = dispatch(hidden, indices, weights)
+            if masked:
+                weights[max(0, rows - 1) :].zero_()
             torch.testing.assert_close(output, _reference(hidden, indices, weights))
             counts = [None] * 4
             dist.all_gather_object(counts, received_rows[-1])
+            if capacity is not None:
+                assert counts == [4 * capacity] * 4
+                return
             expected_transfers = 0
             for source, count in enumerate(row_counts):
                 _, expert_ids, _ = _inputs(source, count, one_owner=one_owner)
@@ -79,6 +101,10 @@ def _ep_worker(rank: int, rendezvous: str) -> None:
         check([3, 2, 0, 1])
         check([1, 0, 4, 0], one_owner=True)
         check([0, 0, 0, 0])
+        check([3, 2, 0, 1], capacity=4)
+        check([1, 0, 4, 0], one_owner=True, capacity=4)
+        check([0, 0, 0, 0], capacity=4)
+        check([3, 2, 0, 1], capacity=4, masked=True)
         replication = None
         handles = []
         for ranks in [(0, 1), (2, 3)]:
@@ -90,6 +116,9 @@ def _ep_worker(rank: int, rendezvous: str) -> None:
         # Non-source ranks remain expert owners and receive remote tokens.
         check([3, 1], replication=replication)
         check([0, 2], replication=replication)
+        check([3, 1], replication=replication, capacity=4)
+        check([0, 2], replication=replication, capacity=4)
+        check([3, 1], replication=replication, capacity=4, masked=True)
 
         def precise_local(hidden, indices, weights):
             result = torch.zeros_like(hidden, dtype=torch.float32)
@@ -106,9 +135,11 @@ def _ep_worker(rank: int, rendezvous: str) -> None:
         indices = torch.tensor([[0, 2]], dtype=torch.int64)[:count]
         weights = torch.ones(count, 2, dtype=torch.float32)
         precise = ExpertParallelDispatch(precise_local, num_experts=8, group=group)
-        result = precise(hidden, indices, weights)
-        assert result.dtype == hidden.dtype
-        torch.testing.assert_close(result, torch.full_like(hidden, 2))
+        for context in (nullcontext(), precise.fixed_capacity(2)):
+            with context:
+                result = precise(hidden, indices, weights)
+            assert result.dtype == hidden.dtype
+            torch.testing.assert_close(result, torch.full_like(hidden, 2))
         for handle in handles:
             if handle != dist.GroupMember.NON_GROUP_MEMBER:
                 dist.destroy_process_group(handle)
@@ -135,3 +166,45 @@ def test_expert_dispatch_routes_unequal_batches_empty_sources_and_replication(tm
             if process.is_alive():
                 process.kill()
             process.join()
+
+
+def test_fixed_capacity_context_validates_and_restores():
+    dispatch = ExpertParallelDispatch(
+        lambda hidden, indices, weights: hidden,
+        num_experts=2,
+        group=RankGroup((0, 1), None, 0),
+    )
+    for value in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="positive integer"):
+            with dispatch.fixed_capacity(value):
+                pass
+    with dispatch.fixed_capacity(3):
+        assert dispatch._capacity == 3
+        with dispatch.fixed_capacity(2):
+            assert dispatch._capacity == 2
+        assert dispatch._capacity == 3
+        with pytest.raises(ValueError, match="4 rows but capacity is 3"):
+            dispatch(torch.empty(4, 2), torch.empty(4, 1), torch.empty(4, 1))
+    assert dispatch._capacity is None
+    with pytest.raises(ValueError, match="one integer tensor value"):
+        with dispatch.fixed_capacity(3, valid_rows=torch.tensor(1.5)):
+            pass
+
+
+def test_model_context_selects_and_restores_all_expert_transports():
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([torch.nn.Module(), torch.nn.Module()])
+    for layer in model.layers:
+        layer.dispatch = ExpertParallelDispatch(
+            lambda hidden, indices, weights: hidden,
+            num_experts=2,
+            group=RankGroup((0, 1), None, 0),
+        )
+    valid_rows = torch.tensor(2, dtype=torch.int32)
+    with fixed_expert_capacity(model, 4, valid_rows=valid_rows):
+        for layer in model.layers:
+            assert layer.dispatch._capacity == 4
+            assert layer.dispatch._valid_rows is valid_rows
+    for layer in model.layers:
+        assert layer.dispatch._capacity is None
+        assert layer.dispatch._valid_rows is None

@@ -442,13 +442,21 @@ class TestFlashInferMXFP4Adapter:
             assert weights.fc1_bias is prepared.fc1_bias
             assert not weights.fc2_bias.any()
             assert routing.selected_experts[:, 1:].eq(config.num_experts).all()
-            assert routing.expert_weights[:, 0].eq(1).all()
+            active = routing.selected_experts[:, 0] < config.num_experts
+            torch.testing.assert_close(routing.expert_weights[:, 0], active.float())
             assert not routing.expert_weights[:, 1:].any()
             calls.append(len(hidden))
-            values = torch.tensor([1000, -1000, 4, 0], dtype=torch.bfloat16)
+            values = torch.tensor(
+                [1000, -1000, 4, 0, float("nan")], dtype=torch.bfloat16
+            )
             return values[routing.selected_experts[:, 0].long(), None].expand(-1, 32)
 
         monkeypatch.setattr(kernel, "forward", unweighted)
+
+        def dynamic_shape(*args, **kwargs):
+            pytest.fail("partial execution must not compact routes dynamically")
+
+        monkeypatch.setattr(torch.Tensor, "nonzero", dynamic_shape)
         hidden = torch.ones(3, 32, dtype=torch.bfloat16)
         ids = torch.tensor([[0, 4, 4, 4], [1, 4, 4, 4], [0, 1, 2, 4]])
         scales = torch.tensor([[1, 0, 0, 0], [1, 0, 0, 0], [0.25, 0.5, 0.25, 0]])
@@ -458,7 +466,7 @@ class TestFlashInferMXFP4Adapter:
         torch.testing.assert_close(
             output[:, 0], torch.tensor([1000.75, -998.75, -248.1875])
         )
-        assert calls == [2, 2, 1]
+        assert calls == [2] * 6
         assert output[0, 0] + output[1, 0] == 2
         assert output[:2, 0].bfloat16().float().sum() == 0
         assert prepared.fc2_bias is bias and bias[0, 0] == 0.75
@@ -469,4 +477,16 @@ class TestFlashInferMXFP4Adapter:
             config,
         )
         assert empty.shape == (0, 32) and empty.dtype == torch.float32
-        assert calls == [2, 2, 1]
+        assert calls == [2] * 6
+
+        # Replaying the same row shape with different active routes keeps all
+        # kernel shapes and chunk counts stable, including entirely idle input.
+        idle = kernel.forward_partial(
+            hidden,
+            MoERouting(torch.zeros(3, 4), ids, torch.zeros_like(scales)),
+            prepared,
+            config,
+        )
+        assert idle.dtype == torch.float32
+        assert torch.equal(idle, torch.zeros_like(idle))
+        assert calls == [2] * 12

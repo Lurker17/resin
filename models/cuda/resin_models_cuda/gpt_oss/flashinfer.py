@@ -401,10 +401,15 @@ class FlashInferSM90MXFP4Kernel:
     ):
         """Keep weighted expert sums in FP32 until EP has combined all owners.
 
-        The pinned W4 kernel returns BF16. Give each selected assignment its
-        own row with unit weight and zero output bias, preserving its BF16
-        GEMM result. Apply output bias and routing weights in FP32 afterward,
+        The pinned W4 kernel returns BF16. Give each assignment its own row
+        with unit weight and zero output bias, preserving its BF16 GEMM
+        result. Apply output bias and routing weights in FP32 afterward,
         matching CUTLASS's finalizer order without rounding an owner sum.
+
+        Expansion and chunk sizes depend only on the input shape. Inactive
+        assignments keep the sentinel expert ID, so padded EP exchanges can
+        replay this operation in a CUDA graph without reading routing counts
+        back to the host or allocating tensors with data-dependent shapes.
         """
 
         self.validate(config)
@@ -414,19 +419,29 @@ class FlashInferSM90MXFP4Kernel:
             & (routing.selected_experts < config.num_experts)
             & (routing.expert_weights != 0)
         )
-        rows, slots = active.nonzero(as_tuple=True)
         # Both bias arguments must exist when FC1 has bias in the pinned ABI.
         # This view shares all packed weights; only the small zero bias is new.
         unbiased = replace(weights, fc2_bias=weights.fc2_zero_bias)
-        limit = self.capabilities.max_tokens or len(rows)
-        for start in range(0, len(rows), limit or 1):
-            token_rows, token_slots = (
-                rows[start : start + limit],
-                slots[start : start + limit],
+        assignments = hidden_states.shape[0] * config.top_k
+        limit = self.capabilities.max_tokens or assignments or 1
+        flat_experts = routing.selected_experts.reshape(-1)
+        flat_weights = routing.expert_weights.reshape(-1)
+        flat_active = active.reshape(-1)
+        for start in range(0, assignments, limit):
+            stop = min(start + limit, assignments)
+            count = stop - start
+            token_rows = (
+                torch.arange(
+                    start, stop, device=hidden_states.device, dtype=torch.int64
+                )
+                // config.top_k
             )
-            experts = routing.selected_experts[token_rows, token_slots].long()
+            selected_active = flat_active[start:stop]
+            experts = torch.where(
+                selected_active, flat_experts[start:stop], config.num_experts
+            )
             indices = torch.full(
-                (len(token_rows), config.top_k),
+                (count, config.top_k),
                 config.num_experts,
                 device=hidden_states.device,
                 dtype=torch.int32,
@@ -435,9 +450,9 @@ class FlashInferSM90MXFP4Kernel:
             scales = torch.zeros(
                 indices.shape, device=hidden_states.device, dtype=torch.float32
             )
-            scales[:, 0] = 1
+            scales[:, 0] = selected_active
             selected = MoERouting(
-                hidden_states.new_zeros((len(token_rows), config.num_experts)),
+                hidden_states.new_zeros((count, config.num_experts)),
                 indices,
                 scales,
             )
@@ -445,8 +460,10 @@ class FlashInferSM90MXFP4Kernel:
                 hidden_states[token_rows], selected, unbiased, config
             ).float()
             if weights.fc2_bias is not None:
-                output += weights.fc2_bias[experts, : config.hidden_size].float()
-            output *= routing.expert_weights[token_rows, token_slots, None].float()
+                safe_experts = experts.clamp(0, config.num_experts - 1).long()
+                output += weights.fc2_bias[safe_experts, : config.hidden_size].float()
+            output *= flat_weights[start:stop, None].float()
+            output.masked_fill_(~selected_active[:, None], 0)
             result.index_add_(0, token_rows, output)
         return result
 
