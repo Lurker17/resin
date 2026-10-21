@@ -1025,7 +1025,7 @@ def _run_speculative_validation(
         "world_size": world_size,
         "prompts": prompts,
         "speculative_tokens": speculative_tokens,
-        "speculative_contract": "masked-compressor-ring-v1",
+        "speculative_contract": "masked-ring-scaled-index-v2",
         "probe_tokens": SPECULATIVE_PROBE_TOKENS,
         "attention_contract": "fixed-swa128-canonical-selected-capacity",
     }

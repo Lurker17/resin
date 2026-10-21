@@ -1920,6 +1920,7 @@ def _compress_verify_finalize_kernel(
     rotate: _ConstantBool,
     parent_rows: _ConstantInt,
     packing: _ConstantInt,
+    row_scale: _ConstantInt,
     layer_offset: int,
     epsilon: float,
 ):
@@ -2021,8 +2022,7 @@ def _compress_verify_finalize_kernel(
         ).item()
         child_rows = parent_rows // packing
         cache_row = (
-            cache_parent * parent_rows
-            + cache_slot * child_rows
+            (cache_parent * parent_rows + cache_slot * child_rows) * row_scale
             + layer_offset
             + (token % 128) // ratio
         )
@@ -2116,6 +2116,7 @@ def compress_verify(
             rotate,
             cache_mapping.parent_rows,
             cache_mapping.packing,
+            cache_mapping.row_scale,
             cache_mapping.layer_offset,
             epsilon,
         ),

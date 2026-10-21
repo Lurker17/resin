@@ -428,7 +428,7 @@ def test_speculative_validation_uses_both_references_and_rejects_other_block_siz
     assert spawn.call_args.args[-1] == 2
     saved = torch.load(tmp_path / "baseline.pt", weights_only=True)
     assert saved["identity"]["speculative_tokens"] == 2
-    assert saved["identity"]["speculative_contract"] == "masked-compressor-ring-v1"
+    assert saved["identity"]["speculative_contract"] == "masked-ring-scaled-index-v2"
     assert saved["target_report"] == target
     assert saved["report"] == baseline
     spawn.reset_mock()

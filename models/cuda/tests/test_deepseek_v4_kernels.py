@@ -515,6 +515,81 @@ def test_overlap_compression_ignores_poisoned_future_ring_slots(
             graph.reset()
 
 
+@pytest.mark.parametrize("row_scale", [1, 4])
+@pytest.mark.parametrize("captured", [False, True])
+def test_compressor_finalize_writes_only_scaled_packed_cache_rows(
+    kernels, row_scale, captured
+):
+    # Indexer keys view the same 512D parent allocation as 128D rows. Their
+    # parent and child strides therefore scale by four, while the layer's
+    # offset is already expressed in the destination row width.
+    mapping = _mapping(divisor=4, row_scale=row_scale)
+    parents = torch.arange(1, 17, device="cuda", dtype=torch.int32).view(2, 8)
+    state_mapping = DeviceMapping(
+        parent_ids=parents,
+        child_slots=torch.zeros_like(parents),
+        first_blocks=torch.zeros(2, device="cuda", dtype=torch.int32),
+        block_tokens=4,
+        divisor=1,
+        parent_rows=128,
+        packing=1,
+        row_scale=1,
+        layer_offset=0,
+    )
+    positions = torch.tensor(
+        [[19, 20, 21, 22, 23, 24], [23, 24, 25, 26, 27, 28]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    values = torch.zeros(2, 6, 256, device="cuda")
+    gates = torch.zeros_like(values)
+    value_state = torch.zeros(17, 4, 256, device="cuda")
+    score_state = torch.zeros_like(value_state)
+    ape = torch.zeros(4, 256, device="cuda")
+    weight = torch.ones(128, device="cuda", dtype=torch.bfloat16)
+    frequencies = torch.zeros(128, 32, 2, device="cuda")
+    frequencies[..., 0] = 1
+    cache = torch.full((10240, 128), -7, device="cuda", dtype=torch.bfloat16)
+    expected = cache.clone()
+    complete = (positions + 1) % 4 == 0
+    expected[_rows(mapping, positions)[complete]] = 0
+
+    def launch():
+        kernels.compress_verify(
+            values,
+            gates,
+            ape,
+            value_state,
+            score_state,
+            weight,
+            frequencies,
+            cache,
+            positions,
+            4,
+            True,
+            1e-6,
+            cache_mapping=mapping,
+            state_mapping=state_mapping,
+            state_ring_size=16,
+        )
+
+    graph = None
+    try:
+        if captured:
+            launch()
+            cache.fill_(-7)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch()
+            graph.replay()
+        else:
+            launch()
+        torch.testing.assert_close(cache, expected, atol=0, rtol=0)
+    finally:
+        if graph is not None:
+            graph.reset()
+
+
 @pytest.mark.parametrize(
     "rows,dtype",
     [(rows, torch.bfloat16) for rows in (1, 8, 32, 129)]
