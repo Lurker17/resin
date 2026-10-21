@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from resin import BatchPhase, Parallelism
+from resin import BatchPhase, CacheGroupLayout, CacheLayout, Parallelism, RunnerConfig
 from resin.backend.cuda.graphs import CudaGraphMode
 from resin.backend.cuda.runner import CudaRunner
 from resin.backend.distributed import StepContext
@@ -34,6 +34,7 @@ class _CpuRunner(CudaRunner):
         self._cuda_failure = lambda: None
         self._cuda_graph_executor = None
         self._model = torch.nn.Module()
+        self.runner_config = RunnerConfig()
         self._configure_expert_parallel_graphs(self._model, groups)
         self._configure_cuda_graphs(
             {"decode": CudaGraphMode(shapes, lambda _: None, lambda _: {})}
@@ -229,6 +230,21 @@ def _selection_worker(rank, rendezvous):
         with pytest.raises((ValueError, RuntimeError), match="agree|policy|same"):
             policy.capture_cuda_graphs()
         assert not launched
+
+        # Equal physical graph shapes do not imply the same expert schedule:
+        # ordinary decode and different draft lengths have different rounds.
+        for lookaheads in ((0, 2), (2, 5)):
+            speculative = _CpuRunner(groups)
+            speculative.runner_config = RunnerConfig(
+                cache_layout=CacheLayout(64, [CacheGroupLayout(2)]),
+                cache_write_lookahead_tokens=lookaheads[rank],
+            )
+            speculative._cuda_graph_executor.capture_all = lambda **_: launched.append(
+                True
+            )
+            with pytest.raises(ValueError, match="agree"):
+                speculative.capture_cuda_graphs()
+            assert not launched
 
         # An agreed catalog reaches capture on both peers, rather than being
         # rejected simply because the attention replicas have unequal work.

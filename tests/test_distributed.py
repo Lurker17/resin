@@ -342,6 +342,30 @@ def _distributed_process(rank, world_size, rendezvous, directory):
         )
     with pytest.raises(DistributedExecutionError, match="configurations must agree"):
         DistributedWorker(divergent, groups)
+    for lookaheads in ((0, 2), (2, 5)):
+        divergent = CollectiveRunner(groups, "normal")
+        divergent.runner_config = RunnerConfig(
+            cache_layout=CacheLayout(64, [CacheGroupLayout(2)]),
+            cache_write_lookahead_tokens=lookaheads[
+                groups.topology.coordinates(rank)[0]
+            ],
+        )
+        with pytest.raises(DistributedExecutionError, match="lookahead must agree"):
+            DistributedWorker(divergent, groups)
+        assert divergent.calls == []
+
+    # Attention-DP replicas keep independent cache capacities and scheduling
+    # limits; only the collective decode protocol must match across them.
+    independent = CollectiveRunner(groups, "normal")
+    replica = groups.topology.coordinates(rank)[0]
+    independent.runner_config = RunnerConfig(
+        cache_layout=CacheLayout(64 + replica, [CacheGroupLayout(2)]),
+        max_batch_tokens=4 + replica,
+        prefill_chunk_size=2 + replica,
+        continuation_prefill=bool(replica),
+        cache_write_lookahead_tokens=2,
+    )
+    DistributedWorker(independent, groups)
     records = {}
     try:
         for case in (

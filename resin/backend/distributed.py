@@ -118,6 +118,7 @@ class DistributedWorker:
         self._entered = False
         self._step_id, self._phase = 0, None
         self._forward, self._validate = None, None
+        lookahead = None
         error = None
         try:
             self._forward = getattr(runner, "forward_distributed", None)
@@ -135,13 +136,23 @@ class DistributedWorker:
                     "CP, EP, and attention DP require forward_distributed(plan_or_none, context)"
                 )
             signature = _runner_signature(self.runner_config)
+            lookahead = self.runner_config.cache_write_lookahead_tokens
         except BaseException as exc:
             signature, error = None, _message(exc)
         configs = self._gather(groups.replica, (signature, error))
         error = next((item[1] for item in configs if item[1]), error)
         if any(item[0] != configs[0][0] for item in configs):
             error = "runner configurations must agree within each attention replica"
-        self._consensus(groups.domain, error)
+        # Replicas own independent caches and limits, but the lookahead fixes
+        # the distributed decode protocol and captured token capacities.
+        contracts = self._gather(groups.domain, (lookahead, error))
+        failure = _first_error(groups.domain, [item[1] for item in contracts])
+        if failure:
+            raise DistributedExecutionError(failure)
+        if any(item[0] != contracts[0][0] for item in contracts):
+            raise DistributedExecutionError(
+                "cache write lookahead must agree across the expert communication domain"
+            )
 
     def _gather(self, group: RankGroup, value):
         if group.size == 1:
