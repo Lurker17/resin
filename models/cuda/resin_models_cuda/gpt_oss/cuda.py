@@ -57,6 +57,7 @@ from resin.backend.cuda.runner import (
     pad_sampling_inputs,
 )
 from resin.backend.cuda.staging import TensorStager
+from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
 from resin.backend.paged_attention import PagedAttentionBatch
 from resin.backend.quantization import QuantizationConfig
 from resin.backend.sampling import format_output
@@ -457,6 +458,46 @@ class GptOssCudaRunner(CudaRunner):
             hidden_size=self.hidden_size,
             max_tokens=self.prefill_chunk_size,
         )
+        self._prefill_attention = self._configure_prefill_tensor_graphs(
+            tuple(
+                region
+                for index, layer in enumerate(self._model.model.layers)
+                for region in (
+                    CudaGraphTensorRegion(
+                        f"layer.{index}.qkv_rope",
+                        lambda hidden, cos, sin, attention=layer.self_attn: (
+                            self._attention_project(attention, hidden, cos, sin)
+                        ),
+                        inputs=(
+                            TensorSpec((self.hidden_size,)),
+                            TensorSpec((self.head_dim // 2,)),
+                            TensorSpec((self.head_dim // 2,)),
+                        ),
+                        output=TensorSpec(
+                            (
+                                (self.num_query_heads + 2 * self.num_kv_heads)
+                                * self.head_dim,
+                            )
+                        ),
+                    ),
+                    CudaGraphTensorRegion(
+                        f"layer.{index}.attention_output",
+                        lambda hidden, projection=layer.self_attn.o_proj: (
+                            self._attention_output_projection(projection, hidden)
+                        ),
+                        inputs=(TensorSpec((self.num_query_heads * self.head_dim,)),),
+                        output=TensorSpec(
+                            (self.hidden_size,),
+                            dtype=torch.float32
+                            if self.tensor_parallel.enabled
+                            else torch.bfloat16,
+                        ),
+                    ),
+                )
+            ),
+            max_tokens=self.prefill_chunk_size,
+            mode="prefill_attention",
+        )
 
     @classmethod
     def _graph_capture_inputs(
@@ -530,7 +571,65 @@ class GptOssCudaRunner(CudaRunner):
     ):
         token_count = hidden.shape[1]
         flat = hidden.reshape(token_count, self.hidden_size)
-        query, key, value = attention.qkv_proj(flat).split(
+        cos, sin = position_embeddings
+        projections = self._prefill_attention if self._prefill_graph_active else None
+        projected = (
+            projections[2 * layer_index](flat, cos.squeeze(0), sin.squeeze(0))
+            if projections is not None
+            else self._attention_project(
+                attention, flat, cos.squeeze(0), sin.squeeze(0)
+            )
+        )
+        output = self._attention_core(
+            layer_index,
+            attention,
+            projected,
+            batch,
+            context_parallel=context_parallel,
+            query_batch=query_batch,
+        )
+        if token_count == 0:
+            return hidden.new_empty((1, 0, self.hidden_size))
+        finished = (
+            projections[2 * layer_index + 1](output)
+            if projections is not None
+            else self._attention_output_projection(attention.o_proj, output)
+        )
+        return finished.unsqueeze(0)
+
+    def _attention_project(self, attention, hidden, cos, sin) -> Tensor:
+        """Project token rows and rotate Q/K without touching cache metadata."""
+
+        token_count = hidden.shape[0]
+        projected = attention.qkv_proj(hidden)
+        query, key, _value = projected.split(
+            (
+                self.num_query_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim,
+            ),
+            dim=-1,
+        )
+        query = query.view(token_count, self.num_query_heads, self.head_dim)
+        key = key.view(token_count, self.num_kv_heads, self.head_dim)
+        self._apply_yarn_rotary(query, cos.unsqueeze(0), sin.unsqueeze(0))
+        self._apply_yarn_rotary(key, cos.unsqueeze(0), sin.unsqueeze(0))
+        return projected
+
+    def _attention_core(
+        self,
+        layer_index: int,
+        attention,
+        projected: Tensor,
+        batch: DevicePagedAttentionBatch,
+        *,
+        context_parallel: ContextParallelTokens | None = None,
+        query_batch: DevicePagedAttentionBatch | None = None,
+    ) -> Tensor:
+        """Append actual K/V rows and attend with the current request metadata."""
+
+        token_count = projected.shape[0]
+        query, key, value = projected.split(
             (
                 self.num_query_heads * self.head_dim,
                 self.num_kv_heads * self.head_dim,
@@ -541,9 +640,6 @@ class GptOssCudaRunner(CudaRunner):
         query = query.view(token_count, self.num_query_heads, self.head_dim)
         key = key.view(token_count, self.num_kv_heads, self.head_dim)
         value = value.view(token_count, self.num_kv_heads, self.head_dim)
-        cos, sin = position_embeddings
-        query = self._apply_yarn_rotary(query, cos, sin)
-        key = self._apply_yarn_rotary(key, cos, sin)
         if context_parallel is not None:
             key, value = context_parallel.gather(key), context_parallel.gather(value)
         layer_type = attention.layer_type
@@ -571,7 +667,7 @@ class GptOssCudaRunner(CudaRunner):
             0, group.append_slots, value
         )
         if token_count == 0:
-            return hidden.new_empty((1, 0, self.hidden_size))
+            return projected.new_empty((0, self.num_query_heads * self.head_dim))
         if query_batch is not None:
             batch = query_batch
             group = batch.group("sliding" if sliding else "full")
@@ -601,9 +697,7 @@ class GptOssCudaRunner(CudaRunner):
             output = output[0]
         if output.dtype is not torch.bfloat16:
             raise TypeError("FA4 output tensor must be bfloat16")
-        return self._attention_output_projection(
-            attention.o_proj, output.reshape(token_count, -1)
-        ).unsqueeze(0)
+        return output.reshape(token_count, -1)
 
     def _attention_output_projection(self, projection, hidden: Tensor) -> Tensor:
         """Keep row-parallel GEMM partials unrounded until their TP reduction."""

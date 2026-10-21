@@ -17,11 +17,12 @@ from resin.backend.topology import RankGroup
 
 
 @pytest.mark.parametrize("ratio", [0, 4, 128])
+@pytest.mark.parametrize("captured_regions", [False, True])
 @pytest.mark.parametrize(
     "length,size,rank", [(5, 2, 0), (5, 2, 1), (1, 4, 0), (1, 4, 3)]
 )
 def test_prefill_context_ranks_update_full_state_and_compute_only_local_queries(
-    monkeypatch, ratio, length, size, rank
+    monkeypatch, ratio, captured_regions, length, size, rank
 ):
     native = _ModelFixture._native_model(monkeypatch)
     hidden = torch.arange(length * 4, dtype=torch.float32).view(1, length, 4)
@@ -63,6 +64,18 @@ def test_prefill_context_ranks_update_full_state_and_compute_only_local_queries(
     def qk_store(q, kv, norm, frequencies, cache, token_positions, epsilon, **kwargs):
         calls.append(("query", q.shape[1], token_positions.clone()))
 
+    def project(hidden):
+        calls.append(("project", hidden.clone()))
+        return hidden, hidden
+
+    def project_query(qr):
+        calls.append(("project_query", qr.clone()))
+        return qr * 2
+
+    def finish(output, token_positions):
+        calls.append(("finish", output.clone(), token_positions.clone()))
+        return output.squeeze(2)
+
     monkeypatch.setattr(native, "kv_norm_rope_store", kv_store)
     monkeypatch.setattr(native, "qk_norm_rope_block", qk_store)
     monkeypatch.setattr(native, "sparse_verify_attention", lambda q, *args: q)
@@ -83,9 +96,12 @@ def test_prefill_context_ranks_update_full_state_and_compute_only_local_queries(
         softmax_scale=0.5,
         _prepare_compression=lambda: None,
         _project=lambda x: (x, x),
+        prefill_project=project if captured_regions else None,
         wq_b=lambda x: x * 2,
+        prefill_query=project_query if captured_regions else None,
         _paged_attention_metadata=lambda *args: (None, None, None),
         _finish=lambda output, positions: output.squeeze(2),
+        prefill_finish=finish if captured_regions else None,
     )
     cache = SimpleNamespace(
         latents=torch.empty(8, 4),
@@ -120,6 +136,22 @@ def test_prefill_context_ranks_update_full_state_and_compute_only_local_queries(
             )
     assert [call[0] for call in calls].count("kv") == 1
     assert [call[0] for call in calls].count("query") == bool(tokens.plan.local_tokens)
+    assert [call[0] for call in calls].count("project") == captured_regions
+    assert [call[0] for call in calls].count("finish") == (
+        captured_regions and bool(tokens.plan.local_tokens)
+    )
+    assert [call[0] for call in calls].count("project_query") == (
+        captured_regions and bool(tokens.plan.local_tokens)
+    )
+    if captured_regions:
+        torch.testing.assert_close(calls[0][1], hidden)
+        for call in calls:
+            if call[0] == "finish":
+                torch.testing.assert_close(call[2], local_positions)
+            elif call[0] == "project_query":
+                torch.testing.assert_close(
+                    call[1], hidden[:, tokens.plan.start : tokens.plan.stop]
+                )
 
 
 @pytest.mark.parametrize("local_indices", [[1, 2], []])

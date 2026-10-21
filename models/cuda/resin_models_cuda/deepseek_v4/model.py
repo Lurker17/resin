@@ -1052,6 +1052,13 @@ class Attention(nn.Module):
 
         self.attention_workspace: torch.Tensor | None = None
         self.decode_overlap_stream: torch.cuda.Stream | None = None
+        self.prefill_project: (
+            Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]] | None
+        ) = None
+        self.prefill_query: Callable[[torch.Tensor], torch.Tensor] | None = None
+        self.prefill_finish: (
+            Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None
+        ) = None
         if self.compress_ratio:
             original_seq_len, rope_theta = (
                 args.original_seq_len,
@@ -1242,7 +1249,7 @@ class Attention(nn.Module):
         if context_parallel is not None and batch_size != 1:
             raise ValueError("DeepSeek context prefill requires one sequence")
         self._prepare_compression()
-        qr, kv = self._project(x)
+        qr, kv = (self.prefill_project or self._project)(x)
 
         if ratio:
             state_group = C4_STATE_GROUP if ratio == 4 else C128_STATE_GROUP
@@ -1296,7 +1303,9 @@ class Attention(nn.Module):
                 return context_parallel.gather(local).unsqueeze(0)
         else:
             query_positions = token_positions
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        q = (self.prefill_query or self.wq_b)(qr).unflatten(
+            -1, (self.n_local_heads, self.head_dim)
+        )
 
         # This fused normalization also stores local KV again. With CP these
         # writes match the complete store above, while keeping Q normalization
@@ -1330,7 +1339,7 @@ class Attention(nn.Module):
             self.attention_workspace,
             self.softmax_scale,
         )
-        output = self._finish(o, query_positions)
+        output = (self.prefill_finish or self._finish)(o, query_positions)
         if context_parallel is not None:
             output = context_parallel.gather(output.squeeze(0)).unsqueeze(0)
         return output

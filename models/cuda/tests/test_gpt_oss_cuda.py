@@ -571,7 +571,14 @@ class TestGptOssCudaNativePlan:
             build_attention_batches(_flat_plan([0], [PREFILL_CHUNK_SIZE + 1]))
 
     def test_cuda_attention_has_no_fp32_promotion_or_kv_head_expansion(self) -> None:
-        source = inspect.getsource(GptOssCudaRunner._attention)
+        source = "\n".join(
+            inspect.getsource(method)
+            for method in (
+                GptOssCudaRunner._attention,
+                GptOssCudaRunner._attention_project,
+                GptOssCudaRunner._attention_core,
+            )
+        )
         assert ".float(" not in source
         assert "repeat_interleave" not in source
         assert "repeat(" not in source

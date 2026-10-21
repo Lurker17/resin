@@ -193,9 +193,12 @@ def test_generated_compressed_geometry_is_shared_by_all_attention_phases(
         softmax_scale=0.5,
         _prepare_compression=lambda: None,
         _project=lambda hidden: (hidden, hidden),
+        prefill_project=None,
         wq_b=lambda hidden: hidden,
+        prefill_query=None,
         _paged_attention_metadata=metadata,
         _finish=lambda output, positions: output.squeeze(2),
+        prefill_finish=None,
     )
     cache = SimpleNamespace(
         latents=torch.empty(16, 4),
