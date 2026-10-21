@@ -33,6 +33,7 @@ class _ObservedRunner:
         self.calls: list[dict[str, object]] = []
         self.pool_ids: list[int] = []
         self.released: list[int] = []
+        self.decode_trace = None
 
     def __getattr__(self, name):
         return getattr(self.runner, name)
@@ -52,6 +53,11 @@ class _ObservedRunner:
         if validate is not None:
             validate(plan, context)
 
+    def forward(self, plan):
+        if self.decode_trace is not None:
+            return self.decode_trace.step(plan, lambda: self.runner.forward(plan))
+        return self.runner.forward(plan)
+
     def forward_distributed(self, plan, context):
         self.calls.append(
             {
@@ -69,7 +75,103 @@ class _ObservedRunner:
                 else list(map(int, plan.context_lengths)),
             }
         )
+        if self.decode_trace is not None:
+            return self.decode_trace.step(
+                plan, lambda: self.runner.forward_distributed(plan, context)
+            )
         return self.runner.forward_distributed(plan, context)
+
+
+class _DecodeTrace:
+    """Observe genuine model/sampler output before fixing the next engine token.
+
+    Graphs keep their captured sampler. Only the token returned to the Engine
+    is replaced after replay and logit capture, so every decode uses the same
+    baseline context even when the genuine greedy outputs differ.
+    """
+
+    def __init__(self, observed, forced_tokens=None):
+        self.observed, self.runner = observed, observed.runner
+        self.forced_tokens = forced_tokens
+        self.latest = None
+        self.graph_shape = None
+        self.logits, self.token_ids, self.advanced_token_ids = [], [], []
+        self.phases, self.input_token_ids, self.positions, self.graph_shapes = (
+            [],
+            [],
+            [],
+            [],
+        )
+
+    def __enter__(self):
+        if self.observed.decode_trace is not None:
+            raise RuntimeError("decode trace is already active")
+        self.head_hook = self.runner._model.head.register_forward_hook(
+            lambda module, inputs, output: setattr(self, "latest", output.detach())
+        )
+        self.original_graph = self.runner._run_cuda_graph
+
+        def graph(mode, shape, inputs):
+            output = self.original_graph(mode, shape, inputs)
+            if mode == "decode":
+                self.latest = self.runner._graph_logits[shape]
+                self.graph_shape = shape
+            return output
+
+        self.runner._run_cuda_graph = graph
+        self.observed.decode_trace = self
+        return self
+
+    def __exit__(self, *error):
+        self.observed.decode_trace = None
+        self.runner._run_cuda_graph = self.original_graph
+        self.head_hook.remove()
+
+    def step(self, plan, operation):
+        self.latest, self.graph_shape = None, None
+        output = operation()
+        if plan is None or plan.num_sequences != 1 or not plan.sampling_mask[0]:
+            return output
+        if self.latest is None:
+            raise AssertionError("generation omitted eager or graph decode logits")
+        index = len(self.logits)
+        values = self.latest.detach().float().cpu()[:1].clone()
+        if values.ndim != 2:
+            raise AssertionError("decode trace requires one vocabulary row")
+        ids = getattr(output, "token_ids", output)
+        genuine = int(ids[0])
+        advanced = genuine
+        if self.forced_tokens is not None:
+            if index >= len(self.forced_tokens):
+                raise AssertionError("decode exceeded the baseline token history")
+            if plan.needs_logprobs:
+                raise AssertionError("forced decode tracing uses token-only requests")
+            advanced = int(self.forced_tokens[index])
+        self.logits.append(values.squeeze(0))
+        self.token_ids.append(genuine)
+        self.advanced_token_ids.append(advanced)
+        self.phases.append("prefill" if plan.phase == BatchPhase.PREFILL else "decode")
+        self.input_token_ids.append(list(map(int, plan.token_ids)))
+        self.positions.append(list(map(int, plan.positions)))
+        self.graph_shapes.append(self.graph_shape)
+        return output if self.forced_tokens is None else [advanced]
+
+    def result(self):
+        if not self.logits:
+            raise AssertionError("decode trace did not record any sampled rows")
+        if self.forced_tokens is not None and len(self.logits) != len(
+            self.forced_tokens
+        ):
+            raise AssertionError("decode did not cover the baseline token history")
+        return {
+            "logits": torch.stack(self.logits),
+            "sampler_token_ids": self.token_ids,
+            "advanced_token_ids": self.advanced_token_ids,
+            "phases": self.phases,
+            "input_token_ids": self.input_token_ids,
+            "positions": self.positions,
+            "graph_shapes": self.graph_shapes,
+        }
 
 
 def _initialize(rank: int, port: int, world_size: int = WORLD_SIZE) -> None:
@@ -85,7 +187,15 @@ def _initialize(rank: int, port: int, world_size: int = WORLD_SIZE) -> None:
     )
 
 
-def _new_runner(rank, model_path, *, groups=None, world_size=WORLD_SIZE, graphs=False):
+def _new_runner(
+    rank,
+    model_path,
+    *,
+    groups=None,
+    world_size=WORLD_SIZE,
+    graphs=False,
+    decode_capacity=CONTEXT_LENGTH,
+):
     from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 
     parallel = (
@@ -104,7 +214,7 @@ def _new_runner(rank, model_path, *, groups=None, world_size=WORLD_SIZE, graphs=
         device=f"cuda:{rank}",
         cuda_graph_prefill="breakable" if graphs else "disabled",
         cuda_graph_decode="full" if graphs else "disabled",
-        cuda_graph_decode_shapes=((1, CONTEXT_LENGTH), (2, CONTEXT_LENGTH))
+        cuda_graph_decode_shapes=((1, decode_capacity), (2, CONTEXT_LENGTH))
         if graphs
         else None,
         speculative_tokens=0,
@@ -179,7 +289,9 @@ def _teacher_logits(engine, runner, prompts):
     return torch.stack(values)
 
 
-def _driver_workload(worker, prompts, *, numerical_directory=None):
+def _driver_workload(
+    worker, prompts, *, numerical_directory=None, decode_reference=None
+):
     groups = worker.groups
     dp = groups.topology.coordinates(groups.rank)[0]
     engine = DistributedEngine(worker, **_engine_options())
@@ -242,6 +354,25 @@ def _driver_workload(worker, prompts, *, numerical_directory=None):
                 _teacher_logits(engine, worker.runner.runner, prompts),
                 Path(numerical_directory, f"{groups.rank}.pt"),
             )
+            if decode_reference is not None:
+                with _DecodeTrace(
+                    worker.runner, decode_reference["advanced_token_ids"]
+                ) as trace:
+                    request = engine.submit(
+                        prompts["probe"],
+                        max_new_tokens=len(decode_reference["advanced_token_ids"]),
+                        sampling_params=SamplingParams(temperature=0.0),
+                    )
+                    _drain(engine, [])
+                    advanced = request.take_result()
+                traced = trace.result()
+                if advanced != traced["advanced_token_ids"]:
+                    raise AssertionError(
+                        "Engine did not advance the fixed decode history"
+                    )
+                torch.save(
+                    traced, Path(numerical_directory, f"decode-{groups.rank}.pt")
+                )
         return {
             "dp": dp,
             "workload_steps": workload_steps,
@@ -266,6 +397,8 @@ def _run_rank(
     attn_dp,
     topology=None,
     graphs=False,
+    decode_reference=None,
+    decode_capacity=CONTEXT_LENGTH,
 ):
     parallelism = Parallelism(
         **(topology or {"world_size": WORLD_SIZE, "ep": WORLD_SIZE, "attn_dp": attn_dp})
@@ -277,7 +410,13 @@ def _run_rank(
         start = time.perf_counter()
         print(f"[deepseek-v4 rank={rank}] loading {parallelism}", flush=True)
         runner = _ObservedRunner(
-            _new_runner(rank, model_path, groups=groups, graphs=graphs)
+            _new_runner(
+                rank,
+                model_path,
+                groups=groups,
+                graphs=graphs,
+                decode_capacity=decode_capacity,
+            )
         )
         if graphs:
             if not all(layer.ffn.routed.fused for layer in runner._model.layers):
@@ -298,6 +437,7 @@ def _run_rank(
                 worker,
                 prompts,
                 numerical_directory=report_directory if topology else None,
+                decode_reference=decode_reference,
             )
         else:
             worker.serve()
@@ -338,20 +478,22 @@ def _run_tp_baseline_rank(
     numerical=False,
 ):
     _initialize(rank, port, world_size)
-    runner = _new_runner(rank, model_path, world_size=world_size)
+    runner = _ObservedRunner(_new_runner(rank, model_path, world_size=world_size))
     engine = Engine(runner, **_engine_options())
     try:
-        request = engine.submit(
-            prompts["probe"], max_new_tokens=4, sampling_params=_sampling()
-        )
-        events = []
-        _drain(engine, events)
+        with _DecodeTrace(runner) as trace:
+            request = engine.submit(
+                prompts["probe"], max_new_tokens=4, sampling_params=_sampling()
+            )
+            events = []
+            _drain(engine, events)
         result = {"token_ids": request.take_result(), "events": events}
         if numerical:
             torch.save(
                 _teacher_logits(engine, runner, prompts),
                 Path(report_directory, f"{rank}.pt"),
             )
+            torch.save(trace.result(), Path(report_directory, f"decode-{rank}.pt"))
         torch.cuda.synchronize()
         dist.barrier()
         Path(report_directory, f"{rank}.json").write_text(json.dumps(result))
@@ -391,6 +533,9 @@ def _spawn(target, model_path, prompts, *extra, world_size=WORLD_SIZE):
             logits_path = Path(directory, f"{rank}.pt")
             if logits_path.exists():
                 record["_teacher_logits"] = torch.load(logits_path, weights_only=True)
+            decode_path = Path(directory, f"decode-{rank}.pt")
+            if decode_path.exists():
+                record["_decode_trace"] = torch.load(decode_path, weights_only=True)
             records.append(record)
         return records
 
@@ -567,11 +712,23 @@ def _logit_metrics(actual, expected):
     difference = actual.float() - expected.float()
     maximum = float(difference.abs().max())
     relative = float(difference.norm() / expected.float().norm().clamp_min(1e-12))
+    offsets = difference.mean(dim=-1)
+    expected_logprobs = expected.float().log_softmax(dim=-1)
+    actual_logprobs = actual.float().log_softmax(dim=-1)
     result = {
         "contexts": actual.shape[0],
         "max_abs": maximum,
         "rms": float(difference.square().mean().sqrt()),
         "relative_l2": relative,
+        "logit_offsets": offsets.tolist(),
+        "centered_rms": float((difference - offsets[..., None]).square().mean().sqrt()),
+        "kl_expected_actual": (
+            expected_logprobs.exp() * (expected_logprobs - actual_logprobs)
+        )
+        .sum(dim=-1)
+        .tolist(),
+        "expected_top_token_ids": expected.argmax(dim=-1).tolist(),
+        "actual_top_token_ids": actual.argmax(dim=-1).tolist(),
         "max_abs_tolerance": 0.5,
         "relative_l2_tolerance": 0.02,
         "passed": bool(torch.isfinite(actual).all())
@@ -579,6 +736,39 @@ def _logit_metrics(actual, expected):
         and relative <= 0.02,
     }
     return result
+
+
+def _decode_comparison(actual, expected):
+    """Compare distributions only after checking the fixed token contexts."""
+
+    contexts_match = (
+        actual["advanced_token_ids"] == expected["advanced_token_ids"]
+        and actual["phases"] == expected["phases"]
+        and all(
+            actual[field][index] == expected[field][index]
+            for index, phase in enumerate(expected["phases"])
+            if phase == "decode"
+            for field in ("input_token_ids", "positions")
+        )
+    )
+    comparisons = [
+        {
+            "token_index": index,
+            "phase": expected["phases"][index],
+            **_logit_metrics(value[None], reference[None]),
+        }
+        for index, (value, reference) in enumerate(
+            zip(actual["logits"], expected["logits"], strict=True)
+        )
+    ]
+    return {
+        **{key: value for key, value in actual.items() if key != "logits"},
+        "contexts_match": contexts_match,
+        "sampler_matches_baseline": actual["sampler_token_ids"]
+        == expected["sampler_token_ids"],
+        "comparisons": comparisons,
+        "passed": contexts_match and all(value["passed"] for value in comparisons),
+    }
 
 
 def run_composable_validation(
@@ -589,12 +779,16 @@ def run_composable_validation(
     diagnostic_path=None,
     case_names=None,
     baseline_path=None,
+    graphs=True,
+    decode_capacity=CONTEXT_LENGTH,
 ):
     """Compare composed graph layouts with an independent eager TP reference."""
 
     world_size = torch.cuda.device_count()
     if world_size not in (2, 4):
         raise RuntimeError("composable validation requires two or four CUDA devices")
+    if type(decode_capacity) is not int or not 2 <= decode_capacity <= CONTEXT_LENGTH:
+        raise ValueError(f"decode_capacity must be between 2 and {CONTEXT_LENGTH}")
     if any(
         not prompt or len(prompt) + 6 > CONTEXT_LENGTH for prompt in prompts.values()
     ):
@@ -629,6 +823,7 @@ def run_composable_validation(
             world_size=world_size,
         )[0]
         expected = baseline.pop("_teacher_logits")
+        decode_reference = baseline.pop("_decode_trace", None)
     else:
         saved = torch.load(baseline_path, weights_only=True)
         if saved["identity"] != identity:
@@ -636,24 +831,38 @@ def run_composable_validation(
                 "reused baseline must match checkpoint, GPU count and prompts"
             )
         baseline, expected = saved["report"], saved["teacher_logits"]
+        decode_reference = saved.get("decode_trace")
         print(f"[deepseek-v4] reusing eager baseline from {baseline_path}", flush=True)
     if directory is not None:
         torch.save(
-            {"identity": identity, "report": baseline, "teacher_logits": expected},
+            {
+                "numerical_version": 2 if decode_reference is not None else 1,
+                "identity": identity,
+                "report": baseline,
+                "teacher_logits": expected,
+                "decode_trace": decode_reference,
+            },
             directory / "baseline.pt",
         )
         (directory / "baseline.json").write_text(json.dumps(baseline, indent=2))
     reports = []
     result = {
-        "graphs": {"prefill": "breakable", "decode": "full"},
+        "graphs": {
+            "prefill": "breakable" if graphs else "disabled",
+            "decode": "full" if graphs else "disabled",
+        },
+        "decode_shapes": ((1, decode_capacity), (2, CONTEXT_LENGTH)) if graphs else (),
         "speculative_tokens": 0,
         "world_size": world_size,
         "selected_cases": selected,
         "diagnostic_path": None if directory is None else str(directory),
         "eager_tp_baseline": baseline,
+        "decode_reference_available": decode_reference is not None,
         "comparison_policy": (
-            "Four identical teacher-forced contexts use fixed BF16 logit tolerances; "
-            "greedy sequence matches are reported separately. CP replicates KV/compressor state."
+            "Fixed prefill and decode contexts use unchanged BF16 logit tolerances. "
+            "Decode records genuine sampler outputs before fixing only the Engine's "
+            "next token; graph samplers remain captured. Legacy baselines omit decode "
+            "validation. CP replicates KV/compressor state."
         ),
         "cases": reports,
         "status": "running",
@@ -674,7 +883,9 @@ def run_composable_validation(
                 prompts,
                 topology["attn_dp"],
                 topology,
-                True,
+                graphs,
+                decode_reference,
+                decode_capacity,
                 world_size=world_size,
             )
             actual_logits = {
@@ -684,7 +895,15 @@ def run_composable_validation(
             }
             if directory is not None:
                 torch.save(actual_logits, directory / f"{name}-logits.pt")
+            decode_traces = {
+                record["rank"]: record.pop("_decode_trace")
+                for record in records
+                if "_decode_trace" in record
+            }
+            if directory is not None:
+                torch.save(decode_traces, directory / f"{name}-decode.pt")
             comparisons = []
+            decode_comparisons = []
             for record in records:
                 if record["driver"]:
                     actual = actual_logits.get(record["rank"])
@@ -695,11 +914,31 @@ def run_composable_validation(
                     comparisons.append(
                         {"rank": record["rank"], **_logit_metrics(actual, expected)}
                     )
+                    if decode_reference is not None:
+                        traced = decode_traces.get(record["rank"])
+                        if traced is None:
+                            raise AssertionError("replica driver omitted decode trace")
+                        decode_comparisons.append(
+                            {
+                                "rank": record["rank"],
+                                **_decode_comparison(traced, decode_reference),
+                            }
+                        )
             report = {
                 "name": name,
                 "parallelism": topology,
                 "ranks": records,
                 "teacher_forced_comparisons": comparisons,
+                "teacher_forced_decode": {
+                    "status": (
+                        "passed"
+                        if all(value["passed"] for value in decode_comparisons)
+                        else "failed"
+                    )
+                    if decode_reference is not None
+                    else "skipped_legacy_baseline",
+                    "ranks": decode_comparisons,
+                },
             }
             reports.append(report)
             if directory is not None:
@@ -711,7 +950,7 @@ def run_composable_validation(
                     topology["attn_dp"],
                     vocab_size,
                     topology=topology,
-                    graphs=True,
+                    graphs=graphs,
                 )
             )
             report["probe_matches_eager_tp"] = [
@@ -726,6 +965,11 @@ def run_composable_validation(
             if not all(comparison["passed"] for comparison in comparisons):
                 raise AssertionError(
                     f"{name}: same-context model logits exceed tolerance: {comparisons}"
+                )
+            if not all(comparison["passed"] for comparison in decode_comparisons):
+                raise AssertionError(
+                    f"{name}: fixed-context decode logits exceed tolerance: "
+                    f"{decode_comparisons}"
                 )
         except BaseException as error:
             result.update(

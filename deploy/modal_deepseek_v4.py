@@ -61,31 +61,39 @@ CHECKPOINT_PATTERNS = (
     "encoding/*.md",
 )
 
-image = build_modal_image(
-    ROOT,
-    env={
-        "CC": "gcc",
-        "CXX": "g++",
-        "TORCH_CUDA_ARCH_LIST": "10.3",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        "FLASHINFER_WORKSPACE_BASE": "/kernel-cache",
-        # Keep lazy kernel work visible without DeepGEMM's per-launch debug
-        # dump. Compiler commands appear only for an actual cache miss.
-        "FLASHINFER_LOGGING_LEVEL": "INFO",
-        "FLASHINFER_LOG_LEVEL": "INFO",
-        "FLASHINFER_JIT_VERBOSE": "1",
-        "CUDA_TILE_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/cutile-python",
-        "DG_JIT_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/deep_gemm",
-        "DG_JIT_DEBUG": "0",
-        "DG_JIT_PRINT_COMPILER_COMMAND": "1",
-        "DG_JIT_PRINT_LOAD_TIME": "1",
-        "TRITON_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/triton",
-        "TILELANG_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/tilelang",
-    },
-).add_local_file(
-    ROOT / "deploy/deepseek_v4_parallel_validation.py",
-    "/root/deploy/deepseek_v4_parallel_validation.py",
-    copy=True,
+image = (
+    build_modal_image(
+        ROOT,
+        env={
+            "CC": "gcc",
+            "CXX": "g++",
+            "TORCH_CUDA_ARCH_LIST": "10.3",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "FLASHINFER_WORKSPACE_BASE": "/kernel-cache",
+            # Keep lazy kernel work visible without DeepGEMM's per-launch debug
+            # dump. Compiler commands appear only for an actual cache miss.
+            "FLASHINFER_LOGGING_LEVEL": "INFO",
+            "FLASHINFER_LOG_LEVEL": "INFO",
+            "FLASHINFER_JIT_VERBOSE": "1",
+            "CUDA_TILE_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/cutile-python",
+            "DG_JIT_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/deep_gemm",
+            "DG_JIT_DEBUG": "0",
+            "DG_JIT_PRINT_COMPILER_COMMAND": "1",
+            "DG_JIT_PRINT_LOAD_TIME": "1",
+            "TRITON_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/triton",
+            "TILELANG_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/tilelang",
+        },
+    )
+    .add_local_file(
+        ROOT / "deploy/deepseek_v4_parallel_validation.py",
+        "/root/deploy/deepseek_v4_parallel_validation.py",
+        copy=True,
+    )
+    .add_local_file(
+        ROOT / "deploy/deepseek_v4_expert_probe.py",
+        "/root/deploy/deepseek_v4_expert_probe.py",
+        copy=True,
+    )
 )
 
 with image.imports():
@@ -1258,6 +1266,48 @@ def validate_kernels() -> dict[str, object]:
 
 
 @app.function(
+    gpu=["B300:1", "B200:1"],
+    env={"TORCH_CUDA_ARCH_LIST": "10.0;10.3"},
+    cpu=4,
+    memory=16 * 1024,
+    timeout=20 * 60,
+    single_use_containers=True,
+)
+def probe_experts() -> dict[str, object]:
+    """Compare FP4 kernel shard and batch semantics without loading a model."""
+
+    from deploy.deepseek_v4_expert_probe import run_probe
+
+    kernel_cache_volume.reload()
+    try:
+        report = {
+            "small": run_probe(),
+            "model_geometry": run_probe(
+                hidden_size=4096,
+                intermediate_size=2048,
+                experts=8,
+                top_k=6,
+                row_counts=(1, 8, 32),
+            ),
+            "checkpoint": run_probe(
+                checkpoint_path=_require_checkpoint(_model_spec(DEFAULT_MODEL_KEY))[0],
+                experts=256,
+                row_counts=(1, 8, 32),
+                probe_deep_gemm=True,
+            ),
+        }
+        destination = Path(PROFILE_MOUNT) / datetime.now(timezone.utc).strftime(
+            "expert-probe-%Y%m%dT%H%M%SZ.json"
+        )
+        destination.write_text(json.dumps(report, indent=2, sort_keys=True))
+        report["remote_report_path"] = str(destination)
+        profile_volume.commit()
+        return report
+    finally:
+        kernel_cache_volume.commit()
+
+
+@app.function(
     image=image.uv_pip_install("pytest>=8,<9").add_local_file(
         ROOT / "tests/test_expert_parallel_gpu.py",
         "/opt/resin/validation/test_expert_parallel_gpu.py",
@@ -1284,6 +1334,10 @@ def _validate_parallel(
     *,
     include_tp_baseline: bool = False,
     composable: bool = False,
+    case_names: tuple[str, ...] | None = None,
+    baseline_path: str | None = None,
+    graphs: bool = True,
+    decode_capacity: int = 512,
 ) -> dict[str, object]:
     """Share checkpoint, routing reference and report handling across GPU sizes."""
 
@@ -1351,16 +1405,35 @@ def _validate_parallel(
         f"[deepseek-v4] validating complete Flash checkpoint on {world_size} Blackwell GPUs",
         flush=True,
     )
-    report = (
-        run_composable_validation(model_path, prompts, vocab_size=len(tokenizer))
-        if composable
-        else run_parallel_validation(
+    if composable:
+        diagnostic_directory = Path(PROFILE_MOUNT) / datetime.now(
+            timezone.utc
+        ).strftime("composable-%Y%m%dT%H%M%SZ")
+        print(
+            f"[deepseek-v4] persistent diagnostics: {diagnostic_directory}", flush=True
+        )
+        try:
+            report = run_composable_validation(
+                model_path,
+                prompts,
+                vocab_size=len(tokenizer),
+                diagnostic_path=diagnostic_directory,
+                case_names=case_names,
+                baseline_path=baseline_path,
+                graphs=graphs,
+                decode_capacity=decode_capacity,
+            )
+        finally:
+            # Keep the baseline, failing tensors and metrics when a check raises.
+            profile_volume.commit()
+            kernel_cache_volume.commit()
+    else:
+        report = run_parallel_validation(
             model_path,
             prompts,
             vocab_size=len(tokenizer),
             include_tp_baseline=include_tp_baseline,
         )
-    )
     report.update(
         {
             "checkpoint": checkpoint,
@@ -1402,14 +1475,27 @@ def _validate_parallel(
     timeout=4 * 60 * 60,
     single_use_containers=True,
 )
-def validate_composable(model_key: str = DEFAULT_MODEL_KEY) -> dict[str, object]:
+def validate_composable(
+    model_key: str = DEFAULT_MODEL_KEY,
+    case_names: tuple[str, ...] | None = None,
+    baseline_path: str | None = None,
+    graphs: bool = True,
+    decode_capacity: int = 512,
+) -> dict[str, object]:
     """Run real FP4 models with composed meshes, graph replay and logit checks."""
 
     if model_key != DEFAULT_MODEL_KEY:
         raise ValueError(
             "composable validation currently requires the Flash checkpoint"
         )
-    return _validate_parallel(model_key, composable=True)
+    return _validate_parallel(
+        model_key,
+        composable=True,
+        case_names=case_names,
+        baseline_path=baseline_path,
+        graphs=graphs,
+        decode_capacity=decode_capacity,
+    )
 
 
 @app.function(
@@ -1538,6 +1624,10 @@ def main(
     speculative_tokens: int = DSPARK_TOKENS,
     model: str = DEFAULT_MODEL_KEY,
     parallel_baseline: bool = False,
+    parallel_cases: str | None = None,
+    parallel_baseline_path: str | None = None,
+    parallel_graphs: bool = True,
+    parallel_decode_capacity: int = 512,
     report_path: str | None = None,
 ) -> None:
     model_spec = _model_spec(model)
@@ -1545,10 +1635,25 @@ def main(
         report = cache_checkpoint.remote(model_spec.key)
     elif mode in {"validate-kernels", "validate-window"}:
         report = validate_kernels.remote()
+    elif mode == "probe-experts":
+        report = probe_experts.remote()
     elif mode == "validate-parallel":
         report = validate_parallel.remote(model_spec.key, parallel_baseline)
     elif mode == "validate-composable":
-        report = validate_composable.remote(model_spec.key)
+        case_names = (
+            None
+            if parallel_cases is None
+            else tuple(
+                name.strip() for name in parallel_cases.split(",") if name.strip()
+            )
+        )
+        report = validate_composable.remote(
+            model_spec.key,
+            case_names,
+            parallel_baseline_path,
+            parallel_graphs,
+            parallel_decode_capacity,
+        )
     elif mode == "bench-tp2":
         if model_spec.key != DEFAULT_MODEL_KEY:
             raise ValueError("bench-tp2 currently supports only flash-0731")
@@ -1577,7 +1682,7 @@ def main(
         )
     else:
         raise ValueError(
-            "mode must be 'download', 'validate-kernels', 'validate-parallel', 'validate-composable', 'bench-tp2', 'bench-tp4', 'run', 'real', "
+            "mode must be 'download', 'validate-kernels', 'probe-experts', 'validate-parallel', 'validate-composable', 'bench-tp2', 'bench-tp4', 'run', 'real', "
             "or 'profile'"
         )
     if mode in {"validate-parallel", "validate-composable"} or report_path is not None:
