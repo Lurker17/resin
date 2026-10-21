@@ -1787,7 +1787,16 @@ def _compress_ring_kernel(
             if overlap:
                 old_mask = (age >= ratio) & (age < 2 * ratio)
                 new_mask = age < ratio
-                pooled_values = ct.cat((first_values, second_values), axis=1)
+                # Future and unused ring slots can contain arbitrary reused
+                # memory. Mask values as well as scores: zero softmax weights
+                # do not suppress NaNs in an unselected value (0 * NaN).
+                pooled_values = ct.cat(
+                    (
+                        ct.where(old_mask, first_values, 0.0),
+                        ct.where(new_mask, second_values, 0.0),
+                    ),
+                    axis=1,
+                )
                 pooled_scores = ct.cat(
                     (
                         ct.where(old_mask, first_scores, float("-inf")),

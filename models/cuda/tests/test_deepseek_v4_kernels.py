@@ -356,6 +356,165 @@ def test_rejected_compressor_cleanup_preserves_accepted_and_unrelated_rows(kerne
     torch.testing.assert_close(scores, expected_scores, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("draft_tokens", [1, 2, 5])
+@pytest.mark.parametrize("captured", [False, True])
+def test_overlap_compression_ignores_poisoned_future_ring_slots(
+    kernels, draft_tokens, captured
+):
+    """Compare pooled FP32 rows with a sequential oracle after rejected tails."""
+
+    batch_size, dimension, ratio = 2, 64, 4
+    block_length = draft_tokens + 1
+    ring_size = 1 << (8 + draft_tokens - 1).bit_length()
+    parents = torch.randperm(24, device="cuda").view(2, 12).int() + 1
+    slots = torch.arange(12, device="cuda", dtype=torch.int32).expand(2, -1) % 2
+    state_mapping = DeviceMapping(
+        parent_ids=parents,
+        child_slots=slots,
+        first_blocks=torch.zeros(2, device="cuda", dtype=torch.int32),
+        block_tokens=4,
+        divisor=1,
+        parent_rows=128,
+        packing=2,
+        row_scale=1,
+        layer_offset=0,
+    )
+    cache_mapping = DeviceMapping(
+        parent_ids=torch.tensor([[1], [2]], device="cuda", dtype=torch.int32),
+        child_slots=torch.zeros(2, 1, device="cuda", dtype=torch.int32),
+        first_blocks=torch.zeros(2, device="cuda", dtype=torch.int32),
+        block_tokens=128,
+        divisor=ratio,
+        parent_rows=128,
+        packing=1,
+        row_scale=1,
+        layer_offset=0,
+    )
+    value_state = torch.empty(50, 4, 2 * dimension, device="cuda")
+    score_state = torch.empty_like(value_state)
+    values = torch.empty(batch_size, block_length, 2 * dimension, device="cuda")
+    gates = torch.empty_like(values)
+    positions = torch.empty(batch_size, block_length, device="cuda", dtype=torch.int32)
+    ape = torch.randn(ratio, 2 * dimension, device="cuda") * 0.05
+    weight = torch.ones(dimension, device="cuda", dtype=torch.bfloat16)
+    frequencies = torch.zeros(128, 32, 2, device="cuda")
+    frequencies[..., 0] = 1
+    cache = torch.full((384, dimension), -7, device="cuda", dtype=torch.bfloat16)
+    history_values = torch.randn(batch_size, 64, 2 * dimension, device="cuda")
+    history_gates = torch.randn_like(history_values)
+    starts = (19, 23)
+
+    def state_locations(batch, times):
+        columns = times // 4
+        return parents[batch, columns].long() * 2 + slots[
+            batch, columns
+        ].long(), times % 4
+
+    def restore_committed_history(step):
+        # A prefix can be restored into arbitrary reused memory. Neither NaN
+        # values nor extreme unused scores may enter a completed live window.
+        value_state.fill_(float("nan"))
+        value_state[..., ::3] = 1e20
+        score_state.fill_(float("nan"))
+        score_state[..., ::2] = -1e20
+        for batch, start in enumerate(starts):
+            times = torch.arange(start + step, device="cuda")
+            pages, offsets = state_locations(batch, times)
+            value_state[pages, offsets] = history_values[batch, times]
+            score_state[pages, offsets] = (
+                history_gates[batch, times] + ape[times % ratio]
+            )
+
+    def launch():
+        kernels.compress_verify(
+            values,
+            gates,
+            ape,
+            value_state,
+            score_state,
+            weight,
+            frequencies,
+            cache,
+            positions,
+            ratio,
+            False,
+            1e-6,
+            cache_mapping=cache_mapping,
+            state_mapping=state_mapping,
+            state_ring_size=ring_size,
+        )
+
+    graph = None
+    try:
+        for step in range(5):
+            raw = torch.randn_like(values)
+            raw_gates = torch.randn_like(gates)
+            times = (
+                torch.tensor(starts, device="cuda")[:, None]
+                + step
+                + torch.arange(block_length, device="cuda")
+            )
+            expected = raw.clone()
+            for batch in range(batch_size):
+                reference_values = history_values[batch].clone()
+                reference_gates = history_gates[batch].clone()
+                for index in range(block_length):
+                    token = int(times[batch, index])
+                    reference_values[token] = raw[batch, index]
+                    reference_gates[token] = raw_gates[batch, index]
+                    if (token + 1) % ratio:
+                        continue
+                    old = torch.arange(token - 7, token - 3, device="cuda")
+                    new = old + ratio
+                    pooled_values = torch.cat(
+                        (
+                            reference_values[old, :dimension],
+                            reference_values[new, dimension:],
+                        )
+                    )
+                    pooled_scores = torch.cat(
+                        (
+                            reference_gates[old, :dimension]
+                            + ape[old % ratio, :dimension],
+                            reference_gates[new, dimension:]
+                            + ape[new % ratio, dimension:],
+                        )
+                    )
+                    expected[batch, index, :dimension] = (
+                        pooled_values * pooled_scores.softmax(0)
+                    ).sum(0)
+
+            # Keep stale rejected tails for some rounds and reconstruct the
+            # committed prefix into poisoned storage for others.
+            if step in (0, 2, 4):
+                restore_committed_history(step)
+            values.copy_(raw)
+            gates.copy_(raw_gates)
+            positions.copy_(times)
+            if captured and graph is None:
+                launch()  # Compile before capture, then restore its state writes.
+                restore_committed_history(step)
+                values.copy_(raw)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    launch()
+            if graph is None:
+                launch()
+            else:
+                graph.replay()
+
+            assert values.isfinite().all()
+            torch.testing.assert_close(values, expected, atol=2e-6, rtol=2e-5)
+            # Accept only the anchor; all other verification inputs are
+            # rejected and replaced by new projections on the next replay.
+            for batch, start in enumerate(starts):
+                history_values[batch, start + step] = raw[batch, 0]
+                history_gates[batch, start + step] = raw_gates[batch, 0]
+    finally:
+        if graph is not None:
+            graph.reset()
+
+
 @pytest.mark.parametrize(
     "rows,dtype",
     [(rows, torch.bfloat16) for rows in (1, 8, 32, 129)]

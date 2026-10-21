@@ -12,6 +12,26 @@ from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLay
 from resin_models_cuda.deepseek_v4.weights import load_deepseek_v4_weights
 
 
+@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("draft_tokens", [0, 1, 2, 5])
+def test_compressor_ring_preserves_the_anchor_window_before_speculative_tail(
+    monkeypatch, ratio, draft_tokens
+):
+    native = _ModelFixture._native_model(monkeypatch)
+    args = native.ModelArgs(dim=64, head_dim=64, dspark_block_size=draft_tokens)
+    compressor = native.Compressor(args, ratio, head_dim=64)
+    logical_window = ratio * (2 if ratio == 4 else 1)
+    required = logical_window + draft_tokens
+    assert compressor.ring_size == 1 << (required - 1).bit_length()
+
+    # The kernel preloads a ring ending at the final speculative position.
+    # If the anchor itself completes a compression window, its oldest live
+    # input must still occur in that preloaded chronology.
+    anchor = 3 * ratio - 1
+    oldest_loaded = anchor + draft_tokens - compressor.ring_size + 1
+    assert oldest_loaded <= anchor - logical_window + 1
+
+
 def test_attention_layers_capture_their_own_tensor_parallel_context(monkeypatch):
     native = _ModelFixture._native_model(monkeypatch)
     handle = object()

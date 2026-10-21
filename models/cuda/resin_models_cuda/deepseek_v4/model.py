@@ -490,10 +490,7 @@ class Compressor(nn.Module):
         logical_window = compress_ratio * coff
         retained_ring_size = (
             (
-                math.ceil(
-                    max(logical_window, compress_ratio + args.dspark_block_size + 1)
-                    / compress_ratio
-                )
+                math.ceil((logical_window + args.dspark_block_size) / compress_ratio)
                 * compress_ratio
             )
             if args.dspark_block_size
