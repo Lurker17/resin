@@ -303,7 +303,7 @@ class GptOssCudaRunner(CudaRunner):
 
         self._allreduce_workspace: AllReduceFusionWorkspace | None = None
         self.allreduce_backend = "local"
-        if self.tensor_parallel.enabled and fast_allreduce:
+        if self.tensor_parallel.enabled and fast_allreduce and parallel_groups is None:
             self._allreduce_workspace = create_allreduce_fusion_workspace(
                 backend="auto",
                 world_size=self.tensor_parallel_size,
