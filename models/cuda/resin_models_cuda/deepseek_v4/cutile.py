@@ -576,7 +576,9 @@ def _finish_index_topk_kernel(
     # process them as fixed 64-wide subtiles while retaining one kernel launch.
     for tile in range(width // 64):
         values = ct.load(indices, (batch, sequence, tile), shape=(1, 1, 64))
-        values = ct.where(values < (token + 1) // ratio, values + offset, -1)
+        values = ct.where(
+            (values >= 0) & (values < (token + 1) // ratio), values + offset, -1
+        )
         logical_positions = values * ratio
         first = ct.load(cache_first_blocks, (batch,), shape=(1,)).item()
         page_columns = logical_positions // 128 - first

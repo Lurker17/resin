@@ -323,7 +323,7 @@ class TestDeepSeekV4Weights:
 
         def top_k(scores: torch.Tensor, width: int, **kwargs: object):
             topk_call.update(width=width, **kwargs)
-            return scores, torch.arange(width).view(1, width)
+            return scores[:, :width], torch.arange(width).view(1, width)
 
         native_model.flashinfer_top_k = top_k
         topk_indices = native_model._compact_topk_indices(torch.zeros(1, 8), 3)

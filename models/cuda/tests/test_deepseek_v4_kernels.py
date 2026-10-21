@@ -158,6 +158,33 @@ def test_index_scores_and_topk_preserve_causality_and_packed_addresses(kernels):
             )
 
 
+@pytest.mark.parametrize("offset", [0, 33])
+def test_index_topk_keeps_negative_padding_invalid_before_offset(kernels, offset):
+    mapping = _mapping(divisor=4)
+    positions = torch.tensor([[0, 7], [3, 11]], device="cuda", dtype=torch.int32)
+    indices = torch.full((2, 2, 64), -1, device="cuda", dtype=torch.int32)
+    indices[..., :4] = torch.tensor([-1, 0, 1, 64], device="cuda")
+    complete = (positions + 1) // 4
+    valid = (indices >= 0) & (indices < complete[..., None])
+    # Positive offsets make an unchecked -1 look like a valid logical row.
+    logical_rows = torch.arange(2, device="cuda").expand(2, -1) + offset
+    expected_rows = _rows(mapping, logical_rows * 4)
+    expected = torch.full_like(indices, -1)
+    for batch in range(2):
+        for query in range(2):
+            selected = valid[batch, query]
+            expected[batch, query, selected] = expected_rows[
+                batch, indices[batch, query, selected].long()
+            ].int()
+
+    actual = kernels.finish_index_topk(
+        indices, positions, 4, offset, cache_mapping=mapping
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert (actual[~valid] == -1).all()
+
+
 def _sparse_mla_reference(query, window_cache, compressed_cache, rows, sinks, scale):
     """Independent FP32 softmax, with a sink logit carrying zero value."""
 

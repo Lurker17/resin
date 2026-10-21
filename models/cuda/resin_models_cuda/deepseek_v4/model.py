@@ -699,11 +699,31 @@ class Compressor(nn.Module):
             )
 
 
-def _compact_topk_indices(scores: torch.Tensor, width: int) -> torch.Tensor:
-    """Keep finite cache candidates ahead of graph-padding entries."""
+def _compact_topk_indices(
+    scores: torch.Tensor, capacity: int, *, complete: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Select a fixed-capacity logical KV set in canonical ascending order.
 
-    _, indices = flashinfer_top_k(scores, width, sorted=True)
-    return indices
+    Scoring remains context-sized. Invalid future candidates sort behind all
+    selected causal rows, and padding never enters the active sparse prefix.
+    """
+
+    width = min(capacity, scores.shape[-1])
+    if width == 0:
+        return torch.full(
+            (*scores.shape[:-1], capacity),
+            -1,
+            dtype=torch.int32,
+            device=scores.device,
+        )
+    values, indices = flashinfer_top_k(scores, width, sorted=True)
+    valid = torch.isfinite(values)
+    if complete is not None:
+        valid &= indices < complete
+    sentinel = torch.iinfo(indices.dtype).max
+    logical = indices.masked_fill(~valid, sentinel).sort(dim=-1).values
+    logical.masked_fill_(logical == sentinel, -1)
+    return F.pad(logical, (0, capacity - width), value=-1)
 
 
 class Indexer(torch.nn.Module):
@@ -719,6 +739,12 @@ class Indexer(torch.nn.Module):
         tensor_parallel: TensorParallelContext | None = None,
     ):
         super().__init__()
+        if (
+            type(args.index_topk) is not int
+            or args.index_topk <= 0
+            or args.index_topk % 64
+        ):
+            raise ValueError("DeepSeek-V4 index_topk must be a positive multiple of 64")
         self.tensor_parallel = tensor_parallel or _default_tensor_parallel()
         self.layer_id = layer_id
         self.dim = args.dim
@@ -727,6 +753,9 @@ class Indexer(torch.nn.Module):
         self.head_dim = args.index_head_dim
         self.rope_head_dim = args.rope_head_dim
         self.index_topk = args.index_topk
+        self.selected_capacity = min(
+            self.index_topk, math.ceil(args.max_seq_len / compress_ratio / 64) * 64
+        )
         self.q_lora_rank = args.q_lora_rank
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
@@ -806,7 +835,11 @@ class Indexer(torch.nn.Module):
             positions = positions.index_select(1, query_indices)
             block_length = query_indices.numel()
         if block_length == 0:
-            return torch.empty((batch_size, 0, 0), dtype=torch.int32, device=x.device)
+            return torch.empty(
+                (batch_size, 0, self.selected_capacity),
+                dtype=torch.int32,
+                device=x.device,
+            )
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
         apply_rotary_emb(q[..., -rope_dim:], self.freqs_cis[positions])
         q = rotate_activation(q)
@@ -814,8 +847,9 @@ class Indexer(torch.nn.Module):
         weights = self.weights_proj(x)
         width = math.ceil(sequence_length / ratio / 64) * 64
         if width == 0:
-            return torch.empty(
-                (batch_size, block_length, 0),
+            return torch.full(
+                (batch_size, block_length, self.selected_capacity),
+                -1,
                 dtype=torch.int32,
                 device=x.device,
             )
@@ -831,10 +865,12 @@ class Indexer(torch.nn.Module):
         )
         if self.tensor_parallel.enabled:
             index_score = self.allreduce(index_score)
-        topk_width = min(self.index_topk, width)
-        topk_indices = torch.topk(index_score, topk_width, dim=-1, sorted=True).indices
         complete = (positions + 1).div(ratio, rounding_mode="floor")
-        logical = torch.where(topk_indices < complete.unsqueeze(-1), topk_indices, -1)
+        logical = _compact_topk_indices(
+            index_score.flatten(0, 1),
+            self.selected_capacity,
+            complete=complete.reshape(-1, 1),
+        ).view(batch_size, block_length, self.selected_capacity)
         physical = cache.compressed_rows(
             self.layer_id,
             ratio,
@@ -858,8 +894,11 @@ class Indexer(torch.nn.Module):
         ratio = self.compress_ratio
         width = math.ceil(graph_seq_len / ratio / 64) * 64
         if width == 0:
-            return torch.empty(
-                (bsz, block_length, 0), dtype=torch.int32, device=x.device
+            return torch.full(
+                (bsz, block_length, self.selected_capacity),
+                -1,
+                dtype=torch.int32,
+                device=x.device,
             )
 
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
@@ -884,9 +923,13 @@ class Indexer(torch.nn.Module):
         )
         if self.tensor_parallel.enabled:
             index_score = self.allreduce(index_score)
-        topk_width = min(self.index_topk, width)
-        topk_idxs = _compact_topk_indices(index_score.flatten(0, 1), topk_width)
-        topk_idxs = topk_idxs.view(*index_score.shape[:2], topk_width)
+        complete = (positions + 1).div(ratio, rounding_mode="floor")
+        topk_idxs = _compact_topk_indices(
+            index_score.flatten(0, 1),
+            self.selected_capacity,
+            complete=complete.reshape(-1, 1),
+        )
+        topk_idxs = topk_idxs.view(*index_score.shape[:2], self.selected_capacity)
         selected = finish_index_topk(
             topk_idxs,
             positions,
@@ -1000,6 +1043,15 @@ class Attention(nn.Module):
                 )
             else:
                 self.indexer = None
+            # Attention sees one prepared sparse-row geometry in every phase,
+            # including when a peer's longer context selects a larger graph.
+            self.compressed_capacity = (
+                self.indexer.selected_capacity
+                if self.indexer is not None
+                else math.ceil(args.max_seq_len / self.compress_ratio / 4) * 4
+            )
+        else:
+            self.compressed_capacity = 0
 
         self.attention_workspace: torch.Tensor | None = None
         self.decode_overlap_stream: torch.cuda.Stream | None = None
@@ -1130,7 +1182,7 @@ class Attention(nn.Module):
                         cache=cache,
                     )
                 else:
-                    generated_compressed_width = compressed_width
+                    generated_compressed_width = self.compressed_capacity
 
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
         qk_norm_rope_store(
@@ -1236,7 +1288,7 @@ class Attention(nn.Module):
                     query_indices=query_indices,
                 )
             else:
-                generated_compressed_width = math.ceil(sequence_length / ratio / 4) * 4
+                generated_compressed_width = self.compressed_capacity
 
         if query_indices is not None:
             qr = qr.index_select(1, query_indices)
@@ -1301,11 +1353,6 @@ class Attention(nn.Module):
         self._prepare_compression()
         qr, kv = self._project(x)
 
-        compressed_width = 0
-        if ratio:
-            padded_width = math.ceil(graph_seq_len / ratio / 4) * 4
-            compressed_width = padded_width
-
         if token_positions.shape != (batch_size, block_length):
             raise ValueError("target layers must share one verification position block")
         if ratio:
@@ -1342,7 +1389,7 @@ class Attention(nn.Module):
                     cache=cache,
                 )
             else:
-                generated_compressed_width = compressed_width
+                generated_compressed_width = self.compressed_capacity
 
         qk_norm_rope_block(
             q,

@@ -71,6 +71,7 @@ def test_prefill_context_ranks_update_full_state_and_compute_only_local_queries(
         head_dim=4,
         n_local_heads=1,
         compress_ratio=ratio,
+        compressed_capacity=4 if ratio == 128 else 1 if ratio == 4 else 0,
         layer_id=2,
         kv_norm=SimpleNamespace(weight=torch.ones(4)),
         freqs_cis=torch.ones(32, 2, dtype=torch.complex64),
@@ -142,6 +143,7 @@ def test_indexer_updates_complete_compressor_before_selecting_queries(
     monkeypatch.setattr(native, "rotate_activation", lambda x: x)
     monkeypatch.setattr(native, "fp4_act_quant", lambda *args: None)
     monkeypatch.setattr(native, "index_scores", score)
+    monkeypatch.setattr(native, "flashinfer_top_k", torch.topk)
     indexer = SimpleNamespace(
         compress_ratio=4,
         rope_head_dim=2,
@@ -151,6 +153,7 @@ def test_indexer_updates_complete_compressor_before_selecting_queries(
         n_heads=2,
         softmax_scale=0.5,
         index_topk=1,
+        selected_capacity=1,
         tensor_parallel=SimpleNamespace(enabled=False),
         freqs_cis=torch.ones(32, 1, dtype=torch.complex64),
         compressor=SimpleNamespace(forward_prefill=compress),
@@ -168,7 +171,7 @@ def test_indexer_updates_complete_compressor_before_selecting_queries(
         indexer, x, x, positions, 8, 12, cache=cache, query_indices=selected
     )
 
-    assert result.shape[:2] == (1, len(local_indices))
+    assert result.shape == (1, len(local_indices), 1)
     assert calls[0][0] == "compress"
     torch.testing.assert_close(calls[0][1], x)
     torch.testing.assert_close(calls[0][2], positions)
