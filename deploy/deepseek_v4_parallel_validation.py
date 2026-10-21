@@ -574,15 +574,22 @@ def _logit_metrics(actual, expected):
         "relative_l2": relative,
         "max_abs_tolerance": 0.5,
         "relative_l2_tolerance": 0.02,
+        "passed": bool(torch.isfinite(actual).all())
+        and maximum <= 0.5
+        and relative <= 0.02,
     }
-    if not torch.isfinite(actual).all() or maximum > 0.5 or relative > 0.02:
-        raise AssertionError(
-            f"same-context BF16 model logits exceed tolerance: {result}"
-        )
     return result
 
 
-def run_composable_validation(model_path, prompts, *, vocab_size):
+def run_composable_validation(
+    model_path,
+    prompts,
+    *,
+    vocab_size,
+    diagnostic_path=None,
+    case_names=None,
+    baseline_path=None,
+):
     """Compare composed graph layouts with an independent eager TP reference."""
 
     world_size = torch.cuda.device_count()
@@ -592,62 +599,142 @@ def run_composable_validation(model_path, prompts, *, vocab_size):
         not prompt or len(prompt) + 6 > CONTEXT_LENGTH for prompt in prompts.values()
     ):
         raise ValueError("validation prompts must fit the bounded context")
-    print(
-        f"[deepseek-v4] loading independent eager TP{world_size} reference", flush=True
-    )
-    baseline = _spawn(
-        _run_tp_baseline_rank,
-        model_path,
-        prompts,
-        world_size,
-        True,
-        world_size=world_size,
-    )[0]
-    expected = baseline.pop("_teacher_logits")
-    reports = []
-    for name, topology in _composable_cases(world_size):
-        print(f"[deepseek-v4] validating {name}: {topology}", flush=True)
-        records = _spawn(
-            _run_rank,
+    catalog = dict(_composable_cases(world_size))
+    selected = tuple(catalog) if case_names is None else tuple(case_names)
+    if (
+        not selected
+        or len(set(selected)) != len(selected)
+        or set(selected) - catalog.keys()
+    ):
+        raise ValueError(f"case_names must be unique choices from {tuple(catalog)}")
+    directory = None if diagnostic_path is None else Path(diagnostic_path)
+    if directory is not None:
+        directory.mkdir(parents=True, exist_ok=True)
+    identity = {
+        "model_path": str(Path(model_path).resolve()),
+        "world_size": world_size,
+        "prompts": prompts,
+    }
+    if baseline_path is None:
+        print(
+            f"[deepseek-v4] loading independent eager TP{world_size} reference",
+            flush=True,
+        )
+        baseline = _spawn(
+            _run_tp_baseline_rank,
             model_path,
             prompts,
-            topology["attn_dp"],
-            topology,
+            world_size,
             True,
             world_size=world_size,
+        )[0]
+        expected = baseline.pop("_teacher_logits")
+    else:
+        saved = torch.load(baseline_path, weights_only=True)
+        if saved["identity"] != identity:
+            raise ValueError(
+                "reused baseline must match checkpoint, GPU count and prompts"
+            )
+        baseline, expected = saved["report"], saved["teacher_logits"]
+        print(f"[deepseek-v4] reusing eager baseline from {baseline_path}", flush=True)
+    if directory is not None:
+        torch.save(
+            {"identity": identity, "report": baseline, "teacher_logits": expected},
+            directory / "baseline.pt",
         )
-        comparisons = []
-        for record in records:
-            actual = record.pop("_teacher_logits", None)
-            if record["driver"]:
-                if actual is None:
-                    raise AssertionError("replica driver omitted fixed-context logits")
-                comparisons.append(
-                    {"rank": record["rank"], **_logit_metrics(actual, expected)}
-                )
-        report = _validate_records(
-            records,
-            topology["attn_dp"],
-            vocab_size,
-            topology=topology,
-            graphs=True,
-        )
-        report["name"] = name
-        report["teacher_forced_comparisons"] = comparisons
-        report["probe_matches_eager_tp"] = [
-            record["driver_result"]["probes"][0]["token_ids"] == baseline["token_ids"]
-            for record in records
-            if record["driver"]
-        ]
-        reports.append(report)
-    return {
+        (directory / "baseline.json").write_text(json.dumps(baseline, indent=2))
+    reports = []
+    result = {
         "graphs": {"prefill": "breakable", "decode": "full"},
         "speculative_tokens": 0,
         "world_size": world_size,
+        "selected_cases": selected,
+        "diagnostic_path": None if directory is None else str(directory),
         "eager_tp_baseline": baseline,
         "comparison_policy": (
             "Four identical teacher-forced contexts use fixed BF16 logit tolerances; "
             "greedy sequence matches are reported separately. CP replicates KV/compressor state."
         ),
         "cases": reports,
+        "status": "running",
     }
+
+    def persist():
+        if directory is not None:
+            (directory / "report.json").write_text(json.dumps(result, indent=2))
+
+    persist()
+    for name in selected:
+        topology = catalog[name]
+        print(f"[deepseek-v4] validating {name}: {topology}", flush=True)
+        try:
+            records = _spawn(
+                _run_rank,
+                model_path,
+                prompts,
+                topology["attn_dp"],
+                topology,
+                True,
+                world_size=world_size,
+            )
+            actual_logits = {
+                record["rank"]: record.pop("_teacher_logits")
+                for record in records
+                if "_teacher_logits" in record
+            }
+            if directory is not None:
+                torch.save(actual_logits, directory / f"{name}-logits.pt")
+            comparisons = []
+            for record in records:
+                if record["driver"]:
+                    actual = actual_logits.get(record["rank"])
+                    if actual is None:
+                        raise AssertionError(
+                            "replica driver omitted fixed-context logits"
+                        )
+                    comparisons.append(
+                        {"rank": record["rank"], **_logit_metrics(actual, expected)}
+                    )
+            report = {
+                "name": name,
+                "parallelism": topology,
+                "ranks": records,
+                "teacher_forced_comparisons": comparisons,
+            }
+            reports.append(report)
+            if directory is not None:
+                (directory / f"{name}.json").write_text(json.dumps(report, indent=2))
+            persist()
+            report.update(
+                _validate_records(
+                    records,
+                    topology["attn_dp"],
+                    vocab_size,
+                    topology=topology,
+                    graphs=True,
+                )
+            )
+            report["probe_matches_eager_tp"] = [
+                record["driver_result"]["probes"][0]["token_ids"]
+                == baseline["token_ids"]
+                for record in records
+                if record["driver"]
+            ]
+            if directory is not None:
+                (directory / f"{name}.json").write_text(json.dumps(report, indent=2))
+            persist()
+            if not all(comparison["passed"] for comparison in comparisons):
+                raise AssertionError(
+                    f"{name}: same-context model logits exceed tolerance: {comparisons}"
+                )
+        except BaseException as error:
+            result.update(
+                status="failed",
+                failed_case=name,
+                error=f"{type(error).__name__}: {error}",
+            )
+            persist()
+            raise
+    result["status"] = "passed"
+    persist()
+    return result
