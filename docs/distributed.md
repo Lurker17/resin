@@ -335,5 +335,10 @@ padding masks, idle origins, and FP32 cancellation.
 [`test_context_parallel.py`](../tests/test_context_parallel.py) checks real token
 exchange and global causal/window coordinates. The completed two-H200
 [eager and graph runs](gpt-oss-parallelism.md#hopper-validation) cover the earlier
-EP2 paths. The expanded eight-GPU graph matrix is pending; DeepSeek-specific
-Blackwell model/kernel validation is also pending.
+EP2 paths. The expanded two/eight-H100 matrices execute composed full-model
+graphs, including all axes together, with matching greedy probes and reclaimed
+request caches. Tensor-parallel layouts still exceed the fixed same-history
+logit-error limits; executing the mesh is not an accuracy pass. Blackwell runs
+also establish DeepSeek graph execution, but expose expert-TP numerical drift
+and a graph-decode discrepancy under investigation. See the model documents
+for the measured limits and reproducible diagnostics.

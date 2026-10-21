@@ -109,12 +109,42 @@ and communication overlap remain separate work. The DeepSeek adapter retains
 its existing FP4 kernel and arithmetic, so shared transport validation does not
 establish DeepSeek-specific numerical correctness.
 
+Sparse MLA metadata follows FlashInfer's fixed 128-column SWA prefix. Short
+windows retain invalid slots in that prefix; compressed rows start at column
+128 and active lengths include the reserved prefix. Per-layer compressed-index
+capacity comes from the configured maximum context, with selected logical rows
+ordered consistently before physical page mapping. Prefill, decode, and
+verification therefore present the same physical reduction geometry even when
+another attention-DP replica requires a larger graph bucket. Indexer scoring
+still uses the current context size.
+
+Fixed capacity adds padding for short contexts. At the default 4,096-token
+maximum, C4 layers reserve up to 512 compressed columns. A 1,048,576-token
+maximum makes C128 layers reserve 8,192 compressed columns, about 32.5 KiB of
+indices per query including SWA. Device lengths mask inactive entries, but the
+physical width can still affect kernel scheduling and scratch requirements.
+This tradeoff needs throughput and memory measurements before wide-context
+production use.
+
 ## Validation
 
 ```bash
 uv run pytest -q
 uv run modal run deploy/modal_deepseek_v4.py --mode validate-parallel \
   --parallel-baseline --report-path artifacts/deepseek-v4-parallel-validation.json
+
+uv run modal run deploy/modal_deepseek_v4.py --mode validate-composable \
+  --parallel-cases ep-attention-tp,attention-tp-expert-tp
+
+uv run modal run deploy/modal_deepseek_v4.py --mode validate-composable \
+  --parallel-world-size 4 --parallel-gpu-type B200 \
+  --parallel-cases ep-context-attention-tp,ep-attention-dp-tp,ep-attention-dp-context
+
+uv run modal run deploy/modal_deepseek_v4.py --mode validate-kernels \
+  --report-path artifacts/deepseek-v4-native-kernels-validation.json
+
+uv run modal run deploy/modal_deepseek_v4.py --mode probe-experts \
+  --report-path artifacts/deepseek-v4-expert-full-checkpoint-probe.json
 ```
 
 The existing DeepSeek validation command uses the complete pinned Flash
@@ -124,14 +154,90 @@ cache reuse, and generated-token logprobs. An optional TP4 run reports token
 comparisons separately because quantized layouts can change greedy choices.
 It is not a completed GPU validation of the new composed layouts or graphs.
 
-Blackwell model/kernel validation remains pending; the earlier four-GPU jobs
-did not receive an allocation. The shared transport and independent request
-engines passed the preceding [eager two-H200 GPT-OSS run](gpt-oss-parallelism.md#completed-eager-run).
-Shared graph orchestration also passed the preceding
-[captured GPT-OSS run](gpt-oss-parallelism.md#completed-graph-run), including idle
-attention-DP replay in both phases. The expanded eight-GPU GPT-OSS graph matrix
-is pending. CPU tests cover composed expert shards and DeepSeek CP/cache control
-flow, but none of this substitutes for DeepSeek-specific Blackwell validation.
+Blackwell runs use the complete 155.43-GiB pinned Flash checkpoint, compare
+fixed prefill and decode contexts against an independent legacy-TP reference,
+and check captured-NCCL teardown. Validation exposed and corrected an existing
+short-window sparse-metadata ABI error: compressed rows must follow the fixed
+128-column SWA prefix. Earlier numerical reports predate that correction and
+must not serve as accuracy evidence for the current implementation.
+
+The [native B300 regression run](https://modal.com/apps/ekzhang/main/ap-0CratjzJslkPeebbuvwIKZ)
+passes all 44 tests, including dense FP32 attention references with separate
+SWA/compressed pools, short and mixed windows, sink logits, replay with changed
+queries, and negative index padding with nonzero offsets. This isolates the
+kernel metadata contract; full-model numerical checks remain separate.
+
+The corrected [two-Blackwell full-checkpoint run](https://modal.com/apps/ekzhang/main/ap-7xdCOphT67GAcKMriz4SEO)
+passes the EP2 + attention-TP2 control bit-for-bit against legacy eager TP2:
+all four prefill contexts and all four same-history decode observations are
+exact, including genuine sampler output. Each rank captures 258 prefill FFN
+regions and two decode shapes, replays 559 prefill regions and 12 decode graphs,
+and records zero eager fallbacks. Cache reclamation, isolated replay, scores,
+and captured-NCCL teardown pass.
+
+Expert TP2 in the same run completes those execution checks but exceeds the
+unchanged logit limits. Its prefill relative L2 error is 0.13435 (max absolute
+6.0606); the largest same-history decode relative L2 error is 0.29297, with
+KL 0.59791. The four fixed prefill top tokens and four genuine sampler choices
+still match. The full report remains failed; these observations do not establish
+model-quality equivalence across quantized tensor-parallel layouts. Diagnostics
+are in `artifacts/deepseek-v4-static-pairs-diagnostics.json` and the profile volume
+directory `composable-20261021T020507Z`.
+
+The [four-B200 composed run](https://modal.com/apps/ekzhang/main/ap-lNAJndyyC3dGhHZpoBA7S2)
+completes the following layouts; each uses EP2 and expert TP2:
+
+| Attention layout | Request engines | Coordinated steps | FFN replays per rank | Decode replays per rank |
+| --- | ---: | ---: | ---: | ---: |
+| CP2, attention TP2 | 1 | 24 | 559 | 12 |
+| Attention DP2, attention TP2 | 2 | 26 | 559 | 14 |
+| Attention DP2, CP2 | 2 | 26 | 559 | 14 |
+
+Each rank captures 258 FFN regions and two decode graphs, with zero fallbacks or
+poisoned graphs. Phase agreement, finite logprobs, cancellation, cache reclaim,
+and identical isolated replay pass. Each attention-DP layout exercises seven
+idle calls in one request replica and two in the other. Every driver's greedy
+probe and four genuine fixed-history sampler choices match legacy TP4. All
+three layouts still fail the strict numerical limits. The retained report is
+`artifacts/deepseek-v4-static-composed4-diagnostics.json`, with durable profile
+`composable-20261021T021100Z`.
+
+The [remaining two-GPU CP/DP run](https://modal.com/apps/ekzhang/main/ap-Y37UA1Sl0fBJeDSOiTqweF)
+also completes all four layouts: CP2 or attention DP2 with EP2/ETP1, and CP2 or
+attention DP2 with EP1/ETP2. Comparing CP against attention DP while holding
+attention TP, EP, and expert TP fixed gives bit-exact prefill and decode logits
+on both request drivers. Their comparisons against legacy TP2 remain failed.
+On four GPUs, the equivalent CP2+TP2 versus DP2+TP2 comparison differs by prefill
+relative L2 0.063–0.079 and decode up to 0.103; it is not numerically qualified.
+All comparisons retain the original limits in
+`artifacts/deepseek-v4-static-mesh-pairwise-diagnostics.json`. The full two-GPU
+report is `artifacts/deepseek-v4-static-cp-dp-diagnostics.json`, durable profile
+`composable-20261021T021205Z`.
+
+The one-Blackwell expert probe loads all 256 first-layer experts. EP2 is exact;
+expert TP2 differs by relative L2 about 0.0037. Padding and duplicate inputs are
+exact. FlashInfer emits BF16 GEMM2 results before finalizing expert contributions,
+so FP32 transport cannot undo intermediate-shard rounding. A separate DeepGEMM
+probe verifies true FP32 ordinary GEMM output and CUDA-graph replay, but the
+pinned grouped API rejects FP32 outputs. This is diagnostic evidence, not an
+implemented FP32 expert backend or a model-quality equivalence result.
+
+Failed runs persist `baseline.pt`, per-case logits, genuine-sampler decode
+traces, KL/offset/error metrics, and `report.json` under the printed directory in
+the `resin-deepseek-v4-profiles-v1` Modal volume. Reuse the exact baseline and
+disable graphs to isolate the device path:
+
+```bash
+uv run modal run deploy/modal_deepseek_v4.py --mode validate-composable \
+  --parallel-cases ep-attention-tp --no-parallel-graphs \
+  --parallel-baseline-path /profiles/<run>/baseline.pt
+```
+
+Decode traces observe genuine logits/tokens before advancing the Engine with
+the baseline token. They therefore compare identical histories without changing
+the captured sampler. Legacy baseline files explicitly report skipped decode
+comparison. Existing CPU tests cover composed expert shards and CP/cache control
+flow; they do not replace Blackwell numerical validation.
 
 Asynchronous communication overlap, explicit-group DSpark, and a cross-replica
 HTTP request router remain separate work.

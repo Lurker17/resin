@@ -111,16 +111,23 @@ using reserved null cache storage, without writing live request pages.
 
 The completed two-H200 runs below establish eager and graph-enabled EP2 with
 attention DP one and two for the preceding implementation. The expanded
-composable implementation has CPU conformance tests; its eight-GPU full-model
-graph matrix is pending. Those results must be assessed separately from the
-older two-GPU proof and from DeepSeek-specific Blackwell validation.
+composable implementation has real two/eight-H100 full-model graph runs.
+All greedy probes match, including the combined attention DP2, attention TP2,
+CP2, EP2, expert TP4 layout. Tensor-parallel layouts exceed the fixed numerical
+limits, so these runs establish graph/lifecycle execution rather than a complete
+accuracy qualification. Those results are separate from the older two-GPU proof
+and from DeepSeek-specific Blackwell validation.
 
 ```bash
 uv run modal run deploy/modal_gpt_oss_parallel.py --graphs \
   --report-path artifacts/gpt-oss-parallel-graphs-validation.json
 
-uv run modal run deploy/modal_gpt_oss_parallel.py --composable --world-size 8 \
+uv run modal run deploy/modal_gpt_oss_parallel.py --composable --world-size 8 --gpu-type H100 \
   --report-path artifacts/gpt-oss-composable-graphs-validation.json
+
+# Recheck only the layout using every axis.
+uv run modal run deploy/modal_gpt_oss_parallel.py --composable --world-size 8 --gpu-type H100 \
+  --parallel-cases all-axes
 ```
 
 The composable command uses the pinned full GPT-OSS-20B checkpoint, independent
@@ -130,6 +137,41 @@ and real FA4 CP attention comparisons. The full-model workload checks same-histo
 logits, greedy output, logprobs, unequal queues, idle/resumed replicas,
 cancellation, cache reuse, capture/replay counts, and orderly graph teardown.
 These are bounded correctness checks; they do not establish throughput or MFU.
+
+### Quantized tensor-parallel numerics
+
+The two-H100 composed pair matrix passes EP2+CP2 and EP2+attention-DP2 within
+the fixed max-absolute 0.5 / relative-L2 0.02 logit limits. Layouts involving
+attention TP or expert TP exceed some limits despite matching greedy probes;
+the diagnostic report retains those failures.
+
+The single-H100 real-weight expert probe reproduces the captured first-layer
+output exactly. EP2/EP4 also reproduce it exactly; expert TP2/TP4 differ by
+relative L2 0.00236/0.00210 (max absolute 0.25). An independently dequantized
+dense reference shows comparable sensitivity when only FC2 shard rounding
+changes. FlashInfer's raw FC2 output is BF16; FP32 routing/communication cannot
+recover rounding already performed inside each intermediate shard. Attention
+TP uses FP32 GEMM partials and reduction, casting once before residual addition.
+
+```bash
+uv run modal run deploy/modal_gpt_oss_parallel.py --expert-probe --gpu-type H100 \
+  --expert-reference-path /profiles/resin-gpt-oss/<run>/baseline-0-expert.pt
+```
+
+`artifacts/gpt-oss-expert-probe.json` records the real-weight comparison.
+`artifacts/gpt-oss-composable-pairs-fp32-attention-diagnostics.json` retains the
+complete pair-matrix failures. These checks do not establish model-quality
+equivalence across quantized TP layouts.
+
+The final [eight-H100 all-axes run](https://modal.com/apps/ekzhang/main/ap-1WwRBajIhnJ3VleKXrA8FQ)
+uses `Parallelism(world_size=8, attn_dp=2, attn_tp=2, cp=2, ep=2)`.
+Every rank captures 144 FFN regions and two full decode shapes, then replays
+792 prefill regions and 26 decode graphs with zero eager fallbacks. Both
+request engines recover all 128 cache parents; all four eight-token greedy
+probes match the independent single-GPU baseline. Five fixed logit comparisons
+still fail. The complete diagnostic report is
+`artifacts/gpt-oss-composable-all-axes-diagnostics.json`, also stored at
+`resin-gpt-oss-profiles/gpt-oss-composable8-20261021T013452Z.json`.
 
 ### Completed graph run
 

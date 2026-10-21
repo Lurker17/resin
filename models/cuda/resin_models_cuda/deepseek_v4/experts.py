@@ -1,4 +1,4 @@
-"""Prepared local experts and eager expert-parallel dispatch/combine.
+"""Prepared local experts and eager or captured expert dispatch/combine.
 
 The architectural MoE owns gating and shared experts. This module owns local
 expert weights, their kernel layout and communication across expert owners.
@@ -22,9 +22,9 @@ if TYPE_CHECKING:
 class RoutedExperts(nn.Module):
     """Execute a prepared expert shard and return complete local token rows.
 
-    Legacy TP receives replicated rows and reduces expert-shard outputs. EP
-    instead dispatches independent local rows to expert owners and combines the
-    returned contributions without reducing unrelated attention-DP requests.
+    Legacy TP receives replicated rows and reduces expert-shard outputs. The
+    explicit mesh dispatches local rows to their expert owner and all of its
+    expert-TP lanes, then combines contributions back into complete origin rows.
     """
 
     def __init__(
