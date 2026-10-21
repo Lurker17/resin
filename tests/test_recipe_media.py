@@ -1,0 +1,152 @@
+"""Optional parity checks with real pinned processors already in the HF cache.
+
+No model weights or network access are needed. Missing cached processors skip;
+fetch their tokenizer/processor files to run the same checks on another machine.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import torch
+
+from resin.recipe import Recipe
+from resin.server.media import prepare_recipe_inputs
+
+MODELS = (
+    (
+        "inkling",
+        "thinkingmachines/Inkling-Small-NVFP4",
+        "b6a99534467840620d411e4cd4ad5819b2610d9c",
+    ),
+    (
+        "qwen3_5",
+        "RadixArk/Qwen3.8-27B-NVFP4",
+        "554ebba9b5f1b79dc11246341960360e6ef05ef4",
+    ),
+    (
+        "gemma4",
+        "nvidia/Gemma-4-31B-IT-NVFP4",
+        "4135a98a9b728a548947683219633b25682223ac",
+    ),
+)
+
+
+@pytest.fixture(scope="module", params=MODELS, ids=lambda model: model[0])
+def model_processor(request):
+    from transformers import AutoProcessor
+
+    model, repo, revision = request.param
+    try:
+        processor = AutoProcessor.from_pretrained(
+            repo, revision=revision, local_files_only=True, trust_remote_code=False
+        )
+    except OSError:
+        pytest.skip(f"pinned processor {repo}@{revision} is not cached")  # ty: ignore[too-many-positional-arguments]
+    return model, processor, Recipe(processor.tokenizer, model=model)
+
+
+def image():
+    return np.linspace(0, 1, 64 * 64 * 3, dtype=np.float32).reshape(64, 64, 3)
+
+
+def assert_reference_tensors(processor, recipe, messages, *, tools=None):
+    request = {"messages": messages, "tools": tools}
+    expected = processor.apply_chat_template(
+        messages,
+        tools=tools,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+        processor_kwargs={"do_rescale": False},
+    )
+    actual = prepare_recipe_inputs(processor, recipe, request)
+    for key, value in expected.items():
+        if isinstance(value, torch.Tensor):
+            assert key in actual, key
+            assert torch.equal(value, actual[key]), key
+    return actual
+
+
+def test_native_recipe_preserves_real_image_geometry_and_tools(model_processor):
+    _, processor, recipe = model_processor
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe "},
+                {"type": "image", "image": image()},
+                {"type": "text", "text": " then "},
+                {"type": "image", "image": image()[:, ::-1].copy()},
+            ],
+        }
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look up a label.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"label": {"type": "string"}},
+                    "required": ["label"],
+                },
+            },
+        }
+    ]
+    assert_reference_tensors(processor, recipe, messages, tools=tools)
+
+
+def test_literal_media_marker_does_not_acquire_a_pixel_slot(model_processor):
+    _, processor, recipe = model_processor
+    text = f"The literal spelling {processor.image_token} is ordinary text."
+    plain = recipe.render({"messages": [{"role": "user", "content": text}]})
+    assert processor.image_token_id not in plain["token_ids"]
+    pixels = processor.image_processor(
+        images=[image()], return_tensors="pt", do_rescale=False
+    )
+    expansion = processor.replace_image_token(pixels, image_idx=0)
+    expected_slots = processor.tokenizer.encode(
+        expansion, add_special_tokens=False
+    ).count(processor.image_token_id)
+    actual = prepare_recipe_inputs(
+        processor,
+        recipe,
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": text},
+                        {"type": "image", "image": image()},
+                    ],
+                }
+            ]
+        },
+    )
+    assert (
+        actual["input_ids"][0].tolist().count(processor.image_token_id)
+        == expected_slots
+    )
+
+
+def test_native_recipe_preserves_gemma_video_timestamps_and_geometry(model_processor):
+    model, processor, recipe = model_processor
+    if model != "gemma4":
+        pytest.skip("only the Gemma runner implements video inputs")  # ty: ignore[too-many-positional-arguments]
+    frames = np.linspace(0, 1, 32 * 64 * 64 * 3, dtype=np.float32).reshape(
+        32, 64, 64, 3
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Compare video:"},
+                {"type": "video", "video": frames},
+                {"type": "text", "text": "Describe."},
+            ],
+        }
+    ]
+    assert_reference_tensors(processor, recipe, messages)

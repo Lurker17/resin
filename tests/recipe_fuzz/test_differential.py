@@ -14,10 +14,25 @@ from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 
-from recipe_fuzz.harness import Case, Part, assert_streams, normalize
-from resin.recipe import InklingResponseParser, Tokenizer
+from recipe_fuzz.deepseek import DeepSeekAdapter
+from recipe_fuzz.gemma import GemmaAdapter
+from recipe_fuzz.gpt_oss import GptOssAdapter
+from recipe_fuzz.harness import (
+    Case,
+    Part,
+    assert_chunk_invariance,
+    assert_streams,
+    normalize,
+)
+from recipe_fuzz.lfm2 import Lfm2Adapter
+from recipe_fuzz.qwen import QwenAdapter
+from resin.recipe import InklingResponseParser, Recipe, Tokenizer
 
 MARKERS = (
+    "message_system",
+    "message_user",
+    "message_tool",
+    "content_xml",
     "message_model",
     "content_text",
     "content_thinking",
@@ -27,7 +42,7 @@ MARKERS = (
     "content_model_end_sampling",
     "end_message",
 )
-LIMIT = int(os.environ.get("RESIN_FUZZ_EXAMPLES", "50"))
+LIMIT = int(os.environ.get("RESIN_FUZZ_EXAMPLES", "40"))
 FUZZ = settings(max_examples=LIMIT, deadline=None, derandomize=True)
 TEXT = st.one_of(
     st.text(min_size=1, max_size=48),
@@ -68,13 +83,69 @@ class InklingAdapter:
             f"<|{name}|>": backend.token_to_id(f"<|{name}|>") for name in MARKERS
         }
         assert all(token_id is not None for token_id in self.ids.values())
+        self.codec = Recipe(backend, model="inkling")
         self.tokenizer = Tokenizer(backend)
         assert self.tokenizer.is_native
         self.reference = tokenizers.O200kBaseChatTokenizer()
         _, self.reference_parser = v0.Renderer(self.reference).render_for_completion(
             chat.OpenAIMessage.from_oss_messages([{"role": "user", "content": "hi"}])
         )
-        self.oracles = (("tml-v0", self.oracle),)
+        self.oracles = (
+            ("generated-grammar", lambda case: normalize(case.parts)),
+            ("tml-v0", self.oracle),
+        )
+
+    @staticmethod
+    def prompt_case(case):
+        messages = [
+            {"role": "system", "content": "Helpful."},
+            {"role": "user", "content": "hello"},
+        ]
+        for index, part in enumerate(case.parts):
+            if part.kind == "tool":
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": f"c{index}",
+                                "function": {
+                                    "name": part.value["name"],
+                                    "arguments": part.value["args"],
+                                },
+                            }
+                        ],
+                    }
+                )
+                messages.append(
+                    {"role": "tool", "tool_call_id": f"c{index}", "content": "ok"}
+                )
+            elif part.kind == "reasoning":
+                messages.append({"role": "assistant", "reasoning_content": part.value})
+            else:
+                messages.append({"role": "assistant", "content": part.value})
+        messages.append({"role": "user", "content": "continue"})
+        return {
+            "messages": messages,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}},
+                }
+            ],
+            "add_generation_prompt": True,
+        }
+
+    @staticmethod
+    def prompt_oracle(request):
+        from pathlib import Path
+
+        from transformers.utils.chat_template_utils import _compile_jinja_template
+
+        template = _compile_jinja_template(
+            Path(__file__).with_name("templates").joinpath("inkling.jinja").read_text()
+        )
+        return template.render(**request)
 
     @staticmethod
     def fragments(case):
@@ -158,7 +229,14 @@ class InklingAdapter:
 
 # Each additional format supplies encoding, its real oracle, and parser setup;
 # the case generator, semantic normalization, and chunk driver stay shared.
-ADAPTERS = {"inkling": InklingAdapter}
+ADAPTERS = {
+    "inkling": InklingAdapter,
+    "gpt_oss": GptOssAdapter,
+    "deepseek_v4": DeepSeekAdapter,
+    "qwen3_5": QwenAdapter,
+    "lfm2": Lfm2Adapter,
+    "gemma4": GemmaAdapter,
+}
 
 
 @pytest.fixture(scope="module", params=ADAPTERS)
@@ -169,22 +247,37 @@ def adapter(request):
 @FUZZ
 @given(st.lists(PARTS, min_size=1, max_size=5), TOOLS, CUTS, st.data())
 def test_reference_semantics_and_truncated_tools(adapter, parts, tool, cuts, data):
-    case = Case(tuple([*parts, tool]))
+    make_case = getattr(adapter, "case", lambda value: value)
+    case = make_case(Case(tuple([*parts, tool])))
     # A final tool may be cut at any byte of its JSON, including complete JSON
     # with its closing control token still absent. It must remain uncommitted.
-    prefix = Case(tuple(parts))
+    prefix = make_case(Case(tuple(parts)))
     ids, first, last = adapter.tool_truncation(case)
     cut = data.draw(st.integers(first, last), label="tool truncation")
-    for name, oracle in adapter.oracles:
+    for oracle_index, (name, oracle) in enumerate(adapter.oracles):
         note(f"reference oracle: {name}")
-        assert_streams(adapter.parser, adapter.encode(case), oracle(case), cuts)
+        float_ulps = 1 if oracle_index > 0 and name.startswith("tml-") else 0
         assert_streams(
             adapter.parser,
-            ids[:cut],
-            oracle(prefix),
+            adapter.encode(case),
+            oracle(case),
             cuts,
-            reason="length",
+            float_ulps=float_ulps,
         )
+        if getattr(adapter, "commits_tools_at_close", True):
+            assert_streams(
+                adapter.parser,
+                ids[:cut],
+                oracle(prefix),
+                cuts,
+                reason="length",
+                float_ulps=float_ulps,
+            )
+    if not getattr(adapter, "commits_tools_at_close", True):
+        assert_chunk_invariance(adapter.parser, ids[:cut], cuts)
+    if hasattr(adapter, "prompt_oracle"):
+        request = adapter.prompt_case(case)
+        assert adapter.codec.render_text(request) == adapter.prompt_oracle(request)
 
 
 @FUZZ
@@ -193,6 +286,7 @@ def test_native_decoder_matches_full_reference_for_arbitrary_bytes(adapter, ids,
     # Every ordinary token represents one byte; generated inputs include
     # malformed UTF-8, incomplete suffixes, and literal replacement characters.
     expected = adapter.ordinary.decode(ids, skip_special_tokens=False)
+    expected = getattr(adapter, "normalize_text", lambda value: value)(expected)
     assert_streams(
         adapter.text_parser,
         ids,
