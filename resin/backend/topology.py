@@ -57,6 +57,8 @@ class ParallelGroups:
     attn_replication: RankGroup
     replica: RankGroup
     domain: RankGroup
+    device_domain: RankGroup
+    device_replica: RankGroup
     drivers: RankGroup | None
     distributed: Any = field(repr=False)
     _owned: list[Any] = field(repr=False)
@@ -93,11 +95,17 @@ class ParallelGroups:
         world = tuple(range(world_size))
         default_backend = str(distributed.get_backend())
         cache[world, default_backend] = distributed.group.WORLD
-        for name, partitions in topology.partitions().items():
+        partitions = topology.partitions()
+        partitions = {
+            **partitions,
+            "device_domain": partitions["domain"],
+            "device_replica": partitions["replica"],
+        }
+        for name, memberships in partitions.items():
             backend = (
                 "gloo" if name in ("replica", "domain", "drivers") else device_backend
             )
-            for ranks in partitions:
+            for ranks in memberships:
                 key = ranks, backend
                 if key not in cache:
                     # Gloo nonmembers must bypass the bound NCCL world's

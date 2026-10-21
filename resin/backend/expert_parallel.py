@@ -16,7 +16,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 if TYPE_CHECKING:
-    from resin.backend.topology import RankGroup
+    from resin.backend.topology import ParallelGroups, RankGroup
 
 
 class ExpertParallelDispatch:
@@ -39,15 +39,27 @@ class ExpertParallelDispatch:
         local: Callable[[Tensor, Tensor, Tensor], Tensor],
         *,
         num_experts: int,
-        group: RankGroup,
+        group: RankGroup | None = None,
         replication: RankGroup | None = None,
+        groups: ParallelGroups | None = None,
     ) -> None:
-        if num_experts <= 0 or num_experts % group.size:
+        if groups is not None:
+            if group is not None or replication is not None:
+                raise ValueError("pass groups or an expert group, not both")
+            group = groups.device_domain
+            expert_size = groups.ep.size
+            self.expert_tp = groups.expert_tp.size
+        else:
+            if group is None:
+                raise ValueError("expert dispatch requires process groups")
+            expert_size = group.size
+            self.expert_tp = 1
+        if num_experts <= 0 or num_experts % expert_size:
             raise ValueError("the number of experts must be divisible by EP")
         self.local = local
         self.group = group
         self.replication = replication
-        self.experts_per_rank = num_experts // group.size
+        self.experts_per_rank = num_experts // expert_size
         self._capacity: int | None = None
         self._valid_rows: Tensor | None = None
 
@@ -95,6 +107,12 @@ class ExpertParallelDispatch:
         send_indices = indices if source else indices[:0]
         send_weights = weights if source else weights[:0]
         owners = send_indices.div(self.experts_per_rank, rounding_mode="floor")
+        # Every intermediate shard of an owned expert sees the same token
+        # assignments. Attention and expert TP coordinates need not coincide.
+        owners = (
+            owners[..., None] * self.expert_tp
+            + torch.arange(self.expert_tp, device=indices.device)
+        ).flatten(1)
         destinations = torch.zeros(
             (send_hidden.shape[0], group.size), device=hidden.device, dtype=torch.bool
         )

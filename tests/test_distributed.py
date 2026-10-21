@@ -521,6 +521,8 @@ def test_control_failure_after_model_work_keeps_the_accepted_batch(monkeypatch):
         singleton,
         singleton,
         singleton,
+        singleton,
+        singleton,
         None,
         [],
     )
