@@ -20,7 +20,7 @@ use resin_recipe::{Event as ParsedEvent, FinishReason as ParserFinishReason};
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::recipe::{self, NativeInklingParser, SharedParser};
+use crate::recipe::{self, NativeInklingParser, NativeResponseParser, SharedParser};
 use crate::{CompletionReason, Engine, RequestLease, SamplingParams};
 
 const MAX_ACTIVE_REQUESTS: usize = 128;
@@ -56,6 +56,9 @@ enum Parser {
 
 impl Parser {
     fn new(py: Python<'_>, object: Py<PyAny>) -> PyResult<Self> {
+        if let Ok(native) = object.bind(py).cast::<NativeResponseParser>() {
+            return Ok(Self::Native(native.borrow().inner.clone()));
+        }
         if let Ok(native) = object.bind(py).cast::<NativeInklingParser>() {
             return Ok(Self::Native(native.borrow().inner.clone()));
         }

@@ -1,35 +1,46 @@
 # resin-recipe
 
-Model-format code above the token-based engine. This crate has no Python, HTTP,
-or GPU dependency. Its first implementation parses Inkling's typed response
-blocks into reasoning, text, and tool events.
+Stock model conversation formats, independent of Python, HTTP and GPU execution.
+`ModelFormat` selects a matching renderer, incremental parser and stop markers
+for GPT-OSS, DeepSeek V4, Inkling, Qwen3.5/3.8, Gemma4 or LFM2.5.
 
-`ResponseParser` consumes new token IDs with `feed` and flushes buffered output
-with `finish(Stop | Length)`. A `Decoder` supplies new decoded text while the
-model parser owns control-token transitions. `TokenizerDecoder` uses a shared
-Hugging Face tokenizer and rolling decode state, retaining incomplete UTF-8 and
-the decoder's required context. Only explicit control-token IDs affect the
-grammar; ordinary text spelling a marker remains content.
+A renderer produces a `Prompt`: ordinary text plus explicit control-token spans.
+Adjacent text coalesces before encoding, preserving BPE boundaries. A prepared
+`TokenizerEncoder` shares the tokenizer and encodes ordinary marker spellings as
+text. Trusted image/video processor expansions replace only explicit media
+slots, then use the same encoding boundary. Model adapters retain pixel/tensor
+preparation and cache identities; they do not run chat templates.
 
-Tool JSON is buffered and validated when its block closes. An unfinished tool
-is discarded at finalization; finalization never invents a completed call.
-Text still flushes at the token limit, including replacement characters for
-truncated UTF-8. Repeated `finish` is harmless, and `feed` after it is an error.
+`ResponseParser::feed` consumes only new token IDs. `finish(Stop | Length)` flushes
+buffered text, including truncated UTF-8; finalization is idempotent. A shared
+`TokenizerDecoder` retains the tokenizer's rolling decode context. Control IDs,
+not printable text, drive model grammar. Tool behavior follows the format:
+Inkling/Harmony/Qwen/Gemma/LFM commit validated calls at their closing marker;
+DeepSeek streams DSML calls and argument deltas as they arrive. Finalization does
+not invent complete arguments for an unfinished call.
 
-`resin-py` exposes these parsers through the existing Python `ResponseParser`
-protocol, with optional `FinalizingResponseParser.finish`. The HTTP actor takes
-the native parser handle at admission and consumes its Rust events directly.
-Python callers receive the same event dictionaries as other model codecs.
+Python's `resin.recipe.Recipe(tokenizer, model=..., options=...)` implements the
+`ConversationCodec` protocol. Its parsers use one common native handle; the HTTP
+actor consumes Rust events directly. Python callers receive identical event
+dictionaries. Applications can instead pass any protocol-compatible codec with
+`render`, `create_parser`, and parser `feed` (plus optional `finish`).
 
-Prepare `resin.recipe.Tokenizer` once per codec. Fast Hugging Face tokenizers
-are snapshotted into Rust and shared across requests. Custom Python tokenizers
-can supply `decode`; that compatibility path retains cumulative decoding.
-The native path uses backend tokenizer semantics, without Transformers'
+Fast Hugging Face tokenizers are snapshotted once and shared across requests.
+Custom Python tokenizers can supply `encode`, `convert_tokens_to_ids` and
+`decode`, with optional `encode_ordinary` for literal text. This compatibility
+path retains Python callbacks and cumulative
+decoding. Its special-token behavior is the custom tokenizer's responsibility.
+The native path follows backend tokenizer semantics rather than Transformers'
 additional `clean_up_tokenization_spaces` postprocessing.
 
-Prompt rendering and media preparation still belong to the existing model
-codecs in this first slice. Other model grammars can implement the same parser
-trait without depending on the inference scheduler or HTTP wire formats.
+References are pinned checkpoint templates/encoders for prompt parity. Harmony
+and DeepSeek Recipe are primary parser oracles; TML supplies secondary checks
+where available. All reference libraries and templates are development-only.
+DeepSeek V4.1 is a different grammar and is not covered by the V4 recipe. LFM's
+nested Python-literal strings use a fixed Python 3.13 / Unicode 15.1 printable
+repertoire for deterministic rendering across deployment Python versions.
 
-Run `cargo test -p resin-recipe` for Rust invariants and
-`uv run pytest tests/test_recipe.py -q` for Python/tokenizer integration.
+Run `cargo test -p resin-recipe` for native invariants,
+`uv run pytest tests/test_recipe*.py -q` for integration, and
+`uv run pytest tests/recipe_fuzz -q` for shared differential fuzzing.
+See the fuzz README for budgets and oracle limitations.

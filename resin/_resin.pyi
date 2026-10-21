@@ -487,6 +487,27 @@ class InklingResponseParser:
     def finish(self, /, reason: Literal["stop", "length"]) -> list[ParserEvent]: ...
 
 @final
+class ModelRecipe:
+    """
+    Model format and prepared tokenizer, shared by all request parsers.
+    """
+    def __new__(
+        cls, /, tokenizer: RecipeTokenizer, *, model: str, options: Any | None = None
+    ) -> ModelRecipe: ...
+    def create_parser(
+        self, /, request: Any, prompt_ids: Sequence[int]
+    ) -> RecipeResponseParser: ...
+    def get_stop_token_ids(self, /, stop_strings: Sequence[str] = ...) -> list[int]: ...
+    def render_ids(
+        self,
+        /,
+        request: Any,
+        *,
+        media_replacements: Mapping[str, Sequence[str]] | None = None,
+    ) -> list[int]: ...
+    def render_text(self, /, request: Any) -> str: ...
+
+@final
 class Parallelism:
     """
     Attention and expert meshes over the same GPU ranks.
@@ -529,6 +550,14 @@ class Parallelism:
     ) -> int: ...
     @property
     def world_size(self, /) -> int: ...
+
+@final
+class RecipeResponseParser:
+    """
+    Common native handle recognized directly by the HTTP actor.
+    """
+    def feed(self, /, token_ids: Sequence[int]) -> list[ParserEvent]: ...
+    def finish(self, /, reason: Literal["stop", "length"]) -> list[ParserEvent]: ...
 
 @final
 class RecipeTokenizer:

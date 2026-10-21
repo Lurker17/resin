@@ -1,3 +1,6 @@
+mod render;
+pub use render::render;
+
 use serde_json::Value;
 
 use crate::{Decoder, Error, Event, FinishReason, ResponseParser};

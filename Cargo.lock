@@ -936,9 +936,11 @@ dependencies = [
 name = "resin-recipe"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "serde",
  "serde_json",
  "tokenizers",
+ "unicode-general-category",
 ]
 
 [[package]]
@@ -1242,6 +1244,12 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
 ]
+
+[[package]]
+name = "unicode-general-category"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2281c8c1d221438e373249e065ca4989c4c36952c211ff21a0ee91c44a3869e7"
 
 [[package]]
 name = "unicode-ident"

@@ -1,0 +1,426 @@
+{
+  "reference": "openai-harmony 0.0.8, renderers 0.1.9 GPT-OSS adapter",
+  "cases": [
+    {
+      "name": "schema_0",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Be concise."
+          },
+          {
+            "role": "user",
+            "content": "What next?"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "f",
+              "description": "First line.\nSecond line.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "x": {
+                    "type": "string",
+                    "enum": [
+                      "a",
+                      "b"
+                    ],
+                    "default": "a"
+                  },
+                  "n": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "a": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    }
+                  },
+                  "m": {
+                    "type": "boolean",
+                    "nullable": true
+                  }
+                },
+                "required": [
+                  "x"
+                ]
+              }
+            }
+          }
+        ],
+        "conversation_start_date": "2026-10-21"
+      },
+      "text": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-21\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Instructions\n\nBe concise.\n\n# Tools\n\n## functions\n\nnamespace functions {\n\n// First line.\n// Second line.\ntype f = (_: {\nx: \"a\" | \"b\", // default: a\nn?: number | null,\na?: number[],\nm?: boolean | null,\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>What next?<|end|><|start|>assistant<|channel|>analysis<|message|>"
+    },
+    {
+      "name": "schema_1",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Be concise."
+          },
+          {
+            "role": "user",
+            "content": "What next?"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "f",
+              "description": "First line.\nSecond line.",
+              "parameters": {
+                "type": "object",
+                "description": "object",
+                "properties": {
+                  "obj": {
+                    "type": "object",
+                    "title": "Title",
+                    "description": "Child",
+                    "examples": [
+                      "one",
+                      "two"
+                    ],
+                    "properties": {
+                      "x": {
+                        "type": "number",
+                        "default": 3.5
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "conversation_start_date": "2026-10-21"
+      },
+      "text": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-21\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Instructions\n\nBe concise.\n\n# Tools\n\n## functions\n\nnamespace functions {\n\n// First line.\n// Second line.\ntype f = (_: // object\n{\n// Title\n//\n// Child\n// Examples:\n// - \"one\"\n// - \"two\"\nobj?:     // Child\n{\n    x?: number, // default: 3.5\n    },\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>What next?<|end|><|start|>assistant<|channel|>analysis<|message|>"
+    },
+    {
+      "name": "schema_2",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Be concise."
+          },
+          {
+            "role": "user",
+            "content": "What next?"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "f",
+              "description": "First line.\nSecond line.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "v": {
+                    "description": "Same",
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "description": "Same",
+                        "default": "a"
+                      },
+                      {
+                        "type": "integer",
+                        "description": "Count",
+                        "nullable": true,
+                        "default": 2
+                      }
+                    ],
+                    "default": "choice"
+                  },
+                  "w": {
+                    "description": "Parent",
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "description": "Child"
+                      },
+                      {
+                        "type": "boolean"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "conversation_start_date": "2026-10-21"
+      },
+      "text": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-21\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Instructions\n\nBe concise.\n\n# Tools\n\n## functions\n\nnamespace functions {\n\n// First line.\n// Second line.\ntype f = (_: {\n// default: \"choice\"\nv?:\n | string // default: \"a\"\n | number | null // Count default: 2\n,\n// Parent\nw?:\n | string\n | boolean\n,\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>What next?<|end|><|start|>assistant<|channel|>analysis<|message|>"
+    },
+    {
+      "name": "schema_3",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Be concise."
+          },
+          {
+            "role": "user",
+            "content": "What next?"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "f",
+              "description": "First line.\nSecond line.",
+              "parameters": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "nullable": true,
+                    "description": "First",
+                    "default": "v"
+                  },
+                  {
+                    "type": "integer",
+                    "default": 9
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "conversation_start_date": "2026-10-21"
+      },
+      "text": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-21\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Instructions\n\nBe concise.\n\n# Tools\n\n## functions\n\nnamespace functions {\n\n// First line.\n// Second line.\ntype f = (_: \n | string | null // First default: \"v\"\n | number // default: 9) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>What next?<|end|><|start|>assistant<|channel|>analysis<|message|>"
+    },
+    {
+      "name": "schema_4",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Be concise."
+          },
+          {
+            "role": "user",
+            "content": "What next?"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "f",
+              "description": "First line.\nSecond line.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "x": {
+                    "type": "array"
+                  },
+                  "unknown": {
+                    "type": "null"
+                  },
+                  "s": {
+                    "type": "string",
+                    "default": "a\\b"
+                  },
+                  "enum": {
+                    "type": "string",
+                    "enum": [
+                      "x",
+                      "y"
+                    ],
+                    "default": "x"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "conversation_start_date": "2026-10-21"
+      },
+      "text": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-21\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Instructions\n\nBe concise.\n\n# Tools\n\n## functions\n\nnamespace functions {\n\n// First line.\n// Second line.\ntype f = (_: {\nx?: Array<any>,\nunknown?: any,\ns?: string, // default: \"a\\b\"\nenum?: \"x\" | \"y\", // default: x\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>What next?<|end|><|start|>assistant<|channel|>analysis<|message|>"
+    },
+    {
+      "name": "history",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "Consider.",
+            "content": "Working.",
+            "tool_calls": [
+              {
+                "function": {
+                  "name": "f",
+                  "arguments": {
+                    "nested": [
+                      1,
+                      "é"
+                    ]
+                  }
+                }
+              },
+              {
+                "function": {
+                  "name": "g",
+                  "arguments": "{\"x\":true}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "name": "f",
+            "content": "ok"
+          },
+          {
+            "role": "assistant",
+            "content": "Done."
+          }
+        ],
+        "add_generation_prompt": false,
+        "conversation_start_date": "2026-10-21"
+      },
+      "text": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-21\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>hi<|end|><|start|>assistant<|channel|>analysis<|message|>Consider.<|end|><|start|>assistant<|channel|>final<|message|>Working.<|end|><|start|>assistant to=functions.f<|channel|>commentary<|message|>{\"nested\": [1, \"é\"]}<|call|><|start|>assistant to=functions.g<|channel|>commentary<|message|>{\"x\":true}<|call|><|start|>functions.f to=assistant<|channel|>commentary<|message|>ok<|end|><|start|>assistant<|channel|>final<|message|>Done.<|return|>"
+    },
+    {
+      "name": "roles",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "first"
+          },
+          {
+            "role": "developer",
+            "content": "second"
+          },
+          {
+            "role": "system",
+            "content": "third"
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "héllo\n"
+              },
+              {
+                "type": "thinking",
+                "thinking": "why"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": null
+          }
+        ],
+        "conversation_start_date": "2026-10-21"
+      },
+      "text": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-21\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\nfirst<|end|><|start|>developer<|message|># Instructions\n\nsecond<|end|><|start|>developer<|message|># Instructions\n\nthird<|end|><|start|>user<|message|>héllo\nwhy<|end|><|start|>assistant<|channel|>final<|message|><|end|><|start|>assistant<|channel|>analysis<|message|>"
+    },
+    {
+      "name": "no_system",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "<|start|> literal"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "kept",
+            "content": null
+          }
+        ],
+        "use_system_prompt": false,
+        "add_generation_prompt": false,
+        "conversation_start_date": "2026-10-21"
+      },
+      "text": "<|start|>user<|message|><|start|> literal<|end|><|start|>assistant<|channel|>analysis<|message|>kept<|return|>"
+    },
+    {
+      "name": "drop_old_analysis",
+      "request": {
+        "messages": [
+          {
+            "role": "assistant",
+            "reasoning_content": "old",
+            "tool_calls": [
+              {
+                "function": {
+                  "name": "f",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "name": "f",
+            "content": "ok"
+          },
+          {
+            "role": "assistant",
+            "content": "finished"
+          },
+          {
+            "role": "user",
+            "content": "next"
+          }
+        ],
+        "auto_drop_analysis": true,
+        "conversation_start_date": "2026-10-21"
+      },
+      "text": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-21\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>assistant to=functions.f<|channel|>commentary<|message|>{}<|call|><|start|>functions.f to=assistant<|channel|>commentary<|message|>ok<|end|><|start|>assistant<|channel|>final<|message|>finished<|end|><|start|>user<|message|>next<|end|><|start|>assistant<|channel|>analysis<|message|>"
+    },
+    {
+      "name": "keep_open_analysis",
+      "request": {
+        "messages": [
+          {
+            "role": "assistant",
+            "reasoning_content": "active",
+            "tool_calls": [
+              {
+                "function": {
+                  "name": "f",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "name": "f",
+            "content": "ok"
+          }
+        ],
+        "auto_drop_analysis": true,
+        "conversation_start_date": "2026-10-21"
+      },
+      "text": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-21\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>assistant<|channel|>analysis<|message|>active<|end|><|start|>assistant to=functions.f<|channel|>commentary<|message|>{}<|call|><|start|>functions.f to=assistant<|channel|>commentary<|message|>ok<|end|><|start|>assistant<|channel|>analysis<|message|>"
+    }
+  ]
+}

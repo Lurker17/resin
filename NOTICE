@@ -41,3 +41,19 @@ SGLang is licensed under the Apache License, Version 2.0.
 
 Model weights are not distributed with Resin. Users who download Liquid AI or
 OpenAI checkpoints are responsible for the checkpoints' separate license terms.
+
+The native conversation formats in crates/resin-recipe follow the checkpoint
+chat templates for thinkingmachines/Inkling-Small-NVFP4, Qwen/Qwen3.5,
+RadixArk/Qwen3.8-27B-NVFP4, nvidia/Gemma-4-31B-IT-NVFP4, and
+LiquidAI/LFM2.5-230M. Source revisions and retained reference licenses are
+recorded in tests/recipe_fuzz/references/README.md and templates/README.md.
+The LFM2.5 template is provided under the Liquid AI LFM Open License.
+
+The GPT-OSS tool-schema formatting in crates/resin-recipe/src/gpt_oss/schema.rs
+is adapted from OpenAI Harmony (Copyright 2025 OpenAI), Apache License 2.0.
+https://github.com/openai/harmony
+
+The DeepSeek V4 conversation format and tools prompt in crates/resin-recipe
+are adapted from encoding/encoding_dsv4.py in DeepSeek-V4-Flash-0731 and
+DeepSeek-V4-Pro-0813, Copyright (c) 2023 DeepSeek, MIT License.
+The MIT notice is retained at crates/resin-recipe/licenses/deepseek-MIT.txt.

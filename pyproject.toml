@@ -9,6 +9,7 @@ description = "A small Rust substrate for model-specific inference engines"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "crates/resin-recipe/licenses/*.txt"]
 authors = [{ name = "Eric Zhang <ekzhang1@gmail.com>" }]
 classifiers = [
   "Development Status :: 3 - Alpha",

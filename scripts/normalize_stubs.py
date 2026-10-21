@@ -16,6 +16,12 @@ OUTPUT_COLUMNS = {
 }
 
 PARAMETERS = {
+    ("ModelRecipe", "create_parser"): {"prompt_ids": "Sequence[int]"},
+    ("ModelRecipe", "render_ids"): {
+        "media_replacements": "Mapping[str, Sequence[str]] | None"
+    },
+    ("RecipeResponseParser", "feed"): {"token_ids": "Sequence[int]"},
+    ("RecipeResponseParser", "finish"): {"reason": 'Literal["stop", "length"]'},
     ("BatchPlan", "__new__"): {
         "sequence_ids": "Sequence[int] | npt.NDArray[np.uint64]",
         "context_lengths": U32_INPUT,
@@ -50,6 +56,8 @@ PARAMETERS = {
 }
 
 RETURNS = {
+    ("RecipeResponseParser", "feed"): "list[ParserEvent]",
+    ("RecipeResponseParser", "finish"): "list[ParserEvent]",
     ("InklingResponseParser", "feed"): "list[ParserEvent]",
     ("InklingResponseParser", "finish"): "list[ParserEvent]",
     ("BatchPlan", "sequence_ids"): "npt.NDArray[np.uint64]",

@@ -1,13 +1,28 @@
 //! Model conversation formats, independent of Python and HTTP protocols.
 
-mod inkling;
+pub mod deepseek;
+pub mod gemma;
+pub mod gpt_oss;
+pub mod inkling;
+mod json;
+pub mod lfm2;
+mod model;
+mod prompt;
+pub mod qwen;
 mod tokenizer;
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub use deepseek::{DeepSeekV4Parser, DeepSeekV4Tokens};
+pub use gemma::{Gemma4Parser, Gemma4Tokens};
+pub use gpt_oss::{GptOssParser, GptOssTokens};
 pub use inkling::{InklingParser, InklingTokens};
+pub use lfm2::{Lfm2Parser, Lfm2Tokens};
+pub use model::ModelFormat;
+pub use prompt::{Encoder, Prompt, PromptSpan, TokenizerEncoder};
+pub use qwen::{QwenParser, QwenTokens};
 pub use tokenizer::{Tokenizer, TokenizerDecoder};
 
 /// A semantic response event, shared by streaming and complete responses.

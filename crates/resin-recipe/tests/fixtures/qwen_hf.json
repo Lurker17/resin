@@ -1,0 +1,581 @@
+{
+  "reference": "HF Qwen3.8 NVFP4 554ebba / Qwen3.5-35B-A3B 59d61f3",
+  "cases": [
+    {
+      "name": "qwen3_8_basic",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": " hi "
+          }
+        ],
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_8"
+        }
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_8_system",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": " Be useful. "
+          },
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "reasoning_effort": "low",
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_8"
+        }
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nBe useful.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_8_empty_system",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "  "
+          },
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "reasoning_effort": "medium",
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_8"
+        }
+      },
+      "text": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_8_no_thinking",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "content": "yes"
+          },
+          {
+            "role": "user",
+            "content": "again"
+          }
+        ],
+        "enable_thinking": false,
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_8"
+        }
+      },
+      "text": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nyes<|im_end|>\n<|im_start|>user\nagain<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "qwen3_8_history",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": " why ",
+            "content": " yes "
+          },
+          {
+            "role": "user",
+            "content": "next"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "more",
+            "content": "Done."
+          }
+        ],
+        "add_generation_prompt": false,
+        "extra": {
+          "recipe_variant": "qwen3_8"
+        }
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\nwhy\n</think>\n\nyes<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\nmore\n</think>\n\nDone.<|im_end|>\n"
+    },
+    {
+      "name": "qwen3_8_drop_history",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "old",
+            "content": "yes"
+          },
+          {
+            "role": "user",
+            "content": "next"
+          }
+        ],
+        "preserve_thinking": false,
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_8"
+        }
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nyes<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_8_tools",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "why",
+            "content": "search",
+            "tool_calls": [
+              {
+                "function": {
+                  "name": "f",
+                  "arguments": {
+                    "city": "東京",
+                    "n": 2,
+                    "ok": true,
+                    "nil": null,
+                    "xs": [
+                      1,
+                      2
+                    ]
+                  }
+                }
+              },
+              {
+                "function": {
+                  "name": "g",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "one"
+          },
+          {
+            "role": "tool",
+            "content": "two"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "f",
+              "description": "Search",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_8"
+        }
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"f\", \"description\": \"Search\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\nwhy\n</think>\n\nsearch\n\n<tool_call>\n<function=f>\n<parameter=city>\n東京\n</parameter>\n<parameter=n>\n2\n</parameter>\n<parameter=ok>\ntrue\n</parameter>\n<parameter=nil>\nnull\n</parameter>\n<parameter=xs>\n[1, 2]\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=g>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\none\n</tool_response>\n<tool_response>\ntwo\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_8_images",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Look "
+              },
+              {
+                "type": "image"
+              },
+              {
+                "type": "text",
+                "text": " now "
+              },
+              {
+                "type": "image"
+              }
+            ]
+          }
+        ],
+        "add_vision_id": true,
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_8"
+        }
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nLook Picture 1: <|vision_start|><|image_pad|><|vision_end|> now Picture 2: <|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_8_video",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "video"
+              },
+              {
+                "type": "text",
+                "text": " what?"
+              }
+            ]
+          }
+        ],
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_8"
+        }
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|> what?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_8_legacy_think",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>\nold\n</think>\n\nAnswer."
+          },
+          {
+            "role": "user",
+            "content": "next"
+          }
+        ],
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_8"
+        }
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<think>\nold\n</think>\n\nAnswer.<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_5_basic",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": " hi "
+          }
+        ],
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_5"
+        }
+      },
+      "text": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_5_system",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": " Be useful. "
+          },
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "reasoning_effort": "low",
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_5"
+        }
+      },
+      "text": "<|im_start|>system\nBe useful.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_5_empty_system",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "  "
+          },
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "reasoning_effort": "medium",
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_5"
+        }
+      },
+      "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_5_no_thinking",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "content": "yes"
+          },
+          {
+            "role": "user",
+            "content": "again"
+          }
+        ],
+        "enable_thinking": false,
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_5"
+        }
+      },
+      "text": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nyes<|im_end|>\n<|im_start|>user\nagain<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "qwen3_5_history",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": " why ",
+            "content": " yes "
+          },
+          {
+            "role": "user",
+            "content": "next"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "more",
+            "content": "Done."
+          }
+        ],
+        "add_generation_prompt": false,
+        "extra": {
+          "recipe_variant": "qwen3_5"
+        }
+      },
+      "text": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nyes<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\nmore\n</think>\n\nDone.<|im_end|>\n"
+    },
+    {
+      "name": "qwen3_5_drop_history",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "old",
+            "content": "yes"
+          },
+          {
+            "role": "user",
+            "content": "next"
+          }
+        ],
+        "preserve_thinking": false,
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_5"
+        }
+      },
+      "text": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nyes<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_5_tools",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "why",
+            "content": "search",
+            "tool_calls": [
+              {
+                "function": {
+                  "name": "f",
+                  "arguments": {
+                    "city": "東京",
+                    "n": 2,
+                    "ok": true,
+                    "nil": null,
+                    "xs": [
+                      1,
+                      2
+                    ]
+                  }
+                }
+              },
+              {
+                "function": {
+                  "name": "g",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "one"
+          },
+          {
+            "role": "tool",
+            "content": "two"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "f",
+              "description": "Search",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_5"
+        }
+      },
+      "text": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"f\", \"description\": \"Search\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\nwhy\n</think>\n\nsearch\n\n<tool_call>\n<function=f>\n<parameter=city>\n東京\n</parameter>\n<parameter=n>\n2\n</parameter>\n<parameter=ok>\nTrue\n</parameter>\n<parameter=nil>\nNone\n</parameter>\n<parameter=xs>\n[1, 2]\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=g>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\none\n</tool_response>\n<tool_response>\ntwo\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_5_images",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Look "
+              },
+              {
+                "type": "image"
+              },
+              {
+                "type": "text",
+                "text": " now "
+              },
+              {
+                "type": "image"
+              }
+            ]
+          }
+        ],
+        "add_vision_id": true,
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_5"
+        }
+      },
+      "text": "<|im_start|>user\nLook Picture 1: <|vision_start|><|image_pad|><|vision_end|> now Picture 2: <|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_5_video",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "video"
+              },
+              {
+                "type": "text",
+                "text": " what?"
+              }
+            ]
+          }
+        ],
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_5"
+        }
+      },
+      "text": "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|> what?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "qwen3_5_legacy_think",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>\nold\n</think>\n\nAnswer."
+          },
+          {
+            "role": "user",
+            "content": "next"
+          }
+        ],
+        "add_generation_prompt": true,
+        "extra": {
+          "recipe_variant": "qwen3_5"
+        }
+      },
+      "text": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nAnswer.<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    }
+  ]
+}

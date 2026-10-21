@@ -3,13 +3,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+import pytest
 from tokenizers import Tokenizer as HuggingFaceTokenizer
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 
 from resin.protocols import FinalizingResponseParser, ParserEvent
-from resin.recipe import InklingResponseParser, Tokenizer
+from resin.recipe import InklingResponseParser, Recipe, Tokenizer
 
 MARKERS = (
     "<|message_model|>",
@@ -66,6 +67,41 @@ def _coalesce(events: list[ParserEvent]) -> list[ParserEvent]:
         else:
             result.append(event.copy())
     return result
+
+
+def test_complete_response_uses_actual_generation_prefix() -> None:
+    backend = _byte_tokenizer()
+    backend.add_special_tokens(
+        [
+            "<|start|>",
+            "<|end|>",
+            "<|return|>",
+            "<|call|>",
+            "<|channel|>",
+            "<|message|>",
+            "<|constrain|>",
+        ]
+    )
+    recipe = Recipe(backend, model="gpt_oss", options={"use_system_prompt": False})
+    request = {"messages": [{"role": "user", "content": "hi"}]}
+    prompt_ids = recipe.render(request)["token_ids"]
+    output = backend.encode(
+        "think<|end|><|start|>assistant<|channel|>final<|message|>answer<|return|>",
+        add_special_tokens=False,
+    ).ids
+    expected = {"content": "answer", "reasoning_content": "think", "tool_calls": []}
+    assert recipe.parse_response(output, request=request) == expected
+    assert recipe.parse_response(output, prompt_ids=prompt_ids) == expected
+    # Supplied tokens describe the real continuation even when re-rendering
+    # the caller's request would produce a different generation prefix.
+    assert (
+        recipe.parse_response(
+            output,
+            request={**request, "add_generation_prompt": False},
+            prompt_ids=prompt_ids,
+        )
+        == expected
+    )
 
 
 def test_native_decode_is_equivalent_for_every_chunk_boundary() -> None:
@@ -176,3 +212,109 @@ def test_custom_tokenizer_with_no_native_backend_uses_decode() -> None:
     assert parser.feed([ord("x")]) == [{"type": "text_delta", "delta": "x"}]
     assert calls == [[ord("x")]]
     assert parser.finish("stop") == []
+
+
+class _CallbackTokenizer:
+    """A tokenizer with explicit ordinary encoding and reversible markers."""
+
+    markers = {
+        marker: index + 1000
+        for index, marker in enumerate(
+            (*MARKERS, "<|message_user|>", "<|message_system|>", "<|message_tool|>")
+        )
+    }
+
+    def __init__(self):
+        self.raw_encodes = []
+
+    def encode(self, text, *, add_special_tokens=False):
+        self.raw_encodes.append(text)
+        return [self.markers[text]] if text in self.markers else list(text.encode())
+
+    def encode_ordinary(self, text):
+        return list(text.encode())
+
+    def convert_tokens_to_ids(self, token):
+        return self.markers.get(token, 0)
+
+    def convert_ids_to_tokens(self, token_id):
+        return next(
+            (token for token, value in self.markers.items() if value == token_id),
+            "<unk>",
+        )
+
+    def decode(self, ids, *, skip_special_tokens=False):
+        return bytes(ids).decode(errors="replace")
+
+
+def test_callback_tokenizer_prefers_ordinary_encoding_and_raw_user_stops():
+    tokenizer = _CallbackTokenizer()
+    recipe = Recipe(tokenizer, model="inkling")
+    marker = "<|content_model_end_sampling|>"
+    request = {"messages": [{"role": "user", "content": marker}]}
+    rendered = recipe.render(request)
+    assert tokenizer.markers[marker] not in rendered["token_ids"]
+    assert tokenizer.raw_encodes == []
+    assert recipe.render({**request, "stop": [marker]})["stop_token_ids"] == [
+        tokenizer.markers[marker]
+    ]
+    assert tokenizer.raw_encodes == [marker]
+
+
+@pytest.mark.parametrize("invalid_id", [0, True])
+def test_callback_tokenizer_rejects_unknown_or_boolean_control_ids(
+    invalid_id, monkeypatch
+):
+    tokenizer = _CallbackTokenizer()
+    monkeypatch.setattr(tokenizer, "convert_tokens_to_ids", lambda _: invalid_id)
+    recipe = Recipe(tokenizer, model="inkling")
+    with pytest.raises(ValueError, match="control token"):
+        recipe.get_stop_token_ids()
+
+
+def test_callback_decoder_is_captured_once_instead_of_refetched():
+    class TokenizerWithProperty(_CallbackTokenizer):
+        reads = 0
+
+        @property
+        def decode(self):
+            self.reads += 1
+            if self.reads > 1:
+                raise ValueError("decode accessor cannot be reread")
+            return super().decode
+
+    tokenizer = TokenizerWithProperty()
+    recipe = Recipe(tokenizer, model="inkling")
+    parser = recipe.create_parser({}, [tokenizer.markers["<|content_text|>"]])
+    assert parser.feed([ord("x")]) == [{"type": "text_delta", "delta": "x"}]
+    assert parser.finish("stop") == []
+    assert tokenizer.reads == 1
+
+
+def test_deepseek_constructor_effort_matches_per_request_effort():
+    backend = _byte_tokenizer()
+    request = {"messages": [{"role": "user", "content": "hi"}]}
+    configured = Recipe(
+        backend, model="deepseek_v4", options={"reasoning_effort": "high"}
+    )
+    per_request = Recipe(backend, model="deepseek_v4")
+    expected = per_request.render_text({**request, "reasoning_effort": "high"})
+    assert configured.render_text(request) == expected
+    assert configured.render_text({**request, "reasoning_effort": None}) == expected
+    assert configured.render_text(
+        {**request, "reasoning_effort": "low"}
+    ) == per_request.render_text({**request, "reasoning_effort": "low"})
+
+
+def test_inkling_tool_float_preserves_original_value() -> None:
+    import json
+
+    backend = _byte_tokenizer()
+    parser = InklingResponseParser(Tokenizer(backend), _token_ids(backend))
+    # TML 0.2.0 rounds this to 0.9999899864196776; the generated JSON and
+    # native parser must retain the exact Python value.
+    ids = backend.encode(
+        '<|content_invoke_tool_json|>{"name":"weather","args":{"":0.9999899864196777}}<|end_message|>'
+    ).ids
+    events = parser.feed(ids)
+    assert json.loads(events[-1]["delta"]) == {"": 0.9999899864196777}

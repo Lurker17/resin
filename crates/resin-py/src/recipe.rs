@@ -8,25 +8,30 @@ use std::{
 use pyo3::{
     exceptions::{PyAttributeError, PyValueError},
     prelude::*,
-    types::PyDict,
+    types::{PyBool, PyDict},
 };
-use pythonize::pythonize;
+use pythonize::{depythonize, pythonize};
 use resin_recipe::{
-    Decoder, Error, Event, FinishReason, InklingParser, InklingTokens, ResponseParser, Tokenizer,
-    TokenizerDecoder,
+    Decoder, Encoder, Error, Event, FinishReason, InklingParser, InklingTokens, ModelFormat,
+    Prompt, PromptSpan, ResponseParser, Tokenizer, TokenizerDecoder, TokenizerEncoder,
 };
+use serde_json::{Map, Value};
 
 #[derive(Clone)]
 enum TokenizerSource {
-    Native(Arc<Tokenizer>),
-    Python(Arc<Py<PyAny>>),
+    Native(Arc<Tokenizer>, Arc<TokenizerEncoder>),
+    Python {
+        object: Arc<Py<PyAny>>,
+        decode: Arc<Py<PyAny>>,
+    },
 }
 
 /// A tokenizer prepared once for a model's response parsers.
 ///
 /// Fast Hugging Face tokenizers are snapshotted into Rust. Custom Python
 /// tokenizers remain supported through their decode method.
-#[pyclass(frozen, module = "resin._resin")]
+#[pyclass(frozen, skip_from_py_object, module = "resin._resin")]
+#[derive(Clone)]
 pub(crate) struct RecipeTokenizer {
     source: TokenizerSource,
 }
@@ -42,20 +47,28 @@ impl RecipeTokenizer {
             let json: String = serialize.call0()?.extract()?;
             let native = Tokenizer::from_bytes(json.as_bytes())
                 .map_err(|error| PyValueError::new_err(format!("invalid tokenizer: {error}")))?;
-            TokenizerSource::Native(Arc::new(native))
+            {
+                let tokenizer = Arc::new(native);
+                let encoder =
+                    Arc::new(TokenizerEncoder::new(tokenizer.clone()).map_err(recipe_error)?);
+                TokenizerSource::Native(tokenizer, encoder)
+            }
         } else {
             let decode = tokenizer.getattr("decode")?;
             if !decode.is_callable() {
                 return Err(PyValueError::new_err("tokenizer.decode must be callable"));
             }
-            TokenizerSource::Python(Arc::new(decode.unbind()))
+            TokenizerSource::Python {
+                object: Arc::new(tokenizer.clone().unbind()),
+                decode: Arc::new(decode.unbind()),
+            }
         };
         Ok(Self { source })
     }
 
     #[getter]
     fn is_native(&self) -> bool {
-        matches!(self.source, TokenizerSource::Native(_))
+        matches!(self.source, TokenizerSource::Native(..))
     }
 }
 
@@ -71,12 +84,23 @@ fn optional_attr<'py>(
 }
 
 impl RecipeTokenizer {
+    fn encode_stop(&self, text: &str) -> Result<Vec<u32>, Error> {
+        match &self.source {
+            TokenizerSource::Native(tokenizer, _) => tokenizer
+                .encode_fast(text, false)
+                .map(|encoding| encoding.get_ids().to_vec())
+                .map_err(|error| Error::new(error.to_string())),
+            TokenizerSource::Python { object, .. } => {
+                PythonEncoder(object.clone()).encode_raw(text)
+            }
+        }
+    }
     fn decoder(&self) -> Box<dyn Decoder> {
         match &self.source {
-            TokenizerSource::Native(tokenizer) => {
+            TokenizerSource::Native(tokenizer, _) => {
                 Box::new(TokenizerDecoder::new(tokenizer.clone()))
             }
-            TokenizerSource::Python(decode) => Box::new(PythonDecoder {
+            TokenizerSource::Python { decode, .. } => Box::new(PythonDecoder {
                 decode: decode.clone(),
                 ids: Vec::new(),
                 emitted: String::new(),
@@ -218,4 +242,272 @@ pub(crate) fn finish(parser: &SharedParser, reason: FinishReason) -> PyResult<Ve
 
 fn recipe_error(error: Error) -> PyErr {
     PyValueError::new_err(error.to_string())
+}
+
+impl RecipeTokenizer {
+    fn encoder(&self) -> Box<dyn Encoder> {
+        match &self.source {
+            TokenizerSource::Native(_, encoder) => Box::new(SharedEncoder(encoder.clone())),
+            TokenizerSource::Python { object, .. } => Box::new(PythonEncoder(object.clone())),
+        }
+    }
+}
+struct SharedEncoder(Arc<TokenizerEncoder>);
+impl Encoder for SharedEncoder {
+    fn encode_text(&self, text: &str) -> Result<Vec<u32>, Error> {
+        self.0.encode_text(text)
+    }
+    fn special_id(&self, spelling: &str) -> Result<u32, Error> {
+        self.0.special_id(spelling)
+    }
+}
+struct PythonEncoder(Arc<Py<PyAny>>);
+impl PythonEncoder {
+    fn raw(tokenizer: &Bound<'_, PyAny>, text: &str) -> PyResult<Vec<u32>> {
+        let kwargs = PyDict::new(tokenizer.py());
+        kwargs.set_item("add_special_tokens", false)?;
+        tokenizer
+            .call_method("encode", (text,), Some(&kwargs))?
+            .extract()
+    }
+
+    fn encode_raw(&self, text: &str) -> Result<Vec<u32>, Error> {
+        Python::attach(|py| Self::raw(self.0.bind(py), text))
+            .map_err(|error| Error::new(error.to_string()))
+    }
+}
+impl Encoder for PythonEncoder {
+    fn encode_text(&self, text: &str) -> Result<Vec<u32>, Error> {
+        Python::attach(|py| {
+            let tokenizer = self.0.bind(py);
+            if let Some(ordinary) = optional_attr(tokenizer, "encode_ordinary")? {
+                ordinary.call1((text,))?.extract()
+            } else {
+                Self::raw(tokenizer, text)
+            }
+        })
+        .map_err(|error: PyErr| Error::new(error.to_string()))
+    }
+    fn special_id(&self, spelling: &str) -> Result<u32, Error> {
+        Python::attach(|py| {
+            let tokenizer = self.0.bind(py);
+            let value = if let Some(method) = optional_attr(tokenizer, "convert_tokens_to_ids")? {
+                method.call1((spelling,))?
+            } else {
+                tokenizer.call_method1("token_to_id", (spelling,))?
+            };
+            if value.is_instance_of::<PyBool>() {
+                return Err(PyValueError::new_err("control token IDs must be integers"));
+            }
+            let id: u32 = value.extract()?;
+            let inverse = match optional_attr(tokenizer, "convert_ids_to_tokens")? {
+                Some(inverse) => Some(inverse),
+                None => optional_attr(tokenizer, "id_to_token")?,
+            };
+            if let Some(inverse) = inverse {
+                let round_trip: String = inverse.call1((id,))?.extract()?;
+                if round_trip != spelling {
+                    return Err(PyValueError::new_err("control token did not round-trip"));
+                }
+            }
+            Ok(id)
+        })
+        .map_err(|error: PyErr| {
+            Error::new(format!("missing model control token {spelling:?}: {error}"))
+        })
+    }
+}
+
+/// Common native handle recognized directly by the HTTP actor.
+#[pyclass(name = "RecipeResponseParser", frozen, module = "resin._resin")]
+pub(crate) struct NativeResponseParser {
+    pub(crate) inner: SharedParser,
+}
+#[pymethods]
+impl NativeResponseParser {
+    fn feed(&self, py: Python<'_>, token_ids: Vec<u32>) -> PyResult<Py<PyAny>> {
+        let events = py.detach(|| feed(&self.inner, &token_ids))?;
+        Ok(pythonize(py, &events)?.unbind())
+    }
+    fn finish(&self, py: Python<'_>, reason: &str) -> PyResult<Py<PyAny>> {
+        let reason = match reason {
+            "stop" => FinishReason::Stop,
+            "length" => FinishReason::Length,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "finish reason must be 'stop' or 'length'",
+                ));
+            }
+        };
+        let events = py.detach(|| finish(&self.inner, reason))?;
+        Ok(pythonize(py, &events)?.unbind())
+    }
+}
+
+/// Model format and prepared tokenizer, shared by all request parsers.
+#[pyclass(frozen, module = "resin._resin")]
+pub(crate) struct ModelRecipe {
+    tokenizer: RecipeTokenizer,
+    encoder: Box<dyn Encoder>,
+    model: ModelFormat,
+    options: Value,
+}
+impl ModelRecipe {
+    fn request(&self, request: &Bound<'_, PyAny>) -> PyResult<Value> {
+        let mut request: Value = depythonize(request)?;
+        let map = request
+            .as_object_mut()
+            .ok_or_else(|| PyValueError::new_err("request must be a dictionary"))?;
+        let mut extra = self.options.as_object().cloned().unwrap_or_default();
+        match map.remove("extra") {
+            Some(Value::Object(overrides)) => extra.extend(overrides),
+            None | Some(Value::Null) => (),
+            Some(_) => return Err(PyValueError::new_err("request.extra must be a dictionary")),
+        }
+        map.insert("extra".into(), Value::Object(extra));
+        Ok(request)
+    }
+}
+#[pymethods]
+impl ModelRecipe {
+    #[new]
+    #[pyo3(signature = (tokenizer, *, model, options=None))]
+    fn new(
+        tokenizer: &RecipeTokenizer,
+        model: &str,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let options: Value = options
+            .map(depythonize)
+            .transpose()?
+            .unwrap_or(Value::Object(Map::new()));
+        if !options.is_object() {
+            return Err(PyValueError::new_err("options must be a dictionary"));
+        }
+        Ok(Self {
+            tokenizer: tokenizer.clone(),
+            encoder: tokenizer.encoder(),
+            model: ModelFormat::parse(model).map_err(recipe_error)?,
+            options,
+        })
+    }
+    fn render_text(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<String> {
+        let request = self.request(request)?;
+        py.detach(|| {
+            self.model
+                .render(&request)
+                .map(|prompt| prompt.rendered_text())
+                .map_err(recipe_error)
+        })
+    }
+    #[pyo3(signature = (request, *, media_replacements=None))]
+    fn render_ids(
+        &self,
+        py: Python<'_>,
+        request: &Bound<'_, PyAny>,
+        media_replacements: Option<HashMap<String, Vec<String>>>,
+    ) -> PyResult<Vec<u32>> {
+        let request = self.request(request)?;
+        py.detach(|| {
+            self.model
+                .render(&request)
+                .and_then(|prompt| {
+                    let prompt = if let Some(replacements) = &media_replacements {
+                        self.expand_media(prompt, replacements)?
+                    } else {
+                        prompt
+                    };
+                    prompt.encode(self.encoder.as_ref())
+                })
+                .map_err(recipe_error)
+        })
+    }
+    #[pyo3(signature = (stop_strings=Vec::new()))]
+    fn get_stop_token_ids(&self, stop_strings: Vec<String>) -> PyResult<Vec<u32>> {
+        let mut ids = self
+            .model
+            .stop_token_ids(self.encoder.as_ref())
+            .map_err(recipe_error)?;
+        for stop in stop_strings {
+            let encoded = self.tokenizer.encode_stop(&stop).map_err(recipe_error)?;
+            if encoded.len() != 1 {
+                return Err(PyValueError::new_err(format!(
+                    "stop sequence {stop:?} encodes to {} tokens; multi-token stop sequences are not supported yet",
+                    encoded.len()
+                )));
+            }
+            if !ids.contains(&encoded[0]) {
+                ids.push(encoded[0]);
+            }
+        }
+        Ok(ids)
+    }
+    fn create_parser(
+        &self,
+        py: Python<'_>,
+        request: &Bound<'_, PyAny>,
+        prompt_ids: Vec<u32>,
+    ) -> PyResult<NativeResponseParser> {
+        let request = self.request(request)?;
+        let parser = py.detach(|| {
+            self.model
+                .create_parser(
+                    self.encoder.as_ref(),
+                    self.tokenizer.decoder(),
+                    &request,
+                    &prompt_ids,
+                )
+                .map_err(recipe_error)
+        })?;
+        Ok(NativeResponseParser {
+            inner: Arc::new(Mutex::new(parser)),
+        })
+    }
+}
+
+impl ModelRecipe {
+    fn expand_media(
+        &self,
+        prompt: Prompt,
+        replacements: &HashMap<String, Vec<String>>,
+    ) -> Result<Prompt, Error> {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        let mut expanded = Prompt::new();
+        for span in prompt.spans {
+            match span {
+                PromptSpan::Text(text) => {
+                    expanded.text(text);
+                }
+                PromptSpan::Special(token) => {
+                    if let Some(values) = replacements.get(&token) {
+                        let index = counts
+                            .entry(replacements.get_key_value(&token).unwrap().0.as_str())
+                            .or_default();
+                        let value = values.get(*index).ok_or_else(|| {
+                            Error::new(format!("missing media expansion for {token}"))
+                        })?;
+                        *index += 1;
+                        match &self.tokenizer.source {
+                            TokenizerSource::Native(_, encoder) => {
+                                encoder.append_format(&mut expanded, value)
+                            }
+                            TokenizerSource::Python { .. } => {
+                                expanded.text(value);
+                            }
+                        }
+                    } else {
+                        expanded.special(token);
+                    }
+                }
+            }
+        }
+        for (marker, values) in replacements {
+            if counts.get(marker.as_str()).copied().unwrap_or(0) != values.len() {
+                return Err(Error::new(format!(
+                    "media expansion count does not match {marker}"
+                )));
+            }
+        }
+        Ok(expanded)
+    }
 }

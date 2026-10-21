@@ -1380,7 +1380,7 @@ mod _resin {
     use crate::http::NativeHttpServer;
 
     #[pymodule_export]
-    use crate::recipe::{NativeInklingParser, RecipeTokenizer};
+    use crate::recipe::{ModelRecipe, NativeInklingParser, NativeResponseParser, RecipeTokenizer};
 
     #[pymodule_export]
     #[allow(non_upper_case_globals)]
