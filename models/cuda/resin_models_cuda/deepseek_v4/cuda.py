@@ -74,7 +74,6 @@ class DeepSeekV4CudaRunner(CudaRunner):
         cp=True,
         ep=True,
         expert_tp=True,
-        attn_replication=True,
     )
 
     def __init__(

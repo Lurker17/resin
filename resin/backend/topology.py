@@ -9,16 +9,15 @@ from typing import Any
 from resin import Parallelism
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ParallelismCapabilities:
-    """Supported axes; preparation also validates model-specific combinations."""
+    """Supported parallelisms for a model implementation."""
 
     attn_dp: bool = False
     attn_tp: bool = False
     cp: bool = False
     ep: bool = False
     expert_tp: bool = False
-    attn_replication: bool = False
 
     def validate(self, parallelism: Parallelism, *, model: str) -> None:
         unsupported = [

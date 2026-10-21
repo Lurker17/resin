@@ -28,9 +28,11 @@ infers model weight layouts or uses the default world group for those operations
 
 CUDA runners declare `parallelism_capabilities`; the shared base defaults to
 single-rank execution. GPT-OSS and DeepSeek-V4 declare attention TP, attention DP,
-CP, EP, expert TP, and attention replication. These axes compose through the
-explicit `parallel_groups=` preparation path. Model dimensions, quantization
-blocks, and kernel capabilities still constrain valid layouts. DeepSeek-V4
+CP, EP, and expert TP. Attention replication is always allowed; it repeats the
+same attention computation without introducing another sharding axis.
+These axes compose through the explicit `parallel_groups=` preparation path.
+Model dimensions, quantization blocks, and kernel capabilities still constrain
+valid layouts. DeepSeek-V4
 DSpark uses the same meshes for draft and target verification, including
 empty-replica participation and captured expert exchanges.
 Both explicit-group paths provide

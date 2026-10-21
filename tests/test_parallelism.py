@@ -80,9 +80,10 @@ def test_remaining_attention_ranks_replicate_the_same_request():
     )
 
 
-def test_topology_requires_keywords():
+@pytest.mark.parametrize("configuration", (Parallelism, ParallelismCapabilities))
+def test_parallel_configuration_requires_keywords(configuration):
     with pytest.raises(TypeError):
-        Parallelism(2)
+        configuration(2)
 
 
 @pytest.mark.parametrize(
@@ -161,13 +162,18 @@ def test_parallelism_rejects_invalid_coordinates(coordinates):
 def test_capabilities_declare_axes_and_reject_unsupported_combinations():
     single_gpu = ParallelismCapabilities()
     single_gpu.validate(Parallelism(), model="Single GPU")
+    with pytest.raises(ValueError, match="expert_tp=2"):
+        single_gpu.validate(Parallelism(world_size=2), model="Single GPU")
     with pytest.raises(ValueError, match="Single GPU does not support attn_tp=2"):
         single_gpu.validate(Parallelism(world_size=2, attn_tp=2), model="Single GPU")
     tp = ParallelismCapabilities(attn_tp=True, expert_tp=True)
     tp.validate(Parallelism(world_size=4, attn_tp=4), model="TP")
+    ParallelismCapabilities(expert_tp=True).validate(
+        Parallelism(world_size=4), model="Expert TP"
+    )
     with pytest.raises(ValueError, match="attn_dp=4"):
         tp.validate(Parallelism(world_size=4, attn_dp=4), model="TP")
-    ep_dp = ParallelismCapabilities(ep=True, attn_dp=True, attn_replication=True)
+    ep_dp = ParallelismCapabilities(ep=True, attn_dp=True)
     ep_dp.validate(Parallelism(world_size=4, ep=4, attn_dp=4), model="EP/DP")
     ep_dp.validate(Parallelism(world_size=4, ep=4), model="EP/DP")
     with pytest.raises(ValueError, match="expert_tp=2"):

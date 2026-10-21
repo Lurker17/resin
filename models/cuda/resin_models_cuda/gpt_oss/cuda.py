@@ -174,7 +174,6 @@ class GptOssCudaRunner(CudaRunner):
         cp=True,
         ep=True,
         expert_tp=True,
-        attn_replication=True,
     )
     page_size = PAGE_SIZE
     sliding_window = SLIDING_WINDOW
