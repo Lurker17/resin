@@ -50,6 +50,7 @@ class CudaGraphShapeStats(TypedDict):
 
 class CudaGraphStats(TypedDict):
     capture_scope: NotRequired[str]
+    captured_operations: NotRequired[tuple[str, ...]]
     enabled: bool
     configured_shapes: tuple[GraphShape, ...]
     captured_shapes: tuple[GraphShape, ...]
@@ -221,9 +222,27 @@ def _as_program(step: CudaGraphStep | CudaGraphProgram) -> CudaGraphProgram:
     raise TypeError("CUDA graph builder must return a step or program")
 
 
+def _map_output(output, operation):
+    if isinstance(output, tuple):
+        return tuple(_map_output(value, operation) for value in output)
+    return operation(output)
+
+
+def _outputs_equal(left, right) -> bool:
+    if isinstance(left, tuple):
+        return (
+            isinstance(right, tuple)
+            and len(left) == len(right)
+            and all(_outputs_equal(a, b) for a, b in zip(left, right, strict=True))
+        )
+    return not isinstance(right, tuple) and torch.equal(left, right)
+
+
 def _output_summary(output: Any) -> str:
     """Keep capture failures bounded even for full prefill hidden tensors."""
 
+    if isinstance(output, tuple):
+        return "(" + ", ".join(_output_summary(value) for value in output) + ")"
     sample = output.reshape(-1)[:8].tolist()
     return (
         f"shape={tuple(output.shape)}, dtype={output.dtype}, "
@@ -427,7 +446,7 @@ class CudaGraphCache:
         except BaseException as error:
             self._fail("graph capture", error)
         return (
-            entry.program.output.tolist()
+            _map_output(entry.program.output, lambda tensor: tensor.tolist())
             if entry.program.output_to_host
             else entry.program.output
         )
@@ -456,7 +475,7 @@ class CudaGraphCache:
             with torch.cuda.device(self.device), torch.inference_mode():
                 self._replay(entry.program, entry.graphs)
             result = (
-                entry.program.output.tolist()
+                _map_output(entry.program.output, lambda tensor: tensor.tolist())
                 if entry.program.output_to_host
                 else entry.program.output
             )
@@ -476,7 +495,7 @@ class CudaGraphCache:
                 if program.prepare is not None:
                     program.prepare()
                 self._launch(program)
-            expected = program.output.clone()
+            expected = _map_output(program.output, lambda tensor: tensor.clone())
         current.wait_stream(warmup)
         entry.warmups = 3
         torch.cuda.synchronize(self.device)
@@ -491,17 +510,17 @@ class CudaGraphCache:
             self._replay(program, graphs)
         torch.cuda.synchronize(self.device)
         if program.validate_eager_output:
-            if not torch.equal(expected, program.output):
+            if not _outputs_equal(expected, program.output):
                 raise RuntimeError(
                     "CUDA graph replay differs from eager warmup "
                     f"(expected: {_output_summary(expected)}; "
                     f"actual: {_output_summary(program.output)})"
                 )
         else:
-            expected_replay = program.output.clone()
+            expected_replay = _map_output(program.output, lambda tensor: tensor.clone())
             self._replay(program, graphs)
             torch.cuda.synchronize(self.device)
-            if not torch.equal(expected_replay, program.output):
+            if not _outputs_equal(expected_replay, program.output):
                 raise RuntimeError(
                     "CUDA graph replays are not deterministic "
                     f"(expected: {_output_summary(expected_replay)}; "

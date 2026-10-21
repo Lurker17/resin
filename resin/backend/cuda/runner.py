@@ -320,6 +320,17 @@ class CudaRunner(Runner):
             self._prefill_buffers[tokens] = (inputs, torch.empty_like(hidden))
         return self._prefill_buffers[tokens]
 
+    def _configure_prefill_tensor_graphs(self, regions, **options):
+        """Capture pure tensor regions while keeping attention metadata eager."""
+
+        from resin.backend.cuda.tensor_graphs import PrefillTensorGraphs
+
+        graphs = PrefillTensorGraphs(self, tuple(regions), **options)
+        if not hasattr(self, "_prefill_tensor_graphs"):
+            self._prefill_tensor_graphs = {}
+        self._prefill_tensor_graphs[graphs.mode] = graphs
+        return graphs.callbacks
+
     def _new_prefill_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         tokens, region = shape
         inputs, output = self._prefill_graph_buffers(tokens)
@@ -408,6 +419,9 @@ class CudaRunner(Runner):
         stats = self._require_cuda_graph_executor().stats
         if self._prefill_operations:
             stats["prefill"]["capture_scope"] = "feed_forward_regions"
+        for mode, graphs in getattr(self, "_prefill_tensor_graphs", {}).items():
+            stats[mode]["capture_scope"] = "attention_projections"
+            stats[mode]["captured_operations"] = tuple(r.name for r in graphs.regions)
         return stats
 
     def _before_cuda_graph_capture(self) -> None:
@@ -432,6 +446,8 @@ class CudaRunner(Runner):
         if self._cuda_graph_executor is not None:
             self._cuda_graph_executor.close()
         self._prefill_buffers.clear()
+        for graphs in getattr(self, "_prefill_tensor_graphs", {}).values():
+            graphs.buffers.clear()
 
     def capture_cuda_graph(self, mode: str, shape: GraphShape) -> CudaGraphStats:
         """Capture one mode shape while honoring model-state hooks."""
@@ -452,6 +468,8 @@ class CudaRunner(Runner):
         executor.check()
         if phase == BatchPhase.PREFILL:
             executor.mode("prefill").check_ready()
+            for mode in getattr(self, "_prefill_tensor_graphs", {}):
+                executor.mode(mode).check_ready()
 
     def _select_cuda_graph(
         self,
