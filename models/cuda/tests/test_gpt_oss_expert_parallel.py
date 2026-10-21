@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -9,11 +11,13 @@ import torch
 
 from resin.backend.cuda.parallel import TensorParallelLayout
 from resin.backend.topology import RankGroup
+from resin.models.gpt_oss.config import GptOssConfig
 from resin_models_cuda.gpt_oss.mxfp4 import (
     EXPERT_CHECKPOINT_NAMES,
     kernel_expert_factory,
     moe_kernel_config,
     shard_checkpoint_tensor,
+    shard_model_config,
 )
 
 
@@ -77,7 +81,251 @@ def test_expert_and_attention_shards_use_independent_axes():
     )
 
 
-def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty():
+def _config():
+    return GptOssConfig.from_dict(
+        {
+            "model_type": "gpt_oss",
+            "vocab_size": 43,
+            "hidden_size": 32,
+            "intermediate_size": 96,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "num_local_experts": 8,
+            "num_experts_per_tok": 2,
+            "head_dim": 8,
+            "sliding_window": 32,
+        }
+    )
+
+
+def test_local_model_heads_and_expert_channels_use_different_tp_sizes():
+    args = _config()
+    # Uneven aligned expert shards are legal; their width is unrelated to the
+    # number of local attention heads or the expert-owner axis.
+    local = shard_model_config(
+        args,
+        TensorParallelLayout(rank=1, size=2),
+        expert_tensor_parallel=TensorParallelLayout(rank=1, size=3),
+    )
+    assert local == replace(
+        args, num_attention_heads=2, num_key_value_heads=1, intermediate_size=32
+    )
+    legacy = shard_model_config(args, TensorParallelLayout(rank=1, size=2))
+    assert legacy.intermediate_size == 32
+    full_attention = shard_model_config(
+        args,
+        TensorParallelLayout(),
+        expert_tensor_parallel=TensorParallelLayout(rank=0, size=2),
+    )
+    assert full_attention.num_attention_heads == args.num_attention_heads
+    assert full_attention.intermediate_size == 64
+
+
+@pytest.mark.parametrize("name", EXPERT_CHECKPOINT_NAMES)
+def test_composed_ep_and_expert_tp_reconstruct_all_checkpoint_weights(name):
+    args = _config()
+    shapes = {
+        "gate_up_proj_blocks": (8, 192, 1, 16),
+        "gate_up_proj_scales": (8, 192, 1),
+        "gate_up_proj_bias": (8, 192),
+        "down_proj_blocks": (8, 32, 3, 16),
+        "down_proj_scales": (8, 32, 3),
+        "down_proj_bias": (8, 32),
+    }
+    tensor = torch.arange(torch.tensor(shapes[name]).prod()).view(shapes[name])
+    owners = []
+    for ep_rank in range(2):
+        channels = [
+            shard_checkpoint_tensor(
+                f"model.layers.0.mlp.experts.{name}",
+                tensor,
+                args=args,
+                tensor_parallel=TensorParallelLayout(rank=1, size=2),
+                expert_parallel=TensorParallelLayout(rank=ep_rank, size=2),
+                expert_tensor_parallel=TensorParallelLayout(rank=rank, size=2),
+            )
+            for rank in range(2)
+        ]
+        assert all(shard.is_contiguous() for shard in channels)
+        if name == "down_proj_bias":
+            owners.append(sum(channels))
+            assert torch.count_nonzero(channels[1]) == 0
+        else:
+            owners.append(torch.cat(channels, dim=1 if name.startswith("gate") else 2))
+    torch.testing.assert_close(torch.cat(owners), tensor)
+
+
+def test_output_biases_belong_to_their_own_tp_group():
+    args = _config()
+    bias = torch.arange(32, dtype=torch.float32)
+    layouts = dict(
+        args=args,
+        tensor_parallel=TensorParallelLayout(rank=1, size=2),
+        expert_tensor_parallel=TensorParallelLayout(rank=0, size=2),
+    )
+    attention = shard_checkpoint_tensor("layer.self_attn.o_proj.bias", bias, **layouts)
+    experts = shard_checkpoint_tensor(
+        "layer.mlp.experts.down_proj_bias", bias, **layouts
+    )
+    torch.testing.assert_close(attention, torch.zeros_like(bias))
+    torch.testing.assert_close(experts, bias)
+
+
+def test_sharded_expert_projections_match_complete_weighted_moe():
+    args = _config()
+    generator = torch.Generator().manual_seed(94)
+    hidden = torch.randn(5, args.hidden_size, generator=generator) * 0.1
+    gate_up = torch.randn(8, 192, 32, generator=generator) * 0.1
+    down = torch.randn(8, 32, 3, 32, generator=generator) * 0.1
+    gate_bias = torch.randn(8, 192, generator=generator) * 0.1
+    down_bias = torch.randn(8, 32, generator=generator) * 0.1
+    indices = torch.tensor([[0, 7], [4, 1], [6, 3], [2, 5], [7, 6]])
+    weights = torch.softmax(torch.randn(5, 2, generator=generator), dim=-1)
+
+    def project(gate_up, gate_bias, down, down_bias, expert_start=0):
+        output = torch.zeros_like(hidden)
+        for row, (experts, probabilities) in enumerate(zip(indices, weights)):
+            for expert, probability in zip(experts, probabilities):
+                local = int(expert) - expert_start
+                if not 0 <= local < gate_up.shape[0]:
+                    continue
+                pair = torch.nn.functional.linear(
+                    hidden[row], gate_up[local], gate_bias[local]
+                )
+                gate = pair[::2].clamp(max=args.swiglu_limit)
+                up = pair[1::2].clamp(-args.swiglu_limit, args.swiglu_limit)
+                activated = gate * torch.sigmoid(1.702 * gate) * (up + 1)
+                output[row] += probability * torch.nn.functional.linear(
+                    activated, down[local].flatten(1), down_bias[local]
+                )
+        return output
+
+    expected = project(gate_up, gate_bias, down, down_bias)
+    actual = torch.zeros_like(hidden)
+    for ep_rank in range(2):
+        for expert_tp_rank in range(2):
+            layouts = dict(
+                args=args,
+                tensor_parallel=TensorParallelLayout(rank=1, size=2),
+                expert_parallel=TensorParallelLayout(rank=ep_rank, size=2),
+                expert_tensor_parallel=TensorParallelLayout(
+                    rank=expert_tp_rank, size=2
+                ),
+            )
+            actual += project(
+                *(
+                    shard_checkpoint_tensor(
+                        f"layer.mlp.experts.{name}", tensor, **layouts
+                    )
+                    for name, tensor in (
+                        ("gate_up_proj_blocks", gate_up),
+                        ("gate_up_proj_bias", gate_bias),
+                        ("down_proj_blocks", down),
+                        ("down_proj_bias", down_bias),
+                    )
+                ),
+                expert_start=ep_rank * 4,
+            )
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_checkpoint_prepares_independent_attention_ep_and_expert_tp_shards(
+    tmp_path, monkeypatch
+):
+    from resin_models_cuda.gpt_oss import checkpoint, mxfp4
+
+    args = _config()
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "gpt_oss",
+                **{
+                    name: getattr(args, name)
+                    for name in (
+                        "vocab_size",
+                        "hidden_size",
+                        "intermediate_size",
+                        "num_hidden_layers",
+                        "num_attention_heads",
+                        "num_key_value_heads",
+                        "num_local_experts",
+                        "num_experts_per_tok",
+                        "head_dim",
+                        "sliding_window",
+                    )
+                },
+                "quantization_config": {"quant_method": "mxfp4"},
+            }
+        )
+    )
+    groups = SimpleNamespace(
+        attn_tp=RankGroup((0, 1), object(), 0),
+        ep=RankGroup((1, 3), object(), 1),
+        expert_tp=RankGroup((2, 3), object(), 1),
+    )
+    dispatches = []
+    prepared = []
+
+    class Dispatch:
+        def __init__(self, local, *, num_experts, groups):
+            dispatches.append((num_experts, groups))
+
+    class Kernel:
+        capabilities = SimpleNamespace(supports_fp32_partial=True)
+
+        def forward_partial(self, *args):
+            raise AssertionError("weight preparation must not execute experts")
+
+        def validate(self, config):
+            assert config.num_experts == 4
+            assert config.intermediate_size == 32
+
+        def prepare_weights(self, weights, config):
+            prepared.append(weights)
+            assert weights.gate_up.shape == (4, 64, 16)
+            assert weights.down.shape == (4, 32, 16)
+            assert torch.count_nonzero(weights.down_bias) == 0
+            return weights
+
+    def load_weights(root, model, *, transform_tensor, install_expert_layer, **kwargs):
+        model.to_empty(device="cpu")
+        tensors = {
+            "gate_up_proj_blocks": torch.zeros(8, 192, 1, 16, dtype=torch.uint8),
+            "gate_up_proj_scales": torch.zeros(8, 192, 1, dtype=torch.uint8),
+            "gate_up_proj_bias": torch.ones(8, 192),
+            "down_proj_blocks": torch.zeros(8, 32, 3, 16, dtype=torch.uint8),
+            "down_proj_scales": torch.zeros(8, 32, 3, dtype=torch.uint8),
+            "down_proj_bias": torch.ones(8, 32),
+        }
+        install_expert_layer(
+            0,
+            {
+                name: transform_tensor(f"model.layers.0.mlp.experts.{name}", value)
+                for name, value in tensors.items()
+            },
+        )
+
+    monkeypatch.setattr(mxfp4, "ExpertParallelDispatch", Dispatch)
+    monkeypatch.setattr(checkpoint, "cuda_architecture", lambda device: "sm90")
+    monkeypatch.setattr(checkpoint, "load_gpt_oss_weights", load_weights)
+    model, _ = checkpoint.load_model(
+        tmp_path, device="cpu", kernel_moe=Kernel(), parallel_groups=groups
+    )
+    assert dispatches == [(8, groups)]
+    assert len(prepared) == 1
+    assert model.args.intermediate_size == 32
+    assert model.args.num_attention_heads == 2
+    assert model.args.num_key_value_heads == 1
+    assert model.model.layers[0].mlp.router.weight.shape == (8, 32)
+
+
+def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty(monkeypatch):
+    from resin_models_cuda.gpt_oss import mxfp4
+
+    monkeypatch.setattr(
+        mxfp4, "ExpertParallelDispatch", lambda *args, **kwargs: object()
+    )
     args = _args()
     local_args = SimpleNamespace(**vars(args))
     local_args.num_local_experts = 4

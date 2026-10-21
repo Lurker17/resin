@@ -46,6 +46,36 @@ def _dequantize_wo_a(weight: Any, scale: Any):
     return weight.flatten(2, 3).flatten(0, 1).bfloat16()
 
 
+def _shard_routed_expert(tensor: Any, name: str, model: Any):
+    """Slice the logical intermediate axis, including packed weights/scales."""
+
+    module_path, separator, expert_path = name.rpartition(".experts.")
+    if not separator:
+        if not name.startswith("experts."):
+            return tensor
+        module_path, expert_path = "", name.removeprefix("experts.")
+    projection = expert_path.split(".")[1]
+    axis = {"w1": 0, "w3": 0, "w2": 1}.get(projection)
+    if axis is None:
+        return tensor
+    source = model.get_submodule(module_path) if module_path else model
+    shard = getattr(source, "expert_intermediate_shard", None)
+    if shard is None:
+        return tensor
+    total = source.routed_intermediate_size
+    width = tensor.shape[axis]
+    if total % width:
+        raise ValueError(
+            f"checkpoint tensor {name!r} has invalid expert block geometry"
+        )
+    packing = total // width
+    if shard.start % packing or shard.size % packing:
+        raise ValueError(f"checkpoint tensor {name!r} crosses an expert TP block")
+    return tensor.narrow(
+        axis, shard.start // packing, shard.size // packing
+    ).contiguous()
+
+
 def _coerce_for_target(tensor: Any, target: Any):
     fp4 = getattr(torch, "float4_e2m1fn_x2", None)
     if fp4 is not None and target.dtype == fp4 and tensor.dtype == torch.int8:
@@ -91,6 +121,7 @@ def load_deepseek_v4_weights(
         for name in ordered:
             path = tensor_files[name]
             tensor = _shard(reader.read(path, name), name, rank, tensor_parallel_size)
+            tensor = _shard_routed_expert(tensor, name, model)
             if name.endswith(".wo_a.weight"):
                 scale_name = name.removesuffix("weight") + "scale"
                 scale_path = tensor_files.get(scale_name)

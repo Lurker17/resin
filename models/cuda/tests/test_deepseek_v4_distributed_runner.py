@@ -42,6 +42,15 @@ def _groups(parallelism: Parallelism, rank: int = 0):
                 setattr(
                     groups, name, RankGroup(ranks, (name, ranks), ranks.index(rank))
                 )
+    for name, source in (
+        ("device_replica", groups.replica),
+        ("device_domain", groups.domain),
+    ):
+        setattr(
+            groups,
+            name,
+            RankGroup(source.ranks, (name, source.ranks), source.local_rank),
+        )
     return groups
 
 
@@ -149,7 +158,7 @@ def test_ragged_prefill_replicas_enter_the_same_expert_rounds(monkeypatch, polic
         )
         assert output == ([4, 6] if rank == 0 else [9])
         assert runner._cache.plans == [plan]
-        assert groups.broadcasts == [(rank, groups.attn_replication.handle, output)]
+        assert groups.broadcasts == [(rank, groups.device_replica.handle, output)]
         runners.append(runner)
 
     assert [call[0] for call in runners[0]._model.calls] == ["prefill", "prefill"]
@@ -285,9 +294,6 @@ def test_managed_cache_addresses_are_validated_before_expert_rounds(
 @pytest.mark.parametrize(
     ("parallelism", "options", "message"),
     [
-        (Parallelism(world_size=4, ep=4, cp=2), {}, "cp=2"),
-        (Parallelism(world_size=4, ep=2), {}, "expert_tp=2"),
-        (Parallelism(world_size=4, ep=4, attn_tp=2), {}, "attn_tp=1"),
         (
             Parallelism(world_size=4, ep=4),
             {"speculative_tokens": 1},
@@ -315,7 +321,19 @@ def test_unsupported_distributed_preparation_fails_before_cuda(
         )
 
 
-def test_distributed_graph_policies_pass_topology_preparation(monkeypatch):
+@pytest.mark.parametrize(
+    "parallelism",
+    [
+        Parallelism(world_size=4, ep=4, attn_dp=4),
+        Parallelism(world_size=4, ep=2),
+        Parallelism(world_size=4, ep=4, attn_tp=2),
+        Parallelism(world_size=4, ep=2, cp=2),
+        Parallelism(world_size=8, attn_dp=2, attn_tp=2, cp=2, ep=2),
+    ],
+)
+def test_distributed_graph_policies_and_composed_meshes_pass_preparation(
+    monkeypatch, parallelism
+):
     import resin_models_cuda.deepseek_v4.cuda as implementation
 
     class CudaEntry(Exception):
@@ -331,7 +349,7 @@ def test_distributed_graph_policies_pass_topology_preparation(monkeypatch):
         DeepSeekV4CudaRunner(
             ".",
             max_seq_len=128,
-            parallel_groups=_groups(Parallelism(world_size=4, ep=4, attn_dp=4)),
+            parallel_groups=_groups(parallelism),
             device="cuda",
         )
 
@@ -486,5 +504,5 @@ def test_decode_graph_launch_fixes_expert_capacity_and_replica_broadcast(monkeyp
 
     assert scopes == [(2, 1)]
     assert step.output.tolist() == [1, 2]
-    assert groups.broadcasts == [(0, groups.attn_replication.handle, [1, 2])]
+    assert groups.broadcasts == [(0, groups.device_replica.handle, [1, 2])]
     torch.testing.assert_close(runner._graph_logits[(2, 128)], logits)

@@ -15,7 +15,7 @@ from torch import Tensor, nn
 from resin.backend.expert_parallel import ExpertParallelDispatch
 
 if TYPE_CHECKING:
-    from resin.backend.topology import RankGroup
+    from resin.backend.topology import ParallelGroups
     from resin_models_cuda.deepseek_v4.model import MoEWeights
 
 
@@ -35,8 +35,7 @@ class RoutedExperts(nn.Module):
         block_size: int,
         scale_fmt: str | None,
         scale_dtype: torch.dtype,
-        expert_parallel: RankGroup | None = None,
-        replication: RankGroup | None = None,
+        groups: ParallelGroups | None = None,
     ) -> None:
         super().__init__()
         self.num_experts = source.n_routed_experts
@@ -51,10 +50,9 @@ class RoutedExperts(nn.Module):
             ExpertParallelDispatch(
                 self.local,
                 num_experts=self.num_experts,
-                group=expert_parallel,
-                replication=replication,
+                groups=groups,
             )
-            if expert_parallel is not None
+            if groups is not None
             else None
         )
         if self.fused:
@@ -81,7 +79,10 @@ class RoutedExperts(nn.Module):
 
     def local(self, hidden: Tensor, indices: Tensor, weights: Tensor) -> Tensor:
         if hidden.shape[0] == 0:
-            return torch.zeros_like(hidden)
+            return torch.zeros_like(
+                hidden,
+                dtype=torch.float32 if self.dispatch is not None else hidden.dtype,
+            )
         if self.fused:
             from resin_models_cuda.deepseek_v4.cutile import moe_act_quant
             from resin_models_cuda.deepseek_v4.gemm import fp4_fused_moe
@@ -105,7 +106,10 @@ class RoutedExperts(nn.Module):
                 scale_dtype=self.scale_dtype,
             )
         else:
-            partial = torch.zeros_like(hidden, dtype=torch.bfloat16)
+            partial = torch.zeros_like(
+                hidden,
+                dtype=torch.float32 if self.dispatch is not None else torch.bfloat16,
+            )
             counts = torch.bincount(
                 indices.flatten(), minlength=self.num_experts
             ).tolist()
@@ -114,4 +118,4 @@ class RoutedExperts(nn.Module):
                 if counts[expert_id]:
                     rows, slots = torch.where(indices == expert_id)
                     partial[rows] += expert(hidden[rows], weights[rows, slots, None])
-        return partial
+        return partial.float() if self.dispatch is not None else partial

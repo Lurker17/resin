@@ -355,6 +355,7 @@ class TestGptOssCudaNativePlan:
         runner.cache_layout = object()
         runner.cuda_graph_prefill = "breakable"
         runner._prefill_graph_active = False
+        runner.parallel_groups = None
         runner._cuda_failure = nullcontext()
         runner._check_cuda_graphs = lambda _phase: None
         runner._graph_forward = lambda *_: None

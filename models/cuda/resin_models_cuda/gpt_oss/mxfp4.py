@@ -35,14 +35,22 @@ def _slice_axis(tensor, axis: int, shard: TensorShard):
     return tensor[tuple(selection)].contiguous()
 
 
-def shard_model_config(args, tensor_parallel: TensorParallelLayout):
+def shard_model_config(
+    args,
+    tensor_parallel: TensorParallelLayout,
+    *,
+    expert_tensor_parallel: TensorParallelLayout | None = None,
+):
+    """Keep attention heads and expert channels on their independent meshes."""
+
+    expert_tensor_parallel = expert_tensor_parallel or tensor_parallel
     query_heads = tensor_parallel.even_shard(
         args.num_attention_heads, name="num_attention_heads"
     )
     kv_heads = tensor_parallel.even_shard(
         args.num_key_value_heads, name="num_key_value_heads"
     )
-    intermediate = tensor_parallel.aligned_shard(
+    intermediate = expert_tensor_parallel.aligned_shard(
         args.intermediate_size,
         alignment=32,
         name="intermediate_size",
@@ -62,6 +70,7 @@ def shard_checkpoint_tensor(
     args,
     tensor_parallel: TensorParallelLayout,
     expert_parallel: TensorParallelLayout | None = None,
+    expert_tensor_parallel: TensorParallelLayout | None = None,
 ):
     """Return one rank's canonical contiguous checkpoint shard."""
 
@@ -69,6 +78,29 @@ def shard_checkpoint_tensor(
     if expert_name in EXPERT_CHECKPOINT_NAMES and expert_parallel is not None:
         shard = expert_parallel.even_shard(args.num_local_experts, name="num_experts")
         tensor = _slice_axis(tensor, 0, shard)
+    expert_tensor_parallel = expert_tensor_parallel or tensor_parallel
+
+    if expert_name in EXPERT_CHECKPOINT_NAMES and expert_tensor_parallel.enabled:
+        intermediate = expert_tensor_parallel.aligned_shard(
+            args.intermediate_size,
+            alignment=32,
+            name="intermediate_size",
+        )
+        if expert_name in {
+            "gate_up_proj_blocks",
+            "gate_up_proj_scales",
+            "gate_up_proj_bias",
+        }:
+            paired = TensorShard(2 * intermediate.start, 2 * intermediate.stop)
+            return _slice_axis(tensor, 1, paired)
+        if expert_name in {"down_proj_blocks", "down_proj_scales"}:
+            grouped = TensorShard(intermediate.start // 32, intermediate.stop // 32)
+            return _slice_axis(tensor, 2, grouped)
+        if expert_name == "down_proj_bias":
+            return (
+                tensor if expert_tensor_parallel.rank == 0 else torch.zeros_like(tensor)
+            )
+
     if not tensor_parallel.enabled:
         return tensor
 
@@ -77,11 +109,6 @@ def shard_checkpoint_tensor(
     )
     kv_heads = tensor_parallel.even_shard(
         args.num_key_value_heads, name="num_key_value_heads"
-    )
-    intermediate = tensor_parallel.aligned_shard(
-        args.intermediate_size,
-        alignment=32,
-        name="intermediate_size",
     )
     query_width = TensorShard(
         query_heads.start * args.head_dim,
@@ -111,18 +138,6 @@ def shard_checkpoint_tensor(
     if key.endswith(".self_attn.o_proj.bias"):
         return tensor if tensor_parallel.rank == 0 else torch.zeros_like(tensor)
 
-    if expert_name in {
-        "gate_up_proj_blocks",
-        "gate_up_proj_scales",
-        "gate_up_proj_bias",
-    }:
-        paired = TensorShard(2 * intermediate.start, 2 * intermediate.stop)
-        return _slice_axis(tensor, 1, paired)
-    if expert_name in {"down_proj_blocks", "down_proj_scales"}:
-        grouped = TensorShard(intermediate.start // 32, intermediate.stop // 32)
-        return _slice_axis(tensor, 2, grouped)
-    if expert_name == "down_proj_bias":
-        return tensor if tensor_parallel.rank == 0 else torch.zeros_like(tensor)
     return tensor
 
 
@@ -201,8 +216,7 @@ def kernel_expert_factory(
                 ExpertParallelDispatch(
                     self.forward_local,
                     num_experts=args.num_local_experts,
-                    group=parallel_groups.ep,
-                    replication=parallel_groups.attn_replication,
+                    groups=parallel_groups,
                 )
                 if parallel_groups is not None
                 else None

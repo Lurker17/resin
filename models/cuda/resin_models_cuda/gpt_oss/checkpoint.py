@@ -137,18 +137,23 @@ def load_model(
         expert_parallel = TensorParallelLayout(
             rank=parallel_groups.ep.local_rank, size=parallel_groups.ep.size
         )
-        if parallel_groups.topology.expert_tp != 1 or parallel_groups.topology.cp != 1:
-            raise ValueError("GPT-OSS expert dispatch requires expert_tp=1 and cp=1")
-        if tensor_parallel.enabled:
-            raise ValueError("GPT-OSS expert dispatch requires attn_tp=1")
+        expert_tensor_parallel = TensorParallelLayout(
+            rank=parallel_groups.expert_tp.local_rank,
+            size=parallel_groups.expert_tp.size,
+        )
     else:
         expert_parallel = None
         tensor_parallel = tensor_parallel or TensorParallelLayout()
+        expert_tensor_parallel = tensor_parallel
     target = torch.device(device)
     resolved_dtype = resolve_dtype(dtype)
     if resolved_dtype not in {None, torch.bfloat16}:
         raise ValueError("the packed SM90 GPT-OSS path requires bfloat16 activations")
-    local_args = shard_model_config(args, tensor_parallel)
+    local_args = shard_model_config(
+        args,
+        tensor_parallel,
+        expert_tensor_parallel=expert_tensor_parallel,
+    )
     expert_args = (
         replace(
             local_args,
@@ -182,6 +187,7 @@ def load_model(
             args=args,
             tensor_parallel=tensor_parallel,
             expert_parallel=expert_parallel,
+            expert_tensor_parallel=expert_tensor_parallel,
         ),
         install_expert_layer=lambda layer, tensors: install_expert_layer(
             model,

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from test_deepseek_v4 import TestDeepSeekV4Weights as _ModelFixture
 
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
+from resin_models_cuda.deepseek_v4.weights import load_deepseek_v4_weights
 
 
 def test_attention_layers_capture_their_own_tensor_parallel_context(monkeypatch):
@@ -75,7 +77,7 @@ def test_attention_and_expert_weight_meshes_are_independent(monkeypatch):
     args = native.ModelArgs(
         dim=128,
         vocab_size=256,
-        moe_inter_dim=128,
+        moe_inter_dim=384,
         n_layers=1,
         n_heads=4,
         index_n_heads=4,
@@ -89,7 +91,10 @@ def test_attention_and_expert_weight_meshes_are_independent(monkeypatch):
     )
     attention = native.Attention(0, args, tensor_parallel=TensorParallelContext())
     experts = native.MoEWeights(
-        0, args, expert_parallel=TensorParallelLayout(rank=2, size=4)
+        0,
+        args,
+        expert_parallel=TensorParallelLayout(rank=2, size=4),
+        expert_tensor_parallel=TensorParallelLayout(rank=1, size=2),
     )
     sharded_attention = native.Attention(
         0,
@@ -106,6 +111,187 @@ def test_attention_and_expert_weight_meshes_are_independent(monkeypatch):
         4,
         5,
     ]
+    assert experts.expert_intermediate_shard.start == 256
+    assert experts.expert_intermediate_shard.stop == 384
+    assert experts.experts[4].w1.weight.shape == (128, 64)
+    assert experts.experts[4].w2.weight.shape == (128, 64)
+    assert experts.experts[4].w3.weight.shape == (128, 64)
+    assert experts.gate.weight.shape == (8, 128)
+    assert experts.shared_experts.w1.weight.shape == (384, 128)
+    assert experts.shared_experts.w2.weight.shape == (128, 384)
+
+
+def test_streaming_loader_reconstructs_uneven_fp4_expert_tensor_shards(
+    monkeypatch, tmp_path
+):
+    import resin_models_cuda.deepseek_v4.weights as weights
+
+    native = _ModelFixture._native_model(monkeypatch)
+    args = native.ModelArgs(
+        dim=128,
+        moe_inter_dim=384,
+        n_routed_experts=4,
+        expert_dtype="fp4",
+    )
+    full = native.MoEWeights(0, args, expert_parallel=TensorParallelLayout())
+
+    def checkpoint_model(moe):
+        model = torch.nn.Module()
+        layer = torch.nn.Module()
+        layer.ffn = moe
+        model.layers = torch.nn.ModuleList([layer])
+        return model
+
+    checkpoint = {}
+    for name, tensor in checkpoint_model(full).state_dict().items():
+        if tensor.dtype in (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu):
+            raw = torch.arange(tensor.numel()).remainder(251).to(torch.uint8)
+            value = raw.reshape(tensor.shape).view(tensor.dtype)
+            # Published FP4 weights are signed bytes; scales retain their dtype.
+            if tensor.dtype == torch.float4_e2m1fn_x2:
+                value = value.view(torch.int8)
+        else:
+            value = (
+                torch.arange(tensor.numel()).remainder(31).reshape(tensor.shape) / 32
+            ).to(tensor.dtype)
+        checkpoint[name] = value
+
+    reads = []
+
+    class Reader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return None
+
+        def read(self, _path, name):
+            reads.append(name)
+            return checkpoint[name]
+
+    path = tmp_path / "model.safetensors"
+    monkeypatch.setattr(weights, "SafetensorReader", Reader)
+    monkeypatch.setattr(
+        weights,
+        "indexed_tensor_files",
+        lambda *_args, **_kwargs: {name: path for name in checkpoint},
+    )
+    for ep_rank in range(2):
+        shards = []
+        for expert_tp_rank in range(2):
+            shard = native.MoEWeights(
+                0,
+                args,
+                expert_parallel=TensorParallelLayout(rank=ep_rank, size=2),
+                expert_tensor_parallel=TensorParallelLayout(
+                    rank=expert_tp_rank, size=2
+                ),
+            )
+            model = checkpoint_model(shard)
+            reads.clear()
+            report = load_deepseek_v4_weights(
+                tmp_path,
+                model,
+                rank=0,
+                tensor_parallel_size=1,
+                device="cpu",
+            )
+            assert report["tensors"] == len(model.state_dict())
+            assert set(reads) == set(model.state_dict())
+            assert all(
+                ".experts." not in name
+                or int(name.split(".experts.")[1].split(".")[0]) // 2 == ep_rank
+                for name in reads
+            )
+            for name, tensor in model.state_dict().items():
+                if ".experts." not in name:
+                    torch.testing.assert_close(tensor, checkpoint[name], rtol=0, atol=0)
+            shards.append(model)
+
+        for expert_id in range(2 * ep_rank, 2 * ep_rank + 2):
+            for projection, axis in (("w1", 0), ("w2", 1), ("w3", 0)):
+                for storage in ("weight", "scale"):
+                    name = f"layers.0.ffn.experts.{expert_id}.{projection}.{storage}"
+                    restored = torch.cat(
+                        [
+                            shard.state_dict()[name].view(torch.uint8)
+                            for shard in shards
+                        ],
+                        dim=axis,
+                    )
+                    assert torch.equal(restored, checkpoint[name].view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    ("intermediate", "experts", "ep", "expert_tp", "message"),
+    [
+        (320, 4, 2, 2, "moe_inter_dim=320 must be divisible by 128"),
+        (128, 4, 2, 2, "only 1 aligned units for TP=2"),
+        (384, 3, 2, 2, "n_routed_experts=3 must be divisible by TP=2"),
+    ],
+)
+def test_invalid_expert_mesh_is_rejected_before_weight_allocation(
+    monkeypatch, intermediate, experts, ep, expert_tp, message
+):
+    native = _ModelFixture._native_model(monkeypatch)
+    args = native.ModelArgs(
+        dim=128,
+        moe_inter_dim=intermediate,
+        n_routed_experts=experts,
+        expert_dtype="fp4",
+    )
+
+    def unexpected_allocation(*_args, **_kwargs):
+        raise AssertionError("invalid expert geometry allocated model weights")
+
+    monkeypatch.setattr(native.torch, "empty", unexpected_allocation)
+    with pytest.raises(ValueError, match=message):
+        native.MoEWeights(
+            0,
+            args,
+            expert_parallel=TensorParallelLayout(size=ep),
+            expert_tensor_parallel=TensorParallelLayout(size=expert_tp),
+        )
+
+
+def test_bf16_expert_tensor_partials_sum_to_full_expert(monkeypatch):
+    native = _ModelFixture._native_model(monkeypatch)
+    monkeypatch.setattr(
+        native,
+        "swiglu",
+        lambda gate, up, _limit: torch.nn.functional.silu(gate.float()) * up.float(),
+    )
+    args = native.ModelArgs(
+        dim=8,
+        moe_inter_dim=7,
+        n_routed_experts=2,
+        dtype="bf16",
+    )
+    full = native.MoEWeights(0, args, expert_parallel=TensorParallelLayout())
+    generator = torch.Generator().manual_seed(19)
+    with torch.no_grad():
+        for parameter in full.experts[1].parameters():
+            parameter.copy_(torch.randn(parameter.shape, generator=generator) / 4)
+    hidden = torch.randn(5, 8, generator=generator, dtype=torch.bfloat16)
+    route_weights = torch.tensor([0.25, 0.5, 0.75, 1, 0.125]).view(-1, 1)
+    expected = full.experts[1](hidden, route_weights).float()
+    partials = []
+    for rank in range(3):
+        shard = native.MoEWeights(
+            0,
+            args,
+            expert_parallel=TensorParallelLayout(rank=1, size=2),
+            expert_tensor_parallel=TensorParallelLayout(rank=rank, size=3),
+        )
+        interval = shard.expert_intermediate_shard.as_slice()
+        with torch.no_grad():
+            shard.experts[1].w1.weight.copy_(full.experts[1].w1.weight[interval])
+            shard.experts[1].w3.weight.copy_(full.experts[1].w3.weight[interval])
+            shard.experts[1].w2.weight.copy_(full.experts[1].w2.weight[:, interval])
+        partials.append(shard.experts[1](hidden, route_weights).float())
+
+    # Each local GEMM rounds to BF16 before combining its partial output.
+    torch.testing.assert_close(sum(partials), expected, rtol=0.02, atol=0.001)
 
 
 def test_empty_model_round_only_calls_prepared_routed_experts(monkeypatch):

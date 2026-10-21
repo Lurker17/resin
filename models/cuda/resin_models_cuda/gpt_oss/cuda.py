@@ -29,6 +29,10 @@ from resin import (
     RunnerConfig,
 )
 from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
+from resin.backend.cuda.context_parallel import (
+    ContextParallelTokens,
+    context_parallel_query_batch,
+)
 from resin.backend.cuda.failures import GraphInputError
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
@@ -46,7 +50,7 @@ from resin.backend.cuda.paged_kv import (
     paged_attention_host_inputs,
     stage_paged_attention_batch,
 )
-from resin.backend.cuda.parallel import TensorParallelContext
+from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
@@ -164,7 +168,12 @@ class GptOssCudaRunner(CudaRunner):
 
     model_label = "GPT-OSS"
     parallelism_capabilities = ParallelismCapabilities(
-        attn_tp=True, attn_dp=True, ep=True, expert_tp=True, attn_replication=True
+        attn_tp=True,
+        attn_dp=True,
+        cp=True,
+        ep=True,
+        expert_tp=True,
+        attn_replication=True,
     )
     page_size = PAGE_SIZE
     sliding_window = SLIDING_WINDOW
@@ -198,10 +207,11 @@ class GptOssCudaRunner(CudaRunner):
             self.parallelism_capabilities.validate(
                 parallel_groups.topology, model=self.model_label
             )
-            if parallel_groups.topology.attn_tp != 1:
-                raise ValueError("GPT-OSS expert dispatch requires attn_tp=1")
-            if parallel_groups.topology.expert_tp != 1:
-                raise ValueError("GPT-OSS expert dispatch requires expert_tp=1")
+            group = parallel_groups.attn_tp
+            tensor_parallel = TensorParallelContext(
+                TensorParallelLayout(rank=group.local_rank, size=group.size),
+                group.handle if group.size > 1 else None,
+            )
         self.parallel_groups = parallel_groups
         if kernel_attention is None:
             from flash_attn.cute import flash_attn_varlen_func
@@ -496,6 +506,8 @@ class GptOssCudaRunner(CudaRunner):
         # The runner already gathers the YaRN rows for every packed token. A
         # synthetic batch dimension lets Quack consume those rows directly,
         # independent of the requests they came from.
+        if hidden.shape[0] == 0:
+            return hidden
         apply_rotary(
             hidden.unsqueeze(0),
             cos.squeeze(0),
@@ -512,6 +524,9 @@ class GptOssCudaRunner(CudaRunner):
         hidden,
         position_embeddings,
         batch: DevicePagedAttentionBatch,
+        *,
+        context_parallel: ContextParallelTokens | None = None,
+        query_batch: DevicePagedAttentionBatch | None = None,
     ):
         token_count = hidden.shape[1]
         flat = hidden.reshape(token_count, self.hidden_size)
@@ -529,6 +544,8 @@ class GptOssCudaRunner(CudaRunner):
         cos, sin = position_embeddings
         query = self._apply_yarn_rotary(query, cos, sin)
         key = self._apply_yarn_rotary(key, cos, sin)
+        if context_parallel is not None:
+            key, value = context_parallel.gather(key), context_parallel.gather(value)
         layer_type = attention.layer_type
         if query.dtype is not torch.bfloat16:
             raise TypeError("FA4 query tensor must be bfloat16")
@@ -553,6 +570,11 @@ class GptOssCudaRunner(CudaRunner):
         value_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
             0, group.append_slots, value
         )
+        if token_count == 0:
+            return hidden.new_empty((1, 0, self.hidden_size))
+        if query_batch is not None:
+            batch = query_batch
+            group = batch.group("sliding" if sliding else "full")
         output = self._fa4(
             query,
             key_cache,
@@ -587,10 +609,14 @@ class GptOssCudaRunner(CudaRunner):
         residual: Tensor,
         weight: Tensor,
         eps: float,
+        *,
+        reduce: bool = True,
     ) -> tuple[Tensor, Tensor]:
-        workspace = self._allreduce_workspace
+        if partial.numel() == 0:
+            return partial, residual
+        workspace = self._allreduce_workspace if reduce else None
         if workspace is None:
-            reduced = self.tensor_parallel.sum(partial)
+            reduced = self.tensor_parallel.sum(partial) if reduce else partial
             normalized, combined = rmsnorm(
                 reduced,
                 weight,
@@ -623,22 +649,41 @@ class GptOssCudaRunner(CudaRunner):
     def _feed_forward(mlp: MLP, hidden: Tensor) -> Tensor:
         shape = hidden.shape
         flat = hidden.reshape(-1, shape[-1])
+        if flat.shape[0] == 0:
+            mlp.experts.forward_empty()
+            return hidden
         logits = _router_logits(mlp.router, flat)
         indices, weights = _route(mlp.router, logits)
         return mlp.experts(flat, indices, weights, logits).reshape(shape)
 
-    def _forward_batch(self, token_ids, positions, batch: DevicePagedAttentionBatch):
+    def _forward_batch(
+        self,
+        token_ids,
+        positions,
+        batch: DevicePagedAttentionBatch,
+        *,
+        context_parallel: ContextParallelTokens | None = None,
+    ):
         selected_tokens = token_ids.index_select(0, batch.token_indices)
         selected_positions = positions.index_select(0, batch.token_indices)
+        query_batch = None
+        if context_parallel is not None:
+            selected_tokens = context_parallel.select(selected_tokens)
+            selected_positions = context_parallel.select(selected_positions)
+            query_batch = context_parallel_query_batch(batch, context_parallel)
         hidden = self._model.model.embed_tokens(selected_tokens).unsqueeze(0)
         position_embeddings = self._model.model.rotary_emb(
             selected_positions.unsqueeze(0), hidden.dtype
         )
         layers = self._model.model.layers
-        normalized = rmsnorm(
-            hidden,
-            layers[0].input_layernorm.weight,
-            eps=layers[0].input_layernorm.eps,
+        normalized = (
+            rmsnorm(
+                hidden,
+                layers[0].input_layernorm.weight,
+                eps=layers[0].input_layernorm.eps,
+            )
+            if hidden.numel()
+            else hidden
         )
         for layer_index, layer in enumerate(layers):
             attention_out = self._attention(
@@ -647,6 +692,8 @@ class GptOssCudaRunner(CudaRunner):
                 normalized,
                 position_embeddings,
                 batch,
+                context_parallel=context_parallel,
+                query_batch=query_batch,
             )
             normalized_mlp_input, hidden = self._allreduce_residual_rmsnorm(
                 attention_out,
@@ -667,8 +714,11 @@ class GptOssCudaRunner(CudaRunner):
                 hidden,
                 next_norm.weight,
                 next_norm.eps,
+                reduce=self.parallel_groups is None,
             )
         final_hidden = normalized.squeeze(0)
+        if context_parallel is not None:
+            final_hidden = context_parallel.gather(final_hidden)
         return final_hidden.index_select(0, batch.last_token_indices)
 
     @staticmethod
@@ -722,11 +772,11 @@ class GptOssCudaRunner(CudaRunner):
                 else:
                     self._sampler.sample_tensors(logits, sampling, out=output_ids)
                 groups = self.parallel_groups
-                if groups is not None and groups.attn_replication.size > 1:
+                if groups is not None and groups.device_replica.size > 1:
                     groups.distributed.broadcast(
                         output_ids,
-                        src=groups.attn_replication.source,
-                        group=groups.attn_replication.handle,
+                        src=groups.device_replica.source,
+                        group=groups.device_replica.handle,
                     )
 
         inputs = {
@@ -855,7 +905,18 @@ class GptOssCudaRunner(CudaRunner):
                 with self._prefill_graphs():
                     for index, host_batch in enumerate(prefill_batches):
                         batch = self._tensorize(host_batch, staging, f"prefill.{index}")
-                        last_hidden = self._forward_batch(token_ids, positions, batch)
+                        groups = self.parallel_groups
+                        arguments = {}
+                        if groups is not None and groups.cp.size > 1:
+                            arguments["context_parallel"] = ContextParallelTokens(
+                                host_batch.query_lengths,
+                                groups.cp,
+                                device=self.device,
+                                distributed=groups.distributed,
+                            )
+                        last_hidden = self._forward_batch(
+                            token_ids, positions, batch, **arguments
+                        )
                         final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
                 if decode_batch is not None:
                     batch = self._tensorize(decode_batch, staging, "decode")
@@ -865,11 +926,11 @@ class GptOssCudaRunner(CudaRunner):
 
             tokens = self._sampler(logits, plan)
             groups = getattr(self, "parallel_groups", None)
-            if groups is not None and groups.attn_replication.size > 1:
+            if groups is not None and groups.device_replica.size > 1:
                 groups.distributed.broadcast(
                     tokens,
-                    src=groups.attn_replication.source,
-                    group=groups.attn_replication.handle,
+                    src=groups.device_replica.source,
+                    group=groups.device_replica.handle,
                 )
             return format_output(logits, tokens, plan)
 

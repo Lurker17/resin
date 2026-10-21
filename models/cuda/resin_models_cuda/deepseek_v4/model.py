@@ -16,7 +16,12 @@ from flashinfer.mhc import mhc_post
 from flashinfer.topk import top_k as flashinfer_top_k
 from torch import nn
 
-from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
+from resin.backend.cuda.context_parallel import ContextParallelTokens
+from resin.backend.cuda.parallel import (
+    TensorParallelContext,
+    TensorParallelLayout,
+    TensorShard,
+)
 from resin.backend.loading import prepare_model
 from resin.backend.torch import use_default_dtype
 from resin.backend.transformer import RMSNorm as SharedRMSNorm
@@ -134,6 +139,14 @@ class ModelArgs:
     dspark_noise_token_id: int = 0
     dspark_target_layer_ids: tuple[int, ...] = ()
     dspark_markov_rank: int = 256
+
+    def expert_intermediate_shard(self, layout: TensorParallelLayout) -> TensorShard:
+        """Partition complete quantization blocks across expert tensor ranks."""
+
+        alignment = 128 if self.expert_dtype == "fp4" or self.dtype == "fp8" else 1
+        return layout.aligned_shard(
+            self.moe_inter_dim, alignment=alignment, name="moe_inter_dim"
+        )
 
 
 class ParallelEmbedding(nn.Module):
@@ -767,6 +780,7 @@ class Indexer(torch.nn.Module):
         sequence_length: int,
         *,
         cache: DeviceCache,
+        query_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Select compressed history for an arbitrary cached prompt suffix."""
 
@@ -786,6 +800,13 @@ class Indexer(torch.nn.Module):
             cache=cache,
             state_group=INDEX_STATE_GROUP,
         )
+        if query_indices is not None:
+            x = x.index_select(1, query_indices)
+            qr = qr.index_select(1, query_indices)
+            positions = positions.index_select(1, query_indices)
+            block_length = query_indices.numel()
+        if block_length == 0:
+            return torch.empty((batch_size, 0, 0), dtype=torch.int32, device=x.device)
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
         apply_rotary_emb(q[..., -rope_dim:], self.freqs_cis[positions])
         q = rotate_activation(q)
@@ -1157,13 +1178,20 @@ class Attention(nn.Module):
         sequence_length: int,
         *,
         cache: DeviceCache,
+        context_parallel: ContextParallelTokens | None = None,
     ) -> torch.Tensor:
-        """Prefill one cached suffix with paged sparse block attention."""
+        """Prefill a cached suffix, optionally splitting queries across CP ranks.
+
+        MLA cache and compressor tails stay replicated; local query results
+        are gathered before the transformer block consumes them.
+        """
 
         batch_size, block_length, _ = x.shape
         ratio = self.compress_ratio
         if token_positions.shape != (batch_size, block_length):
             raise ValueError("prefill positions must match the token block")
+        if context_parallel is not None and batch_size != 1:
+            raise ValueError("DeepSeek context prefill requires one sequence")
         self._prepare_compression()
         qr, kv = self._project(x)
 
@@ -1179,7 +1207,21 @@ class Attention(nn.Module):
                 state_group=state_group,
             )
 
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        query_indices = (
+            None if context_parallel is None else context_parallel.token_indices
+        )
+        if context_parallel is not None:
+            # Compressor tails and MLA KV remain replicated. Preserve their
+            # complete ordered updates before partitioning any query work.
+            kv_norm_rope_store(
+                kv,
+                self.kv_norm.weight,
+                torch.view_as_real(self.freqs_cis),
+                cache.latents.view(-1, self.head_dim),
+                token_positions,
+                self.eps,
+                cache_mapping=cache.window_mapping(self.layer_id),
+            )
         compressed_indices = None
         generated_compressed_width = 0
         if ratio:
@@ -1191,23 +1233,38 @@ class Attention(nn.Module):
                     start_position,
                     sequence_length,
                     cache=cache,
+                    query_indices=query_indices,
                 )
             else:
                 generated_compressed_width = math.ceil(sequence_length / ratio / 4) * 4
 
+        if query_indices is not None:
+            qr = qr.index_select(1, query_indices)
+            kv = kv.index_select(1, query_indices)
+            query_positions = token_positions.index_select(1, query_indices)
+            if query_indices.numel() == 0:
+                local = x.new_empty((0, self.dim))
+                return context_parallel.gather(local).unsqueeze(0)
+        else:
+            query_positions = token_positions
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+
+        # This fused normalization also stores local KV again. With CP these
+        # writes match the complete store above, while keeping Q normalization
+        # identical to the unpartitioned kernel.
         qk_norm_rope_block(
             q,
             kv,
             self.kv_norm.weight,
             torch.view_as_real(self.freqs_cis),
             cache.latents.view(-1, self.head_dim),
-            token_positions,
+            query_positions,
             self.eps,
             cache_mapping=cache.window_mapping(self.layer_id),
         )
         topk_indices, sparse_lengths, sequence_lengths = self._paged_attention_metadata(
             cache,
-            token_positions,
+            query_positions,
             compressed_indices,
             generated_compressed_width,
         )
@@ -1224,7 +1281,10 @@ class Attention(nn.Module):
             self.attention_workspace,
             self.softmax_scale,
         )
-        return self._finish(o, token_positions)
+        output = self._finish(o, query_positions)
+        if context_parallel is not None:
+            output = context_parallel.gather(output.squeeze(0)).unsqueeze(0)
+        return output
 
     def forward_verify(
         self,
@@ -1486,21 +1546,29 @@ class MoEWeights(nn.Module):
         args: ModelArgs,
         *,
         expert_parallel: TensorParallelLayout | None = None,
+        expert_tensor_parallel: TensorParallelLayout | None = None,
     ):
         super().__init__()
         expert_parallel = expert_parallel or _default_tensor_parallel().layout
+        expert_tensor_parallel = expert_tensor_parallel or TensorParallelLayout()
         self.layer_id = layer_id
         self.dim = args.dim
-        assert args.n_routed_experts % expert_parallel.size == 0, (
-            f"Number of experts must be divisible by EP (size={expert_parallel.size})"
+        owned = expert_parallel.even_shard(
+            args.n_routed_experts, name="n_routed_experts"
         )
+        self.expert_tensor_parallel = expert_tensor_parallel
+        self.expert_intermediate_shard = args.expert_intermediate_shard(
+            expert_tensor_parallel
+        )
+        self.routed_intermediate_size = args.moe_inter_dim
+        intermediate = self.expert_intermediate_shard.size
         self.n_routed_experts = args.n_routed_experts
-        self.n_local_experts = args.n_routed_experts // expert_parallel.size
+        self.n_local_experts = owned.size
         self.n_activated_experts = args.n_activated_experts
         self.swiglu_limit = args.swiglu_limit
         self.decode_overlap_stream: torch.cuda.Stream | None = None
-        self.experts_start_idx = expert_parallel.rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        self.experts_start_idx = owned.start
+        self.experts_end_idx = owned.stop
         self.gate = Gate(layer_id, args)
         expert_dtype = torch.float4_e2m1fn_x2 if args.expert_dtype == "fp4" else None
         self._fused_fp4 = expert_dtype == torch.float4_e2m1fn_x2
@@ -1509,7 +1577,7 @@ class MoEWeights(nn.Module):
                 "_fused_w13_weight",
                 torch.empty(
                     self.n_local_experts,
-                    2 * args.moe_inter_dim,
+                    2 * intermediate,
                     args.dim // 2,
                     dtype=expert_dtype,
                 ),
@@ -1519,7 +1587,7 @@ class MoEWeights(nn.Module):
                 "_fused_w13_scale",
                 torch.empty(
                     self.n_local_experts,
-                    2 * args.moe_inter_dim,
+                    2 * intermediate,
                     args.dim // fp4_block_size,
                     dtype=torch.float8_e8m0fnu,
                 ),
@@ -1530,7 +1598,7 @@ class MoEWeights(nn.Module):
                 torch.empty(
                     self.n_local_experts,
                     args.dim,
-                    args.moe_inter_dim // 2,
+                    intermediate // 2,
                     dtype=expert_dtype,
                 ),
                 persistent=False,
@@ -1540,7 +1608,7 @@ class MoEWeights(nn.Module):
                 torch.empty(
                     self.n_local_experts,
                     args.dim,
-                    args.moe_inter_dim // fp4_block_size,
+                    intermediate // fp4_block_size,
                     dtype=torch.float8_e8m0fnu,
                 ),
                 persistent=False,
@@ -1564,7 +1632,7 @@ class MoEWeights(nn.Module):
             if not self._fused_fp4:
                 return None
             local = expert_id - self.experts_start_idx
-            split = args.moe_inter_dim
+            split = intermediate
             return (
                 (
                     self._fused_w13_weight[local, split:],
@@ -1584,7 +1652,7 @@ class MoEWeights(nn.Module):
             [
                 Expert(
                     args.dim,
-                    args.moe_inter_dim,
+                    intermediate,
                     dtype=expert_dtype,
                     swiglu_limit=args.swiglu_limit,
                     storage=expert_storage(i),
@@ -1653,12 +1721,18 @@ class Block(nn.Module):
         *,
         tensor_parallel: TensorParallelContext | None = None,
         expert_parallel: TensorParallelLayout | None = None,
+        expert_tensor_parallel: TensorParallelLayout | None = None,
     ):
         super().__init__()
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
         self.attn = self.attention_cls(layer_id, args, tensor_parallel=tensor_parallel)
-        self.ffn = MoEWeights(layer_id, args, expert_parallel=expert_parallel)
+        self.ffn = MoEWeights(
+            layer_id,
+            args,
+            expert_parallel=expert_parallel,
+            expert_tensor_parallel=expert_tensor_parallel,
+        )
         self.prefill_ffn: Callable | None = None
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
@@ -1943,12 +2017,14 @@ class DSparkBlock(Block):
         *,
         tensor_parallel: TensorParallelContext | None = None,
         expert_parallel: TensorParallelLayout | None = None,
+        expert_tensor_parallel: TensorParallelLayout | None = None,
     ):
         super().__init__(
             layer_id,
             args,
             tensor_parallel=tensor_parallel,
             expert_parallel=expert_parallel,
+            expert_tensor_parallel=expert_tensor_parallel,
         )
         self.stage_id = layer_id - args.n_layers
         if self.stage_id == 0:
@@ -2012,6 +2088,17 @@ class Transformer(nn.Module):
             if parallel_groups is not None
             else tensor_parallel.layout
         )
+        expert_tensor_parallel = (
+            TensorParallelLayout(
+                rank=parallel_groups.expert_tp.local_rank,
+                size=parallel_groups.expert_tp.size,
+            )
+            if parallel_groups is not None
+            else TensorParallelLayout()
+        )
+        # Validate quantization boundaries before any model storage is allocated.
+        args.expert_intermediate_shard(expert_tensor_parallel)
+        expert_parallel.even_shard(args.n_routed_experts, name="n_routed_experts")
         default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         scale_fmt = "ue8m0" if args.scale_dtype == "fp8" else args.scale_fmt
         scale_dtype = (
@@ -2030,6 +2117,7 @@ class Transformer(nn.Module):
                     args,
                     tensor_parallel=tensor_parallel,
                     expert_parallel=expert_parallel,
+                    expert_tensor_parallel=expert_tensor_parallel,
                 )
             )
         self.mtp = torch.nn.ModuleList(
@@ -2038,6 +2126,7 @@ class Transformer(nn.Module):
                 args,
                 tensor_parallel=tensor_parallel,
                 expert_parallel=expert_parallel,
+                expert_tensor_parallel=expert_tensor_parallel,
             )
             for stage_id in range(args.n_mtp_layers)
         )
@@ -2082,10 +2171,7 @@ class Transformer(nn.Module):
                         block_size=block_size,
                         scale_fmt=scale_fmt,
                         scale_dtype=scale_dtype,
-                        expert_parallel=groups.ep if groups is not None else None,
-                        replication=groups.attn_replication
-                        if groups is not None
-                        else None,
+                        groups=groups,
                     ),
                 )
                 if isinstance(source, MoEWeights)
@@ -2234,6 +2320,17 @@ class Transformer(nn.Module):
             input_ids.shape[1], device=input_ids.device
         ).view(1, -1)
         sequence_length = start_position + input_ids.shape[1]
+        groups = self.parallel_groups
+        context_parallel = (
+            ContextParallelTokens(
+                (input_ids.shape[1],),
+                groups.cp,
+                device=input_ids.device,
+                distributed=groups.distributed,
+            )
+            if groups is not None and groups.cp.size > 1
+            else None
+        )
         with dynamic_gemm_rows():
             h, main_hidden = self._forward_layers(
                 input_ids,
@@ -2246,6 +2343,7 @@ class Transformer(nn.Module):
                         start_position,
                         sequence_length,
                         cache=cache,
+                        context_parallel=context_parallel,
                     ),
                 ),
             )

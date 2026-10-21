@@ -36,6 +36,8 @@ def _groups(parallelism, rank=0):
                 setattr(
                     groups, name, RankGroup(ranks, (name, ranks), ranks.index(rank))
                 )
+    groups.device_domain = groups.domain
+    groups.device_replica = groups.replica
     return groups
 
 
@@ -187,7 +189,7 @@ def test_idle_replica_joins_each_expert_layer_without_attention_or_cache(
     assert runner._cuda_failure.synchronizations == 1
 
 
-def test_sample_broadcast_uses_attention_replication_group(monkeypatch):
+def test_sample_broadcast_uses_complete_attention_replica_group(monkeypatch):
     groups = _groups(Parallelism(world_size=2, ep=2), rank=1)
     runner = _runner(monkeypatch, groups)
     plan = BatchPlan([7], [3], [9], [0, 1], phase=BatchPhase.DECODE)
@@ -196,7 +198,7 @@ def test_sample_broadcast_uses_attention_replication_group(monkeypatch):
         plan, _context(groups, BatchPhase.DECODE, ((1, 1),), plan)
     ) == [9]
 
-    assert groups.broadcasts == [(0, groups.attn_replication.handle, [9])]
+    assert groups.broadcasts == [(0, groups.device_replica.handle, [9])]
 
 
 def test_distributed_metadata_mismatch_is_rejected_before_execution(monkeypatch):
@@ -247,9 +249,6 @@ def test_missing_graph_capture_is_rejected_in_worker_readiness_validation(
 @pytest.mark.parametrize(
     ("parallelism", "options", "message"),
     [
-        (Parallelism(world_size=2, ep=2, cp=2), {}, "cp=2"),
-        (Parallelism(world_size=2), {}, "expert_tp=1"),
-        (Parallelism(world_size=2, ep=2, attn_tp=2), {}, "attn_tp=1"),
         (
             Parallelism(world_size=2, ep=2),
             {"tensor_parallel": TensorParallelContext()},
@@ -266,7 +265,16 @@ def test_unsupported_distributed_preparation_fails_before_cuda(
         GptOssCudaRunner(device="cuda", parallel_groups=_groups(parallelism), **kwargs)
 
 
-def test_distributed_graph_policies_pass_topology_preparation(monkeypatch):
+@pytest.mark.parametrize(
+    "parallelism",
+    [
+        Parallelism(world_size=2, ep=2, cp=2),
+        Parallelism(world_size=2),
+        Parallelism(world_size=2, ep=2, attn_tp=2),
+        Parallelism(world_size=8, ep=2, attn_dp=2, cp=2, attn_tp=2),
+    ],
+)
+def test_distributed_graph_policies_pass_topology_preparation(monkeypatch, parallelism):
     import resin_models_cuda.gpt_oss.cuda as implementation
 
     class CudaEntry(Exception):
@@ -281,7 +289,7 @@ def test_distributed_graph_policies_pass_topology_preparation(monkeypatch):
     with pytest.raises(CudaEntry):
         GptOssCudaRunner(
             device="cuda",
-            parallel_groups=_groups(Parallelism(world_size=2, ep=2, attn_dp=2)),
+            parallel_groups=_groups(parallelism),
             kernel_attention=lambda *args: None,
         )
 
@@ -447,5 +455,5 @@ def test_decode_capture_wraps_experts_and_replica_sampling_broadcast(monkeypatch
 
     assert scopes == [(2, 1)]
     assert step.output.tolist() == [4, 6]
-    assert groups.broadcasts == [(0, groups.attn_replication.handle, [4, 6])]
+    assert groups.broadcasts == [(0, groups.device_replica.handle, [4, 6])]
     assert runner._graph_logits[(2, 1)].argmax(-1).tolist() == [4, 6]

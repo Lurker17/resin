@@ -68,7 +68,12 @@ class DeepSeekV4CudaRunner(CudaRunner):
     """Dynamically batched runner over Resin's DeepSeek-V4 implementation."""
 
     parallelism_capabilities = ParallelismCapabilities(
-        attn_tp=True, attn_dp=True, ep=True, attn_replication=True
+        attn_tp=True,
+        attn_dp=True,
+        cp=True,
+        ep=True,
+        expert_tp=True,
+        attn_replication=True,
     )
 
     def __init__(
@@ -127,8 +132,6 @@ class DeepSeekV4CudaRunner(CudaRunner):
             self.parallelism_capabilities.validate(
                 parallel_groups.topology, model="DeepSeek-V4"
             )
-            if parallel_groups.topology.attn_tp != 1:
-                raise ValueError("DeepSeek-V4 expert dispatch requires attn_tp=1")
             if speculative_tokens:
                 raise ValueError(
                     "DeepSeek-V4 expert dispatch requires speculative_tokens=0"
@@ -494,7 +497,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(self._sampler.graph_inputs(sampling))
         kwargs = dict(inputs=inputs, output=output_ids, prepare=self._reset_model_state)
-        if not self.tensor_parallel.enabled:
+        if self.parallel_groups is not None or not self.tensor_parallel.enabled:
             return CudaGraphStep(launch=launch, **kwargs)
         if self.cuda_graph_decode == "full":
 
@@ -692,11 +695,11 @@ class DeepSeekV4CudaRunner(CudaRunner):
     def _broadcast_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
         groups = self.parallel_groups
         if groups is not None:
-            if groups.attn_replication.size > 1:
+            if groups.device_replica.size > 1:
                 groups.distributed.broadcast(
                     token_ids,
-                    src=groups.attn_replication.source,
-                    group=groups.attn_replication.handle,
+                    src=groups.device_replica.source,
+                    group=groups.device_replica.handle,
                 )
         elif self.tensor_parallel.enabled:
             dist.broadcast(
