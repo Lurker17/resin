@@ -4,14 +4,8 @@ mod schema;
 
 use serde_json::Value;
 
+use crate::render::{function, list, messages, option};
 use crate::{Decoder, Error, Event, FinishReason, Prompt, ResponseParser};
-
-fn option<'a>(request: &'a Value, name: &str) -> Option<&'a Value> {
-    request
-        .get(name)
-        .filter(|value| !value.is_null())
-        .or_else(|| request.get("extra").and_then(|extra| extra.get(name)))
-}
 
 fn content(value: Option<&Value>) -> String {
     match value {
@@ -56,7 +50,7 @@ fn message(
 fn tools_section(tools: &[Value]) -> String {
     let mut lines = vec!["# Tools\n\n## functions\n\nnamespace functions {\n".to_owned()];
     for tool in tools {
-        let tool = tool.get("function").unwrap_or(tool);
+        let tool = function(tool);
         for line in tool
             .get("description")
             .and_then(Value::as_str)
@@ -86,16 +80,8 @@ fn tools_section(tools: &[Value]) -> String {
 /// Options are accepted at the request root or in `extra`; a codec supplies its
 /// construction-time date through `conversation_start_date`.
 pub fn render(request: &Value) -> Result<Prompt, Error> {
-    let messages = request
-        .get("messages")
-        .and_then(Value::as_array)
-        .filter(|messages| !messages.is_empty())
-        .ok_or_else(|| Error::new("GPT-OSS requires nonempty messages"))?;
-    let tools = request
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
+    let messages = messages(request, "GPT-OSS")?;
+    let tools = list(&request["tools"]);
     let effort = option(request, "reasoning_effort")
         .and_then(Value::as_str)
         .unwrap_or("medium")
@@ -175,11 +161,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                 );
             }
             "assistant" => {
-                let calls = item
-                    .get("tool_calls")
-                    .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
+                let calls = list(&item["tool_calls"]);
                 let keep_analysis = !auto_drop_analysis
                     || (!calls.is_empty()
                         && !messages[index + 1..].iter().any(|later| {
@@ -212,7 +194,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                     message(&mut prompt, "assistant", Some("final"), None, &text);
                 }
                 for call in calls {
-                    let function = call.get("function").unwrap_or(call);
+                    let function = function(call);
                     let name = function.get("name").and_then(Value::as_str).unwrap_or("");
                     let recipient = if name.starts_with("functions.") {
                         name.to_owned()
@@ -270,43 +252,18 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
     Ok(prompt)
 }
 
-/// The Harmony vocabulary used by GPT-OSS (canonical names and HF aliases).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GptOssTokens {
-    pub start: u32,
-    pub end: u32,
-    pub turn_end: u32,
-    pub tool_end: u32,
-    pub channel: u32,
-    pub message: u32,
-    pub constrain: u32,
-}
+use crate::parser::{Grammar, Parser, emit_tool, tokens};
 
-impl GptOssTokens {
-    pub fn validate(&self) -> Result<(), Error> {
-        let ids = self.ids();
-        for (index, id) in ids.iter().enumerate() {
-            if ids[..index].contains(id) {
-                return Err(Error::new("Harmony markers must have distinct token IDs"));
-            }
-        }
-        Ok(())
-    }
+tokens! { GptOssTokens {
+    start => ["<|im_start|>", "<|start|>"],
+    end => ["<|im_end|>", "<|end|>"],
+    turn_end => ["<|fim_suffix|>", "<|return|>"],
+    tool_end => ["<|ghissue|>", "<|call|>"],
+    channel => ["<|meta_sep|>", "<|channel|>"],
+    message => ["<|im_sep|>", "<|message|>"],
+    constrain => ["<|meta_start|>", "<|constrain|>"],
+}}
 
-    fn ids(self) -> [u32; 7] {
-        [
-            self.start,
-            self.end,
-            self.turn_end,
-            self.tool_end,
-            self.channel,
-            self.message,
-            self.constrain,
-        ]
-    }
-}
-
-#[derive(Debug)]
 enum State {
     Header,
     Text,
@@ -315,20 +272,16 @@ enum State {
     Ignore,
 }
 
-/// Incrementally decode Harmony headers and channel bodies.
-///
-/// A tool call commits when its message terminator arrives. Incomplete JSON
-/// at a generation limit is discarded; text and reasoning always flush.
-pub struct GptOssParser {
+/// Harmony headers and channel bodies. A tool call commits at its terminator.
+pub type GptOssParser = Parser<GptOssGrammar>;
+pub struct GptOssGrammar {
     tokens: GptOssTokens,
-    decoder: Box<dyn Decoder>,
     state: State,
     header: String,
     channel_offset: Option<usize>,
     tool_text: String,
     tool_index: usize,
     ended: bool,
-    finished: bool,
 }
 
 impl GptOssParser {
@@ -338,48 +291,30 @@ impl GptOssParser {
         prompt_ids: &[u32],
     ) -> Result<Self, Error> {
         tokens.validate()?;
-        let mut parser = Self {
-            tokens,
+        let mut parser = Self::with_grammar(
+            GptOssGrammar {
+                tokens,
+                state: State::Text,
+                header: String::new(),
+                channel_offset: None,
+                tool_text: String::new(),
+                tool_index: 0,
+                ended: false,
+            },
             decoder,
-            state: State::Text,
-            header: String::new(),
-            channel_offset: None,
-            tool_text: String::new(),
-            tool_index: 0,
-            ended: false,
-            finished: false,
-        };
-        // The generation prompt opens a message, usually on analysis. Parse
-        // only its header, never preceding conversation text or prompt body.
+        );
+        // Seed only the final message's header, never earlier conversation text.
         if let Some(start) = prompt_ids.iter().rposition(|&id| id == tokens.start) {
-            parser.state = State::Header;
+            parser.grammar.state = State::Header;
             let tail = &prompt_ids[start + 1..];
             let end = tail.iter().position(|&id| id == tokens.message);
             parser.feed(&tail[..end.map_or(tail.len(), |end| end + 1)])?;
         }
         Ok(parser)
     }
+}
 
-    fn text(&mut self, text: String, events: &mut Vec<Event>) {
-        if text.is_empty() {
-            return;
-        }
-        match self.state {
-            State::Header => self.header.push_str(&text),
-            State::Text => events.push(Event::TextDelta { delta: text }),
-            State::Reasoning => events.push(Event::ReasoningDelta { delta: text }),
-            State::Tool(_) => self.tool_text.push_str(&text),
-            State::Ignore => {}
-        }
-    }
-
-    fn flush(&mut self, events: &mut Vec<Event>) -> Result<(), Error> {
-        let text = self.decoder.finish()?;
-        self.text(text, events);
-        self.decoder.reset();
-        Ok(())
-    }
-
+impl GptOssGrammar {
     fn open_body(&mut self) {
         let role = self.header.split_whitespace().next().unwrap_or("");
         let channel = self
@@ -399,89 +334,59 @@ impl GptOssParser {
             State::Text
         };
     }
-
-    fn close_body(&mut self, events: &mut Vec<Event>) -> Result<(), Error> {
-        if let State::Tool(name) = &self.state {
-            // Match the reference renderer's closed, valid JSON contract.
-            // Invalid generated calls remain uncommitted, just like a
-            // truncated call whose terminator never arrived.
-            if !name.is_empty()
-                && serde_json::from_str::<serde_json::Value>(&self.tool_text).is_ok()
-            {
-                let index = self.tool_index;
-                events.push(Event::ToolCallStart {
-                    index,
-                    id: format!("call_{index}"),
-                    name: name.clone(),
-                });
-                events.push(Event::ToolCallArgumentsDelta {
-                    index,
-                    // Harmony already emits JSON. Preserve its numeric
-                    // lexemes and whitespace instead of reparsing then
-                    // serializing the entire payload just to send it on.
-                    delta: self.tool_text.clone(),
-                });
-                self.tool_index += 1;
-            }
+    fn close_body(&mut self, events: &mut Vec<Event>) {
+        if let State::Tool(name) = &self.state
+            && !name.is_empty()
+            && serde_json::from_str::<Value>(&self.tool_text).is_ok()
+        {
+            // Preserve JSON lexemes/whitespace; incomplete calls never commit.
+            emit_tool(&mut self.tool_index, name, self.tool_text.clone(), events);
         }
         self.tool_text.clear();
         self.state = State::Ignore;
-        Ok(())
     }
 }
 
-impl ResponseParser for GptOssParser {
-    fn feed(&mut self, ids: &[u32]) -> Result<Vec<Event>, Error> {
-        if self.finished {
-            return Err(Error::new("cannot feed a Harmony parser after finish"));
-        }
-        if self.ended {
-            return Ok(Vec::new());
-        }
-        let mut events = Vec::new();
-        let mut start = 0;
-        for (index, &id) in ids.iter().enumerate() {
-            if !self.tokens.ids().contains(&id) {
-                continue;
-            }
-            let text = self.decoder.push(&ids[start..index])?;
-            self.text(text, &mut events);
-            self.flush(&mut events)?;
-            if id == self.tokens.start {
-                // A new header may follow a nonterminal analysis message.
-                self.tool_text.clear();
-                self.header.clear();
-                self.channel_offset = None;
-                self.state = State::Header;
-            } else if id == self.tokens.channel && matches!(self.state, State::Header) {
-                self.header.push(' ');
-                self.channel_offset = Some(self.header.len());
-            } else if id == self.tokens.constrain && matches!(self.state, State::Header) {
-                self.header.push(' ');
-            } else if id == self.tokens.message && matches!(self.state, State::Header) {
-                self.open_body();
-            } else if [self.tokens.end, self.tokens.turn_end, self.tokens.tool_end].contains(&id) {
-                self.close_body(&mut events)?;
-                if id == self.tokens.turn_end {
-                    self.ended = true;
-                    return Ok(events);
-                }
-            }
-            start = index + 1;
-        }
-        let text = self.decoder.push(&ids[start..])?;
-        self.text(text, &mut events);
-        Ok(events)
+impl Grammar for GptOssGrammar {
+    fn is_control(&self, id: u32) -> bool {
+        self.tokens.ids().contains(&id)
     }
-
-    fn finish(&mut self, _reason: FinishReason) -> Result<Vec<Event>, Error> {
-        if self.finished {
-            return Ok(Vec::new());
+    fn ended(&self) -> bool {
+        self.ended
+    }
+    fn text(&mut self, text: String, events: &mut Vec<Event>) -> Result<(), Error> {
+        if !text.is_empty() {
+            match self.state {
+                State::Header => self.header.push_str(&text),
+                State::Text => events.push(Event::TextDelta { delta: text }),
+                State::Reasoning => events.push(Event::ReasoningDelta { delta: text }),
+                State::Tool(_) => self.tool_text.push_str(&text),
+                State::Ignore => {}
+            }
         }
-        let mut events = Vec::new();
-        self.flush(&mut events)?;
+        Ok(())
+    }
+    fn control(&mut self, id: u32, events: &mut Vec<Event>) -> Result<(), Error> {
+        if id == self.tokens.start {
+            self.tool_text.clear();
+            self.header.clear();
+            self.channel_offset = None;
+            self.state = State::Header;
+        } else if id == self.tokens.channel && matches!(self.state, State::Header) {
+            self.header.push(' ');
+            self.channel_offset = Some(self.header.len());
+        } else if id == self.tokens.constrain && matches!(self.state, State::Header) {
+            self.header.push(' ');
+        } else if id == self.tokens.message && matches!(self.state, State::Header) {
+            self.open_body();
+        } else if [self.tokens.end, self.tokens.turn_end, self.tokens.tool_end].contains(&id) {
+            self.close_body(events);
+            self.ended = id == self.tokens.turn_end;
+        }
+        Ok(())
+    }
+    fn finish(&mut self, _reason: FinishReason, _events: &mut Vec<Event>) -> Result<(), Error> {
         self.tool_text.clear();
-        self.finished = true;
-        Ok(events)
+        Ok(())
     }
 }

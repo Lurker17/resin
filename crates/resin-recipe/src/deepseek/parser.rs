@@ -1,38 +1,12 @@
+use super::{BOS, DSML, EOS, THINKING_END, THINKING_START};
+use crate::parser::{Grammar, Parser, tokens};
+use crate::{Decoder, Error, Event, FinishReason};
 use std::collections::HashSet;
 
-use crate::{Decoder, Error, Event, FinishReason, ResponseParser};
-
-use super::DSML;
-
-/// The actual special-token IDs, rather than their spellings in ordinary text.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DeepSeekV4Tokens {
-    pub bos: u32,
-    pub eos: u32,
-    pub thinking_start: u32,
-    pub thinking_end: u32,
-    pub dsml: u32,
-}
-
-impl DeepSeekV4Tokens {
-    pub fn validate(&self) -> Result<(), Error> {
-        let ids = [
-            self.bos,
-            self.eos,
-            self.thinking_start,
-            self.thinking_end,
-            self.dsml,
-        ];
-        for (index, id) in ids.iter().enumerate() {
-            if ids[..index].contains(id) {
-                return Err(Error::new(
-                    "DeepSeek response markers must have distinct token IDs",
-                ));
-            }
-        }
-        Ok(())
-    }
-}
+tokens! { DeepSeekV4Tokens {
+    bos => [BOS], eos => [EOS], thinking_start => [THINKING_START],
+    thinking_end => [THINKING_END], dsml => [DSML],
+}}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Stage {
@@ -148,14 +122,10 @@ impl Buffer {
     }
 }
 
-/// Incremental parser for the pinned DeepSeek V4 output grammar.
-///
-/// Token decoding and marker scanning consume only newly received data. Tool
-/// argument strings are escaped as they arrive; plain marker spellings cannot
-/// become control tokens. Truncation preserves already streamed partial calls.
-pub struct DeepSeekV4Parser {
+/// Incremental DSML parsing. Only actual control IDs introduce DSML markers.
+pub type DeepSeekV4Parser = Parser<DeepSeekV4Grammar>;
+pub struct DeepSeekV4Grammar {
     tokens: DeepSeekV4Tokens,
-    decoder: Box<dyn Decoder>,
     stage: Stage,
     buffer: Buffer,
     name: String,
@@ -164,7 +134,6 @@ pub struct DeepSeekV4Parser {
     tool_index: usize,
     first_parameter: bool,
     ended: bool,
-    finished: bool,
 }
 
 impl DeepSeekV4Parser {
@@ -188,25 +157,28 @@ impl DeepSeekV4Parser {
                 }
             })
             .unwrap_or(thinking);
-        Ok(Self {
-            tokens,
-            decoder,
-            stage: if thinking {
-                Stage::Reasoning
-            } else {
-                Stage::Content
+        Ok(Self::with_grammar(
+            DeepSeekV4Grammar {
+                tokens,
+                stage: if thinking {
+                    Stage::Reasoning
+                } else {
+                    Stage::Content
+                },
+                buffer: Buffer::default(),
+                name: String::new(),
+                parameter_name: String::new(),
+                parameter_names: HashSet::new(),
+                tool_index: 0,
+                first_parameter: true,
+                ended: false,
             },
-            buffer: Buffer::default(),
-            name: String::new(),
-            parameter_name: String::new(),
-            parameter_names: HashSet::new(),
-            tool_index: 0,
-            first_parameter: true,
-            ended: false,
-            finished: false,
-        })
+            decoder,
+        ))
     }
+}
 
+impl DeepSeekV4Grammar {
     fn argument(&self, text: String, events: &mut Vec<Event>) {
         if !text.is_empty() {
             events.push(Event::ToolCallArgumentsDelta {
@@ -216,7 +188,7 @@ impl DeepSeekV4Parser {
         }
     }
 
-    fn text(&mut self, text: &str, special: bool, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn push(&mut self, text: &str, special: bool, events: &mut Vec<Event>) -> Result<(), Error> {
         self.buffer.push(text, special);
         loop {
             match self.stage {
@@ -348,16 +320,20 @@ impl DeepSeekV4Parser {
         }
         Ok(())
     }
+}
 
-    fn flush_decoder(&mut self, events: &mut Vec<Event>) -> Result<(), Error> {
-        let text = self.decoder.finish()?;
-        self.text(&text, false, events)?;
-        self.decoder.reset();
-        Ok(())
+impl Grammar for DeepSeekV4Grammar {
+    const STRICT_END: bool = true;
+    fn is_control(&self, id: u32) -> bool {
+        self.tokens.ids().contains(&id)
     }
-
+    fn ended(&self) -> bool {
+        self.ended
+    }
+    fn text(&mut self, text: String, events: &mut Vec<Event>) -> Result<(), Error> {
+        self.push(&text, false, events)
+    }
     fn control(&mut self, id: u32, events: &mut Vec<Event>) -> Result<(), Error> {
-        self.flush_decoder(events)?;
         if id == self.tokens.eos {
             match self.stage {
                 Stage::Content => {
@@ -382,7 +358,7 @@ impl DeepSeekV4Parser {
             }
             self.stage = Stage::Content;
         } else if id == self.tokens.dsml {
-            self.text(DSML, true, events)?;
+            self.push(DSML, true, events)?;
         } else {
             return Err(Error::new(
                 "DeepSeek emitted an unexpected response control token",
@@ -390,60 +366,18 @@ impl DeepSeekV4Parser {
         }
         Ok(())
     }
-}
-
-impl ResponseParser for DeepSeekV4Parser {
-    fn feed(&mut self, ids: &[u32]) -> Result<Vec<Event>, Error> {
-        if self.finished {
-            return Err(Error::new("cannot feed a DeepSeek parser after finish"));
-        }
-        let mut events = Vec::new();
-        let mut start = 0;
-        for (index, &id) in ids.iter().enumerate() {
-            if self.ended {
-                return Err(Error::new("DeepSeek emitted tokens after EOS"));
-            }
-            if [
-                self.tokens.bos,
-                self.tokens.eos,
-                self.tokens.thinking_start,
-                self.tokens.thinking_end,
-                self.tokens.dsml,
-            ]
-            .contains(&id)
-            {
-                let text = self.decoder.push(&ids[start..index])?;
-                self.text(&text, false, &mut events)?;
-                self.control(id, &mut events)?;
-                start = index + 1;
-            }
-        }
+    fn finish(&mut self, _reason: FinishReason, events: &mut Vec<Event>) -> Result<(), Error> {
         if !self.ended {
-            let text = self.decoder.push(&ids[start..])?;
-            self.text(&text, false, &mut events)?;
-        }
-        Ok(events)
-    }
-
-    fn finish(&mut self, _reason: FinishReason) -> Result<Vec<Event>, Error> {
-        if self.finished {
-            return Ok(Vec::new());
-        }
-        let mut events = Vec::new();
-        if !self.ended {
-            self.flush_decoder(&mut events)?;
             let delta = self.buffer.take(self.buffer.text.len());
             match self.stage {
                 Stage::Reasoning if !delta.is_empty() => {
                     events.push(Event::ReasoningDelta { delta })
                 }
                 Stage::Content if !delta.is_empty() => events.push(Event::TextDelta { delta }),
-                // An unfinished markup suffix is not part of the answer.
                 _ => {}
             }
         }
         self.buffer.clear();
-        self.finished = true;
-        Ok(events)
+        Ok(())
     }
 }

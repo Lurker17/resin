@@ -39,6 +39,69 @@ impl Prompt {
         self
     }
 
+    pub fn append(&mut self, prompt: Self) -> &mut Self {
+        for span in prompt.spans {
+            match span {
+                PromptSpan::Text(text) => {
+                    self.text(text);
+                }
+                PromptSpan::Special(token) => {
+                    self.special(token);
+                }
+            }
+        }
+        self
+    }
+
+    pub fn separated<T>(
+        &mut self,
+        values: impl IntoIterator<Item = T>,
+        separator: &str,
+        mut write: impl FnMut(&mut Self, T),
+    ) -> &mut Self {
+        for (index, value) in values.into_iter().enumerate() {
+            if index > 0 {
+                self.text(separator);
+            }
+            write(self, value);
+        }
+        self
+    }
+
+    /// Trim template whitespace while preserving control-token provenance.
+    pub fn trim(mut self) -> Self {
+        if let Some(PromptSpan::Text(first)) = self.spans.first_mut() {
+            *first = first
+                .trim_start_matches(crate::render::whitespace)
+                .to_owned();
+        }
+        if let Some(PromptSpan::Text(last)) = self.spans.last_mut() {
+            *last = last.trim_end_matches(crate::render::whitespace).to_owned();
+        }
+        self
+    }
+
+    /// Slice rendered byte positions, retaining whole control-token spans.
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Self {
+        let mut result = Self::new();
+        let mut offset = 0;
+        for span in &self.spans {
+            let (PromptSpan::Text(spelling) | PromptSpan::Special(spelling)) = span;
+            let next = offset + spelling.len();
+            let first = range.start.max(offset);
+            let last = range.end.min(next);
+            if first < last {
+                if matches!(span, PromptSpan::Special(_)) && first == offset && last == next {
+                    result.special(spelling);
+                } else {
+                    result.text(&spelling[first - offset..last - offset]);
+                }
+            }
+            offset = next;
+        }
+        result
+    }
+
     pub fn rendered_text(&self) -> String {
         self.spans
             .iter()
@@ -77,9 +140,17 @@ impl TokenizerEncoder {
     pub fn new(tokenizer: Arc<Tokenizer>) -> Result<Self, Error> {
         let format_tokens = AhoCorasick::builder()
             .match_kind(MatchKind::LeftmostLongest)
-            .build(tokenizer.get_added_tokens_decoder().into_values()
-                .filter(|token| token.special || token.content.starts_with('<') || token.content.starts_with('｜'))
-                .map(|token| token.content))
+            .build(
+                tokenizer
+                    .get_added_tokens_decoder()
+                    .into_values()
+                    .filter(|token| {
+                        token.special
+                            || token.content.starts_with('<')
+                            || token.content.starts_with('｜')
+                    })
+                    .map(|token| token.content),
+            )
             .map_err(|error| Error::new(error.to_string()))?;
         let mut ordinary = (*tokenizer).clone();
         // Some checkpoints mark format delimiters (e.g. LFM's <think>) as

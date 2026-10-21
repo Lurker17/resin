@@ -1,5 +1,6 @@
 //! Gemma's schema/value notation, whose strings use explicit quote tokens.
 
+use crate::render::{list, text, truthy};
 use crate::{Error, Prompt};
 use serde_json::{Map, Value};
 
@@ -11,16 +12,6 @@ pub(super) fn sorted(map: &Map<String, Value>) -> Vec<(&str, &Value)> {
     // Jinja's dictsort is case-insensitive and stable for equivalent keys.
     items.sort_by_key(|(key, _)| key.to_lowercase());
     items
-}
-
-fn text(value: Option<&Value>) -> &str {
-    value.and_then(Value::as_str).unwrap_or("")
-}
-fn truthy(value: &Value) -> bool {
-    super::truthy(value)
-}
-fn list(value: Option<&Value>) -> &[Value] {
-    super::array(value)
 }
 
 fn quoted(prompt: &mut Prompt, value: &str) {
@@ -41,20 +32,14 @@ pub(super) fn argument(prompt: &mut Prompt, value: &Value, escape_keys: bool) {
         }
         Value::Array(values) => {
             prompt.text("[");
-            for (index, value) in values.iter().enumerate() {
-                if index > 0 {
-                    prompt.text(",");
-                }
+            prompt.separated(values, ",", |prompt, value| {
                 argument(prompt, value, escape_keys);
-            }
+            });
             prompt.text("]");
         }
         Value::Object(values) => {
             prompt.text("{");
-            for (index, (key, value)) in sorted(values).into_iter().enumerate() {
-                if index > 0 {
-                    prompt.text(",");
-                }
+            prompt.separated(sorted(values), ",", |prompt, (key, value)| {
                 if escape_keys {
                     quoted(prompt, key);
                 } else {
@@ -62,7 +47,7 @@ pub(super) fn argument(prompt: &mut Prompt, value: &Value, escape_keys: bool) {
                 }
                 prompt.text(":");
                 argument(prompt, value, escape_keys);
-            }
+            });
             prompt.text("}");
         }
     }
@@ -75,7 +60,7 @@ fn upper(value: Option<&Value>) -> String {
             "[{}]",
             values
                 .iter()
-                .map(|value| format!("'{}'", text(Some(value)).to_uppercase()))
+                .map(|value| format!("'{}'", text(value).to_uppercase()))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -85,12 +70,9 @@ fn upper(value: Option<&Value>) -> String {
 
 fn required(prompt: &mut Prompt, value: Option<&Value>) {
     prompt.text("required:[");
-    for (index, item) in list(value).iter().enumerate() {
-        if index > 0 {
-            prompt.text(",");
-        }
-        quoted(prompt, text(Some(item)));
-    }
+    prompt.separated(list(value.unwrap_or(&Value::Null)), ",", |prompt, item| {
+        quoted(prompt, text(item))
+    });
     prompt.text("]");
 }
 
@@ -117,7 +99,7 @@ fn parameters(prompt: &mut Prompt, properties: &Map<String, Value>, filter_stand
         let mut has_fields = false;
         if let Some(description) = value.get("description").filter(|value| truthy(value)) {
             prompt.text("description:");
-            quoted(prompt, text(Some(description)));
+            quoted(prompt, text(description));
             has_fields = true;
         }
         let kind = upper(value.get("type"));
@@ -209,9 +191,9 @@ fn parameters(prompt: &mut Prompt, properties: &Map<String, Value>, filter_stand
 pub(super) fn declaration(prompt: &mut Prompt, function: &Value) {
     prompt.text(format!(
         "declaration:{}{{description:",
-        text(function.get("name"))
+        text(&function["name"])
     ));
-    quoted(prompt, text(function.get("description")));
+    quoted(prompt, text(&function["description"]));
     if let Some(params) = function.get("parameters").filter(|value| truthy(value)) {
         prompt.text(",parameters:{");
         if let Some(properties) = params
@@ -237,7 +219,7 @@ pub(super) fn declaration(prompt: &mut Prompt, function: &Value) {
         prompt.text(",response:{");
         if response.get("description").is_some_and(truthy) {
             prompt.text("description:");
-            quoted(prompt, text(response.get("description")));
+            quoted(prompt, text(&response["description"]));
             prompt.text(",");
         }
         if upper(response.get("type")) == "OBJECT" {
@@ -256,149 +238,83 @@ pub(super) enum Character {
     Quote,
 }
 
-struct Reader<'a> {
-    input: &'a [Character],
-    position: usize,
-}
-
-impl Reader<'_> {
-    fn whitespace(&mut self) {
-        while matches!(self.input.get(self.position), Some(Character::Text(character)) if character.is_whitespace())
-        {
-            self.position += 1;
-        }
+/// Normalize Gemma's explicit quote tokens, unquoted keys and `None` to JSON;
+/// let serde validate the nested value grammar instead of maintaining a second
+/// recursive JSON parser. Plain text resembling the quote token stays literal.
+pub(super) fn parse_call(input: &[Character]) -> Result<(String, Value), Error> {
+    let invalid = || Error::new("invalid Gemma tool call");
+    let body = input
+        .iter()
+        .position(|unit| *unit == Character::Text('{'))
+        .ok_or_else(invalid)?;
+    let header: Option<String> = input[..body]
+        .iter()
+        .map(|unit| match unit {
+            Character::Text(character) => Some(*character),
+            Character::Quote => None,
+        })
+        .collect();
+    let header = header.ok_or_else(invalid)?;
+    let (call, name) = header.split_once(':').ok_or_else(invalid)?;
+    let name = name.trim();
+    if call.trim() != "call" || name.is_empty() || name.contains([':', ',', '[', ']']) {
+        return Err(invalid());
     }
-
-    fn take(&mut self, expected: char) -> bool {
-        self.whitespace();
-        if self.input.get(self.position) == Some(&Character::Text(expected)) {
-            self.position += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn require(&mut self, expected: char) -> Result<(), Error> {
-        if self.take(expected) {
-            Ok(())
-        } else {
-            Err(Error::new(format!("Gemma tool call expected {expected:?}")))
-        }
-    }
-
-    fn quoted(&mut self) -> Result<String, Error> {
-        self.whitespace();
-        if self.input.get(self.position) != Some(&Character::Quote) {
-            return Err(Error::new(
-                "Gemma tool string must start with its quote token",
-            ));
-        }
-        self.position += 1;
-        let mut value = String::new();
-        while let Some(character) = self.input.get(self.position) {
-            self.position += 1;
-            match character {
-                Character::Text(character) => value.push(*character),
-                Character::Quote => return Ok(value),
-            }
-        }
-        Err(Error::new("unterminated Gemma tool string"))
-    }
-
-    fn atom(&mut self) -> Result<String, Error> {
-        self.whitespace();
-        let start = self.position;
-        while let Some(Character::Text(character)) = self.input.get(self.position) {
-            if [':', ',', '{', '}', '[', ']'].contains(character) {
-                break;
-            }
-            self.position += 1;
-        }
-        if self.position == start {
-            return Err(Error::new("missing Gemma tool value"));
-        }
-        Ok(self.input[start..self.position]
-            .iter()
-            .filter_map(|character| match character {
-                Character::Text(character) => Some(*character),
-                Character::Quote => None,
-            })
-            .collect::<String>()
-            .trim()
-            .to_owned())
-    }
-
-    fn object(&mut self) -> Result<Value, Error> {
-        self.require('{')?;
-        let mut values = Map::new();
-        if self.take('}') {
-            return Ok(Value::Object(values));
-        }
-        loop {
-            self.whitespace();
-            let key = if self.input.get(self.position) == Some(&Character::Quote) {
-                self.quoted()?
-            } else {
-                self.atom()?
-            };
-            self.require(':')?;
-            values.insert(key, self.value()?);
-            if self.take('}') {
-                break;
-            }
-            self.require(',')?;
-        }
-        Ok(Value::Object(values))
-    }
-
-    fn value(&mut self) -> Result<Value, Error> {
-        self.whitespace();
-        match self.input.get(self.position) {
-            Some(Character::Quote) => Ok(Value::String(self.quoted()?)),
-            Some(Character::Text('{')) => self.object(),
-            Some(Character::Text('[')) => {
-                self.position += 1;
-                let mut values = Vec::new();
-                if self.take(']') {
-                    return Ok(Value::Array(values));
+    let mut json = String::new();
+    let mut cursor = body;
+    while let Some(unit) = input.get(cursor) {
+        match unit {
+            Character::Quote => {
+                cursor += 1;
+                let start = cursor;
+                while matches!(input.get(cursor), Some(Character::Text(_))) {
+                    cursor += 1;
                 }
-                loop {
-                    values.push(self.value()?);
-                    if self.take(']') {
-                        break;
-                    }
-                    self.require(',')?;
+                if input.get(cursor) != Some(&Character::Quote) {
+                    return Err(invalid());
                 }
-                Ok(Value::Array(values))
+                let text: String = input[start..cursor]
+                    .iter()
+                    .filter_map(|unit| match unit {
+                        Character::Text(character) => Some(*character),
+                        Character::Quote => None,
+                    })
+                    .collect();
+                json.push_str(&serde_json::to_string(&text).unwrap());
+                cursor += 1;
+            }
+            Character::Text(character) if "{}[],:".contains(*character) => {
+                json.push(*character);
+                cursor += 1;
             }
             _ => {
-                let atom = self.atom()?;
-                if atom == "None" {
-                    return Ok(Value::Null);
+                let start = cursor;
+                while matches!(input.get(cursor), Some(Character::Text(character)) if !"{}[],:".contains(*character))
+                {
+                    cursor += 1;
                 }
-                serde_json::from_str(&atom)
-                    .map_err(|_| Error::new(format!("invalid Gemma tool value {atom:?}")))
+                let atom: String = input[start..cursor]
+                    .iter()
+                    .filter_map(|unit| match unit {
+                        Character::Text(character) => Some(*character),
+                        Character::Quote => None,
+                    })
+                    .collect();
+                let atom = atom.trim();
+                if input.get(cursor) == Some(&Character::Text(':')) {
+                    if atom.is_empty() {
+                        return Err(invalid());
+                    }
+                    json.push_str(&serde_json::to_string(atom).unwrap());
+                } else {
+                    json.push_str(if atom == "None" { "null" } else { atom });
+                }
             }
         }
     }
-}
-
-pub(super) fn parse_call(input: &[Character]) -> Result<(String, Value), Error> {
-    let mut reader = Reader { input, position: 0 };
-    let call = reader.atom()?;
-    if call != "call" {
-        return Err(Error::new("Gemma tool call must start with call:"));
+    let arguments: Value = serde_json::from_str(&json).map_err(|_| invalid())?;
+    if !arguments.is_object() {
+        return Err(invalid());
     }
-    reader.require(':')?;
-    let name = reader.atom()?;
-    if name.is_empty() {
-        return Err(Error::new("Gemma tool call requires a name"));
-    }
-    let arguments = reader.object()?;
-    reader.whitespace();
-    if reader.position != input.len() {
-        return Err(Error::new("trailing Gemma tool call data"));
-    }
-    Ok((name, arguments))
+    Ok((name.to_owned(), arguments))
 }

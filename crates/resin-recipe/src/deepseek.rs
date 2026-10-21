@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::json::spaced as json_spaced;
 
+use crate::render::{function, option, text_content};
 use crate::{Error, Prompt};
 
 pub use parser::{DeepSeekV4Parser, DeepSeekV4Tokens};
@@ -29,14 +30,7 @@ const MAX_EFFORT: &str = "Reasoning Effort: Beyond maximum — exhaustive, relen
 /// Resolve Resin's API effort aliases without changing the checkpoint default.
 pub fn thinking_settings(request: &Value) -> Result<(bool, &'static str), Error> {
     let extra = &request["extra"];
-    let configured_effort = request
-        .get("reasoning_effort")
-        .filter(|value| !value.is_null())
-        .or_else(|| {
-            extra
-                .get("reasoning_effort")
-                .filter(|value| !value.is_null())
-        });
+    let configured_effort = option(request, "reasoning_effort");
     let effort = match configured_effort {
         None => "low",
         Some(Value::String(value)) => match value.as_str() {
@@ -254,25 +248,9 @@ fn content(message: &Value) -> Result<String, Error> {
 }
 
 fn text_value(value: &Value) -> Result<String, Error> {
-    match value {
-        Value::Null => Ok(String::new()),
-        Value::String(text) => Ok(text.clone()),
-        Value::Array(blocks) => {
-            let mut text = String::new();
-            for block in blocks {
-                if block["type"] != "text" {
-                    return Err(Error::new("DeepSeek V4 recipe supports text content only"));
-                }
-                text.push_str(
-                    block["text"]
-                        .as_str()
-                        .ok_or_else(|| Error::new("text content must be a string"))?,
-                );
-            }
-            Ok(text)
-        }
-        _ => Err(Error::new("message content must be text")),
-    }
+    text_content(value, |_| {
+        Err(Error::new("DeepSeek V4 recipe supports text content only"))
+    })
 }
 
 fn merge_messages(messages: Vec<Value>) -> Result<Vec<Value>, Error> {
@@ -358,7 +336,7 @@ fn render_tools(prompt: &mut Prompt, tools: &[Value]) -> Result<(), Error> {
     }
     prompt.text(template);
     for tool in tools {
-        let tool = tool.get("function").unwrap_or(tool);
+        let tool = function(tool);
         if !tool.is_object() {
             return Err(Error::new("tool schema must be an object"));
         }
@@ -381,7 +359,7 @@ fn render_tool_calls(prompt: &mut Prompt, calls: &[Value]) -> Result<(), Error> 
         if index > 0 {
             prompt.text("\n");
         }
-        let function = call.get("function").unwrap_or(call);
+        let function = function(call);
         let name = function["name"]
             .as_str()
             .ok_or_else(|| Error::new("tool call name must be a string"))?;

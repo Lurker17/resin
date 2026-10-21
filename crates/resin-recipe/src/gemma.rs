@@ -4,41 +4,8 @@ mod values;
 
 use serde_json::Value;
 
-use crate::{Decoder, Error, Event, FinishReason, Prompt, ResponseParser};
-
-fn option<'a>(request: &'a Value, name: &str) -> Option<&'a Value> {
-    request
-        .get(name)
-        .filter(|value| !value.is_null())
-        .or_else(|| {
-            request
-                .get("extra")
-                .and_then(|extra| extra.get(name))
-                .filter(|value| !value.is_null())
-        })
-}
-
-fn array(value: Option<&Value>) -> &[Value] {
-    value
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-}
-
-fn string(value: Option<&Value>) -> &str {
-    value.and_then(Value::as_str).unwrap_or("")
-}
-
-fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::String(value) => !value.is_empty(),
-        Value::Array(value) => !value.is_empty(),
-        Value::Object(value) => !value.is_empty(),
-        Value::Number(value) => value.as_f64().unwrap_or(0.0) != 0.0,
-    }
-}
+use crate::render::{function, list as array, messages, option, text as string, truthy};
+use crate::{Decoder, Error, Event, FinishReason, Prompt};
 
 fn strip_thinking(text: &str) -> String {
     text.split("<channel|>")
@@ -64,8 +31,8 @@ fn content(prompt: &mut Prompt, value: Option<&Value>, assistant: bool) -> Optio
         Some(Value::String(value)) => text(prompt, value),
         Some(Value::Array(parts)) => {
             for part in parts {
-                match string(part.get("type")) {
-                    "text" | "input_text" => text(prompt, string(part.get("text"))),
+                match string(&part["type"]) {
+                    "text" | "input_text" => text(prompt, string(&part["text"])),
                     "image" | "image_url" | "input_image" => {
                         prompt.special("<|image|>");
                         last_media = Some("image");
@@ -92,13 +59,10 @@ fn tool_response(prompt: &mut Prompt, name: &str, response: &Value) {
         .special("<|tool_response>")
         .text(format!("response:{name}{{"));
     if let Some(response) = response.as_object() {
-        for (index, (key, value)) in values::sorted(response).into_iter().enumerate() {
-            if index > 0 {
-                prompt.text(",");
-            }
+        prompt.separated(values::sorted(response), ",", |prompt, (key, value)| {
             prompt.text(key).text(":");
             values::argument(prompt, value, false);
-        }
+        });
     } else {
         prompt.text("value:");
         values::argument(prompt, response, false);
@@ -108,17 +72,14 @@ fn tool_response(prompt: &mut Prompt, name: &str, response: &Value) {
 
 /// Render the pinned Gemma 4 template, preserving explicit control-token spans.
 pub fn render(request: &Value) -> Result<Prompt, Error> {
-    let messages = array(request.get("messages"));
-    if messages.is_empty() {
-        return Err(Error::new("Gemma 4 requires nonempty messages"));
-    }
-    let tools = array(request.get("tools"));
+    let messages = messages(request, "Gemma 4")?;
+    let tools = array(&request["tools"]);
     let enable_thinking = option(request, "enable_thinking")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let mut prompt = Prompt::new();
     prompt.special("<bos>");
-    let system = matches!(string(messages[0].get("role")), "system" | "developer");
+    let system = matches!(string(&messages[0]["role"]), "system" | "developer");
     let mut previous_kind = None;
     if enable_thinking || !tools.is_empty() || system {
         prompt.special("<|turn>").text("system\n");
@@ -133,7 +94,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                 }
                 Some(Value::Array(parts)) => {
                     for part in parts {
-                        prompt.text(string(part.get("text")).trim()).text(" ");
+                        prompt.text(string(&part["text"]).trim()).text(" ");
                     }
                 }
                 _ => {}
@@ -150,10 +111,10 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
     let messages = if system { &messages[1..] } else { messages };
     let last_user = messages
         .iter()
-        .rposition(|message| string(message.get("role")) == "user");
+        .rposition(|message| string(&message["role"]) == "user");
     let mut previous_role = "";
     for (index, message) in messages.iter().enumerate() {
-        let role = string(message.get("role"));
+        let role = string(&message["role"]);
         if role == "tool" {
             continue;
         }
@@ -172,7 +133,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                 .text("\n");
         }
         previous_role = role;
-        let calls = array(message.get("tool_calls"));
+        let calls = array(&message["tool_calls"]);
         let reasoning = message
             .get("reasoning")
             .filter(|value| truthy(value))
@@ -191,20 +152,16 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                 .special("<channel|>");
         }
         for call in calls {
-            let function = call.get("function").unwrap_or(call);
+            let function = function(call);
             prompt
                 .special("<|tool_call>")
-                .text(format!("call:{}{{", string(function.get("name"))));
+                .text(format!("call:{}{{", string(&function["name"])));
             match function.get("arguments") {
                 Some(Value::Object(arguments)) => {
-                    for (index, (name, value)) in values::sorted(arguments).into_iter().enumerate()
-                    {
-                        if index > 0 {
-                            prompt.text(",");
-                        }
+                    prompt.separated(values::sorted(arguments), ",", |prompt, (name, value)| {
                         prompt.text(name).text(":");
-                        values::argument(&mut prompt, value, false);
-                    }
+                        values::argument(prompt, value, false);
+                    });
                 }
                 Some(Value::String(arguments)) => {
                     prompt.text(arguments);
@@ -215,7 +172,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
             previous_kind = Some("tool_call");
         }
         let mut has_response = false;
-        let responses = array(message.get("tool_responses"));
+        let responses = array(&message["tool_responses"]);
         if !responses.is_empty() {
             for response in responses {
                 tool_response(
@@ -232,12 +189,12 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
         } else if !calls.is_empty() {
             for follow in messages[index + 1..]
                 .iter()
-                .take_while(|follow| string(follow.get("role")) == "tool")
+                .take_while(|follow| string(&follow["role"]) == "tool")
             {
                 let name = calls
                     .iter()
                     .rfind(|call| call.get("id") == follow.get("tool_call_id"))
-                    .map(|call| string(call.get("function").unwrap_or(call).get("name")))
+                    .map(|call| string(&function(call)["name"]))
                     .unwrap_or_else(|| {
                         follow
                             .get("name")
@@ -248,8 +205,8 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                 if let Some(parts) = body.as_array() {
                     let text = parts
                         .iter()
-                        .filter(|part| string(part.get("type")) == "text")
-                        .map(|part| string(part.get("text")))
+                        .filter(|part| string(&part["type"]) == "text")
+                        .map(|part| string(&part["text"]))
                         .collect::<String>();
                     tool_response(&mut prompt, name, &Value::String(text));
                 } else {
@@ -264,16 +221,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
             previous_kind = Some(kind);
         }
         let has_content = !body.rendered_text().trim().is_empty();
-        for span in body.spans {
-            match span {
-                crate::PromptSpan::Text(text) => {
-                    prompt.text(text);
-                }
-                crate::PromptSpan::Special(token) => {
-                    prompt.special(token);
-                }
-            }
-        }
+        prompt.append(body);
         if previous_kind == Some("tool_call") && !has_response {
             prompt.special("<|tool_response>");
         } else if !(has_response && !has_content) {
@@ -296,22 +244,17 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
     Ok(prompt)
 }
 
-/// Explicit Gemma 4 grammar markers. Ordinary marker spellings remain text.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Gemma4Tokens {
-    pub turn_start: u32,
-    pub turn_end: u32,
-    pub channel_start: u32,
-    pub channel_end: u32,
-    pub tool_call_start: u32,
-    pub tool_call_end: u32,
-    pub tool_response_start: u32,
-    pub tool_response_end: u32,
-    pub escape: u32,
-    pub eos: u32,
-}
+use crate::parser::{Grammar, Parser, emit_tool, tokens};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+tokens! { Gemma4Tokens {
+    turn_start => ["<|turn>"], turn_end => ["<turn|>"],
+    channel_start => ["<|channel>"], channel_end => ["<channel|>"],
+    tool_call_start => ["<|tool_call>"], tool_call_end => ["<tool_call|>"],
+    tool_response_start => ["<|tool_response>"], tool_response_end => ["<tool_response|>"],
+    escape => ["<|\"|>"], eos => ["<eos>"],
+}}
+
+#[derive(Clone, Copy, PartialEq)]
 enum State {
     Content,
     ChannelHeader,
@@ -322,15 +265,14 @@ enum State {
     Ended,
 }
 
-/// Incrementally parse thought channels and Gemma's structured tool arguments.
-pub struct Gemma4Parser {
+/// Gemma's thought channels and structured tool-call arguments.
+pub type Gemma4Parser = Parser<Gemma4Grammar>;
+pub struct Gemma4Grammar {
     tokens: Gemma4Tokens,
-    decoder: Box<dyn Decoder>,
     state: State,
     header: String,
     tool: Vec<values::Character>,
     tool_index: usize,
-    finished: bool,
 }
 
 impl Gemma4Parser {
@@ -339,23 +281,7 @@ impl Gemma4Parser {
         decoder: Box<dyn Decoder>,
         prompt_ids: &[u32],
     ) -> Result<Self, Error> {
-        let markers = [
-            tokens.turn_start,
-            tokens.turn_end,
-            tokens.channel_start,
-            tokens.channel_end,
-            tokens.tool_call_start,
-            tokens.tool_call_end,
-            tokens.tool_response_start,
-            tokens.tool_response_end,
-            tokens.escape,
-            tokens.eos,
-        ];
-        for (index, marker) in markers.iter().enumerate() {
-            if markers[..index].contains(marker) {
-                return Err(Error::new("Gemma 4 markers must be distinct"));
-            }
-        }
+        tokens.validate()?;
         let mut state = State::Content;
         for &id in prompt_ids {
             state = if id == tokens.channel_start {
@@ -366,162 +292,96 @@ impl Gemma4Parser {
                 State::Tool
             } else if id == tokens.tool_response_start {
                 State::ToolResponse
-            } else if id == tokens.tool_response_end
-                || id == tokens.turn_start
-                || id == tokens.turn_end
-            {
+            } else if [tokens.tool_response_end, tokens.turn_start, tokens.turn_end].contains(&id) {
                 State::Content
             } else {
                 state
             };
         }
-        // The generation prompt may leave the thought header open. Its decoded
-        // header is already in the prompt, so generated text starts reasoning.
+        // The prompt has already supplied an unfinished thought header.
         if state == State::ChannelHeader {
             state = State::Reasoning;
         }
-        Ok(Self {
-            tokens,
+        Ok(Self::with_grammar(
+            Gemma4Grammar {
+                tokens,
+                state,
+                header: String::new(),
+                tool: Vec::new(),
+                tool_index: 0,
+            },
             decoder,
-            state,
-            header: String::new(),
-            tool: Vec::new(),
-            tool_index: 0,
-            finished: false,
-        })
-    }
-
-    fn text(&mut self, text: String, events: &mut Vec<Event>) {
-        if text.is_empty() {
-            return;
-        }
-        match self.state {
-            State::Content => events.push(Event::TextDelta { delta: text }),
-            State::Reasoning => events.push(Event::ReasoningDelta { delta: text }),
-            State::Tool => self.tool.extend(text.chars().map(values::Character::Text)),
-            State::ChannelHeader | State::TurnHeader => {
-                self.header.push_str(&text);
-                if let Some((_, body)) = self.header.split_once('\n') {
-                    let body = body.to_owned();
-                    self.header.clear();
-                    self.state = if self.state == State::ChannelHeader {
-                        State::Reasoning
-                    } else {
-                        State::Content
-                    };
-                    self.text(body, events);
-                }
-            }
-            State::ToolResponse | State::Ended => {}
-        }
-    }
-
-    fn close(&mut self, events: &mut Vec<Event>) -> Result<(), Error> {
-        let text = self.decoder.finish()?;
-        self.text(text, events);
-        self.decoder.reset();
-        Ok(())
-    }
-
-    fn emit_tool(&mut self, events: &mut Vec<Event>) -> Result<(), Error> {
-        let (name, arguments) = values::parse_call(&self.tool)?;
-        let index = self.tool_index;
-        self.tool_index += 1;
-        events.push(Event::ToolCallStart {
-            index,
-            id: format!("call_{index}"),
-            name,
-        });
-        events.push(Event::ToolCallArgumentsDelta {
-            index,
-            delta: arguments.to_string(),
-        });
-        self.tool.clear();
-        Ok(())
+        ))
     }
 }
 
-impl ResponseParser for Gemma4Parser {
-    fn feed(&mut self, ids: &[u32]) -> Result<Vec<Event>, Error> {
-        if self.finished {
-            return Err(Error::new("cannot feed a finished Gemma 4 parser"));
-        }
-        if self.state == State::Ended {
-            return Ok(Vec::new());
-        }
-        let mut events = Vec::new();
-        let mut start = 0;
-        for (index, &id) in ids.iter().enumerate() {
-            let t = self.tokens;
-            let control = [
-                t.turn_start,
-                t.turn_end,
-                t.channel_start,
-                t.channel_end,
-                t.tool_call_start,
-                t.tool_call_end,
-                t.tool_response_start,
-                t.tool_response_end,
-                t.escape,
-                t.eos,
-            ]
-            .contains(&id);
-            if !control {
-                continue;
-            }
-            if start < index {
-                let text = self.decoder.push(&ids[start..index])?;
-                self.text(text, &mut events);
-            }
-            self.close(&mut events)?;
-            if id == t.escape {
-                if self.state == State::Tool {
-                    self.tool.push(values::Character::Quote);
-                }
-            } else if id == t.tool_call_end {
-                if self.state == State::Tool {
-                    self.emit_tool(&mut events)?;
-                }
-                self.state = State::Content;
-            } else if id == t.tool_call_start {
-                self.tool.clear();
-                self.state = State::Tool;
-            } else if id == t.channel_start {
-                self.header.clear();
-                self.state = State::ChannelHeader;
-            } else if id == t.channel_end {
-                self.header.clear();
-                self.state = State::Content;
-            } else if id == t.turn_start {
-                self.header.clear();
-                self.state = State::TurnHeader;
-            } else if id == t.tool_response_start {
-                self.state = State::ToolResponse;
-            } else if id == t.tool_response_end {
-                self.state = State::Content;
-            } else {
-                self.state = State::Ended;
-            }
-            start = index + 1;
-            if self.state == State::Ended {
-                return Ok(events);
-            }
-        }
-        if start < ids.len() {
-            let text = self.decoder.push(&ids[start..])?;
-            self.text(text, &mut events);
-        }
-        Ok(events)
+impl Grammar for Gemma4Grammar {
+    fn is_control(&self, id: u32) -> bool {
+        self.tokens.ids().contains(&id)
     }
-
-    fn finish(&mut self, _reason: FinishReason) -> Result<Vec<Event>, Error> {
-        if self.finished {
-            return Ok(Vec::new());
+    fn ended(&self) -> bool {
+        self.state == State::Ended
+    }
+    fn text(&mut self, text: String, events: &mut Vec<Event>) -> Result<(), Error> {
+        if !text.is_empty() {
+            match self.state {
+                State::Content => events.push(Event::TextDelta { delta: text }),
+                State::Reasoning => events.push(Event::ReasoningDelta { delta: text }),
+                State::Tool => self.tool.extend(text.chars().map(values::Character::Text)),
+                State::ChannelHeader | State::TurnHeader => {
+                    self.header.push_str(&text);
+                    if let Some((_, body)) = self.header.split_once('\n') {
+                        let body = body.to_owned();
+                        self.header.clear();
+                        self.state = if self.state == State::ChannelHeader {
+                            State::Reasoning
+                        } else {
+                            State::Content
+                        };
+                        self.text(body, events)?;
+                    }
+                }
+                State::ToolResponse | State::Ended => {}
+            }
         }
-        let mut events = Vec::new();
-        self.close(&mut events)?;
+        Ok(())
+    }
+    fn control(&mut self, id: u32, events: &mut Vec<Event>) -> Result<(), Error> {
+        let t = self.tokens;
+        if id == t.escape {
+            if self.state == State::Tool {
+                self.tool.push(values::Character::Quote);
+            }
+        } else if id == t.tool_call_end {
+            if self.state == State::Tool {
+                let (name, arguments) = values::parse_call(&self.tool)?;
+                emit_tool(&mut self.tool_index, name, arguments.to_string(), events);
+            }
+            self.tool.clear();
+            self.state = State::Content;
+        } else if id == t.tool_call_start {
+            self.tool.clear();
+            self.state = State::Tool;
+        } else if id == t.channel_start {
+            self.header.clear();
+            self.state = State::ChannelHeader;
+        } else if id == t.channel_end {
+            self.header.clear();
+            self.state = State::Content;
+        } else if id == t.turn_start {
+            self.header.clear();
+            self.state = State::TurnHeader;
+        } else if id == t.tool_response_start {
+            self.state = State::ToolResponse;
+        } else if id == t.tool_response_end {
+            self.state = State::Content;
+        } else {
+            self.state = State::Ended;
+        }
+        Ok(())
+    }
+    fn finish(&mut self, _reason: FinishReason, _events: &mut Vec<Event>) -> Result<(), Error> {
         self.tool.clear();
-        self.finished = true;
-        Ok(events)
+        Ok(())
     }
 }

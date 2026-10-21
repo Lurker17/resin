@@ -7,8 +7,10 @@ pub mod inkling;
 mod json;
 pub mod lfm2;
 mod model;
+mod parser;
 mod prompt;
 pub mod qwen;
+mod render;
 mod tokenizer;
 
 use std::fmt;

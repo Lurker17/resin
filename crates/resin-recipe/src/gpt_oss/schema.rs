@@ -1,324 +1,169 @@
 // Adapted from OpenAI Harmony's JSON-schema tool formatter (Apache-2.0).
 // https://github.com/openai/harmony/blob/abd677f7ac962629c808197caa1feb9e3e95d2b0/src/encoding.rs
-// Preserve its exact whitespace, enum, default, and oneOf behavior: this text
-// becomes model input, so semantic TypeScript equivalence is insufficient.
+// Whitespace, enum defaults and oneOf comments are part of the model format.
 
-pub(super) fn schema_type(schema: &serde_json::Value, indent: &str) -> String {
-    // Helper to check if this schema is an enum
-    fn is_enum(schema: &serde_json::Value) -> bool {
-        schema
-            .get("enum")
-            .and_then(|e| e.as_array())
-            .is_some_and(|arr| !arr.is_empty())
+use serde_json::Value;
+
+fn string<'a>(schema: &'a Value, key: &str) -> Option<&'a str> {
+    schema.get(key).and_then(Value::as_str)
+}
+
+fn default_comment(schema: &Value, quote_enum: bool) -> Option<String> {
+    // Harmony quotes enum defaults in root unions, but not object properties.
+    let value = schema.get("default")?;
+    let has_enum = schema["enum"]
+        .as_array()
+        .is_some_and(|values| !values.is_empty());
+    let value = match value.as_str() {
+        Some(text) if !has_enum => format!("\"{text}\""),
+        Some(text) if !quote_enum => text.to_owned(),
+        _ => value.to_string(),
+    };
+    Some(format!("default: {value}"))
+}
+
+fn trailing(out: &mut String, description: Option<&str>, schema: &Value, quote_enum: bool) {
+    let mut comments = Vec::new();
+    if let Some(description) = description {
+        comments.push(description.to_owned());
     }
+    if let Some(default) = default_comment(schema, quote_enum) {
+        comments.push(default);
+    }
+    if !comments.is_empty() {
+        out.push_str(&format!(" // {}", comments.join(" ")));
+    }
+}
 
-    // Handle oneOf at the top level
-    if let Some(one_of) = schema.get("oneOf")
-        && let Some(arr) = one_of.as_array()
-    {
+fn nullable(schema: &Value, indent: &str) -> String {
+    let mut text = schema_type(schema, indent);
+    if schema["nullable"].as_bool() == Some(true) && !text.contains("null") {
+        text.push_str(" | null");
+    }
+    text
+}
+
+pub(super) fn schema_type(schema: &Value, indent: &str) -> String {
+    if let Some(variants) = schema["oneOf"].as_array() {
         let mut out = String::new();
-        let mut first = true;
-        for variant in arr {
-            if !first {
-                out.push('\n');
-                out.push_str(&format!("{indent} | "));
-            } else {
-                out.push_str(&format!("\n{indent} | "));
-                first = false;
-            }
-            let type_str = schema_type(variant, &format!("{indent}   "));
-            let mut type_str = type_str;
-            if variant
-                .get("nullable")
-                .and_then(|n| n.as_bool())
-                .unwrap_or(false)
-                && !type_str.contains("null")
-            {
-                type_str = format!("{type_str} | null");
-            }
-            out.push_str(&type_str);
-            // Add trailing comments (description, default)
-            let mut trailing_comments = Vec::new();
-            if let Some(desc) = variant.get("description")
-                && let Some(desc_str) = desc.as_str()
-            {
-                trailing_comments.push(desc_str.to_string());
-            }
-            if let Some(default) = variant.get("default") {
-                if default.is_string() && !is_enum(variant) {
-                    trailing_comments.push(format!("default: \"{}\"", default.as_str().unwrap()));
-                } else {
-                    trailing_comments.push(format!("default: {default}"));
-                }
-            }
-            if !trailing_comments.is_empty() {
-                out.push_str(&format!(" // {}", trailing_comments.join(" ")));
-            }
+        for variant in variants {
+            out.push_str(&format!(
+                "\n{indent} | {}",
+                nullable(variant, &format!("{indent}   "))
+            ));
+            trailing(&mut out, string(variant, "description"), variant, true);
         }
         return out;
     }
-    // Handle type as array (e.g., ["number", "string"])
-    if let Some(types) = schema.get("type").and_then(|v| v.as_array()) {
-        let mut type_strings = Vec::new();
-        for ty in types {
-            if let Some(ty_str) = ty.as_str() {
-                let mapped = match ty_str {
-                    "integer" => "number",
-                    other => other,
-                };
-                type_strings.push(mapped.to_string());
-            }
-        }
-        if !type_strings.is_empty() {
-            return type_strings.join(" | ");
+    if let Some(types) = schema["type"].as_array() {
+        let types: Vec<_> = types
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|kind| if kind == "integer" { "number" } else { kind })
+            .collect();
+        if !types.is_empty() {
+            return types.join(" | ");
         }
     }
-    // Handle type
-    if let Some(ty) = schema.get("type").and_then(|v| v.as_str()) {
-        match ty {
-            "object" => {
-                let mut out = String::new();
-                // Render object-level description as comment
-                if let Some(desc) = schema.get("description")
-                    && let Some(desc_str) = desc.as_str()
-                {
-                    out.push_str(&format!("{indent}// {desc_str}\n"));
-                }
-                out.push_str("{\n");
+    match string(schema, "type") {
+        Some("object") => object(schema, indent),
+        Some("string") => {
+            let variants: Vec<_> = schema["enum"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|value| format!("\"{value}\""))
+                .collect();
+            if variants.is_empty() {
+                "string".into()
+            } else {
+                variants.join(" | ")
+            }
+        }
+        Some("number" | "integer") => "number".into(),
+        Some("boolean") => "boolean".into(),
+        Some("array") => schema.get("items").map_or_else(
+            || "Array<any>".into(),
+            |items| format!("{}[]", schema_type(items, indent)),
+        ),
+        _ => "any".into(),
+    }
+}
 
-                if let Some(props) = schema.get("properties")
-                    && let Some(props_map) = props.as_object()
-                {
-                    // Determine required fields
-                    let mut required = std::collections::HashSet::new();
-                    if let Some(req) = schema.get("required")
-                        && let Some(req_arr) = req.as_array()
-                    {
-                        for r in req_arr {
-                            if let Some(s) = r.as_str() {
-                                required.insert(s);
-                            }
-                        }
-                    }
-                    for (key, val) in props_map {
-                        // Render title, description, and examples as comments
-                        if let Some(title) = val.get("title")
-                            && let Some(title_str) = title.as_str()
-                        {
-                            out.push_str(&format!("{indent}// {title_str}\n{indent}//\n"));
-                        }
-                        // Only render description here if not a oneOf property
-                        if val.get("oneOf").is_none()
-                            && let Some(desc) = val.get("description")
-                            && let Some(desc_str) = desc.as_str()
-                        {
-                            out.push_str(&format!("{indent}// {desc_str}\n"));
-                        }
-                        if let Some(examples) = val.get("examples")
-                            && let Some(arr) = examples.as_array()
-                            && !arr.is_empty()
-                        {
-                            out.push_str(&format!("{indent}// Examples:\n"));
-                            for ex in arr {
-                                if let Some(ex_str) = ex.as_str() {
-                                    out.push_str(&format!("{indent}// - \"{ex_str}\"\n"));
-                                }
-                            }
-                        }
-                        // Handle oneOf at the property level
-                        if let Some(one_of) = val.get("oneOf")
-                            && let Some(arr) = one_of.as_array()
-                        {
-                            // Deduplicate property-level description if it matches the first variant's description
-                            let mut property_desc: Option<&str> = None;
-                            if let Some(desc) = val.get("description")
-                                && let Some(desc_str) = desc.as_str()
-                            {
-                                property_desc = Some(desc_str);
-                            }
-                            let mut skip_property_desc = false;
-                            if let Some(desc_str) = property_desc
-                                && let Some(first_variant) = arr.first()
-                                && let Some(variant_desc) = first_variant.get("description")
-                                && let Some(variant_desc_str) = variant_desc.as_str()
-                                && desc_str == variant_desc_str
-                            {
-                                skip_property_desc = true;
-                            }
-                            // Add property-level comments above the property name if not skipped
-                            let mut rendered_property_desc_above = false;
-                            if !skip_property_desc && let Some(desc_str) = property_desc {
-                                out.push_str(&format!("{indent}// {desc_str}\n"));
-                                rendered_property_desc_above = true;
-                            }
-                            if let Some(default) = val.get("default") {
-                                if default.is_string() && !is_enum(val) {
-                                    out.push_str(&format!(
-                                        "{}// default: \"{}\"\n",
-                                        indent,
-                                        default.as_str().unwrap()
-                                    ));
-                                } else if default.is_string() {
-                                    out.push_str(&format!(
-                                        "{}// default: {}\n",
-                                        indent,
-                                        default.as_str().unwrap()
-                                    ));
-                                } else {
-                                    out.push_str(&format!("{indent}// default: {default}\n"));
-                                }
-                            }
-                            // Add property name and optional marker
-                            out.push_str(&format!(
-                                "{}{}{}:\n",
-                                indent,
-                                key,
-                                if required.contains(key.as_str()) {
-                                    ""
-                                } else {
-                                    "?"
-                                }
-                            ));
-                            // Render each variant
-                            for (i, variant) in arr.iter().enumerate() {
-                                out.push_str(&format!("{indent} | "));
-                                let type_str = schema_type(variant, &format!("{indent}   "));
-                                // Handle nullable in variant
-                                let mut type_str = type_str;
-                                if variant
-                                    .get("nullable")
-                                    .and_then(|n| n.as_bool())
-                                    .unwrap_or(false)
-                                    && !type_str.contains("null")
-                                {
-                                    type_str = format!("{type_str} | null");
-                                }
-                                out.push_str(&type_str);
-                                // Add variant-level comments after the type
-                                let mut trailing_comments = Vec::new();
-                                if i == 0 && rendered_property_desc_above {
-                                    // Do not add any description for the first variant if property-level description was rendered above
-                                } else if let Some(desc) = variant.get("description")
-                                    && let Some(desc_str) = desc.as_str()
-                                {
-                                    // Only render if not equal to property-level description
-                                    if Some(desc_str) != property_desc {
-                                        trailing_comments.push(desc_str.to_string());
-                                    }
-                                }
-                                if let Some(default) = variant.get("default") {
-                                    if default.is_string() && !is_enum(variant) {
-                                        trailing_comments.push(format!(
-                                            "default: \"{}\"",
-                                            default.as_str().unwrap()
-                                        ));
-                                    } else if default.is_string() {
-                                        trailing_comments.push(format!(
-                                            "default: {}",
-                                            default.as_str().unwrap()
-                                        ));
-                                    } else {
-                                        trailing_comments.push(format!("default: {default}"));
-                                    }
-                                }
-                                if !trailing_comments.is_empty() {
-                                    out.push_str(&format!(" // {}", trailing_comments.join(" ")));
-                                }
-                                out.push('\n');
-                            }
-                            out.push_str(&format!("{indent},\n"));
-                            continue;
-                        }
-                        // Normal property rendering
-                        out.push_str(&format!(
-                            "{}{}{}: ",
-                            indent,
-                            key,
-                            if required.contains(key.as_str()) {
-                                ""
-                            } else {
-                                "?"
-                            }
-                        ));
-                        // Handle nullable
-                        let mut type_str = schema_type(val, &format!("{indent}    "));
-                        if val
-                            .get("nullable")
-                            .and_then(|n| n.as_bool())
-                            .unwrap_or(false)
-                            && !type_str.contains("null")
-                        {
-                            type_str = format!("{type_str} | null");
-                        }
-                        out.push_str(&type_str);
-                        out.push(',');
-                        // Add default as comment if present (and not already handled)
-                        if val.get("oneOf").is_none()
-                            && let Some(default) = val.get("default")
-                        {
-                            if default.is_string() && !is_enum(val) {
-                                out.push_str(&format!(
-                                    " // default: \"{}\"",
-                                    default.as_str().unwrap()
-                                ));
-                            } else if default.is_string() {
-                                out.push_str(&format!(
-                                    " // default: {}",
-                                    default.as_str().unwrap()
-                                ));
-                            } else {
-                                out.push_str(&format!(" // default: {default}"));
-                            }
-                        }
-                        out.push('\n');
-                    }
-                }
-                out.push_str(&format!("{indent}}}"));
-                out
-            }
-            "string" => {
-                if let Some(enum_vals) = schema.get("enum")
-                    && let Some(arr) = enum_vals.as_array()
-                {
-                    let enums: Vec<String> = arr
-                        .iter()
-                        .filter_map(|v| v.as_str().map(|s| format!("\"{s}\"")))
-                        .collect();
-                    if !enums.is_empty() {
-                        return enums.join(" | ");
-                    }
-                }
-                "string".to_string()
-            }
-            "number" => "number".to_string(),
-            "integer" => "number".to_string(),
-            "boolean" => "boolean".to_string(),
-            "array" => {
-                if let Some(items) = schema.get("items") {
-                    format!("{}[]", schema_type(items, indent))
-                } else {
-                    "Array<any>".to_string()
-                }
-            }
-            _ => "any".to_string(),
-        }
-    } else if let Some(one_of) = schema.get("oneOf") {
-        // Defensive: already handled above, but just in case
-        if let Some(arr) = one_of.as_array() {
-            let mut out = String::new();
-            let mut first = true;
-            for variant in arr {
-                if !first {
-                    out.push_str("\n | ");
-                } else {
-                    first = false;
-                }
-                out.push_str(&schema_type(variant, indent));
-            }
-            return out;
-        }
-        "any".to_string()
-    } else {
-        "any".to_string()
+fn object(schema: &Value, indent: &str) -> String {
+    let mut out = String::new();
+    if let Some(description) = string(schema, "description") {
+        out.push_str(&format!("{indent}// {description}\n"));
     }
+    out.push_str("{\n");
+    let required: Vec<_> = schema["required"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    for (name, property) in schema["properties"].as_object().into_iter().flatten() {
+        if let Some(title) = string(property, "title") {
+            out.push_str(&format!("{indent}// {title}\n{indent}//\n"));
+        }
+        let description = string(property, "description");
+        if property.get("oneOf").is_none()
+            && let Some(description) = description
+        {
+            out.push_str(&format!("{indent}// {description}\n"));
+        }
+        if let Some(examples) = property["examples"]
+            .as_array()
+            .filter(|examples| !examples.is_empty())
+        {
+            out.push_str(&format!("{indent}// Examples:\n"));
+            for example in examples.iter().filter_map(Value::as_str) {
+                out.push_str(&format!("{indent}// - \"{example}\"\n"));
+            }
+        }
+        let optional = if required.contains(&name.as_str()) {
+            ""
+        } else {
+            "?"
+        };
+        if let Some(variants) = property["oneOf"].as_array() {
+            let own_description = description.filter(|description| {
+                Some(*description)
+                    != variants
+                        .first()
+                        .and_then(|variant| string(variant, "description"))
+            });
+            if let Some(description) = own_description {
+                out.push_str(&format!("{indent}// {description}\n"));
+            }
+            if let Some(default) = default_comment(property, false) {
+                out.push_str(&format!("{indent}// {default}\n"));
+            }
+            out.push_str(&format!("{indent}{name}{optional}:\n"));
+            for (index, variant) in variants.iter().enumerate() {
+                out.push_str(&format!(
+                    "{indent} | {}",
+                    nullable(variant, &format!("{indent}   "))
+                ));
+                let description = string(variant, "description").filter(|text| {
+                    Some(*text) != description && !(index == 0 && own_description.is_some())
+                });
+                trailing(&mut out, description, variant, false);
+                out.push('\n');
+            }
+            out.push_str(&format!("{indent},\n"));
+        } else {
+            out.push_str(&format!(
+                "{indent}{name}{optional}: {},",
+                nullable(property, &format!("{indent}    "))
+            ));
+            if property.get("oneOf").is_none() {
+                trailing(&mut out, None, property, false);
+            }
+            out.push('\n');
+        }
+    }
+    out.push_str(&format!("{indent}}}"));
+    out
 }

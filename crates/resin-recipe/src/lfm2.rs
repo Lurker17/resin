@@ -2,9 +2,10 @@
 
 mod literals;
 
+use crate::render::{function, list, messages, object_arguments, text_content};
 use serde_json::Value;
 
-use crate::{Decoder, Error, Event, FinishReason, Prompt, ResponseParser};
+use crate::{Decoder, Error, Event, FinishReason, Prompt};
 
 const BOS: &str = "<|startoftext|>";
 const START: &str = "<|im_start|>";
@@ -16,27 +17,20 @@ const TOOL_END: &str = "<|tool_call_end|>";
 
 /// Render the LFM2.5 checkpoint's chat template without running Python/Jinja.
 pub fn render(request: &Value) -> Result<Prompt, Error> {
-    let messages = request["messages"]
-        .as_array()
-        .ok_or_else(|| Error::new("messages must be an array"))?;
-    if messages.is_empty() {
-        return Err(Error::new("conversation must contain at least one message"));
-    }
+    let messages = messages(request, "LFM2")?;
     let mut prompt = Prompt::new();
     prompt.special(BOS);
     let (system, messages) = if messages[0]["role"] == "system" {
         (content(&messages[0]["content"])?, &messages[1..])
     } else {
-        (String::new(), messages.as_slice())
+        (String::new(), messages)
     };
-    let tools = request["tools"]
-        .as_array()
-        .filter(|tools| !tools.is_empty());
-    if !system.is_empty() || tools.is_some() {
+    let tools = list(&request["tools"]);
+    if !system.is_empty() || !tools.is_empty() {
         prompt.special(START);
         prompt.text("system\n");
         prompt.text(&system);
-        if let Some(tools) = tools {
+        if !tools.is_empty() {
             if !system.is_empty() {
                 prompt.text("\n");
             }
@@ -119,30 +113,12 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
 }
 
 fn content(value: &Value) -> Result<String, Error> {
-    match value {
-        Value::Null => Ok(String::new()),
-        Value::String(text) => Ok(text.clone()),
-        Value::Array(blocks) => {
-            let mut text = String::new();
-            for block in blocks {
-                match block["type"].as_str() {
-                    Some("text") => text.push_str(
-                        block["text"]
-                            .as_str()
-                            .ok_or_else(|| Error::new("text content must be a string"))?,
-                    ),
-                    Some("image") => {
-                        return Err(Error::new(
-                            "the stock LFM2 runner supports text content only",
-                        ));
-                    }
-                    _ => text.push_str(&crate::json::spaced(block)),
-                }
-            }
-            Ok(text)
-        }
-        _ => Err(Error::new("message content must be text or content blocks")),
-    }
+    text_content(value, |block| match block["type"].as_str() {
+        Some("image") => Err(Error::new(
+            "the stock LFM2 runner supports text content only",
+        )),
+        _ => Ok(crate::json::spaced(block)),
+    })
 }
 
 fn render_calls(prompt: &mut Prompt, calls: &[Value]) -> Result<(), Error> {
@@ -152,36 +128,21 @@ fn render_calls(prompt: &mut Prompt, calls: &[Value]) -> Result<(), Error> {
         if index > 0 {
             prompt.text(", ");
         }
-        let function = call.get("function").unwrap_or(call);
+        let function = function(call);
         let name = function["name"]
             .as_str()
             .ok_or_else(|| Error::new("tool call name must be a string"))?;
         prompt.text(name);
         prompt.text("(");
-        let arguments = &function["arguments"];
-        let decoded;
-        let arguments = if let Some(text) = arguments.as_str() {
-            decoded = serde_json::from_str(text)
-                .map_err(|_| Error::new("tool call arguments must be a JSON object"))?;
-            &decoded
-        } else {
-            arguments
-        };
-        let arguments = arguments
-            .as_object()
-            .ok_or_else(|| Error::new("tool call arguments must be a JSON object"))?;
-        for (index, (name, value)) in arguments.iter().enumerate() {
-            if index > 0 {
-                prompt.text(", ");
-            }
-            prompt.text(name);
-            prompt.text("=");
+        let arguments = object_arguments(&function["arguments"])?;
+        prompt.separated(arguments.iter(), ", ", |prompt, (name, value)| {
+            prompt.text(name).text("=");
             prompt.text(match value {
                 Value::String(text) => format!("'{text}'"),
                 Value::Object(_) => crate::json::spaced(value),
                 _ => literals::repr(value),
             });
-        }
+        });
         prompt.text(")");
     }
     prompt.text("]");
@@ -189,43 +150,20 @@ fn render_calls(prompt: &mut Prompt, calls: &[Value]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Control IDs used by LFM2.5; several are added tokens marked `special=false`
-/// by the upstream tokenizer, but still delimit this model's response format.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Lfm2Tokens {
-    pub message_start: u32,
-    pub message_end: u32,
-    pub thinking_start: u32,
-    pub thinking_end: u32,
-    pub tool_call_start: u32,
-    pub tool_call_end: u32,
-}
+use crate::parser::{Grammar, Parser, emit_tool, tokens};
 
-impl Lfm2Tokens {
-    fn ids(&self) -> [u32; 6] {
-        [
-            self.message_start,
-            self.message_end,
-            self.thinking_start,
-            self.thinking_end,
-            self.tool_call_start,
-            self.tool_call_end,
-        ]
-    }
-    pub fn validate(&self) -> Result<(), Error> {
-        let ids = self.ids();
-        for (index, id) in ids.iter().enumerate() {
-            if ids[..index].contains(id) {
-                return Err(Error::new(
-                    "LFM2 response markers must have distinct token IDs",
-                ));
-            }
-        }
-        Ok(())
-    }
-}
+// Think/tool delimiters are added tokens marked `special=false` upstream.
+// Their actual IDs still delimit LFM2's grammar; literal spellings do not.
+tokens! { Lfm2Tokens {
+    message_start => ["<|im_start|>"],
+    message_end => ["<|im_end|>"],
+    thinking_start => ["<think>"],
+    thinking_end => ["</think>"],
+    tool_call_start => ["<|tool_call_start|>"],
+    tool_call_end => ["<|tool_call_end|>"],
+}}
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Stage {
     Content,
     Reasoning,
@@ -234,14 +172,13 @@ enum Stage {
     Done,
 }
 
-/// Parse LFM2.5 output incrementally, buffering only an unfinished tool block.
-pub struct Lfm2Parser {
+/// LFM2.5 reasoning and literal tool calls, buffering one unfinished tool block.
+pub type Lfm2Parser = Parser<Lfm2Grammar>;
+pub struct Lfm2Grammar {
     tokens: Lfm2Tokens,
-    decoder: Box<dyn Decoder>,
     stage: Stage,
     tool: String,
     tool_index: usize,
-    finished: bool,
 }
 
 impl Lfm2Parser {
@@ -251,43 +188,40 @@ impl Lfm2Parser {
         _prompt_ids: &[u32],
     ) -> Result<Self, Error> {
         tokens.validate()?;
-        Ok(Self {
-            tokens,
+        Ok(Self::with_grammar(
+            Lfm2Grammar {
+                tokens,
+                stage: Stage::Content,
+                tool: String::new(),
+                tool_index: 0,
+            },
             decoder,
-            stage: Stage::Content,
-            tool: String::new(),
-            tool_index: 0,
-            finished: false,
-        })
+        ))
     }
+}
 
-    fn text(&mut self, text: String, events: &mut Vec<Event>) {
-        if text.is_empty() {
-            return;
-        }
-        match self.stage {
-            Stage::Content => events.push(Event::TextDelta { delta: text }),
-            Stage::Reasoning => events.push(Event::ReasoningDelta { delta: text }),
-            Stage::Tool => self.tool.push_str(&text),
-            Stage::Header => {
-                if let Some((_, content)) = text.split_once('\n') {
-                    self.stage = Stage::Content;
-                    self.text(content.to_owned(), events);
+impl Grammar for Lfm2Grammar {
+    fn is_control(&self, id: u32) -> bool {
+        self.tokens.ids().contains(&id)
+    }
+    fn text(&mut self, text: String, events: &mut Vec<Event>) -> Result<(), Error> {
+        if !text.is_empty() {
+            match self.stage {
+                Stage::Content => events.push(Event::TextDelta { delta: text }),
+                Stage::Reasoning => events.push(Event::ReasoningDelta { delta: text }),
+                Stage::Tool => self.tool.push_str(&text),
+                Stage::Header => {
+                    if let Some((_, content)) = text.split_once('\n') {
+                        self.stage = Stage::Content;
+                        self.text(content.to_owned(), events)?;
+                    }
                 }
+                Stage::Done => {}
             }
-            Stage::Done => {}
         }
-    }
-
-    fn close(&mut self, events: &mut Vec<Event>) -> Result<(), Error> {
-        let text = self.decoder.finish()?;
-        self.text(text, events);
-        self.decoder.reset();
         Ok(())
     }
-
     fn control(&mut self, id: u32, events: &mut Vec<Event>) -> Result<(), Error> {
-        self.close(events)?;
         if id == self.tokens.tool_call_end {
             if self.stage != Stage::Tool {
                 return Err(Error::new(
@@ -295,17 +229,7 @@ impl Lfm2Parser {
                 ));
             }
             for (name, arguments) in literals::parse_calls(&self.tool)? {
-                let index = self.tool_index;
-                events.push(Event::ToolCallStart {
-                    index,
-                    id: format!("call_{index}"),
-                    name,
-                });
-                events.push(Event::ToolCallArgumentsDelta {
-                    index,
-                    delta: arguments.to_string(),
-                });
-                self.tool_index += 1;
+                emit_tool(&mut self.tool_index, name, arguments.to_string(), events);
             }
             self.tool.clear();
             self.stage = Stage::Content;
@@ -324,35 +248,8 @@ impl Lfm2Parser {
         }
         Ok(())
     }
-}
-
-impl ResponseParser for Lfm2Parser {
-    fn feed(&mut self, ids: &[u32]) -> Result<Vec<Event>, Error> {
-        if self.finished {
-            return Err(Error::new("cannot feed an LFM2 parser after finish"));
-        }
-        let mut events = Vec::new();
-        let mut start = 0;
-        for (index, &id) in ids.iter().enumerate() {
-            if self.tokens.ids().contains(&id) {
-                let text = self.decoder.push(&ids[start..index])?;
-                self.text(text, &mut events);
-                self.control(id, &mut events)?;
-                start = index + 1;
-            }
-        }
-        let text = self.decoder.push(&ids[start..])?;
-        self.text(text, &mut events);
-        Ok(events)
-    }
-    fn finish(&mut self, _reason: FinishReason) -> Result<Vec<Event>, Error> {
-        if self.finished {
-            return Ok(Vec::new());
-        }
-        let mut events = Vec::new();
-        self.close(&mut events)?;
+    fn finish(&mut self, _reason: FinishReason, _events: &mut Vec<Event>) -> Result<(), Error> {
         self.tool.clear();
-        self.finished = true;
-        Ok(events)
+        Ok(())
     }
 }

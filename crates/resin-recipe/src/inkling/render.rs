@@ -1,25 +1,12 @@
 //! Inkling's pinned template; user text never becomes a control token.
+use crate::render::{function, object_arguments, option, value_or};
 use crate::{Error, Prompt};
-use serde_json::{Map, Value};
+use serde_json::{Value, json};
 
-fn sorted(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut entries: Vec<_> = map.iter().collect();
-            entries.sort_by_key(|(key, _)| *key);
-            Value::Object(
-                entries
-                    .into_iter()
-                    .map(|(key, value)| (key.clone(), sorted(value)))
-                    .collect(),
-            )
-        }
-        Value::Array(values) => Value::Array(values.iter().map(sorted).collect()),
-        _ => value.clone(),
-    }
-}
 fn compact(value: &Value) -> String {
-    crate::json::compact(&sorted(value))
+    let mut value = value.clone();
+    value.sort_all_objects();
+    crate::json::compact(&value)
 }
 fn block(prompt: &mut Prompt, role: &str, kind: &str, text: &str) {
     prompt
@@ -29,14 +16,7 @@ fn block(prompt: &mut Prompt, role: &str, kind: &str, text: &str) {
         .special("<|end_message|>");
 }
 fn effort(request: &Value) -> Result<String, Error> {
-    let value = request
-        .get("reasoning_effort")
-        .filter(|v| !v.is_null())
-        .or_else(|| {
-            request["extra"]
-                .get("reasoning_effort")
-                .filter(|v| !v.is_null())
-        });
+    let value = option(request, "reasoning_effort");
     let num = match value {
         None => 0.9,
         Some(Value::String(value)) => match value.trim() {
@@ -81,33 +61,13 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
         let specs: Vec<Value> = tools
             .iter()
             .map(|tool| {
-                let function = tool.get("function").unwrap_or(tool);
-                let mut spec = Map::new();
-                spec.insert(
-                    "description".into(),
-                    function
-                        .get("description")
-                        .filter(|v| !v.is_null())
-                        .cloned()
-                        .unwrap_or(Value::String(String::new())),
-                );
-                spec.insert("name".into(), function["name"].clone());
-                spec.insert(
-                    "parameters".into(),
-                    function
-                        .get("parameters")
-                        .filter(|v| !v.is_null())
-                        .cloned()
-                        .unwrap_or(Value::Object(Map::new())),
-                );
-                spec.insert(
-                    "type".into(),
-                    tool.get("type")
-                        .filter(|v| !v.is_null())
-                        .cloned()
-                        .unwrap_or(Value::String("function".into())),
-                );
-                Value::Object(spec)
+                let function = function(tool);
+                json!({
+                    "description": value_or(&function["description"], json!("")),
+                    "name": function["name"],
+                    "parameters": value_or(&function["parameters"], json!({})),
+                    "type": value_or(&tool["type"], json!("function")),
+                })
             })
             .collect();
         prompt
@@ -207,15 +167,8 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                 let name = function["name"]
                     .as_str()
                     .ok_or_else(|| Error::new("tool call function name must be a string"))?;
-                let args = match &function["arguments"] {
-                    Value::Null => Value::Object(Map::new()),
-                    Value::String(text) => serde_json::from_str(text)
-                        .map_err(|e| Error::new(format!("invalid tool arguments: {e}")))?,
-                    value => value.clone(),
-                };
-                if !args.is_object() {
-                    return Err(Error::new("tool call arguments must be an object"));
-                }
+                let args = value_or(&function["arguments"], json!({}));
+                let args = object_arguments(&args)?;
                 prompt
                     .special(token)
                     .text(name)
@@ -223,7 +176,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                     .text(format!(
                         "{{\"name\":{},\"args\":{}}}",
                         compact(&Value::String(name.into())),
-                        compact(&args)
+                        compact(&Value::Object(args.into_owned()))
                     ))
                     .special("<|end_message|>");
             }

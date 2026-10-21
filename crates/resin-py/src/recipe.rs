@@ -245,20 +245,11 @@ fn recipe_error(error: Error) -> PyErr {
 }
 
 impl RecipeTokenizer {
-    fn encoder(&self) -> Box<dyn Encoder> {
+    fn encoder(&self) -> Arc<dyn Encoder> {
         match &self.source {
-            TokenizerSource::Native(_, encoder) => Box::new(SharedEncoder(encoder.clone())),
-            TokenizerSource::Python { object, .. } => Box::new(PythonEncoder(object.clone())),
+            TokenizerSource::Native(_, encoder) => encoder.clone(),
+            TokenizerSource::Python { object, .. } => Arc::new(PythonEncoder(object.clone())),
         }
-    }
-}
-struct SharedEncoder(Arc<TokenizerEncoder>);
-impl Encoder for SharedEncoder {
-    fn encode_text(&self, text: &str) -> Result<Vec<u32>, Error> {
-        self.0.encode_text(text)
-    }
-    fn special_id(&self, spelling: &str) -> Result<u32, Error> {
-        self.0.special_id(spelling)
     }
 }
 struct PythonEncoder(Arc<Py<PyAny>>);
@@ -348,7 +339,7 @@ impl NativeResponseParser {
 #[pyclass(frozen, module = "resin._resin")]
 pub(crate) struct ModelRecipe {
     tokenizer: RecipeTokenizer,
-    encoder: Box<dyn Encoder>,
+    encoder: Arc<dyn Encoder>,
     model: ModelFormat,
     options: Value,
 }

@@ -3,64 +3,11 @@
 mod parser;
 pub use parser::{QwenParser, QwenTokens};
 
-use crate::{Error, Prompt, PromptSpan};
+use crate::{
+    Error, Prompt,
+    render::{function, list, messages, option, whitespace},
+};
 use serde_json::Value;
-
-fn option<'a>(request: &'a Value, key: &str) -> Option<&'a Value> {
-    request
-        .get(key)
-        .filter(|value| !value.is_null())
-        .or_else(|| request.get("extra").and_then(|extra| extra.get(key)))
-}
-
-fn whitespace(c: char) -> bool {
-    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
-}
-
-fn append(prompt: &mut Prompt, content: Prompt) {
-    for span in content.spans {
-        match span {
-            PromptSpan::Text(text) => {
-                prompt.text(text);
-            }
-            PromptSpan::Special(token) => {
-                prompt.special(token);
-            }
-        }
-    }
-}
-
-fn trim(mut prompt: Prompt) -> Prompt {
-    if let Some(PromptSpan::Text(first)) = prompt.spans.first_mut() {
-        *first = first.trim_start_matches(whitespace).to_owned();
-    }
-    if let Some(PromptSpan::Text(last)) = prompt.spans.last_mut() {
-        *last = last.trim_end_matches(whitespace).to_owned();
-    }
-    prompt
-}
-
-fn slice(prompt: &Prompt, start: usize, end: usize) -> Prompt {
-    let mut result = Prompt::new();
-    let mut offset = 0;
-    for span in &prompt.spans {
-        let spelling = match span {
-            PromptSpan::Text(text) | PromptSpan::Special(text) => text,
-        };
-        let next = offset + spelling.len();
-        let first = start.max(offset);
-        let last = end.min(next);
-        if first < last {
-            if matches!(span, PromptSpan::Special(_)) && first == offset && last == next {
-                result.special(spelling);
-            } else {
-                result.text(&spelling[first - offset..last - offset]);
-            }
-        }
-        offset = next;
-    }
-    result
-}
 
 #[derive(Default)]
 struct Vision {
@@ -119,7 +66,7 @@ impl Vision {
             }
             _ => return Err(Error::new("unexpected Qwen content type")),
         }
-        Ok(trim(prompt))
+        Ok(prompt.trim())
     }
 }
 
@@ -150,11 +97,7 @@ fn tool_instructions(prompt: &mut Prompt) {
 /// Match the pinned 3.8 template; `extra.recipe_variant="qwen3_5"` selects
 /// 3.5's historical reasoning retention and Python scalar parameter spelling.
 pub fn render(request: &Value) -> Result<Prompt, Error> {
-    let messages = request
-        .get("messages")
-        .and_then(Value::as_array)
-        .filter(|messages| !messages.is_empty())
-        .ok_or_else(|| Error::new("Qwen requires nonempty messages"))?;
+    let messages = messages(request, "Qwen")?;
     let variant35 = option(request, "recipe_variant").and_then(Value::as_str) == Some("qwen3_5");
     let thinking = option(request, "enable_thinking")
         .and_then(Value::as_bool)
@@ -183,11 +126,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
             }
         }
     };
-    let tools = request
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
+    let tools = list(&request["tools"]);
     let first_system = messages[0].get("role").and_then(Value::as_str) == Some("system");
     let system = if first_system {
         Vision::default().content(messages[0].get("content"), true)?
@@ -217,7 +156,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                 prompt.text("\n\n");
             }
         }
-        append(&mut prompt, system);
+        prompt.append(system);
         end(&mut prompt);
     }
     let mut last_query = None;
@@ -251,7 +190,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
             }
             "user" => {
                 start(&mut prompt, "user");
-                append(&mut prompt, body);
+                prompt.append(body);
                 end(&mut prompt);
             }
             "assistant" => {
@@ -271,32 +210,25 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                             .map_or(0, |index| index + "<think>".len());
                         let thinking = before[first..].trim_start_matches(whitespace);
                         let begin = before.len() - thinking.len();
-                        reasoning = slice(
-                            &body,
-                            begin,
-                            begin + thinking.trim_end_matches(whitespace).len(),
-                        );
+                        reasoning =
+                            body.slice(begin..begin + thinking.trim_end_matches(whitespace).len());
                         let last = text.rfind("</think>").unwrap() + "</think>".len();
                         let suffix = text[last..].trim_start_matches('\n');
                         let begin = text.len() - suffix.len();
-                        body = slice(&body, begin, text.len());
+                        body = body.slice(begin..text.len());
                     }
                 }
                 let has_text = !body.rendered_text().is_empty();
                 start(&mut prompt, "assistant");
                 if preserve || index > last_query {
                     prompt.special("<think>").text("\n");
-                    append(&mut prompt, reasoning);
+                    prompt.append(reasoning);
                     prompt.text("\n").special("</think>").text("\n\n");
                 }
-                append(&mut prompt, body);
-                let calls = item
-                    .get("tool_calls")
-                    .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
+                prompt.append(body);
+                let calls = list(&item["tool_calls"]);
                 for (call_index, call) in calls.iter().enumerate() {
-                    let function = call.get("function").unwrap_or(call);
+                    let function = function(call);
                     if call_index > 0 {
                         prompt.text("\n");
                     } else if has_text {
@@ -347,7 +279,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                     prompt.special("<|im_start|>").text("user");
                 }
                 prompt.text("\n").special("<tool_response>").text("\n");
-                append(&mut prompt, body);
+                prompt.append(body);
                 prompt.text("\n").special("</tool_response>");
                 if index + 1 == messages.len()
                     || messages[index + 1].get("role").and_then(Value::as_str) != Some("tool")

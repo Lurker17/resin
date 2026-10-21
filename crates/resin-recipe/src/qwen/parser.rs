@@ -1,39 +1,12 @@
-use crate::{Decoder, Error, Event, FinishReason, ResponseParser};
+use crate::parser::{Grammar, Parser, emit_tool, tokens};
+use crate::{Decoder, Error, Event, FinishReason};
 use serde_json::{Map, Value};
 
-#[derive(Clone, Copy, Debug)]
-pub struct QwenTokens {
-    pub im_end: u32,
-    pub endoftext: u32,
-    pub think: u32,
-    pub think_end: u32,
-    pub tool_call: u32,
-    pub tool_call_end: u32,
-}
-
-impl QwenTokens {
-    fn ids(self) -> [u32; 6] {
-        [
-            self.im_end,
-            self.endoftext,
-            self.think,
-            self.think_end,
-            self.tool_call,
-            self.tool_call_end,
-        ]
-    }
-    pub fn validate(self) -> Result<(), Error> {
-        let ids = self.ids();
-        if ids
-            .iter()
-            .enumerate()
-            .any(|(index, id)| ids[..index].contains(id))
-        {
-            return Err(Error::new("Qwen markers must have distinct token IDs"));
-        }
-        Ok(())
-    }
-}
+tokens! { QwenTokens {
+    im_end => ["<|im_end|>"], endoftext => ["<|endoftext|>"],
+    think => ["<think>"], think_end => ["</think>"],
+    tool_call => ["<tool_call>"], tool_call_end => ["</tool_call>"],
+}}
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -71,16 +44,15 @@ impl Trim {
 }
 
 /// Qwen's token-delimited reasoning and schema-aware XML tool calls.
-pub struct QwenParser {
+pub type QwenParser = Parser<QwenGrammar>;
+pub struct QwenGrammar {
     tokens: QwenTokens,
-    decoder: Box<dyn Decoder>,
     state: State,
     trim: Trim,
     tool_text: String,
     tools: Vec<Value>,
     tool_index: usize,
     ended: bool,
-    finished: bool,
 }
 
 impl QwenParser {
@@ -94,59 +66,36 @@ impl QwenParser {
         let reasoning = prompt_ids
             .iter()
             .rev()
-            .find_map(|id| {
-                if *id == tokens.think {
+            .find_map(|&id| {
+                if id == tokens.think {
                     Some(true)
-                } else if *id == tokens.think_end {
+                } else if id == tokens.think_end {
                     Some(false)
                 } else {
                     None
                 }
             })
             .unwrap_or(false);
-        Ok(Self {
-            tokens,
-            decoder,
-            state: if reasoning {
-                State::Reasoning
-            } else {
-                State::Text
+        Ok(Self::with_grammar(
+            QwenGrammar {
+                tokens,
+                state: if reasoning {
+                    State::Reasoning
+                } else {
+                    State::Text
+                },
+                trim: Trim::default(),
+                tool_text: String::new(),
+                tools: tools.as_array().cloned().unwrap_or_default(),
+                tool_index: 0,
+                ended: false,
             },
-            trim: Trim::default(),
-            tool_text: String::new(),
-            tools: tools.as_array().cloned().unwrap_or_default(),
-            tool_index: 0,
-            ended: false,
-            finished: false,
-        })
+            decoder,
+        ))
     }
+}
 
-    fn text(&mut self, text: String, events: &mut Vec<Event>) {
-        if self.state == State::Tool {
-            self.tool_text.push_str(&text);
-            return;
-        }
-        if self.state == State::BetweenTools {
-            return;
-        }
-        let delta = self.trim.push(&text);
-        if delta.is_empty() {
-            return;
-        }
-        events.push(if self.state == State::Reasoning {
-            Event::ReasoningDelta { delta }
-        } else {
-            Event::TextDelta { delta }
-        });
-    }
-
-    fn flush(&mut self, events: &mut Vec<Event>) -> Result<(), Error> {
-        let text = self.decoder.finish()?;
-        self.text(text, events);
-        self.decoder.reset();
-        Ok(())
-    }
-
+impl QwenGrammar {
     fn emit_tool(&mut self, events: &mut Vec<Event>) {
         let Some((_, function)) = self.tool_text.split_once("<function=") else {
             return;
@@ -188,71 +137,62 @@ impl QwenParser {
             arguments.insert(key.to_owned(), value);
             tail = rest;
         }
-        let index = self.tool_index;
-        events.push(Event::ToolCallStart {
-            index,
-            id: format!("call_{index}"),
-            name: name.to_owned(),
-        });
-        events.push(Event::ToolCallArgumentsDelta {
-            index,
-            delta: Value::Object(arguments).to_string(),
-        });
-        self.tool_index += 1;
+        emit_tool(
+            &mut self.tool_index,
+            name,
+            Value::Object(arguments).to_string(),
+            events,
+        );
     }
 }
 
-impl ResponseParser for QwenParser {
-    fn feed(&mut self, ids: &[u32]) -> Result<Vec<Event>, Error> {
-        if self.finished {
-            return Err(Error::new("cannot feed a Qwen parser after finish"));
-        }
-        if self.ended {
-            return Ok(Vec::new());
-        }
-        let mut events = Vec::new();
-        let mut start = 0;
-        for (index, &id) in ids.iter().enumerate() {
-            if !self.tokens.ids().contains(&id) {
-                continue;
-            }
-            let text = self.decoder.push(&ids[start..index])?;
-            self.text(text, &mut events);
-            self.flush(&mut events)?;
-            if id == self.tokens.im_end || id == self.tokens.endoftext {
-                self.ended = true;
-                return Ok(events);
-            }
-            if id == self.tokens.tool_call {
-                self.state = State::Tool;
-                self.tool_text.clear();
-            } else if id == self.tokens.tool_call_end {
-                if self.state == State::Tool {
-                    self.emit_tool(&mut events);
-                }
-                self.tool_text.clear();
-                self.state = State::BetweenTools;
-            } else if id == self.tokens.think {
-                self.state = State::Reasoning;
-            } else if id == self.tokens.think_end {
-                self.state = State::Text;
-            }
-            self.trim = Trim::default();
-            start = index + 1;
-        }
-        let text = self.decoder.push(&ids[start..])?;
-        self.text(text, &mut events);
-        Ok(events)
+impl Grammar for QwenGrammar {
+    fn is_control(&self, id: u32) -> bool {
+        self.tokens.ids().contains(&id)
     }
-
-    fn finish(&mut self, _reason: FinishReason) -> Result<Vec<Event>, Error> {
-        if self.finished {
-            return Ok(Vec::new());
+    fn ended(&self) -> bool {
+        self.ended
+    }
+    fn text(&mut self, text: String, events: &mut Vec<Event>) -> Result<(), Error> {
+        if self.state == State::Tool {
+            self.tool_text.push_str(&text);
+            return Ok(());
         }
-        let mut events = Vec::new();
-        self.flush(&mut events)?;
+        if self.state == State::BetweenTools {
+            return Ok(());
+        }
+        let delta = self.trim.push(&text);
+        if !delta.is_empty() {
+            events.push(if self.state == State::Reasoning {
+                Event::ReasoningDelta { delta }
+            } else {
+                Event::TextDelta { delta }
+            });
+        }
+        Ok(())
+    }
+    fn control(&mut self, id: u32, events: &mut Vec<Event>) -> Result<(), Error> {
+        if id == self.tokens.im_end || id == self.tokens.endoftext {
+            self.ended = true;
+        } else if id == self.tokens.tool_call {
+            self.state = State::Tool;
+            self.tool_text.clear();
+        } else if id == self.tokens.tool_call_end {
+            if self.state == State::Tool {
+                self.emit_tool(events);
+            }
+            self.tool_text.clear();
+            self.state = State::BetweenTools;
+        } else if id == self.tokens.think {
+            self.state = State::Reasoning;
+        } else if id == self.tokens.think_end {
+            self.state = State::Text;
+        }
+        self.trim = Trim::default();
+        Ok(())
+    }
+    fn finish(&mut self, _reason: FinishReason, _events: &mut Vec<Event>) -> Result<(), Error> {
         self.tool_text.clear();
-        self.finished = true;
-        Ok(events)
+        Ok(())
     }
 }

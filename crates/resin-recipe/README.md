@@ -4,6 +4,12 @@ Stock model conversation formats, independent of Python, HTTP and GPU execution.
 `ModelFormat` selects a matching renderer, incremental parser and stop markers
 for GPT-OSS, DeepSeek V4, Inkling, Qwen3.5/3.8, Gemma4 or LFM2.5.
 
+Model code describes format rules. Shared `Parser<G>` owns token batching,
+decoder boundaries, EOS handling and finalization; each grammar handles only
+text and control transitions. A small token declaration supplies spellings,
+aliases, lookup and validation once. Renderers share request/tool conventions
+and span operations while retaining their model-specific ordering and framing.
+
 A renderer produces a `Prompt`: ordinary text plus explicit control-token spans.
 Adjacent text coalesces before encoding, preserving BPE boundaries. A prepared
 `TokenizerEncoder` shares the tokenizer and encodes ordinary marker spellings as

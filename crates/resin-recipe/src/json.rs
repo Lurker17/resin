@@ -1,133 +1,92 @@
-//! Python-compatible JSON spacing and float formatting for model prompts.
+//! Python-compatible JSON separators and float spelling for model prompts.
 
-use serde::Serialize;
-use serde_json::{
-    Value,
-    ser::{CompactFormatter, Formatter},
-};
-
-struct PythonFormatter {
-    spaced: bool,
-}
-
-impl Formatter for PythonFormatter {
-    fn begin_array_value<W: ?Sized + std::io::Write>(
-        &mut self,
-        writer: &mut W,
-        first: bool,
-    ) -> std::io::Result<()> {
-        writer.write_all(if first {
-            b""
-        } else if self.spaced {
-            b", "
-        } else {
-            b","
-        })
-    }
-    fn begin_object_key<W: ?Sized + std::io::Write>(
-        &mut self,
-        writer: &mut W,
-        first: bool,
-    ) -> std::io::Result<()> {
-        writer.write_all(if first {
-            b""
-        } else if self.spaced {
-            b", "
-        } else {
-            b","
-        })
-    }
-    fn begin_object_value<W: ?Sized + std::io::Write>(
-        &mut self,
-        writer: &mut W,
-    ) -> std::io::Result<()> {
-        writer.write_all(if self.spaced { b": " } else { b":" })
-    }
-
-    fn write_f64<W: ?Sized + std::io::Write>(
-        &mut self,
-        writer: &mut W,
-        value: f64,
-    ) -> std::io::Result<()> {
-        let mut compact = Vec::new();
-        CompactFormatter.write_f64(&mut compact, value)?;
-        let compact = String::from_utf8(compact).expect("float formatter emits ASCII");
-        let (sign, unsigned) = compact
-            .strip_prefix('-')
-            .map_or(("", compact.as_str()), |text| ("-", text));
-        let (mantissa, power) = unsigned
-            .split_once('e')
-            .map_or((unsigned, 0), |(mantissa, power)| {
-                (mantissa, power.parse::<i32>().unwrap())
-            });
-        let decimal = mantissa.find('.').unwrap_or(mantissa.len()) as i32;
-        let digits: String = mantissa
-            .chars()
-            .filter(|&character| character != '.')
-            .collect();
-        let zeros = digits.bytes().take_while(|&byte| byte == b'0').count();
-        if zeros == digits.len() {
-            return writer.write_all(if sign.is_empty() { b"0.0" } else { b"-0.0" });
-        }
-        let digits = digits[zeros..].trim_end_matches('0');
-        let exponent = decimal + power - zeros as i32 - 1;
-        writer.write_all(sign.as_bytes())?;
-        if !(-4..16).contains(&exponent) {
-            writer.write_all(&digits.as_bytes()[..1])?;
-            if digits.len() > 1 {
-                writer.write_all(b".")?;
-                writer.write_all(&digits.as_bytes()[1..])?;
-            }
-            write!(
-                writer,
-                "e{}{exponent:02}",
-                if exponent < 0 { "-" } else { "+" },
-                exponent = exponent.abs()
-            )
-        } else if exponent < 0 {
-            writer.write_all(b"0.")?;
-            for _ in 0..-exponent - 1 {
-                writer.write_all(b"0")?;
-            }
-            writer.write_all(digits.as_bytes())
-        } else {
-            let whole = exponent as usize + 1;
-            if whole < digits.len() {
-                writer.write_all(&digits.as_bytes()[..whole])?;
-                writer.write_all(b".")?;
-                writer.write_all(&digits.as_bytes()[whole..])
-            } else {
-                writer.write_all(digits.as_bytes())?;
-                for _ in digits.len()..whole {
-                    writer.write_all(b"0")?;
-                }
-                writer.write_all(b".0")
-            }
-        }
-    }
-}
+use serde_json::{Number, Value};
 
 pub(crate) fn spaced(value: &Value) -> String {
-    format(value, true)
+    format(value, ", ", ": ")
 }
 pub(crate) fn compact(value: &Value) -> String {
-    format(value, false)
+    format(value, ",", ":")
 }
-fn format(value: &Value, spaced: bool) -> String {
-    let mut bytes = Vec::new();
-    value
-        .serialize(&mut serde_json::Serializer::with_formatter(
-            &mut bytes,
-            PythonFormatter { spaced },
-        ))
-        .expect("JSON values serialize to memory");
-    String::from_utf8(bytes).expect("JSON serialization produces UTF-8")
+
+fn format(value: &Value, comma: &str, colon: &str) -> String {
+    fn write(out: &mut String, value: &Value, comma: &str, colon: &str) {
+        match value {
+            Value::Array(values) => {
+                out.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        out.push_str(comma);
+                    }
+                    write(out, value, comma, colon);
+                }
+                out.push(']');
+            }
+            Value::Object(values) => {
+                out.push('{');
+                for (index, (key, value)) in values.iter().enumerate() {
+                    if index != 0 {
+                        out.push_str(comma);
+                    }
+                    out.push_str(&serde_json::to_string(key).unwrap());
+                    out.push_str(colon);
+                    write(out, value, comma, colon);
+                }
+                out.push('}');
+            }
+            Value::Number(number) if number.is_f64() => out.push_str(&float(number)),
+            _ => out.push_str(&value.to_string()),
+        }
+    }
+    let mut out = String::new();
+    write(&mut out, value, comma, colon);
+    out
+}
+
+fn float(number: &Number) -> String {
+    // Keep serde's correctly rounded shortest digits; only Python's notation
+    // thresholds and signed, zero-padded exponent differ. Rust Debug rounds
+    // some shortest-decimal ties differently, so cannot replace this step.
+    let compact = number.to_string();
+    let (sign, unsigned) = compact
+        .strip_prefix('-')
+        .map_or(("", compact.as_str()), |text| ("-", text));
+    let (mantissa, power) = unsigned
+        .split_once('e')
+        .map_or((unsigned, 0), |(mantissa, power)| {
+            (mantissa, power.parse::<i32>().unwrap())
+        });
+    let decimal = mantissa.find('.').unwrap_or(mantissa.len()) as i32;
+    let digits = mantissa.replace('.', "");
+    let zeros = digits.len() - digits.trim_start_matches('0').len();
+    if zeros == digits.len() {
+        return format!("{sign}0.0");
+    }
+    let digits = digits[zeros..].trim_end_matches('0');
+    let exponent = decimal + power - zeros as i32 - 1;
+    let body = if !(-4..16).contains(&exponent) {
+        let tail = if digits.len() == 1 {
+            String::new()
+        } else {
+            format!(".{}", &digits[1..])
+        };
+        format!("{}{tail}e{exponent:+03}", &digits[..1])
+    } else if exponent < 0 {
+        format!("0.{}{digits}", "0".repeat((-exponent - 1) as usize))
+    } else {
+        let whole = exponent as usize + 1;
+        if whole < digits.len() {
+            format!("{}.{}", &digits[..whole], &digits[whole..])
+        } else {
+            format!("{digits}{}.0", "0".repeat(whole - digits.len()))
+        }
+    };
+    format!("{sign}{body}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn python_json_float_thresholds_and_separators() {
         let value = serde_json::json!({"floats": [1e-7, 1e-5, 0.0001, 1e15, 1e16, -0.0, 1.25e-7], "unicode": "東京"});
@@ -136,10 +95,15 @@ mod tests {
             "{\"floats\": [1e-07, 1e-05, 0.0001, 1000000000000000.0, 1e+16, -0.0, 1.25e-07], \"unicode\": \"東京\"}"
         );
     }
-
     #[test]
-    fn float_at_binary_midpoint_keeps_python_shortest_spelling() {
-        let value: Value = serde_json::from_str("5.960464477539063e-08").unwrap();
-        assert_eq!(spaced(&value), "5.960464477539063e-08");
+    fn float_midpoints_keep_python_shortest_spelling() {
+        for text in [
+            "5.960464477539063e-08",
+            "1441495712046950.2",
+            "226180940831505.12",
+        ] {
+            let value: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(spaced(&value), text);
+        }
     }
 }
