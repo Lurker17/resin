@@ -1,6 +1,6 @@
 # Resin
 
-_Inspired by SGLang, vLLM, TokenSpeed, FlashInfer, and FlashAttention-4._
+_Inspired by SGLang, TokenSpeed, and DeepInfer._
 
 > [!WARNING]
 > Almost the entire repository is vibe coded right now. Big chunks of code
@@ -45,13 +45,29 @@ Resin requires Python 3.11+ and Rust.
 
 ```bash
 uv sync
-uv run maturin develop --generate-stubs
-uv run python scripts/normalize_stubs.py
-uv run ruff format resin/_resin.pyi
+uv run scripts/rust_build_and_types.py
 ```
+
+The build command syncs type-library sources, builds the Rust extension with
+generated stubs, then normalizes and formats those stubs. It stops if any step
+fails.
 
 The control-plane tests do not require a GPU. Importing a concrete model module
 loads PyTorch; importing `resin` or a model package namespace does not.
+
+`sync_type_libraries.py` gives ty and its editor extension the Python interfaces of
+the CUDA package's Linux-only dependencies. It follows their locked dependency
+graph, reuses ordinary installed dependencies, and extracts Python source and
+`.pyi` files into ignored `.type-libs/sources/`. Namespace packages are merged,
+CUTLASS and bundled TVM import roots are exposed without executing their setup
+code, and the small corrections in `type_stubs/` are applied last.
+The script verifies the lockfile checksum, installs no packages, and never
+imports the extracted code. Rerun it after dependency or stub changes; cached
+wheels allow repeat runs offline. To refresh only these sources, run
+`uv run scripts/sync_type_libraries.py`.
+Only ty uses these sources; Python's runtime import path is unchanged. Type
+detail depends on upstream annotations: compiled exports may lack `.pyi` files,
+and some decorators erase signatures. Corrections belong in `type_stubs/`.
 
 Install `resin-models-cuda`; it pulls in `resin[cuda]` for the shared
 accelerator runtime. The uv lock intentionally
@@ -68,9 +84,7 @@ new machine:
 
 ```bash
 uv sync
-uv run maturin develop --generate-stubs
-uv run python scripts/normalize_stubs.py
-uv run ruff format resin/_resin.pyi
+uv run scripts/rust_build_and_types.py
 uv run modal setup
 ```
 
