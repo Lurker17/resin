@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +11,7 @@ from resin.backend.parallel import (
     batch_plan_payload,
     follow_tensor_parallel_runner,
 )
-from resin.server import HttpServer, RendererCodec
+from resin.server import HttpServer
 
 
 class IncrementingRunner:
@@ -134,142 +133,18 @@ def test_tensor_parallel_plan_round_trip_preserves_native_contract() -> None:
     assert restored.sampling_params[1].top_p == 0.9
 
 
-@dataclass
-class Parsed:
-    content: str
-    reasoning_content: str | None = None
-    tool_calls: list[object] | None = None
-
-    def __post_init__(self) -> None:
-        if self.tool_calls is None:
-            self.tool_calls = []
-
-
-class FakeRenderer:
-    def __init__(self) -> None:
-        self.calls = []
-
-    def render_ids(self, messages, *, tools, add_generation_prompt):
-        self.calls.append((messages, tools, add_generation_prompt))
-        return [1, 2]
-
-    @staticmethod
-    def get_stop_token_ids():
-        return [9]
-
-    @staticmethod
-    def parse_response(token_ids, *, tools):
-        del tools
-        text = "".join(chr(96 + token) for token in token_ids)
-        return Parsed(content=text)
-
-
-def test_renderer_codec_renders_and_incrementally_parses() -> None:
-    renderer = FakeRenderer()
-    # Minimal renderer double implements only the adapter methods exercised here.
-    codec = RendererCodec(renderer)  # ty: ignore[invalid-argument-type]
-    request = {"messages": [{"role": "user", "content": "hi"}], "tools": []}
-
-    assert codec.render(request) == {"token_ids": [1, 2], "stop_token_ids": [9]}
-    parser = codec.create_parser(request, [1, 2])
-    assert parser.feed([3]) == [{"type": "text_delta", "delta": "c"}]
-    assert parser.feed([4]) == [{"type": "text_delta", "delta": "d"}]
-    assert renderer.calls[0][2] is True
-
-
-def test_renderer_codec_emits_complete_tool_call_when_parseable() -> None:
-    tool = SimpleNamespace(
-        status=SimpleNamespace(name="OK"),
-        id=None,
-        name="weather",
-        arguments={"city": "SF"},
-    )
-
-    class ToolRenderer(FakeRenderer):
-        @staticmethod
-        def parse_response(token_ids, *, tools):
-            del token_ids, tools
-            return Parsed(content="", tool_calls=[tool])
-
-    # Minimal renderer double implements only the adapter methods exercised here.
-    parser = RendererCodec(ToolRenderer()).create_parser({"tools": []}, [])  # ty: ignore[invalid-argument-type]
-    assert parser.feed([1]) == [
-        {"type": "tool_call_start", "index": 0, "id": "call_0", "name": "weather"},
-        {"type": "tool_call_arguments_delta", "delta": '{"city":"SF"}', "index": 0},
-    ]
-
-
-def test_renderer_codec_holds_incomplete_utf8_decoder_sentinel() -> None:
-    class UnicodeRenderer(FakeRenderer):
-        @staticmethod
-        def parse_response(token_ids, *, tools):
-            del tools
-            content = (
-                "hello \N{REPLACEMENT CHARACTER}" if len(token_ids) == 1 else "hello 😀"
-            )
-            return Parsed(content=content)
-
-    # Minimal renderer double implements only the adapter methods exercised here.
-    parser = RendererCodec(UnicodeRenderer()).create_parser({"tools": []}, [])  # ty: ignore[invalid-argument-type]
-
-    assert parser.feed([1]) == [{"type": "text_delta", "delta": "hello "}]
-    assert parser.feed([2]) == [{"type": "text_delta", "delta": "😀"}]
-
-
-def test_renderer_codec_can_restore_generation_prefix_for_parser() -> None:
-    class PrefixRenderer(FakeRenderer):
-        @staticmethod
-        def render_ids(messages, *, tools, add_generation_prompt):
-            del messages, tools
-            return [1, 2, 10] if add_generation_prompt else [1, 2]
-
-        @staticmethod
-        def parse_response(token_ids, *, tools):
-            del tools
-            assert token_ids[0] == 10
-            return Parsed(content="".join(chr(96 + token) for token in token_ids[1:]))
-
-    # Minimal renderer double implements the adapter methods exercised here.
-    codec = RendererCodec(PrefixRenderer(), include_generation_prefix_in_parser=True)  # ty: ignore[invalid-argument-type]
-    request = {"messages": [{"role": "user", "content": "hi"}], "tools": []}
-    rendered = codec.render(request)
-    parser = codec.create_parser(request, rendered["token_ids"])
-
-    assert parser.feed([3]) == [{"type": "text_delta", "delta": "c"}]
-
-
-def test_renderer_codec_can_anchor_generation_prefix_for_parser() -> None:
-    class AnchoredPrefixRenderer(FakeRenderer):
-        @staticmethod
-        def render_ids(messages, *, tools, add_generation_prompt):
-            del messages, tools
-            return [1, 2, 9, 10] if add_generation_prompt else [1, 2]
-
-        @staticmethod
-        def parse_response(token_ids, *, tools):
-            del tools
-            assert token_ids[0] == 10
-            return Parsed(content="".join(chr(96 + token) for token in token_ids[1:]))
-
-    codec = RendererCodec(
-        # Minimal renderer double implements only the adapter methods exercised here.
-        AnchoredPrefixRenderer(),  # ty: ignore[invalid-argument-type]
-        include_generation_prefix_in_parser=True,
-        generation_prefix_parser_anchor_token_id=10,
-    )
-    request = {"messages": [{"role": "user", "content": "hi"}], "tools": []}
-    rendered = codec.render(request)
-    parser = codec.create_parser(request, rendered["token_ids"])
-
-    assert parser.feed([3]) == [{"type": "text_delta", "delta": "c"}]
-
-
 def test_http_server_validates_route_configuration() -> None:
+    class Codec:
+        def render(self, request):
+            return {"token_ids": [1], "stop_token_ids": []}
+
+        def create_parser(self, request, prompt_ids):
+            return SimpleNamespace(feed=lambda ids: [])
+
     with pytest.raises(ValueError, match="requires enable_openai"):
         HttpServer(
             Engine(IncrementingRunner()),
-            # Minimal renderer double implements only the adapter methods exercised here.
-            renderer=FakeRenderer(),  # ty: ignore[invalid-argument-type]
+            codec=Codec(),
             model="test",
             enable_openai=False,
             enable_demo=True,

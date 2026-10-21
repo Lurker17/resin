@@ -98,6 +98,8 @@ def build_modal_image(
             root / "pyproject.toml", f"{_SOURCE_ROOT}/pyproject.toml", copy=True
         )
         .add_local_file(root / "README.md", f"{_SOURCE_ROOT}/README.md", copy=True)
+        .add_local_file(root / "LICENSE", f"{_SOURCE_ROOT}/LICENSE", copy=True)
+        .add_local_file(root / "NOTICE", f"{_SOURCE_ROOT}/NOTICE", copy=True)
         .add_local_dir(root / "docs", f"{_SOURCE_ROOT}/docs", copy=True)
         .add_local_dir(root / "crates", f"{_SOURCE_ROOT}/crates", copy=True)
         .add_local_dir(

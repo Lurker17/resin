@@ -136,9 +136,77 @@ def normalize_image_messages(
     return normalized
 
 
+def prepare_recipe_inputs(
+    processor: Any,
+    recipe: Any,
+    request: dict[str, Any],
+    *,
+    processor_kwargs: dict[str, Any] | None = None,
+) -> Any:
+    """Render a native recipe, then prepare its image/video placeholders.
+
+    The processor handles pixel geometry and placeholder expansion only. Chat
+    formatting, tools, and reasoning controls stay with the recipe. Payloads
+    are kept out of the native conversation and retain their message order.
+    """
+
+    messages = normalize_image_messages(request["messages"])
+    images = []
+    videos = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for index, block in enumerate(content):
+            kind = block.get("type")
+            if kind == "image":
+                images.append(block["image"])
+                content[index] = {"type": "image"}
+            elif kind == "video":
+                video = block.get("video")
+                if video is None or isinstance(video, str):
+                    raise ValueError("video content must contain decoded frames")
+                videos.append(video)
+                content[index] = {"type": "video"}
+    # Only tensor preparation and trusted placeholder expansion use the
+    # processor. Encoding the whole rendered text would allow literal marker
+    # spellings in user content to become control tokens again.
+    kwargs = {"do_rescale": False, "return_tensors": "pt", **(processor_kwargs or {})}
+    output: dict[str, Any] = {}
+    replacements: dict[str, list[str]] = {}
+    if images:
+        prepared = processor.image_processor(images=images, **kwargs)
+        replacements[processor.image_token] = [
+            processor.replace_image_token(prepared, image_idx=index)
+            for index in range(len(images))
+        ]
+        output.update(prepared)
+    if videos:
+        prepared = processor.video_processor(
+            videos=videos, return_metadata=True, **kwargs
+        )
+        replacements[processor.video_token] = [
+            processor.replace_video_token(prepared, video_idx=index)
+            for index in range(len(videos))
+        ]
+        output.update(prepared)
+    ids = recipe.render_media_ids({**request, "messages": messages}, replacements)
+    import torch
+
+    output["input_ids"] = torch.tensor([ids], dtype=torch.int64)
+    output["attention_mask"] = torch.ones((1, len(ids)), dtype=torch.int64)
+    if hasattr(processor, "create_mm_token_type_ids"):
+        output["mm_token_type_ids"] = torch.tensor(
+            processor.create_mm_token_type_ids([ids]), dtype=torch.int64
+        )
+    unused = {*getattr(processor, "unused_input_names", ()), "video_metadata"}
+    return {key: value for key, value in output.items() if key not in unused}
+
+
 __all__ = [
     "canonical_rgb_image",
     "decode_image",
     "normalize_image_messages",
     "normalized_rgb_from_data_url",
+    "prepare_recipe_inputs",
 ]

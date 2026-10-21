@@ -1,4 +1,4 @@
-"""OpenAI-wire adapter for canonical Gemma 4 media arrays."""
+"""Gemma 4's native conversation recipe with Python media preparation."""
 
 from __future__ import annotations
 
@@ -6,9 +6,10 @@ from collections.abc import Sequence
 from typing import Any
 
 from resin.models.gemma4.media import Gemma4Media
-from resin.protocols import ParserEvent, RenderedPrompt
+from resin.protocols import FinalizingResponseParser, RenderedPrompt
+from resin.recipe import Recipe
 from resin.server import encode_stop_tokens
-from resin.server.media import normalize_image_messages
+from resin.server.media import prepare_recipe_inputs
 
 
 class Gemma4Codec:
@@ -18,14 +19,11 @@ class Gemma4Codec:
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.eos_token_ids = tuple(int(token) for token in eos_token_ids)
+        self.recipe = Recipe(self.tokenizer, model="gemma4")
 
     def render(self, request: dict[str, Any]) -> RenderedPrompt:
-        messages = normalize_image_messages(request["messages"])
-        media = Gemma4Media.from_messages(
-            self.processor,
-            messages,
-            tools=request.get("tools") or None,
-            processor_kwargs={"do_rescale": False},
+        media = Gemma4Media.from_processor_output(
+            prepare_recipe_inputs(self.processor, self.recipe, request)
         )
         return {
             "token_ids": list(media.token_ids),
@@ -37,26 +35,8 @@ class Gemma4Codec:
 
     def create_parser(
         self, request: dict[str, Any], prompt_ids: Sequence[int]
-    ) -> Gemma4ResponseParser:
-        del request, prompt_ids
-        return Gemma4ResponseParser(self.tokenizer)
+    ) -> FinalizingResponseParser:
+        return self.recipe.create_parser(request, prompt_ids)
 
 
-class Gemma4ResponseParser:
-    def __init__(self, tokenizer: Any) -> None:
-        self.tokenizer = tokenizer
-        self.token_ids: list[int] = []
-        self.text = ""
-
-    def feed(self, token_ids: Sequence[int]) -> list[ParserEvent]:
-        self.token_ids.extend(int(token) for token in token_ids)
-        text = self.tokenizer.decode(self.token_ids, skip_special_tokens=True)
-        text = text.rstrip("\N{REPLACEMENT CHARACTER}")
-        if not text.startswith(self.text):
-            raise ValueError("Gemma 4 decoded output is not prefix-stable")
-        delta = text[len(self.text) :]
-        self.text = text
-        return [] if not delta else [{"type": "text_delta", "delta": delta}]
-
-
-__all__ = ["Gemma4Codec", "Gemma4ResponseParser"]
+__all__ = ["Gemma4Codec"]

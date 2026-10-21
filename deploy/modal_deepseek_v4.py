@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import socket
@@ -12,7 +11,6 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import ModuleType
 from typing import cast
 
 import modal
@@ -35,6 +33,7 @@ from resin.backend.parallel import (
     monitor_process_context,
 )
 from resin.models.deepseek_v4.codec import DeepSeekV4Codec
+from resin.recipe import Recipe
 from resin.server import HttpServer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,8 +56,6 @@ CHECKPOINT_PATTERNS = (
     "tokenizer.json",
     "tokenizer_config.json",
     "inference/config.json",
-    "encoding/*.py",
-    "encoding/*.md",
 )
 
 image = (
@@ -181,7 +178,6 @@ def _checkpoint_inventory(model: ModelSpec) -> dict[str, int]:
         root / "tokenizer.json",
         root / "tokenizer_config.json",
         root / "inference/config.json",
-        root / "encoding/encoding_dsv4.py",
     ]
     files = [*required, *weights]
     if missing := [str(path.relative_to(root)) for path in files if not path.is_file()]:
@@ -263,33 +259,19 @@ def _require_checkpoint(model: ModelSpec) -> tuple[Path, dict[str, object]]:
     }
 
 
-def _load_encoding(model_path: Path) -> ModuleType:
-    path = model_path / "encoding/encoding_dsv4.py"
-    spec = importlib.util.spec_from_file_location("_resin_encoding_dsv4", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load DeepSeek-V4 encoding: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 def _encode_prompt(
-    tokenizer: PreTrainedTokenizerBase,
-    encoding: ModuleType,
+    recipe: Recipe,
     prompt: str,
     thinking_mode: str,
     reasoning_effort: str,
 ) -> list[int]:
-    rendered = encoding.encode_messages(
-        [{"role": "user", "content": prompt}],
-        thinking_mode=thinking_mode,
-        reasoning_effort=reasoning_effort,
-    )
-    token_ids = tokenizer.encode(rendered)
-    if not token_ids:
-        raise ValueError("prompt produced no tokens")
-    return [int(token_id) for token_id in token_ids]
+    return recipe.render(
+        {
+            "messages": [{"role": "user", "content": prompt}],
+            "extra": {"thinking_mode": thinking_mode},
+            "reasoning_effort": reasoning_effort,
+        }
+    )["token_ids"]
 
 
 def _real_prompt_ids(
@@ -1024,10 +1006,9 @@ def _benchmark_remote(
             str(model_path), local_files_only=True, trust_remote_code=False
         ),
     )
-    encoding = _load_encoding(model_path)
+    recipe = DeepSeekV4Codec(tokenizer)
     seed_prompt = _encode_prompt(
-        tokenizer,
-        encoding,
+        recipe,
         "Measure inference throughput with a stable synthetic prompt.",
         "chat",
         "high",
@@ -1092,7 +1073,7 @@ def _serve_http_rank(
             str(model_path), local_files_only=True, trust_remote_code=False
         ),
     )
-    encoding = _load_encoding(model_path)
+    recipe = DeepSeekV4Codec(tokenizer)
     coordinated_runner = TensorParallelRunner(runner, control_group, dist)
     engine = Engine(
         coordinated_runner,
@@ -1113,8 +1094,7 @@ def _serve_http_rank(
     )
     for prompt, thinking_mode, reasoning_effort in warmups:
         prompt_ids = _encode_prompt(
-            tokenizer,
-            encoding,
+            recipe,
             prompt,
             thinking_mode,
             reasoning_effort,
@@ -1135,8 +1115,7 @@ def _serve_http_rank(
         )
     continuation_prompt = "word " * 4096 + "continue briefly"
     continuation_ids = _encode_prompt(
-        tokenizer,
-        encoding,
+        recipe,
         continuation_prompt,
         "chat",
         "low",
@@ -1160,7 +1139,7 @@ def _serve_http_rank(
     try:
         HttpServer(
             engine,
-            codec=DeepSeekV4Codec(tokenizer, encoding),
+            codec=recipe,
             model=model_name,
         ).serve(host="0.0.0.0", port=8000)
     finally:
@@ -1386,7 +1365,7 @@ def _validate_parallel(
             str(model_path), local_files_only=True, trust_remote_code=False
         ),
     )
-    encoding = _load_encoding(model_path)
+    recipe = DeepSeekV4Codec(tokenizer)
     texts = {
         "short": "Continue the sequence with the next number: 2, 4, 6,",
         "long": (
@@ -1399,7 +1378,7 @@ def _validate_parallel(
         "probe": "What is the next integer after 41? Answer briefly.",
     }
     prompts = {
-        name: _encode_prompt(tokenizer, encoding, text, "chat", "low")
+        name: _encode_prompt(recipe, text, "chat", "low")
         for name, text in texts.items()
     }
     print(
@@ -1556,13 +1535,12 @@ def run_model_tp4(
             str(model_path), local_files_only=True, trust_remote_code=False
         ),
     )
-    encoding = _load_encoding(model_path)
+    recipe = DeepSeekV4Codec(tokenizer)
     prompt_ids = (
         _real_prompt_ids(tokenizer, profile_input_tokens)
         if profile_input_tokens is not None
         else _encode_prompt(
-            tokenizer,
-            encoding,
+            recipe,
             prompt,
             thinking_mode,
             reasoning_effort,
@@ -1601,8 +1579,14 @@ def run_model_tp4(
     report["thinking_mode"] = thinking_mode
     if batch_size == 1:
         try:
-            report["message"] = encoding.parse_message_from_completion_text(
-                completions[0], thinking_mode=thinking_mode
+            report["message"] = recipe.parse_response(
+                output_rows[0],
+                request={
+                    "messages": [{"role": "user", "content": prompt}],
+                    "extra": {"thinking_mode": thinking_mode},
+                    "reasoning_effort": reasoning_effort,
+                },
+                prompt_ids=prompt_ids,
             )
         except (AssertionError, ValueError) as error:
             report["parse_error"] = str(error)

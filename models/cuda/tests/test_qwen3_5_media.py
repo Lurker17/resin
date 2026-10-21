@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import base64
 import io
-from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
-from renderers.base import MultiModalData, PlaceholderRange, RenderedTokens
 
+import resin.models.qwen3_5.codec as codec_module
 from resin import MediaInput
 from resin.models.qwen3_5.codec import Qwen35Codec
 from resin.models.qwen3_5.media import Qwen35Media
@@ -47,46 +47,57 @@ def _data_url() -> str:
     return "data:image/png;base64," + base64.b64encode(output.getvalue()).decode()
 
 
-def test_qwen_codec_normalizes_images_and_attaches_renderer_sidecar() -> None:
+def test_qwen_codec_normalizes_images_and_attaches_processor_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class Tokenizer:
         @staticmethod
         def convert_tokens_to_ids(token):
-            return {"<|image_pad|>": 8, "<think>": 9}[token]
+            return {"<|image_pad|>": 8}[token]
 
         @staticmethod
         def encode(text, add_special_tokens=False):
             del text, add_special_tokens
             return [12]
 
-    class Renderer:
-        seen = None
+    class RecordingRecipe:
+        request = None
+
+        def __init__(self, tokenizer, *, model):
+            assert model == "qwen3_5"
 
         @classmethod
-        def render(cls, messages, **kwargs):
-            cls.seen = (messages, kwargs)
-            return RenderedTokens(
-                token_ids=[2, 8, 8, 8, 8, 3],
-                multi_modal_data=MultiModalData(
-                    mm_placeholders={"image": [PlaceholderRange(1, 4)]},
-                    mm_items={
-                        "image": [
-                            {
-                                "pixel_values": np.ones((16, 12), np.float32),
-                                "image_grid_thw": np.array([[1, 4, 4]], np.int64),
-                            }
-                        ]
-                    },
-                ),
-            )
+        def render_media_ids(cls, request, replacements):
+            cls.request = request
+            assert replacements == {"<|image_pad|>": ["<|image_pad|>" * 4]}
+            return [2, 8, 8, 8, 8, 3]
 
         @staticmethod
         def get_stop_token_ids():
             return [1]
 
-    processor = SimpleNamespace(
-        tokenizer=Tokenizer(), image_processor=SimpleNamespace(merge_size=2)
-    )
-    codec = Qwen35Codec(Renderer(), processor)
+    class ImageProcessor:
+        merge_size = 2
+        seen = None
+
+        def __call__(self, **kwargs):
+            self.seen = kwargs
+            return {
+                "pixel_values": torch.ones(16, 12),
+                "image_grid_thw": torch.tensor([[1, 4, 4]]),
+            }
+
+    class Processor:
+        tokenizer = Tokenizer()
+        image_processor = ImageProcessor()
+        image_token = "<|image_pad|>"
+
+        def replace_image_token(self, output, image_idx):
+            return self.image_token * 4
+
+    monkeypatch.setattr(codec_module, "Recipe", RecordingRecipe)
+    processor = Processor()
+    codec = Qwen35Codec(processor)
     output = codec.render(
         {
             "messages": [
@@ -104,6 +115,27 @@ def test_qwen_codec_normalizes_images_and_attaches_renderer_sidecar() -> None:
 
     assert output["stop_token_ids"] == [1, 12]
     assert isinstance(output["media"], Qwen35Media)
-    assert Renderer.seen is not None
-    assert isinstance(Renderer.seen[0][0]["content"][0]["image"], Image.Image)
-    assert Renderer.seen[1] == {"tools": None, "add_generation_prompt": True}
+    assert RecordingRecipe.request is not None
+    assert RecordingRecipe.request["messages"][0]["content"] == [
+        {"type": "image"},
+        {"type": "text", "text": "describe"},
+    ]
+    assert processor.image_processor.seen is not None
+    assert processor.image_processor.seen["images"][0].dtype == np.float32
+    assert processor.image_processor.seen["return_tensors"] == "pt"
+    assert processor.image_processor.seen["do_rescale"] is False
+
+
+def test_qwen_codec_rejects_video_instead_of_dropping_its_embeddings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codec = Qwen35Codec.__new__(Qwen35Codec)
+    monkeypatch.setattr(codec, "processor", None, raising=False)
+    monkeypatch.setattr(codec, "recipe", None, raising=False)
+    monkeypatch.setattr(
+        codec_module,
+        "prepare_recipe_inputs",
+        lambda *_: {"pixel_values_videos": torch.zeros(1, 1, 1)},
+    )
+    with pytest.raises(ValueError, match="image input only"):
+        codec.render({"messages": []})

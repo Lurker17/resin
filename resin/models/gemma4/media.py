@@ -10,7 +10,8 @@ import torch
 from torch import Tensor
 
 from resin.protocols import MediaTokenSpan
-from resin.server.media import canonical_rgb_image, decode_image
+from resin.recipe import Recipe
+from resin.server.media import canonical_rgb_image, decode_image, prepare_recipe_inputs
 from resin.server.media_inputs import (
     digest_tensors,
     owned_cpu_tensor,
@@ -184,18 +185,13 @@ class Gemma4Media:
         *,
         tools: list[dict[str, Any]] | None = None,
         processor_kwargs: dict[str, Any] | None = None,
+        recipe: Recipe | None = None,
     ) -> Gemma4Media:
-        template_kwargs = {}
-        if processor_kwargs is not None:
-            template_kwargs["processor_kwargs"] = processor_kwargs
-        output = processor.apply_chat_template(
-            messages,
-            tools=tools,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-            **template_kwargs,
+        output = prepare_recipe_inputs(
+            processor,
+            recipe or Recipe(processor.tokenizer, model="gemma4"),
+            {"messages": messages, "tools": tools},
+            processor_kwargs=processor_kwargs,
         )
         return cls.from_processor_output(output)
 

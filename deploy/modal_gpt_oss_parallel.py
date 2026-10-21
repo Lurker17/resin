@@ -152,10 +152,10 @@ def validate_parallel(
     case_names: tuple[str, ...] | None = None,
 ):
     import torch
-    from renderers import GptOssRendererConfig, create_renderer
     from transformers import AutoTokenizer
 
     from deploy.gpt_oss_parallel_validation import run_validation
+    from resin.recipe import Recipe
 
     if torch.cuda.device_count() != world_size or any(
         torch.cuda.get_device_capability(rank) != (9, 0) for rank in range(world_size)
@@ -194,10 +194,7 @@ def validate_parallel(
     )
     if tokenizer is None:
         raise RuntimeError("the GPT-OSS checkpoint did not load a tokenizer")
-    renderer = create_renderer(
-        tokenizer,
-        GptOssRendererConfig(reasoning_effort="medium", auto_drop_analysis=False),
-    )
+    recipe = Recipe(tokenizer, model="gpt_oss", options={"reasoning_effort": "medium"})
     texts = {
         "short": "Continue the sequence with the next number: 2, 4, 6,",
         "long": (
@@ -213,7 +210,7 @@ def validate_parallel(
         name: list(
             map(
                 int,
-                renderer.render_ids(
+                recipe.render_ids(
                     [{"role": "user", "content": text}],
                     add_generation_prompt=True,
                 ),

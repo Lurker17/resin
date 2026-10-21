@@ -144,11 +144,10 @@ uv run modal run deploy/modal_deepseek_v4.py --mode profile --input-tokens 8192 
 1. Measure mixed-arrival latency with separate queue, planning, execution, and
    commit timing. Bound prefill interference using a concrete latency target.
    Move costly prompt rendering out of the engine actor through a bounded
-   preparation queue when profiling justifies it. The bundled `RendererCodec`
-   still reparses accumulated output because renderers 0.1.9 exposes only a
-   whole-response parser. Its long-response work remains quadratic; a custom
-   codec can already supply a true incremental `feed` implementation. Replacing
-   that fallback needs an upstream streaming API or a model-specific parser.
+   preparation queue when profiling justifies it. Stock codecs use
+   `resin-recipe` for conversation formatting and incremental parsing, and the
+   HTTP actor consumes native parser events directly. Applications can supply
+   another codec through the same structural Python protocol.
 2. Expose a narrow scheduling-policy seam while retaining compatibility,
    capacity, progress, and lease validation in the core. Keep the current
    scheduler as the reference policy.

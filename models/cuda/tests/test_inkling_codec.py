@@ -10,6 +10,9 @@ from resin.protocols import ConversationCodec, FinalizingResponseParser
 
 SPECIAL_TOKENS = {
     "<|message_model|>": 200001,
+    "<|message_user|>": 200000,
+    "<|message_system|>": 200002,
+    "<|message_tool|>": 200003,
     "<|content_text|>": 200004,
     "<|content_model_end_sampling|>": 200006,
     "<|content_thinking|>": 200008,
@@ -42,79 +45,67 @@ def _text_ids(text: str) -> list[int]:
     return [ord(character) for character in text]
 
 
-def test_render_forwards_reasoning_effort_and_uses_inkling_terminal(
+def test_render_forwards_request_to_native_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: dict[str, Any] = {}
 
-    class Renderer:
-        @staticmethod
-        def render_ids(messages, *, tools, add_generation_prompt):
-            seen.update(
-                messages=messages,
-                tools=tools,
-                add_generation_prompt=add_generation_prompt,
-            )
-            return [4, 5]
+    class RecordingRecipe:
+        def __init__(self, tokenizer, *, model):
+            seen.update(tokenizer=tokenizer, model=model)
 
-    def create_renderer(tokenizer, config):
-        seen["tokenizer"] = tokenizer
-        seen["config"] = config
-        return Renderer()
+        def render(self, request):
+            seen["request"] = request
+            return {"token_ids": [4, 5], "stop_token_ids": [200006, 33]}
 
-    monkeypatch.setattr(codec_module, "create_renderer", create_renderer)
+    monkeypatch.setattr(codec_module, "Recipe", RecordingRecipe)
     tokenizer = FakeTokenizer()
     codec = InklingCodec(tokenizer)
-    messages = [{"role": "user", "content": "hello"}]
-    tools = [{"type": "function", "function": {"name": "weather"}}]
+    request = {
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{"type": "function", "function": {"name": "weather"}}],
+        "reasoning_effort": "low",
+        "stop": ["!"],
+    }
+    assert codec.render(request) == {
+        "token_ids": [4, 5],
+        "stop_token_ids": [200006, 33],
+    }
+    assert seen == {"tokenizer": tokenizer, "model": "inkling", "request": request}
 
-    rendered = codec.render(
-        {
-            "messages": messages,
-            "tools": tools,
-            "reasoning_effort": "low",
-            "stop": ["!"],
-        }
+
+def test_render_maps_openai_xhigh_to_inkling_max() -> None:
+    codec = InklingCodec(FakeTokenizer())
+    request = {"messages": [{"role": "user", "content": "hello"}]}
+    assert codec.render({**request, "reasoning_effort": "xhigh"}) == codec.render(
+        {**request, "reasoning_effort": "max"}
     )
 
-    assert seen["tokenizer"] is tokenizer
-    assert seen["config"].model_extra == {"reasoning_effort": "low"}
-    assert seen["messages"] == messages
-    assert seen["tools"] == tools
-    assert seen["add_generation_prompt"] is True
-    assert rendered == {"token_ids": [4, 5], "stop_token_ids": [200006, 33]}
 
+def test_processor_recipe_receives_all_format_controls(monkeypatch: pytest.MonkeyPatch):
+    class Processor:
+        tokenizer = FakeTokenizer()
+        image_token_id = 200054
 
-def test_render_maps_openai_xhigh_to_inkling_max(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    seen: dict[str, Any] = {}
+    seen = []
 
-    class Renderer:
-        @staticmethod
-        def render_ids(messages, *, tools, add_generation_prompt):
-            del messages, tools, add_generation_prompt
-            return []
+    def prepare(processor, recipe, request):
+        seen.append(request)
+        return {"input_ids": [[1, 2]]}
 
-    def create_renderer(tokenizer, config):
-        del tokenizer
-        seen["config"] = config
-        return Renderer()
-
-    monkeypatch.setattr(codec_module, "create_renderer", create_renderer)
-    InklingCodec(FakeTokenizer()).render(
-        {
-            "messages": [{"role": "user", "content": "hello"}],
-            "reasoning_effort": "xhigh",
-        }
-    )
-
-    assert seen["config"].model_extra == {"reasoning_effort": "max"}
+    monkeypatch.setattr(codec_module, "prepare_recipe_inputs", prepare)
+    request = {
+        "messages": [{"role": "user", "content": "hello"}],
+        "reasoning_effort": None,
+        "extra": {"reasoning_effort": "low"},
+    }
+    assert InklingCodec(Processor()).render(request)["token_ids"] == [1, 2]
+    assert seen == [request]
 
 
 def test_render_rejects_unknown_reasoning_effort() -> None:
     codec = InklingCodec(FakeTokenizer())
-    with pytest.raises(ValueError, match="unsupported reasoning_effort"):
+    with pytest.raises(ValueError, match="reasoning_effort"):
         codec.render(
             {
                 "messages": [{"role": "user", "content": "hello"}],
@@ -214,14 +205,14 @@ def test_native_codec_implements_python_protocols() -> None:
 def test_codec_prepares_one_native_tokenizer_for_multiple_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    prepare = codec_module.Tokenizer
+    prepare = codec_module.Recipe
     calls: list[Any] = []
 
-    def prepare_tokenizer(tokenizer):
+    def prepare_recipe(tokenizer, *, model):
         calls.append(tokenizer)
-        return prepare(tokenizer)
+        return prepare(tokenizer, model=model)
 
-    monkeypatch.setattr(codec_module, "Tokenizer", prepare_tokenizer)
+    monkeypatch.setattr(codec_module, "Recipe", prepare_recipe)
     tokenizer = FakeTokenizer()
     codec = InklingCodec(tokenizer)
     first = codec.create_parser({}, [200001, 200004])

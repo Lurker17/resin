@@ -159,10 +159,10 @@ def _build_runtime(
     *, context_length: int = MAX_CONTEXT_LENGTH, validate_graphs: bool = False
 ):
     import torch
-    from renderers import DefaultRendererConfig, create_renderer
     from transformers import AutoProcessor
 
     from resin import Engine, SchedulerConfig
+    from resin.recipe import Recipe
     from resin_models_cuda.inkling.cuda import InklingCudaRunner
 
     inventory = _require_models()
@@ -188,7 +188,7 @@ def _build_runtime(
         TARGET_PATH, local_files_only=True, trust_remote_code=False
     )
     tokenizer = processor.tokenizer
-    renderer = create_renderer(tokenizer, DefaultRendererConfig())
+    recipe = Recipe(tokenizer, model="inkling")
     engine = Engine(
         runner,
         max_running_requests=DEFAULT_MAX_NUM_SEQS,
@@ -208,11 +208,11 @@ def _build_runtime(
         "cuda_graphs": graph_stats,
         "device": torch.cuda.get_device_name(runner.device),
     }
-    return runner, processor, renderer, engine, report
+    return runner, processor, recipe, engine, report
 
 
-def _prompt_ids(renderer: Any, prompt: str) -> list[int]:
-    token_ids = renderer.render_ids(
+def _prompt_ids(recipe: Any, prompt: str) -> list[int]:
+    token_ids = recipe.render_ids(
         [{"role": "user", "content": prompt}], add_generation_prompt=True
     )
     if not token_ids:
@@ -237,18 +237,18 @@ def smoke_test(
 
     from resin import SamplingParams
 
-    runner, processor, renderer, engine, report = _build_runtime(
+    runner, processor, recipe, engine, report = _build_runtime(
         context_length=context_length, validate_graphs=True
     )
     try:
         prompt_ids = _prompt_ids(
-            renderer,
+            recipe,
             "Explain why speculative decoding can preserve model quality.",
         )
         lease = engine.submit(
             prompt_ids,
             max_new_tokens=max_new_tokens,
-            stop_token_ids=renderer.get_stop_token_ids(),
+            stop_token_ids=recipe.get_stop_token_ids(),
             sampling_params=SamplingParams(
                 temperature=1.0,
                 top_p=0.95,
@@ -284,12 +284,12 @@ def _serve(_: int) -> None:
     from resin.models.inkling.codec import InklingCodec
     from resin.server import HttpServer
 
-    runner, processor, renderer, engine, _ = _build_runtime()
+    runner, processor, recipe, engine, _ = _build_runtime()
     try:
         warmup = engine.submit(
-            _prompt_ids(renderer, "Reply with one word."),
+            _prompt_ids(recipe, "Reply with one word."),
             max_new_tokens=2,
-            stop_token_ids=renderer.get_stop_token_ids(),
+            stop_token_ids=recipe.get_stop_token_ids(),
             sampling_params=SamplingParams(temperature=0.0),
         )
         while engine.has_work():

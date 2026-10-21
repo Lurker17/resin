@@ -171,6 +171,7 @@ def report() -> dict[str, Counts]:
                 ),
             },
             "resin-http": source_files(ROOT / "crates/resin-http/src", "*.rs"),
+            "resin-recipe": source_files(ROOT / "crates/resin-recipe/src", "*.rs"),
             "resin-py": source_files(ROOT / "crates/resin-py/src", "*.rs"),
         },
         "python": {

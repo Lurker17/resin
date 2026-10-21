@@ -8,6 +8,8 @@ from typing import Any
 from torch import Tensor
 
 from resin.protocols import MediaTokenSpan
+from resin.recipe import Recipe
+from resin.server.media import prepare_recipe_inputs
 from resin.server.media_inputs import (
     digest_tensors,
     owned_cpu_tensor,
@@ -86,18 +88,16 @@ class InklingMedia:
         *,
         tools: list[dict[str, Any]] | None = None,
         reasoning_effort: str | None = None,
+        recipe: Recipe | None = None,
     ) -> InklingMedia:
-        template_kwargs: dict[str, Any] = {
-            "tools": tools,
-            "tokenize": True,
-            "add_generation_prompt": True,
-            "return_dict": True,
-            "return_tensors": "pt",
-            "processor_kwargs": {"do_rescale": False},
-        }
+        request: dict[str, Any] = {"messages": messages, "tools": tools}
         if reasoning_effort is not None:
-            template_kwargs["reasoning_effort"] = reasoning_effort
-        output = processor.apply_chat_template(messages, **template_kwargs)
+            request["reasoning_effort"] = reasoning_effort
+        output = prepare_recipe_inputs(
+            processor,
+            recipe or Recipe(processor.tokenizer, model="inkling"),
+            request,
+        )
         return cls.from_processor_output(processor, output)
 
 

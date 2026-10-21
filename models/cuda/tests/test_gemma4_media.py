@@ -7,6 +7,7 @@ import pytest
 import torch
 from PIL import Image
 
+import resin.models.gemma4.media as media_module
 from resin import Engine, MediaInput, MediaTokenSpan
 from resin.models.gemma4.media import Gemma4Media
 from resin.server.media import decode_image
@@ -60,28 +61,47 @@ def test_media_owns_processor_tensors_and_absolute_placeholder_mapping() -> None
     assert media.cache_key[1] != media.token_ids[1]
 
 
-def test_canonical_normalized_arrays_are_copied_before_processing() -> None:
-    class Processor:
+def test_canonical_normalized_arrays_are_copied_before_processing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Recipe:
+        def __init__(self, tokenizer, *, model):
+            assert model == "gemma4"
+
+        def render_media_ids(self, request, replacements):
+            return [2, 8]
+
+    class ImageProcessor:
         seen = None
 
-        @classmethod
-        def apply_chat_template(cls, messages, **kwargs):
-            cls.seen = (messages, kwargs)
+        def __call__(self, **kwargs):
+            self.seen = kwargs
             return {
-                "input_ids": torch.tensor([[2, 8]]),
-                "mm_token_type_ids": torch.tensor([[0, 1]]),
                 "pixel_values": torch.ones(1, 9, 12),
                 "image_position_ids": torch.zeros(1, 9, 2, dtype=torch.int64),
             }
 
+    class Processor:
+        tokenizer = object()
+        image_token = "<|image|>"
+        image_processor = ImageProcessor()
+
+        def replace_image_token(self, output, image_idx):
+            return self.image_token
+
+        def create_mm_token_type_ids(self, ids):
+            return [[int(token == 8) for token in row] for row in ids]
+
+    monkeypatch.setattr(media_module, "Recipe", Recipe)
     image = np.ones((3, 4, 3), dtype=np.float32)
-    media = Gemma4Media.from_images(Processor(), [image], prompt="describe")
+    processor = Processor()
+    media = Gemma4Media.from_images(processor, [image], prompt="describe")
     image.fill(0)
 
-    assert Processor.seen is not None
-    passed = Processor.seen[0][0]["content"][0]["image"]
+    assert processor.image_processor.seen is not None
+    passed = processor.image_processor.seen["images"][0]
     assert passed.sum() == 36
-    assert Processor.seen[1]["processor_kwargs"] == {"do_rescale": False}
+    assert processor.image_processor.seen["do_rescale"] is False
     assert media.image_positions == (1,)
 
 

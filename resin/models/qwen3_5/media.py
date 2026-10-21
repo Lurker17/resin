@@ -14,6 +14,7 @@ from resin.server.media_inputs import (
     digest_tensors,
     owned_cpu_tensor,
     salt_token_positions,
+    single_row,
 )
 
 
@@ -113,40 +114,24 @@ class Qwen35Media:
         )
 
     @classmethod
-    def from_rendered(
+    def from_processor_output(
         cls,
-        rendered: Any,
+        output: Any,
         *,
         spatial_merge_size: int,
         image_token_id: int,
     ) -> Qwen35Media:
-        data = rendered.multi_modal_data
-        if data is None or data.is_empty():
-            raise ValueError("rendered Qwen prompt contains no image data")
-        if set(data.mm_items) - {"image"} or set(data.mm_placeholders) - {"image"}:
+        if output.get("pixel_values_videos") is not None:
             raise ValueError("Qwen35Media currently supports image input only")
-        items = data.mm_items.get("image") or []
-        placeholders = data.mm_placeholders.get("image") or []
-        if len(items) != len(placeholders) or not items:
-            raise ValueError("Qwen image items and placeholders do not align")
-        pixels = []
-        grids = []
-        image_positions = []
-        for item, placeholder in zip(items, placeholders, strict=True):
-            pixels.append(torch.as_tensor(item["pixel_values"]))
-            grid = torch.as_tensor(item["image_grid_thw"])
-            grids.append(grid)
-            image_positions.extend(
-                range(
-                    int(placeholder.offset),
-                    int(placeholder.offset + placeholder.length),
-                )
-            )
+        token_ids = tuple(single_row(output["input_ids"], "input_ids").tolist())
+        image_positions = tuple(
+            index for index, token in enumerate(token_ids) if token == image_token_id
+        )
         return cls(
-            token_ids=tuple(rendered.token_ids),
-            image_positions=tuple(image_positions),
-            pixel_values=torch.cat(pixels, dim=0),
-            image_grid_thw=torch.cat(grids, dim=0),
+            token_ids=token_ids,
+            image_positions=image_positions,
+            pixel_values=output["pixel_values"],
+            image_grid_thw=output["image_grid_thw"],
             spatial_merge_size=spatial_merge_size,
             image_token_id=image_token_id,
         )

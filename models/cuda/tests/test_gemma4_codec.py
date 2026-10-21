@@ -8,6 +8,7 @@ import pytest
 import torch
 from PIL import Image
 
+import resin.models.gemma4.codec as codec_module
 from resin.models.gemma4.codec import Gemma4Codec
 from resin.models.gemma4.media import Gemma4Media
 from resin.server.media import normalized_rgb_from_data_url
@@ -32,7 +33,9 @@ def test_data_url_adapter_ends_at_owned_normalized_rgb() -> None:
         normalized_rgb_from_data_url("https://example.com/image.png")
 
 
-def test_codec_attaches_media_and_keeps_codec_work_out_of_engine() -> None:
+def test_codec_attaches_media_and_keeps_codec_work_out_of_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class Tokenizer:
         @staticmethod
         def encode(text, add_special_tokens=False):
@@ -44,21 +47,44 @@ def test_codec_attaches_media_and_keeps_codec_work_out_of_engine() -> None:
             del skip_special_tokens
             return "".join(map(str, token_ids))
 
-    class Processor:
-        tokenizer = Tokenizer()
+    class ImageProcessor:
         seen = None
 
-        @classmethod
-        def apply_chat_template(cls, messages, **kwargs):
-            cls.seen = (messages, kwargs)
+        def __call__(self, **kwargs):
+            self.seen = kwargs
             return {
-                "input_ids": torch.tensor([[2, 8]]),
-                "mm_token_type_ids": torch.tensor([[0, 1]]),
                 "pixel_values": torch.ones(1, 9, 12),
                 "image_position_ids": torch.zeros(1, 9, 2, dtype=torch.int64),
             }
 
-    codec = Gemma4Codec(Processor(), eos_token_ids=(1, 106))
+    class Processor:
+        tokenizer = Tokenizer()
+        image_token = "<|image|>"
+        image_processor = ImageProcessor()
+
+        def replace_image_token(self, output, image_idx):
+            return self.image_token
+
+        def create_mm_token_type_ids(self, ids):
+            return [[int(token == 8) for token in row] for row in ids]
+
+    parser = object()
+
+    class RecordingRecipe:
+        def __init__(self, tokenizer, *, model):
+            assert model == "gemma4"
+
+        def render_media_ids(self, request, replacements):
+            assert replacements == {"<|image|>": ["<|image|>"]}
+            assert request["extra"] == {"enable_thinking": True}
+            return [2, 8]
+
+        def create_parser(self, request, prompt_ids):
+            return parser
+
+    monkeypatch.setattr(codec_module, "Recipe", RecordingRecipe)
+    processor = Processor()
+    codec = Gemma4Codec(processor, eos_token_ids=(1, 106))
     rendered = codec.render(
         {
             "messages": [
@@ -71,17 +97,14 @@ def test_codec_attaches_media_and_keeps_codec_work_out_of_engine() -> None:
                 }
             ],
             "stop": ["stop"],
+            "extra": {"enable_thinking": True},
         }
     )
 
     assert isinstance(rendered["media"], Gemma4Media)
     assert rendered["token_ids"] == [2, 8]
     assert rendered["stop_token_ids"] == [1, 106, 12]
-    assert Processor.seen is not None
-    image = Processor.seen[0][0]["content"][0]["image"]
-    assert image.dtype == np.float32
-    assert Processor.seen[1]["processor_kwargs"] == {"do_rescale": False}
-
-    parser = codec.create_parser({}, [])
-    assert parser.feed([3]) == [{"type": "text_delta", "delta": "3"}]
-    assert parser.feed([4]) == [{"type": "text_delta", "delta": "4"}]
+    assert processor.image_processor.seen is not None
+    assert processor.image_processor.seen["images"][0].dtype == np.float32
+    assert processor.image_processor.seen["do_rescale"] is False
+    assert codec.create_parser({}, []) is parser

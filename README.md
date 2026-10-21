@@ -166,8 +166,9 @@ Pass `prefix_cache=True` to reuse aligned prefixes across requests.
 
 The built-in native server exposes one Engine through OpenAI Chat Completions and
 Responses, Anthropic Messages, and a small streaming chat page. Model-specific
-prompt rendering and response parsing stay in Python so they can follow model
-formats without coupling them to the native scheduler.
+prompt rendering and incremental response parsing live in the independent
+`resin-recipe` Rust crate. Python prepares media tensors and may supply custom
+protocol-compatible codecs.
 
 The bridge bounds queued jobs (32), active requests (128), admissions before
 an inference step (4), and buffered events per client (64). A full admission
@@ -180,7 +181,6 @@ blocking other requests. Actor failure stops the listener, and
 uv run python scripts/lfm2_chat.py
 
 # Serve LFM2 locally over HTTP.
-uv sync --extra server
 uv run python scripts/lfm2_serve.py
 ```
 
@@ -217,7 +217,11 @@ Because `requires_proxy_auth=False`, anyone with a URL can submit inference
 requests and incur GPU usage; remove the deployment when it is no longer
 needed.
 
-For a custom model-format adapter, pass `codec=` instead of a renderer:
+Stock model codecs use the native `resin-recipe` conversation formats and
+incremental response parsers. Image/video processors prepare media arrays and
+placeholder geometry after the recipe renders the conversation.
+
+For a custom model-format adapter, pass any protocol-compatible `codec=`:
 
 ```python
 from resin.server import HttpServer
@@ -227,8 +231,9 @@ HttpServer(engine, codec=my_codec, model="my-model").serve()
 
 `ConversationCodec.render()` returns prompt and stop token IDs;
 `create_parser()` returns a per-request incremental parser that emits text,
-reasoning, and tool-call deltas. `RendererCodec` supplies this contract for the
-optional `renderers` package.
+reasoning, and tool-call deltas. An optional `finish("stop" | "length")` flushes
+buffered output before the server sends the final response. Custom codecs do
+not need to inherit a Resin class or use the native tokenizer/parser.
 
 `resin.server.media` provides optional image decoding and OpenAI-style message
 normalization helpers for model bring-up, demos, and tests. Codecs do not have

@@ -174,10 +174,10 @@ def _build_runtime(
     *, context_length: int, speculative_tokens: int, validate_graphs: bool = False
 ):
     import torch
-    from renderers import Qwen35Renderer, Qwen35RendererConfig
     from transformers import AutoProcessor
 
     from resin import Engine, SchedulerConfig
+    from resin.recipe import Recipe
     from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
 
     inventory = _require_model()
@@ -199,11 +199,7 @@ def _build_runtime(
         MODEL_PATH, local_files_only=True, trust_remote_code=False
     )
     tokenizer = processor.tokenizer
-    renderer = Qwen35Renderer(
-        tokenizer,
-        Qwen35RendererConfig(enable_thinking=True),
-        processor=processor,
-    )
+    recipe = Recipe(tokenizer, model="qwen3_5")
     graph_started = time.perf_counter()
     graph_stats = capture_cuda_graphs(runner)
     graph_capture_s = time.perf_counter() - graph_started
@@ -251,15 +247,15 @@ def _build_runtime(
     return (
         runner,
         processor,
-        renderer,
+        recipe,
         engine,
         report,
         kernel_files_after_load,
     )
 
 
-def _prompt_ids(renderer: Any, prompt: str) -> list[int]:
-    token_ids = renderer.render_ids(
+def _prompt_ids(recipe: Any, prompt: str) -> list[int]:
+    token_ids = recipe.render_ids(
         [{"role": "user", "content": prompt}], add_generation_prompt=True
     )
     if not token_ids:
@@ -309,7 +305,7 @@ def smoke_test(
     (
         runner,
         processor,
-        renderer,
+        recipe,
         engine,
         report,
         kernel_files_after_load,
@@ -321,13 +317,13 @@ def smoke_test(
     tokenizer = processor.tokenizer
     try:
         prompt_ids = _prompt_ids(
-            renderer,
+            recipe,
             "Explain how a recurrent-attention hybrid reduces KV-cache growth.",
         )
         request = engine.submit(
             prompt_ids,
             max_new_tokens=max_new_tokens,
-            stop_token_ids=renderer.get_stop_token_ids(),
+            stop_token_ids=recipe.get_stop_token_ids(),
             sampling_params=SamplingParams(temperature=0.0),
         )
         started = time.perf_counter()
@@ -340,7 +336,7 @@ def smoke_test(
         steady_s = event_times[-1] - event_times[0] if timed_tokens else 0.0
         from resin.models.qwen3_5.codec import Qwen35Codec
 
-        codec = Qwen35Codec(renderer, processor)
+        codec = Qwen35Codec(processor)
         image_prompt = codec.render(
             {
                 "messages": [
@@ -418,11 +414,11 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
     from resin.models.qwen3_5.codec import Qwen35Codec
     from resin.server import HttpServer
 
-    runner, processor, renderer, engine, report, kernels_before_warmup = _build_runtime(
+    runner, processor, recipe, engine, report, kernels_before_warmup = _build_runtime(
         context_length=context_length,
         speculative_tokens=speculative_tokens,
     )
-    codec = Qwen35Codec(renderer, processor)
+    codec = Qwen35Codec(processor)
     try:
         text_prompt = codec.render(
             {"messages": [{"role": "user", "content": "Reply with the word ready."}]}
