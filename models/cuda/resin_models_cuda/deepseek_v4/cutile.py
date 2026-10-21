@@ -1282,12 +1282,15 @@ def _verify_attention_metadata_kernel(
 
     output = window_indices
     if has_compression:
-        compressed_column = columns - block_end
+        # TRTLLM reserves 128 SWA columns even for a short causal window.
+        # Compressed indices address a separate pool and must follow that
+        # fixed segment, rather than the number of currently valid SWA rows.
+        compressed_column = columns - window_size
         if has_explicit_compressed_indices:
             compressed = ct.gather(
                 compressed_indices,
                 (batch, query, compressed_column),
-                mask=(columns >= block_end)
+                mask=(columns >= window_size)
                 & (compressed_column < compressed_index_width),
                 padding_value=-1,
             )
@@ -1336,7 +1339,7 @@ def _verify_attention_metadata_kernel(
                 -1,
             )
         output = ct.where(
-            columns < block_end,
+            columns < window_size,
             output,
             compressed,
         )
@@ -1353,7 +1356,7 @@ def _verify_attention_metadata_kernel(
     ct.scatter(
         sparse_lengths,
         (batch, query),
-        (block_end + compressed_complete).astype(ct.int32),
+        (window_size + compressed_complete).astype(ct.int32),
         mask=tile == 0,
     )
     ct.scatter(
@@ -1377,10 +1380,14 @@ def verify_attention_metadata(
     window_mapping: PagedCacheMapping,
     compressed_mapping: PagedCacheMapping | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Build all sparse-verification indices and lengths in one launch."""
+    """Build a fixed SWA segment followed by compressed sparse-MLA rows."""
 
     if position.ndim != 1 or block_length <= 0 or window_size <= 0:
         raise ValueError("verification metadata requires valid rows and widths")
+    if window_size != 128:
+        raise ValueError(
+            "FlashInfer DeepSeek-V4 sparse MLA requires a 128-token window"
+        )
     batch_size = position.shape[0]
     if compressed_indices is not None and generated_compressed_width:
         raise ValueError("compressed indices cannot be both supplied and generated")
@@ -1546,9 +1553,8 @@ def _dspark_attention_metadata_kernel(
         (batch, query),
         ct.full((1, 1), window_size + block_length, dtype=ct.int32),
     )
-    # FlashInfer uses the logical sequence length to identify how many leading
-    # sparse indices address the dense-window pool. Draft-block indices follow
-    # that prefix and address the separate block-local KV pool.
+    # FlashInfer uses the logical sequence length to mask the fixed SWA segment;
+    # draft-block indices follow it and address the separate block-local pool.
     ct.store(
         sequence_lengths,
         (batch, query),
@@ -1573,6 +1579,10 @@ def dspark_attention_metadata(
         or window_capacity < window_size
     ):
         raise ValueError("DSpark attention metadata requires valid geometry")
+    if window_size != 128:
+        raise ValueError(
+            "FlashInfer DeepSeek-V4 sparse MLA requires a 128-token window"
+        )
     batch_size = position.shape[0]
     index_width = math.ceil((window_size + block_length) / 64) * 64
     indices = torch.empty(

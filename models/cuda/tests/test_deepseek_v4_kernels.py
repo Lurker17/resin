@@ -158,6 +158,153 @@ def test_index_scores_and_topk_preserve_causality_and_packed_addresses(kernels):
             )
 
 
+def _sparse_mla_reference(query, window_cache, compressed_cache, rows, sinks, scale):
+    """Independent FP32 softmax, with a sink logit carrying zero value."""
+
+    outputs = []
+    for batch, (window, compressed) in enumerate(rows):
+        values = torch.cat(
+            (
+                window_cache.view(-1, 512)[window],
+                compressed_cache.view(-1, 512)[compressed],
+            )
+        ).float()
+        scores = (query[batch, 0].float()[:, None] * values[None]).sum(-1) * scale
+        scores = torch.cat((scores, sinks[:, None]), dim=-1)
+        probabilities = scores.softmax(dim=-1)[:, :-1]
+        outputs.append((probabilities[..., None] * values[None]).sum(1))
+    return torch.stack(outputs).unsqueeze(1)
+
+
+@pytest.mark.parametrize("lengths", [(17,), (1, 17, 511)])
+@pytest.mark.parametrize("ratio", [0, 4, 128])
+def test_native_sparse_mla_matches_reference_across_padding_and_graphs(
+    kernels, lengths, ratio
+):
+    from resin_models_cuda.deepseek_v4.attention import sparse_decode_attention
+
+    batch, heads, dimension = len(lengths), 32, 512
+    parents = torch.arange(1, 1 + batch * 4, device="cuda", dtype=torch.int32).view(
+        batch, 4
+    )
+
+    def mapping(divisor):
+        return DeviceMapping(
+            parent_ids=parents,
+            child_slots=torch.zeros_like(parents),
+            first_blocks=torch.zeros(batch, device="cuda", dtype=torch.int32),
+            block_tokens=128,
+            divisor=divisor,
+            parent_rows=128,
+            packing=1,
+            row_scale=1,
+            layer_offset=0,
+        )
+
+    # Distinct pools make a misplaced compressed row observable: sharing a
+    # latent allocation can hide an incorrect SWA/compressed segment boundary.
+    shape = (1 + batch * 4, 128, dimension)
+    window_cache = (torch.randn(shape, device="cuda") * 0.25 - 0.5).bfloat16()
+    compressed_cache = (torch.randn(shape, device="cuda") * 0.25 + 0.5).bfloat16()
+    original_query = torch.randn(
+        batch, 1, heads, dimension, device="cuda", dtype=torch.bfloat16
+    )
+    sinks = torch.linspace(-1, 1, heads, device="cuda", dtype=torch.float32)
+    positions = torch.tensor(lengths, device="cuda", dtype=torch.int32) - 1
+    workspace = torch.zeros(128 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    rows = []
+    for row, length in enumerate(lengths):
+        window = torch.arange(max(0, length - 128), length, device="cuda")
+        window_rows = parents[row, window // 128].long() * 128 + window % 128
+        logical = torch.arange(length // ratio if ratio else 0, device="cuda")
+        times = logical * (ratio or 1)
+        compressed_rows = parents[row, times // 128].long() * 128 + times % 128 // (
+            ratio or 1
+        )
+        rows.append((window_rows, compressed_rows))
+    expected = _sparse_mla_reference(
+        original_query, window_cache, compressed_cache, rows, sinks, dimension**-0.5
+    )
+    capacities = (64, 128, 512) if ratio == 4 else (4, 64, 512) if ratio else (0,)
+    if max(lengths) > 256 and ratio == 4:
+        capacities = (128, 192, 512)
+    first_output = None
+    for capacity in capacities:
+        compressed = None
+        if ratio == 4:
+            compressed = torch.full(
+                (batch, 1, capacity), -1, device="cuda", dtype=torch.int32
+            )
+            for row, (_, selected) in enumerate(rows):
+                compressed[row, 0, : selected.numel()] = selected.int()
+        indices, sparse_lengths, sequence_lengths = kernels.verify_attention_metadata(
+            positions,
+            1,
+            128,
+            128,
+            compressed,
+            0,
+            ratio,
+            capacity if ratio == 128 else 0,
+            window_mapping=mapping(1),
+            compressed_mapping=mapping(ratio) if ratio else None,
+        )
+        for row, (window, selected) in enumerate(rows):
+            assert sparse_lengths[row, 0].item() == 128 + selected.numel()
+            torch.testing.assert_close(indices[row, 0, : window.numel()].long(), window)
+            assert (indices[row, 0, window.numel() : 128] == -1).all()
+            torch.testing.assert_close(
+                indices[row, 0, 128 : 128 + selected.numel()].long(), selected
+            )
+        query = original_query.clone()
+
+        def run():
+            return sparse_decode_attention(
+                query,
+                window_cache,
+                compressed_cache,
+                sinks,
+                indices,
+                sparse_lengths.flatten(),
+                sequence_lengths.flatten(),
+                workspace,
+                dimension**-0.5,
+            )
+
+        eager = run()
+        torch.testing.assert_close(
+            eager.float(), expected, atol=0.015625, rtol=0.015625
+        )
+        if first_output is None:
+            first_output = eager.clone()
+        else:
+            torch.testing.assert_close(
+                eager, first_output, atol=0.015625, rtol=0.015625
+            )
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                captured = run()
+            query.add_(0.25)
+            graph.replay()
+            torch.cuda.synchronize()
+            replay_reference = _sparse_mla_reference(
+                query, window_cache, compressed_cache, rows, sinks, dimension**-0.5
+            )
+            torch.testing.assert_close(
+                captured.float(), replay_reference, atol=0.015625, rtol=0.015625
+            )
+        finally:
+            graph.reset()
+
+
 def test_rejected_compressor_cleanup_preserves_accepted_and_unrelated_rows(kernels):
     mapping = _mapping(first_blocks=(15, 31), block_tokens=8)
     starts = torch.tensor([126, 254], device="cuda", dtype=torch.int32)

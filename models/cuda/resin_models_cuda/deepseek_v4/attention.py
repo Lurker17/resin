@@ -42,6 +42,8 @@ def sparse_decode_attention(
         raise ValueError("DeepSeek-V4 physical KV pools must be contiguous")
     if indices.shape[:2] != (batch_size, 1):
         raise ValueError("DeepSeek-V4 sparse indices must contain one row per query")
+    if indices.shape[-1] < 128:
+        raise ValueError("sparse indices must include the fixed 128 SWA entries")
     if (
         query.shape[-1] != window_cache.shape[-1]
         or query.shape[-1] != compressed_cache.shape[-1]
@@ -93,6 +95,8 @@ def sparse_verify_attention(
         raise ValueError("DeepSeek-V4 physical KV pools must be contiguous")
     if indices.shape[:2] != (batch_size, block_length):
         raise ValueError("DeepSeek-V4 sparse indices must match the query block")
+    if indices.shape[-1] < 128:
+        raise ValueError("sparse indices must include the fixed 128 SWA entries")
     if sparse_lengths.shape != (batch_size, block_length):
         raise ValueError("DeepSeek-V4 sparse lengths must match the query block")
     if sequence_lengths.shape != (batch_size, block_length):

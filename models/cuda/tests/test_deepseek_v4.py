@@ -851,9 +851,12 @@ class TestDeepSeekV4Attention:
         query = torch.zeros(2, 1, 2, 4)
         window = torch.arange(24, dtype=torch.float32).view(2, 3, 4)
         compressed = torch.arange(16, dtype=torch.float32).view(2, 2, 4)
-        indices = torch.tensor([[[2, 1, 0, 1]], [[1, 0, -1, -1]]], dtype=torch.int32)
+        indices = torch.full((2, 1, 132), -1, dtype=torch.int32)
+        indices[0, 0, :3] = torch.tensor([2, 1, 0])
+        indices[0, 0, 128] = 1
+        indices[1, 0, :2] = torch.tensor([1, 0])
         sinks = torch.tensor([1.0, 1.0])
-        sparse_lengths = torch.tensor([4, 2], dtype=torch.int32)
+        sparse_lengths = torch.tensor([129, 128], dtype=torch.int32)
         sequence_lengths = torch.tensor([3, 2], dtype=torch.int32)
         workspace = torch.empty(8, dtype=torch.uint8)
 
@@ -883,7 +886,7 @@ class TestDeepSeekV4Attention:
         assert kwargs["enable_pdl"] is True
         assert output.shape == query.shape
 
-        unaligned_indices = torch.zeros(2, 1, 5, dtype=torch.int32)
+        unaligned_indices = torch.zeros(2, 1, 133, dtype=torch.int32)
         attention.sparse_decode_attention(
             query,
             window,
@@ -896,9 +899,23 @@ class TestDeepSeekV4Attention:
             0.5,
         )
         padded_indices = calls[1][0][3]
-        assert padded_indices.shape == (2, 8)
-        assert torch.equal(padded_indices[:, :5], unaligned_indices.view(2, 5))
-        assert torch.equal(padded_indices[:, 5:], torch.full((2, 3), -1))
+        assert padded_indices.shape == (2, 136)
+        assert torch.equal(padded_indices[:, :133], unaligned_indices.view(2, 133))
+        assert torch.equal(padded_indices[:, 133:], torch.full((2, 3), -1))
+
+        with pytest.raises(ValueError, match="fixed 128 SWA entries"):
+            attention.sparse_decode_attention(
+                query,
+                window,
+                compressed,
+                sinks,
+                indices[..., :127],
+                sparse_lengths,
+                sequence_lengths,
+                workspace,
+                0.5,
+            )
+        assert len(calls) == 2
 
         complete = torch.tensor([0, 32, 2048])
         assert attention.sparse_topk_lengths(complete, 512, 128).tolist() == [
@@ -941,8 +958,10 @@ class TestDeepSeekV4Attention:
         query = torch.zeros(2, 3, 2, 4)
         window = torch.zeros(2, 7, 4)
         compressed = torch.zeros(2, 5, 4)
-        indices = torch.zeros(2, 3, 5, dtype=torch.int32)
-        sparse_lengths = torch.full((2, 3), 5, dtype=torch.int32)
+        indices = torch.full((2, 3, 133), -1, dtype=torch.int32)
+        indices[..., 0] = 0
+        indices[..., 128] = 0
+        sparse_lengths = torch.full((2, 3), 129, dtype=torch.int32)
         sequence_lengths = torch.arange(1, 7, dtype=torch.int32).view(2, 3)
         sinks = torch.ones(2)
         workspace = torch.empty(8, dtype=torch.uint8)
@@ -963,7 +982,9 @@ class TestDeepSeekV4Attention:
         assert args[0].shape == (6, 1, 2, 4)
         assert args[1] is window
         assert args[2] is workspace
-        assert args[3].shape == (6, 8)
+        assert args[3].shape == (6, 136)
+        assert torch.equal(args[3][:, :133], indices.view(6, 133))
+        assert (args[3][:, 133:] == -1).all()
         assert kwargs["compressed_kv_cache"] is compressed
         assert torch.equal(kwargs["sparse_topk_lens"], sparse_lengths.flatten())
         assert torch.equal(kwargs["seq_lens"], sequence_lengths.flatten())
@@ -983,6 +1004,20 @@ class TestDeepSeekV4Attention:
             enable_pdl=False,
         )
         assert calls[1][1]["enable_pdl"] is False
+
+        with pytest.raises(ValueError, match="fixed 128 SWA entries"):
+            attention.sparse_verify_attention(
+                query,
+                window,
+                compressed,
+                sinks,
+                indices[..., :127],
+                sparse_lengths,
+                sequence_lengths,
+                workspace,
+                0.5,
+            )
+        assert len(calls) == 2
 
 
 class TestDeepSeekV4Runner:

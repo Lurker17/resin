@@ -52,7 +52,9 @@ def test_attention_metadata_keeps_each_query_inside_its_sliding_window(
     for query in range(block_length):
         position = start + query
         expected = list(range(max(0, position - window + 1), position + 1))
-        assert lengths[0, query].item() == len(expected)
+        # The native ABI keeps 128 SWA columns, including invalid early rows.
+        # seq_lens and -1 entries provide causality inside that fixed segment.
+        assert lengths[0, query].item() == window
         assert sequence_lengths[0, query].item() == position + 1
         # Parent zero is reserved; this identity mapping offsets rows by 128.
         actual = indices[0, query]
