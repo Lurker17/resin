@@ -315,8 +315,8 @@ def speculative_record():
                             "request_id": 8,
                             "index": index,
                             "token_id": 1,
-                            "logprob": None,
-                            "top_logprobs": [],
+                            "logprob": -0.5,
+                            "top_logprobs": [(0, -0.5), (1, -1.0), (2, -2.0)],
                         }
                         for index in range(16)
                     ],
@@ -328,8 +328,8 @@ def speculative_record():
                             "request_id": 8,
                             "index": index,
                             "token_id": 1,
-                            "logprob": None,
-                            "top_logprobs": [],
+                            "logprob": -0.5,
+                            "top_logprobs": [(0, -0.5), (1, -1.0), (2, -2.0)],
                         }
                         for index in range(16)
                     ],
@@ -357,6 +357,8 @@ def test_speculative_block_checks_cover_ragged_outputs_and_idle_resume(
         ("counters", "counters"),
         ("indices", "streamed token index"),
         ("scores", "logprob columns"),
+        ("probe_nan", "logprob columns"),
+        ("probe_unscored", "logprob columns"),
         ("no_acceptance", "accept draft tokens"),
         ("no_resume", "did not resume"),
     ],
@@ -373,6 +375,10 @@ def test_speculative_checks_reject_incomplete_execution(
         speculative_record["driver_result"]["events"][2]["index"] = 1
     elif failure == "scores":
         speculative_record["driver_result"]["events"][0]["top_logprobs"].pop()
+    elif failure in ("probe_nan", "probe_unscored"):
+        speculative_record["driver_result"]["probes"][0]["events"][4]["logprob"] = (
+            float("nan") if failure == "probe_nan" else None
+        )
     elif failure == "no_acceptance":
         speculative_record["calls"][2]["output_lengths"] = [1]
         speculative_record["speculative_stats"].update(accepted=0, emitted=2)
@@ -422,6 +428,7 @@ def test_speculative_validation_uses_both_references_and_rejects_other_block_siz
     assert spawn.call_args.args[-1] == 2
     saved = torch.load(tmp_path / "baseline.pt", weights_only=True)
     assert saved["identity"]["speculative_tokens"] == 2
+    assert saved["identity"]["speculative_contract"] == "masked-compressor-ring-v1"
     assert saved["target_report"] == target
     assert saved["report"] == baseline
     spawn.reset_mock()
@@ -436,6 +443,18 @@ def test_speculative_validation_uses_both_references_and_rejects_other_block_siz
             },
         )
     spawn.assert_not_called()
+    saved["identity"].pop("speculative_contract")
+    torch.save(saved, tmp_path / "old-baseline.pt")
+    with pytest.raises(ValueError, match="attention contract"):
+        validation.run_composable_validation(
+            tmp_path / "checkpoint",
+            {"probe": [7]},
+            **{
+                **options,
+                "baseline_path": tmp_path / "old-baseline.pt",
+            },
+        )
+    spawn.assert_not_called()
 
 
 @pytest.mark.parametrize("count", [-1, True, 1.5])
@@ -447,3 +466,104 @@ def test_composed_speculative_validation_requires_integer_block_size(
         validation.run_composable_validation(
             "checkpoint", {"probe": [7]}, vocab_size=3, speculative_tokens=count
         )
+
+
+def test_worker_failure_retains_child_evidence_after_temporary_directory_cleanup(
+    monkeypatch, tmp_path
+):
+    from pathlib import Path
+
+    def spawn(target, *, args, **options):
+        Path(args[1], "error-0.json").write_text('{"error":"nonfinite logits"}')
+        return SimpleNamespace(
+            join=Mock(side_effect=RuntimeError("child failed")), processes=[]
+        )
+
+    monkeypatch.setattr(validation.torch.multiprocessing, "spawn", spawn)
+    with pytest.raises(RuntimeError, match="child failed"):
+        validation._spawn(
+            object(),
+            "checkpoint",
+            {},
+            world_size=2,
+            failure_directory=tmp_path / "workers",
+        )
+    assert json.loads((tmp_path / "workers/error-0.json").read_text()) == {
+        "error": "nonfinite logits"
+    }
+
+
+@pytest.mark.parametrize("failure", [None, "nonfinite", "changed", "cache"])
+def test_legacy_dspark_reference_scores_and_replays_all_tokens(
+    monkeypatch, tmp_path, failure
+):
+    runner = SimpleNamespace(speculative_stats={}, close_cuda_graphs=Mock())
+
+    class ReferenceEngine:
+        cache_parent_capacity = 64
+        cache_free_parent_count = 63 if failure == "cache" else 64
+
+        def __init__(self, *args, **kwargs):
+            self.requests = []
+            self.close = Mock()
+
+        def submit(self, prompt, *, max_new_tokens, sampling_params):
+            assert sampling_params.logprobs and sampling_params.top_logprobs == 3
+            assert max_new_tokens == 16
+            ids = [2 if failure == "changed" and self.requests else 1] * 16
+            request = SimpleNamespace(take_result=lambda: ids)
+            self.requests.append(request)
+            return request
+
+    engine = ReferenceEngine()
+
+    def drain(engine, events):
+        events.extend(
+            {"logprob": -0.5, "top_logprobs": [(0, -0.5), (1, -1.0), (2, -2.0)]}
+            for _ in range(16)
+        )
+        if failure == "nonfinite" and len(engine.requests) == 2:
+            events[4]["logprob"] = float("nan")
+
+    monkeypatch.setattr(validation, "_initialize", lambda *args: None)
+    monkeypatch.setattr(validation, "_new_runner", lambda *args, **kwargs: runner)
+    monkeypatch.setattr(validation, "Engine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr(validation, "_drain", drain)
+    monkeypatch.setattr(validation.torch.cuda, "synchronize", lambda *args: None)
+    monkeypatch.setattr(validation.dist, "barrier", lambda: None)
+    monkeypatch.setattr(validation.dist, "destroy_process_group", lambda: None)
+
+    def execute():
+        validation._run_tp_baseline_rank(
+            0,
+            1,
+            tmp_path,
+            "checkpoint",
+            {"probe": [7]},
+            world_size=2,
+            speculative_tokens=5,
+            probe_tokens=16,
+        )
+
+    if failure is None:
+        execute()
+        report = json.loads((tmp_path / "0.json").read_text())
+        assert report["token_ids"] == report["replay_token_ids"] == [1] * 16
+        assert report["free_after_replay"] == report["parent_capacity"] == 64
+        assert len(report["events"]) == len(report["replay_events"]) == 16
+    else:
+        with pytest.raises(
+            AssertionError,
+            match={
+                "nonfinite": "finite token scores",
+                "changed": "replay changed",
+                "cache": "leaked cache parents",
+            }[failure],
+        ):
+            execute()
+        failure_report = json.loads((tmp_path / "error-0.json").read_text())
+        assert failure_report["error"].startswith("AssertionError:")
+        assert len(failure_report["replay_events"]) == 16
+    assert len(engine.requests) == 2
+    engine.close.assert_called_once()
+    runner.close_cuda_graphs.assert_called_once()

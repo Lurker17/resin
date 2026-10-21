@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import socket
 import tempfile
 import time
@@ -319,7 +320,6 @@ def _driver_workload(
     engine = DistributedEngine(worker, **_engine_options())
     requests, events, cancellations = {}, [], []
     sampling = _sampling()
-    probe_sampling = SamplingParams(temperature=0.0) if speculative_tokens else sampling
     probe_tokens = SPECULATIVE_PROBE_TOKENS if speculative_tokens else 4
     try:
 
@@ -371,7 +371,7 @@ def _driver_workload(
             probe = engine.submit(
                 prompts["probe"],
                 max_new_tokens=probe_tokens,
-                sampling_params=probe_sampling,
+                sampling_params=sampling,
             )
             probe_events = []
             _drain(engine, probe_events)
@@ -492,6 +492,27 @@ def _run_rank(
             "driver_result": result,
         }
         Path(report_directory, f"{rank}.json").write_text(json.dumps(report))
+    except BaseException as error:
+        if runner is not None:
+            failure = {
+                "rank": rank,
+                "error": f"{type(error).__name__}: {error}",
+                "calls": runner.calls,
+                "speculative_stats": runner.speculative_stats,
+                "cuda_graph_stats": runner.cuda_graph_stats,
+            }
+            try:
+                torch.save(
+                    {
+                        shape: values.detach().float().cpu()
+                        for shape, values in runner._graph_logits.items()
+                    },
+                    Path(report_directory, f"error-{rank}-graph-logits.pt"),
+                )
+            except BaseException as dump_error:
+                failure["logit_dump_error"] = str(dump_error)
+            Path(report_directory, f"error-{rank}.json").write_text(json.dumps(failure))
+        raise
     finally:
         if runner is not None:
             runner.close_cuda_graphs()
@@ -520,24 +541,56 @@ def _run_tp_baseline_rank(
         )
     )
     engine = Engine(runner, **_engine_options())
+    events, replay_events, result = [], [], None
     try:
         with _DecodeTrace(runner) if numerical else nullcontext() as trace:
             request = engine.submit(
                 prompts["probe"],
                 max_new_tokens=probe_tokens,
-                sampling_params=(
-                    SamplingParams(temperature=0.0)
-                    if speculative_tokens
-                    else _sampling()
-                ),
+                sampling_params=_sampling(),
             )
-            events = []
             _drain(engine, events)
         result = {
             "token_ids": request.take_result(),
             "events": events,
             "speculative_stats": runner.speculative_stats,
         }
+        if speculative_tokens:
+            free_after_reference = engine.cache_free_parent_count
+            replay = engine.submit(
+                prompts["probe"],
+                max_new_tokens=probe_tokens,
+                sampling_params=_sampling(),
+            )
+            _drain(engine, replay_events)
+            replay_ids = replay.take_result()
+            result.update(
+                replay_token_ids=replay_ids,
+                replay_events=replay_events,
+                free_after_reference=free_after_reference,
+                free_after_replay=engine.cache_free_parent_count,
+                parent_capacity=engine.cache_parent_capacity,
+                speculative_stats=runner.speculative_stats,
+            )
+            if replay_ids != result["token_ids"]:
+                raise AssertionError("legacy DSpark replay changed after cache reuse")
+            if len(events) != probe_tokens or len(replay_events) != probe_tokens:
+                raise AssertionError("legacy DSpark reference omitted streamed tokens")
+            if any(
+                event["logprob"] is None
+                or not math.isfinite(event["logprob"])
+                or len(event["top_logprobs"]) != 3
+                or any(not math.isfinite(value) for _, value in event["top_logprobs"])
+                for event in [*events, *replay_events]
+            ):
+                raise AssertionError(
+                    "legacy DSpark reference omitted finite token scores"
+                )
+            if any(
+                result[field] != result["parent_capacity"]
+                for field in ("free_after_reference", "free_after_replay")
+            ):
+                raise AssertionError("legacy DSpark reference leaked cache parents")
         if numerical:
             torch.save(
                 _teacher_logits(engine, runner, prompts),
@@ -547,13 +600,29 @@ def _run_tp_baseline_rank(
         torch.cuda.synchronize()
         dist.barrier()
         Path(report_directory, f"{rank}.json").write_text(json.dumps(result))
+    except BaseException as error:
+        Path(report_directory, f"error-{rank}.json").write_text(
+            json.dumps(
+                {
+                    "rank": rank,
+                    "error": f"{type(error).__name__}: {error}",
+                    "events": events,
+                    "replay_events": replay_events,
+                    "report": result,
+                    "speculative_stats": runner.speculative_stats,
+                }
+            )
+        )
+        raise
     finally:
         engine.close()
         runner.close_cuda_graphs()
         dist.destroy_process_group()
 
 
-def _spawn(target, model_path, prompts, *extra, world_size=WORLD_SIZE):
+def _spawn(
+    target, model_path, prompts, *extra, world_size=WORLD_SIZE, failure_directory=None
+):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -571,6 +640,10 @@ def _spawn(target, model_path, prompts, *extra, world_size=WORLD_SIZE):
                     raise TimeoutError(
                         "DeepSeek-V4 parallel validation exceeded 40 minutes"
                     )
+        except BaseException:
+            if failure_directory is not None:
+                shutil.copytree(directory, failure_directory, dirs_exist_ok=True)
+            raise
         finally:
             for process in context.processes:
                 if process.is_alive():
@@ -590,9 +663,7 @@ def _spawn(target, model_path, prompts, *extra, world_size=WORLD_SIZE):
         return records
 
 
-def _validate_records(
-    records, attn_dp, vocab_size, *, topology=None, graphs=False, speculative_tokens=0
-):
+def _validate_records(records, attn_dp, vocab_size, *, topology=None, graphs=False):
     drivers = [record["driver_result"] for record in records if record["driver"]]
     if len(drivers) != attn_dp:
         raise AssertionError("request Engine count does not match attention DP")
@@ -623,11 +694,10 @@ def _validate_records(
             raise AssertionError("completed/cancelled requests leaked cache parents")
         if driver["probes"][0]["token_ids"] != driver["probes"][1]["token_ids"]:
             raise AssertionError("greedy isolated replay changed after cache reuse")
-        scored_events = list(driver["events"])
-        if not speculative_tokens:
-            scored_events.extend(
-                event for probe in driver["probes"] for event in probe["events"]
-            )
+        scored_events = [
+            *driver["events"],
+            *(event for probe in driver["probes"] for event in probe["events"]),
+        ]
         for event in scored_events:
             if event["logprob"] is None or not math.isfinite(event["logprob"]):
                 raise AssertionError("full-model generation omitted finite logprobs")
@@ -677,7 +747,6 @@ def _validate_records(
         "checks": {
             "phases_aligned": True,
             "finite_scores": True,
-            "probe_token_only": bool(speculative_tokens),
             "cache_reclaimed": True,
             "isolated_replay_identical": True,
             "independent_request_engines": attn_dp,
@@ -866,8 +935,10 @@ def _validate_speculative_records(records, speculative_tokens):
             by_request = {}
             for event in events:
                 by_request.setdefault(event["request_id"], []).append(event["index"])
-                if event["logprob"] is not None and (
-                    len(event["top_logprobs"]) != 3
+                if (
+                    event["logprob"] is None
+                    or not math.isfinite(event["logprob"])
+                    or len(event["top_logprobs"]) != 3
                     or any(
                         not math.isfinite(value) for _, value in event["top_logprobs"]
                     )
@@ -908,6 +979,7 @@ def _validate_speculative_records(records, speculative_tokens):
         "accepted_draft_tokens": accepted,
         "variable_output_rows_valid": True,
         "stream_indices_contiguous": True,
+        "accepted_tokens_have_finite_scores": True,
         "idle_replica_resumed": len([record for record in records if record["driver"]])
         > 1,
     }
@@ -953,6 +1025,7 @@ def _run_speculative_validation(
         "world_size": world_size,
         "prompts": prompts,
         "speculative_tokens": speculative_tokens,
+        "speculative_contract": "masked-compressor-ring-v1",
         "probe_tokens": SPECULATIVE_PROBE_TOKENS,
         "attention_contract": "fixed-swa128-canonical-selected-capacity",
     }
@@ -973,6 +1046,9 @@ def _run_speculative_validation(
                     count,
                     SPECULATIVE_PROBE_TOKENS,
                     world_size=world_size,
+                    failure_directory=None
+                    if directory is None
+                    else directory / f"baseline-k{count}-workers",
                 )[0]
             )
         target, baseline = references
@@ -1035,6 +1111,9 @@ def _run_speculative_validation(
                 decode_capacity,
                 speculative_tokens,
                 world_size=world_size,
+                failure_directory=None
+                if directory is None
+                else directory / f"{name}-workers",
             )
             report = {"name": name, "ranks": records}
             result["cases"].append(report)
@@ -1046,7 +1125,6 @@ def _run_speculative_validation(
                     vocab_size,
                     topology=topology,
                     graphs=graphs,
-                    speculative_tokens=speculative_tokens,
                 )
             )
             report["speculative_checks"] = _validate_speculative_records(
