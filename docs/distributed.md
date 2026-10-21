@@ -30,8 +30,9 @@ CUDA runners declare `parallelism_capabilities`; the shared base defaults to
 single-rank execution. GPT-OSS and DeepSeek-V4 declare attention TP, attention DP,
 CP, EP, expert TP, and attention replication. These axes compose through the
 explicit `parallel_groups=` preparation path. Model dimensions, quantization
-blocks, and kernel capabilities still constrain valid layouts; DeepSeek's
-explicit-group path also requires speculative decoding to be disabled.
+blocks, and kernel capabilities still constrain valid layouts. DeepSeek-V4
+DSpark uses the same meshes for draft and target verification, including
+empty-replica participation and captured expert exchanges.
 Both explicit-group paths provide
 captured prefill FFN regions and full decode graphs. GPT-OSS EP additionally
 requires a kernel advertising FP32 local expert partials so the cross-rank
@@ -76,6 +77,11 @@ FP32 partials through the combine. Sampling broadcasts use
 `groups.device_replica`, covering every rank executing one logical request
 replica. The older `group=` dispatcher API retains its optional single-source
 attention-replication behavior.
+
+Eager combine groups returned partials by their origin while preserving owner
+rank order, then reduces each segment in that order. This avoids unordered CUDA
+atomic additions changing repeated greedy outputs. Both transports preserve the
+local callback's partial dtype until the final cast to the hidden-state dtype.
 
 This dense graph transport is a correctness prototype. Every expert owner
 receives `world_size * capacity` rows, including padding and foreign routes.

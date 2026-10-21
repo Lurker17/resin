@@ -934,7 +934,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
 
     def _distributed_decode_graph(
         self, plan: BatchPlan | None, context: StepContext
-    ) -> tuple[bool, list[int] | ForwardOutput | None]:
+    ) -> tuple[bool, list[int] | list[list[int]] | ForwardOutput | None]:
         """Replay one common graph bucket across independent attention replicas."""
 
         shape = self._select_distributed_cuda_graph(
