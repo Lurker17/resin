@@ -110,6 +110,9 @@ def test_graph_cache_uses_fixed_tables_and_null_capture_inputs() -> None:
         (3, 3),
     ]
     inputs = arena.graph_shape_capture_inputs(3, 257)
-    assert len(inputs["cache.0.slabs"]) == 9
-    assert len(inputs["cache.1.slabs"]) == 3
+    target_slabs = inputs["cache.0.slabs"]
+    state_slabs = inputs["cache.1.slabs"]
+    assert isinstance(target_slabs, tuple) and isinstance(state_slabs, tuple)
+    assert len(target_slabs) == 9
+    assert len(state_slabs) == 3
     assert set(inputs.values()) == {(0,) * 9, (0,) * 3}

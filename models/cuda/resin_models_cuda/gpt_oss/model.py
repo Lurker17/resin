@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from typing import cast
 
 import torch
 from torch import Tensor, nn
@@ -235,9 +236,12 @@ class MoETransformerModel(nn.Module):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
         )
-        self.layers = nn.ModuleList(
-            MoEDecoderLayer(config, index, expert_factory)
-            for index in range(config.num_hidden_layers)
+        self.layers = cast(
+            Sequence[MoEDecoderLayer],
+            nn.ModuleList(
+                MoEDecoderLayer(config, index, expert_factory)
+                for index in range(config.num_hidden_layers)
+            ),
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = YarnRotaryEmbedding(config)
@@ -258,7 +262,7 @@ class MoEForCausalLM(nn.Module):
         std = self.config.initializer_range
         if isinstance(module, (nn.Linear, nn.Embedding)):
             nn.init.normal_(module.weight, std=std)
-            if getattr(module, "bias", None) is not None:
+            if isinstance(module, nn.Linear) and module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, RMSNorm):
             if module.weight is not None:

@@ -7,6 +7,7 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
+from resin.protocols import ParserEvent, RenderedPrompt
 from resin.server import encode_stop_tokens
 
 
@@ -49,7 +50,7 @@ class DeepSeekV4Codec:
         self._tokenizer = tokenizer
         self._encoding = encoding
 
-    def render(self, request: dict[str, Any]) -> dict[str, list[int]]:
+    def render(self, request: dict[str, Any]) -> RenderedPrompt:
         messages = copy.deepcopy(request["messages"])
         tools = request.get("tools") or []
         extra = request.get("extra") or {}
@@ -57,7 +58,7 @@ class DeepSeekV4Codec:
             if messages and messages[0].get("role") == "system":
                 system = messages[0]
             else:
-                system = {"role": "system", "content": ""}
+                system: dict[str, Any] = {"role": "system", "content": ""}
                 messages.insert(0, system)
             if tools:
                 system["tools"] = [
@@ -110,10 +111,10 @@ class DeepSeekV4ResponseParser:
         self._content = ""
         self._tools_emitted = False
 
-    def feed(self, token_ids: Sequence[int]) -> list[dict[str, Any]]:
+    def feed(self, token_ids: Sequence[int]) -> list[ParserEvent]:
         self._token_ids.extend(token_ids)
         text = self._tokenizer.decode(self._token_ids, skip_special_tokens=False)
-        events: list[dict[str, Any]] = []
+        events: list[ParserEvent] = []
         if self._encoding.eos_token in text:
             parsed = self._encoding.parse_message_from_completion_text(
                 text, thinking_mode=self._thinking_mode
@@ -181,7 +182,7 @@ class DeepSeekV4ResponseParser:
 
     @staticmethod
     def _append_delta(
-        events: list[dict[str, Any]],
+        events: list[ParserEvent],
         event_type: str,
         previous: str,
         current: str,
@@ -193,8 +194,8 @@ class DeepSeekV4ResponseParser:
         events.append({"type": event_type, "delta": current[len(previous) :]})
 
     @staticmethod
-    def _tool_events(tool_calls: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-        events = []
+    def _tool_events(tool_calls: Sequence[dict[str, Any]]) -> list[ParserEvent]:
+        events: list[ParserEvent] = []
         for index, tool_call in enumerate(tool_calls):
             function = tool_call.get("function") or {}
             name = function.get("name")

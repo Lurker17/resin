@@ -83,7 +83,7 @@ def _ep_worker(rank: int, rendezvous: str) -> None:
             if masked:
                 weights[max(0, rows - 1) :].zero_()
             torch.testing.assert_close(output, _reference(hidden, indices, weights))
-            counts = [None] * 4
+            counts: list[int] = [0] * 4
             dist.all_gather_object(counts, received_rows[-1])
             if capacity is not None:
                 assert counts == [4 * capacity] * 4
@@ -198,7 +198,8 @@ def test_fixed_capacity_context_validates_and_restores():
     )
     for value in (0, -1, True, 1.5):
         with pytest.raises(ValueError, match="positive integer"):
-            with dispatch.fixed_capacity(value):
+            # Invalid capacities exercise runtime validation.
+            with dispatch.fixed_capacity(value):  # ty: ignore[invalid-argument-type]
                 pass
     with dispatch.fixed_capacity(3):
         assert dispatch._capacity == 3
@@ -214,19 +215,27 @@ def test_fixed_capacity_context_validates_and_restores():
 
 
 def test_model_context_selects_and_restores_all_expert_transports():
+    class Layer(torch.nn.Module):
+        dispatch: ExpertParallelDispatch
+
+    layers = [Layer(), Layer()]
     model = torch.nn.Module()
-    model.layers = torch.nn.ModuleList([torch.nn.Module(), torch.nn.Module()])
-    for layer in model.layers:
-        layer.dispatch = ExpertParallelDispatch(
-            lambda hidden, indices, weights: hidden,
-            num_experts=2,
-            group=RankGroup((0, 1), None, 0),
+    setattr(model, "layers", torch.nn.ModuleList(layers))
+    for layer in layers:
+        setattr(
+            layer,
+            "dispatch",
+            ExpertParallelDispatch(
+                lambda hidden, indices, weights: hidden,
+                num_experts=2,
+                group=RankGroup((0, 1), None, 0),
+            ),
         )
     valid_rows = torch.tensor(2, dtype=torch.int32)
     with fixed_expert_capacity(model, 4, valid_rows=valid_rows):
-        for layer in model.layers:
+        for layer in layers:
             assert layer.dispatch._capacity == 4
             assert layer.dispatch._valid_rows is valid_rows
-    for layer in model.layers:
+    for layer in layers:
         assert layer.dispatch._capacity is None
         assert layer.dispatch._valid_rows is None

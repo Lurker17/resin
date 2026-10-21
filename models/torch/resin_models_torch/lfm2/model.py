@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import cast
+
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -26,6 +29,7 @@ class FullAttentionState:
         if self.keys is None:
             self.keys, self.values = keys, values
         else:
+            assert self.values is not None
             self.keys = torch.cat((self.keys, keys), dim=-2)
             self.values = torch.cat((self.values, values), dim=-2)
         return self.keys, self.values
@@ -147,7 +151,7 @@ class Attention(nn.Module):
         self,
         hidden: Tensor,
         positions: Tensor,
-        states: list[FullAttentionState],
+        states: Sequence[FullAttentionState],
     ) -> Tensor:
         """Decode one token for each independently cached sequence."""
 
@@ -228,7 +232,7 @@ class ShortConv(nn.Module):
         )
         return self.out_proj(gate_c * output.transpose(1, 2))
 
-    def forward_batch(self, hidden: Tensor, states: list[RecurrentState]) -> Tensor:
+    def forward_batch(self, hidden: Tensor, states: Sequence[RecurrentState]) -> Tensor:
         """Decode one token for each independently cached sequence."""
 
         batch, length, _ = hidden.shape
@@ -301,10 +305,12 @@ class DecoderLayer(nn.Module):
         normalized = self.operator_norm(hidden)
         if self.is_attention_layer:
             hidden = hidden + self.self_attn.forward_batch(
-                normalized, positions, states
+                normalized, positions, cast(Sequence[FullAttentionState], states)
             )
         else:
-            hidden = hidden + self.conv.forward_batch(normalized, states)
+            hidden = hidden + self.conv.forward_batch(
+                normalized, cast(Sequence[RecurrentState], states)
+            )
         return hidden + self.feed_forward(self.ffn_norm(hidden))
 
 
@@ -329,7 +335,7 @@ class Lfm2Model(nn.Module):
         self, tokens: Tensor, positions: Tensor, states: list[Lfm2State]
     ) -> Tensor:
         hidden = self.embed_tokens(tokens)
-        for index, layer in enumerate(self.layers):
+        for index, layer in enumerate(cast(Sequence[DecoderLayer], self.layers)):
             layer_states = [state.layers[index] for state in states]
             hidden = layer.forward_batch(hidden, positions, layer_states)
         return self.embedding_norm(hidden)

@@ -165,6 +165,7 @@ def load_model(
         else local_args
     )
     kernel_config = moe_kernel_config(expert_args, cuda_architecture(target))
+    assert kernel_moe is not None
     kernel_moe.validate(kernel_config)
     with torch.device("meta"):
         model = MoEForCausalLM(

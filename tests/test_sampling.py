@@ -65,7 +65,8 @@ class TestSamplingContract:
             {"seed": -1},
         ):
             with pytest.raises(ValueError):
-                SamplingParams(**kwargs)
+                # Parametrized invalid values exercise native validation.
+                SamplingParams(**kwargs)  # ty: ignore[invalid-argument-type]
 
     def test_engine_freezes_mixed_row_annotations_and_advances_offsets(self) -> None:
         first_extra = {"processor": "first"}
@@ -224,7 +225,7 @@ class TestSharedSampler:
 
     def test_flashinfer_sampler_rejects_invalid_or_out_of_range_samples(self) -> None:
         sampler = FlashInferSampler.__new__(FlashInferSampler)
-        sampler.torch = torch
+        setattr(sampler, "torch", torch)
         sampler._softmax = lambda logits, *, temperature: torch.softmax(
             logits / temperature[:, None], dim=-1
         )

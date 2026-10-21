@@ -40,6 +40,7 @@ dev = [
   "renderers>=0.1.9",
   "tokenizers>=0.22.2",
   "transformers>=5.14.1",
+  "ty>=0.0.90",
 ]
 
 [tool.maturin]
@@ -84,3 +85,10 @@ resin-models-torch = { workspace = true }
 
 [tool.uv.workspace]
 members = ["models/*"]
+
+[tool.ty.rules]
+# Development doesn't have all GPU-only packages available.
+unresolved-import = "ignore"
+
+# nn.Module declares forward as a writable Callable; model methods specialize it.
+invalid-mutable-override = "ignore"

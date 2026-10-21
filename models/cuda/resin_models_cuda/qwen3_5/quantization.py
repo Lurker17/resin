@@ -9,6 +9,10 @@ from torch import Tensor, nn
 class ModelOptFp8Linear(nn.Module):
     """Tensor-scaled W8A8 linear matching unified ModelOpt tensor names."""
 
+    weight: Tensor
+    input_scale: Tensor
+    weight_scale: Tensor
+
     def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__()
         self.in_features = in_features

@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from typing import TypedDict
+
 import numpy as np
+import numpy.typing as npt
 import torch
+
+from resin import SamplingParams
 
 SAMPLING_OFFSET_STRIDE = 32
 
@@ -81,7 +86,7 @@ def format_output(logits, token_ids, plan):
         (min(params.top_logprobs, values.shape[-1]) for params in policies),
         dtype=np.uint32,
     )[row_ids]
-    max_k = int(counts.max(initial=0))
+    max_k = int(np.max(counts)) if counts.size else 0
     if max_k:
         top_values, top_ids = values.topk(max_k, dim=-1)
         keep = (
@@ -104,12 +109,21 @@ def format_output(logits, token_ids, plan):
     )
 
 
-def batch_sampling_inputs(plan, vocab_size: int) -> dict[str, object]:
+class SamplingInputs(TypedDict):
+    temperatures: tuple[float, ...]
+    top_ps: tuple[float, ...]
+    top_ks: tuple[int, ...]
+    seeds: tuple[int, ...]
+    offsets: tuple[int, ...]
+    sampling_mask: npt.NDArray[np.bool_]
+
+
+def batch_sampling_inputs(plan, vocab_size: int) -> SamplingInputs:
     """Extract backend-friendly primitive arrays from one immutable plan."""
 
     if vocab_size <= 0:
         raise ValueError("vocab_size must be positive")
-    params = tuple(plan.sampling_params)
+    params: tuple[SamplingParams, ...] = tuple(plan.sampling_params)
     rows = plan.num_sequences
     indptr = plan.token_indptr
     context_lengths = plan.context_lengths
@@ -124,9 +138,11 @@ def batch_sampling_inputs(plan, vocab_size: int) -> dict[str, object]:
         * SAMPLING_OFFSET_STRIDE
         for index in range(rows)
     )
-    seeds = tuple(item.seed for item in params)
-    if any(seed is None for seed in seeds):
-        raise ValueError("sampling params must contain effective seeds")
+    seeds = []
+    for item in params:
+        if item.seed is None:
+            raise ValueError("sampling params must contain effective seeds")
+        seeds.append(item.seed)
     return {
         "temperatures": tuple(float(item.temperature) for item in params),
         "top_ps": tuple(float(item.top_p) for item in params),
@@ -134,7 +150,7 @@ def batch_sampling_inputs(plan, vocab_size: int) -> dict[str, object]:
             min(vocab_size, vocab_size if item.top_k is None else int(item.top_k))
             for item in params
         ),
-        "seeds": seeds,
+        "seeds": tuple(seeds),
         "offsets": offsets,
         "sampling_mask": plan.sampling_mask,
     }

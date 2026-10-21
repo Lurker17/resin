@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Literal
 
 
 class GraphInputError(ValueError):
@@ -39,7 +40,7 @@ class CudaFailureGuard:
     def __enter__(self) -> CudaFailureGuard:
         return self
 
-    def __exit__(self, _type, error, _traceback) -> bool:
+    def __exit__(self, _type, error, _traceback) -> Literal[False]:
         if error is None or isinstance(error, GraphInputError):
             return False
         if isinstance(error, PostAcceptCudaError):

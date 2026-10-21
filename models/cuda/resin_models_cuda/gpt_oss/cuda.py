@@ -740,7 +740,7 @@ class GptOssCudaRunner(CudaRunner):
         shape = hidden.shape
         flat = hidden.reshape(-1, shape[-1])
         if flat.shape[0] == 0:
-            mlp.experts.forward_empty()
+            getattr(mlp.experts, "forward_empty")()
             return hidden
         logits = _router_logits(mlp.router, flat)
         indices, weights = _route(mlp.router, logits)
@@ -1072,6 +1072,7 @@ class GptOssCudaRunner(CudaRunner):
                 )
                 if shape is not None:
                     if plan is not None:
+                        assert host is not None
                         return self._graph_forward(plan, host, shape=shape)
                     inputs = self._decode_graph_capture_inputs(shape)
                     inputs["ep_valid_rows"] = 0
@@ -1096,7 +1097,7 @@ class GptOssCudaRunner(CudaRunner):
 
     def _forward_experts_empty(self):
         for layer in self._model.model.layers:
-            layer.mlp.experts.forward_empty()
+            getattr(layer.mlp.experts, "forward_empty")()
 
 
 def _router_logits(router: TopKRouter, hidden: Tensor) -> Tensor:

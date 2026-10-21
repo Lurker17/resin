@@ -17,12 +17,16 @@ def _runner():
         1,
         2,
     )
-    runner.tensor_parallel = SimpleNamespace(enabled=False)
+    setattr(runner, "tensor_parallel", SimpleNamespace(enabled=False))
     runner._prefill_graph_active = True
     runner._full_layer_slots = {0: 0}
-    runner._kv = SimpleNamespace(
-        keys=[torch.zeros(4, 4, 1, 2, dtype=torch.bfloat16)],
-        values=[torch.zeros(4, 4, 1, 2, dtype=torch.bfloat16)],
+    setattr(
+        runner,
+        "_kv",
+        SimpleNamespace(
+            keys=[torch.zeros(4, 4, 1, 2, dtype=torch.bfloat16)],
+            values=[torch.zeros(4, 4, 1, 2, dtype=torch.bfloat16)],
+        ),
     )
     runner.softmax_scale = 2**-0.5
     runner.sliding_window = 128
@@ -48,7 +52,7 @@ def _runner():
         )
         return hidden
 
-    runner._apply_yarn_rotary = rotary
+    setattr(runner, "_apply_yarn_rotary", rotary)
     return runner, attention, calls
 
 

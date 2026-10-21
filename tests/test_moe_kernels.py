@@ -38,21 +38,22 @@ def _config(**changes) -> MoEKernelConfig:
 
 
 def _capabilities(**changes) -> MoEKernelCapabilities:
-    values = {
-        "kernel_id": "test-sm90-mxfp4",
-        "architectures": {"sm90"},
-        "quantizations": {"mxfp4"},
-        "activations": {"swiglu"},
-        "top_k_values": {4},
-        "group_sizes": {32},
-        "supports_expert_bias": True,
-        "min_experts": 8,
-        "max_experts": 128,
-        "min_tokens": 1,
-        "max_tokens": 8192,
-    }
-    values.update(changes)
-    return MoEKernelCapabilities(**values)
+    return replace(
+        MoEKernelCapabilities(
+            kernel_id="test-sm90-mxfp4",
+            architectures=frozenset({"sm90"}),
+            quantizations=frozenset({"mxfp4"}),
+            activations=frozenset({"swiglu"}),
+            top_k_values=frozenset({4}),
+            group_sizes=frozenset({32}),
+            supports_expert_bias=True,
+            min_experts=8,
+            max_experts=128,
+            min_tokens=1,
+            max_tokens=8192,
+        ),
+        **changes,
+    )
 
 
 class TestMoEKernelContract:
@@ -123,9 +124,9 @@ class TestMoEKernelContract:
 
         assert capabilities.architectures == frozenset({"sm90"})
         with pytest.raises(dataclasses.FrozenInstanceError):
-            capabilities.kernel_id = "changed"  # type: ignore[misc]
+            setattr(capabilities, "kernel_id", "changed")  # type: ignore[misc]
         with pytest.raises(dataclasses.FrozenInstanceError):
-            config.top_k = 2  # type: ignore[misc]
+            setattr(config, "top_k", 2)  # type: ignore[misc]
 
     def test_structural_adapter_uses_only_opaque_tensor_objects(self) -> None:
         class FakeKernel:

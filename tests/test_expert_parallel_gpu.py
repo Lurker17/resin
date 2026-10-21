@@ -184,7 +184,8 @@ def test_nccl_expert_dispatch_matches_reference_with_unequal_and_empty_rows(
     try:
         while not context.join(timeout=1):
             if time.monotonic() >= deadline:
-                pytest.fail("NCCL expert dispatch exceeded its 150 second bound")
+                # ty misbinds pytest's decorated helper and drops its reason parameter.
+                pytest.fail("NCCL expert dispatch exceeded its 150 second bound")  # ty: ignore[invalid-argument-type]
     finally:
         for process in context.processes:
             if process.is_alive():
@@ -362,7 +363,7 @@ def test_nccl_expert_dispatch_cuda_graph_replays_routes_and_idle_rows(
     try:
         while not context.join(timeout=1):
             if time.monotonic() >= deadline:
-                pytest.fail("NCCL graph dispatch exceeded its 150 second bound")
+                pytest.fail("NCCL graph dispatch exceeded its 150 second bound")  # ty: ignore[invalid-argument-type]
     finally:
         for process in context.processes:
             if process.is_alive():

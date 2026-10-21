@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -171,8 +171,11 @@ def load_model(
                 / rotary.dim
             )
         )
-    model = prepare_nvfp4_modules(
-        model, select_nvfp4_backend(nvfp4_backend, torch.backends.cudnn.version())
+    model = cast(
+        Qwen3_5ForConditionalGeneration,
+        prepare_nvfp4_modules(
+            model, select_nvfp4_backend(nvfp4_backend, torch.backends.cudnn.version())
+        ),
     )
     model.eval()
     return model, config, raw_config

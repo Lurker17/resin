@@ -481,22 +481,20 @@ class Gemma4CudaRunner(CudaRunner):
             video_token_id=self.config.video_token_id,
         )
         with torch.inference_mode():
-            image = (
-                self._model.get_image_features(
+            image = None
+            if media.pixel_values is not None:
+                assert media.image_position_ids is not None
+                image = self._model.get_image_features(
                     media.pixel_values.to(self.device, dtype=torch.bfloat16),
                     media.image_position_ids.to(self.device),
                 )
-                if media.pixel_values is not None
-                else None
-            )
-            video = (
-                self._model.get_video_features(
+            video = None
+            if media.pixel_values_videos is not None:
+                assert media.video_position_ids is not None
+                video = self._model.get_video_features(
                     media.pixel_values_videos.to(self.device, dtype=torch.bfloat16),
                     media.video_position_ids.to(self.device),
                 )
-                if media.pixel_values_videos is not None
-                else None
-            )
         if image is not None and len(image) != len(media.image_positions):
             raise ValueError("vision features do not match image placeholder count")
         if video is not None and len(video) != len(media.video_positions):
@@ -574,6 +572,7 @@ class Gemma4CudaRunner(CudaRunner):
                     continue
                 kind, feature_index = location
                 source = features.image if kind == "image" else features.video
+                assert source is not None
                 hidden[flat_index].copy_(source[feature_index])
         return features_by_row
 

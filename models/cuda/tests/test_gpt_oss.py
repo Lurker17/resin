@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from resin_models_cuda.gpt_oss.model import MoEForCausalLM
+from resin_models_cuda.gpt_oss.model import DenseExperts, MoEForCausalLM
 
 
 def _tiny_args():
@@ -75,7 +75,7 @@ class TestGptOssImport:
     def test_configs_cover_both_released_model_shapes(self) -> None:
         from resin.models.gpt_oss.config import GptOssConfig
 
-        base = {
+        base: dict[str, object] = {
             "model_type": "gpt_oss",
             "vocab_size": 201_088,
             "hidden_size": 2_880,
@@ -130,6 +130,7 @@ class TestGptOssTorch:
 
     def test_topk_moe_routes_and_weights_selected_experts(self) -> None:
         mlp = self.model.model.layers[0].mlp
+        assert isinstance(mlp.experts, DenseExperts)
         with torch.no_grad():
             mlp.router.weight.zero_()
             mlp.router.bias.copy_(torch.tensor([10.0, 9.0, -10.0, -20.0]))

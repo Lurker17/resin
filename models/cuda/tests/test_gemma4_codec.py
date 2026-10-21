@@ -77,6 +77,7 @@ def test_codec_attaches_media_and_keeps_codec_work_out_of_engine() -> None:
     assert isinstance(rendered["media"], Gemma4Media)
     assert rendered["token_ids"] == [2, 8]
     assert rendered["stop_token_ids"] == [1, 106, 12]
+    assert Processor.seen is not None
     image = Processor.seen[0][0]["content"][0]["image"]
     assert image.dtype == np.float32
     assert Processor.seen[1]["processor_kwargs"] == {"do_rescale": False}

@@ -122,6 +122,8 @@ def _real_prompt_ids(model_path: Path, input_tokens: int) -> list[int]:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if tokenizer is None:
+        raise RuntimeError("the DeepSeek checkpoint did not load a tokenizer")
     prefix = (
         "You are reviewing Resin, a language-model inference engine. Read the "
         "project documentation and implementation excerpts below carefully. "

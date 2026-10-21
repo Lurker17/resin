@@ -37,8 +37,8 @@ def test_quantization_declarations_are_frozen_and_validated() -> None:
     assert config.resolve("experts") == MXFP4
 
     with pytest.raises(TypeError):
-        config.components["attention"] = BF16  # type: ignore[index]
+        config.components["attention"] = BF16  # type: ignore[index]  # ty: ignore[invalid-assignment]
     with pytest.raises(ValueError, match="group_size"):
         WeightEncoding("packed", group_size=0)
     with pytest.raises(TypeError, match="WeightEncoding"):
-        QuantizationConfig({"experts": "mxfp4"})  # type: ignore[dict-item]
+        QuantizationConfig({"experts": "mxfp4"})  # type: ignore[dict-item]  # ty: ignore[invalid-argument-type]

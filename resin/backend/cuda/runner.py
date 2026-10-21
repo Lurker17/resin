@@ -9,7 +9,7 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from resin import BatchPhase, ResourceBinding
+from resin import BatchPhase, ResourceBinding, RunnerConfig
 from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
     CudaGraphExecutor,
@@ -52,6 +52,8 @@ class CudaRunner(Runner):
     about transformer layers, cache geometry, kernels, or quantization.
     """
 
+    runner_config: RunnerConfig
+    prefill_chunk_size: int
     parallelism_capabilities = ParallelismCapabilities()
 
     def __init__(
@@ -104,9 +106,9 @@ class CudaRunner(Runner):
     def _expert_graph_capacity(self, capacity: int, *, valid_rows=None):
         if getattr(self, "_expert_graph_groups", None) is None:
             return nullcontext()
-        return fixed_expert_capacity(
-            self._expert_graph_model, capacity, valid_rows=valid_rows
-        )
+        model = self._expert_graph_model
+        assert model is not None
+        return fixed_expert_capacity(model, capacity, valid_rows=valid_rows)
 
     def _graph_domain_values(self, value):
         groups = getattr(self, "_expert_graph_groups", None)
@@ -394,6 +396,7 @@ class CudaRunner(Runner):
             self._cuda_graph_fallback("prefill", fallback)
             output = operation(flattened, ids)
         else:
+            assert bucket is not None
             inputs, _ = self._prefill_graph_buffers(bucket)
             if "ep_valid_rows" in inputs:
                 inputs["ep_valid_rows"].fill_(tokens)

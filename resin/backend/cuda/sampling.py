@@ -11,12 +11,12 @@ from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, batch_sampling_inputs
 
 @dataclass(frozen=True, slots=True)
 class SamplingTensors:
-    temperatures: object
-    top_ps: object
-    top_ks: object
-    seeds: object
-    offsets: object
-    stochastic_mask: object
+    temperatures: torch.Tensor
+    top_ps: torch.Tensor
+    top_ks: torch.Tensor
+    seeds: torch.Tensor
+    offsets: torch.Tensor
+    stochastic_mask: torch.Tensor
 
 
 class FlashInferSampler:

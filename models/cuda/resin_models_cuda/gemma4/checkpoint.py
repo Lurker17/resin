@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -57,11 +57,16 @@ def resolve_model_path(model: str | Path, revision: str | None = None) -> Path:
 def build_meta_model(
     raw_config: dict[str, Any],
 ) -> tuple[Gemma4ForConditionalGeneration, Gemma4Nvfp4Config]:
-    from transformers.models.gemma4.configuration_gemma4 import Gemma4Config
+    from transformers.models.gemma4.configuration_gemma4 import (
+        Gemma4Config,
+        Gemma4VisionConfig,
+    )
 
     config = Gemma4Nvfp4Config.from_dict(raw_config)
     transformers_config = Gemma4Config.from_dict(raw_config)
-    transformers_config.vision_config._attn_implementation = "sdpa"
+    vision_config = transformers_config.vision_config
+    assert isinstance(vision_config, Gemma4VisionConfig)
+    vision_config._attn_implementation = "sdpa"
     with use_default_dtype(torch.bfloat16):
         with torch.device("meta"):
             model = Gemma4ForConditionalGeneration(config, transformers_config)
@@ -99,8 +104,11 @@ def load_model(
             assign_model_tensor(model, key, reader.read(path, key), device=target)
     model.materialize_buffers(target)
     model.prepare_attention()
-    model = prepare_nvfp4_modules(
-        model, select_nvfp4_backend(nvfp4_backend, torch.backends.cudnn.version())
+    model = cast(
+        Gemma4ForConditionalGeneration,
+        prepare_nvfp4_modules(
+            model, select_nvfp4_backend(nvfp4_backend, torch.backends.cudnn.version())
+        ),
     )
     model.eval()
     return model, config, raw_config

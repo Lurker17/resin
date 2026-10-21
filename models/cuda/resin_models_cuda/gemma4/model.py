@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import Tensor, nn
@@ -158,19 +159,22 @@ class ScaledEmbedding(nn.Embedding):
     def materialize_scale(self) -> None:
         self.scale_tensor = self.weight.new_tensor(self.scale)
 
-    def forward(self, token_ids: Tensor) -> Tensor:
+    def forward(self, input: Tensor) -> Tensor:
         if self.scale_tensor is None:
             raise RuntimeError("embedding scale must be materialized before inference")
-        return super().forward(token_ids) * self.scale_tensor
+        return super().forward(input) * self.scale_tensor
 
 
 class Gemma4TextModel(nn.Module):
     def __init__(self, config: Gemma4Nvfp4Config) -> None:
         super().__init__()
         self.embed_tokens = ScaledEmbedding(config)
-        self.layers = nn.ModuleList(
-            Gemma4DecoderLayer(config, index)
-            for index in range(config.num_hidden_layers)
+        self.layers = cast(
+            Sequence[Gemma4DecoderLayer],
+            nn.ModuleList(
+                Gemma4DecoderLayer(config, index)
+                for index in range(config.num_hidden_layers)
+            ),
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = RotaryEmbedding(config)
@@ -181,16 +185,22 @@ class _Gemma4ModelContainer(nn.Module):
         self, config: Gemma4Nvfp4Config, transformers_config: Gemma4Config
     ) -> None:
         super().__init__()
+        from transformers.models.gemma4.configuration_gemma4 import (
+            Gemma4TextConfig,
+            Gemma4VisionConfig,
+        )
         from transformers.models.gemma4.modeling_gemma4 import (
             Gemma4MultimodalEmbedder,
             Gemma4VisionModel,
         )
 
         self.language_model = Gemma4TextModel(config)
-        self.vision_tower = Gemma4VisionModel(transformers_config.vision_config)
-        self.embed_vision = Gemma4MultimodalEmbedder(
-            transformers_config.vision_config, transformers_config.text_config
-        )
+        vision_config = transformers_config.vision_config
+        text_config = transformers_config.text_config
+        assert isinstance(vision_config, Gemma4VisionConfig)
+        assert isinstance(text_config, Gemma4TextConfig)
+        self.vision_tower = Gemma4VisionModel(vision_config)
+        self.embed_vision = Gemma4MultimodalEmbedder(vision_config, text_config)
 
 
 class Gemma4ForConditionalGeneration(nn.Module):
@@ -209,13 +219,16 @@ class Gemma4ForConditionalGeneration(nn.Module):
         return self.model.language_model
 
     def materialize_buffers(self, device: torch.device) -> None:
+        from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
         from transformers.models.gemma4.modeling_gemma4 import (
             Gemma4VisionRotaryEmbedding,
         )
 
         self.language_model.rotary_emb.materialize(device)
+        vision_config = self.transformers_config.vision_config
+        assert isinstance(vision_config, Gemma4VisionConfig)
         self.model.vision_tower.encoder.rotary_emb = Gemma4VisionRotaryEmbedding(
-            self.transformers_config.vision_config
+            vision_config
         ).to(device)
 
     def prepare_attention(self) -> None:

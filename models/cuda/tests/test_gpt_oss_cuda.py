@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
 import pytest
@@ -39,7 +40,7 @@ from resin_models_cuda.gpt_oss.cuda import (
     _router_logits,
     plan_gpt_oss_kv_capacity,
 )
-from resin_models_cuda.gpt_oss.model import SinkAttention
+from resin_models_cuda.gpt_oss.model import SinkAttention, TopKRouter
 
 
 def build_attention_batches(plan, *, parent_capacity: int = 2048):
@@ -238,7 +239,7 @@ class TestGptOssCudaNativePlan:
     @staticmethod
     def _binding_runner():
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        runner.cache_layout = object()
+        setattr(runner, "cache_layout", object())
         binding = CachePoolBinding(runner.cache_layout, resource="GPT-OSS KV")
         runner._cache_binding = binding
         return runner
@@ -298,12 +299,14 @@ class TestGptOssCudaNativePlan:
         runner = object.__new__(GptOssCudaRunner)
         runner.parallel_groups = None
         runner.vocab_size = 16
-        runner._sampler = FlashInferSampler
-        runner._cuda_graph_mode_enabled = lambda _: True
+        setattr(runner, "_sampler", FlashInferSampler)
+        setattr(runner, "_cuda_graph_mode_enabled", lambda _: True)
         shapes = default_decode_graph_shapes(4, speculative=False, max_batch_size=128)
         runner._graph_logits = {shape: torch.empty(shape[0], 16) for shape in shapes}
-        runner._select_cuda_graph = lambda _, match: next(
-            shape for shape in shapes if match(shape)
+        setattr(
+            runner,
+            "_select_cuda_graph",
+            lambda _, match: next(shape for shape in shapes if match(shape)),
         )
         captured = []
 
@@ -311,7 +314,7 @@ class TestGptOssCudaNativePlan:
             captured.append((mode, shape, inputs))
             return list(range(1000, 1000 + shape[0]))
 
-        runner._run_cuda_graph = replay
+        setattr(runner, "_run_cuda_graph", replay)
         assert runner._graph_forward(plan, batch) == list(range(1000, 1000 + rows))
         mode, shape, inputs = captured.pop()
         assert mode == "decode"
@@ -350,19 +353,23 @@ class TestGptOssCudaNativePlan:
         plan = _flat_plan([130, 260], [1, 1], phase=phase)
         batches = build_attention_batches(plan)
         runner = object.__new__(GptOssCudaRunner)
-        runner.device = "cpu"
+        setattr(runner, "device", "cpu")
         runner.hidden_size = 2
-        runner.cache_layout = object()
+        setattr(runner, "cache_layout", object())
         runner.cuda_graph_prefill = "breakable"
         runner._prefill_graph_active = False
         runner.parallel_groups = None
-        runner._cuda_failure = nullcontext()
-        runner._check_cuda_graphs = lambda _phase: None
-        runner._graph_forward = lambda *_: None
-        runner._model = SimpleNamespace(lm_head=lambda hidden: hidden)
-        runner._sampler = lambda logits, _: logits.argmax(dim=-1)
-        runner._tensorize = lambda host, *_: SimpleNamespace(
-            sequence_indices=torch.tensor(host.sequence_indices)
+        setattr(runner, "_cuda_failure", nullcontext())
+        setattr(runner, "_check_cuda_graphs", lambda _phase: None)
+        setattr(runner, "_graph_forward", lambda *_: None)
+        setattr(runner, "_model", SimpleNamespace(lm_head=lambda hidden: hidden))
+        setattr(runner, "_sampler", lambda logits, _: logits.argmax(dim=-1))
+        setattr(
+            runner,
+            "_tensorize",
+            lambda host, *_: SimpleNamespace(
+                sequence_indices=torch.tensor(host.sequence_indices)
+            ),
         )
         events = []
 
@@ -370,7 +377,7 @@ class TestGptOssCudaNativePlan:
             events.append(runner._prefill_graph_active)
             return torch.tensor([[0, 1], [1, 0]], dtype=torch.bfloat16)
 
-        runner._forward_batch = forward
+        setattr(runner, "_forward_batch", forward)
         monkeypatch.setattr(
             gpt_oss_runtime, "build_attention_batches", lambda *_: batches
         )
@@ -613,7 +620,7 @@ class TestGptOssCudaTinyOracle:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        runner.tensor_parallel = SimpleNamespace(enabled=True)
+        setattr(runner, "tensor_parallel", SimpleNamespace(enabled=True))
         projection = torch.nn.Linear(4, 3, bias=True, dtype=torch.bfloat16)
         hidden = torch.randn(2, 4, dtype=torch.bfloat16)
         calls = []
@@ -634,7 +641,7 @@ class TestGptOssCudaTinyOracle:
         assert output.dtype == torch.float32
         torch.testing.assert_close(output, expected)
 
-        runner.tensor_parallel = SimpleNamespace(enabled=False)
+        setattr(runner, "tensor_parallel", SimpleNamespace(enabled=False))
         calls.clear()
         torch.testing.assert_close(
             runner._attention_output_projection(projection, hidden), projection(hidden)
@@ -662,7 +669,7 @@ class TestGptOssCudaTinyOracle:
             calls.append("norm")
             return tensor, tensor + residual
 
-        runner.tensor_parallel = SimpleNamespace(sum=reduce)
+        setattr(runner, "tensor_parallel", SimpleNamespace(sum=reduce))
         monkeypatch.setattr(gpt_oss_runtime, "rmsnorm", norm)
         normalized, combined = runner._allreduce_residual_rmsnorm(
             partial, residual, torch.ones(4, dtype=torch.bfloat16), 1e-5
@@ -715,10 +722,14 @@ class TestGptOssCudaTinyOracle:
     def test_packed_qkv_matches_three_loaded_projections(self) -> None:
         import torch
 
-        attention = SimpleNamespace(
-            q_proj=torch.nn.Linear(8, 12, bias=True),
-            k_proj=torch.nn.Linear(8, 4, bias=True),
-            v_proj=torch.nn.Linear(8, 4, bias=True),
+        # This projection-only fixture supplies the checkpoint-loaded fields.
+        attention = cast(
+            SinkAttention,
+            SimpleNamespace(
+                q_proj=torch.nn.Linear(8, 12, bias=True),
+                k_proj=torch.nn.Linear(8, 4, bias=True),
+                v_proj=torch.nn.Linear(8, 4, bias=True),
+            ),
         )
         hidden = torch.randn(7, 8)
         expected = torch.cat(
@@ -742,9 +753,12 @@ class TestGptOssCudaTinyOracle:
     ) -> None:
         import torch
 
-        router = SimpleNamespace(
-            weight=torch.randn(16, 64, dtype=torch.bfloat16),
-            bias=torch.randn(16, dtype=torch.bfloat16),
+        router = cast(
+            TopKRouter,
+            SimpleNamespace(
+                weight=torch.randn(16, 64, dtype=torch.bfloat16),
+                bias=torch.randn(16, dtype=torch.bfloat16),
+            ),
         )
         calls = []
 
@@ -782,7 +796,7 @@ class TestGptOssCudaTinyOracle:
     ) -> None:
         import torch
 
-        official = SimpleNamespace(top_k=4)
+        official = cast(TopKRouter, SimpleNamespace(top_k=4))
         logits = torch.randn(32, 128, dtype=torch.bfloat16)
         expected_values, expected_indices = torch.topk(logits, 4, dim=-1, sorted=True)
         expected_weights = torch.softmax(expected_values, dim=-1)
@@ -800,7 +814,7 @@ class TestGptOssCudaTinyOracle:
         torch.testing.assert_close(indices, expected_indices.to(torch.int32))
         torch.testing.assert_close(weights, expected_weights.to(torch.float32))
 
-        generic = SimpleNamespace(top_k=2)
+        generic = cast(TopKRouter, SimpleNamespace(top_k=2))
         indices, weights = _route(generic, logits[:, :16])
         values, expected_indices = torch.topk(logits[:, :16], 2, dim=-1, sorted=True)
         torch.testing.assert_close(indices, expected_indices)
@@ -826,15 +840,19 @@ class TestGptOssCudaTinyOracle:
         import torch
 
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        runner._sampler = TorchSampler()
+        setattr(runner, "_sampler", TorchSampler())
         runner.parallel_groups = None
-        runner.device = "cpu"
+        setattr(runner, "device", "cpu")
         runner.hidden_size = 3
         runner.vocab_size = 3
         runner._graph_logits = {}
-        runner._model = SimpleNamespace(lm_head=lambda hidden: hidden)
-        runner._forward_batch = lambda *_args: torch.tensor(
-            [[0.0, 5.0, 1.0], [4.0, 0.0, 1.0]], dtype=torch.bfloat16
+        setattr(runner, "_model", SimpleNamespace(lm_head=lambda hidden: hidden))
+        setattr(
+            runner,
+            "_forward_batch",
+            lambda *_args: torch.tensor(
+                [[0.0, 5.0, 1.0], [4.0, 0.0, 1.0]], dtype=torch.bfloat16
+            ),
         )
         step = runner._new_decode_graph_step((2, 1))
         step.inputs["sequence_indices"].copy_(torch.tensor([1, 0]))
@@ -849,7 +867,7 @@ class TestGptOssCudaTinyOracle:
         import torch
 
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        runner._torch = torch
+        setattr(runner, "_torch", torch)
         hidden = torch.tensor(
             [
                 [[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.0, -3.0]],

@@ -15,7 +15,7 @@ def test_resolve_dtype_rejects_unknown_names_and_types() -> None:
     with pytest.raises(ValueError, match="unknown torch dtype"):
         resolve_dtype("not_a_dtype")
     with pytest.raises(TypeError, match="dtype must be"):
-        resolve_dtype(16)  # type: ignore[arg-type]
+        resolve_dtype(16)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
 
 
 def test_load_safetensor_weights_streams_with_name_replacements(tmp_path) -> None:
@@ -74,6 +74,7 @@ def test_preparation_preserves_aliases_and_can_fuse_loaded_children() -> None:
         return module
 
     runtime = prepare_model(model, lower)
+    assert isinstance(runtime, torch.nn.ModuleList)
 
     assert lowered == [shared]
     assert runtime[0] is runtime[1] is runtime[2]

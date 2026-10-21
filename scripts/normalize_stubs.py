@@ -97,7 +97,7 @@ class Normalizer(ast.NodeVisitor):
         self.found_returns: set[tuple[str, str]] = set()
         self.found_retention_default = False
 
-    def replace(self, node: ast.AST, replacement: str) -> None:
+    def replace(self, node: ast.expr, replacement: str) -> None:
         if (
             node.lineno is None
             or node.col_offset is None
@@ -139,7 +139,7 @@ class Normalizer(ast.NodeVisitor):
                 zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True)
             )
             retention = by_name.get("retention")
-            default = defaults.get(retention)
+            default = defaults.get(retention) if retention is not None else None
             if default is None:
                 raise ValueError(
                     "generated stub is missing CacheGroupLayout.retention default"
@@ -178,6 +178,7 @@ def import_edits(
     for node in incomplete_imports:
         if {alias.name for alias in node.names} != {"Incomplete"}:
             raise ValueError("cannot remove a mixed _typeshed import safely")
+        assert node.end_lineno is not None
         edits.append(
             (line_offsets[node.lineno - 1], line_offsets[node.end_lineno], b"")
         )
@@ -215,7 +216,9 @@ def import_edits(
         remaining_imports = [node for node in imports if node not in incomplete_imports]
         if not remaining_imports:
             raise ValueError("generated stub has no import insertion point")
-        insert_at = line_offsets[max(node.end_lineno for node in remaining_imports)]
+        ends = [node.end_lineno for node in remaining_imports]
+        assert all(end is not None for end in ends)
+        insert_at = line_offsets[max(end for end in ends if end is not None)]
         edits.append((insert_at, insert_at, ("\n".join(additions) + "\n").encode()))
     return edits
 

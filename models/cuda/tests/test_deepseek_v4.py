@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import inspect
 import json
 import sys
@@ -121,7 +122,7 @@ class TestDeepSeekV4Collectives:
         import flashinfer.comm as flashinfer_comm
 
         reducer = FlashInferAllReduce.__new__(FlashInferAllReduce)
-        reducer.context = SimpleNamespace(sum=lambda tensor: tensor)
+        setattr(reducer, "context", SimpleNamespace(sum=lambda tensor: tensor))
         reducer.max_token_num = 1
         reducer.hidden_dim = 8
         reducer.dtype = torch.float32
@@ -130,7 +131,9 @@ class TestDeepSeekV4Collectives:
 
         def fused(**kwargs: object) -> torch.Tensor:
             calls.append(kwargs)
-            return kwargs["input"] * 2
+            tensor = kwargs["input"]
+            assert isinstance(tensor, torch.Tensor)
+            return tensor * 2
 
         monkeypatch.setattr(flashinfer_comm, "allreduce_fusion", fused)
         tensor = torch.randn(1, 1, 8)
@@ -263,12 +266,12 @@ class TestDeepSeekV4Weights:
             setattr(cutile, name, None)
         flashinfer = ModuleType("flashinfer")
         flashinfer_mhc = ModuleType("flashinfer.mhc")
-        flashinfer_mhc.mhc_post = None
-        flashinfer_mhc.mhc_pre_big_fuse_with_prenorm = None
+        setattr(flashinfer_mhc, "mhc_post", None)
+        setattr(flashinfer_mhc, "mhc_pre_big_fuse_with_prenorm", None)
         flashinfer_topk = ModuleType("flashinfer.topk")
-        flashinfer_topk.top_k = None
+        setattr(flashinfer_topk, "top_k", None)
         deep_gemm = ModuleType("deep_gemm")
-        deep_gemm.tf32_hc_prenorm_gemm = None
+        setattr(deep_gemm, "tf32_hc_prenorm_gemm", None)
         gemm = ModuleType("resin_models_cuda.deepseek_v4.gemm")
         for name in (
             "dynamic_gemm_rows",
@@ -280,11 +283,11 @@ class TestDeepSeekV4Weights:
         ):
             setattr(gemm, name, None)
         attention = ModuleType("resin_models_cuda.deepseek_v4.attention")
-        attention.sparse_decode_attention = None
-        attention.sparse_topk_lengths = None
-        attention.sparse_verify_attention = None
+        setattr(attention, "sparse_decode_attention", None)
+        setattr(attention, "sparse_topk_lengths", None)
+        setattr(attention, "sparse_verify_attention", None)
         quack = ModuleType("quack")
-        quack.rmsnorm = None
+        setattr(quack, "rmsnorm", None)
         monkeypatch.setitem(sys.modules, cutile.__name__, cutile)
         monkeypatch.setitem(sys.modules, gemm.__name__, gemm)
         monkeypatch.setitem(sys.modules, attention.__name__, attention)
@@ -325,7 +328,7 @@ class TestDeepSeekV4Weights:
             topk_call.update(width=width, **kwargs)
             return scores[:, :width], torch.arange(width).view(1, width)
 
-        native_model.flashinfer_top_k = top_k
+        setattr(native_model, "flashinfer_top_k", top_k)
         topk_indices = native_model._compact_topk_indices(torch.zeros(1, 8), 3)
         assert topk_indices.tolist() == [[0, 1, 2]]
         assert topk_call == {"width": 3, "sorted": True}
@@ -451,7 +454,7 @@ class TestDeepSeekV4Weights:
         model = torch.nn.ModuleList([source])
         native.Transformer.prepare_weights(model, reduce)
         moe = model[0]
-        assert moe.routed.w13_weight is loaded_weight
+        assert getattr(getattr(moe, "routed"), "w13_weight") is loaded_weight
         assert not hasattr(moe, "experts") and not hasattr(moe, "_fused_w13_weight")
         assert calls == ["pack"]
         native.Transformer.prepare_weights(model, reduce)
@@ -487,7 +490,7 @@ class TestDeepSeekV4Weights:
             experts_start_idx=2,
             experts_end_idx=3,
             _fused_fp4=False,
-            experts=torch.nn.ModuleList([None, None, Expert(), None]),
+            experts=[None, None, Expert(), None],
         )
         partials = []
 
@@ -522,29 +525,29 @@ class TestDeepSeekV4Gemms:
     def _module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
         flashinfer = ModuleType("flashinfer")
         flashinfer_gemm = ModuleType("flashinfer.gemm")
-        flashinfer_gemm.gemm_fp8_nt_groupwise = None
+        setattr(flashinfer_gemm, "gemm_fp8_nt_groupwise", None)
         flashinfer_moe = ModuleType("flashinfer.fused_moe")
-        flashinfer_moe.reorder_rows_for_gated_act_gemm = None
-        flashinfer_moe.trtllm_fp4_block_scale_routed_moe = None
+        setattr(flashinfer_moe, "reorder_rows_for_gated_act_gemm", None)
+        setattr(flashinfer_moe, "trtllm_fp4_block_scale_routed_moe", None)
         flashinfer_quantization = ModuleType("flashinfer.quantization")
-        flashinfer_quantization.block_scale_interleave = None
-        flashinfer_quantization.shuffle_matrix_a = None
+        setattr(flashinfer_quantization, "block_scale_interleave", None)
+        setattr(flashinfer_quantization, "shuffle_matrix_a", None)
         flashinfer_enums = ModuleType("flashinfer.tllm_enums")
 
         class ActivationType:
             class Swiglu:
                 value = 3
 
-        flashinfer_enums.ActivationType = ActivationType
+        setattr(flashinfer_enums, "ActivationType", ActivationType)
         deep_gemm = ModuleType("deep_gemm")
-        deep_gemm.fp8_fp4_gemm_nt = None
-        deep_gemm.transform_sf_into_required_layout = None
+        setattr(deep_gemm, "fp8_fp4_gemm_nt", None)
+        setattr(deep_gemm, "transform_sf_into_required_layout", None)
         quack = ModuleType("quack")
         quack_blockscaled = ModuleType("quack.blockscaled")
-        quack_blockscaled.BlockScaledOperand = None
-        quack_blockscaled.pack_scale_2d_to_blocked_contig = None
+        setattr(quack_blockscaled, "BlockScaledOperand", None)
+        setattr(quack_blockscaled, "pack_scale_2d_to_blocked_contig", None)
         quack_gemm = ModuleType("quack.gemm_interface")
-        quack_gemm.gemm = None
+        setattr(quack_gemm, "gemm", None)
         for name, module in {
             "flashinfer": flashinfer,
             "flashinfer.gemm": flashinfer_gemm,
@@ -567,14 +570,26 @@ class TestDeepSeekV4Gemms:
         deepseek_gemm = self._module(monkeypatch)
 
         transform_calls: list[tuple[torch.Tensor, dict[str, object]]] = []
-        gemm_calls: list[tuple[object, ...]] = []
+        gemm_calls: list[
+            tuple[
+                tuple[torch.Tensor, torch.Tensor],
+                tuple[torch.Tensor, torch.Tensor],
+                torch.Tensor,
+                dict[str, object],
+            ]
+        ] = []
 
         def transform(scales: torch.Tensor, **kwargs: object) -> torch.Tensor:
             transform_calls.append((scales, kwargs))
             return torch.ones(128, 1, dtype=torch.int32)
 
-        def deep_gemm(*args: object, **kwargs: object) -> None:
-            gemm_calls.append((*args, kwargs))
+        def deep_gemm(
+            left: tuple[torch.Tensor, torch.Tensor],
+            right: tuple[torch.Tensor, torch.Tensor],
+            output: torch.Tensor,
+            **kwargs: object,
+        ) -> None:
+            gemm_calls.append((left, right, output, kwargs))
 
         monkeypatch.setattr(
             deepseek_gemm, "transform_sf_into_required_layout", transform
@@ -646,11 +661,13 @@ class TestDeepSeekV4Gemms:
     ) -> None:
         deepseek_gemm = self._module(monkeypatch)
 
-        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        calls: list[tuple[tuple[torch.Tensor, ...], dict[str, object]]] = []
 
-        def flashinfer_gemm(*args: object, **kwargs: object) -> torch.Tensor:
+        def flashinfer_gemm(*args: torch.Tensor, **kwargs: object) -> torch.Tensor:
             calls.append((args, kwargs))
-            return kwargs["out"]
+            output = kwargs["out"]
+            assert isinstance(output, torch.Tensor)
+            return output
 
         monkeypatch.setattr(deepseek_gemm, "gemm_fp8_nt_groupwise", flashinfer_gemm)
         monkeypatch.setattr(
@@ -686,6 +703,7 @@ class TestDeepSeekV4Gemms:
         assert args[3].dtype == torch.float32
         assert kwargs["scale_major_mode"] == "MN"
         assert kwargs["scale_granularity_mnk"] == (1, 128, 128)
+        assert isinstance(kwargs["out"], torch.Tensor)
         assert kwargs["out"].shape == (aligned_rows, 128)
         assert kwargs["out"].dtype == torch.bfloat16
         assert kwargs["backend"] == "trtllm"
@@ -696,14 +714,26 @@ class TestDeepSeekV4Gemms:
         deepseek_gemm = self._module(monkeypatch)
 
         transform_calls: list[tuple[torch.Tensor, dict[str, object]]] = []
-        gemm_calls: list[tuple[object, ...]] = []
+        gemm_calls: list[
+            tuple[
+                tuple[torch.Tensor, torch.Tensor],
+                tuple[torch.Tensor, torch.Tensor],
+                torch.Tensor,
+                dict[str, object],
+            ]
+        ] = []
 
         def transform(scales: torch.Tensor, **kwargs: object) -> torch.Tensor:
             transform_calls.append((scales, kwargs))
             return torch.ones(128, 1, dtype=torch.int32)
 
-        def deep_gemm(*args: object, **kwargs: object) -> None:
-            gemm_calls.append((*args, kwargs))
+        def deep_gemm(
+            left: tuple[torch.Tensor, torch.Tensor],
+            right: tuple[torch.Tensor, torch.Tensor],
+            output: torch.Tensor,
+            **kwargs: object,
+        ) -> None:
+            gemm_calls.append((left, right, output, kwargs))
 
         monkeypatch.setattr(
             deepseek_gemm, "transform_sf_into_required_layout", transform
@@ -775,12 +805,12 @@ class TestDeepSeekV4Gemms:
         )
 
         kwargs = calls[0]
-        ids, weights = kwargs["topk_ids"]  # type: ignore[misc]
+        ids, weights = kwargs["topk_ids"]  # type: ignore[misc]  # ty: ignore[not-iterable]
         assert ids is topk_ids
         assert weights is topk_weights
         assert kwargs["hidden_states_scale"] is left_scales
-        assert kwargs["gemm1_weights"].data_ptr() == w13.data_ptr()  # type: ignore[union-attr]
-        assert kwargs["gemm2_weights"].data_ptr() == w2.data_ptr()  # type: ignore[union-attr]
+        assert kwargs["gemm1_weights"].data_ptr() == w13.data_ptr()  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
+        assert kwargs["gemm2_weights"].data_ptr() == w2.data_ptr()  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
         assert kwargs["gemm1_clamp_limit"] is clamp_limits
         assert kwargs["output1_scale_scalar"] is output_scales
         assert kwargs["num_experts"] == 4
@@ -834,15 +864,15 @@ class TestDeepSeekV4Attention:
     def test_flashinfer_decode_uses_dsv4_sparse_mla_contract(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        calls: list[tuple[tuple[torch.Tensor, ...], dict[str, object]]] = []
 
-        def flashinfer(*args: object, **kwargs: object) -> torch.Tensor:
+        def flashinfer(*args: torch.Tensor, **kwargs: object) -> torch.Tensor:
             calls.append((args, kwargs))
             return torch.ones(2, 1, 2, 4)
 
         flashinfer_package = ModuleType("flashinfer")
         flashinfer_mla = ModuleType("flashinfer.mla")
-        flashinfer_mla.trtllm_batch_decode_sparse_mla_dsv4 = flashinfer
+        setattr(flashinfer_mla, "trtllm_batch_decode_sparse_mla_dsv4", flashinfer)
         monkeypatch.setitem(sys.modules, "flashinfer", flashinfer_package)
         monkeypatch.setitem(sys.modules, "flashinfer.mla", flashinfer_mla)
         module_name = "resin_models_cuda.deepseek_v4.attention"
@@ -940,15 +970,15 @@ class TestDeepSeekV4Attention:
     def test_flashinfer_verify_flattens_a_small_query_block(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        calls: list[tuple[tuple[torch.Tensor, ...], dict[str, object]]] = []
 
-        def flashinfer(*args: object, **kwargs: object) -> torch.Tensor:
+        def flashinfer(*args: torch.Tensor, **kwargs: object) -> torch.Tensor:
             calls.append((args, kwargs))
             return torch.ones(6, 1, 2, 4)
 
         flashinfer_package = ModuleType("flashinfer")
         flashinfer_mla = ModuleType("flashinfer.mla")
-        flashinfer_mla.trtllm_batch_decode_sparse_mla_dsv4 = flashinfer
+        setattr(flashinfer_mla, "trtllm_batch_decode_sparse_mla_dsv4", flashinfer)
         monkeypatch.setitem(sys.modules, "flashinfer", flashinfer_package)
         monkeypatch.setitem(sys.modules, "flashinfer.mla", flashinfer_mla)
         module_name = "resin_models_cuda.deepseek_v4.attention"
@@ -986,6 +1016,8 @@ class TestDeepSeekV4Attention:
         assert torch.equal(args[3][:, :133], indices.view(6, 133))
         assert (args[3][:, 133:] == -1).all()
         assert kwargs["compressed_kv_cache"] is compressed
+        assert isinstance(kwargs["sparse_topk_lens"], torch.Tensor)
+        assert isinstance(kwargs["seq_lens"], torch.Tensor)
         assert torch.equal(kwargs["sparse_topk_lens"], sparse_lengths.flatten())
         assert torch.equal(kwargs["seq_lens"], sequence_lengths.flatten())
         assert kwargs["enable_pdl"] is True

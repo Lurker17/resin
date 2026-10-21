@@ -22,20 +22,30 @@ def _runner(block_size: int = 2):
     runner._dspark_phase_events = {}
     runner._graph_device_caches = {}
     runner._graph_logits = {}
-    runner._cache = SimpleNamespace(
-        graph_cache=lambda *args: "graph-cache",
-        graph_device_inputs=lambda cache: {"cache": cache},
+    setattr(
+        runner,
+        "_cache",
+        SimpleNamespace(
+            graph_cache=lambda *args: "graph-cache",
+            graph_device_inputs=lambda cache: {"cache": cache},
+        ),
     )
     runner._sampler = FlashInferSampler.__new__(FlashInferSampler)
-    runner._sampler.sample_tensors = lambda logits, sampling: logits.argmax(-1)
+    setattr(
+        runner._sampler, "sample_tensors", lambda logits, sampling: logits.argmax(-1)
+    )
     broadcasts = []
     replica = RankGroup((2, 3), "original-replica", 1)
-    runner.parallel_groups = SimpleNamespace(
-        device_replica=replica,
-        distributed=SimpleNamespace(
-            broadcast=lambda values, *, src, group: broadcasts.append(
-                (src, group, values.tolist())
-            )
+    setattr(
+        runner,
+        "parallel_groups",
+        SimpleNamespace(
+            device_replica=replica,
+            distributed=SimpleNamespace(
+                broadcast=lambda values, *, src, group: broadcasts.append(
+                    (src, group, values.tolist())
+                )
+            ),
         ),
     )
     return runner, broadcasts

@@ -43,6 +43,11 @@ def swizzle_block_scales(scales: Tensor) -> Tensor:
 class Nvfp4LinearWeights(nn.Module):
     """ModelOpt checkpoint storage; replaced before serving or graph capture."""
 
+    weight: Tensor
+    weight_scale: Tensor
+    input_scale: Tensor
+    weight_scale_2: Tensor
+
     def __init__(self, in_features: int, out_features: int, group_size: int = 16):
         super().__init__()
         if in_features % group_size:
@@ -68,6 +73,10 @@ class Nvfp4LinearWeights(nn.Module):
 
 class Nvfp4Linear(nn.Module):
     """Execution-only W4A16 linear with a fixed kernel and prepared layout."""
+
+    weight: Tensor
+    weight_scale: Tensor
+    weight_scale_2: Tensor | None
 
     def __init__(
         self,

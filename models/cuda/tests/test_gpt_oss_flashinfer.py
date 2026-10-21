@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -175,7 +176,7 @@ class _FakeFusedMoE:
 
 
 def _config(**changes) -> MoEKernelConfig:
-    values = {
+    values: dict[str, Any] = {
         "architecture": "sm90",
         "quantization": "mxfp4",
         "activation": "swiglu",
@@ -397,7 +398,8 @@ class TestFlashInferMXFP4Adapter:
             padded_hidden_size=32,
         )
         routing = MoERouting(torch.zeros(2, 4), indices, weights)
-        output = kernel.forward(hidden, routing, prepared, config)
+        # This partial prepared-weight fixture supplies only fields read by forward.
+        output = kernel.forward(hidden, routing, prepared, config)  # ty: ignore[invalid-argument-type]
         torch.testing.assert_close(
             output[:, 0], torch.tensor([1.75, 1.0], dtype=torch.bfloat16)
         )
@@ -454,7 +456,8 @@ class TestFlashInferMXFP4Adapter:
         monkeypatch.setattr(kernel, "forward", unweighted)
 
         def dynamic_shape(*args, **kwargs):
-            pytest.fail("partial execution must not compact routes dynamically")
+            # pytest's _WithException wrapper obscures fail's callable signature.
+            pytest.fail("partial execution must not compact routes dynamically")  # ty: ignore[invalid-argument-type]
 
         monkeypatch.setattr(torch.Tensor, "nonzero", dynamic_shape)
         hidden = torch.ones(3, 32, dtype=torch.bfloat16)

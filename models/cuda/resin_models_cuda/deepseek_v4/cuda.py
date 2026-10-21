@@ -477,7 +477,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
     @staticmethod
     def _graph_capture_inputs(
         shape: GraphShape, vocab_size: int = 129_280
-    ) -> dict[str, tuple]:
+    ) -> dict[str, object]:
         """Return deterministic synthetic inputs for one decode graph."""
 
         batch_size, sequence_capacity = shape
@@ -557,22 +557,33 @@ class DeepSeekV4CudaRunner(CudaRunner):
             inputs["ep_valid_rows"] = valid_rows
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(self._sampler.graph_inputs(sampling))
-        kwargs = dict(inputs=inputs, output=output_ids, prepare=self._reset_model_state)
         if self.parallel_groups is not None or not self.tensor_parallel.enabled:
-            return CudaGraphStep(launch=launch, **kwargs)
+            return CudaGraphStep(
+                launch=launch,
+                inputs=inputs,
+                output=output_ids,
+                prepare=self._reset_model_state,
+            )
         if self.cuda_graph_decode == "full":
 
             def full_launch() -> None:
                 launch()
                 broadcast()
 
-            return CudaGraphStep(launch=full_launch, **kwargs)
+            return CudaGraphStep(
+                launch=full_launch,
+                inputs=inputs,
+                output=output_ids,
+                prepare=self._reset_model_state,
+            )
         return CudaGraphProgram(
             regions=(
                 CudaGraphRegion("model", launch),
                 CudaGraphRegion("broadcast", broadcast, capture=False),
             ),
-            **kwargs,
+            inputs=inputs,
+            output=output_ids,
+            prepare=self._reset_model_state,
         )
 
     def _new_dspark_graph_step(self, shape: GraphShape) -> CudaGraphStep:
@@ -672,7 +683,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
     ) -> list[int] | list[list[int]] | ForwardOutput | None:
         batch_size = plan.num_sequences
         positions = plan.positions
-        sequence_length = int(positions.max()) + 1
+        sequence_length = int(np.max(positions)) + 1
         if shape is None:
             shape = self._select_cuda_graph(
                 "decode",
@@ -836,7 +847,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
 
         batch_size = plan.num_sequences
         anchors = token_ids.view(batch_size, 1)
-        graph_seq_len = int(plan.positions.max()) + self.speculative_tokens + 1
+        graph_seq_len = int(np.max(plan.positions)) + self.speculative_tokens + 1
         drafts = self._broadcast_tokens(
             self._model.draft(anchors, positions, cache=cache)
         )
@@ -895,7 +906,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
                     logits = self._model.forward_decode(
                         input_ids,
                         positions,
-                        int(plan.positions.max()) + 1,
+                        int(np.max(plan.positions)) + 1,
                         cache=cache,
                     )
                 output = self._sample_target(logits, plan, 0)
@@ -978,7 +989,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
                     output_logits = self._model.forward_decode(
                         token_ids.view(plan.num_sequences, 1),
                         positions,
-                        int(plan.positions.max()) + 1,
+                        int(np.max(plan.positions)) + 1,
                         cache=cache,
                     )
                 else:
@@ -991,6 +1002,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
                     # to the host. Empty replicas have no output transfer.
                     self._cuda_failure()
                     return None
+                assert output_logits is not None
                 output = self._sample_target(output_logits, plan, 0)
             return format_output(output_logits, output, plan)
 
@@ -1006,7 +1018,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 0 if plan is None else plan.num_sequences,
                 0
                 if plan is None
-                else int(plan.positions.max()) + self.speculative_tokens + 1,
+                else int(np.max(plan.positions)) + self.speculative_tokens + 1,
             ),
         )
         if shape is None:

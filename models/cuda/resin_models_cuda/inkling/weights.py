@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
-from resin_models_cuda.inkling.dspark import DSparkDraft
+from resin_models_cuda.inkling.dspark import DSparkDraft, DSparkLayer
 from resin_models_cuda.inkling.model import (
+    DecoderLayer,
     DenseMlp,
     InklingForCausalLM,
+    InklingVisionEncoderLayer,
     Nvfp4Experts,
     SparseMlp,
 )
@@ -41,11 +44,13 @@ def _target_names(model: InklingForCausalLM) -> set[str]:
         "model.llm.unembed.weight",
         "model.visual.final_norm.weight",
     }
-    for index, layer in enumerate(model.vision.layers):
+    for index, layer in enumerate(
+        cast(Sequence[InklingVisionEncoderLayer], model.vision.layers)
+    ):
         names.add(f"model.visual.layers.linear_{index}.weight")
         if layer.norm is not None:
             names.add(f"model.visual.layers.norm_{index}.weight")
-    for index, layer in enumerate(model.target.layers):
+    for index, layer in enumerate(cast(Sequence[DecoderLayer], model.target.layers)):
         prefix = f"model.llm.layers.{index}"
         names.update(
             {
@@ -111,7 +116,9 @@ def _target_destination(model: InklingForCausalLM, name: str):
         if separator != "_" or dot != "." or parameter != "weight":
             raise ValueError(f"unrecognized Inkling vision tensor: {name!r}")
         try:
-            layer = model.vision.layers[int(index_text)]
+            layer = cast(
+                InklingVisionEncoderLayer, model.vision.layers[int(index_text)]
+            )
         except (ValueError, IndexError) as error:
             raise ValueError(f"unrecognized Inkling vision tensor: {name!r}") from error
         if kind == "linear":
@@ -122,7 +129,7 @@ def _target_destination(model: InklingForCausalLM, name: str):
     parts = name.split(".")
     if len(parts) < 6 or parts[:3] != ["model", "llm", "layers"]:
         raise ValueError(f"unrecognized Inkling target tensor: {name!r}")
-    layer = target.layers[int(parts[3])]
+    layer = cast(DecoderLayer, target.layers[int(parts[3])])
     suffix = ".".join(parts[4:])
     common = {
         "attn_norm.weight": layer.attn_norm.weight,
@@ -275,7 +282,7 @@ def _draft_destination(model: DSparkDraft, name: str):
     parts = name.split(".")
     if len(parts) < 4 or parts[0] != "layers":
         raise ValueError(f"unrecognized Inkling DSpark tensor: {name!r}")
-    layer = model.layers[int(parts[1])]
+    layer = cast(DSparkLayer, model.layers[int(parts[1])])
     suffix = ".".join(parts[2:])
     layer_tensors = {
         "input_layernorm.weight": layer.input_norm.weight,

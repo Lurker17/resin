@@ -35,9 +35,14 @@ class MediaInput(Protocol):
     one prefill row when a model uses bidirectional attention within media.
     """
 
-    token_ids: Sequence[int]
-    cache_key: tuple[int, ...]
-    token_spans: tuple[MediaTokenSpan, ...]
+    @property
+    def token_ids(self) -> Sequence[int]: ...
+
+    @property
+    def cache_key(self) -> tuple[int, ...]: ...
+
+    @property
+    def token_spans(self) -> tuple[MediaTokenSpan, ...]: ...
 
 
 class RenderedPrompt(TypedDict):
@@ -78,7 +83,7 @@ class Runner(Protocol):
     """Execute one Engine-owned immutable plan synchronously."""
 
     def forward(
-        self, plan: BatchPlan
+        self, plan: BatchPlan, /
     ) -> ForwardOutput | Sequence[int] | Sequence[Sequence[int]]: ...
 
 

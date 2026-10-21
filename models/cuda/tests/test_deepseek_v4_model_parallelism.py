@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -34,7 +35,7 @@ def test_compressor_ring_preserves_the_anchor_window_before_speculative_tail(
 
 def test_attention_layers_capture_their_own_tensor_parallel_context(monkeypatch):
     native = _ModelFixture._native_model(monkeypatch)
-    handle = object()
+    handle = Mock(spec=torch.distributed.ProcessGroup)
     sharded = TensorParallelContext(TensorParallelLayout(rank=1, size=2), handle)
     local = TensorParallelContext()
     reductions, gathers = [], []
@@ -119,7 +120,8 @@ def test_attention_and_expert_weight_meshes_are_independent(monkeypatch):
     sharded_attention = native.Attention(
         0,
         args,
-        tensor_parallel=TensorParallelContext(TensorParallelLayout(size=2), object()),
+        # The opaque group is never used: this test only checks shard geometry.
+        tensor_parallel=TensorParallelContext(TensorParallelLayout(size=2), object()),  # ty: ignore[invalid-argument-type]
     )
     assert attention.n_local_heads == 4
     assert attention.n_local_groups == 4

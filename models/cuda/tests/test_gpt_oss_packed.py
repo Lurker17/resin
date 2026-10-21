@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import cast
+
 import torch
 
 from resin.moe_kernels import MoEKernelConfig
@@ -60,7 +63,7 @@ class TestGptOssPackedBridge:
         class Backbone(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
-                self.layers = torch.nn.ModuleList([Layer()])
+                self.layers = cast(Sequence[Layer], torch.nn.ModuleList([Layer()]))
 
         class Model(torch.nn.Module):
             def __init__(self) -> None:

@@ -95,6 +95,7 @@ class InklingCodec:
 
     def render(self, request: dict[str, Any]) -> RenderedPrompt:
         effort = self._reasoning_effort(request)
+        rendered: RenderedPrompt
         if self.processor is not None:
             messages = normalize_image_messages(request["messages"])
             media = InklingMedia.from_messages(
@@ -103,7 +104,7 @@ class InklingCodec:
                 tools=request.get("tools") or None,
                 reasoning_effort=effort,
             )
-            rendered: RenderedPrompt = {
+            rendered = {
                 "token_ids": list(media.token_ids),
                 "stop_token_ids": [self.token_ids[CONTENT_MODEL_END_SAMPLING]],
             }

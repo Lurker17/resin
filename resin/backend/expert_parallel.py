@@ -153,7 +153,7 @@ class ExpertParallelDispatch:
             # Packed rows arrive in owner-rank order. Preserve that order
             # within each origin instead of using unordered CUDA atomic sums.
             order = rows.argsort(stable=True)
-            result = torch.segment_reduce(
+            result = torch.segment_reduce(  # ty: ignore[unresolved-attribute]  # Missing in Torch stubs.
                 returned[order],
                 "sum",
                 lengths=destinations.sum(1, dtype=torch.int64),

@@ -83,6 +83,7 @@ class SafetensorReader:
             self._context = safe_open(str(path), framework="pt", device="cpu")
             self._handle = self._context.__enter__()
             self._path = path
+        assert self._handle is not None
         return self._handle.get_tensor(key)
 
 

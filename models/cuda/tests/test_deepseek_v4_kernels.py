@@ -13,7 +13,8 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture
 def kernels():
     if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("DeepSeek-V4 cuTile kernels require Blackwell")
+        # pytest's _WithException decorator obscures skip's callable signature.
+        pytest.skip("DeepSeek-V4 cuTile kernels require Blackwell")  # ty: ignore[too-many-positional-arguments]
     from resin_models_cuda.deepseek_v4 import cutile
 
     torch.manual_seed(17)
@@ -340,13 +341,15 @@ def test_rejected_compressor_cleanup_preserves_accepted_and_unrelated_rows(kerne
     scores = torch.randn_like(values)
     expected_values, expected_scores = values.clone(), scores.clone()
     for batch in range(2):
-        for offset in range(processed[batch].item(), 6):
-            position = starts[batch].item() + offset
-            column = position // 8 - mapping.first_blocks[batch].item()
-            page = (
-                mapping.parent_ids[batch, column] * 2
-                + mapping.child_slots[batch, column]
-            ).item()
+        for offset in range(int(processed[batch].item()), 6):
+            position = int(starts[batch].item()) + offset
+            column = position // 8 - int(mapping.first_blocks[batch].item())
+            page = int(
+                (
+                    mapping.parent_ids[batch, column] * 2
+                    + mapping.child_slots[batch, column]
+                ).item()
+            )
             expected_values[page, position % 8] = 0
             expected_scores[page, position % 8] = float("-inf")
     kernels.clear_rejected_compress_state(

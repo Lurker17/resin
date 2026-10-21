@@ -50,6 +50,7 @@ def test_media_owns_processor_tensors_and_absolute_placeholder_mapping() -> None
         MediaTokenSpan(position=1, length=2),
         MediaTokenSpan(position=4, length=2),
     )
+    assert media.pixel_values is not None
     assert media.pixel_values.sum().item() == 108
     media.validate_placeholder_tokens(image_token_id=8, video_token_id=9)
     assert len(media.digest) == 64
@@ -77,6 +78,7 @@ def test_canonical_normalized_arrays_are_copied_before_processing() -> None:
     media = Gemma4Media.from_images(Processor(), [image], prompt="describe")
     image.fill(0)
 
+    assert Processor.seen is not None
     passed = Processor.seen[0][0]["content"][0]["image"]
     assert passed.sum() == 36
     assert Processor.seen[1]["processor_kwargs"] == {"do_rescale": False}

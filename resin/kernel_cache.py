@@ -311,9 +311,9 @@ def wrap_flashinfer_build_and_load(
             build=lambda: original(spec, *args, **kwargs),
         )
 
-    build_and_load._resin_artifact_cache = cache  # type: ignore[attr-defined]
-    build_and_load._resin_durable_artifact_resolver = (  # type: ignore[attr-defined]
-        durable_artifact_resolver
+    setattr(build_and_load, "_resin_artifact_cache", cache)
+    setattr(
+        build_and_load, "_resin_durable_artifact_resolver", durable_artifact_resolver
     )
     return build_and_load
 

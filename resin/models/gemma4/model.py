@@ -12,11 +12,16 @@ from resin.models.gemma4.config import SLIDING_ATTENTION
 
 
 class Gemma4RotaryConfig(Protocol):
-    head_dim: int
-    global_head_dim: int
-    local_rope_theta: float
-    global_rope_theta: float
-    global_partial_rotary_factor: float
+    @property
+    def head_dim(self) -> int: ...
+    @property
+    def global_head_dim(self) -> int: ...
+    @property
+    def local_rope_theta(self) -> float: ...
+    @property
+    def global_rope_theta(self) -> float: ...
+    @property
+    def global_partial_rotary_factor(self) -> float: ...
 
 
 class RMSNorm(SharedRMSNorm):

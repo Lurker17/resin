@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -48,6 +49,7 @@ from resin_models_cuda.inkling.checkpoint import (
 )
 from resin_models_cuda.inkling.dspark import DSparkDraft
 from resin_models_cuda.inkling.model import (
+    DecoderLayer,
     InklingForCausalLM,
     select_convolution_state,
 )
@@ -208,14 +210,13 @@ class InklingCudaRunner(CudaRunner):
             cache_write_lookahead_tokens=self.speculative_tokens,
             cache_layout=self.cache_layout,
         )
+        layers = cast(Sequence[DecoderLayer], self._model.target.layers)
         prefill_ffns = self._configure_prefill_graphs(
-            tuple(layer.feed_forward for layer in self._model.target.layers),
+            tuple(layer.feed_forward for layer in layers),
             hidden_size=self.config.hidden_size,
             max_tokens=self.prefill_chunk_size,
         )
-        for layer, callback in zip(
-            self._model.target.layers, prefill_ffns, strict=True
-        ):
+        for layer, callback in zip(layers, prefill_ffns, strict=True):
             layer.prefill_ffn = callback
 
     @property
@@ -316,7 +317,7 @@ class InklingCudaRunner(CudaRunner):
             self._cuda_graph_fallback("decode", "logprobs")
             return None
         batch_size = plan.num_sequences
-        required_length = int(plan.positions.max()) + self.speculative_tokens + 1
+        required_length = int(np.max(plan.positions)) + self.speculative_tokens + 1
         shape = self._select_cuda_graph(
             "decode",
             match=lambda candidate: (
@@ -532,7 +533,7 @@ class InklingCudaRunner(CudaRunner):
         self._draft.inject_target(taps, verify_positions, cache)
         return format_output(logits, acceptance.token_rows, plan)
 
-    def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
+    def forward(self, plan: BatchPlan) -> list[int] | list[list[int]] | ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         rows = self._validate_plan(plan)
         cache_plan = PagedCachePlan.from_plan(

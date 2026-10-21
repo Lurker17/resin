@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import NoReturn, TypedDict
 
 import numpy as np
 import pytest
@@ -24,6 +25,11 @@ from resin.backend.cuda.graphs import (
 )
 from resin.backend.cuda.runner import CudaRunner, resolve_kv_cache_dtype
 from resin.backend.resources import CachePoolBinding
+
+
+# Empty shape catalogs must never invoke their builder.
+def _unreachable(_shape) -> NoReturn:
+    raise AssertionError("empty graph catalog must not build")
 
 
 class _Context:
@@ -169,6 +175,18 @@ def _cache(shapes, build, synchronize_failure=lambda: None):
     )
 
 
+class _ConcreteCudaRunner(CudaRunner):
+    def forward(self, plan):
+        raise AssertionError("this fixture only tests graph ownership")
+
+
+class _DecodeOptions(TypedDict):
+    policy: str
+    width: int
+    speculative: bool
+    max_batch_size: int
+
+
 class TestCudaGraph:
     def test_cuda_runner_owns_device_precision_sampler_and_cache_binding(
         self, monkeypatch
@@ -178,7 +196,7 @@ class TestCudaGraph:
         monkeypatch.setattr(runner_runtime.torch.cuda, "current_device", lambda: 3)
         monkeypatch.setattr(runner_runtime, "FlashInferSampler", lambda: sampler)
 
-        runner = CudaRunner(device="cuda", label="test", kv_cache_dtype="fp8")
+        runner = _ConcreteCudaRunner(device="cuda", label="test", kv_cache_dtype="fp8")
 
         assert str(runner.device) == "cuda:3"
         assert runner.kv_cache_dtype == "fp8"
@@ -187,7 +205,8 @@ class TestCudaGraph:
         layout = object()
         binding = CachePoolBinding(layout, resource="test KV")
         runner._configure_cache_binding(binding)
-        runner.bind_resources(SimpleNamespace(cache_pool_id=7, cache_layout=layout))
+        # Minimal native binding double isolates cache ownership.
+        runner.bind_resources(SimpleNamespace(cache_pool_id=7, cache_layout=layout))  # ty: ignore[invalid-argument-type]
         assert binding.pool_id == 7
         with pytest.raises(RuntimeError, match="already configured"):
             runner._configure_cache_binding(CachePoolBinding(layout))
@@ -199,7 +218,7 @@ class TestCudaGraph:
         monkeypatch.setattr(staging, "torch", torch)
         monkeypatch.setattr(graph_runtime, "torch", torch)
 
-        class ModelRunner(CudaRunner):
+        class ModelRunner(_ConcreteCudaRunner):
             device = "cuda:0"
 
             def __init__(self) -> None:
@@ -240,7 +259,7 @@ class TestCudaGraph:
         runner._check_cuda_graphs()
 
     def test_model_runner_requires_one_nonempty_mode_configuration(self) -> None:
-        class ModelRunner(CudaRunner):
+        class ModelRunner(_ConcreteCudaRunner):
             device = "cuda:0"
 
         runner = ModelRunner.__new__(ModelRunner)
@@ -251,8 +270,8 @@ class TestCudaGraph:
         with pytest.raises(RuntimeError, match="not been configured"):
             runner._require_cuda_graph_executor()
 
-        mode = CudaGraphMode((), lambda _shape: None, lambda _shape: {})
-        runner._cuda_failure = lambda: None
+        mode = CudaGraphMode((), _unreachable, lambda _shape: {})
+        setattr(runner, "_cuda_failure", lambda: None)
         runner._configure_cuda_graphs({"decode": mode})
         with pytest.raises(RuntimeError, match="already configured"):
             runner._configure_cuda_graphs({"decode": mode})
@@ -352,7 +371,9 @@ class TestCudaGraph:
 
     @pytest.mark.parametrize("policy", ["disabled", "full", "breakable"])
     def test_decode_policy_resolves_defaults_and_explicit_overrides(self, policy):
-        arguments = dict(policy=policy, width=128, speculative=True, max_batch_size=9)
+        arguments: _DecodeOptions = dict(
+            policy=policy, width=128, speculative=True, max_batch_size=9
+        )
         expected = (
             ()
             if policy == "disabled"
@@ -430,7 +451,10 @@ class TestCudaGraph:
         monkeypatch.setattr(staging, "torch", torch)
         monkeypatch.setattr(graph_runtime, "torch", torch)
         monkeypatch.setattr(
-            _Tensor, "tolist", lambda _: pytest.fail("unexpected host conversion")
+            _Tensor,
+            "tolist",
+            # ty misbinds pytest's decorated helper and drops its reason parameter.
+            lambda _: pytest.fail("unexpected host conversion"),  # ty: ignore[invalid-argument-type]
         )
         output = _Tensor([0])
         operation = (
@@ -478,7 +502,7 @@ class TestCudaGraph:
 
         events.clear()
         graphs.capture_all(
-            lambda _shape: pytest.fail("captured shapes must not rebuild inputs"),
+            lambda _shape: pytest.fail("captured shapes must not rebuild inputs"),  # ty: ignore[invalid-argument-type]
             before_capture=lambda: events.append("before"),
             after_capture=lambda: events.append("after"),
         )
@@ -652,14 +676,14 @@ class TestCudaGraph:
         monkeypatch.setattr(
             torch.cuda,
             "synchronize",
-            lambda _: pytest.fail("no graph or pending device work exists"),
+            lambda _: pytest.fail("no graph or pending device work exists"),  # ty: ignore[invalid-argument-type]
         )
-        cache = _cache(((1, 4),), lambda _: pytest.fail("must not build"))
+        cache = _cache(((1, 4),), lambda _: pytest.fail("must not build"))  # ty: ignore[invalid-argument-type]
         cache.close()
         cache.close()
         executor = CudaGraphExecutor(
             "cuda:0",
-            {"decode": CudaGraphMode((), lambda _: None, lambda _: {})},
+            {"decode": CudaGraphMode((), _unreachable, lambda _: {})},
             synchronize_failure=lambda: None,
         )
         executor.close()
@@ -772,7 +796,8 @@ class TestCudaGraph:
         tensor.copy_error = AssertionError("unnecessary self-copy")
         inputs = {"value": tensor}
         stager = staging.TensorStager("cuda:0")
-        stager.copy_into(inputs, inputs)
+        # CPU tensor double proves no CUDA allocation or copy occurs.
+        stager.copy_into(inputs, inputs)  # ty: ignore[invalid-argument-type]
         assert tensor.tolist() == [3, 7]
         assert not stager.host_tensors
 

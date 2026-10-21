@@ -310,6 +310,7 @@ cargo test --all-targets
 uv run pytest -q
 uv run ruff format --check .
 uv run ruff check .
+uv run ty check
 uv run python scripts/cloc.py
 ```
 

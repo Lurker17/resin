@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from resin.models.gemma4.media import Gemma4Media
+from resin.protocols import ParserEvent, RenderedPrompt
 from resin.server import encode_stop_tokens
 from resin.server.media import normalize_image_messages
 
@@ -18,7 +19,7 @@ class Gemma4Codec:
         self.tokenizer = processor.tokenizer
         self.eos_token_ids = tuple(int(token) for token in eos_token_ids)
 
-    def render(self, request: dict[str, Any]) -> dict[str, Any]:
+    def render(self, request: dict[str, Any]) -> RenderedPrompt:
         messages = normalize_image_messages(request["messages"])
         media = Gemma4Media.from_messages(
             self.processor,
@@ -47,7 +48,7 @@ class Gemma4ResponseParser:
         self.token_ids: list[int] = []
         self.text = ""
 
-    def feed(self, token_ids: Sequence[int]) -> list[dict[str, str]]:
+    def feed(self, token_ids: Sequence[int]) -> list[ParserEvent]:
         self.token_ids.extend(int(token) for token in token_ids)
         text = self.tokenizer.decode(self.token_ids, skip_special_tokens=True)
         text = text.rstrip("\N{REPLACEMENT CHARACTER}")

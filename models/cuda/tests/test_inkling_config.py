@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import copy
 import math
+from typing import Any
 
 import pytest
 
 from resin.models.inkling.config import InklingConfig, InklingDSparkConfig
 
 
-def _target() -> dict[str, object]:
+def _target() -> dict[str, Any]:
     local = [index for index in range(42) if index not in (5, 11, 17, 23, 29, 35, 41)]
     return {
         "architectures": ["InklingForConditionalGeneration"],
@@ -62,7 +63,7 @@ def _target() -> dict[str, object]:
     }
 
 
-def _draft() -> dict[str, object]:
+def _draft() -> dict[str, Any]:
     return {
         "architectures": ["DSparkDraftModel"],
         "model_type": "qwen3",

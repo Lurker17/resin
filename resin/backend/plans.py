@@ -279,6 +279,8 @@ class PagedCachePlan:
                     decode_lookahead if batch.phase == BatchPhase.DECODE else 0
                 )
                 if window_blocks is not None:
+                    assert descriptor.window_tokens is not None
+                    assert descriptor.read_window_tokens is not None
                     maximum = (
                         descriptor.window_tokens - descriptor.read_window_tokens + 1
                     )

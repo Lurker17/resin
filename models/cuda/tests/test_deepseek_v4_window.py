@@ -12,7 +12,8 @@ def test_attention_metadata_keeps_each_query_inside_its_sliding_window(
     start: int, block_length: int
 ) -> None:
     if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("DeepSeek-V4 cuTile kernels require Blackwell")
+        # pytest's _WithException decorator obscures skip's callable signature.
+        pytest.skip("DeepSeek-V4 cuTile kernels require Blackwell")  # ty: ignore[too-many-positional-arguments]
     pytest.importorskip("cuda.tile")
     from resin_models_cuda.deepseek_v4.cutile import verify_attention_metadata
 

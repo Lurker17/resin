@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -261,6 +262,19 @@ class Bf16Experts(nn.Module):
 
 
 class Nvfp4Experts(nn.Module):
+    w13: Tensor
+    w13_scales: Tensor
+    w2: Tensor
+    w2_scales: Tensor
+    w13_input_amax: Tensor | None
+    w2_input_amax: Tensor | None
+    w13_scale2: Tensor | None
+    w2_scale2: Tensor | None
+    input_scale_quant: Tensor
+    g1_scale_c: Tensor
+    g1_alphas: Tensor
+    g2_alphas: Tensor
+
     def __init__(self, config: InklingConfig) -> None:
         super().__init__()
         experts = config.num_routed_experts
@@ -316,6 +330,8 @@ class Nvfp4Experts(nn.Module):
                 self.w13_scales[expert].copy_(
                     _deinterleave_w13(self.w13_scales[expert], up_first=True)
                 )
+        assert self.w13_input_amax is not None and self.w2_input_amax is not None
+        assert self.w13_scale2 is not None and self.w2_scale2 is not None
         w13_input = self.w13_input_amax.float().max() / (448.0 * 6.0)
         w2_input = self.w2_input_amax.float().max() / (448.0 * 6.0)
         up_alpha = w13_input * self.w13_scale2
@@ -554,7 +570,7 @@ class DecoderLayer(nn.Module):
         record_state_inputs: bool,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
         k_state, v_state, attn_state, mlp_state = torch.split(
-            state, (1024, 1024, 4096, 4096), dim=-1
+            state, [1024, 1024, 4096, 4096], dim=-1
         )
         residual = hidden
         attended, k_state, v_state, k_input, v_input = self.attn(
@@ -721,7 +737,7 @@ class InklingTarget(nn.Module):
         )
 
     def prepare(self) -> None:
-        for layer in self.layers:
+        for layer in cast(Sequence[DecoderLayer], self.layers):
             layer.prepare()
 
     def embed_tokens(self, token_ids: Tensor) -> Tensor:

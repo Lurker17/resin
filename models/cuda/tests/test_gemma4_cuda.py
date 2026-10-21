@@ -4,6 +4,7 @@ import inspect
 import math
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -185,10 +186,17 @@ def test_ordinary_graph_padding_rows_stay_inside_null_page() -> None:
     )
 
     inputs = Gemma4CudaRunner._graph_page_inputs(
-        "local", plan, active_rows=1, graph_rows=128, width=81
+        # Minimal page-table double covers only fields used by this adapter.
+        "local",
+        plan,  # ty: ignore[invalid-argument-type]
+        active_rows=1,
+        graph_rows=128,
+        width=81,
     )
 
-    assert max(inputs["local_append_offsets"]) < PAGE_SIZE
+    offsets = inputs["local_append_offsets"]
+    assert isinstance(offsets, np.ndarray)
+    assert max(offsets) < PAGE_SIZE
 
 
 @pytest.mark.parametrize("phase", [BatchPhase.PREFILL, BatchPhase.DECODE])
@@ -197,7 +205,11 @@ def test_prefill_regions_activate_after_media_and_attention_planning(phase) -> N
     runner.device = torch.device("cpu")
     runner.cuda_graph_prefill = "breakable"
     runner._prefill_graph_active = False
-    runner._model = SimpleNamespace(embed_tokens=lambda ids: ids[:, None].bfloat16())
+    setattr(
+        runner,
+        "_model",
+        SimpleNamespace(embed_tokens=lambda ids: ids[:, None].bfloat16()),
+    )
     events = []
 
     def record(name, result):
@@ -220,7 +232,8 @@ def test_prefill_regions_activate_after_media_and_attention_planning(phase) -> N
         global_=object(),
         phase=phase,
     )
-    assert runner._eager_transformer(object(), batch) is expected
+    # This fixture isolates activation order from native plan construction.
+    assert runner._eager_transformer(object(), batch) is expected  # ty: ignore[invalid-argument-type]
     assert events[:-1] == [
         (name, False) for name in ("media", "mask", "cache", "cache", "attention")
     ]
@@ -247,18 +260,26 @@ def test_prefill_feed_forward_can_reuse_output_storage_across_layers() -> None:
         )
         for scale in (0.5, 0.75)
     ]
-    runner.config = SimpleNamespace(layer_types=(SLIDING_ATTENTION,) * 2)
-    runner._model = SimpleNamespace(
-        language_model=SimpleNamespace(
-            layers=layers,
-            rotary_emb=lambda *_: (None, None),
-            norm=lambda hidden: hidden * 0.5,
-        )
+    setattr(runner, "config", SimpleNamespace(layer_types=(SLIDING_ATTENTION,) * 2))
+    setattr(
+        runner,
+        "_model",
+        SimpleNamespace(
+            language_model=SimpleNamespace(
+                layers=layers,
+                rotary_emb=lambda *_: (None, None),
+                norm=lambda hidden: hidden * 0.5,
+            )
+        ),
     )
-    runner._cache = SimpleNamespace(
-        dtype=torch.bfloat16,
-        local_keys=torch.zeros(2, 1, PAGE_SIZE, 1, width, dtype=torch.bfloat16),
-        local_values=torch.zeros(2, 1, PAGE_SIZE, 1, width, dtype=torch.bfloat16),
+    setattr(
+        runner,
+        "_cache",
+        SimpleNamespace(
+            dtype=torch.bfloat16,
+            local_keys=torch.zeros(2, 1, PAGE_SIZE, 1, width, dtype=torch.bfloat16),
+            local_values=torch.zeros(2, 1, PAGE_SIZE, 1, width, dtype=torch.bfloat16),
+        ),
     )
     plan = SimpleNamespace(
         append_pages=torch.zeros(rows, dtype=torch.int64),
@@ -269,7 +290,13 @@ def test_prefill_feed_forward_can_reuse_output_storage_across_layers() -> None:
 
     def run():
         return runner._run_transformer(
-            hidden, torch.arange(rows), plan, plan, wrapper, wrapper
+            # Minimal device-plan doubles supply only append destinations.
+            hidden,
+            torch.arange(rows),
+            plan,  # ty: ignore[invalid-argument-type]
+            plan,  # ty: ignore[invalid-argument-type]
+            wrapper,
+            wrapper,
         )
 
     operations = tuple(
@@ -315,26 +342,38 @@ def test_graph_attention_contract_matches_capture_and_replay(
         monkeypatch.setattr(flashinfer, name, Wrapper, raising=False)
     runner = object.__new__(Gemma4CudaRunner)
     runner.device = torch.device("cpu")
-    runner.config = SimpleNamespace(
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        num_global_key_value_heads=1,
-        head_dim=4,
-        global_head_dim=8,
-        hidden_size=8,
-        vocab_size=16,
+    setattr(
+        runner,
+        "config",
+        SimpleNamespace(
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_global_key_value_heads=1,
+            head_dim=4,
+            global_head_dim=8,
+            hidden_size=8,
+            vocab_size=16,
+        ),
     )
     runner.speculative_tokens = speculative_tokens
-    runner._assistant = object()
-    runner._cache = SimpleNamespace(
-        dtype=torch.float8_e4m3fn,
-        local_keys=[None],
-        local_values=[None],
-        global_keys=[None],
-        global_values=[None],
+    setattr(runner, "_assistant", object())
+    setattr(
+        runner,
+        "_cache",
+        SimpleNamespace(
+            dtype=torch.float8_e4m3fn,
+            local_keys=[None],
+            local_values=[None],
+            global_keys=[None],
+            global_values=[None],
+        ),
     )
-    runner._sampler = SimpleNamespace(empty=lambda *_: None, graph_inputs=lambda _: {})
-    runner._graph_attention_workspaces = (None, None)
+    setattr(
+        runner,
+        "_sampler",
+        SimpleNamespace(empty=lambda *_: None, graph_inputs=lambda _: {}),
+    )
+    setattr(runner, "_graph_attention_workspaces", (None, None))
     runner._graph_attention = {}
     runner._graph_spec_attention = {}
     runner._graph_verify_hidden = {}
@@ -343,6 +382,7 @@ def test_graph_attention_contract_matches_capture_and_replay(
     inputs = runner._graph_capture_inputs(shape, vocab_size=16)
     for name, values in inputs.items():
         if name.endswith("_page_indices"):
+            assert isinstance(values, tuple)
             inputs[name] = (17 if "local" in name else 23,) * len(values)
     runner._prepare_graph_attention(shape, inputs)
 
@@ -376,8 +416,8 @@ def test_speculative_failure_after_state_update_is_not_retryable(
     synchronized = []
     runner = object.__new__(Gemma4CudaRunner)
     runner.speculative_tokens = 1
-    runner.cache_layout = object()
-    runner._check_cuda_graphs = lambda _phase: None
+    setattr(runner, "cache_layout", object())
+    setattr(runner, "_check_cuda_graphs", lambda _phase: None)
     runner._cuda_failure = CudaFailureGuard(
         lambda: synchronized.append(True), label="Gemma speculative decode"
     )
@@ -390,13 +430,16 @@ def test_speculative_failure_after_state_update_is_not_retryable(
         state[0] += 1
         raise ValueError("sampling failed after state update")
 
-    runner._speculative_graph_forward = (
-        fail_after_update if graph else lambda _plan, _batch: None
+    setattr(
+        runner,
+        "_speculative_graph_forward",
+        fail_after_update if graph else lambda _plan, _batch: None,
     )
-    runner._speculative_decode = fail_after_update
+    setattr(runner, "_speculative_decode", fail_after_update)
 
     with pytest.raises(PostAcceptCudaError, match="sampling failed"):
-        runner.forward(native)
+        # The plan double tests failure tagging after a simulated cache write.
+        runner.forward(native)  # ty: ignore[invalid-argument-type]
 
     assert state == [1]
     assert synchronized == [True]

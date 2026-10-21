@@ -169,6 +169,7 @@ class TestEngineExecution:
         with pytest.raises(RuntimeError, match="physical cleanup failed"):
             engine.step()
         assert engine.poisoned
+        assert engine.poison_error is not None
         assert "release" in engine.poison_error
         assert not request.done
         assert (engine.cache_free_parent_count, engine.cache_occupied_block_count) == (
@@ -269,9 +270,11 @@ class TestRunnerContractConstruction:
                 raise RuntimeError("release descriptor failed")
 
         with pytest.raises(TypeError, match="define callable forward"):
-            Engine(DispatchOnly())
+            # Intentionally missing the required forward callback.
+            Engine(DispatchOnly())  # ty: ignore[invalid-argument-type]
         with pytest.raises(TypeError, match="forward must be callable"):
-            Engine(BadForward())
+            # Intentionally non-callable forward callback.
+            Engine(BadForward())  # ty: ignore[invalid-argument-type]
         with pytest.raises(TypeError, match="release must be callable"):
             Engine(BadRelease())
         with pytest.raises(RuntimeError, match="release descriptor failed"):

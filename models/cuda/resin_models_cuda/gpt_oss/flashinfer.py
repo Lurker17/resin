@@ -157,17 +157,17 @@ class FlashInferSM90MXFP4Kernel:
 
     capabilities = MoEKernelCapabilities(
         kernel_id=KERNEL_ID,
-        architectures={"sm90"},
-        quantizations={"mxfp4"},
-        activations={"swiglu"},
-        top_k_values={4},
-        group_sizes={_MXFP4_GROUP_SIZE},
+        architectures=frozenset({"sm90"}),
+        quantizations=frozenset({"mxfp4"}),
+        activations=frozenset({"swiglu"}),
+        top_k_values=frozenset({4}),
+        group_sizes=frozenset({_MXFP4_GROUP_SIZE}),
         supports_expert_bias=True,
         min_experts=4,
         max_experts=128,
         min_tokens=1,
         max_tokens=_MAX_TOKENS,
-        gate_up_layouts={"interleaved_gate_up"},
+        gate_up_layouts=frozenset({"interleaved_gate_up"}),
         supports_fp32_partial=True,
     )
 
@@ -335,6 +335,7 @@ class FlashInferSM90MXFP4Kernel:
         fc1_bias = None
         fc2_bias = None
         if config.expert_bias:
+            assert weights.gate_up_bias is not None and weights.down_bias is not None
             fc1_bias = weights.gate_up_bias.to(
                 device=device, dtype=torch.bfloat16
             ).contiguous()
@@ -359,6 +360,7 @@ class FlashInferSM90MXFP4Kernel:
             dtype=torch.float32,
             device=device,
         )
+        assert config.activation_limit is not None
         limit = torch.full(
             activation_shape,
             fill_value=float(config.activation_limit),

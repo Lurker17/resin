@@ -117,7 +117,9 @@ def _stream_subprocess(command, *, env, timeout):
     lines = []
 
     def read_output():
-        for line in process.stdout:
+        stdout = process.stdout
+        assert stdout is not None
+        for line in stdout:
             lines.append(line)
             print(line, end="", flush=True)
 
@@ -190,6 +192,8 @@ def validate_parallel(
     tokenizer = AutoTokenizer.from_pretrained(
         str(MODEL_PATH), local_files_only=True, trust_remote_code=False
     )
+    if tokenizer is None:
+        raise RuntimeError("the GPT-OSS checkpoint did not load a tokenizer")
     renderer = create_renderer(
         tokenizer,
         GptOssRendererConfig(reasoning_effort="medium", auto_drop_analysis=False),

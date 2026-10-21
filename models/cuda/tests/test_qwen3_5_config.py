@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from typing import Any
 
 import pytest
 
@@ -8,7 +9,7 @@ from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_cuda.qwen3_5.checkpoint import DEFAULT_MODEL, DEFAULT_REVISION
 
 
-def _qwen38() -> dict[str, object]:
+def _qwen38() -> dict[str, Any]:
     layers = [
         "full_attention" if (index + 1) % 4 == 0 else "linear_attention"
         for index in range(64)

@@ -287,9 +287,9 @@ def plan_cache_capacity(
 class DeviceMapping:
     """Raw page-table geometry consumed directly by CUDA kernels."""
 
-    parent_ids: object
-    child_slots: object
-    first_blocks: object
+    parent_ids: Tensor
+    child_slots: Tensor
+    first_blocks: Tensor
     block_tokens: int
     divisor: int
     parent_rows: int
@@ -304,8 +304,8 @@ class DeviceCache:
 
     geometry: CacheGeometry
     groups: tuple[DeviceGroup, ...]
-    latents: object
-    index_keys: object
+    latents: Tensor
+    index_keys: Tensor
 
     def row(self, index: int):
         """Return a one-sequence metadata view over the same physical pools."""
@@ -601,8 +601,8 @@ class CacheArena(GraphPageTableArena):
             self.index_keys,
         )
 
-    def _graph_padding_id(self, index: int) -> int:
-        return self.layout.parent_capacity + index + 1
+    def _graph_padding_id(self, _index: int) -> int:
+        return self.layout.parent_capacity + _index + 1
 
 
 __all__ = [

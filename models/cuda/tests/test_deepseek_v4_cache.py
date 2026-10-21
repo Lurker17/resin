@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
 import torch
 
-from resin import BatchPhase, CacheRetention
+from resin import BatchPhase, BatchPlan, CacheRetention
 from resin.backend.plans import PagedCachePlan
 from resin_models_cuda.deepseek_v4.cache import (
     C4_STATE_GROUP,
@@ -81,6 +82,9 @@ def test_prefill_guard_bands_preserve_history_beside_a_full_chunk() -> None:
     assert geometry.layout(300).groups[0].window_resident_block_count == 34
     for group in geometry.layout(300).groups:
         if group.retention is CacheRetention.WINDOW:
+            assert (
+                group.window_tokens is not None and group.read_window_tokens is not None
+            )
             assert group.window_tokens - group.read_window_tokens + 1 == 4096
 
 
@@ -96,6 +100,7 @@ def test_dspark_short_verify_lease_keeps_the_entire_preceding_anchor_window() ->
             prefill_chunk_size=writes,
         )
         group = geometry.layout(1000).groups[0]
+        assert group.window_resident_block_count is not None
         for context in range(2 * window, 3 * window):
             last_block = (context + writes - 1) // group.block_tokens
             first_block = max(0, last_block + 1 - group.window_resident_block_count)
@@ -135,8 +140,11 @@ def test_graph_capture_uses_group_private_scratch_parents() -> None:
     assert arena.storage.shape[0] == layout.parent_capacity + 7
     for group in range(len(geometry.packings)):
         expected_parent = layout.parent_capacity + group + 1
-        assert set(inputs[f"cache.{group}.parent_ids"]) == {expected_parent}
-        assert set(inputs[f"cache.{group}.child_slots"]) == {0}
+        parent_ids = inputs[f"cache.{group}.parent_ids"]
+        child_slots = inputs[f"cache.{group}.child_slots"]
+        assert isinstance(parent_ids, tuple) and isinstance(child_slots, tuple)
+        assert set(parent_ids) == {expected_parent}
+        assert set(child_slots) == {0}
 
 
 def test_plan_preserves_structured_parent_and_child_addresses() -> None:
@@ -171,7 +179,9 @@ def test_plan_preserves_structured_parent_and_child_addresses() -> None:
         phase=BatchPhase.PREFILL,
     )
 
-    cache_plan = PagedCachePlan.from_plan(plan, layout, decode_lookahead=5)
+    cache_plan = PagedCachePlan.from_plan(
+        cast(BatchPlan, plan), layout, decode_lookahead=5
+    )
 
     for index, (group, descriptor) in enumerate(
         zip(cache_plan.groups, layout.groups, strict=True)

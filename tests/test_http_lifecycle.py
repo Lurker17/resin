@@ -20,11 +20,11 @@ class Codec:
         slow = request["messages"][0]["content"] == "slow"
         return {"token_ids": [1 if slow else 2], "stop_token_ids": []}
 
-    def create_parser(self, _request, prompt_ids):
+    def create_parser(self, request, prompt_ids):
         delta = "x" * 65_536 if prompt_ids == [1] else "ok"
 
         class Parser:
-            def feed(self, _tokens):
+            def feed(self, token_ids):
                 return [{"type": "text_delta", "delta": delta}]
 
         return Parser()
@@ -128,7 +128,7 @@ def test_programmatic_shutdown_stops_idle_server_and_closes_engine():
 
 def test_actor_failure_stops_listener_and_propagates_from_serve():
     class FailingRunner(Runner):
-        def forward(self, _plan):
+        def forward(self, plan):
             raise PostAcceptCudaError("runner failed after updating state")
 
     with running_server(FailingRunner()) as (

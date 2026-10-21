@@ -7,6 +7,7 @@ import os
 import socket
 import time
 from datetime import timedelta
+from typing import NoReturn
 
 import pytest
 import torch
@@ -20,8 +21,15 @@ from resin.backend.expert_parallel import ExpertParallelDispatch
 from resin.backend.topology import ParallelGroups
 
 
+def _unreachable() -> NoReturn:
+    raise AssertionError("fixture graph builder must not run")
+
+
 class _CpuRunner(CudaRunner):
     """Exercise coordination and graph ownership without constructing CUDA."""
+
+    def forward(self, plan):
+        raise AssertionError("this fixture only tests graph coordination")
 
     def __init__(self, groups, shapes=((1, 4), (2, 4), (4, 4), (4, 8))):
         self.device = torch.device("cpu")
@@ -37,7 +45,7 @@ class _CpuRunner(CudaRunner):
         self.runner_config = RunnerConfig()
         self._configure_expert_parallel_graphs(self._model, groups)
         self._configure_cuda_graphs(
-            {"decode": CudaGraphMode(shapes, lambda _: None, lambda _: {})}
+            {"decode": CudaGraphMode(shapes, lambda _: _unreachable(), lambda _: {})}
         )
 
 
@@ -60,7 +68,7 @@ def _prefill_rounds(groups):
         return (hidden.float() + 1) * coefficient[:, None]
 
     dispatch = ExpertParallelDispatch(local, num_experts=2, group=groups.ep)
-    runner._model.dispatch = dispatch
+    setattr(runner._model, "dispatch", dispatch)
 
     def operation(hidden, _ids):
         indices = torch.tensor([0, 1], dtype=torch.int32).expand(hidden.shape[0], 2)
@@ -84,7 +92,7 @@ def _prefill_rounds(groups):
         step.launch()
         return step.output
 
-    runner._run_cuda_graph = replay
+    setattr(runner, "_run_cuda_graph", replay)
     for sizes, capacity in (
         (((1, 1), (1, 3)), 4),
         (((0, 0), (1, 2)), 2),

@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Iterator
 
 import torch
 
 
 @contextmanager
-def use_default_dtype(dtype: torch.dtype) -> Iterator[None]:
+def use_default_dtype(dtype: torch.dtype) -> Generator[None, None, None]:
     previous = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:

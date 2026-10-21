@@ -7,7 +7,7 @@ expert weights, their kernel layout and communication across expert owners.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import Tensor, nn
@@ -16,7 +16,7 @@ from resin.backend.expert_parallel import ExpertParallelDispatch
 
 if TYPE_CHECKING:
     from resin.backend.topology import ParallelGroups
-    from resin_models_cuda.deepseek_v4.model import MoEWeights
+    from resin_models_cuda.deepseek_v4.model import Expert, MoEWeights
 
 
 class RoutedExperts(nn.Module):
@@ -26,6 +26,13 @@ class RoutedExperts(nn.Module):
     explicit mesh dispatches local rows to their expert owner and all of its
     expert-TP lanes, then combines contributions back into complete origin rows.
     """
+
+    w13_weight: Tensor
+    w13_scale: Tensor
+    w2_weight: Tensor
+    w2_scale: Tensor
+    output_scales: Tensor
+    clamp_limits: Tensor
 
     def __init__(
         self,
@@ -70,7 +77,10 @@ class RoutedExperts(nn.Module):
             self.register_buffer("output_scales", source._fused_output_scales)
             self.register_buffer("clamp_limits", source._fused_clamp_limits)
         else:
-            self.experts = nn.ModuleList(source.experts[self.start : self.stop])
+            self.experts = nn.ModuleList(
+                cast("Expert", expert)
+                for expert in source.experts[self.start : self.stop]
+            )
 
     def forward(self, hidden: Tensor, indices: Tensor, weights: Tensor) -> Tensor:
         if self.dispatch is not None:

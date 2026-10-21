@@ -10,7 +10,7 @@ import pickle
 from collections.abc import Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Protocol
+from typing import Any, Protocol
 
 from resin import BatchPhase, BatchPlan, Engine, ForwardOutput, Runner, RunnerConfig
 from resin.backend.parallel import batch_plan_from_payload, batch_plan_payload
@@ -172,10 +172,15 @@ class DistributedWorker:
         if failure:
             raise DistributedExecutionError(failure)
 
-    def _drivers(self, operation, value):
+    @property
+    def _driver_group(self) -> RankGroup:
         group = self.groups.drivers
         if group is None:
             raise RuntimeError("only replica drivers coordinate serving")
+        return group
+
+    def _drivers(self, operation, value):
+        group = self._driver_group
         results = self._gather(group, (operation, value))
         if any(kind != operation for kind, _ in results):
             raise DistributedExecutionError(
@@ -202,7 +207,7 @@ class DistributedWorker:
         error = None
         try:
             if operation == "bind":
-                self.runner.bind_resources(
+                getattr(self.runner, "bind_resources")(
                     SimpleNamespace(
                         cache_pool_id=command["cache_pool_id"],
                         cache_layout=self.runner_config.cache_layout,
@@ -261,7 +266,7 @@ class DistributedWorker:
                 error,
             ),
         )
-        failure = _first_error(self.groups.drivers, [item[2] for item in descriptors])
+        failure = _first_error(self._driver_group, [item[2] for item in descriptors])
         if failure:
             raise DistributedExecutionError(failure)
         sizes = tuple((rows, tokens) for rows, tokens, _ in descriptors)
@@ -302,7 +307,7 @@ class DistributedWorker:
             if self._forward is not None:
                 result = self._forward(plan, context)
             elif plan is not None:
-                result = self.runner.forward(plan)
+                result = getattr(self.runner, "forward")(plan)
         except BaseException as exc:
             error = _message(exc)
         self._consensus(self.groups.domain, error)
@@ -313,7 +318,7 @@ class DistributedWorker:
         if self.groups.is_driver:
             raise ValueError("replica drivers construct DistributedEngine instead")
         while True:
-            commands = [None]
+            commands: list[dict[str, Any]] = [{}]
             self.groups.distributed.broadcast_object_list(
                 commands,
                 src=self.groups.replica.source,
@@ -350,19 +355,24 @@ class DistributedEngine:
             raise ValueError("only replica drivers own a request engine")
         self.worker, self.closed = worker, False
         self._step_id, self._last_phase = 0, None
-        self.local = None
+        self._local: Engine | None = None
         error = None
         try:
-            self.local = Engine(worker, **engine_options)
+            self._local = Engine(worker, **engine_options)
         except BaseException as exc:
             error = _message(exc)
         errors = worker._drivers("initialize", error)
-        failure = _first_error(worker.groups.drivers, errors)
+        failure = _first_error(worker._driver_group, errors)
         if failure:
             self._record_failure(failure)
             worker._send({"operation": "close", "error": failure})
             worker.closed = self.closed = True
             raise DistributedExecutionError(failure)
+
+    @property
+    def local(self) -> Engine:
+        assert self._local is not None
+        return self._local
 
     @property
     def poisoned(self):
@@ -398,8 +408,8 @@ class DistributedEngine:
     def _record_failure(self, failure):
         if failure:
             self.worker.failure = self.worker.failure or failure
-            if self.local is not None:
-                self.local.poison(failure)
+            if self._local is not None:
+                self._local.poison(failure)
 
     def has_work(self):
         if self.closed:
@@ -409,7 +419,7 @@ class DistributedEngine:
             (self.local.has_work(), self.worker.failure or self.local.poison_error),
         )
         failure = _first_error(
-            self.worker.groups.drivers, [error for _, error in states]
+            self.worker._driver_group, [error for _, error in states]
         )
         if failure:
             self._finish(failure)
@@ -430,7 +440,7 @@ class DistributedEngine:
             error = _message(exc)
         proposals = self.worker._drivers("phase", (proposal, error))
         failure = _first_error(
-            self.worker.groups.drivers, [error for _, error in proposals]
+            self.worker._driver_group, [error for _, error in proposals]
         )
         if failure:
             self._finish(failure)
@@ -463,7 +473,7 @@ class DistributedEngine:
             except BaseException as exc:
                 error = error or _message(exc)
         errors = self.worker._drivers("commit", error)
-        self._finish(_first_error(self.worker.groups.drivers, errors))
+        self._finish(_first_error(self.worker._driver_group, errors))
         return events
 
     def close(self):
@@ -477,7 +487,7 @@ class DistributedEngine:
         except BaseException as exc:
             error = error or _message(exc)
         errors = self.worker._drivers("close", error)
-        failure = _first_error(self.worker.groups.drivers, errors)
+        failure = _first_error(self.worker._driver_group, errors)
         self._record_failure(failure)
         self.worker._send({"operation": "close", "error": failure})
         self.worker.closed = self.closed = True

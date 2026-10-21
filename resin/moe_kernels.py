@@ -49,7 +49,7 @@ def _freeze_names(field: str, values: object) -> frozenset[str]:
     if isinstance(values, str):
         raise TypeError(f"{field} must be a collection of names, not one string")
     try:
-        frozen = frozenset(values)  # type: ignore[arg-type]
+        frozen = frozenset(values)  # ty: ignore[invalid-argument-type]  # Validate untrusted input below.
     except TypeError as error:
         raise ValueError(f"{field} must be a collection of names") from error
     if not frozen:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import numpy as np
+
 from resin import (
     BatchPhase,
     BatchPlan,
@@ -147,7 +149,7 @@ def test_decode_lookahead_expands_verify_but_not_assistant_context() -> None:
     assistant = gemma4_assistant_context(batch)
     verify = expand_gemma4_decode_batch(
         batch,
-        [[201, 202, 203]],
+        np.array([[201, 202, 203]], dtype=np.int64),
     )
 
     assert assistant.global_.page_indices.tolist() == [20]
@@ -183,7 +185,9 @@ def test_five_drafts_reserve_the_local_page_beyond_a_full_window() -> None:
         decode_lookahead=5,
     )
     assistant = gemma4_assistant_context(batch)
-    verify = expand_gemma4_decode_batch(batch, [[201, 202, 203, 204, 205]])
+    verify = expand_gemma4_decode_batch(
+        batch, np.array([[201, 202, 203, 204, 205]], dtype=np.int64)
+    )
 
     assert len(assistant.local.page_indices) == 16
     assert assistant.local.last_page_lengths.tolist() == [64]

@@ -37,6 +37,7 @@ from deploy.modal_image import build_modal_image
 from resin import Engine, SamplingParams, SchedulerConfig, TokenEvent
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
+    GraphShape,
     default_decode_graph_shapes,
 )
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
@@ -352,7 +353,7 @@ def _new_cuda_runner(
     model_path: Path,
     cache_parent_capacity: int | None,
     tensor_parallel: TensorParallelContext,
-    cuda_graph_decode_shapes: tuple[tuple[int, int], ...] | None = None,
+    cuda_graph_decode_shapes: tuple[GraphShape, ...] | None = None,
 ) -> GptOssCudaRunner:
     kernel_moe = FlashInferSM90MXFP4Kernel()
     if tensor_parallel.rank == 0:

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Iterator
 
 import torch
 from deep_gemm import fp8_fp4_gemm_nt, transform_sf_into_required_layout
@@ -23,7 +22,7 @@ _DYNAMIC_ROWS = ContextVar("deepseek_v4_dynamic_gemm_rows", default=False)
 
 
 @contextmanager
-def dynamic_gemm_rows() -> Iterator[None]:
+def dynamic_gemm_rows() -> Generator[None, None, None]:
     """Select runtime-M GEMMs while processing an arbitrary-length prefill."""
 
     token = _DYNAMIC_ROWS.set(True)

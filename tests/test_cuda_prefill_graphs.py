@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from typing import NoReturn
 
 import pytest
 import torch
@@ -13,6 +14,11 @@ from resin.backend.cuda.graphs import CudaGraphMode, CudaGraphProgram, CudaGraph
 from resin.backend.cuda.runner import CudaRunner
 
 
+# Empty shape catalogs must never invoke their builder.
+def _unreachable(_shape) -> NoReturn:
+    raise AssertionError("empty graph catalog must not build")
+
+
 def _runner(device="cpu", *, prefill="breakable", decode="full", decode_builder=None):
     runner = object.__new__(CudaRunner)
     runner.device = torch.device(device)
@@ -21,9 +27,9 @@ def _runner(device="cpu", *, prefill="breakable", decode="full", decode_builder=
     runner._prefill_operations = ()
     runner._prefill_buffers = {}
     runner._cuda_graph_executor = None
-    runner._cuda_failure = lambda: torch.cuda.synchronize(runner.device)
+    setattr(runner, "_cuda_failure", lambda: torch.cuda.synchronize(runner.device))
     runner._configure_cuda_graphs(
-        {"decode": CudaGraphMode((), decode_builder or (lambda _: None), lambda _: {})}
+        {"decode": CudaGraphMode((), decode_builder or (_unreachable), lambda _: {})}
     )
     return runner
 
@@ -99,7 +105,10 @@ def test_decode_and_unsupported_prefill_inputs_keep_the_eager_operation(
         (operation,), hidden_size=4, max_tokens=4
     )
     monkeypatch.setattr(
-        runner, "_run_cuda_graph", lambda *args: pytest.fail("unexpected replay")
+        runner,
+        "_run_cuda_graph",
+        # ty misbinds pytest's decorated helper and drops its reason parameter.
+        lambda *args: pytest.fail("unexpected replay"),  # ty: ignore[invalid-argument-type]
     )
     decode = torch.ones(1, 3, 4, dtype=torch.bfloat16)
     torch.testing.assert_close(invoke(decode), decode + 1)

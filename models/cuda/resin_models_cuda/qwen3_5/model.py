@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +19,9 @@ from resin_models_cuda.qwen3_5.attention import (
 )
 from resin_models_cuda.qwen3_5.cache import MTP_GROUP, TARGET_GROUP, DeviceCache
 from resin_models_cuda.qwen3_5.quantization import ModelOptFp8Linear
+
+if TYPE_CHECKING:
+    from transformers import Qwen3_5VisionModel
 
 
 def _projection(in_features: int, out_features: int, *, quantized: bool) -> nn.Module:
@@ -160,7 +164,7 @@ class Qwen35GatedDeltaNet(nn.Module):
         convolution_state = convolution_input[..., -state_length:]
 
         query, key, value = torch.split(
-            mixed, (self.key_dim, self.key_dim, self.value_dim), dim=-1
+            mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1
         )
         query = query.view(
             batch,
@@ -385,6 +389,8 @@ class Qwen35DecoderLayer(nn.Module):
 
 
 class Qwen35TextModel(nn.Module):
+    inv_freq: Tensor
+
     def __init__(self, config: Qwen35Config, *, quantized: bool = False) -> None:
         super().__init__()
         self.config = config
@@ -486,7 +492,7 @@ class Qwen35TextModel(nn.Module):
         recurrent_out = []
         convolution_out = []
         linear_index = 0
-        for layer in self.layers:
+        for layer in cast(Sequence[Qwen35DecoderLayer], self.layers):
             residual = hidden
             normalized = layer.input_layernorm(hidden)
             if layer.block_type == "linear_attention":
@@ -527,6 +533,8 @@ class Qwen35TextModel(nn.Module):
 
 
 class _Qwen35Backbone(nn.Module):
+    visual: Qwen3_5VisionModel | None
+
     def __init__(
         self,
         config: Qwen35Config,
@@ -596,7 +604,7 @@ class Qwen35MTP(nn.Module):
                 dim=-1,
             )
         )
-        layer = self.layers[0]
+        layer = cast(Qwen35DecoderLayer, self.layers[0])
         attention = (
             attention_runtime.prepare(
                 cache,
@@ -649,7 +657,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         return self.model.language_model
 
     @property
-    def visual(self) -> nn.Module | None:
+    def visual(self) -> Qwen3_5VisionModel | None:
         return self.model.visual
 
     def logits(self, hidden: Tensor) -> Tensor:

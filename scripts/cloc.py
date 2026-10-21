@@ -9,6 +9,16 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import NotRequired, TypedDict
+
+SourceTree = dict[str, "list[Path] | SourceTree"]
+
+
+class Counts(TypedDict):
+    files: int
+    code: int
+    children: NotRequired[dict[str, Counts]]
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -18,8 +28,8 @@ def source_files(path: Path, pattern: str, *, recursive: bool = True) -> list[Pa
     return sorted(file for file in files if "tests" not in file.parts)
 
 
-def python_package(path: Path) -> dict[str, object]:
-    groups: dict[str, object] = {"_self": source_files(path, "*.py", recursive=False)}
+def python_package(path: Path) -> SourceTree:
+    groups: SourceTree = {"_self": source_files(path, "*.py", recursive=False)}
     for directory in sorted(path.iterdir()):
         if directory.is_dir() and not directory.name.startswith("__"):
             files = source_files(directory, "*.py")
@@ -112,7 +122,7 @@ def rust_without_tests(paths: list[Path], destination: Path) -> list[Path]:
     return stripped
 
 
-def count(paths: list[Path], language: str) -> dict[str, int]:
+def count(paths: list[Path], language: str) -> Counts:
     if not paths:
         return {"files": 0, "code": 0}
     with tempfile.TemporaryDirectory() as temporary:
@@ -129,8 +139,10 @@ def count(paths: list[Path], language: str) -> dict[str, int]:
     return {"files": len(paths), "code": json.loads(result.stdout)[language]["code"]}
 
 
-def count_tree(groups: dict[str, object], language: str) -> dict[str, object]:
-    own = count(groups.get("_self", []), language)
+def count_tree(groups: SourceTree, language: str) -> Counts:
+    own_paths = groups.get("_self", [])
+    assert isinstance(own_paths, list)
+    own = count(own_paths, language)
     children = {}
     for name, group in groups.items():
         if name == "_self":
@@ -147,8 +159,8 @@ def count_tree(groups: dict[str, object], language: str) -> dict[str, object]:
     }
 
 
-def report() -> dict[str, dict[str, object]]:
-    groups = {
+def report() -> dict[str, Counts]:
+    groups: dict[str, SourceTree] = {
         "rust": {
             "resin-core": {
                 "core": source_files(
@@ -176,8 +188,8 @@ def report() -> dict[str, dict[str, object]]:
 
 
 def tree_rows(
-    children: dict[str, dict[str, object]], prefix: str = ""
-) -> list[tuple[str, dict[str, object]]]:
+    children: dict[str, Counts], prefix: str = ""
+) -> list[tuple[str, Counts]]:
     rows = []
     items = list(children.items())
     for index, (name, node) in enumerate(items):
@@ -203,7 +215,7 @@ def main() -> None:
     print("Production code lines (Tokei; comments, blanks, and test code excluded)")
     for section, root in counts.items():
         print(f"\n{section.title()}")
-        children = dict(root["children"])
+        children = dict(root.get("children", {}))
         children["total"] = {"files": root["files"], "code": root["code"]}
         rows = tree_rows(children)
         width = max(len(label) for label, _ in rows)

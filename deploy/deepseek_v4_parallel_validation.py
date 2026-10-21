@@ -233,14 +233,12 @@ def _new_runner(
 ):
     from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 
-    parallel = (
-        {"parallel_groups": groups}
-        if groups is not None
-        else {
-            "tensor_parallel": TensorParallelContext(
-                TensorParallelLayout(rank=rank, size=world_size), dist.group.WORLD
-            )
-        }
+    tensor_parallel = (
+        TensorParallelContext(
+            TensorParallelLayout(rank=rank, size=world_size), dist.group.WORLD
+        )
+        if groups is None
+        else None
     )
     return DeepSeekV4CudaRunner(
         model_path,
@@ -256,7 +254,8 @@ def _new_runner(
         fast_allreduce=False,
         cache_parent_capacity=CACHE_PARENTS,
         prefill_chunk_size=PREFILL_CHUNK_SIZE,
-        **parallel,
+        tensor_parallel=tensor_parallel,
+        parallel_groups=groups,
     )
 
 
@@ -622,6 +621,7 @@ def _run_tp_baseline_rank(
             ):
                 raise AssertionError("legacy DSpark reference leaked cache parents")
         if numerical:
+            assert trace is not None
             torch.save(
                 _teacher_logits(engine, runner, prompts),
                 Path(report_directory, f"{rank}.pt"),

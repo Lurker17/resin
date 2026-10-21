@@ -14,8 +14,8 @@ if importlib.util.find_spec("quack") is None:
         del args, kwargs
         raise RuntimeError("Quack is unavailable in this test environment")
 
-    quack.rmsnorm = _unavailable
-    rotary.apply_rotary = _unavailable
+    setattr(quack, "rmsnorm", _unavailable)
+    setattr(rotary, "apply_rotary", _unavailable)
     sys.modules["quack"] = quack
     sys.modules["quack.rotary"] = rotary
 
@@ -29,7 +29,7 @@ if importlib.util.find_spec("flashinfer") is None:
         del args, kwargs
         raise RuntimeError("FlashInfer is unavailable in this test environment")
 
-    gemm.tinygemm_bf16 = _flashinfer_unavailable
+    setattr(gemm, "tinygemm_bf16", _flashinfer_unavailable)
 
     class _AllReduceFusionPattern:
         kAllReduce = 0
@@ -42,11 +42,11 @@ if importlib.util.find_spec("flashinfer") is None:
         def __init__(self, group: object = None) -> None:
             self.group = group
 
-    comm.AllReduceFusionPattern = _AllReduceFusionPattern
-    comm.AllReduceFusionWorkspace = _AllReduceFusionWorkspace
-    comm.allreduce_fusion = _flashinfer_unavailable
-    comm.create_allreduce_fusion_workspace = _flashinfer_unavailable
-    mnnvl.TorchDistBackend = _TorchDistBackend
+    setattr(comm, "AllReduceFusionPattern", _AllReduceFusionPattern)
+    setattr(comm, "AllReduceFusionWorkspace", _AllReduceFusionWorkspace)
+    setattr(comm, "allreduce_fusion", _flashinfer_unavailable)
+    setattr(comm, "create_allreduce_fusion_workspace", _flashinfer_unavailable)
+    setattr(mnnvl, "TorchDistBackend", _TorchDistBackend)
     sys.modules["flashinfer"] = flashinfer
     sys.modules["flashinfer.comm"] = comm
     sys.modules["flashinfer.comm.mnnvl"] = mnnvl
@@ -62,7 +62,7 @@ if (
     def _kernel(function: object) -> object:
         return function
 
-    tile.kernel = _kernel
-    cuda.tile = tile
+    setattr(tile, "kernel", _kernel)
+    setattr(cuda, "tile", tile)
     sys.modules["cuda"] = cuda
     sys.modules["cuda.tile"] = tile

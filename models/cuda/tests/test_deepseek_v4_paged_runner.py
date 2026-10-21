@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
 import pytest
@@ -100,12 +101,18 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
             }
 
     graphs = Graphs()
-    runner._select_cuda_graph = lambda _mode, *, match, fallback="shape": graphs.match(
-        match
+    setattr(
+        runner,
+        "_select_cuda_graph",
+        lambda _mode, *, match, fallback="shape": graphs.match(match),
     )
-    runner._run_cuda_graph = lambda _mode, shape, inputs: graphs.run(shape, inputs)
-    runner._sampler = Sampler()
-    runner._cache = Cache()
+    setattr(
+        runner,
+        "_run_cuda_graph",
+        lambda _mode, shape, inputs: graphs.run(shape, inputs),
+    )
+    setattr(runner, "_sampler", Sampler())
+    setattr(runner, "_cache", Cache())
     plan = SimpleNamespace(
         num_sequences=3,
         sampling_mask=[True] * 3,
@@ -118,7 +125,7 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
         positions=np.array([11, 12, 13]),
     )
 
-    assert runner._graph_forward(plan, "cache-plan") == [11, 12, 13]
+    assert runner._graph_forward(cast(BatchPlan, plan), "cache-plan") == [11, 12, 13]
     shape, inputs = graphs.calls[0]
     assert shape == (4, 128)
     assert inputs["token_ids"].tolist() == [5, 6, 7, 0]
@@ -160,7 +167,7 @@ def test_prefill_uses_one_paged_path_for_fresh_and_continuation_rows() -> None:
             ).float()
             return logits, None
 
-    runner._model = Model()
+    setattr(runner, "_model", Model())
     cache = Cache()
     plan = BatchPlan(
         [7, 8],

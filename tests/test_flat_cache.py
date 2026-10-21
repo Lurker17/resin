@@ -11,6 +11,7 @@ from resin import (
     CacheLayout,
     CacheRetention,
     Engine,
+    MediaTokenSpan,
     ResourceBinding,
     RunnerConfig,
     SchedulerConfig,
@@ -83,7 +84,7 @@ class TestFlatCacheApi:
         assert layout.group_kernel_page_capacity(1) == 6
         assert layout.group_kernel_page_count(1) == 7
         with pytest.raises(AttributeError):
-            layout.parent_capacity = 4
+            setattr(layout, "parent_capacity", 4)
 
     def test_cache_retention_is_only_history_or_window(self) -> None:
         history = CacheGroupLayout(4)
@@ -106,11 +107,14 @@ class TestFlatCacheApi:
                     read_window_tokens=read_window,
                 )
         with pytest.raises(AttributeError):
-            _ = history.resident_blocks
+            # Removed API must fail at runtime.
+            _ = history.resident_blocks  # ty: ignore[unresolved-attribute]
         with pytest.raises(TypeError, match="resident_blocks"):
-            CacheGroupLayout(4, resident_blocks=1)
+            # Removed constructor argument must fail at runtime.
+            CacheGroupLayout(4, resident_blocks=1)  # ty: ignore[unknown-argument]
         with pytest.raises(TypeError):
-            CacheGroupLayout(4, retention="state")
+            # Invalid retention type must fail at runtime.
+            CacheGroupLayout(4, retention="state")  # ty: ignore[invalid-argument-type]
 
     def test_manual_sparse_group_plan_is_the_only_batch_cache_metadata(self) -> None:
         group = CacheGroupPlan(
@@ -208,6 +212,7 @@ class TestFlatCacheApi:
 
         runner = RecordingCachedRunner(layout)
         engine = Engine(runner)
+        assert engine.cache_pool_id is not None
         assert engine.cache_pool_id > 0
         assert runner.bindings == [(engine.cache_pool_id, layout)]
         assert runner.bindings[0][1] is layout
@@ -263,9 +268,10 @@ class TestFlatCacheEngine:
     def test_media_digest_identity_controls_prefix_reuse(self) -> None:
         class Media:
             token_ids = [1, 2, 3, 4]
+            token_spans = ()
 
             def __init__(self, identity: list[int]) -> None:
-                self.cache_key = identity
+                self.cache_key = tuple(identity)
 
         layout = CacheLayout(4, [CacheGroupLayout(2)])
         runner = RecordingCachedRunner(layout)
@@ -292,7 +298,7 @@ class TestFlatCacheEngine:
         class Media:
             token_ids = [1, 2, 3, 4, 5, 6]
             cache_key = (1, 20, 30, 40, 50, 6)
-            token_spans = ((1, 4),)
+            token_spans = (MediaTokenSpan(1, 4),)
 
         runner = RecordingCachedRunner(CacheLayout(4, [CacheGroupLayout(4)]))
         engine = Engine(runner, prefix_cache=True)

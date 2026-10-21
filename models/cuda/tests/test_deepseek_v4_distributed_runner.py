@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from typing import Any, NoReturn
 
 import pytest
 import torch
@@ -159,15 +160,19 @@ def _runner(monkeypatch, groups):
     runner.cuda_graph_prefill = "disabled"
     runner.cuda_graph_decode = "disabled"
     runner._prefill_graph_active = False
-    runner._model = _Model()
-    runner._cache = _Cache()
-    runner._cache_plan = lambda plan: plan
-    runner._cuda_failure = _Guard()
-    runner._prefill_compute_context = nullcontext
-    runner._distributed_prefill_graphs = lambda context, **kwargs: nullcontext()
-    runner._select_distributed_cuda_graph = lambda *args, **kwargs: None
-    runner._check_cuda_graphs = lambda phase: None
-    runner._sampler = lambda logits, plan, *, offset_delta: logits.argmax(dim=-1)
+    setattr(runner, "_model", _Model())
+    setattr(runner, "_cache", _Cache())
+    setattr(runner, "_cache_plan", lambda plan: plan)
+    setattr(runner, "_cuda_failure", _Guard())
+    setattr(runner, "_prefill_compute_context", nullcontext)
+    setattr(
+        runner, "_distributed_prefill_graphs", lambda context, **kwargs: nullcontext()
+    )
+    setattr(runner, "_select_distributed_cuda_graph", lambda *args, **kwargs: None)
+    setattr(runner, "_check_cuda_graphs", lambda phase: None)
+    setattr(
+        runner, "_sampler", lambda logits, plan, *, offset_delta: logits.argmax(dim=-1)
+    )
     return runner
 
 
@@ -416,11 +421,15 @@ def test_missing_graph_capture_is_rejected_in_worker_readiness_validation(
     runner.cuda_graph_prefill = "breakable"
     runner._cuda_graph_executor = None
     pending = "prefill" if phase == BatchPhase.PREFILL else "decode"
+
+    def unexpected_capture(_shape) -> NoReturn:
+        raise AssertionError("readiness validation must precede graph construction")
+
     runner._configure_cuda_graphs(
         {
             name: CudaGraphMode(
                 ((1, 1),) if name == pending else (),
-                lambda _: None,
+                unexpected_capture,
                 lambda _: {},
             )
             for name in ("prefill", "decode")
@@ -492,7 +501,9 @@ def test_managed_cache_addresses_are_validated_before_expert_rounds(
 def test_unsupported_distributed_preparation_fails_before_cuda(
     parallelism, options, message
 ):
-    kwargs = dict(cuda_graph_prefill="disabled", cuda_graph_decode="disabled")
+    kwargs: dict[str, Any] = dict(
+        cuda_graph_prefill="disabled", cuda_graph_decode="disabled"
+    )
     kwargs.update(options)
     with pytest.raises(ValueError, match=message):
         DeepSeekV4CudaRunner(

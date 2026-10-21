@@ -5,12 +5,12 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import torch
 
-from resin import CacheGroupFamily, CacheRetention
+from resin import CacheGroupFamily, CacheLayout, CacheRetention
 
 _SLAB_NAMES = ("slabs", "slots", "first")
 _PARENT_NAMES = ("parent_ids", "child_slots", "first_blocks")
@@ -54,9 +54,17 @@ def slab_locations(groups, group_index, positions, block_tokens):
     )
 
 
+class SlabGeometry(Protocol):
+    @property
+    def slab_units(self) -> int: ...
+
+
+@dataclass(frozen=True)
 class SlabDeviceCache:
     """Common addressing for model-specific views over a fungible slab."""
 
+    geometry: SlabGeometry
+    groups: tuple[DevicePageGroup, ...]
     page_tokens = 128
 
     @property
@@ -203,6 +211,8 @@ PARENT_PAGE_NAMES = _PARENT_NAMES
 class GraphPageTableArena:
     """Graph-buffer lifecycle shared by model-owned paged cache arenas."""
 
+    layout: CacheLayout
+    device: str | torch.device
     graph_input_names = _SLAB_NAMES
     graph_label = "CUDA model"
 

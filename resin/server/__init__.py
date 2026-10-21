@@ -218,6 +218,7 @@ class HttpServer:
         if (renderer is None) == (codec is None):
             raise TypeError("pass exactly one of renderer or codec")
         if codec is None:
+            assert renderer is not None
             codec = RendererCodec(renderer)
         if model is None:
             tokenizer = getattr(renderer, "_tokenizer", None)

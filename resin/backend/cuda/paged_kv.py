@@ -15,35 +15,68 @@ from resin.backend.resources import CachePoolBinding
 class SlabPageGroup(Protocol):
     """The page-table fields shared by slab-packed model caches."""
 
-    slab_ids: Any
-    slotnums: Any
-    first_blocks: Any
+    @property
+    def slab_ids(self) -> torch.Tensor: ...
+
+    @property
+    def slotnums(self) -> torch.Tensor: ...
+
+    @property
+    def first_blocks(self) -> torch.Tensor: ...
 
 
 class SlabPagedKvCache(Protocol):
     """Narrow cache interface consumed by importable attention kernels."""
 
-    page_tokens: int
-    slab_units: int
-    groups: tuple[SlabPageGroup, ...]
-    keys: Any
-    values: Any
+    @property
+    def page_tokens(self) -> int: ...
+
+    @property
+    def slab_units(self) -> int: ...
+
+    @property
+    def groups(self) -> tuple[SlabPageGroup, ...]: ...
+
+    @property
+    def keys(self) -> torch.Tensor: ...
+
+    @property
+    def values(self) -> torch.Tensor: ...
 
     def rows(self, group_index, layer, layer_count, positions): ...
+
+    def pages(self, group_index, layer, layer_count): ...
 
 
 class PagedCacheMapping(Protocol):
     """Physical address mapping accepted by fused cache-aware kernels."""
 
-    parent_ids: Any
-    child_slots: Any
-    first_blocks: Any
-    block_tokens: int
-    divisor: int
-    parent_rows: int
-    packing: int
-    row_scale: int
-    layer_offset: int
+    @property
+    def parent_ids(self) -> torch.Tensor: ...
+
+    @property
+    def child_slots(self) -> torch.Tensor: ...
+
+    @property
+    def first_blocks(self) -> torch.Tensor: ...
+
+    @property
+    def block_tokens(self) -> int: ...
+
+    @property
+    def divisor(self) -> int: ...
+
+    @property
+    def parent_rows(self) -> int: ...
+
+    @property
+    def packing(self) -> int: ...
+
+    @property
+    def row_scale(self) -> int: ...
+
+    @property
+    def layer_offset(self) -> int: ...
 
 
 class PagedKvArena:

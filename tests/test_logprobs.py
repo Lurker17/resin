@@ -1,5 +1,6 @@
 import weakref
-from types import SimpleNamespace
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 import pytest
@@ -16,6 +17,12 @@ from resin import (
 )
 from resin.backend.parallel import batch_plan_from_payload, batch_plan_payload
 from resin.backend.sampling import TorchSampler, format_output
+
+
+@dataclass
+class OutputRunner:
+    forward: Callable[[BatchPlan], ForwardOutput | list[int]]
+    release: Callable[[list[int]], None] = lambda _: None
 
 
 def scored_output(rows, scores, **kwargs):
@@ -136,9 +143,10 @@ def test_native_events_keep_speculative_scores_aligned_through_eos():
     )
     events = engine.step() + engine.step()
     assert [event.token_id for event in events] == [2, 7, 99]
-    assert [event.logprobs.logprob for event in events] == pytest.approx(
-        [-0.1, -0.2, -0.3]
-    )
+    assert all(event.logprobs is not None for event in events)
+    assert [
+        event.logprobs.logprob for event in events if event.logprobs is not None
+    ] == pytest.approx([-0.1, -0.2, -0.3])
     assert [event.index for event in events] == [0, 1, 2]
     assert request.take_result() == [2, 7, 99]
     assert runner.released == [request]
@@ -155,7 +163,7 @@ def test_invalid_scores_after_stop_still_quarantine_the_whole_batch(scores):
     def forward(plan):
         return scored_output([[7, 99, 8]], scores) if runner.calls else original(plan)
 
-    runner.forward = forward
+    setattr(runner, "forward", forward)
     engine = Engine(runner)
     request = engine.submit(
         [1],
@@ -168,13 +176,14 @@ def test_invalid_scores_after_stop_still_quarantine_the_whole_batch(scores):
         engine.step()
     assert engine.poisoned and not request.done
     assert runner.released == []
+    assert engine.cache_occupied_block_count is not None
     assert engine.cache_occupied_block_count > 0
 
 
 @pytest.mark.parametrize("offsets", [[1, 3], [0, 4], [0, 2], [0, 3, 2]])
 def test_invalid_output_offsets_fail_before_commit(offsets):
     output = ForwardOutput(np.array([3, 4, 5], np.uint32), np.array(offsets, np.uint32))
-    engine = Engine(SimpleNamespace(forward=lambda plan: output))
+    engine = Engine(OutputRunner(forward=lambda plan: output))
     request = engine.submit([1], max_new_tokens=1)
     with pytest.raises(RuntimeError):
         engine.step()
@@ -198,22 +207,24 @@ def test_array_handoff_retains_storage_and_events_own_their_scores():
         # The ForwardOutput temporary is gone, but Rust still retains its borrows.
         assert sources[0]() is not None
 
-    engine = Engine(SimpleNamespace(forward=forward, release=release))
+    engine = Engine(OutputRunner(forward=forward, release=release))
     engine.submit([1], max_new_tokens=1, sampling_params=SamplingParams(logprobs=True))
     (event,) = engine.step()
     assert sources[0]() is None
+    assert event.logprobs is not None
     assert event.logprobs.logprob == -0.5
 
 
 def test_exact_array_dtypes_and_contiguity_are_required_without_coercion():
     with pytest.raises(TypeError):
-        ForwardOutput(np.array([3], np.int64), np.array([0, 1], np.uint32))
+        # Wrong array dtype must fail without coercion.
+        ForwardOutput(np.array([3], np.int64), np.array([0, 1], np.uint32))  # ty: ignore[invalid-argument-type]
     output = ForwardOutput(
         np.array([3], np.uint32),
         np.array([0, 1], np.uint32),
         logprobs=np.zeros(4, np.float32)[::2],
     )
-    engine = Engine(SimpleNamespace(forward=lambda plan: output))
+    engine = Engine(OutputRunner(forward=lambda plan: output))
     engine.submit([1], max_new_tokens=1)
     with pytest.raises(ValueError, match="contiguous"):
         engine.step()
@@ -228,9 +239,10 @@ def test_top_alternatives_are_read_from_arrays_and_validated_even_past_eos():
         top_token_ids=np.array([3, 4], np.uint32),
         top_logprobs=np.array([-0.1, -2.0], np.float32),
     )
-    engine = Engine(SimpleNamespace(forward=lambda plan: good))
+    engine = Engine(OutputRunner(forward=lambda plan: good))
     engine.submit([1], max_new_tokens=1, sampling_params=SamplingParams(top_logprobs=2))
     (event,) = engine.step()
+    assert event.logprobs is not None
     assert np.array(event.logprobs.top_logprobs) == pytest.approx(
         np.array([[3, -0.1], [4, -2.0]])
     )
@@ -242,7 +254,7 @@ def test_top_alternatives_are_read_from_arrays_and_validated_even_past_eos():
         top_token_ids=np.array([3], np.uint32),
         top_logprobs=np.array([-0.1, float("nan")], np.float32),
     )
-    engine = Engine(SimpleNamespace(forward=lambda plan: bad))
+    engine = Engine(OutputRunner(forward=lambda plan: bad))
     engine.submit([1], max_new_tokens=1, sampling_params=SamplingParams(top_logprobs=2))
     with pytest.raises(RuntimeError):
         engine.step()
@@ -250,7 +262,7 @@ def test_top_alternatives_are_read_from_arrays_and_validated_even_past_eos():
 
 
 def test_requested_scores_cannot_silently_disappear():
-    engine = Engine(SimpleNamespace(forward=lambda plan: [3]))
+    engine = Engine(OutputRunner(forward=lambda plan: [3]))
     engine.submit([1], max_new_tokens=1, sampling_params=SamplingParams(logprobs=True))
     with pytest.raises(RuntimeError, match="requested token logprobs"):
         engine.step()
@@ -258,7 +270,7 @@ def test_requested_scores_cannot_silently_disappear():
 
 
 def test_plain_token_outputs_keep_the_original_contract():
-    engine = Engine(SimpleNamespace(forward=lambda plan: [3]))
+    engine = Engine(OutputRunner(forward=lambda plan: [3]))
     request = engine.submit([1], max_new_tokens=1)
     (event,) = engine.step()
     assert event.logprobs is None and request.take_result() == [3]

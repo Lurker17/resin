@@ -17,7 +17,7 @@ class TensorStager:
 
     def __init__(self, device) -> None:
         self.target_device = device
-        self.host_tensors = {}
+        self.host_tensors: dict[str, torch.Tensor] = {}
 
     def host(self, name: str, values, dtype):
         values = np.asarray(values)
@@ -63,7 +63,7 @@ class TensorStager:
 
     def copy_into(
         self,
-        targets: Mapping[str, object],
+        targets: Mapping[str, torch.Tensor],
         values: Mapping[str, object],
     ) -> None:
         if targets is values:

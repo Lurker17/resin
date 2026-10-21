@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import Tensor, nn
@@ -153,6 +154,8 @@ class Gemma4AssistantMLP(nn.Module):
 
 
 class Gemma4AssistantLayer(nn.Module):
+    layer_scalar: Tensor
+
     def __init__(self, config: Gemma4AssistantConfig, layer_index: int) -> None:
         super().__init__()
         self.self_attn = Gemma4AssistantAttention(config, layer_index)
@@ -176,9 +179,12 @@ class Gemma4AssistantTextModel(nn.Module):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=torch.bfloat16
         )
-        self.layers = nn.ModuleList(
-            Gemma4AssistantLayer(config, index)
-            for index in range(config.num_hidden_layers)
+        self.layers = cast(
+            Sequence[Gemma4AssistantLayer],
+            nn.ModuleList(
+                Gemma4AssistantLayer(config, index)
+                for index in range(config.num_hidden_layers)
+            ),
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = RotaryEmbedding(config)

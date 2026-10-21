@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Self
+from typing import Any, Self, cast
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +83,10 @@ class Qwen35Config:
                 )
             ),
             mrope_section=(
-                tuple(int(section) for section in rope["mrope_section"])
+                cast(
+                    tuple[int, int, int],
+                    tuple(int(section) for section in rope["mrope_section"]),
+                )
                 if "mrope_section" in rope
                 else None
             ),

@@ -72,7 +72,8 @@ def test_projection_local_buckets_do_not_inherit_expert_padding(monkeypatch):
     # Expert replicas agree on their exchange shape; pure projections need
     # only agree within their own TP group and can preserve exact row counts.
     runner._distributed_prefill_bucket = 8
-    monkeypatch.setattr(runner, "_run_cuda_graph", lambda *args: pytest.fail("replay"))
+    # ty misbinds pytest's decorated helper and drops its reason parameter.
+    monkeypatch.setattr(runner, "_run_cuda_graph", lambda *args: pytest.fail("replay"))  # ty: ignore[invalid-argument-type]
     hidden = torch.ones((3, 4), dtype=torch.bfloat16)
     with runner._prefill_graphs():
         qr, _ = project(hidden)

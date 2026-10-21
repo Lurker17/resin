@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
 
 from resin.backend.cuda.parallel import TensorParallelLayout
-from resin.backend.topology import RankGroup
+from resin.backend.topology import ParallelGroups, RankGroup
 from resin.models.gpt_oss.config import GptOssConfig
 from resin_models_cuda.gpt_oss.mxfp4 import (
     EXPERT_CHECKPOINT_NAMES,
@@ -133,7 +134,7 @@ def test_composed_ep_and_expert_tp_reconstruct_all_checkpoint_weights(name):
         "down_proj_scales": (8, 32, 3),
         "down_proj_bias": (8, 32),
     }
-    tensor = torch.arange(torch.tensor(shapes[name]).prod()).view(shapes[name])
+    tensor = torch.arange(int(torch.tensor(shapes[name]).prod())).view(shapes[name])
     owners = []
     for ep_rank in range(2):
         channels = [
@@ -310,7 +311,10 @@ def test_checkpoint_prepares_independent_attention_ep_and_expert_tp_shards(
     monkeypatch.setattr(checkpoint, "cuda_architecture", lambda device: "sm90")
     monkeypatch.setattr(checkpoint, "load_gpt_oss_weights", load_weights)
     model, _ = checkpoint.load_model(
-        tmp_path, device="cpu", kernel_moe=Kernel(), parallel_groups=groups
+        tmp_path,
+        device="cpu",
+        kernel_moe=Kernel(),
+        parallel_groups=cast(ParallelGroups, groups),
     )
     assert dispatches == [(8, groups)]
     assert len(prepared) == 1
@@ -355,7 +359,9 @@ def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty(monke
                 result += hidden * scales * (expert + 5)
             return result
 
-    module = kernel_expert_factory(Kernel(), config, parallel_groups=groups)(args)
+    module = kernel_expert_factory(
+        Kernel(), config, parallel_groups=cast(ParallelGroups, groups)
+    )(args)
     module.install_prepared_weights(storage, device=torch.device("cpu"))
     hidden = torch.ones(3, 32, dtype=torch.bfloat16)
     indices = torch.tensor([[0, 4], [7, 3], [5, 6]])
@@ -393,4 +399,5 @@ def test_ep_rejects_kernels_without_fp32_partial_execution():
     args = _args()
     config = moe_kernel_config(args, "sm90")
     with pytest.raises(ValueError, match="FP32 forward_partial"):
-        kernel_expert_factory(object(), config, parallel_groups=object())
+        # Reject the kernel before reading any fields from this opaque group.
+        kernel_expert_factory(object(), config, parallel_groups=object())  # ty: ignore[invalid-argument-type]

@@ -132,6 +132,7 @@ class TestLfm2Torch:
                 ].log_softmax(-1)
             (event,) = engine.step()
             assert event.token_id == expected.argmax().item()
+            assert event.logprobs is not None
             assert event.logprobs.logprob == pytest.approx(
                 expected[event.token_id].item(), abs=1e-5
             )
@@ -170,6 +171,7 @@ class TestLfm2Torch:
             [0, 2, 3],
         )
         first = runner.forward(prefill)
+        assert isinstance(first, list)
         assert len(first) == 2
         assert runner.live_cache_count == 2
 
@@ -181,6 +183,7 @@ class TestLfm2Torch:
             phase=BatchPhase.DECODE,
         )
         second = runner.forward(decode)
+        assert isinstance(second, list)
         assert len(second) == 2
         assert all(0 <= token < self.args.vocab_size for token in second)
         runner.release([17, 23])

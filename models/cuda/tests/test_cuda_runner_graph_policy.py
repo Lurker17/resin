@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import NoReturn
 
 import pytest
 import torch
@@ -19,6 +20,10 @@ from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
 from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
 from resin_models_cuda.inkling.cuda import InklingCudaRunner
 from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
+
+
+def _fail(message: str) -> NoReturn:
+    raise AssertionError(message)
 
 
 @pytest.mark.parametrize(
@@ -83,8 +88,14 @@ def test_model_prefill_rejects_uncaptured_graphs_before_accessing_model_state(
     runner = object.__new__(runner_type)
     runner._cuda_graph_executor = CudaGraphExecutor(
         "cpu",
-        {"prefill": CudaGraphMode(((4, 1),), lambda _: None, lambda _: {})},
-        synchronize_failure=lambda: pytest.fail("no CUDA work should have begun"),
+        {
+            "prefill": CudaGraphMode(
+                ((4, 1),),
+                lambda _: _fail("uncaptured graph must not be constructed"),
+                lambda _: {},
+            )
+        },
+        synchronize_failure=lambda: _fail("no CUDA work should have begun"),
     )
     with pytest.raises(RuntimeError, match="call runner.capture_cuda_graphs") as error:
         runner.forward(SimpleNamespace(phase=BatchPhase.PREFILL))
@@ -103,12 +114,20 @@ def test_deepseek_decode_policy_places_broadcast_inside_or_between_graphs(
     runner.vocab_size = 2
     runner.cuda_graph_decode = policy
     runner.device = torch.device("cpu")
-    runner.tensor_parallel = SimpleNamespace(enabled=parallel, process_group=object())
+    setattr(
+        runner,
+        "tensor_parallel",
+        SimpleNamespace(enabled=parallel, process_group=object()),
+    )
     runner._graph_device_caches = {}
     runner._graph_logits = {}
-    runner._cache = SimpleNamespace(
-        graph_cache=lambda *_args: object(),
-        graph_device_inputs=lambda _cache: {},
+    setattr(
+        runner,
+        "_cache",
+        SimpleNamespace(
+            graph_cache=lambda *_args: object(),
+            graph_device_inputs=lambda _cache: {},
+        ),
     )
     events = []
 
@@ -125,11 +144,15 @@ def test_deepseek_decode_policy_places_broadcast_inside_or_between_graphs(
         assert src == 0 and group is runner.tensor_parallel.process_group
         output.fill_(7)
 
-    runner._model = SimpleNamespace(forward_decode=forward)
-    runner._sampler = SimpleNamespace(
-        empty=lambda *_args: object(),
-        sample_tensors=sample,
-        graph_inputs=lambda _sampling: {},
+    setattr(runner, "_model", SimpleNamespace(forward_decode=forward))
+    setattr(
+        runner,
+        "_sampler",
+        SimpleNamespace(
+            empty=lambda *_args: object(),
+            sample_tensors=sample,
+            graph_inputs=lambda _sampling: {},
+        ),
     )
     monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
     program = runner._new_decode_graph_step((2, 32))
@@ -165,7 +188,9 @@ def cpu_prefill_regions(
     runner._prefill_graph_active = False
     runner._prefill_operations = ()
     runner._prefill_buffers = {}
-    runner._cuda_graph_executor = SimpleNamespace(add_mode=lambda *_args: None)
+    setattr(
+        runner, "_cuda_graph_executor", SimpleNamespace(add_mode=lambda *_args: None)
+    )
     callbacks = runner._configure_prefill_graphs(
         tuple(operations),
         hidden_size=hidden_size,
@@ -184,5 +209,5 @@ def cpu_prefill_regions(
         replays.append(shape)
         return program.output
 
-    runner._run_cuda_graph = replay
+    setattr(runner, "_run_cuda_graph", replay)
     return runner, callbacks, replays

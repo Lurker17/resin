@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import sys
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -186,8 +187,8 @@ if sys.platform == "linux":
                 T.pdl_trigger()
 
 else:
-    _mhc_pre_norm_kernel = None
-    per_token_cast = None
+    _mhc_pre_norm_kernel: Any = None
+    per_token_cast: Any = None
 
 
 def mhc_pre_norm(

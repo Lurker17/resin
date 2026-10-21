@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal, cast
 
 import torch
 import torch.distributed as dist
@@ -118,7 +119,7 @@ class ModelArgs:
     o_groups: int = 8
     o_lora_rank: int = 1024
     window_size: int = 128
-    compress_ratios: tuple[int] = (0, 0, 4, 128, 4, 128, 4, 0)
+    compress_ratios: tuple[int, ...] = (0, 0, 4, 128, 4, 128, 4, 0)
     # yarn
     compress_rope_theta: float = 40000.0
     original_seq_len: int = 0
@@ -202,7 +203,9 @@ def linear(
             scale_dtype,
             packed_scales=True,
         )
-        return fp4_gemm(x, s, weight, weight.scale, scale_dtype)
+        return fp4_gemm(
+            x, s, weight, cast(torch.Tensor, getattr(weight, "scale")), scale_dtype
+        )
     elif weight.dtype == torch.float8_e4m3fn:
         rows = x.numel() // x.shape[-1]
         x, s = act_quant(
@@ -212,7 +215,9 @@ def linear(
             scale_dtype,
             packed_scales=fp8_gemm_uses_packed_scales(rows),
         )
-        return fp8_gemm(x, s, weight, weight.scale, scale_dtype)
+        return fp8_gemm(
+            x, s, weight, cast(torch.Tensor, getattr(weight, "scale")), scale_dtype
+        )
     else:
         return F.linear(x, weight)
 
@@ -270,7 +275,8 @@ class Linear(nn.Module):
                 or scale_storage.dtype != torch.float8_e8m0fnu
             ):
                 raise ValueError("invalid shared FP4 scale storage")
-            self.weight.scale = self.scale = nn.Parameter(scale_storage)
+            self.scale = nn.Parameter(scale_storage)
+            setattr(self.weight, "scale", self.scale)
         elif dtype == torch.float8_e4m3fn:
             weight_shape = (out_features, in_features)
             if weight_storage is None:
@@ -288,7 +294,8 @@ class Linear(nn.Module):
                 or scale_storage.dtype != torch.float8_e8m0fnu
             ):
                 raise ValueError("invalid shared FP8 scale storage")
-            self.weight.scale = self.scale = nn.Parameter(scale_storage)
+            self.scale = nn.Parameter(scale_storage)
+            setattr(self.weight, "scale", self.scale)
         else:
             if scale_storage is not None:
                 raise ValueError("unquantized weights do not have scale storage")
@@ -444,6 +451,8 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 class Compressor(nn.Module):
     """Compresses KV cache via learned gated pooling over `compress_ratio` consecutive tokens.
     When overlap=True (ratio==4), uses overlapping windows for smoother compression boundaries."""
+
+    _fused_projection_weight: torch.Tensor
 
     def __init__(
         self,
@@ -653,6 +662,7 @@ class Compressor(nn.Module):
         """Update a fixed verification block with one projection and scan."""
 
         value_state, score_state = self._state_tensors()
+        assert self.freqs_cis is not None
         kv, score = bf16_linear_fp32(x, self._fused_projection_weight).chunk(2, dim=-1)
         compress_verify(
             kv,
@@ -899,6 +909,7 @@ class Indexer(torch.nn.Module):
             )
 
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        assert self.freqs_cis is not None
         rope_last_block_inplace(
             q,
             torch.view_as_real(self.freqs_cis),
@@ -940,6 +951,10 @@ class Indexer(torch.nn.Module):
 class Attention(nn.Module):
     """Multi-head Latent Attention (MLA) with sliding window + optional KV compression.
     Uses low-rank Q projection (wq_a -> q_norm -> wq_b) and grouped low-rank O projection."""
+
+    freqs_cis: torch.Tensor
+    _fused_wqkv_weight: torch.Tensor
+    _fused_wqkv_scale: torch.Tensor
 
     def __init__(
         self,
@@ -991,7 +1006,7 @@ class Attention(nn.Module):
                 ),
                 persistent=False,
             )
-            self._fused_wqkv_weight.scale = self._fused_wqkv_scale
+            setattr(self._fused_wqkv_weight, "scale", self._fused_wqkv_scale)
             self.wq_a = Linear(
                 self.dim,
                 self.q_lora_rank,
@@ -1202,6 +1217,7 @@ class Attention(nn.Module):
 
         if ratio:
             assert main_stream is not None
+            assert self.decode_overlap_stream is not None
             main_stream.wait_stream(self.decode_overlap_stream)
         topk_idxs, sparse_lengths, sequence_lengths = self._paged_attention_metadata(
             cache,
@@ -1300,6 +1316,7 @@ class Attention(nn.Module):
             query_positions = token_positions.index_select(1, query_indices)
             if query_indices.numel() == 0:
                 local = x.new_empty((0, self.dim))
+                assert context_parallel is not None
                 return context_parallel.gather(local).unsqueeze(0)
         else:
             query_positions = token_positions
@@ -1499,6 +1516,9 @@ class Gate(nn.Module):
 class Expert(nn.Module):
     """Single MoE expert: SwiGLU FFN (w1, w2, w3). Computation in float32 for stability."""
 
+    _fused_w13_weight: torch.Tensor
+    _fused_w13_scale: torch.Tensor
+
     def __init__(
         self,
         dim: int,
@@ -1531,7 +1551,7 @@ class Expert(nn.Module):
                     ),
                     persistent=False,
                 )
-                self._fused_w13_weight.scale = self._fused_w13_scale
+                setattr(self._fused_w13_weight, "scale", self._fused_w13_scale)
                 self.w1 = Linear(
                     dim,
                     inter_dim,
@@ -1592,6 +1612,13 @@ class Expert(nn.Module):
 
 class MoEWeights(nn.Module):
     """Checkpoint-shaped gate, shared expert and rank-local routed storage."""
+
+    _fused_w13_weight: torch.Tensor
+    _fused_w13_scale: torch.Tensor
+    _fused_w2_weight: torch.Tensor
+    _fused_w2_scale: torch.Tensor
+    _fused_output_scales: torch.Tensor
+    _fused_clamp_limits: torch.Tensor
 
     def __init__(
         self,
@@ -1701,19 +1728,26 @@ class MoEWeights(nn.Module):
                 ),
             )
 
-        self.experts = nn.ModuleList(
-            [
-                Expert(
-                    args.dim,
-                    intermediate,
-                    dtype=expert_dtype,
-                    swiglu_limit=args.swiglu_limit,
-                    storage=expert_storage(i),
+        # ModuleList supports None placeholders at runtime for unowned experts.
+        self.experts = cast(
+            Sequence[Expert | None],
+            nn.ModuleList(
+                cast(
+                    Iterable[nn.Module],
+                    [
+                        Expert(
+                            args.dim,
+                            intermediate,
+                            dtype=expert_dtype,
+                            swiglu_limit=args.swiglu_limit,
+                            storage=expert_storage(i),
+                        )
+                        if self.experts_start_idx <= i < self.experts_end_idx
+                        else None
+                        for i in range(self.n_routed_experts)
+                    ],
                 )
-                if self.experts_start_idx <= i < self.experts_end_idx
-                else None
-                for i in range(self.n_routed_experts)
-            ]
+            ),
         )
         assert args.n_shared_experts == 1
         self.shared_experts = Expert(
@@ -1753,6 +1787,7 @@ class MoE(nn.Module):
         if main_stream is None:
             shared = self.shared_experts(x)
         else:
+            assert self.decode_overlap_stream is not None
             main_stream.wait_stream(self.decode_overlap_stream)
         assert shared is not None
         y += shared
@@ -2061,6 +2096,7 @@ class DSparkMarkovHead(nn.Module):
 class DSparkBlock(Block):
     """One checkpoint DSpark stage under the ``mtp.*`` namespace."""
 
+    attn: DSparkAttention
     attention_cls = DSparkAttention
 
     def __init__(
@@ -2119,6 +2155,8 @@ class Transformer(nn.Module):
     """Full DeepSeek-V4 model: embed -> HC-expand -> N blocks -> HC-head -> logits.
     Attention TP and expert ownership are bound independently at construction."""
 
+    _attention_workspace: torch.Tensor
+
     def __init__(
         self,
         args: ModelArgs,
@@ -2162,9 +2200,9 @@ class Transformer(nn.Module):
         self.embed = ParallelEmbedding(
             args.vocab_size, args.dim, tensor_parallel=tensor_parallel
         )
-        self.layers = torch.nn.ModuleList()
-        for layer_id in range(args.n_layers):
-            self.layers.append(
+        self.layers = cast(
+            Sequence[Block],
+            torch.nn.ModuleList(
                 Block(
                     layer_id,
                     args,
@@ -2172,16 +2210,21 @@ class Transformer(nn.Module):
                     expert_parallel=expert_parallel,
                     expert_tensor_parallel=expert_tensor_parallel,
                 )
-            )
-        self.mtp = torch.nn.ModuleList(
-            DSparkBlock(
-                args.n_layers + stage_id,
-                args,
-                tensor_parallel=tensor_parallel,
-                expert_parallel=expert_parallel,
-                expert_tensor_parallel=expert_tensor_parallel,
-            )
-            for stage_id in range(args.n_mtp_layers)
+                for layer_id in range(args.n_layers)
+            ),
+        )
+        self.mtp = cast(
+            Sequence[DSparkBlock],
+            torch.nn.ModuleList(
+                DSparkBlock(
+                    args.n_layers + stage_id,
+                    args,
+                    tensor_parallel=tensor_parallel,
+                    expert_parallel=expert_parallel,
+                    expert_tensor_parallel=expert_tensor_parallel,
+                )
+                for stage_id in range(args.n_mtp_layers)
+            ),
         )
         self.dspark_block_size = args.dspark_block_size
         self.dspark_noise_token_id = args.dspark_noise_token_id
@@ -2250,7 +2293,7 @@ class Transformer(nn.Module):
         layers = self.layers if stage == "target" else self.mtp
         hidden = self.embed.weight.new_empty((0, self.embed.dim))
         for layer in layers:
-            ffn = layer.ffn
+            ffn = cast(MoE, layer.ffn)
             indices = torch.empty(
                 (0, ffn.gate.topk), device=hidden.device, dtype=torch.int32
             )

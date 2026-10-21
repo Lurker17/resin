@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -51,6 +52,7 @@ from resin_models_cuda.qwen3_5.checkpoint import (
     load_model,
     resolve_model_path,
 )
+from resin_models_cuda.qwen3_5.model import Qwen35DecoderLayer
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
@@ -237,9 +239,11 @@ class Qwen3_5CudaRunner(CudaRunner):
             cache_write_lookahead_tokens=lookahead,
             cache_layout=self.cache_layout,
         )
-        layers = tuple(self._model.language_model.layers)
+        layers = tuple(
+            cast(Sequence[Qwen35DecoderLayer], self._model.language_model.layers)
+        )
         if self._model.mtp is not None:
-            layers += tuple(self._model.mtp.layers)
+            layers += tuple(cast(Sequence[Qwen35DecoderLayer], self._model.mtp.layers))
         prefill_ffns = self._configure_prefill_graphs(
             tuple(layer.feed_forward for layer in layers),
             hidden_size=self.config.hidden_size,
@@ -590,9 +594,9 @@ class Qwen3_5CudaRunner(CudaRunner):
             self._cuda_graph_fallback("decode", "logprobs")
             return None
         batch_size = plan.num_sequences
-        required_length = int(plan.positions.max()) + self.speculative_tokens + 2
+        required_length = int(np.max(plan.positions)) + self.speculative_tokens + 2
         if not self.speculative_tokens:
-            required_length = int(plan.positions.max()) + 1
+            required_length = int(np.max(plan.positions)) + 1
         shape = self._select_cuda_graph(
             "decode",
             match=lambda candidate: (
@@ -1005,7 +1009,7 @@ class Qwen3_5CudaRunner(CudaRunner):
             return format_output(logits, rows, plan)
         return rows
 
-    def forward(self, plan: BatchPlan) -> list[int] | list[list[int]]:
+    def forward(self, plan: BatchPlan) -> list[int] | list[list[int]] | ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         rows = self._validate_plan(plan)
         lookahead = (

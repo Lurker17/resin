@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import lru_cache
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -68,6 +69,9 @@ def apply_neox_rope(
 
 
 class DSparkAttention(nn.Module):
+    cos: Tensor
+    sin: Tensor
+
     def __init__(
         self,
         config: InklingDSparkConfig,
@@ -264,7 +268,7 @@ class DSparkDraft(nn.Module):
         self, taps: Tensor, positions: Tensor, cache: DeviceCache
     ) -> None:
         projected = self.project_target_hidden(taps)
-        for layer in self.layers:
+        for layer in cast(Sequence[DSparkLayer], self.layers):
             layer.attn.inject(projected, positions, cache)
 
     def forward(

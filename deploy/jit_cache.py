@@ -11,10 +11,10 @@ import json
 import os
 import socket
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from blake3 import blake3
 
@@ -328,7 +328,7 @@ def flashinfer_autotune_context(
     *,
     tune_missing: bool,
     tuning_buckets: tuple[int, ...],
-) -> Iterator[bool | None]:
+) -> Generator[bool | None, None, None]:
     """Load saved tactics and scope FlashInfer autotuning after cache setup."""
 
     # This import must remain after ``install_flashinfer_hash_cache`` so a

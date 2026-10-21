@@ -104,5 +104,6 @@ def test_qwen_codec_normalizes_images_and_attaches_renderer_sidecar() -> None:
 
     assert output["stop_token_ids"] == [1, 12]
     assert isinstance(output["media"], Qwen35Media)
+    assert Renderer.seen is not None
     assert isinstance(Renderer.seen[0][0]["content"][0]["image"], Image.Image)
     assert Renderer.seen[1] == {"tools": None, "add_generation_prompt": True}

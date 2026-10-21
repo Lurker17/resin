@@ -166,7 +166,8 @@ class FakeRenderer:
 
 def test_renderer_codec_renders_and_incrementally_parses() -> None:
     renderer = FakeRenderer()
-    codec = RendererCodec(renderer)
+    # Minimal renderer double implements only the adapter methods exercised here.
+    codec = RendererCodec(renderer)  # ty: ignore[invalid-argument-type]
     request = {"messages": [{"role": "user", "content": "hi"}], "tools": []}
 
     assert codec.render(request) == {"token_ids": [1, 2], "stop_token_ids": [9]}
@@ -190,7 +191,8 @@ def test_renderer_codec_emits_complete_tool_call_when_parseable() -> None:
             del token_ids, tools
             return Parsed(content="", tool_calls=[tool])
 
-    parser = RendererCodec(ToolRenderer()).create_parser({"tools": []}, [])
+    # Minimal renderer double implements only the adapter methods exercised here.
+    parser = RendererCodec(ToolRenderer()).create_parser({"tools": []}, [])  # ty: ignore[invalid-argument-type]
     assert parser.feed([1]) == [
         {"type": "tool_call_start", "index": 0, "id": "call_0", "name": "weather"},
         {"type": "tool_call_arguments_delta", "delta": '{"city":"SF"}', "index": 0},
@@ -207,7 +209,8 @@ def test_renderer_codec_holds_incomplete_utf8_decoder_sentinel() -> None:
             )
             return Parsed(content=content)
 
-    parser = RendererCodec(UnicodeRenderer()).create_parser({"tools": []}, [])
+    # Minimal renderer double implements only the adapter methods exercised here.
+    parser = RendererCodec(UnicodeRenderer()).create_parser({"tools": []}, [])  # ty: ignore[invalid-argument-type]
 
     assert parser.feed([1]) == [{"type": "text_delta", "delta": "hello "}]
     assert parser.feed([2]) == [{"type": "text_delta", "delta": "😀"}]
@@ -226,7 +229,8 @@ def test_renderer_codec_can_restore_generation_prefix_for_parser() -> None:
             assert token_ids[0] == 10
             return Parsed(content="".join(chr(96 + token) for token in token_ids[1:]))
 
-    codec = RendererCodec(PrefixRenderer(), include_generation_prefix_in_parser=True)
+    # Minimal renderer double implements the adapter methods exercised here.
+    codec = RendererCodec(PrefixRenderer(), include_generation_prefix_in_parser=True)  # ty: ignore[invalid-argument-type]
     request = {"messages": [{"role": "user", "content": "hi"}], "tools": []}
     rendered = codec.render(request)
     parser = codec.create_parser(request, rendered["token_ids"])
@@ -248,7 +252,8 @@ def test_renderer_codec_can_anchor_generation_prefix_for_parser() -> None:
             return Parsed(content="".join(chr(96 + token) for token in token_ids[1:]))
 
     codec = RendererCodec(
-        AnchoredPrefixRenderer(),
+        # Minimal renderer double implements only the adapter methods exercised here.
+        AnchoredPrefixRenderer(),  # ty: ignore[invalid-argument-type]
         include_generation_prefix_in_parser=True,
         generation_prefix_parser_anchor_token_id=10,
     )
@@ -263,7 +268,8 @@ def test_http_server_validates_route_configuration() -> None:
     with pytest.raises(ValueError, match="requires enable_openai"):
         HttpServer(
             Engine(IncrementingRunner()),
-            renderer=FakeRenderer(),
+            # Minimal renderer double implements only the adapter methods exercised here.
+            renderer=FakeRenderer(),  # ty: ignore[invalid-argument-type]
             model="test",
             enable_openai=False,
             enable_demo=True,

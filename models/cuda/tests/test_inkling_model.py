@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
+from typing import cast
 
 import pytest
 import torch
@@ -10,6 +12,7 @@ from resin.models.inkling.config import InklingConfig, YarnConfig
 from resin_models_cuda.inkling.dspark import precompute_yarn_rope
 from resin_models_cuda.inkling.model import (
     DecoderLayer,
+    InklingVisionEncoderLayer,
     InklingVisionModel,
     ShortConvolution,
     select_convolution_state,
@@ -68,11 +71,12 @@ def test_prefill_ffn_shared_output_preserves_convolution_state_and_dspark_taps()
         # Keep real layer/convolution math without allocating checkpoint-sized MLPs.
         layer = object.__new__(DecoderLayer)
         torch.nn.Module.__init__(layer)
-        layer.attn_norm = layer.mlp_norm = torch.nn.Identity()
-        layer.attn = Attention()
+        setattr(layer, "attn_norm", torch.nn.Identity())
+        setattr(layer, "mlp_norm", torch.nn.Identity())
+        setattr(layer, "attn", Attention())
         layer.attn_sconv = ShortConvolution(4096)
         layer.mlp_sconv = ShortConvolution(4096)
-        layer.mlp = torch.nn.SiLU()
+        setattr(layer, "mlp", torch.nn.SiLU())
         layer.prefill_ffn = None
         with torch.no_grad():
             layer.attn_sconv.weight.uniform_(-0.1, 0.1)
@@ -175,7 +179,10 @@ def test_vision_hmlp_matches_pinned_checkpoint_shapes() -> None:
     with torch.device("meta"):
         vision = InklingVisionModel(config)
 
-    assert [tuple(layer.projection.weight.shape) for layer in vision.layers] == [
+    assert [
+        tuple(layer.projection.weight.shape)
+        for layer in cast(Sequence[InklingVisionEncoderLayer], vision.layers)
+    ] == [
         (128, 75),
         (320, 512),
         (4800, 5120),

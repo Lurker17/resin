@@ -20,7 +20,14 @@ from deploy.graph_validation import (
     validate_prefill_attention_regions,
 )
 from deploy.jit_cache import ensure_kernel_cache_dirs, install_flashinfer_hash_cache
-from resin import BatchPhase, Engine, Parallelism, SamplingParams, SchedulerConfig
+from resin import (
+    BatchPhase,
+    Engine,
+    Parallelism,
+    RunnerConfig,
+    SamplingParams,
+    SchedulerConfig,
+)
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.topology import ParallelGroups
 
@@ -169,15 +176,16 @@ class _Capture:
         self.history = []
         self.expected_tokens = forced_tokens
         self.force_tokens = force
-        self.original_sampler = self.runner._sampler
+        original_sampler = self.runner._sampler
+        self.original_sampler = original_sampler
         capture = self
 
         class Sampler:
             def __getattr__(self, name):
-                return getattr(capture.original_sampler, name)
+                return getattr(original_sampler, name)
 
             def __call__(self, logits, plan=None, **kwargs):
-                tokens = capture.original_sampler(logits, plan, **kwargs)
+                tokens = original_sampler(logits, plan, **kwargs)
                 capture.record(logits, plan, tokens)
                 if (
                     force
@@ -205,6 +213,8 @@ class _Capture:
 
 
 class _ObservedRunner:
+    runner_config: RunnerConfig
+
     def __init__(self, runner, capture):
         self.runner = runner
         self.capture = capture
@@ -293,6 +303,7 @@ def _baseline_rank(rank, port, directory, model_path, prompts, world_size):
                 prompts[name], max_new_tokens=1, sampling_params=_sampling()
             )
             progress = _drain(engine)
+            assert capture.logits is not None
             teachers[name] = capture.logits.clone()
             teacher_reports[name] = {"token_ids": request.take_result(), **progress}
         capture.begin_history()

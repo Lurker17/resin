@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,10 +16,12 @@ import torch.multiprocessing as mp
 
 from resin import (
     BatchPhase,
+    BatchPlan,
     CacheGroupLayout,
     CacheLayout,
     ForwardOutput,
     Parallelism,
+    ResourceBinding,
     RunnerConfig,
     SamplingParams,
 )
@@ -27,6 +31,14 @@ from resin.backend.distributed import (
     DistributedWorker,
 )
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
+
+
+@dataclass
+class LocalRunner:
+    forward: Callable[[BatchPlan], list[int]]
+    runner_config: RunnerConfig = field(default_factory=RunnerConfig)
+    bind_resources: Callable[[ResourceBinding], None] = lambda _: None
+    release: Callable[[list[int]], None] = lambda _: None
 
 
 class CollectiveRunner:
@@ -233,6 +245,7 @@ def _run_case(groups, case):
                 assert engine.poisoned
                 local_poisoned = engine.local.poisoned
                 if case in ("preflight_failure", "forward_failure"):
+                    assert engine.local.cache_occupied_block_count is not None
                     assert engine.local.cache_occupied_block_count > 0
                 with pytest.raises(DistributedExecutionError):
                     engine.step()
@@ -327,9 +340,9 @@ def _distributed_process(rank, world_size, rendezvous, directory):
         timeout=timedelta(seconds=20),
     )
     with pytest.raises(DistributedExecutionError, match="forward_distributed"):
-        DistributedWorker(SimpleNamespace(forward=lambda plan: [1]), groups)
+        DistributedWorker(LocalRunner(forward=lambda plan: [1]), groups)
     unsupported = CollectiveRunner(groups, "normal")
-    unsupported.parallelism_capabilities = ParallelismCapabilities()
+    setattr(unsupported, "parallelism_capabilities", ParallelismCapabilities())
     with pytest.raises(DistributedExecutionError, match="does not support attn_dp"):
         DistributedWorker(unsupported, groups)
     divergent = CollectiveRunner(groups, "normal")
@@ -442,8 +455,9 @@ def test_real_tp_cp_ep_and_attn_dp_processes(tmp_path):
     try:
         while not process.join(timeout=1):
             if time.monotonic() > deadline:
+                # ty misbinds pytest's decorated helper and drops its reason parameter.
                 pytest.fail(
-                    "distributed prototype did not shut down within 110 seconds"
+                    "distributed prototype did not shut down within 110 seconds"  # ty: ignore[invalid-argument-type]
                 )
     finally:
         for child in process.processes:
@@ -509,7 +523,7 @@ def test_real_tp_cp_ep_and_attn_dp_processes(tmp_path):
 
 def test_external_failure_preserves_native_resources_and_disables_cleanup():
     releases = []
-    runner = SimpleNamespace(
+    runner = LocalRunner(
         runner_config=RunnerConfig(cache_layout=CacheLayout(4, [CacheGroupLayout(2)])),
         bind_resources=lambda binding: None,
         forward=lambda plan: [3],
@@ -552,7 +566,7 @@ def test_control_failure_after_model_work_keeps_the_accepted_batch(monkeypatch):
     )
     releases = []
     calls = []
-    runner = SimpleNamespace(
+    runner = LocalRunner(
         runner_config=RunnerConfig(cache_layout=CacheLayout(4, [CacheGroupLayout(2)])),
         bind_resources=lambda binding: None,
         forward=lambda plan: calls.append(plan) or [3],
@@ -577,6 +591,7 @@ def test_control_failure_after_model_work_keeps_the_accepted_batch(monkeypatch):
     assert len(calls) == 1
     assert engine.local.poisoned and not request.done
     assert engine.local.ready_request_count == 0  # Kept in quarantine, not requeued.
+    assert engine.local.cache_occupied_block_count is not None
     assert engine.local.cache_occupied_block_count > 0
     assert releases == []
     with pytest.raises(DistributedExecutionError):

@@ -294,13 +294,13 @@ def test_native_text_model_matches_transformers_reference() -> None:
 
 def test_text_loader_ignores_vision_and_optionally_mtp() -> None:
     target = {
-        "model.language_model.embed_tokens.weight": __file__,
-        "lm_head.weight": __file__,
-        "mtp.fc.weight": __file__,
-        "model.visual.blocks.0.attn.qkv.weight": __file__,
+        "model.language_model.embed_tokens.weight": Path(__file__),
+        "lm_head.weight": Path(__file__),
+        "mtp.fc.weight": Path(__file__),
+        "model.visual.blocks.0.attn.qkv.weight": Path(__file__),
     }
     selected = _select_tensor_files(
-        target,  # type: ignore[arg-type]
+        target,
         {"model.language_model.embed_tokens.weight", "lm_head.weight"},
         include_mtp=False,
     )
@@ -312,12 +312,12 @@ def test_text_loader_ignores_vision_and_optionally_mtp() -> None:
 
 def test_multimodal_loader_selects_visual_tensors() -> None:
     target = {
-        "model.language_model.embed_tokens.weight": __file__,
-        "lm_head.weight": __file__,
-        "model.visual.blocks.0.attn.qkv.weight": __file__,
+        "model.language_model.embed_tokens.weight": Path(__file__),
+        "lm_head.weight": Path(__file__),
+        "model.visual.blocks.0.attn.qkv.weight": Path(__file__),
     }
     selected = _select_tensor_files(
-        target,  # type: ignore[arg-type]
+        target,
         set(target),
         include_mtp=False,
         include_vision=True,

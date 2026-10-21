@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from typing import Any, NoReturn
 
 import numpy as np
 import pytest
 import torch
 
-from resin import BatchPhase, BatchPlan, Parallelism, SamplingParams
+from resin import BatchPhase, BatchPlan, ForwardOutput, Parallelism, SamplingParams
 from resin.backend.cuda.graphs import CudaGraphMode
 from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.cuda.runner import CudaRunner
@@ -58,34 +59,39 @@ def _runner(monkeypatch, groups):
     runner.tensor_parallel = TensorParallelContext()
     runner.device = torch.device("cpu")
     runner.hidden_size = 32
-    runner.cache_layout = object()
+    setattr(runner, "cache_layout", object())
     runner.cuda_graph_prefill = "disabled"
     runner.cuda_graph_decode = "disabled"
     runner._prefill_graph_active = False
     runner._graph_logits = {}
-    runner._cuda_failure = _Guard()
-    runner._check_cuda_graphs = lambda _phase: None
-    runner._graph_forward = lambda *_args, **kwargs: None
-    runner._select_distributed_cuda_graph = lambda *args, **kwargs: None
-    runner._distributed_prefill_graphs = lambda context: nullcontext()
-    runner._sampler = lambda logits, plan: logits.argmax(dim=-1)
-    runner.calls = []
-    runner.tensorized = []
-    runner._model = SimpleNamespace(
-        lm_head=lambda hidden: hidden,
-        model=SimpleNamespace(
-            layers=[
-                SimpleNamespace(
-                    mlp=SimpleNamespace(
-                        experts=SimpleNamespace(
-                            forward_empty=lambda index=index: runner.calls.append(
-                                ("empty", index)
+    setattr(runner, "_cuda_failure", _Guard())
+    setattr(runner, "_check_cuda_graphs", lambda _phase: None)
+    setattr(runner, "_graph_forward", lambda *_args, **kwargs: None)
+    setattr(runner, "_select_distributed_cuda_graph", lambda *args, **kwargs: None)
+    setattr(runner, "_distributed_prefill_graphs", lambda context: nullcontext())
+    setattr(runner, "_sampler", lambda logits, plan: logits.argmax(dim=-1))
+    calls, tensorized = [], []
+    setattr(runner, "calls", calls)
+    setattr(runner, "tensorized", tensorized)
+    setattr(
+        runner,
+        "_model",
+        SimpleNamespace(
+            lm_head=lambda hidden: hidden,
+            model=SimpleNamespace(
+                layers=[
+                    SimpleNamespace(
+                        mlp=SimpleNamespace(
+                            experts=SimpleNamespace(
+                                forward_empty=lambda index=index: calls.append(
+                                    ("empty", index)
+                                )
                             )
                         )
                     )
-                )
-                for index in range(3)
-            ]
+                    for index in range(3)
+                ]
+            ),
         ),
     )
 
@@ -103,14 +109,14 @@ def _runner(monkeypatch, groups):
         return ((batch,), None) if plan.phase == BatchPhase.PREFILL else ((), batch)
 
     def tensorize(host, staging, prefix):
-        runner.tensorized.append(prefix)
+        tensorized.append(prefix)
         return SimpleNamespace(
             sequence_indices=torch.tensor(host.sequence_indices),
             last_token_indices=host.last_token_indices,
         )
 
     def forward(token_ids, positions, batch):
-        runner.calls.append(("batch", len(token_ids), positions.tolist()))
+        calls.append(("batch", len(token_ids), positions.tolist()))
         return torch.nn.functional.one_hot(
             token_ids[batch.last_token_indices], num_classes=runner.hidden_size
         ).bfloat16()
@@ -125,8 +131,8 @@ def _runner(monkeypatch, groups):
             )
         ),
     )
-    runner._tensorize = tensorize
-    runner._forward_batch = forward
+    setattr(runner, "_tensorize", tensorize)
+    setattr(runner, "_forward_batch", forward)
     return runner
 
 
@@ -225,11 +231,15 @@ def test_missing_graph_capture_is_rejected_in_worker_readiness_validation(
     runner.cuda_graph_prefill = "breakable"
     runner._cuda_graph_executor = None
     pending = "prefill" if phase == BatchPhase.PREFILL else "decode"
+
+    def unexpected_capture(_shape) -> NoReturn:
+        raise AssertionError("readiness validation must precede graph construction")
+
     runner._configure_cuda_graphs(
         {
             name: CudaGraphMode(
                 ((1, 1),) if name == pending else (),
-                lambda _: None,
+                unexpected_capture,
                 lambda _: {},
             )
             for name in ("prefill", "decode")
@@ -259,7 +269,9 @@ def test_missing_graph_capture_is_rejected_in_worker_readiness_validation(
 def test_unsupported_distributed_preparation_fails_before_cuda(
     parallelism, options, message
 ):
-    kwargs = dict(cuda_graph_prefill="disabled", cuda_graph_decode="disabled")
+    kwargs: dict[str, Any] = dict(
+        cuda_graph_prefill="disabled", cuda_graph_decode="disabled"
+    )
     kwargs.update(options)
     with pytest.raises(ValueError, match=message):
         GptOssCudaRunner(device="cuda", parallel_groups=_groups(parallelism), **kwargs)
@@ -419,6 +431,8 @@ def test_decode_graph_retains_logits_and_stages_active_row_count(monkeypatch):
         runner, plan, _decode_host(runner, plan), shape=shape
     )
 
+    assert isinstance(output, ForwardOutput)
+    assert output.logprobs is not None
     assert output.token_ids.tolist() == [1, 2]
     expected = logits[:2].log_softmax(-1)
     assert output.logprobs.tolist() == pytest.approx([expected[0, 1], expected[1, 2]])

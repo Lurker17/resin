@@ -148,7 +148,8 @@ class TestSchedulerConfigContract:
         )
 
         with pytest.raises(TypeError):
-            SchedulerConfig(17)
+            # Intentionally reject positional arguments to the native keyword-only API.
+            SchedulerConfig(17)  # ty: ignore[too-many-positional-arguments]
         limited = SchedulerConfig(max_batch_tokens=17, prefill_chunk_size=5)
         assert (limited.max_batch_tokens, limited.prefill_chunk_size) == (17, 5)
         assert (
@@ -259,7 +260,8 @@ class TestSchedulerConfigContract:
         engine = Engine(runner, scheduler_config=config)
         assert engine.scheduler_config.max_batch_tokens == 17
         with pytest.raises(TypeError):
-            Engine(runner, scheduler_config=object())
+            # Invalid scheduler configuration must fail at runtime.
+            Engine(runner, scheduler_config=object())  # ty: ignore[invalid-argument-type]
 
         default = Engine(RecordingRunner())
         assert default.scheduler_config.max_batch_tokens is None
@@ -291,7 +293,7 @@ class TestSchedulerConfigContract:
         assert plan.num_sequences == 3
         assert len(RecordingRunner().forward(plan)) == 3
         with pytest.raises(AttributeError):
-            plan.sampling_mask = [True, False, False]
+            setattr(plan, "sampling_mask", [True, False, False])
 
     def test_opaque_media_preserves_identity(self) -> None:
         payload = object()
@@ -300,7 +302,8 @@ class TestSchedulerConfigContract:
             [0, 0],
             [10, 20],
             [0, 1, 2],
-            media=[payload, None],
+            # BatchPlan deliberately preserves opaque model-owned payloads.
+            media=[payload, None],  # ty: ignore[invalid-argument-type]
         )
 
         assert plan.media[0] is payload
@@ -324,7 +327,8 @@ class TestSchedulerConfigContract:
         runner = ChunkedRunner()
         engine = Engine(runner)
         payload = {"image": object()}
-        engine.submit([1, 2, 3], max_new_tokens=2, media=payload)
+        # The native plan carries opaque model-owned payloads unchanged.
+        engine.submit([1, 2, 3], max_new_tokens=2, media=payload)  # ty: ignore[invalid-argument-type]
 
         while engine.has_work():
             engine.step()
@@ -344,7 +348,8 @@ class TestSchedulerConfigContract:
         engine = Engine(runner)
         media = Media()
 
-        engine.submit(max_new_tokens=1, media=media)
+        # Minimal media fixture exercises token-id duck typing.
+        engine.submit(max_new_tokens=1, media=media)  # ty: ignore[invalid-argument-type]
         engine.step()
 
         assert runner.plans[0].token_ids.tolist() == [4, 5]
@@ -417,7 +422,8 @@ class TestSchedulerConfigContract:
                 [0],
                 [1],
                 [0, 1],
-                prefill_sequence_indices=[0],
+                # Removed constructor argument must fail at runtime.
+                prefill_sequence_indices=[0],  # ty: ignore[unknown-argument]
             )
 
 
