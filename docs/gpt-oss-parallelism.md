@@ -87,9 +87,10 @@ namespace, and cache pool.
 
 ## CUDA graphs and current costs
 
-The shared runner captures prefill FFN regions, QKV projection with RoPE, and
-attention output projections. `prefill_attention` reports those projection
-regions separately; FA4 attention, CP gathering and KV writes remain eager.
+The shared runner captures prefill FFN regions and QKV projection with RoPE.
+`prefill_attention` reports those projection regions separately; FA4 attention,
+CP gathering, KV writes, and the output projection remain eager. Projection
+graphs use exact token buckets to preserve eager GEMM row geometry.
 Full decode captures expert communication and sampling. All ranks capture
 matching catalogs before serving. Replicas agree on an expert/decode bucket or
 collectively fall back to eager execution. Projection buckets are local to the

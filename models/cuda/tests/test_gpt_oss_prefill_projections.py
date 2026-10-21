@@ -38,11 +38,7 @@ def _runner():
         calls.append(("project", hidden.shape[0]))
         return runner._attention_project(attention, hidden, cos, sin)
 
-    def finish(hidden):
-        calls.append(("finish", hidden.shape[0]))
-        return runner._attention_output_projection(attention.o_proj, hidden)
-
-    runner._prefill_attention = (project, finish)
+    runner._prefill_attention = (project,)
 
     def rotary(hidden, cos, sin):
         first, second = hidden.chunk(2, -1)
@@ -104,7 +100,7 @@ def test_projection_regions_leave_actual_queries_and_page_writes_with_eager_atte
             output = runner._attention(0, attention, hidden, (cos, sin), batch)
 
             torch.testing.assert_close(output, attention.o_proj(query).unsqueeze(0))
-            assert calls[-2:] == [("project", count), ("finish", count)]
+            assert calls[-1:] == [("project", count)]
             assert attended[-1][0] == count
             assert attended[-1][1]["cu_seqlens_q"] is batch.cu_seqlens_q
             assert attended[-1][1]["seqused_k"] is batch.group("full").lengths

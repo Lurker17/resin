@@ -671,7 +671,7 @@ def _check_case(records, case, vocab_size, *, graphs=False, collect_numerical=Fa
         validate_prefill_attention(
             records,
             stats_key="graphs_after_workload",
-            required_operations=("qkv_rope", "attention_output"),
+            required_operations=("qkv_rope",),
         )
         if graphs
         else None

@@ -58,12 +58,31 @@ def test_projection_validation_accepts_explicit_padding_and_records_changed_inpu
     result = _validate(_record())
     assert result["replayed_context_lengths"] == [0, 32]
     assert result["replayed_query_lengths"] == [16, 32]
+    assert result["all_query_lengths"] == [16, 32]
     assert result["distinct_cache_maps"] == 2
     assert result["captured_operations"] == [
         "layer.0.finish",
         "layer.0.project",
         "layer.0.query",
     ]
+
+
+def test_exact_bucket_replays_and_eager_partial_tail_cover_variable_query_lengths():
+    record = _record()
+    record["calls"][0]["query_lengths"] = [32]
+    tail = deepcopy(record["calls"][1])
+    tail.update(
+        query_lengths=[18],
+        contexts=[64],
+        cache_map="third",
+        graph_replays={"prefill_attention": 0},
+    )
+    record["calls"].append(tail)
+    result = _validate(record)
+    assert result["replayed_query_lengths"] == [32]
+    assert result["all_query_lengths"] == [18, 32]
+    assert result["replayed_context_lengths"] == [0, 32]
+    assert result["distinct_cache_maps"] == 2
 
 
 @pytest.mark.parametrize(
@@ -125,7 +144,23 @@ def test_plan_metadata_tracks_physical_parent_and_slot_without_dumping_page_tabl
     assert prefill_plan_metadata(None)["cache_map"] is None
 
 
-def test_projection_probe_replays_changed_inputs_and_isolates_mutating_reference():
+def test_projection_probe_replays_changed_inputs_and_isolates_mutating_reference(
+    monkeypatch,
+):
+    from deploy import graph_validation
+
+    timed = []
+
+    def timings(eager, live, replay, *, rounds, iterations):
+        assert eager is live
+        assert (rounds, iterations) == (3, 10)
+        eager()
+        replay()
+        timed.append(True)
+        return {"eager_padded_us": {"median": 2}, "configured_policy_us": {"median": 1}}
+
+    monkeypatch.setattr(graph_validation, "_paired_timings", timings)
+
     def operation(hidden, positions):
         return hidden.add_(positions[:, None])
 
@@ -161,4 +196,9 @@ def test_projection_probe_replays_changed_inputs_and_isolates_mutating_reference
     )
     result = validate_prefill_attention_regions(runner)
     assert len(result) == 4 and all(record["same_bucket_exact"] for record in result)
-    assert not torch.equal(seen[1], seen[3])
+    positions = [value for value in seen if len(value) == 16]
+    assert not torch.equal(positions[0], positions[1])
+    assert len(timed) == 1
+    assert next(record for record in result if record["tokens"] == 32)[
+        "staging_included"
+    ]

@@ -38,7 +38,7 @@ Breakable prefill captures **stateless tensor regions** within the existing
 model forward. Each layer calls the shared graph runner for its MLP or MoE;
 normalization and residual operations are included where the model already
 groups them with that computation. GPT-OSS additionally captures QKV projection
-and RoPE, then its attention output projection. DeepSeek captures the MLA input
+and RoPE. DeepSeek captures the MLA input
 projection and Q normalization, the local query projection after CP selection,
 and inverse RoPE with the output projections. These use a shared tensor-region
 contract: row shapes and dtypes describe fixed-address inputs and outputs,
@@ -105,8 +105,15 @@ between projection callbacks does not increment that counter.
 Projection graphs capture no request metadata or page tables. They consume the
 actual local rows selected by the ordinary CP path. Expert dispatch retains its
 shared bucket across attention-DP replicas; pure projections choose their own
-local bucket, because they have no collectives across those replicas. DeepSeek
-uses exact projection buckets to preserve FP8 GEMM row geometry.
+local bucket, because they have no collectives across those replicas. Both
+models use exact projection buckets to preserve eager GEMM row geometry:
+padding can change rounding, even when each operation is row-independent.
+
+Capturing a single GEMM can cost more in staging than it saves in launches.
+GPT-OSS keeps its attention output projection eager: the 32-token Hopper probes
+measured 16–19 µs eager versus 24–30 µs through a separate graph in the CP/DP
+layouts. QKV plus RoPE amortizes that boundary across more kernels. These are
+region measurements, not an end-to-end throughput result.
 
 Run `uv run modal run deploy/modal_cuda_graphs.py` to exercise shared-buffer
 reuse, changed inputs, padding, and replay on a Blackwell GPU. The model smoke

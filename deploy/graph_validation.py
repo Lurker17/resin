@@ -60,18 +60,22 @@ def validate_prefill_attention(records, *, stats_key, required_operations):
                 "prefill attention projections were not captured and replayed"
             )
         operations.update(stats["captured_operations"])
-    calls = [
+    live_calls = [
         call
         for record in records
         for call in record["calls"]
-        if call["phase"] == "prefill"
-        and not call["placeholder"]
-        and call["graph_replays"].get("prefill_attention", 0)
+        if call["phase"] == "prefill" and not call["placeholder"]
+    ]
+    calls = [
+        call for call in live_calls if call["graph_replays"].get("prefill_attention", 0)
     ]
     contexts = sorted({value for call in calls for value in call["contexts"]})
     lengths = sorted({value for call in calls for value in call["query_lengths"]})
+    all_lengths = sorted(
+        {value for call in live_calls for value in call["query_lengths"]}
+    )
     maps = {call["cache_map"] for call in calls}
-    if min(len(contexts), len(lengths), len(maps)) < 2:
+    if min(len(contexts), len(all_lengths), len(maps)) < 2:
         raise AssertionError(
             "prefill projection replay did not vary positions, lengths and cache maps"
         )
@@ -80,6 +84,7 @@ def validate_prefill_attention(records, *, stats_key, required_operations):
         "captured_operations": sorted(operations),
         "replayed_context_lengths": contexts,
         "replayed_query_lengths": lengths,
+        "all_query_lengths": all_lengths,
         "distinct_cache_maps": len(maps),
     }
 
@@ -149,14 +154,38 @@ def validate_prefill_attention_regions(runner):
                         for value, reference in zip(actual, expected, strict=True)
                     )
                 )
-                records.append(
-                    {
-                        "operation": region.name,
-                        "tokens": tokens,
-                        "position_offset": offset,
-                        "same_bucket_exact": exact,
-                    }
-                )
+                record = {
+                    "operation": region.name,
+                    "tokens": tokens,
+                    "position_offset": offset,
+                    "same_bucket_exact": exact,
+                }
+                if tokens == 32 and region.name.rsplit(".", 1)[0] == layers[0]:
+                    timing_values = tuple(value.clone() for value in values)
+
+                    def eager_projection():
+                        with graphs.capture_context():
+                            return region.operation(*timing_values)
+
+                    def replay_projection():
+                        with graphs.capture_context():
+                            return graphs.invoke(index, *timing_values)
+
+                    # Exact buckets give both eager lanes the same operation.
+                    # Replay includes input staging; cloning stays outside timing.
+                    record.update(
+                        timing_rounds=3,
+                        calls_per_round=10,
+                        staging_included=True,
+                        timings=_paired_timings(
+                            eager_projection,
+                            eager_projection,
+                            replay_projection,
+                            rounds=3,
+                            iterations=10,
+                        ),
+                    )
+                records.append(record)
                 if not exact:
                     failures.append((region.name, tokens, offset))
     failed = torch.tensor(bool(failures), device=runner.device, dtype=torch.int32)

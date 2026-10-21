@@ -460,43 +460,28 @@ class GptOssCudaRunner(CudaRunner):
         )
         self._prefill_attention = self._configure_prefill_tensor_graphs(
             tuple(
-                region
-                for index, layer in enumerate(self._model.model.layers)
-                for region in (
-                    CudaGraphTensorRegion(
-                        f"layer.{index}.qkv_rope",
-                        lambda hidden, cos, sin, attention=layer.self_attn: (
-                            self._attention_project(attention, hidden, cos, sin)
-                        ),
-                        inputs=(
-                            TensorSpec((self.hidden_size,)),
-                            TensorSpec((self.head_dim // 2,)),
-                            TensorSpec((self.head_dim // 2,)),
-                        ),
-                        output=TensorSpec(
-                            (
-                                (self.num_query_heads + 2 * self.num_kv_heads)
-                                * self.head_dim,
-                            )
-                        ),
+                CudaGraphTensorRegion(
+                    f"layer.{index}.qkv_rope",
+                    lambda hidden, cos, sin, attention=layer.self_attn: (
+                        self._attention_project(attention, hidden, cos, sin)
                     ),
-                    CudaGraphTensorRegion(
-                        f"layer.{index}.attention_output",
-                        lambda hidden, projection=layer.self_attn.o_proj: (
-                            self._attention_output_projection(projection, hidden)
-                        ),
-                        inputs=(TensorSpec((self.num_query_heads * self.head_dim,)),),
-                        output=TensorSpec(
-                            (self.hidden_size,),
-                            dtype=torch.float32
-                            if self.tensor_parallel.enabled
-                            else torch.bfloat16,
-                        ),
+                    inputs=(
+                        TensorSpec((self.hidden_size,)),
+                        TensorSpec((self.head_dim // 2,)),
+                        TensorSpec((self.head_dim // 2,)),
+                    ),
+                    output=TensorSpec(
+                        (
+                            (self.num_query_heads + 2 * self.num_kv_heads)
+                            * self.head_dim,
+                        )
                     ),
                 )
+                for index, layer in enumerate(self._model.model.layers)
             ),
             max_tokens=self.prefill_chunk_size,
             mode="prefill_attention",
+            pad_up_to=0,
         )
 
     @classmethod
@@ -574,7 +559,7 @@ class GptOssCudaRunner(CudaRunner):
         cos, sin = position_embeddings
         projections = self._prefill_attention if self._prefill_graph_active else None
         projected = (
-            projections[2 * layer_index](flat, cos.squeeze(0), sin.squeeze(0))
+            projections[layer_index](flat, cos.squeeze(0), sin.squeeze(0))
             if projections is not None
             else self._attention_project(
                 attention, flat, cos.squeeze(0), sin.squeeze(0)
@@ -590,12 +575,7 @@ class GptOssCudaRunner(CudaRunner):
         )
         if token_count == 0:
             return hidden.new_empty((1, 0, self.hidden_size))
-        finished = (
-            projections[2 * layer_index + 1](output)
-            if projections is not None
-            else self._attention_output_projection(attention.o_proj, output)
-        )
-        return finished.unsqueeze(0)
+        return self._attention_output_projection(attention.o_proj, output).unsqueeze(0)
 
     def _attention_project(self, attention, hidden, cos, sin) -> Tensor:
         """Project token rows and rotate Q/K without touching cache metadata."""
