@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import (
     TYPE_CHECKING,
     Any,
+    Literal,
     NamedTuple,
     NotRequired,
     Protocol,
@@ -69,6 +70,12 @@ class ResponseParser(Protocol):
     def feed(self, token_ids: Sequence[int]) -> list[ParserEvent]: ...
 
 
+class FinalizingResponseParser(ResponseParser, Protocol):
+    """Flush buffered output before a response ends normally or at its limit."""
+
+    def finish(self, reason: Literal["stop", "length"]) -> list[ParserEvent]: ...
+
+
 class ConversationCodec(Protocol):
     """Render requests and construct their incremental response parsers."""
 
@@ -102,6 +109,7 @@ class ManagedRunner(Runner, Protocol):
 
 __all__ = [
     "ConversationCodec",
+    "FinalizingResponseParser",
     "ManagedRunner",
     "MediaInput",
     "MediaTokenSpan",

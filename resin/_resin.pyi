@@ -1,8 +1,10 @@
 from collections.abc import Sequence
 from typing import Any, Final, final
+from collections.abc import Mapping
+from typing import Literal
 import numpy as np
 import numpy.typing as npt
-from resin.protocols import ConversationCodec, MediaInput, Runner
+from resin.protocols import ConversationCodec, MediaInput, ParserEvent, Runner
 
 __version__: Final[str]
 
@@ -469,6 +471,22 @@ class ForwardOutput:
     def top_token_ids(self, /) -> npt.NDArray[np.uint32] | None: ...
 
 @final
+class InklingResponseParser:
+    """
+    Parse Inkling response blocks into the events accepted by HttpServer.
+    """
+    def __new__(
+        cls,
+        /,
+        tokenizer: RecipeTokenizer,
+        token_ids: Mapping[str, int],
+        *,
+        prompt_ids: Sequence[int] = ...,
+    ) -> InklingResponseParser: ...
+    def feed(self, /, token_ids: Sequence[int]) -> list[ParserEvent]: ...
+    def finish(self, /, reason: Literal["stop", "length"]) -> list[ParserEvent]: ...
+
+@final
 class Parallelism:
     """
     Attention and expert meshes over the same GPU ranks.
@@ -511,6 +529,18 @@ class Parallelism:
     ) -> int: ...
     @property
     def world_size(self, /) -> int: ...
+
+@final
+class RecipeTokenizer:
+    """
+    A tokenizer prepared once for a model's response parsers.
+
+    Fast Hugging Face tokenizers are snapshotted into Rust. Custom Python
+    tokenizers remain supported through their decode method.
+    """
+    def __new__(cls, /, tokenizer: Any) -> RecipeTokenizer: ...
+    @property
+    def is_native(self, /) -> bool: ...
 
 @final
 class RequestLease:

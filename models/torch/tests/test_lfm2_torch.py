@@ -229,8 +229,25 @@ class TestLfm2Torch:
         (path / "config.json").write_text(json.dumps(config))
         save_file(self.model.state_dict(), path / "model.safetensors")
         loaded, loaded_config = load_model(path, device="cpu")
-        assert "transformers" not in sys.modules
-        assert "tokenizers" not in sys.modules
+        # Codec tests can import these libraries earlier in this process.
+        # Check the loader's import boundary in a fresh interpreter.
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import sys
+sys.path.insert(0, 'models/torch')
+from resin_models_torch.lfm2.reference import load_model
+from pathlib import Path
+load_model(Path(sys.argv[1]), device='cpu')
+assert 'transformers' not in sys.modules
+assert 'tokenizers' not in sys.modules
+""",
+                str(path),
+            ],
+            check=True,
+        )
         with torch.inference_mode():
             actual = loaded(tokens, loaded.make_cache())
         assert loaded_config["model_type"] == "lfm2"

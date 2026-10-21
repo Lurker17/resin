@@ -38,6 +38,7 @@ The focused contracts are:
 - [CUDA model package boundaries](models/cuda/ARCHITECTURE.md)
 - [GPT-OSS runner status](docs/gpt-oss-itl.md)
 - [persistent kernel artifacts](docs/kernel-cache.md)
+- [model recipe and streaming parser boundary](crates/resin-recipe/README.md)
 
 ## Install for development
 

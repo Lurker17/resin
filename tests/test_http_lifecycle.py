@@ -9,9 +9,11 @@ import urllib.request
 from contextlib import contextmanager
 
 import pytest
+from test_recipe import _byte_tokenizer, _FastTokenizer, _token_ids
 
 from resin import BatchPhase, Engine
 from resin.backend.cuda.failures import PostAcceptCudaError
+from resin.recipe import InklingResponseParser, Tokenizer
 from resin.server import HttpServer
 
 
@@ -150,6 +152,190 @@ def test_actor_failure_stops_listener_and_propagates_from_serve():
         assert "runner failed after updating state" in str(errors[0])
         with pytest.raises(OSError):
             socket.create_connection(("127.0.0.1", port), timeout=0.2)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("completion_reason", ["stop", "length"])
+def test_parser_finalization_deltas_precede_completion(stream, completion_reason):
+    finished = []
+
+    class FinalizingCodec(Codec):
+        def render(self, request):
+            rendered = super().render(request)
+            if completion_reason == "stop":
+                rendered["stop_token_ids"] = [3]
+            return rendered
+
+        def create_parser(self, request, prompt_ids):
+            class Parser:
+                def feed(self, token_ids):
+                    return [{"type": "text_delta", "delta": "before"}]
+
+                def finish(self, reason):
+                    finished.append(reason)
+                    return [{"type": "text_delta", "delta": "-after"}]
+
+            return Parser()
+
+    with running_server(Runner(), FinalizingCodec()) as (
+        _server,
+        _engine,
+        _thread,
+        errors,
+        base,
+        _port,
+    ):
+        with post(base, request_body(stream=stream, max_tokens=1)) as response:
+            if stream:
+                payloads = [
+                    line.removeprefix("data: ")
+                    for line in response.read().decode().splitlines()
+                    if line.startswith("data: ")
+                ]
+                assert payloads[-1] == "[DONE]"
+                choices = [
+                    json.loads(payload)["choices"][0] for payload in payloads[:-1]
+                ]
+                deltas = [
+                    choice["delta"]["content"]
+                    for choice in choices
+                    if choice["delta"].get("content")
+                ]
+                assert deltas == ["before", "-after"]
+                assert choices[-1]["finish_reason"] == completion_reason
+                assert all(choice["finish_reason"] is None for choice in choices[:-1])
+            else:
+                choice = json.load(response)["choices"][0]
+                assert choice["message"]["content"] == "before-after"
+                assert choice["finish_reason"] == completion_reason
+        assert finished == [completion_reason]
+        assert errors == []
+
+
+def test_parser_without_finalization_remains_supported():
+    with running_server(Runner()) as (_server, engine, _thread, errors, base, _port):
+        with post(base, request_body(max_tokens=1)) as response:
+            choice = json.load(response)["choices"][0]
+            assert choice["message"]["content"] == "ok"
+            assert choice["finish_reason"] == "length"
+        assert not engine.poisoned
+        assert errors == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_native_parser_flushes_partial_utf8_in_http_actor(stream):
+    backend = _byte_tokenizer()
+    markers = _token_ids(backend)
+    # The final two UTF-8 bytes never arrive because generation reaches its
+    # token limit. Only parser finalization can emit the replacement character.
+    output = backend.encode("A🦀", add_special_tokens=False).ids[:3]
+    tokenizer = Tokenizer(_FastTokenizer(backend))
+    assert tokenizer.is_native
+
+    class NativeCodec:
+        def render(self, request):
+            return {
+                "token_ids": [
+                    markers["<|message_model|>"],
+                    markers["<|content_text|>"],
+                ],
+                "stop_token_ids": [],
+            }
+
+        def create_parser(self, request, prompt_ids):
+            return InklingResponseParser(tokenizer, markers, prompt_ids=prompt_ids)
+
+    class ByteRunner:
+        def __init__(self):
+            self.step = 0
+
+        def forward(self, plan):
+            assert plan.num_sequences == 1
+            token = output[self.step]
+            self.step += 1
+            return [token]
+
+    with running_server(ByteRunner(), NativeCodec()) as (
+        _server,
+        engine,
+        _thread,
+        errors,
+        base,
+        _port,
+    ):
+        with post(
+            base, request_body(stream=stream, max_tokens=len(output))
+        ) as response:
+            if stream:
+                payloads = [
+                    line.removeprefix("data: ")
+                    for line in response.read().decode().splitlines()
+                    if line.startswith("data: ")
+                ]
+                assert payloads[-1] == "[DONE]"
+                choices = [
+                    json.loads(payload)["choices"][0] for payload in payloads[:-1]
+                ]
+                assert [
+                    choice["delta"]["content"]
+                    for choice in choices
+                    if choice["delta"].get("content")
+                ] == ["A", "\ufffd"]
+                assert choices[-1]["finish_reason"] == "length"
+                assert all(choice["finish_reason"] is None for choice in choices[:-1])
+            else:
+                choice = json.load(response)["choices"][0]
+                assert choice["message"]["content"] == "A\ufffd"
+                assert choice["finish_reason"] == "length"
+        assert not engine.poisoned
+        assert errors == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_parser_finalization_failure_does_not_poison_other_requests(stream):
+    class FinalizingCodec(Codec):
+        def create_parser(self, request, prompt_ids):
+            fail = request["messages"][0]["content"] == "fail"
+
+            class Parser:
+                def feed(self, token_ids):
+                    return []
+
+                def finish(self, reason):
+                    if fail:
+                        raise ValueError("intentional finalization failure")
+                    return [{"type": "text_delta", "delta": "success"}]
+
+            return Parser()
+
+    with running_server(Runner(), FinalizingCodec()) as (
+        server,
+        engine,
+        thread,
+        errors,
+        base,
+        _port,
+    ):
+        body = request_body("fail", stream=stream, max_tokens=1)
+        if stream:
+            with post(base, body) as response:
+                payload = response.read().decode()
+            assert "intentional finalization failure" in payload
+            assert '"finish_reason":"length"' not in payload
+        else:
+            with pytest.raises(urllib.error.HTTPError) as caught:
+                post(base, body)
+            assert caught.value.code == 500
+            assert "intentional finalization failure" in caught.value.read().decode()
+
+        with post(base, request_body(max_tokens=1)) as response:
+            choice = json.load(response)["choices"][0]
+            assert choice["message"]["content"] == "success"
+            assert choice["finish_reason"] == "length"
+        assert server.running
+        assert thread.is_alive()
+        assert not engine.poisoned
+        assert errors == []
 
 
 def test_slow_client_is_cancelled_without_blocking_other_clients():

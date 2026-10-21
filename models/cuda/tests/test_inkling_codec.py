@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
 import resin.models.inkling.codec as codec_module
 from resin.models.inkling.codec import InklingCodec
+from resin.protocols import ConversationCodec, FinalizingResponseParser
 
 SPECIAL_TOKENS = {
     "<|message_model|>": 200001,
@@ -198,3 +199,62 @@ def test_raw_tool_and_tool_error_blocks_remain_visible() -> None:
     assert parser.feed([200001, 200022, *_text_ids("error"), 200010]) == [
         {"type": "text_delta", "delta": "error"}
     ]
+
+
+def test_native_codec_implements_python_protocols() -> None:
+    codec = InklingCodec(FakeTokenizer())
+    compatible_codec: ConversationCodec = codec
+    parser: FinalizingResponseParser = codec.create_parser({}, [200001, 200004])
+
+    assert compatible_codec is codec
+    assert parser.feed(_text_ids("hello")) == [{"type": "text_delta", "delta": "hello"}]
+    assert parser.finish("stop") == []
+
+
+def test_codec_prepares_one_native_tokenizer_for_multiple_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare = codec_module.Tokenizer
+    calls: list[Any] = []
+
+    def prepare_tokenizer(tokenizer):
+        calls.append(tokenizer)
+        return prepare(tokenizer)
+
+    monkeypatch.setattr(codec_module, "Tokenizer", prepare_tokenizer)
+    tokenizer = FakeTokenizer()
+    codec = InklingCodec(tokenizer)
+    first = codec.create_parser({}, [200001, 200004])
+    second = codec.create_parser({}, [200001, 200008])
+
+    assert calls == [tokenizer]
+    assert first.feed(_text_ids("visible")) == [
+        {"type": "text_delta", "delta": "visible"}
+    ]
+    assert second.feed(_text_ids("private")) == [
+        {"type": "reasoning_delta", "delta": "private"}
+    ]
+
+
+@pytest.mark.parametrize("reason", ["stop", "length"])
+def test_parser_discards_unterminated_tool_at_finish(
+    reason: Literal["stop", "length"],
+) -> None:
+    parser = InklingCodec(FakeTokenizer()).create_parser({}, [200001])
+
+    assert parser.feed([200049, *_text_ids('{"name":"weather","args":')]) == []
+    assert parser.finish(reason) == []
+    assert parser.finish(reason) == []
+    with pytest.raises(ValueError, match="finish"):
+        parser.feed(_text_ids("late"))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["{bad json", "[]", '{"args":{}}', '{"name":"weather","args":"SF"}'],
+)
+def test_parser_rejects_invalid_closed_tool_block(payload: str) -> None:
+    parser = InklingCodec(FakeTokenizer()).create_parser({}, [200001])
+
+    with pytest.raises(ValueError):
+        parser.feed([200049, *_text_ids(payload), 200010])

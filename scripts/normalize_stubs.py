@@ -41,9 +41,17 @@ PARAMETERS = {
     ("Engine", "submit"): {"media": "MediaInput | None"},
     ("ForwardOutput", "__new__"): OUTPUT_COLUMNS,
     ("_HttpServer", "__new__"): {"codec": "ConversationCodec"},
+    ("InklingResponseParser", "__new__"): {
+        "token_ids": "Mapping[str, int]",
+        "prompt_ids": "Sequence[int]",
+    },
+    ("InklingResponseParser", "feed"): {"token_ids": "Sequence[int]"},
+    ("InklingResponseParser", "finish"): {"reason": 'Literal["stop", "length"]'},
 }
 
 RETURNS = {
+    ("InklingResponseParser", "feed"): "list[ParserEvent]",
+    ("InklingResponseParser", "finish"): "list[ParserEvent]",
     ("BatchPlan", "sequence_ids"): "npt.NDArray[np.uint64]",
     **{
         (owner, name): "npt.NDArray[np.uint32]"
@@ -203,11 +211,25 @@ def import_edits(
         for alias in node.names
     }
     additions = []
+    existing_imports = {
+        (node.module, alias.name)
+        for node in imports
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    for module, name in (("collections.abc", "Mapping"), ("typing", "Literal")):
+        if (module, name) not in existing_imports:
+            additions.append(f"from {module} import {name}")
     if not has_numpy:
         additions.append("import numpy as np")
     if not has_numpy_typing:
         additions.append("import numpy.typing as npt")
-    missing_protocols = {"ConversationCodec", "MediaInput", "Runner"} - protocol_names
+    missing_protocols = {
+        "ConversationCodec",
+        "MediaInput",
+        "ParserEvent",
+        "Runner",
+    } - protocol_names
     if missing_protocols:
         additions.append(
             f"from resin.protocols import {', '.join(sorted(missing_protocols))}"

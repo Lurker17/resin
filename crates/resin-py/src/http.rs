@@ -10,15 +10,17 @@ use std::{
 };
 
 use pyo3::{
-    exceptions::{PyRuntimeError, PyValueError},
+    exceptions::{PyAttributeError, PyRuntimeError, PyValueError},
     prelude::*,
     types::PyDict,
 };
 use pythonize::{depythonize, pythonize};
 use resin_http::{FinishReason, GenerationEvent, GenerationJob, JOB_QUEUE_CAPACITY, RouteConfig};
+use resin_recipe::{Event as ParsedEvent, FinishReason as ParserFinishReason};
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::recipe::{self, NativeInklingParser, SharedParser};
 use crate::{CompletionReason, Engine, RequestLease, SamplingParams};
 
 const MAX_ACTIVE_REQUESTS: usize = 128;
@@ -31,44 +33,72 @@ struct RenderedPrompt {
     stop_token_ids: Vec<u32>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ParsedEvent {
-    ReasoningDelta {
-        delta: String,
-    },
-    TextDelta {
-        delta: String,
-    },
-    ToolCallStart {
-        index: usize,
-        id: String,
-        name: String,
-    },
-    ToolCallArgumentsDelta {
-        index: usize,
-        delta: String,
+fn into_http(event: ParsedEvent) -> GenerationEvent {
+    match event {
+        ParsedEvent::ReasoningDelta { delta } => GenerationEvent::ReasoningDelta(delta),
+        ParsedEvent::TextDelta { delta } => GenerationEvent::TextDelta(delta),
+        ParsedEvent::ToolCallStart { index, id, name } => {
+            GenerationEvent::ToolCallStart { index, id, name }
+        }
+        ParsedEvent::ToolCallArgumentsDelta { index, delta } => {
+            GenerationEvent::ToolCallArgumentsDelta { index, delta }
+        }
+    }
+}
+
+enum Parser {
+    Native(SharedParser),
+    Python {
+        object: Py<PyAny>,
+        finish: Option<Py<PyAny>>,
     },
 }
 
-impl ParsedEvent {
-    fn into_http(self) -> GenerationEvent {
+impl Parser {
+    fn new(py: Python<'_>, object: Py<PyAny>) -> PyResult<Self> {
+        if let Ok(native) = object.bind(py).cast::<NativeInklingParser>() {
+            return Ok(Self::Native(native.borrow().inner.clone()));
+        }
+        let finish = match object.bind(py).getattr("finish") {
+            Ok(method) if method.is_callable() => Some(method.unbind()),
+            Ok(_) => return Err(PyValueError::new_err("parser.finish must be callable")),
+            Err(error) if error.is_instance_of::<PyAttributeError>(py) => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self::Python { object, finish })
+    }
+
+    fn feed(&self, ids: &[u32]) -> PyResult<Vec<ParsedEvent>> {
         match self {
-            Self::ReasoningDelta { delta } => GenerationEvent::ReasoningDelta(delta),
-            Self::TextDelta { delta } => GenerationEvent::TextDelta(delta),
-            Self::ToolCallStart { index, id, name } => {
-                GenerationEvent::ToolCallStart { index, id, name }
-            }
-            Self::ToolCallArgumentsDelta { index, delta } => {
-                GenerationEvent::ToolCallArgumentsDelta { index, delta }
-            }
+            Self::Native(parser) => recipe::feed(parser, ids),
+            Self::Python { object, .. } => Python::attach(|py| {
+                let events = object.bind(py).call_method1("feed", (ids,))?;
+                depythonize(&events).map_err(Into::into)
+            }),
+        }
+    }
+
+    fn finish(&self, reason: ParserFinishReason) -> PyResult<Vec<ParsedEvent>> {
+        match self {
+            Self::Native(parser) => recipe::finish(parser, reason),
+            Self::Python {
+                finish: Some(method),
+                ..
+            } => Python::attach(|py| {
+                let reason = match reason {
+                    ParserFinishReason::Stop => "stop",
+                    ParserFinishReason::Length => "length",
+                };
+                depythonize(&method.bind(py).call1((reason,))?).map_err(Into::into)
+            }),
+            Self::Python { finish: None, .. } => Ok(Vec::new()),
         }
     }
 }
 
 struct ActiveRequest {
     lease: Py<RequestLease>,
-    parser: Py<PyAny>,
+    parser: Parser,
     events: mpsc::Sender<GenerationEvent>,
     started: Instant,
     first_token_at: Option<Instant>,
@@ -331,10 +361,20 @@ fn engine_actor(
             request.first_token_at.get_or_insert_with(Instant::now);
             request.output_tokens += tokens.len();
             let token_ids = tokens.iter().map(|(token, _)| *token).collect::<Vec<_>>();
-            let delivered = match parser_events(&request.parser, &token_ids) {
+            let finished = tokens.iter().find_map(|(_, reason)| *reason);
+            let parsed = request.parser.feed(&token_ids).and_then(|mut events| {
+                if let Some(reason) = finished {
+                    events.extend(request.parser.finish(match reason {
+                        CompletionReason::Stop => ParserFinishReason::Stop,
+                        CompletionReason::Length => ParserFinishReason::Length,
+                    })?);
+                }
+                Ok(events)
+            });
+            let delivered = match parsed {
                 Ok(events) => events
                     .into_iter()
-                    .all(|event| request.events.try_send(event.into_http()).is_ok()),
+                    .all(|event| request.events.try_send(into_http(event)).is_ok()),
                 Err(error) => {
                     let _ = request.events.try_send(GenerationEvent::Error {
                         message: format_python_error("response parser failed", error),
@@ -355,7 +395,7 @@ fn engine_actor(
                 active.remove(&request_id);
                 continue;
             }
-            if let Some(reason) = tokens.iter().find_map(|(_, reason)| *reason) {
+            if let Some(reason) = finished {
                 let reason = match reason {
                     CompletionReason::Stop => FinishReason::Stop,
                     CompletionReason::Length => FinishReason::Length,
@@ -406,6 +446,7 @@ fn admit(
             .bind(py)
             .call_method1("create_parser", (&request, rendered.token_ids.clone()))?
             .unbind();
+        let parser = Parser::new(py, parser)?;
         let extra = pythonize(py, &job.request.extra)?.unbind();
         let sampling_params = Py::new(
             py,
@@ -461,13 +502,6 @@ fn admit(
             });
         }
     }
-}
-
-fn parser_events(parser: &Py<PyAny>, token_ids: &[u32]) -> PyResult<Vec<ParsedEvent>> {
-    Python::attach(|py| {
-        let events = parser.bind(py).call_method1("feed", (token_ids,))?;
-        depythonize(&events).map_err(Into::into)
-    })
 }
 
 fn cancel_disconnected(

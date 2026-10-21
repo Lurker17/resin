@@ -12,6 +12,7 @@ mod http;
 mod output;
 mod parallelism;
 mod planning;
+mod recipe;
 mod runner;
 
 use cache::{CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention};
@@ -1377,6 +1378,9 @@ mod _resin {
 
     #[pymodule_export]
     use crate::http::NativeHttpServer;
+
+    #[pymodule_export]
+    use crate::recipe::{NativeInklingParser, RecipeTokenizer};
 
     #[pymodule_export]
     #[allow(non_upper_case_globals)]
