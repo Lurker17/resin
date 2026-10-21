@@ -8,7 +8,7 @@ logical cache groups backed by one fungible Engine-owned parent pool.
 from __future__ import annotations
 
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -864,7 +864,11 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 positions = staging.device("positions", plan.positions, torch.long)
             with (
                 torch.inference_mode(),
-                self._prefill_compute_context(),
+                use_default_dtype(torch.bfloat16),
+                torch.device(self.device),
+                self._prefill_compute_context()
+                if context.phase == BatchPhase.PREFILL
+                else nullcontext(),
             ):
                 if context.phase == BatchPhase.PREFILL:
                     with self._distributed_prefill_graphs(context, per_sequence=True):

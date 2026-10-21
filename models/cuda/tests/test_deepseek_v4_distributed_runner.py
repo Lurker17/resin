@@ -204,6 +204,41 @@ def test_decode_keeps_the_replica_batch_and_cache_namespace(monkeypatch):
     assert groups.broadcasts == []
 
 
+@pytest.mark.parametrize("phase", [BatchPhase.PREFILL, BatchPhase.DECODE])
+def test_eager_decode_preserves_fixed_row_gemm_selection(monkeypatch, phase):
+    groups = _groups(Parallelism(world_size=2, ep=2))
+    runner = _runner(monkeypatch, groups)
+    events = []
+
+    @contextmanager
+    def dynamic_prefill_gemms():
+        events.append("enter_prefill")
+        yield
+        events.append("leave_prefill")
+
+    runner._prefill_compute_context = dynamic_prefill_gemms
+    method_name = "forward_prefill" if phase == BatchPhase.PREFILL else "forward_decode"
+    original = getattr(runner._model, method_name)
+
+    def execute(*args, **kwargs):
+        events.append(method_name)
+        assert torch.get_default_dtype() == torch.bfloat16
+        return original(*args, **kwargs)
+
+    setattr(runner._model, method_name, execute)
+    plan = BatchPlan([7], [0], [2], [0, 1], phase=phase)
+    previous_dtype = torch.get_default_dtype()
+    assert runner.forward_distributed(
+        plan, _context(groups, phase, ((1, 1),), plan)
+    ) == [2]
+    assert events == (
+        ["enter_prefill", "forward_prefill", "leave_prefill"]
+        if phase == BatchPhase.PREFILL
+        else ["forward_decode"]
+    )
+    assert torch.get_default_dtype() == previous_dtype
+
+
 def test_distributed_metadata_is_validated_before_model_or_cache_work(monkeypatch):
     groups = _groups(Parallelism(world_size=4, ep=4, attn_dp=4))
     runner = _runner(monkeypatch, groups)
