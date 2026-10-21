@@ -1,4 +1,4 @@
-"""Validate genuine GPT-OSS expert parallelism on two Hopper GPUs."""
+"""Validate GPT-OSS parallelism and its compositions on Hopper GPUs."""
 
 from __future__ import annotations
 
@@ -45,6 +45,11 @@ image = (
     .add_local_file(
         ROOT / "models/cuda/tests/test_gpt_oss_flashinfer_gpu.py",
         "/opt/resin/validation/test_gpt_oss_flashinfer_gpu.py",
+        copy=True,
+    )
+    .add_local_file(
+        ROOT / "tests/test_context_parallel_gpu.py",
+        "/opt/resin/validation/test_context_parallel_gpu.py",
         copy=True,
     )
 )
@@ -133,19 +138,22 @@ def _stream_subprocess(command, *, env, timeout):
     timeout=100 * 60,
     single_use_containers=True,
 )
-def validate_parallel(graphs: bool = False):
+def validate_parallel(
+    graphs: bool = False, composable: bool = False, world_size: int = 2
+):
     import torch
     from renderers import GptOssRendererConfig, create_renderer
     from transformers import AutoTokenizer
 
     from deploy.gpt_oss_parallel_validation import run_validation
 
-    if torch.cuda.device_count() != 2 or any(
-        torch.cuda.get_device_capability(rank) != (9, 0) for rank in range(2)
+    if torch.cuda.device_count() != world_size or any(
+        torch.cuda.get_device_capability(rank) != (9, 0) for rank in range(world_size)
     ):
-        raise RuntimeError("GPT-OSS validation requires two Hopper SM90 GPUs")
+        raise RuntimeError(f"GPT-OSS validation requires {world_size} Hopper SM90 GPUs")
+    graphs = graphs or composable
     print(
-        f"[parallel-validation] allocated {[torch.cuda.get_device_name(rank) for rank in range(2)]}",
+        f"[parallel-validation] allocated {[torch.cuda.get_device_name(rank) for rank in range(world_size)]}",
         flush=True,
     )
     model_volume.reload()
@@ -164,6 +172,7 @@ def validate_parallel(graphs: bool = False):
             "-s",
             "/opt/resin/validation/test_expert_parallel_gpu.py",
             "/opt/resin/validation/test_gpt_oss_flashinfer_gpu.py",
+            "/opt/resin/validation/test_context_parallel_gpu.py",
         ],
         env={**os.environ, "RESIN_EP_TEST_WORLD_SIZE": "2", "PYTHONUNBUFFERED": "1"},
         timeout=6 * 60,
@@ -200,7 +209,13 @@ def validate_parallel(graphs: bool = False):
         )
         for name, text in texts.items()
     }
-    prefix = "gpt-oss-ep-graphs" if graphs else "gpt-oss-ep"
+    prefix = (
+        f"gpt-oss-composable{world_size}"
+        if composable
+        else "gpt-oss-ep-graphs"
+        if graphs
+        else "gpt-oss-ep"
+    )
     run_id = datetime.now(timezone.utc).strftime(f"{prefix}-%Y%m%dT%H%M%SZ")
     path = Path(PROFILE_MOUNT) / f"{run_id}.json"
     print(f"[parallel-validation] diagnostic report: {path}", flush=True)
@@ -211,6 +226,8 @@ def validate_parallel(graphs: bool = False):
             vocab_size=len(tokenizer),
             diagnostic_path=path,
             graphs=graphs,
+            composable=composable,
+            world_size=world_size,
         )
     except Exception as error:
         if path.is_file():
@@ -257,8 +274,25 @@ def validate_parallel(graphs: bool = False):
 def main(
     report_path: str = "artifacts/gpt-oss-parallel-validation.json",
     graphs: bool = False,
+    composable: bool = False,
+    world_size: int = 0,
+    gpu_type: str = "H200",
 ):
-    report = validate_parallel.remote(graphs=graphs)
+    world_size = world_size or (4 if composable else 2)
+    if world_size not in ((2, 4, 8) if composable else (2,)):
+        raise ValueError("use two GPUs, or --composable with --world-size 2, 4 or 8")
+    if gpu_type not in ("H200", "H100"):
+        raise ValueError("gpu_type must be H200 or H100")
+    function = validate_parallel
+    if world_size != 2 or gpu_type != "H200":
+        function = function.with_options(
+            gpu=f"{gpu_type}:{world_size}",
+            cpu=4 * world_size,
+            memory=16 * 1024 * world_size,
+        )
+    report = function.remote(
+        graphs=graphs, composable=composable, world_size=world_size
+    )
     path = Path(report_path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, indent=2, sort_keys=True))

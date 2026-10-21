@@ -1276,14 +1276,32 @@ def validate_parallel(
 ) -> dict[str, object]:
     """Validate NCCL routing and complete-checkpoint EP/attention-DP serving."""
 
+    return _validate_parallel(model_key, include_tp_baseline=include_tp_baseline)
+
+
+def _validate_parallel(
+    model_key: str,
+    *,
+    include_tp_baseline: bool = False,
+    composable: bool = False,
+) -> dict[str, object]:
+    """Share checkpoint, routing reference and report handling across GPU sizes."""
+
     import subprocess
 
-    from deploy.deepseek_v4_parallel_validation import run_parallel_validation
+    from deploy.deepseek_v4_parallel_validation import (
+        run_composable_validation,
+        run_parallel_validation,
+    )
 
     model = _model_spec(model_key)
     model_path, checkpoint = _require_checkpoint(model)
-    if not torch.cuda.is_available() or torch.cuda.device_count() != 4:
-        raise RuntimeError("parallel validation requires four available Blackwell GPUs")
+    world_size = torch.cuda.device_count()
+    expected_sizes = (2, 4) if composable else (4,)
+    if not torch.cuda.is_available() or world_size not in expected_sizes:
+        raise RuntimeError(
+            f"parallel validation requires Blackwell GPU counts {expected_sizes}"
+        )
     tests = subprocess.run(
         [
             sys.executable,
@@ -1298,12 +1316,15 @@ def validate_parallel(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env={**os.environ, "RESIN_EP_TEST_WORLD_SIZE": str(world_size)},
         timeout=8 * 60,
         check=False,
     )
     print(tests.stdout, flush=True)
     if tests.returncode or "skipped" in tests.stdout:
-        raise RuntimeError("four-GPU expert dispatch reference validation did not pass")
+        raise RuntimeError(
+            f"{world_size}-GPU expert dispatch reference validation did not pass"
+        )
     tokenizer = cast(
         PreTrainedTokenizerBase,
         AutoTokenizer.from_pretrained(
@@ -1327,14 +1348,18 @@ def validate_parallel(
         for name, text in texts.items()
     }
     print(
-        "[deepseek-v4] validating full checkpoint with EP=4, attention DP=1 and 4",
+        f"[deepseek-v4] validating complete Flash checkpoint on {world_size} Blackwell GPUs",
         flush=True,
     )
-    report = run_parallel_validation(
-        model_path,
-        prompts,
-        vocab_size=len(tokenizer),
-        include_tp_baseline=include_tp_baseline,
+    report = (
+        run_composable_validation(model_path, prompts, vocab_size=len(tokenizer))
+        if composable
+        else run_parallel_validation(
+            model_path,
+            prompts,
+            vocab_size=len(tokenizer),
+            include_tp_baseline=include_tp_baseline,
+        )
     )
     report.update(
         {
@@ -1362,6 +1387,29 @@ def validate_parallel(
     profile_volume.commit()
     kernel_cache_volume.commit()
     return report
+
+
+@app.function(
+    image=image.uv_pip_install("pytest>=8,<9").add_local_file(
+        ROOT / "tests/test_expert_parallel_gpu.py",
+        "/opt/resin/validation/test_expert_parallel_gpu.py",
+        copy=True,
+    ),
+    gpu=["B300:2", "B200:2", "B300:4", "B200:4"],
+    env={"TORCH_CUDA_ARCH_LIST": "10.0;10.3"},
+    cpu=32,
+    memory=256 * 1024,
+    timeout=4 * 60 * 60,
+    single_use_containers=True,
+)
+def validate_composable(model_key: str = DEFAULT_MODEL_KEY) -> dict[str, object]:
+    """Run real FP4 models with composed meshes, graph replay and logit checks."""
+
+    if model_key != DEFAULT_MODEL_KEY:
+        raise ValueError(
+            "composable validation currently requires the Flash checkpoint"
+        )
+    return _validate_parallel(model_key, composable=True)
 
 
 @app.function(
@@ -1499,6 +1547,8 @@ def main(
         report = validate_kernels.remote()
     elif mode == "validate-parallel":
         report = validate_parallel.remote(model_spec.key, parallel_baseline)
+    elif mode == "validate-composable":
+        report = validate_composable.remote(model_spec.key)
     elif mode == "bench-tp2":
         if model_spec.key != DEFAULT_MODEL_KEY:
             raise ValueError("bench-tp2 currently supports only flash-0731")
@@ -1527,10 +1577,10 @@ def main(
         )
     else:
         raise ValueError(
-            "mode must be 'download', 'validate-kernels', 'validate-parallel', 'bench-tp2', 'bench-tp4', 'run', 'real', "
+            "mode must be 'download', 'validate-kernels', 'validate-parallel', 'validate-composable', 'bench-tp2', 'bench-tp4', 'run', 'real', "
             "or 'profile'"
         )
-    if mode == "validate-parallel" or report_path is not None:
+    if mode in {"validate-parallel", "validate-composable"} or report_path is not None:
         destination = (
             (
                 Path(report_path)

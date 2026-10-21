@@ -1,4 +1,4 @@
-"""Bounded full-checkpoint EP/attention-DP validation on four CUDA ranks."""
+"""Bounded full-checkpoint validation over composed CUDA rank meshes."""
 
 from __future__ import annotations
 
@@ -72,20 +72,20 @@ class _ObservedRunner:
         return self.runner.forward_distributed(plan, context)
 
 
-def _initialize(rank: int, port: int) -> None:
+def _initialize(rank: int, port: int, world_size: int = WORLD_SIZE) -> None:
     torch.cuda.set_device(rank)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(
         "nccl",
         rank=rank,
-        world_size=WORLD_SIZE,
+        world_size=world_size,
         timeout=timedelta(minutes=10),
         device_id=torch.device(f"cuda:{rank}"),
     )
 
 
-def _new_runner(rank, model_path, *, groups=None):
+def _new_runner(rank, model_path, *, groups=None, world_size=WORLD_SIZE, graphs=False):
     from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 
     parallel = (
@@ -93,7 +93,7 @@ def _new_runner(rank, model_path, *, groups=None):
         if groups is not None
         else {
             "tensor_parallel": TensorParallelContext(
-                TensorParallelLayout(rank=rank, size=WORLD_SIZE), dist.group.WORLD
+                TensorParallelLayout(rank=rank, size=world_size), dist.group.WORLD
             )
         }
     )
@@ -102,8 +102,11 @@ def _new_runner(rank, model_path, *, groups=None):
         max_seq_len=CONTEXT_LENGTH,
         max_batch_size=2,
         device=f"cuda:{rank}",
-        cuda_graph_prefill="disabled",
-        cuda_graph_decode="disabled",
+        cuda_graph_prefill="breakable" if graphs else "disabled",
+        cuda_graph_decode="full" if graphs else "disabled",
+        cuda_graph_decode_shapes=((1, CONTEXT_LENGTH), (2, CONTEXT_LENGTH))
+        if graphs
+        else None,
         speculative_tokens=0,
         fast_allreduce=False,
         cache_parent_capacity=CACHE_PARENTS,
@@ -150,7 +153,33 @@ def _drain(engine, events, *, inject=None):
     return steps
 
 
-def _driver_workload(worker, prompts):
+def _teacher_logits(engine, runner, prompts):
+    """Record full-vocabulary logits on identical fixed token contexts."""
+
+    latest = []
+    handle = runner._model.head.register_forward_hook(
+        lambda module, inputs, output: latest.append(output.detach())
+    )
+    values = []
+    try:
+        for suffix in ((), (2,), (2, 3), (2, 3, 4)):
+            latest.clear()
+            request = engine.submit(
+                [*prompts["probe"], *suffix],
+                max_new_tokens=1,
+                sampling_params=_sampling(),
+            )
+            _drain(engine, [])
+            request.take_result()
+            if not latest:
+                raise AssertionError("teacher-forced prefill omitted model logits")
+            values.append(latest[-1].float().cpu().squeeze(0).clone())
+    finally:
+        handle.remove()
+    return torch.stack(values)
+
+
+def _driver_workload(worker, prompts, *, numerical_directory=None):
     groups = worker.groups
     dp = groups.topology.coordinates(groups.rank)[0]
     engine = DistributedEngine(worker, **_engine_options())
@@ -208,6 +237,11 @@ def _driver_workload(worker, prompts):
             probe_events = []
             _drain(engine, probe_events)
             probes.append({"token_ids": probe.take_result(), "events": probe_events})
+        if numerical_directory is not None:
+            torch.save(
+                _teacher_logits(engine, worker.runner.runner, prompts),
+                Path(numerical_directory, f"{groups.rank}.pt"),
+            )
         return {
             "dp": dp,
             "workload_steps": workload_steps,
@@ -223,20 +257,48 @@ def _driver_workload(worker, prompts):
         engine.close()
 
 
-def _run_rank(rank, port, report_directory, model_path, prompts, attn_dp):
-    _initialize(rank, port)
-    groups = ParallelGroups.create(
-        Parallelism(world_size=WORLD_SIZE, ep=WORLD_SIZE, attn_dp=attn_dp)
+def _run_rank(
+    rank,
+    port,
+    report_directory,
+    model_path,
+    prompts,
+    attn_dp,
+    topology=None,
+    graphs=False,
+):
+    parallelism = Parallelism(
+        **(topology or {"world_size": WORLD_SIZE, "ep": WORLD_SIZE, "attn_dp": attn_dp})
     )
+    _initialize(rank, port, parallelism.world_size)
+    groups = ParallelGroups.create(parallelism)
+    runner = None
     try:
         start = time.perf_counter()
-        runner = _ObservedRunner(_new_runner(rank, model_path, groups=groups))
+        print(f"[deepseek-v4 rank={rank}] loading {parallelism}", flush=True)
+        runner = _ObservedRunner(
+            _new_runner(rank, model_path, groups=groups, graphs=graphs)
+        )
+        if graphs:
+            if not all(layer.ffn.routed.fused for layer in runner._model.layers):
+                raise AssertionError(
+                    "composed graph validation requires fused FP4 experts"
+                )
+            print(
+                f"[deepseek-v4 rank={rank}] capturing prefill/decode graphs", flush=True
+            )
+            runner.capture_cuda_graphs()
+            print(f"[deepseek-v4 rank={rank}] graph startup complete", flush=True)
         torch.cuda.synchronize()
         dist.barrier()
         loaded_seconds = time.perf_counter() - start
         worker = DistributedWorker(runner, groups)
         if groups.is_driver:
-            result = _driver_workload(worker, prompts)
+            result = _driver_workload(
+                worker,
+                prompts,
+                numerical_directory=report_directory if topology else None,
+            )
         else:
             worker.serve()
             result = None
@@ -250,6 +312,9 @@ def _run_rank(rank, port, report_directory, model_path, prompts, attn_dp):
             "loaded_seconds": loaded_seconds,
             "elapsed_seconds": time.perf_counter() - start,
             "weight_load": runner.weight_load,
+            "cuda_graph_stats": runner.cuda_graph_stats,
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "free_memory_bytes": torch.cuda.mem_get_info()[0],
             "pool_ids": runner.pool_ids,
             "released_ids": runner.released,
             "calls": runner.calls,
@@ -257,13 +322,23 @@ def _run_rank(rank, port, report_directory, model_path, prompts, attn_dp):
         }
         Path(report_directory, f"{rank}.json").write_text(json.dumps(report))
     finally:
+        if runner is not None:
+            runner.close_cuda_graphs()
         groups.close()
         dist.destroy_process_group()
 
 
-def _run_tp_baseline_rank(rank, port, report_directory, model_path, prompts):
-    _initialize(rank, port)
-    runner = _new_runner(rank, model_path)
+def _run_tp_baseline_rank(
+    rank,
+    port,
+    report_directory,
+    model_path,
+    prompts,
+    world_size=WORLD_SIZE,
+    numerical=False,
+):
+    _initialize(rank, port, world_size)
+    runner = _new_runner(rank, model_path, world_size=world_size)
     engine = Engine(runner, **_engine_options())
     try:
         request = engine.submit(
@@ -272,15 +347,21 @@ def _run_tp_baseline_rank(rank, port, report_directory, model_path, prompts):
         events = []
         _drain(engine, events)
         result = {"token_ids": request.take_result(), "events": events}
+        if numerical:
+            torch.save(
+                _teacher_logits(engine, runner, prompts),
+                Path(report_directory, f"{rank}.pt"),
+            )
         torch.cuda.synchronize()
         dist.barrier()
         Path(report_directory, f"{rank}.json").write_text(json.dumps(result))
     finally:
         engine.close()
+        runner.close_cuda_graphs()
         dist.destroy_process_group()
 
 
-def _spawn(target, model_path, prompts, *extra):
+def _spawn(target, model_path, prompts, *extra, world_size=WORLD_SIZE):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -288,7 +369,7 @@ def _spawn(target, model_path, prompts, *extra):
         context = torch.multiprocessing.spawn(
             target,
             args=(port, directory, str(model_path), prompts, *extra),
-            nprocs=WORLD_SIZE,
+            nprocs=world_size,
             join=False,
         )
         deadline = time.monotonic() + PROCESS_TIMEOUT_SECONDS
@@ -304,13 +385,17 @@ def _spawn(target, model_path, prompts, *extra):
                     process.terminate()
             for process in context.processes:
                 process.join(timeout=5)
-        return [
-            json.loads(Path(directory, f"{rank}.json").read_text())
-            for rank in range(WORLD_SIZE)
-        ]
+        records = []
+        for rank in range(world_size):
+            record = json.loads(Path(directory, f"{rank}.json").read_text())
+            logits_path = Path(directory, f"{rank}.pt")
+            if logits_path.exists():
+                record["_teacher_logits"] = torch.load(logits_path, weights_only=True)
+            records.append(record)
+        return records
 
 
-def _validate_records(records, attn_dp, vocab_size):
+def _validate_records(records, attn_dp, vocab_size, *, topology=None, graphs=False):
     drivers = [record["driver_result"] for record in records if record["driver"]]
     if len(drivers) != attn_dp:
         raise AssertionError("request Engine count does not match attention DP")
@@ -353,7 +438,9 @@ def _validate_records(records, attn_dp, vocab_size):
             ):
                 raise AssertionError("request cancellation did not complete")
     if attn_dp > 1:
-        if not any(call["placeholder"] for call in records[3]["calls"]):
+        if not any(
+            call["placeholder"] for record in records for call in record["calls"]
+        ):
             raise AssertionError("idle attention-DP rank did not participate empty")
         if not any(
             len({tuple(size) for size in call["replica_sizes"]}) > 1
@@ -366,8 +453,21 @@ def _validate_records(records, attn_dp, vocab_size):
             for item in driver["cancellations"]
         ):
             raise AssertionError("active cancellation was not exercised")
+    if graphs:
+        for record in records:
+            for mode in ("prefill", "decode"):
+                stats = record["cuda_graph_stats"][mode]
+                if not stats["capture_count"] or not stats["replay_count"]:
+                    raise AssertionError(
+                        f"{mode} graphs were not captured and replayed"
+                    )
+                if stats["eager_fallback_count"] or stats["poisoned"]:
+                    raise AssertionError(
+                        f"{mode} graph validation fell back or was poisoned"
+                    )
     return {
-        "parallelism": {
+        "parallelism": topology
+        or {
             "world_size": WORLD_SIZE,
             "ep": WORLD_SIZE,
             "attn_dp": attn_dp,
@@ -381,6 +481,7 @@ def _validate_records(records, attn_dp, vocab_size):
             "cache_reclaimed": True,
             "isolated_replay_identical": True,
             "independent_request_engines": attn_dp,
+            "graphs_captured_and_replayed": graphs,
         },
         "ranks": records,
     }
@@ -426,3 +527,127 @@ def run_parallel_validation(
             "observational; different quantized execution layouts may change greedy tokens"
         )
     return result
+
+
+def _composable_cases(world_size):
+    axes = [
+        ("attention-tp-expert-tp", {"ep": 1, "attn_tp": 2}),
+        ("context-expert-tp", {"ep": 1, "cp": 2}),
+        ("attention-dp-expert-tp", {"ep": 1, "attn_dp": 2}),
+        ("ep-attention-tp", {"ep": 2, "attn_tp": 2}),
+        ("ep-context", {"ep": 2, "cp": 2}),
+        ("ep-attention-dp", {"ep": 2, "attn_dp": 2}),
+    ]
+    if world_size == 4:
+        axes.extend(
+            [
+                ("ep-context-attention-tp", {"ep": 2, "cp": 2, "attn_tp": 2}),
+                ("ep-attention-dp-tp", {"ep": 2, "attn_dp": 2, "attn_tp": 2}),
+                ("ep-attention-dp-context", {"ep": 2, "attn_dp": 2, "cp": 2}),
+            ]
+        )
+    cases = []
+    for name, values in axes:
+        topology = {
+            "world_size": world_size,
+            "attn_dp": 1,
+            "attn_tp": 1,
+            "cp": 1,
+            "ep": 1,
+            **values,
+        }
+        Parallelism(**topology)  # Validate the matrix before allocating GPUs.
+        cases.append((name, topology))
+    return cases
+
+
+def _logit_metrics(actual, expected):
+    if actual.shape != expected.shape:
+        raise AssertionError("teacher-forced contexts produced different logit shapes")
+    difference = actual.float() - expected.float()
+    maximum = float(difference.abs().max())
+    relative = float(difference.norm() / expected.float().norm().clamp_min(1e-12))
+    result = {
+        "contexts": actual.shape[0],
+        "max_abs": maximum,
+        "rms": float(difference.square().mean().sqrt()),
+        "relative_l2": relative,
+        "max_abs_tolerance": 0.5,
+        "relative_l2_tolerance": 0.02,
+    }
+    if not torch.isfinite(actual).all() or maximum > 0.5 or relative > 0.02:
+        raise AssertionError(
+            f"same-context BF16 model logits exceed tolerance: {result}"
+        )
+    return result
+
+
+def run_composable_validation(model_path, prompts, *, vocab_size):
+    """Compare composed graph layouts with an independent eager TP reference."""
+
+    world_size = torch.cuda.device_count()
+    if world_size not in (2, 4):
+        raise RuntimeError("composable validation requires two or four CUDA devices")
+    if any(
+        not prompt or len(prompt) + 6 > CONTEXT_LENGTH for prompt in prompts.values()
+    ):
+        raise ValueError("validation prompts must fit the bounded context")
+    print(
+        f"[deepseek-v4] loading independent eager TP{world_size} reference", flush=True
+    )
+    baseline = _spawn(
+        _run_tp_baseline_rank,
+        model_path,
+        prompts,
+        world_size,
+        True,
+        world_size=world_size,
+    )[0]
+    expected = baseline.pop("_teacher_logits")
+    reports = []
+    for name, topology in _composable_cases(world_size):
+        print(f"[deepseek-v4] validating {name}: {topology}", flush=True)
+        records = _spawn(
+            _run_rank,
+            model_path,
+            prompts,
+            topology["attn_dp"],
+            topology,
+            True,
+            world_size=world_size,
+        )
+        comparisons = []
+        for record in records:
+            actual = record.pop("_teacher_logits", None)
+            if record["driver"]:
+                if actual is None:
+                    raise AssertionError("replica driver omitted fixed-context logits")
+                comparisons.append(
+                    {"rank": record["rank"], **_logit_metrics(actual, expected)}
+                )
+        report = _validate_records(
+            records,
+            topology["attn_dp"],
+            vocab_size,
+            topology=topology,
+            graphs=True,
+        )
+        report["name"] = name
+        report["teacher_forced_comparisons"] = comparisons
+        report["probe_matches_eager_tp"] = [
+            record["driver_result"]["probes"][0]["token_ids"] == baseline["token_ids"]
+            for record in records
+            if record["driver"]
+        ]
+        reports.append(report)
+    return {
+        "graphs": {"prefill": "breakable", "decode": "full"},
+        "speculative_tokens": 0,
+        "world_size": world_size,
+        "eager_tp_baseline": baseline,
+        "comparison_policy": (
+            "Four identical teacher-forced contexts use fixed BF16 logit tolerances; "
+            "greedy sequence matches are reported separately. CP replicates KV/compressor state."
+        ),
+        "cases": reports,
+    }

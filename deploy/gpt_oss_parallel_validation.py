@@ -19,21 +19,20 @@ from resin import BatchPhase, Engine, Parallelism, SamplingParams, SchedulerConf
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.topology import ParallelGroups
 
-WORLD_SIZE = 2
 CACHE_PARENTS = 128
 CONTEXT_LENGTH = 512
 PREFILL_CHUNK_SIZE = 32
 GENERATION_TOKENS = 8
 
 
-def _initialize(rank, port):
+def _initialize(rank, port, world_size):
     torch.cuda.set_device(rank)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(
         "nccl",
         rank=rank,
-        world_size=WORLD_SIZE,
+        world_size=world_size,
         timeout=timedelta(minutes=10),
         device_id=torch.device(f"cuda:{rank}"),
     )
@@ -271,8 +270,8 @@ def _metrics(actual, expected, *, maximum, relative):
     return result
 
 
-def _baseline_rank(rank, port, directory, model_path, prompts):
-    _initialize(rank, port)
+def _baseline_rank(rank, port, directory, model_path, prompts, world_size):
+    _initialize(rank, port, world_size)
     start = time.perf_counter()
     runner = _new_runner(rank, model_path)
     capture = _Capture(runner, expert=True)
@@ -372,13 +371,11 @@ def _expert_comparisons(runner, groups, reference):
     expert = runner._model.model.layers[0].mlp.experts
     results = []
     count = reference["hidden"].shape[0]
+    dp = groups.topology.coordinates(groups.rank)[0]
+    dp_size = groups.topology.attn_dp
     selections = [
-        torch.arange(count)
-        if groups.topology.attn_dp == 1
-        else torch.arange(groups.rank, count, WORLD_SIZE),
-        torch.arange(0)
-        if groups.topology.attn_dp > 1 and groups.rank == 0
-        else torch.arange(min(count, 5)),
+        torch.arange(count) if dp_size == 1 else torch.arange(dp, count, dp_size),
+        torch.arange(0) if dp_size > 1 and dp == 0 else torch.arange(min(count, 5)),
     ]
     # Replicated attention must use the same rows on every rank.
     if groups.topology.attn_dp == 1:
@@ -576,11 +573,11 @@ def _driver_workload(worker, capture, reference, prompts, baseline, *, graphs=Fa
         engine.close()
 
 
-def _ep_rank(rank, port, directory, model_path, prompts, attn_dp, graphs=False):
-    _initialize(rank, port)
-    groups = ParallelGroups.create(
-        Parallelism(world_size=WORLD_SIZE, ep=WORLD_SIZE, attn_dp=attn_dp)
-    )
+def _ep_rank(
+    rank, port, directory, model_path, prompts, world_size, case, graphs=False
+):
+    _initialize(rank, port, world_size)
+    groups = ParallelGroups.create(Parallelism(**case["parallelism"]))
     start = time.perf_counter()
     runner = capture = None
     try:
@@ -603,7 +600,7 @@ def _ep_rank(rank, port, directory, model_path, prompts, attn_dp, graphs=False):
             result = None
         torch.cuda.synchronize()
         dist.barrier()
-        Path(directory, f"ep{attn_dp}-{rank}.json").write_text(
+        Path(directory, f"{case['name']}-{rank}.json").write_text(
             json.dumps(
                 {
                     "rank": rank,
@@ -629,14 +626,14 @@ def _ep_rank(rank, port, directory, model_path, prompts, attn_dp, graphs=False):
         dist.destroy_process_group()
 
 
-def _spawn(target, directory, model_path, prompts, *extra):
+def _spawn(target, directory, model_path, prompts, world_size, *extra):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     processes = torch.multiprocessing.spawn(
         target,
-        args=(port, directory, str(model_path), prompts, *extra),
-        nprocs=WORLD_SIZE,
+        args=(port, directory, str(model_path), prompts, world_size, *extra),
+        nprocs=world_size,
         join=False,
     )
     deadline = time.monotonic() + 30 * 60
@@ -654,7 +651,9 @@ def _spawn(target, directory, model_path, prompts, *extra):
             process.join(timeout=5)
 
 
-def _check_case(records, attn_dp, vocab_size, *, graphs=False, collect_numerical=False):
+def _check_case(records, case, vocab_size, *, graphs=False, collect_numerical=False):
+    parallelism = Parallelism(**case["parallelism"])
+    attn_dp = parallelism.attn_dp
     numerical_errors = []
     phases = [(call["step"], call["phase"]) for call in records[0]["calls"]]
     if not phases or any(
@@ -770,22 +769,17 @@ def _check_case(records, attn_dp, vocab_size, *, graphs=False, collect_numerical
             f"checkpoint numerical comparisons failed: {numerical_errors}"
         )
     return {
-        "parallelism": {
-            "world_size": WORLD_SIZE,
-            "ep": WORLD_SIZE,
-            "attn_dp": attn_dp,
-            "attn_tp": 1,
-            "cp": 1,
-        },
+        "name": case["name"],
+        "parallelism": {**case["parallelism"], "expert_tp": parallelism.expert_tp},
         "coordinated_steps": len(phases),
         "numerical_errors": numerical_errors,
         "ranks": records,
     }
 
 
-def _case_summary(records, attn_dp):
+def _case_summary(records, case):
     return {
-        "attn_dp": attn_dp,
+        **case,
         "ranks": [
             {
                 "rank": record["rank"],
@@ -830,11 +824,66 @@ def _case_summary(records, attn_dp):
     }
 
 
+def _validation_cases(world_size=2, *, composable=False):
+    if world_size not in ((2, 4, 8) if composable else (2,)):
+        raise ValueError(
+            "validation uses two GPUs, or two/four/eight with composable=True"
+        )
+
+    def case(name, **axes):
+        topology = Parallelism(world_size=world_size, **axes)
+        return {
+            "name": name,
+            "parallelism": {
+                axis: getattr(topology, axis)
+                for axis in ("world_size", "attn_dp", "attn_tp", "cp", "ep")
+            },
+        }
+
+    if not composable:
+        return [
+            case(f"ep{world_size}-attn-dp1", ep=world_size),
+            case(
+                f"ep{world_size}-attn-dp{world_size}", ep=world_size, attn_dp=world_size
+            ),
+        ]
+    if world_size == 2:
+        return [
+            case("expert-tp2-attn-tp2", attn_tp=2),
+            case("expert-tp2-cp2", cp=2),
+            case("expert-tp2-attn-dp2", attn_dp=2),
+            case("ep2-attn-tp2", ep=2, attn_tp=2),
+            case("ep2-cp2", ep=2, cp=2),
+            case("ep2-attn-dp2", ep=2, attn_dp=2),
+        ]
+    cases = [
+        case("ep2-attn-tp2", ep=2, attn_tp=2),
+        case("ep2-attn-dp2-tp2", ep=2, attn_dp=2, attn_tp=2),
+        case("ep2-cp2-attn-tp2", ep=2, cp=2, attn_tp=2),
+        case("ep2-cp2-attn-dp2", ep=2, cp=2, attn_dp=2),
+        case(f"ep{world_size}-attn-dp{world_size}", ep=world_size, attn_dp=world_size),
+    ]
+    if world_size == 8:
+        cases.append(case("all-axes", ep=2, attn_dp=2, cp=2, attn_tp=2))
+    return cases
+
+
 def run_validation(
-    model_path, prompts, *, vocab_size, diagnostic_path=None, graphs=False
+    model_path,
+    prompts,
+    *,
+    vocab_size,
+    diagnostic_path=None,
+    graphs=False,
+    composable=False,
+    world_size=2,
 ):
-    if torch.cuda.device_count() != WORLD_SIZE:
-        raise RuntimeError("Hopper validation requires exactly two visible GPUs")
+    configurations = _validation_cases(world_size, composable=composable)
+    graphs = graphs or composable
+    if torch.cuda.device_count() != world_size:
+        raise RuntimeError(
+            f"Hopper validation requires exactly {world_size} visible GPUs"
+        )
     if any(
         not ids or len(ids) + GENERATION_TOKENS > CONTEXT_LENGTH
         for ids in prompts.values()
@@ -845,10 +894,10 @@ def run_validation(
             "[parallel-validation] loading independent full20B single-GPU baselines",
             flush=True,
         )
-        _spawn(_baseline_rank, directory, model_path, prompts)
+        _spawn(_baseline_rank, directory, model_path, prompts, world_size)
         baseline = [
             json.loads(Path(directory, f"baseline-{rank}.json").read_text())
-            for rank in range(WORLD_SIZE)
+            for rank in range(world_size)
         ]
         for record in baseline:
             print(
@@ -860,7 +909,8 @@ def run_validation(
                 flush=True,
             )
         diagnostic = {
-            "world_size": WORLD_SIZE,
+            "world_size": world_size,
+            "composable": composable,
             "graphs": "prefill_breakable_decode_full" if graphs else "disabled",
             "baseline": baseline,
             "cases": [],
@@ -870,7 +920,7 @@ def run_validation(
             artifact_directory = Path(diagnostic_path).with_suffix("")
             artifact_directory.mkdir(parents=True, exist_ok=True)
             diagnostic["expert_reference_artifacts"] = []
-            for rank in range(WORLD_SIZE):
+            for rank in range(world_size):
                 reference = torch.load(
                     Path(directory, f"baseline-{rank}.pt"), weights_only=True
                 )
@@ -886,20 +936,20 @@ def run_validation(
 
         save_diagnostic()
         cases = []
-        for attn_dp in (1, WORLD_SIZE):
+        for case in configurations:
             print(
-                f"[parallel-validation] loading checkpoint EP={WORLD_SIZE}, attention DP={attn_dp}",
+                f"[parallel-validation] loading checkpoint {case['name']}: {case['parallelism']}",
                 flush=True,
             )
-            _spawn(_ep_rank, directory, model_path, prompts, attn_dp, graphs)
+            _spawn(_ep_rank, directory, model_path, prompts, world_size, case, graphs)
             records = [
-                json.loads(Path(directory, f"ep{attn_dp}-{rank}.json").read_text())
-                for rank in range(WORLD_SIZE)
+                json.loads(Path(directory, f"{case['name']}-{rank}.json").read_text())
+                for rank in range(world_size)
             ]
-            diagnostic["cases"].append({"attn_dp": attn_dp, "ranks": records})
+            diagnostic["cases"].append({**case, "ranks": records})
             print(
                 "[parallel-validation] numerical diagnostics "
-                + json.dumps(_case_summary(records, attn_dp), sort_keys=True),
+                + json.dumps(_case_summary(records, case), sort_keys=True),
                 flush=True,
             )
             save_diagnostic()
@@ -907,7 +957,7 @@ def run_validation(
                 cases.append(
                     _check_case(
                         records,
-                        attn_dp,
+                        case,
                         vocab_size,
                         graphs=graphs,
                         collect_numerical=True,
@@ -919,7 +969,7 @@ def run_validation(
                 save_diagnostic()
                 raise
         numerical_errors = [
-            {"attn_dp": case["parallelism"]["attn_dp"], **error}
+            {"case": case["name"], **error}
             for case in cases
             for error in case["numerical_errors"]
         ]
@@ -932,7 +982,8 @@ def run_validation(
             save_diagnostic()
             raise AssertionError(diagnostic["validation_error"])
         return {
-            "world_size": WORLD_SIZE,
+            "world_size": world_size,
+            "composable": composable,
             "graphs": "prefill_breakable_decode_full" if graphs else "disabled",
             "baseline": baseline,
             "cases": cases,

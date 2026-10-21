@@ -118,14 +118,32 @@ path. See the [runner contract](kernel-boundary.md) for Python error handling.
 The [distributed prototype](distributed.md) adds explicit attention TP/CP/DP and
 expert EP/TP meshes, one request Engine per attention-DP replica, and synchronous
 phase agreement across communicating replicas. It leaves model partitioning and
-kernel collectives in prepared runtimes. [Generated-token logprobs](logprobs.md)
-cross the Python-to-Rust boundary as borrowed NumPy columns.
+kernel collectives in prepared runtimes. GPT-OSS and DeepSeek-V4 prepare
+attention head shards separately from expert ownership and intermediate shards.
+Shared expert dispatch returns complete origin rows across EP and expert TP;
+models do not reduce that result again across attention TP. Sampling uses the
+full device request-replica group.
+
+Their CP prefill boundaries differ: GPT-OSS partitions hidden/FFN token rows and
+gathers K/V, while DeepSeek partitions attention query work around replicated
+MLA compressor updates and full FFNs. Both replicate attention during decode
+and retain complete KV/state copies across CP ranks. CP does not multiply
+logical cache capacity. Shared CUDA graph machinery captures FFN regions and
+decode, coordinates buckets and empty ranks, and explicitly releases captured
+collectives before process-group shutdown.
+
+[Generated-token logprobs](logprobs.md) cross the Python-to-Rust boundary as
+borrowed NumPy columns.
 
 ## Current limits
 
 - one synchronous batch per Engine step;
 - no prefill/decode disaggregation;
-- production CUDA model adapters do not yet implement the prototype CP/EP contract;
+- dense graph-safe expert dispatch and duplicated attention-origin work remain
+  correctness prototypes; sparse routing and communication overlap are pending;
+- model dimensions, quantization blocks, and kernel capabilities constrain layouts;
+- the preceding two-H200 EP2/attention-DP eager and graph checks passed; expanded
+  composable GPU validation and DeepSeek-specific Blackwell validation are pending;
 - no multi-node serving;
 - model runtimes implement device collectives; the native scheduler owns local
   request and page lifetimes.

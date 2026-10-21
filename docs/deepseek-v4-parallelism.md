@@ -1,4 +1,4 @@
-# DeepSeek-V4 Flash: EP and attention DP
+# DeepSeek-V4 Flash: composable attention and expert parallelism
 
 The CUDA runner accepts explicit groups prepared from `resin.Parallelism`:
 
@@ -9,7 +9,9 @@ from resin.backend.topology import ParallelGroups
 from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 
 # Initialize the default NCCL world first, with one process per GPU.
-groups = ParallelGroups.create(Parallelism(world_size=4, ep=4, attn_dp=4))
+groups = ParallelGroups.create(
+    Parallelism(world_size=8, attn_dp=2, attn_tp=2, cp=2, ep=2)
+)
 runner = DeepSeekV4CudaRunner(
     checkpoint_path,
     max_seq_len=4096,
@@ -20,75 +22,92 @@ runner = DeepSeekV4CudaRunner(
     cuda_graph_decode="full",
     speculative_tokens=0,
 )
-# Collective startup operation, before any rank starts serving requests.
-runner.capture_cuda_graphs()
+runner.capture_cuda_graphs()  # Collective startup, before workers serve.
 worker = DistributedWorker(runner, groups)
 if groups.is_driver:
     engine = DistributedEngine(worker)
-    # Submit this replica's requests, then collectively step/close all drivers.
+    # Submit local requests; collectively step and close every driver.
 else:
     worker.serve()
-# All ranks reach this after their serving loops have stopped.
+# Every rank reaches this after its serving loop has stopped.
 runner.close_cuda_graphs()
 groups.close()
 ```
 
-The current explicit-group path requires full-width EP (`ep == world_size`),
-attention TP one, and CP one. Expert TP is one. Attention DP may be any divisor
-of the world size; remaining ranks replicate attention within the same request
-replica. The existing `tensor_parallel=` entry point retains its TP behavior.
-The two construction modes are mutually exclusive.
+Attention TP, attention DP, CP, EP, expert TP, and attention replication compose
+through this path. Expert TP is `world_size / ep`, independent of attention TP
+and CP. The legacy `tensor_parallel=` path remains available and is mutually
+exclusive with explicit groups. Explicit-group execution currently requires
+`speculative_tokens=0`.
+
+Model dimensions and quantization geometry still constrain valid layouts.
+Attention head, indexer, vocabulary, and grouped projection slices must satisfy
+their sharding rules. EP must divide the routed expert count. Expert TP partitions
+complete intermediate quantization blocks: 128-value boundaries for FP4 experts
+or FP8 model storage, with unequal aligned shard widths permitted. Preparation
+checks these boundaries before allocating model storage or preparing kernels.
 
 ## Ownership and execution
 
-Attention projections, vocabulary shards, indexers, and logits use their
-injected attention-TP context. Expert ownership uses the EP coordinate.
-Checkpoint loading reads only the owned expert tensors and applies the separate
-attention-TP slices. Preparation replaces checkpoint expert containers with
-local kernel storage and an EP dispatcher. Model execution no longer reads
-process-global attention rank or width.
+Attention projections, vocabulary shards, indexers, and logits use injected
+attention-TP contexts. Routed experts use separate EP ownership and expert-TP
+intermediate coordinates. Checkpoint loading reads owned experts and slices
+packed weights/scales on their logical intermediate axes before converting them
+to prepared kernel storage. Execution does not infer these layouts from the
+default process group.
 
-For each MoE layer, the dispatcher sends a hidden row once to each distinct
-selected expert owner. The owner executes its existing local FP4 kernel and
-returns partial rows; the source combines them in its own token order. Replicated
-attention dispatches from one copy and broadcasts the combined result to the
-other copies. Shared experts remain local. Independent DP requests are never
-summed together.
+The shared `ExpertParallelDispatch` preserves every attention rank's token
+origins across `groups.device_domain`. Selected rows visit every intermediate
+shard of their expert owner; returned partials combine across EP and expert TP.
+The returned FFN rows are complete, so the model does not apply another
+attention-TP reduction to them. Shared experts remain local. Sampling broadcasts
+use `groups.device_replica`, covering all ranks executing the same request
+replica. Independent attention-DP requests retain their own origin rows.
 
-Every attention-DP replica has its own Rust scheduler, logical cache pool, and
-request namespace. Physical cache capacity is agreed within that request
-replica. Prefill aligns the number of per-sequence model calls across replicas;
-missing rows and completely idle replicas join matching expert rounds. Eager
-empty rounds do not run attention or modify KV state. Captured empty prefill
-replays only FFN regions; captured empty decode runs padded rows backed by
-reserved null/scratch cache storage. Decode retains each replica's own logical
-batch size.
+Each attention-DP replica has its own Rust scheduler, logical cache pool, and
+request namespace. Physical cache capacity is agreed within that replica.
+Prefill executes one sequence per model call and aligns the call count across
+replicas. Missing calls and entirely idle replicas join matching expert rounds.
+Eager empty rounds do not run attention or modify KV state. Captured empty
+prefill replays only FFN regions; captured empty decode uses reserved scratch
+cache rows.
 
-`parallelism_capabilities` declares supported axes. Preparation additionally
-rejects unsupported combinations before CUDA work, including CP, expert TP,
-attention TP in the explicit-group path, and speculative decoding.
+## Context parallelism
 
-## CUDA graphs
+DeepSeek's recurrent MLA compressors require ordered updates. Prefill therefore
+keeps full hidden rows, MLA KV writes, compressor tails, and indexer compressor
+state replicated across CP ranks. It splits query/output projection work,
+indexer query scoring, and sparse attention over contiguous query segments,
+then gathers attention output before the transformer block's full FFN.
+Zero-query ranks still participate in the output gather.
 
-The explicit-group runner uses the shared CUDA graph machinery for prefill FFN
-regions and full decode. Every rank captures the same catalog collectively at
-startup. Replicas agree on physical buckets before GPU work; if any replica
-cannot use a configured shape, all use eager execution for that step. DeepSeek's
-per-sequence prefill calls and empty participation remain aligned across the
-domain. Requested decode logprobs use logits retained from graph replay.
+Decode executes replicated attention on CP ranks. Complete KV and recurrent
+state copies remain present on every CP rank in both phases; CP does not
+increase logical cache capacity. This conservative query partition preserves
+the cache/compressor boundary and duplicates projection, state, and FFN work.
+GPT-OSS uses a different CP boundary with local hidden and FFN rows; see its
+[model documentation](gpt-oss-parallelism.md#context-parallelism).
 
-Graph expert dispatch all-gathers a fixed capacity of source rows and
-reduce-scatters local weighted expert partials back to their sources. A device
-valid-row scalar masks padding, and routing metadata stays on the GPU. Attention
-replication still dispatches once and broadcasts complete rows. This transport
-is shared with GPT-OSS; the DeepSeek model retains its own FP4 kernel and cache
-adapters.
+## CUDA graphs and current costs
 
-The dense transport sends every padded row to every expert owner, giving each
-owner `EP * capacity` rows. It makes shapes and collectives capturable but adds
-bandwidth, scratch memory, and padded expert work. Sparse graph-safe routing and
-communication overlap remain separate work. The eager path continues to pack
-only selected owners and reads variable split counts on the host.
+The explicit-group runner uses shared graph machinery for prefill FFN regions
+and full decode. Every rank captures matching catalogs at startup. Graph
+readiness is validated before the coordinator's execution vote. Replicas agree
+on common buckets before GPU work; unsupported shapes force the entire domain
+to execute eagerly. Requested decode logprobs use retained graph logits.
+
+Captured expert dispatch all-gathers a fixed token capacity across the device
+world and reduce-scatters weighted partials to their origins. Device valid-row
+scalars mask padding. Every callback receives `world_size * capacity` rows,
+including foreign routes. Each attention copy dispatches its own origin, even
+when another copy has identical hidden rows. Eager dispatch packs selected
+owners and all their expert-TP lanes, reading split counts on the host.
+
+This dense transport is a correctness prototype. It adds communication,
+padding, scratch storage, and duplicated expert work; sparse graph-safe routing
+and communication overlap remain separate work. The DeepSeek adapter retains
+its existing FP4 kernel and arithmetic, so shared transport validation does not
+establish DeepSeek-specific numerical correctness.
 
 ## Validation
 
@@ -98,26 +117,21 @@ uv run modal run deploy/modal_deepseek_v4.py --mode validate-parallel \
   --parallel-baseline --report-path artifacts/deepseek-v4-parallel-validation.json
 ```
 
-The Modal command prefers four B300 GPUs and can fall back to four B200s. It uses
-the complete pinned Flash checkpoint.
-It checks NCCL routing against an independent arithmetic reference, EP-only
-replicated attention, and independent attention-DP request engines. The model
-workload includes unequal prompts and queues, idle ranks, continuation prefill,
-active and queued cancellation, cache reuse, and generated-token logprobs.
-An optional eager TP4 run records a baseline token comparison; different
-quantized execution layouts can change greedy tokens, so that comparison is
-reported separately from the routing and lifecycle assertions.
+The existing DeepSeek validation command uses the complete pinned Flash
+checkpoint and eager four-GPU EP/attention-DP cases. It exercises independent
+request engines, unequal queues, idle ranks, continuation prefill, cancellation,
+cache reuse, and generated-token logprobs. An optional TP4 run reports token
+comparisons separately because quantized layouts can change greedy choices.
+It is not a completed GPU validation of the new composed layouts or graphs.
 
-The current DeepSeek Modal validation command runs eager execution. Captured
-DeepSeek execution is implemented but has not been validated on Blackwell.
-Asynchronous communication overlap, expert TP, CP, DSpark, and a cross-replica
-HTTP request router remain outside this explicit-group path.
+Blackwell model/kernel validation remains pending; the earlier four-GPU jobs
+did not receive an allocation. The shared transport and independent request
+engines passed the preceding [eager two-H200 GPT-OSS run](gpt-oss-parallelism.md#completed-eager-run).
+Shared graph orchestration also passed the preceding
+[captured GPT-OSS run](gpt-oss-parallelism.md#completed-graph-run), including idle
+attention-DP replay in both phases. The expanded eight-GPU GPT-OSS graph matrix
+is pending. CPU tests cover composed expert shards and DeepSeek CP/cache control
+flow, but none of this substitutes for DeepSeek-specific Blackwell validation.
 
-Blackwell validation remains pending: the attempted four-GPU jobs did not
-receive an allocation. The shared dispatcher and independent request engines
-have passed [eager GPT-OSS-20B validation on two H200s](gpt-oss-parallelism.md#completed-eager-run).
-The shared graph orchestration and transport also passed
-[captured GPT-OSS-20B validation](gpt-oss-parallelism.md#completed-graph-run),
-including independent attention-DP queues and idle-rank replay in both phases.
-That evidence does not validate DeepSeek-V4's model, cache state, or Blackwell
-kernel integration.
+Asynchronous communication overlap, explicit-group DSpark, and a cross-replica
+HTTP request router remain separate work.

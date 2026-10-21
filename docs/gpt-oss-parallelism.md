@@ -1,6 +1,6 @@
-# GPT-OSS: EP and attention DP
+# GPT-OSS: composable attention and expert parallelism
 
-The Hopper runner accepts the same explicit process groups as DeepSeek-V4:
+The Hopper runner accepts explicit attention and expert meshes:
 
 ```python
 from resin import Parallelism
@@ -9,7 +9,9 @@ from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
 from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
 
 # Initialize NCCL first, with one process per GPU.
-groups = ParallelGroups.create(Parallelism(world_size=2, ep=2, attn_dp=2))
+groups = ParallelGroups.create(
+    Parallelism(world_size=8, attn_dp=2, attn_tp=2, cp=2, ep=2)
+)
 runner = GptOssCudaRunner(
     checkpoint_path,
     device=f"cuda:{local_rank}",
@@ -18,112 +20,116 @@ runner = GptOssCudaRunner(
     cuda_graph_prefill="breakable",
     cuda_graph_decode="full",
 )
-# Collective startup operation: every rank captures before workers serve.
-runner.capture_cuda_graphs()
+runner.capture_cuda_graphs()  # Collective startup, before workers serve.
 ```
 
-Use `DistributedWorker` and `DistributedEngine` as described in
-[distributed execution](distributed.md). Each attention-DP replica owns a
-scheduler and cache namespace. With `attn_dp=1`, the remaining ranks replicate
-the same attention and requests; they still own different expert weights.
+This layout has two request engines, attention TP two, CP two, and expert TP
+four. The attention and expert meshes share the same eight ranks. Attention
+replication is the remaining factor in `world_size / (attn_dp * cp * attn_tp)`;
+CP does not add another factor to expert TP, which is `world_size / ep`.
+See [distributed execution](distributed.md) for drivers, workers, and stepping.
 
-After every rank has left its driver loop or `worker.serve()`, release captured
-NCCL graphs before destroying process groups:
+All declared axes compose through `parallel_groups=`. The legacy
+`tensor_parallel=` construction remains available and is mutually exclusive
+with explicit groups. Preparation checks model and kernel geometry: attention
+TP must divide query/KV heads, EP must divide the global expert count, and expert
+TP partitions complete 32-value MXFP4 groups. Intermediate shards may have
+unequal aligned widths. The SM90 adapter requires at least four local experts.
+A numerically valid `Parallelism` value alone does not guarantee valid model
+geometry or an accepted kernel configuration.
+
+After serving has stopped on every rank:
 
 ```python
-runner.close_cuda_graphs()  # All ranks, after serving has stopped.
+runner.close_cuda_graphs()  # Release captured NCCL references first.
 groups.close()
 ```
 
-The explicit-group path requires `ep == world_size` and `attn_tp=cp=expert_tp=1`.
-It supports eager execution and CUDA graphs. The existing `tensor_parallel=`
-path is separate.
-`parallelism_capabilities` declares the supported axes, and construction checks
-their combinations. The local fused kernel must also support the resulting
-expert count; the Hopper adapter requires at least four local experts.
-
 ## Preparation and execution boundaries
 
-The model retains a router over all experts. Checkpoint preparation slices the
-expert axis of all six MXFP4 weight, scale, and bias tensors before converting
-them to the local kernel's storage. Attention TP and expert ownership use
-separate coordinates. The kernel config describes only locally stored experts.
+The router retains every global expert. Checkpoint preparation independently
+slices attention heads, the expert ownership axis, and expert intermediate
+channels. All six MXFP4 weight/scale/bias tensors receive their appropriate
+slices before kernel packing. Gate/up biases follow intermediate channels;
+down-projection bias belongs only to expert-TP lane zero. The kernel config
+describes the local expert count and intermediate width.
 
-`ExpertParallelDispatch` in `resin.backend.expert_parallel` is shared with
-DeepSeek-V4. It sends each row once per selected expert owner, passes global
-routes to a local callback, and returns combined rows in their original order.
-GPT-OSS's callback maps owned expert IDs to local IDs and marks other routes
-inactive without renormalization. The existing kernel adapter retains ownership
-of MXFP4 packing and the fused kernel call.
+`ExpertParallelDispatch` is shared with DeepSeek-V4. With explicit groups it
+preserves each attention rank as an independent origin, sends selected rows to
+every intermediate shard of their expert owner, and combines all expert/TP
+partials back into complete origin rows. This result must not be reduced again
+across attention TP. Sampling broadcasts across `groups.device_replica` so all
+ranks executing the same logical requests agree on selected tokens.
 
-EP kernels must advertise `supports_fp32_partial` and implement
-`forward_partial`: weighted local expert sums in FP32, including for empty
-inputs. Dispatch preserves that dtype through the return exchange and global
-combine, then casts to the activation dtype. Rounding each owner's sum to BF16
-before the exchange introduces an extra rounding step and can change routing in
-later layers.
+The GPT callback maps global IDs to local IDs and marks foreign routes inactive
+without renormalizing weights. EP kernels advertise `supports_fp32_partial` and
+implement `forward_partial`. The Hopper adapter retains its BF16 GEMMs but
+expands fixed assignment slots, applies output bias and routing probabilities
+in FP32, and preserves FP32 owner sums through communication. Only the combined
+origin result is cast to the activation dtype. Packing and kernel selection
+remain inside the prepared kernel adapter.
 
-The Hopper adapter keeps its existing BF16 GEMMs. Internally it expands fixed
-assignment slots into rows with one expert each, then applies the prepared output
-bias, routing weights, and reduction in FP32. Packed weights are shared with
-ordinary execution; only a small zero-bias tensor is added during preparation.
-Inactive assignments use the kernel's expert sentinel. Expansion and chunking
-have static shapes, respecting the kernel's token limit without reading route
-counts on the host.
+## Context parallelism
 
-GPT-OSS packs one attention batch per step, so every rank executes one expert
-round per layer. Eager idle replicas execute empty expert rounds without
-attention or KV writes. Captured idle prefill replays only FFN regions; captured
-idle decode uses padded model rows backed by reserved null cache storage.
-Routing tensors have a consistent collective dtype even when the model's router
-implementation changes.
+Prefill partitions the packed token axis into balanced contiguous CP segments.
+Each rank embeds, normalizes, and executes FFNs on its local hidden rows. Each
+attention layer gathers rotated local K/V back into global packed order and
+writes the full cache on every CP copy. Local queries use filtered sequence
+metadata with K lengths ending at their own query segment; this preserves
+causal and sliding-window attention without changing global positions. A rank
+with no local queries still joins K/V and expert exchanges. Final hidden rows
+are gathered before selecting request-final tokens.
 
-## CUDA graph execution
+Decode runs the ordinary replicated attention path on CP ranks. KV storage is
+replicated across CP in both phases, so adding CP does not increase logical
+cache capacity. Each attention-DP replica retains its own scheduler, request
+namespace, and cache pool.
 
-The shared CUDA runner captures prefill FFN regions and full decode, including
-expert communication and sampling. All ranks call `capture_cuda_graphs()` before
-serving with matching catalogs. At each step, replicas agree on a bucket or
-collectively fall back to eager execution. Unequal batches and idle replicas
-use a device valid-row scalar to mask padding. Requested logprobs are formatted
-from the retained decode logits after replay.
+## CUDA graphs and current costs
 
-Captured expert dispatch uses a fixed-capacity all-gather and FP32
-reduce-scatter, followed by attention-replica broadcast. This sends padded source
-rows to every owner; each owner receives `EP * capacity` rows. It avoids
-host routing-count reads and dynamic shapes, at the cost of dense communication,
-scratch storage, and padded kernel work. The eager transport still packs only
-selected owners and reads variable split counts on the host. The Hopper adapter
-also copies expanded activations. Communication overlap, sparse graph-safe
-dispatch, and a native FP32-partial kernel remain future work.
+The shared runner captures prefill FFN regions and full decode, including expert
+communication and sampling. All ranks capture matching catalogs before serving.
+Replicas agree on a physical bucket or collectively fall back to eager
+execution. Device valid-row scalars mask padding. Graph readiness is checked
+before the coordinator's execution vote. Requested logprobs use retained decode
+logits after replay.
+
+Eager dispatch sends each row only to its selected expert owners and their
+expert-TP lanes, reading split counts on the host. Captured dispatch uses a
+fixed-capacity world all-gather and FP32 reduce-scatter; every local expert
+callback receives `world_size * capacity` rows, including padding and foreign
+routes. Replicated attention and attention-TP ranks currently dispatch their own
+origins even when their hidden rows are identical. This is a correctness
+prototype with extra communication, scratch memory, activation expansion, and
+duplicate expert work. Sparse graph-safe routing, communication overlap, and a
+native FP32-partial kernel remain separate work.
+
+Idle prefill replays only matching FFN regions. Idle decode replays padded rows
+using reserved null cache storage, without writing live request pages.
 
 ## Hopper validation
 
-```bash
-uv run modal run deploy/modal_gpt_oss_parallel.py \
-  --report-path artifacts/gpt-oss-parallel-validation.json
-```
-
-The command requests two H200s with H100 fallback and uses a pinned GPT-OSS-20B
-checkpoint. It runs an independent NCCL routing reference, real fused expert
-comparisons, and full-model EP2 with attention DP one and two. Single-GPU runs
-provide the same-context reference logits. It also exercises unequal prompts,
-idle replicas, cancellation, cache reuse, and generated-token logprobs.
-The JSON report records numerical errors against fixed tolerances and greedy
-token agreement. This validates the shared transport on Hopper; DeepSeek-V4's
-Blackwell-specific model and kernels need their own GPU validation.
-
-To exercise captured prefill and decode, including idle-rank replay:
+The completed two-H200 runs below establish eager and graph-enabled EP2 with
+attention DP one and two for the preceding implementation. The expanded
+composable implementation has CPU conformance tests; its eight-GPU full-model
+graph matrix is pending. Those results must be assessed separately from the
+older two-GPU proof and from DeepSeek-specific Blackwell validation.
 
 ```bash
 uv run modal run deploy/modal_gpt_oss_parallel.py --graphs \
   --report-path artifacts/gpt-oss-parallel-graphs-validation.json
+
+uv run modal run deploy/modal_gpt_oss_parallel.py --composable --world-size 8 \
+  --report-path artifacts/gpt-oss-composable-graphs-validation.json
 ```
 
-This mode also captures and replays the independent NCCL transport reference
-and real Hopper partial-expert kernel. Full-model graph cases retain logprob
-output, compare greedy decode logits with matching baseline contexts, and
-require both graph modes to replay without eager fallback. The validation uses
-32-token prefill buckets and bounded decode shapes.
+The composable command uses the pinned full GPT-OSS-20B checkpoint, independent
+single-GPU baselines, and graph-enabled layouts combining attention TP, attention
+DP, CP, EP, and expert TP. It also runs NCCL transport, real SM90 partial-expert,
+and real FA4 CP attention comparisons. The full-model workload checks same-history
+logits, greedy output, logprobs, unequal queues, idle/resumed replicas,
+cancellation, cache reuse, capture/replay counts, and orderly graph teardown.
+These are bounded correctness checks; they do not establish throughput or MFU.
 
 ### Completed graph run
 
