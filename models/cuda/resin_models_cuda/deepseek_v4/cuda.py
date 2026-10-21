@@ -132,10 +132,6 @@ class DeepSeekV4CudaRunner(CudaRunner):
             self.parallelism_capabilities.validate(
                 parallel_groups.topology, model="DeepSeek-V4"
             )
-            if speculative_tokens:
-                raise ValueError(
-                    "DeepSeek-V4 expert dispatch requires speculative_tokens=0"
-                )
             tensor_parallel = TensorParallelContext(
                 TensorParallelLayout(
                     rank=parallel_groups.attn_tp.local_rank,
@@ -207,8 +203,11 @@ class DeepSeekV4CudaRunner(CudaRunner):
         )
         if any(shape[0] > max_batch_size for shape in decode_graph_shapes):
             raise ValueError("CUDA graph batch capacity exceeds max_batch_size")
-        if any(shape[1] < 2 for shape in decode_graph_shapes):
-            raise ValueError("DeepSeek-V4 CUDA graph sequence capacity must be >= 2")
+        if any(shape[1] < speculative_tokens + 2 for shape in decode_graph_shapes):
+            raise ValueError(
+                "DeepSeek-V4 CUDA graph sequence capacity must cover position 1 "
+                "and the complete verification block"
+            )
         if any(shape[1] > physical_seq_len for shape in decode_graph_shapes):
             raise ValueError("CUDA graph sequence capacity exceeds max_seq_len")
         self._configure_cuda_graphs(
@@ -526,6 +525,17 @@ class DeepSeekV4CudaRunner(CudaRunner):
             dtype=torch.long,
             device=self.device,
         )
+        logits_buffer = torch.empty(
+            (batch_size, block_size + 1, self.vocab_size),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self._graph_logits[shape] = logits_buffer
+        valid_rows = (
+            torch.empty((), dtype=torch.int32, device=self.device)
+            if self.parallel_groups is not None
+            else None
+        )
         sampling = self._sampler.empty(batch_size, self.device)
         phase_events: tuple[torch.cuda.Event, ...] | None = None
         if self.profile_graph_phases:
@@ -543,15 +553,29 @@ class DeepSeekV4CudaRunner(CudaRunner):
             with use_default_dtype(torch.bfloat16), torch.device(self.device):
                 if phase_events is not None:
                     phase_events[0].record()
-                drafts = self._broadcast_tokens(
-                    self._model.draft(token_ids, positions, cache=cache)
-                )
+                # Expert dispatch counts flattened token rows. Draft and
+                # verification have different block widths, while the live
+                # replica batch is a replay input that may also be zero.
+                with self._expert_graph_capacity(
+                    batch_size * block_size,
+                    valid_rows=None if valid_rows is None else valid_rows * block_size,
+                ):
+                    drafts = self._broadcast_tokens(
+                        self._model.draft(token_ids, positions, cache=cache)
+                    )
                 if phase_events is not None:
                     phase_events[1].record()
                 verify_ids = torch.cat((token_ids, drafts), dim=1)
-                verify_logits, verify_hidden = self._model.forward_verify(
-                    verify_ids, positions, graph_seq_len, cache=cache
-                )
+                with self._expert_graph_capacity(
+                    batch_size * (block_size + 1),
+                    valid_rows=None
+                    if valid_rows is None
+                    else valid_rows * (block_size + 1),
+                ):
+                    verify_logits, verify_hidden = self._model.forward_verify(
+                        verify_ids, positions, graph_seq_len, cache=cache
+                    )
+                logits_buffer.copy_(verify_logits)
                 if phase_events is not None:
                     phase_events[2].record()
                 if verify_hidden is None:
@@ -570,6 +594,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
                     phase_events[3].record()
 
         inputs = {"token_ids": token_ids, "positions": positions}
+        if valid_rows is not None:
+            inputs["ep_valid_rows"] = valid_rows
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(self._sampler.graph_inputs(sampling))
         return CudaGraphStep(
@@ -582,9 +608,6 @@ class DeepSeekV4CudaRunner(CudaRunner):
     def _graph_forward(
         self, plan: BatchPlan, cache_plan, *, shape: GraphShape | None = None
     ) -> list[int] | list[list[int]] | ForwardOutput | None:
-        if plan.needs_logprobs and self.speculative_tokens:
-            self._cuda_graph_fallback("decode", "logprobs")
-            return None
         batch_size = plan.num_sequences
         positions = plan.positions
         sequence_length = int(positions.max()) + 1
@@ -629,12 +652,15 @@ class DeepSeekV4CudaRunner(CudaRunner):
         block_size = self.speculative_tokens
         drafts = [row[:block_size] for row in output]
         targets = [row[block_size:] for row in output]
-        return self._accept_speculative(
+        accepted = self._accept_speculative(
             drafts,
             targets,
             torch.tensor(positions, dtype=torch.long, device=self.device),
             graph_cache,
         )
+        if plan.needs_logprobs:
+            return format_output(self._graph_logits[shape][:batch_size], accepted, plan)
+        return accepted
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
         batch = BatchView.from_plan(plan)
@@ -842,12 +868,14 @@ class DeepSeekV4CudaRunner(CudaRunner):
 
     def forward_distributed(
         self, plan: BatchPlan | None, context: StepContext
-    ) -> list[int] | ForwardOutput | None:
+    ) -> list[int] | list[list[int]] | ForwardOutput | None:
         """Join every EP layer even when this attention replica has no work.
 
         Prefill executes one sequence per model call. Replicas with shorter
         queues still enter each routed-expert round, without touching a cache.
         Token counts within a round may differ; expert dispatch carries them.
+        Speculative decode joins draft stages before one target verification
+        round, including replicas that have no local requests.
         """
 
         self.validate_distributed(plan, context)
@@ -882,6 +910,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
                                 self._empty_prefill_regions()
                             else:
                                 self._model.forward_experts_empty()
+                elif plan is not None and self.speculative_tokens:
+                    return self._speculative_decode(plan, cache, token_ids, positions)
                 elif plan is not None:
                     output_logits = self._model.forward_decode(
                         token_ids.view(plan.num_sequences, 1),
@@ -890,6 +920,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
                         cache=cache,
                     )
                 else:
+                    if self.speculative_tokens:
+                        self._model.forward_experts_empty(stage="draft")
                     self._model.forward_experts_empty()
                     output_logits = None
                 if plan is None:
@@ -910,7 +942,9 @@ class DeepSeekV4CudaRunner(CudaRunner):
             context,
             required_shape=(
                 0 if plan is None else plan.num_sequences,
-                0 if plan is None else int(plan.positions.max()) + 1,
+                0
+                if plan is None
+                else int(plan.positions.max()) + self.speculative_tokens + 1,
             ),
         )
         if shape is None:

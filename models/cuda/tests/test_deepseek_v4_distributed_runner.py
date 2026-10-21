@@ -20,6 +20,7 @@ from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.cuda.runner import CudaRunner
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.distributed import StepContext
+from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import RankGroup
 from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 
@@ -68,8 +69,48 @@ class _Model:
         self.calls.append(("decode", token_ids.tolist(), positions.tolist(), cache))
         return torch.nn.functional.one_hot(token_ids[:, -1], num_classes=32).float()
 
-    def forward_experts_empty(self):
-        self.calls.append(("empty",))
+    def forward_experts_empty(self, *, stage="target"):
+        self.calls.append(("empty",) if stage == "target" else ("empty-draft",))
+
+
+class _SpeculativeModel(_Model):
+    def forward_prefill(self, token_ids, position, *, cache):
+        logits, _ = super().forward_prefill(token_ids, position, cache=cache)
+        return logits, token_ids[..., None].expand(-1, -1, 4).float()
+
+    def prefill_dspark(self, hidden, *, cache):
+        self.calls.append(("prefill-draft-state", hidden.shape, cache))
+
+    def commit_dspark_main_block(self, hidden, positions, *, cache):
+        self.calls.append(("commit", hidden.shape, positions.tolist(), cache))
+
+    def draft(self, anchors, positions, *, cache):
+        self.calls.append(("draft", anchors.tolist(), positions.tolist(), cache))
+        return torch.tensor([[4, 5], [6, 7]])[: anchors.shape[0]]
+
+    def forward_verify(self, token_ids, positions, sequence_length, *, cache):
+        self.calls.append(
+            ("verify", token_ids.tolist(), positions.tolist(), sequence_length, cache)
+        )
+        # The first row accepts both drafts; the second rejects its first draft.
+        targets = torch.tensor([[4, 5, 9], [8, 7, 10]])[: token_ids.shape[0]]
+        return (
+            torch.nn.functional.one_hot(targets, num_classes=32).float(),
+            torch.ones((*token_ids.shape, 4)),
+        )
+
+    def clear_rejected_speculative_state(
+        self, positions, processed_counts, block_length, *, cache
+    ):
+        self.calls.append(
+            (
+                "clear",
+                positions.tolist(),
+                processed_counts.tolist(),
+                block_length,
+                cache,
+            )
+        )
 
 
 class _Cache:
@@ -204,6 +245,118 @@ def test_decode_keeps_the_replica_batch_and_cache_namespace(monkeypatch):
     assert groups.broadcasts == []
 
 
+@pytest.mark.parametrize("logprobs", [False, True])
+def test_speculative_decode_fallback_preserves_ragged_acceptance_and_state(
+    monkeypatch, logprobs
+):
+    # CP and the remaining attention replication are replicated during decode.
+    groups = _groups(Parallelism(world_size=8, ep=2, attn_dp=2, cp=2), rank=4)
+    runner = _runner(monkeypatch, groups)
+    runner.speculative_tokens = 2
+    runner._speculation = SpeculativeStats(2)
+    runner._model = _SpeculativeModel()
+    runner.cuda_graph_decode = "full"
+    runner._require_cuda_graph_executor = lambda: SimpleNamespace(
+        mode=lambda _: SimpleNamespace(check_ready=lambda: None)
+    )
+    selections = []
+    runner._select_distributed_cuda_graph = lambda *args, **kwargs: selections.append(
+        kwargs
+    )
+    sample_offsets = []
+
+    def sample(logits, plan, *, offset_delta):
+        sample_offsets.append(offset_delta)
+        return logits.argmax(dim=-1)
+
+    runner._sampler = sample
+    plan = BatchPlan(
+        [7, 8],
+        [14, 25],
+        [2, 3],
+        [0, 1, 2],
+        phase=BatchPhase.DECODE,
+        sampling_params=[SamplingParams(logprobs=logprobs, seed=1)] * 2,
+    )
+    context = _context(groups, BatchPhase.DECODE, ((0, 0), (2, 2)), plan)
+
+    output = runner.forward_distributed(plan, context)
+
+    assert selections == [{"required_shape": (2, 28)}]
+    if logprobs:
+        assert output.token_ids.tolist() == [4, 5, 9, 8]
+        assert output.token_indptr.tolist() == [0, 3, 4]
+        assert len(output.logprobs) == 4
+    else:
+        assert output == [[4, 5, 9], [8]]
+    assert [call[0] for call in runner._model.calls] == [
+        "draft",
+        "verify",
+        "commit",
+        "clear",
+    ]
+    assert runner._model.calls[1] == (
+        "verify",
+        [[2, 4, 5], [3, 6, 7]],
+        [14, 25],
+        28,
+        runner._cache,
+    )
+    assert runner._model.calls[-1] == ("clear", [14, 25], [3, 1], 3, runner._cache)
+    assert sample_offsets == [0, 32, 64]
+    assert runner.speculative_stats == {
+        "blocks": 2,
+        "drafts": 4,
+        "accepted": 2,
+        "emitted": 4,
+        "acceptance_rate": 0.5,
+    }
+    assert [call[2] for call in groups.broadcasts] == [
+        [[4, 5], [6, 7]],
+        [4, 8],
+        [5, 7],
+        [9, 10],
+    ]
+    assert {call[0] for call in groups.broadcasts} == {4}
+
+
+def test_idle_speculative_decode_joins_draft_then_target_without_cache(monkeypatch):
+    groups = _groups(Parallelism(world_size=4, ep=2, attn_dp=2))
+    runner = _runner(monkeypatch, groups)
+    runner.speculative_tokens = 2
+    context = _context(groups, BatchPhase.DECODE, ((0, 0), (2, 2)), None)
+
+    assert runner.forward_distributed(None, context) is None
+
+    assert runner._model.calls == [("empty-draft",), ("empty",)]
+    assert runner._cache.plans == runner._cache.rows == []
+    assert groups.broadcasts == []
+    assert runner._cuda_failure.synchronizations == 1
+
+
+def test_speculative_prefill_only_joins_target_expert_rounds(monkeypatch):
+    groups = _groups(Parallelism(world_size=4, ep=2, attn_dp=2))
+    runner = _runner(monkeypatch, groups)
+    runner.speculative_tokens = 2
+    runner._model = _SpeculativeModel()
+    plan = BatchPlan(
+        [7, 8], [0, 9], [2, 3, 4, 5, 6], [0, 3, 5], phase=BatchPhase.PREFILL
+    )
+    context = _context(groups, BatchPhase.PREFILL, ((2, 5), (3, 7)), plan)
+
+    assert runner.forward_distributed(plan, context) == [4, 6]
+
+    assert [call[0] for call in runner._model.calls] == [
+        "prefill",
+        "prefill-draft-state",
+        "prefill",
+        "commit",
+        "empty",
+    ]
+    assert runner._model.calls[1] == ("prefill-draft-state", (1, 3, 4), "row-0")
+    assert runner._model.calls[3] == ("commit", (1, 2, 4), [9], "row-1")
+
+
 @pytest.mark.parametrize("phase", [BatchPhase.PREFILL, BatchPhase.DECODE])
 def test_eager_decode_preserves_fixed_row_gemm_selection(monkeypatch, phase):
     groups = _groups(Parallelism(world_size=2, ep=2))
@@ -331,11 +484,6 @@ def test_managed_cache_addresses_are_validated_before_expert_rounds(
     [
         (
             Parallelism(world_size=4, ep=4),
-            {"speculative_tokens": 1},
-            "speculative_tokens=0",
-        ),
-        (
-            Parallelism(world_size=4, ep=4),
             {"tensor_parallel": TensorParallelContext()},
             "either",
         ),
@@ -356,6 +504,7 @@ def test_unsupported_distributed_preparation_fails_before_cuda(
         )
 
 
+@pytest.mark.parametrize("speculative_tokens", [0, 2])
 @pytest.mark.parametrize(
     "parallelism",
     [
@@ -367,7 +516,7 @@ def test_unsupported_distributed_preparation_fails_before_cuda(
     ],
 )
 def test_distributed_graph_policies_and_composed_meshes_pass_preparation(
-    monkeypatch, parallelism
+    monkeypatch, parallelism, speculative_tokens
 ):
     import resin_models_cuda.deepseek_v4.cuda as implementation
 
@@ -386,6 +535,7 @@ def test_distributed_graph_policies_and_composed_meshes_pass_preparation(
             max_seq_len=128,
             parallel_groups=_groups(parallelism),
             device="cuda",
+            speculative_tokens=speculative_tokens,
         )
 
 

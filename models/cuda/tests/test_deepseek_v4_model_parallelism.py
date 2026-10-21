@@ -316,3 +316,35 @@ def test_empty_model_round_only_calls_prepared_routed_experts(monkeypatch):
     )
     native.Transformer.forward_experts_empty(model)
     assert len(calls) == 2
+
+
+def test_empty_speculative_stages_visit_their_own_expert_layers(monkeypatch):
+    native = _ModelFixture._native_model(monkeypatch)
+    calls = []
+
+    def layer(name):
+        def routed(hidden, indices, weights):
+            assert hidden.shape == (0, 4)
+            assert hidden.dtype == weights.dtype == torch.bfloat16
+            assert indices.shape == weights.shape == (0, 3)
+            calls.append(name)
+            # Prepared distributed expert callbacks retain FP32 partials.
+            return hidden.float()
+
+        return SimpleNamespace(
+            ffn=SimpleNamespace(gate=SimpleNamespace(topk=3), routed=routed)
+        )
+
+    model = SimpleNamespace(
+        parallel_groups=object(),
+        embed=SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16), dim=4),
+        layers=[layer("target-0"), layer("target-1")],
+        mtp=[layer("draft-0"), layer("draft-1"), layer("draft-2")],
+    )
+    native.Transformer.forward_experts_empty(model, stage="draft")
+    native.Transformer.forward_experts_empty(model)
+    assert calls == ["draft-0", "draft-1", "draft-2", "target-0", "target-1"]
+
+    with pytest.raises(ValueError, match="stage"):
+        native.Transformer.forward_experts_empty(model, stage="invalid")
+    assert len(calls) == 5

@@ -2226,17 +2226,24 @@ class Transformer(nn.Module):
             ),
         )
 
-    def forward_experts_empty(self) -> None:
+    def forward_experts_empty(
+        self, *, stage: Literal["target", "draft"] = "target"
+    ) -> None:
         """Join one EP model round without attention, sampling, or cache writes.
 
         Other attention-DP replicas may have work while this replica is idle.
         Its experts still receive and execute their tokens in every layer.
+        Speculative decode calls the draft stages first, then the target
+        verification layers. Prefill only enters the target layers.
         """
 
         if self.parallel_groups is None:
             raise RuntimeError("empty expert rounds require explicit parallel groups")
+        if stage not in ("target", "draft"):
+            raise ValueError("expert round stage must be target or draft")
+        layers = self.layers if stage == "target" else self.mtp
         hidden = self.embed.weight.new_empty((0, self.embed.dim))
-        for layer in self.layers:
+        for layer in layers:
             ffn = layer.ffn
             indices = torch.empty(
                 (0, ffn.gate.topk), device=hidden.device, dtype=torch.int32
