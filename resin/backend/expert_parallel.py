@@ -149,7 +149,16 @@ class ExpertParallelDispatch:
             group=group.handle,
         )
         result = partial.new_zeros(hidden.shape)
-        result.index_add_(0, rows, returned)
+        if source and hidden.shape[0]:
+            # Packed rows arrive in owner-rank order. Preserve that order
+            # within each origin instead of using unordered CUDA atomic sums.
+            order = rows.argsort(stable=True)
+            result = torch.segment_reduce(
+                returned[order],
+                "sum",
+                lengths=destinations.sum(1, dtype=torch.int64),
+                unsafe=True,  # Lengths partition the packed rows by construction.
+            )
         if replication is not None and replication.size > 1 and result.numel():
             dist.broadcast(result, src=replication.source, group=replication.handle)
         return result.to(hidden.dtype)

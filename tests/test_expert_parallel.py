@@ -140,6 +140,28 @@ def _ep_worker(rank: int, rendezvous: str) -> None:
                 result = precise(hidden, indices, weights)
             assert result.dtype == hidden.dtype
             torch.testing.assert_close(result, torch.full_like(hidden, 2))
+
+        def ordered_local(hidden, indices, weights):
+            value = (2**24, 1, -(2**24), 1)[rank]
+            owned = (indices // 2 == rank).float() * weights
+            return hidden.float() * owned.sum(1, keepdim=True) * value
+
+        # FP32 arithmetic in rank order leaves one; summing the two small
+        # partials together before cancellation would leave two instead.
+        for replicas in (None, replication):
+            ordered = ExpertParallelDispatch(
+                ordered_local, num_experts=8, group=group, replication=replicas
+            )
+            source = rank if replicas is None else rank // 2
+            count = (2, 0, 3, 1)[source]
+            for live in (count, 0, count):
+                hidden = torch.ones(live, 4, dtype=torch.bfloat16)
+                indices = torch.tensor([0, 2, 4, 6]).expand(live, 4)
+                weights = torch.ones(live, 4)
+                actual = ordered(hidden, indices, weights)
+                torch.testing.assert_close(
+                    actual, torch.ones_like(hidden), rtol=0, atol=0
+                )
         for handle in handles:
             if handle != dist.GroupMember.NON_GROUP_MEMBER:
                 dist.destroy_process_group(handle)

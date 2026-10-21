@@ -110,12 +110,58 @@ def _dispatch_rank(rank, rendezvous, directory, replicated):
             progress(f"phase {phase}: dispatch returned")
             torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
             errors.append(0.0 if not count else float((actual - expected).abs().max()))
+
+        # Repeated eager combines must preserve owner-rank summation order,
+        # including a completely idle source and non-source attention copies.
+        values = (
+            (1000.75, -998.75)
+            if WORLD_SIZE == 2
+            else (2**24, 1, -(2**24), 1) + (0,) * (WORLD_SIZE - 4)
+        )
+
+        def ordered_local(hidden, indices, weights):
+            owned = (indices >= start) & (indices < stop)
+            return (
+                hidden.float() * (owned * weights).sum(1, keepdim=True) * values[rank]
+            )
+
+        ordered = ExpertParallelDispatch(
+            ordered_local,
+            num_experts=8,
+            group=groups.ep,
+            replication=groups.attn_replication if replicated else None,
+        )
+        ordered_replays = 0
+        for count in (sizes[owner], 0, sizes[owner]):
+            hidden = torch.ones(count, 16, device=device, dtype=torch.bfloat16)
+            indices = (
+                torch.arange(WORLD_SIZE, device=device, dtype=torch.int32)
+                .mul(local_experts)
+                .expand(count, WORLD_SIZE)
+            )
+            weights = torch.ones(count, WORLD_SIZE, device=device)
+            expected = torch.zeros_like(hidden, dtype=torch.float32)
+            for value in values:
+                expected += hidden.float() * value
+            for _ in range(8):
+                actual = ordered(hidden, indices, weights)
+                torch.testing.assert_close(
+                    actual, expected.to(hidden.dtype), rtol=0, atol=0
+                )
+                ordered_replays += 1
         torch.cuda.synchronize()
         progress("device synchronized")
         dist.barrier()
         progress("barrier complete")
         Path(directory, f"{rank}.json").write_text(
-            json.dumps({"rank": rank, "max_abs_errors": errors, "received_rows": calls})
+            json.dumps(
+                {
+                    "rank": rank,
+                    "max_abs_errors": errors,
+                    "received_rows": calls,
+                    "rank_ordered_replays": ordered_replays,
+                }
+            )
         )
     finally:
         groups.close()
@@ -150,6 +196,7 @@ def test_nccl_expert_dispatch_matches_reference_with_unequal_and_empty_rows(
         for rank in range(WORLD_SIZE)
     ]
     assert all(len(record["max_abs_errors"]) == 3 for record in records)
+    assert all(record["rank_ordered_replays"] == 24 for record in records)
     assert any(any(record["received_rows"]) for record in records)
 
 
