@@ -1338,6 +1338,7 @@ def _validate_parallel(
     baseline_path: str | None = None,
     graphs: bool = True,
     decode_capacity: int = 512,
+    speculative_tokens: int = 0,
 ) -> dict[str, object]:
     """Share checkpoint, routing reference and report handling across GPU sizes."""
 
@@ -1422,6 +1423,7 @@ def _validate_parallel(
                 baseline_path=baseline_path,
                 graphs=graphs,
                 decode_capacity=decode_capacity,
+                speculative_tokens=speculative_tokens,
             )
         finally:
             # Keep the baseline, failing tensors and metrics when a check raises.
@@ -1481,6 +1483,7 @@ def validate_composable(
     baseline_path: str | None = None,
     graphs: bool = True,
     decode_capacity: int = 512,
+    speculative_tokens: int = 0,
 ) -> dict[str, object]:
     """Run real FP4 models with composed meshes, graph replay and logit checks."""
 
@@ -1488,6 +1491,8 @@ def validate_composable(
         raise ValueError(
             "composable validation currently requires the Flash checkpoint"
         )
+    if not 0 <= speculative_tokens <= DSPARK_TOKENS:
+        raise ValueError(f"speculative_tokens must be in [0, {DSPARK_TOKENS}]")
     return _validate_parallel(
         model_key,
         composable=True,
@@ -1495,6 +1500,7 @@ def validate_composable(
         baseline_path=baseline_path,
         graphs=graphs,
         decode_capacity=decode_capacity,
+        speculative_tokens=speculative_tokens,
     )
 
 
@@ -1628,6 +1634,7 @@ def main(
     parallel_baseline_path: str | None = None,
     parallel_graphs: bool = True,
     parallel_decode_capacity: int = 512,
+    parallel_speculative_tokens: int = 0,
     parallel_world_size: int = 2,
     parallel_gpu_type: str = "B300",
     report_path: str | None = None,
@@ -1667,6 +1674,7 @@ def main(
             parallel_baseline_path,
             parallel_graphs,
             parallel_decode_capacity,
+            parallel_speculative_tokens,
         )
     elif mode == "bench-tp2":
         if model_spec.key != DEFAULT_MODEL_KEY:

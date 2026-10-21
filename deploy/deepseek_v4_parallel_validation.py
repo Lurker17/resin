@@ -8,6 +8,7 @@ import os
 import socket
 import tempfile
 import time
+from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
 
@@ -25,6 +26,16 @@ PREFILL_CHUNK_SIZE = 32
 CACHE_PARENTS = 64
 MAX_STEPS = 96
 PROCESS_TIMEOUT_SECONDS = 40 * 60
+SPECULATIVE_PROBE_TOKENS = 16
+
+
+def _output_lengths(output):
+    if output is None:
+        return []
+    if hasattr(output, "token_indptr"):
+        offsets = output.token_indptr
+        return [int(end - start) for start, end in zip(offsets[:-1], offsets[1:])]
+    return [len(row) for row in output]
 
 
 class _ObservedRunner:
@@ -76,10 +87,14 @@ class _ObservedRunner:
             }
         )
         if self.decode_trace is not None:
-            return self.decode_trace.step(
+            output = self.decode_trace.step(
                 plan, lambda: self.runner.forward_distributed(plan, context)
             )
-        return self.runner.forward_distributed(plan, context)
+        else:
+            output = self.runner.forward_distributed(plan, context)
+        if self.runner.speculative_tokens and context.phase == BatchPhase.DECODE:
+            self.calls[-1]["output_lengths"] = _output_lengths(output)
+        return output
 
 
 class _DecodeTrace:
@@ -195,6 +210,7 @@ def _new_runner(
     world_size=WORLD_SIZE,
     graphs=False,
     decode_capacity=CONTEXT_LENGTH,
+    speculative_tokens=0,
 ):
     from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 
@@ -217,7 +233,7 @@ def _new_runner(
         cuda_graph_decode_shapes=((1, decode_capacity), (2, CONTEXT_LENGTH))
         if graphs
         else None,
-        speculative_tokens=0,
+        speculative_tokens=speculative_tokens,
         fast_allreduce=False,
         cache_parent_capacity=CACHE_PARENTS,
         prefill_chunk_size=PREFILL_CHUNK_SIZE,
@@ -251,6 +267,7 @@ def _drain(engine, events, *, inject=None):
                     "request_id": int(event.request_id),
                     "token_id": int(event.token_id),
                     "index": int(event.index),
+                    "step": steps,
                     "logprob": None if scores is None else float(scores.logprob),
                     "top_logprobs": [] if scores is None else scores.top_logprobs,
                 }
@@ -290,17 +307,25 @@ def _teacher_logits(engine, runner, prompts):
 
 
 def _driver_workload(
-    worker, prompts, *, numerical_directory=None, decode_reference=None
+    worker,
+    prompts,
+    *,
+    numerical_directory=None,
+    decode_reference=None,
+    speculative_tokens=0,
 ):
     groups = worker.groups
     dp = groups.topology.coordinates(groups.rank)[0]
     engine = DistributedEngine(worker, **_engine_options())
     requests, events, cancellations = {}, [], []
+    sampling = _sampling()
+    probe_sampling = SamplingParams(temperature=0.0) if speculative_tokens else sampling
+    probe_tokens = SPECULATIVE_PROBE_TOKENS if speculative_tokens else 4
     try:
 
         def submit(name, prompt, limit):
             request = engine.submit(
-                prompt, max_new_tokens=limit, sampling_params=_sampling()
+                prompt, max_new_tokens=limit, sampling_params=sampling
             )
             requests[name] = (request, limit)
             return request
@@ -321,7 +346,7 @@ def _driver_workload(
         if dp == 0:
             submit("short", prompts["short"], 3)
             queued = engine.submit(
-                prompts["late"], max_new_tokens=4, sampling_params=_sampling()
+                prompts["late"], max_new_tokens=4, sampling_params=sampling
             )
             cancel("queued", queued)
         if dp == 1 or groups.topology.attn_dp == 1:
@@ -344,12 +369,14 @@ def _driver_workload(
         probes = []
         for _ in range(2):
             probe = engine.submit(
-                prompts["probe"], max_new_tokens=4, sampling_params=_sampling()
+                prompts["probe"],
+                max_new_tokens=probe_tokens,
+                sampling_params=probe_sampling,
             )
             probe_events = []
             _drain(engine, probe_events)
             probes.append({"token_ids": probe.take_result(), "events": probe_events})
-        if numerical_directory is not None:
+        if numerical_directory is not None and not speculative_tokens:
             torch.save(
                 _teacher_logits(engine, worker.runner.runner, prompts),
                 Path(numerical_directory, f"{groups.rank}.pt"),
@@ -399,6 +426,7 @@ def _run_rank(
     graphs=False,
     decode_reference=None,
     decode_capacity=CONTEXT_LENGTH,
+    speculative_tokens=0,
 ):
     parallelism = Parallelism(
         **(topology or {"world_size": WORLD_SIZE, "ep": WORLD_SIZE, "attn_dp": attn_dp})
@@ -416,6 +444,7 @@ def _run_rank(
                 groups=groups,
                 graphs=graphs,
                 decode_capacity=decode_capacity,
+                speculative_tokens=speculative_tokens,
             )
         )
         if graphs:
@@ -438,6 +467,7 @@ def _run_rank(
                 prompts,
                 numerical_directory=report_directory if topology else None,
                 decode_reference=decode_reference,
+                speculative_tokens=speculative_tokens,
             )
         else:
             worker.serve()
@@ -453,6 +483,7 @@ def _run_rank(
             "elapsed_seconds": time.perf_counter() - start,
             "weight_load": runner.weight_load,
             "cuda_graph_stats": runner.cuda_graph_stats,
+            "speculative_stats": runner.speculative_stats,
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
             "free_memory_bytes": torch.cuda.mem_get_info()[0],
             "pool_ids": runner.pool_ids,
@@ -476,18 +507,37 @@ def _run_tp_baseline_rank(
     prompts,
     world_size=WORLD_SIZE,
     numerical=False,
+    speculative_tokens=0,
+    probe_tokens=4,
 ):
     _initialize(rank, port, world_size)
-    runner = _ObservedRunner(_new_runner(rank, model_path, world_size=world_size))
+    runner = _ObservedRunner(
+        _new_runner(
+            rank,
+            model_path,
+            world_size=world_size,
+            speculative_tokens=speculative_tokens,
+        )
+    )
     engine = Engine(runner, **_engine_options())
     try:
-        with _DecodeTrace(runner) as trace:
+        with _DecodeTrace(runner) if numerical else nullcontext() as trace:
             request = engine.submit(
-                prompts["probe"], max_new_tokens=4, sampling_params=_sampling()
+                prompts["probe"],
+                max_new_tokens=probe_tokens,
+                sampling_params=(
+                    SamplingParams(temperature=0.0)
+                    if speculative_tokens
+                    else _sampling()
+                ),
             )
             events = []
             _drain(engine, events)
-        result = {"token_ids": request.take_result(), "events": events}
+        result = {
+            "token_ids": request.take_result(),
+            "events": events,
+            "speculative_stats": runner.speculative_stats,
+        }
         if numerical:
             torch.save(
                 _teacher_logits(engine, runner, prompts),
@@ -540,7 +590,9 @@ def _spawn(target, model_path, prompts, *extra, world_size=WORLD_SIZE):
         return records
 
 
-def _validate_records(records, attn_dp, vocab_size, *, topology=None, graphs=False):
+def _validate_records(
+    records, attn_dp, vocab_size, *, topology=None, graphs=False, speculative_tokens=0
+):
     drivers = [record["driver_result"] for record in records if record["driver"]]
     if len(drivers) != attn_dp:
         raise AssertionError("request Engine count does not match attention DP")
@@ -571,10 +623,12 @@ def _validate_records(records, attn_dp, vocab_size, *, topology=None, graphs=Fal
             raise AssertionError("completed/cancelled requests leaked cache parents")
         if driver["probes"][0]["token_ids"] != driver["probes"][1]["token_ids"]:
             raise AssertionError("greedy isolated replay changed after cache reuse")
-        for event in [
-            *driver["events"],
-            *(event for probe in driver["probes"] for event in probe["events"]),
-        ]:
+        scored_events = list(driver["events"])
+        if not speculative_tokens:
+            scored_events.extend(
+                event for probe in driver["probes"] for event in probe["events"]
+            )
+        for event in scored_events:
             if event["logprob"] is None or not math.isfinite(event["logprob"]):
                 raise AssertionError("full-model generation omitted finite logprobs")
         for cancellation in driver["cancellations"]:
@@ -623,6 +677,7 @@ def _validate_records(records, attn_dp, vocab_size, *, topology=None, graphs=Fal
         "checks": {
             "phases_aligned": True,
             "finite_scores": True,
+            "probe_token_only": bool(speculative_tokens),
             "cache_reclaimed": True,
             "isolated_replay_identical": True,
             "independent_request_engines": attn_dp,
@@ -771,6 +826,264 @@ def _decode_comparison(actual, expected):
     }
 
 
+def _validate_speculative_records(records, speculative_tokens):
+    """Check real variable-length acceptance, including idle replica recovery."""
+
+    accepted = 0
+    blocks = 0
+    for record in records:
+        lengths = []
+        for call in record["calls"]:
+            if call["phase"] != "decode":
+                continue
+            output_lengths = call["output_lengths"]
+            if len(output_lengths) != call["rows"] or any(
+                not 1 <= size <= speculative_tokens + 1 for size in output_lengths
+            ):
+                raise AssertionError(
+                    "speculative output rows do not match the block budget"
+                )
+            lengths.extend(output_lengths)
+        stats = record["speculative_stats"]
+        if (
+            stats["blocks"] != len(lengths)
+            or stats["drafts"] != len(lengths) * speculative_tokens
+            or stats["emitted"] != sum(lengths)
+            or stats["accepted"] != sum(size - 1 for size in lengths)
+        ):
+            raise AssertionError(
+                "speculative counters do not match verified output blocks"
+            )
+        if not record["driver"]:
+            continue
+        blocks += stats["blocks"]
+        accepted += stats["accepted"]
+        driver = record["driver_result"]
+        for events in [
+            driver["events"],
+            *(probe["events"] for probe in driver["probes"]),
+        ]:
+            by_request = {}
+            for event in events:
+                by_request.setdefault(event["request_id"], []).append(event["index"])
+                if event["logprob"] is not None and (
+                    len(event["top_logprobs"]) != 3
+                    or any(
+                        not math.isfinite(value) for _, value in event["top_logprobs"]
+                    )
+                ):
+                    raise AssertionError("speculative logprob columns are incomplete")
+            if any(
+                indices != list(range(len(indices))) for indices in by_request.values()
+            ):
+                raise AssertionError(
+                    "accepted blocks skipped or repeated a streamed token index"
+                )
+        if any(
+            len(probe["token_ids"]) != SPECULATIVE_PROBE_TOKENS
+            for probe in driver["probes"]
+        ):
+            raise AssertionError(
+                "speculative output did not honor the request token budget"
+            )
+        if any(
+            [event["token_id"] for event in probe["events"]] != probe["token_ids"]
+            for probe in driver["probes"]
+        ):
+            raise AssertionError("speculative stream omitted accepted output tokens")
+    if not blocks or not accepted:
+        raise AssertionError(
+            "speculative validation must verify blocks and accept draft tokens"
+        )
+    if len([record for record in records if record["driver"]]) > 1:
+        if not any(
+            any(call["placeholder"] for call in record["calls"][:index])
+            and not call["placeholder"]
+            for record in records
+            for index, call in enumerate(record["calls"])
+        ):
+            raise AssertionError("idle attention-DP replicas did not resume generation")
+    return {
+        "verified_blocks": blocks,
+        "accepted_draft_tokens": accepted,
+        "variable_output_rows_valid": True,
+        "stream_indices_contiguous": True,
+        "idle_replica_resumed": len([record for record in records if record["driver"]])
+        > 1,
+    }
+
+
+def _token_comparison(actual, expected):
+    differences = [
+        index
+        for index, (token, reference) in enumerate(zip(actual, expected))
+        if token != reference
+    ]
+    if len(actual) != len(expected):
+        differences.append(min(len(actual), len(expected)))
+    return {
+        "matches": not differences,
+        "first_difference": differences[0] if differences else None,
+        "token_ids": actual,
+        "reference_token_ids": expected,
+    }
+
+
+def _run_speculative_validation(
+    model_path,
+    prompts,
+    *,
+    vocab_size,
+    diagnostic_path,
+    selected,
+    catalog,
+    baseline_path,
+    graphs,
+    decode_capacity,
+    speculative_tokens,
+    world_size,
+):
+    """Validate DSpark as variable output blocks, never as one-token decode steps."""
+
+    directory = None if diagnostic_path is None else Path(diagnostic_path)
+    if directory is not None:
+        directory.mkdir(parents=True, exist_ok=True)
+    identity = {
+        "model_path": str(Path(model_path).resolve()),
+        "world_size": world_size,
+        "prompts": prompts,
+        "speculative_tokens": speculative_tokens,
+        "probe_tokens": SPECULATIVE_PROBE_TOKENS,
+        "attention_contract": "fixed-swa128-canonical-selected-capacity",
+    }
+    if baseline_path is None:
+        references = []
+        for count in (0, speculative_tokens):
+            print(
+                f"[deepseek-v4] loading eager TP{world_size} reference, DSpark K={count}",
+                flush=True,
+            )
+            references.append(
+                _spawn(
+                    _run_tp_baseline_rank,
+                    model_path,
+                    prompts,
+                    world_size,
+                    False,
+                    count,
+                    SPECULATIVE_PROBE_TOKENS,
+                    world_size=world_size,
+                )[0]
+            )
+        target, baseline = references
+    else:
+        saved = torch.load(baseline_path, weights_only=True)
+        if saved["identity"] != identity:
+            raise ValueError(
+                "reused speculative baseline must match checkpoint, GPU count, prompts, K and attention contract"
+            )
+        target, baseline = saved["target_report"], saved["report"]
+    if directory is not None:
+        torch.save(
+            {"identity": identity, "target_report": target, "report": baseline},
+            directory / "baseline.pt",
+        )
+    result = {
+        "speculative_tokens": speculative_tokens,
+        "world_size": world_size,
+        "selected_cases": selected,
+        "diagnostic_path": None if directory is None else str(directory),
+        "graphs": {
+            "prefill": "breakable" if graphs else "disabled",
+            "decode": "full" if graphs else "disabled",
+        },
+        "decode_shapes": ((1, decode_capacity), (2, CONTEXT_LENGTH)) if graphs else (),
+        "eager_tp_baseline": target,
+        "eager_dspark_baseline": baseline,
+        "baseline_comparison": _token_comparison(
+            baseline["token_ids"], target["token_ids"]
+        ),
+        "comparison_policy": (
+            "Complete isolated greedy sequences are compared with eager target and legacy DSpark references. "
+            "Token differences are numerical diagnostics across quantized layouts; functional checks require "
+            "real accepted drafts, streamed block indices, graph replay, idle/resume and cache recovery."
+        ),
+        "cases": [],
+        "status": "running",
+    }
+
+    def persist():
+        if directory is not None:
+            (directory / "report.json").write_text(json.dumps(result, indent=2))
+
+    persist()
+    for name in selected:
+        topology = catalog[name]
+        print(
+            f"[deepseek-v4] validating DSpark K={speculative_tokens}, {name}: {topology}",
+            flush=True,
+        )
+        try:
+            records = _spawn(
+                _run_rank,
+                model_path,
+                prompts,
+                topology["attn_dp"],
+                topology,
+                graphs,
+                None,
+                decode_capacity,
+                speculative_tokens,
+                world_size=world_size,
+            )
+            report = {"name": name, "ranks": records}
+            result["cases"].append(report)
+            persist()
+            report.update(
+                _validate_records(
+                    records,
+                    topology["attn_dp"],
+                    vocab_size,
+                    topology=topology,
+                    graphs=graphs,
+                    speculative_tokens=speculative_tokens,
+                )
+            )
+            report["speculative_checks"] = _validate_speculative_records(
+                records, speculative_tokens
+            )
+            report["greedy_comparisons"] = [
+                {
+                    "rank": record["rank"],
+                    "target": _token_comparison(
+                        record["driver_result"]["probes"][0]["token_ids"],
+                        target["token_ids"],
+                    ),
+                    "legacy_dspark": _token_comparison(
+                        record["driver_result"]["probes"][0]["token_ids"],
+                        baseline["token_ids"],
+                    ),
+                }
+                for record in records
+                if record["driver"]
+            ]
+            report["status"] = "passed"
+            if directory is not None:
+                (directory / f"{name}.json").write_text(json.dumps(report, indent=2))
+            persist()
+        except BaseException as error:
+            result.update(
+                status="failed",
+                failed_case=name,
+                error=f"{type(error).__name__}: {error}",
+            )
+            persist()
+            raise
+    result["status"] = "passed"
+    persist()
+    return result
+
+
 def run_composable_validation(
     model_path,
     prompts,
@@ -781,6 +1094,7 @@ def run_composable_validation(
     baseline_path=None,
     graphs=True,
     decode_capacity=CONTEXT_LENGTH,
+    speculative_tokens=0,
 ):
     """Compare composed graph layouts with an independent eager TP reference."""
 
@@ -801,6 +1115,22 @@ def run_composable_validation(
         or set(selected) - catalog.keys()
     ):
         raise ValueError(f"case_names must be unique choices from {tuple(catalog)}")
+    if type(speculative_tokens) is not int or speculative_tokens < 0:
+        raise ValueError("speculative_tokens must be a non-negative integer")
+    if speculative_tokens:
+        return _run_speculative_validation(
+            model_path,
+            prompts,
+            vocab_size=vocab_size,
+            diagnostic_path=diagnostic_path,
+            selected=selected,
+            catalog=catalog,
+            baseline_path=baseline_path,
+            graphs=graphs,
+            decode_capacity=decode_capacity,
+            speculative_tokens=speculative_tokens,
+            world_size=world_size,
+        )
     directory = None if diagnostic_path is None else Path(diagnostic_path)
     if directory is not None:
         directory.mkdir(parents=True, exist_ok=True)

@@ -1,14 +1,16 @@
 """Keep full-checkpoint numerical failures available for focused GPU retries."""
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
 from deploy import deepseek_v4_parallel_validation as validation
-from resin import BatchPhase
+from resin import BatchPhase, ForwardOutput
 
 
 def test_failed_case_persists_logits_and_reuses_baseline_for_retry(
@@ -280,3 +282,168 @@ def test_numerical_failures_allow_later_cases_but_protocol_errors_stop(
         assert report["cases"][1]["status"] == "passed"
         assert len(report["numerical_errors"]) == 1
         assert (tmp_path / f"{cases[1]}-logits.pt").exists()
+
+
+@pytest.fixture
+def speculative_record():
+    events = [
+        {
+            "request_id": 7,
+            "index": index,
+            "logprob": -0.5,
+            "top_logprobs": [(0, -0.5), (1, -1.0), (2, -2.0)],
+        }
+        for index in range(4)
+    ]
+    return {
+        "rank": 0,
+        "driver": True,
+        "calls": [
+            {"phase": "prefill", "placeholder": False, "rows": 1},
+            {"phase": "decode", "placeholder": True, "rows": 0, "output_lengths": []},
+            {"phase": "decode", "placeholder": False, "rows": 1, "output_lengths": [3]},
+            {"phase": "decode", "placeholder": False, "rows": 1, "output_lengths": [1]},
+        ],
+        "speculative_stats": {"blocks": 2, "drafts": 4, "accepted": 2, "emitted": 4},
+        "driver_result": {
+            "events": events,
+            "probes": [
+                {
+                    "token_ids": [1] * 16,
+                    "events": [
+                        {
+                            "request_id": 8,
+                            "index": index,
+                            "token_id": 1,
+                            "logprob": None,
+                            "top_logprobs": [],
+                        }
+                        for index in range(16)
+                    ],
+                },
+                {
+                    "token_ids": [1] * 16,
+                    "events": [
+                        {
+                            "request_id": 8,
+                            "index": index,
+                            "token_id": 1,
+                            "logprob": None,
+                            "top_logprobs": [],
+                        }
+                        for index in range(16)
+                    ],
+                },
+            ],
+        },
+    }
+
+
+def test_speculative_block_checks_cover_ragged_outputs_and_idle_resume(
+    speculative_record,
+):
+    other = deepcopy(speculative_record)
+    other["rank"] = 1
+    result = validation._validate_speculative_records([speculative_record, other], 2)
+    assert result["verified_blocks"] == 4
+    assert result["accepted_draft_tokens"] == 4
+    assert result["idle_replica_resumed"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("budget", "block budget"),
+        ("counters", "counters"),
+        ("indices", "streamed token index"),
+        ("scores", "logprob columns"),
+        ("no_acceptance", "accept draft tokens"),
+        ("no_resume", "did not resume"),
+    ],
+)
+def test_speculative_checks_reject_incomplete_execution(
+    speculative_record, failure, message
+):
+    records = [speculative_record]
+    if failure == "budget":
+        speculative_record["calls"][2]["output_lengths"] = [4]
+    elif failure == "counters":
+        speculative_record["speculative_stats"]["drafts"] = 3
+    elif failure == "indices":
+        speculative_record["driver_result"]["events"][2]["index"] = 1
+    elif failure == "scores":
+        speculative_record["driver_result"]["events"][0]["top_logprobs"].pop()
+    elif failure == "no_acceptance":
+        speculative_record["calls"][2]["output_lengths"] = [1]
+        speculative_record["speculative_stats"].update(accepted=0, emitted=2)
+    else:
+        speculative_record["calls"].append(speculative_record["calls"].pop(1))
+        records.append(deepcopy(speculative_record))
+    with pytest.raises(AssertionError, match=message):
+        validation._validate_speculative_records(records, 2)
+
+
+def test_speculative_output_lengths_support_zero_copy_scored_blocks():
+    output = ForwardOutput(
+        np.array([1, 2, 3, 4], np.uint32),
+        np.array([0, 3, 4], np.uint32),
+    )
+    assert validation._output_lengths(output) == [3, 1]
+    assert validation._output_lengths([[1, 2, 3], [4]]) == [3, 1]
+    assert validation._output_lengths(None) == []
+
+
+def test_speculative_validation_uses_both_references_and_rejects_other_block_size(
+    monkeypatch, tmp_path, speculative_record
+):
+    monkeypatch.setattr(validation.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(validation, "_validate_records", lambda *args, **kwargs: {})
+    target = {"token_ids": [0] * 16}
+    baseline = {"token_ids": [1] * 16}
+    spawn = Mock(side_effect=[[target], [baseline], [speculative_record]])
+    monkeypatch.setattr(validation, "_spawn", spawn)
+    case = "ep-attention-dp"
+    options = dict(
+        vocab_size=3,
+        case_names=(case,),
+        diagnostic_path=tmp_path,
+        speculative_tokens=2,
+    )
+    result = validation.run_composable_validation(
+        tmp_path / "checkpoint", {"probe": [7]}, **options
+    )
+    assert result["status"] == "passed"
+    assert not result["baseline_comparison"]["matches"]
+    assert result["cases"][0]["greedy_comparisons"][0]["legacy_dspark"]["matches"]
+    assert not result["cases"][0]["greedy_comparisons"][0]["target"]["matches"]
+    for call, count in zip(spawn.call_args_list[:2], (0, 2), strict=True):
+        assert call.args[0] is validation._run_tp_baseline_rank
+        assert call.args[4:] == (False, count, 16)
+    assert spawn.call_args.args[-1] == 2
+    saved = torch.load(tmp_path / "baseline.pt", weights_only=True)
+    assert saved["identity"]["speculative_tokens"] == 2
+    assert saved["target_report"] == target
+    assert saved["report"] == baseline
+    spawn.reset_mock()
+    with pytest.raises(ValueError, match="K and attention contract"):
+        validation.run_composable_validation(
+            tmp_path / "checkpoint",
+            {"probe": [7]},
+            **{
+                **options,
+                "speculative_tokens": 3,
+                "baseline_path": tmp_path / "baseline.pt",
+            },
+        )
+    spawn.assert_not_called()
+
+
+@pytest.mark.parametrize("count", [-1, True, 1.5])
+def test_composed_speculative_validation_requires_integer_block_size(
+    monkeypatch, count
+):
+    monkeypatch.setattr(validation.torch.cuda, "device_count", lambda: 2)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        validation.run_composable_validation(
+            "checkpoint", {"probe": [7]}, vocab_size=3, speculative_tokens=count
+        )
