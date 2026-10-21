@@ -44,11 +44,11 @@ The focused contracts are:
 Resin requires Python 3.11+ and Rust.
 
 ```bash
-uv sync
 uv run scripts/rust_build_and_types.py
 ```
 
-The build command syncs type-library sources, builds the Rust extension with
+`uv run` syncs the project dependencies automatically. The build command then
+syncs type-library sources, builds the Rust extension with
 generated stubs, then normalizes and formats those stubs. It stops if any step
 fails.
 
@@ -83,7 +83,6 @@ development dependencies first, then authenticate with Modal once if this is a
 new machine:
 
 ```bash
-uv sync
 uv run scripts/rust_build_and_types.py
 uv run modal setup
 ```
