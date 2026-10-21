@@ -298,6 +298,7 @@ def speculative_record():
     return {
         "rank": 0,
         "driver": True,
+        "null_parent_zero": True,
         "calls": [
             {"phase": "prefill", "placeholder": False, "rows": 1},
             {"phase": "decode", "placeholder": True, "rows": 0, "output_lengths": []},
@@ -350,6 +351,33 @@ def test_speculative_block_checks_cover_ragged_outputs_and_idle_resume(
     assert result["idle_replica_resumed"]
 
 
+@pytest.mark.parametrize("null_parent_zero", [True, False, None])
+def test_full_model_validation_requires_observed_zero_null_parent(
+    speculative_record, null_parent_zero
+):
+    record = speculative_record
+    record["pool_ids"] = [7]
+    if null_parent_zero is None:
+        record.pop("null_parent_zero")
+    else:
+        record["null_parent_zero"] = null_parent_zero
+    for step, call in enumerate(record["calls"]):
+        call["step"] = step
+    record["driver_result"].update(
+        outputs={"probe": {"token_ids": [1] * 16, "expected_tokens": 16}},
+        cancellations=[],
+        free_after_workload=64,
+        free_after_replay=64,
+        parent_capacity=64,
+    )
+    if null_parent_zero:
+        result = validation._validate_records([record], 1, 3)
+        assert result["checks"]["null_parent_zero"] is True
+    else:
+        with pytest.raises(AssertionError, match="zeroed null cache parent"):
+            validation._validate_records([record], 1, 3)
+
+
 @pytest.mark.parametrize(
     ("failure", "message"),
     [
@@ -397,6 +425,20 @@ def test_speculative_output_lengths_support_zero_copy_scored_blocks():
     assert validation._output_lengths(output) == [3, 1]
     assert validation._output_lengths([[1, 2, 3], [4]]) == [3, 1]
     assert validation._output_lengths(None) == []
+
+
+@pytest.mark.parametrize("column", ["logprob", "top_logprobs"])
+def test_scored_probe_replay_rejects_finite_score_changes_with_identical_tokens(
+    speculative_record, column
+):
+    event = speculative_record["driver_result"]["probes"][1]["events"][4]
+    if column == "logprob":
+        event[column] += 0.01
+    else:
+        token, score = event[column][0]
+        event[column][0] = (token, score + 0.01)
+    with pytest.raises(AssertionError, match="token scores changed after cache reuse"):
+        validation._validate_speculative_records([speculative_record], 2)
 
 
 def test_speculative_validation_uses_both_references_and_rejects_other_block_size(

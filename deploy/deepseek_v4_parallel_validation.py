@@ -314,6 +314,7 @@ def _driver_workload(
     numerical_directory=None,
     decode_reference=None,
     speculative_tokens=0,
+    exercise_padding=False,
 ):
     groups = worker.groups
     dp = groups.topology.coordinates(groups.rank)[0]
@@ -361,6 +362,10 @@ def _driver_workload(
                 submit("late", prompts["late"], 2)
 
         workload_steps = _drain(engine, events, inject=inject)
+        if exercise_padding:
+            for index in range(1 if dp == 0 else 2):
+                submit(f"padded_decode_{index}", prompts["probe"], 8)
+            workload_steps += _drain(engine, events)
         outputs = {
             name: {"token_ids": request.take_result(), "expected_tokens": limit}
             for name, (request, limit) in requests.items()
@@ -468,6 +473,7 @@ def _run_rank(
                 numerical_directory=report_directory if topology else None,
                 decode_reference=decode_reference,
                 speculative_tokens=speculative_tokens,
+                exercise_padding=graphs and parallelism.attn_dp > 1,
             )
         else:
             worker.serve()
@@ -487,6 +493,9 @@ def _run_rank(
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
             "free_memory_bytes": torch.cuda.mem_get_info()[0],
             "pool_ids": runner.pool_ids,
+            "null_parent_zero": bool(
+                torch.count_nonzero(runner._cache.storage[0]).item() == 0
+            ),
             "released_ids": runner.released,
             "calls": runner.calls,
             "driver_result": result,
@@ -678,6 +687,8 @@ def _validate_records(records, attn_dp, vocab_size, *, topology=None, graphs=Fal
     for record in records:
         if len(record["pool_ids"]) != 1:
             raise AssertionError("rank did not bind exactly one replica cache pool")
+        if record.get("null_parent_zero") is not True:
+            raise AssertionError("rank did not preserve the zeroed null cache parent")
     for driver in drivers:
         for output in driver["outputs"].values():
             ids = output["token_ids"]
@@ -723,6 +734,15 @@ def _validate_records(records, attn_dp, vocab_size, *, topology=None, graphs=Fal
         ):
             raise AssertionError("active cancellation was not exercised")
     if graphs:
+        if attn_dp > 1 and not any(
+            call["phase"] == "decode"
+            and min(rows for rows, _ in call["replica_sizes"]) > 0
+            and len({rows for rows, _ in call["replica_sizes"]}) > 1
+            for call in records[0]["calls"]
+        ):
+            raise AssertionError(
+                "graph validation did not exercise live padded decode rows"
+            )
         for record in records:
             for mode in ("prefill", "decode"):
                 stats = record["cuda_graph_stats"][mode]
@@ -748,9 +768,11 @@ def _validate_records(records, attn_dp, vocab_size, *, topology=None, graphs=Fal
             "phases_aligned": True,
             "finite_scores": True,
             "cache_reclaimed": True,
+            "null_parent_zero": True,
             "isolated_replay_identical": True,
             "independent_request_engines": attn_dp,
             "graphs_captured_and_replayed": graphs,
+            "live_padded_decode_rows": graphs and attn_dp > 1,
         },
         "ranks": records,
     }
@@ -962,6 +984,17 @@ def _validate_speculative_records(records, speculative_tokens):
             for probe in driver["probes"]
         ):
             raise AssertionError("speculative stream omitted accepted output tokens")
+        scored_probes = [
+            [
+                (event["token_id"], event["logprob"], event["top_logprobs"])
+                for event in probe["events"]
+            ]
+            for probe in driver["probes"]
+        ]
+        if scored_probes[0] != scored_probes[1]:
+            raise AssertionError(
+                "isolated speculative token scores changed after cache reuse"
+            )
     if not blocks or not accepted:
         raise AssertionError(
             "speculative validation must verify blocks and accept draft tokens"
@@ -980,6 +1013,7 @@ def _validate_speculative_records(records, speculative_tokens):
         "variable_output_rows_valid": True,
         "stream_indices_contiguous": True,
         "accepted_tokens_have_finite_scores": True,
+        "isolated_token_scores_identical": True,
         "idle_replica_resumed": len([record for record in records if record["driver"]])
         > 1,
     }
