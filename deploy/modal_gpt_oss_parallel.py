@@ -144,7 +144,10 @@ def _stream_subprocess(command, *, env, timeout):
     single_use_containers=True,
 )
 def validate_parallel(
-    graphs: bool = False, composable: bool = False, world_size: int = 2
+    graphs: bool = False,
+    composable: bool = False,
+    world_size: int = 2,
+    case_names: tuple[str, ...] | None = None,
 ):
     import torch
     from renderers import GptOssRendererConfig, create_renderer
@@ -233,6 +236,7 @@ def validate_parallel(
             graphs=graphs,
             composable=composable,
             world_size=world_size,
+            case_names=case_names,
         )
     except Exception as error:
         if path.is_file():
@@ -316,6 +320,7 @@ def main(
     gpu_type: str = "H200",
     expert_probe: bool = False,
     expert_reference_path: str = "",
+    parallel_cases: str | None = None,
 ):
     if gpu_type not in ("H200", "H100"):
         raise ValueError("gpu_type must be H200 or H100")
@@ -337,7 +342,16 @@ def main(
                 memory=16 * 1024 * world_size,
             )
         report = function.remote(
-            graphs=graphs, composable=composable, world_size=world_size
+            graphs=graphs,
+            composable=composable,
+            world_size=world_size,
+            case_names=(
+                None
+                if parallel_cases is None
+                else tuple(
+                    name.strip() for name in parallel_cases.split(",") if name.strip()
+                )
+            ),
         )
     path = Path(report_path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -868,6 +868,21 @@ def _validation_cases(world_size=2, *, composable=False):
     return cases
 
 
+def _selected_validation_cases(world_size=2, *, composable=False, case_names=None):
+    cases = _validation_cases(world_size, composable=composable)
+    if case_names is None:
+        return cases
+    catalog = {case["name"]: case for case in cases}
+    selected = tuple(case_names)
+    if (
+        not selected
+        or len(set(selected)) != len(selected)
+        or any(name not in catalog for name in selected)
+    ):
+        raise ValueError(f"case_names must be unique choices from {tuple(catalog)}")
+    return [catalog[name] for name in selected]
+
+
 def run_validation(
     model_path,
     prompts,
@@ -877,8 +892,11 @@ def run_validation(
     graphs=False,
     composable=False,
     world_size=2,
+    case_names=None,
 ):
-    configurations = _validation_cases(world_size, composable=composable)
+    configurations = _selected_validation_cases(
+        world_size, composable=composable, case_names=case_names
+    )
     graphs = graphs or composable
     if torch.cuda.device_count() != world_size:
         raise RuntimeError(
@@ -911,6 +929,7 @@ def run_validation(
         diagnostic = {
             "world_size": world_size,
             "composable": composable,
+            "selected_cases": [case["name"] for case in configurations],
             "graphs": "prefill_breakable_decode_full" if graphs else "disabled",
             "baseline": baseline,
             "cases": [],
@@ -984,6 +1003,7 @@ def run_validation(
         return {
             "world_size": world_size,
             "composable": composable,
+            "selected_cases": [case["name"] for case in configurations],
             "graphs": "prefill_breakable_decode_full" if graphs else "disabled",
             "baseline": baseline,
             "cases": cases,

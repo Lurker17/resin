@@ -10,6 +10,7 @@ from deploy.gpt_oss_parallel_validation import (
     _Capture,
     _expert_comparisons,
     _ObservedRunner,
+    _selected_validation_cases,
     _spawn,
     _validation_cases,
 )
@@ -154,6 +155,25 @@ def test_two_gpu_composable_matrix_exercises_each_attention_and_expert_pair():
         1,
         1,
     ]
+
+
+def test_selected_validation_cases_preserve_requested_order_and_default_catalog():
+    assert _selected_validation_cases(8, composable=True) == _validation_cases(
+        8, composable=True
+    )
+    cases = _selected_validation_cases(
+        8, composable=True, case_names=("all-axes", "ep2-attn-tp2")
+    )
+    assert [case["name"] for case in cases] == ["all-axes", "ep2-attn-tp2"]
+    assert cases[0]["parallelism"] == dict(
+        world_size=8, attn_dp=2, attn_tp=2, cp=2, ep=2
+    )
+
+
+@pytest.mark.parametrize("names", [(), ("unknown",), ("all-axes", "all-axes")])
+def test_selected_validation_cases_reject_empty_unknown_and_duplicate_names(names):
+    with pytest.raises(ValueError, match="unique choices"):
+        _selected_validation_cases(8, composable=True, case_names=names)
 
 
 @pytest.mark.parametrize("world_size,composable", [(4, False), (1, True), (3, True)])
