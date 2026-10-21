@@ -2,9 +2,174 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import statistics
 import time
+
+
+def prefill_plan_metadata(plan):
+    """Keep bounded host evidence that replay receives new logical cache maps."""
+
+    if plan is None:
+        return {"contexts": [], "query_lengths": [], "cache_map": None}
+    addresses = tuple(
+        (
+            int(group.group_index),
+            tuple(map(int, group.block_slab_ids)),
+            tuple(map(int, group.block_slotnums)),
+            tuple(map(int, group.block_table_start_indices)),
+        )
+        for group in plan.cache_groups
+    )
+    return {
+        "contexts": list(map(int, plan.context_lengths)),
+        "query_lengths": [
+            int(end - start)
+            for start, end in zip(plan.token_indptr[:-1], plan.token_indptr[1:])
+        ],
+        "cache_map": hashlib.sha256(repr(addresses).encode()).hexdigest()[:16],
+    }
+
+
+def validate_prefill_attention(records, *, stats_key, required_operations):
+    """Require projection replay and changed live inputs, beyond FFN capture."""
+
+    operations = set()
+    for record in records:
+        stats = record[stats_key].get("prefill_attention")
+        groups = {}
+        for name in () if stats is None else stats.get("captured_operations", ()):
+            layer, operation = name.rsplit(".", 1)
+            groups.setdefault(layer, set()).add(operation)
+        if (
+            stats is None
+            or stats.get("capture_scope") != "attention_projections"
+            or not groups
+            or any(
+                not set(required_operations).issubset(names)
+                for names in groups.values()
+            )
+            or not stats["capture_count"]
+            or not stats["replay_count"]
+            or set(stats["fallback_counts"]) - {"padding"}
+            or stats["eager_fallback_count"] != sum(stats["fallback_counts"].values())
+            or stats["poisoned"]
+        ):
+            raise AssertionError(
+                "prefill attention projections were not captured and replayed"
+            )
+        operations.update(stats["captured_operations"])
+    calls = [
+        call
+        for record in records
+        for call in record["calls"]
+        if call["phase"] == "prefill"
+        and not call["placeholder"]
+        and call["graph_replays"].get("prefill_attention", 0)
+    ]
+    contexts = sorted({value for call in calls for value in call["contexts"]})
+    lengths = sorted({value for call in calls for value in call["query_lengths"]})
+    maps = {call["cache_map"] for call in calls}
+    if min(len(contexts), len(lengths), len(maps)) < 2:
+        raise AssertionError(
+            "prefill projection replay did not vary positions, lengths and cache maps"
+        )
+    return {
+        "capture_scope": "attention_projections",
+        "captured_operations": sorted(operations),
+        "replayed_context_lengths": contexts,
+        "replayed_query_lengths": lengths,
+        "distinct_cache_maps": len(maps),
+    }
+
+
+def validate_prefill_attention_regions(runner):
+    """Compare checkpoint projections eagerly and captured on identical inputs."""
+    import torch
+
+    graphs = runner._prefill_tensor_graphs["prefill_attention"]
+    layers = tuple(
+        dict.fromkeys(region.name.rsplit(".", 1)[0] for region in graphs.regions)
+    )
+    selected = {layers[0], layers[-1]}
+    cases = [
+        (n, offset)
+        for n, offset in ((1, 3), (16, 17), (32, 31), (16, 37))
+        if n in graphs.buckets
+    ]
+    generator = torch.Generator(device=runner.device).manual_seed(4187)
+    position_limit = getattr(runner, "max_seq_len", 128)
+    records, failures = [], []
+    with torch.inference_mode(), runner._prefill_graphs():
+        for index, region in enumerate(graphs.regions):
+            if region.name.rsplit(".", 1)[0] not in selected:
+                continue
+            for tokens, offset in cases:
+                values = []
+                for layout in region.inputs:
+                    shape = (tokens, *layout.shape)
+                    if layout.dtype.is_floating_point:
+                        value = torch.randn(
+                            shape,
+                            device=runner.device,
+                            dtype=layout.dtype,
+                            generator=generator,
+                        )
+                    else:
+                        value = (
+                            torch.arange(
+                                tokens, device=runner.device, dtype=layout.dtype
+                            )
+                            + offset
+                        ) % position_limit
+                        value = (
+                            value.reshape(tokens, *(1 for _ in layout.shape))
+                            .expand(shape)
+                            .contiguous()
+                        )
+                    values.append(value)
+                # Finish operations may rotate their input in place. Neither
+                # execution may mutate the other's reference inputs.
+                with graphs.capture_context():
+                    eager = region.operation(*(value.clone() for value in values))
+                eager = eager if isinstance(eager, tuple) else (eager,)
+                expected = tuple(value.clone() for value in eager)
+                before = runner.cuda_graph_stats[graphs.mode]["replay_count"]
+                actual = graphs.invoke(index, *(value.clone() for value in values))
+                replayed = runner.cuda_graph_stats[graphs.mode]["replay_count"] > before
+                actual = actual if isinstance(actual, tuple) else (actual,)
+                exact = (
+                    replayed
+                    and len(actual) == len(expected)
+                    and all(
+                        bool(torch.isfinite(value).all())
+                        and bool(torch.isfinite(reference).all())
+                        and torch.equal(value, reference)
+                        for value, reference in zip(actual, expected, strict=True)
+                    )
+                )
+                records.append(
+                    {
+                        "operation": region.name,
+                        "tokens": tokens,
+                        "position_offset": offset,
+                        "same_bucket_exact": exact,
+                    }
+                )
+                if not exact:
+                    failures.append((region.name, tokens, offset))
+    failed = torch.tensor(bool(failures), device=runner.device, dtype=torch.int32)
+    groups = getattr(runner, "parallel_groups", None)
+    if groups is not None:
+        torch.distributed.all_reduce(
+            failed, op=torch.distributed.ReduceOp.MAX, group=groups.device_domain.handle
+        )
+    if failed.item():
+        raise AssertionError(
+            f"prefill projection eager/captured mismatch: {failures or 'another rank'}"
+        )
+    return records
 
 
 def _rank(runner) -> int:

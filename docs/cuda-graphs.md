@@ -34,10 +34,18 @@ Breakable decode permits explicit eager regions between captured regions. In
 DeepSeek's ordinary tensor-parallel decode, this keeps the token broadcast
 outside capture. Other paths currently use the same graph for both policies.
 
-Breakable prefill captures **stateless feed-forward regions** within the existing
+Breakable prefill captures **stateless tensor regions** within the existing
 model forward. Each layer calls the shared graph runner for its MLP or MoE;
 normalization and residual operations are included where the model already
-groups them with that computation. Attention planning, attention, cache writes,
+groups them with that computation. GPT-OSS additionally captures QKV projection
+and RoPE, then its attention output projection. DeepSeek captures the MLA input
+projection and Q normalization, the local query projection after CP selection,
+and inverse RoPE with the output projections. These use a shared tensor-region
+contract: row shapes and dtypes describe fixed-address inputs and outputs,
+including tuples of tensors. The ordinary forward calls the same operations
+with graph capture disabled.
+
+Attention planning, attention kernels, cache writes,
 recurrent updates, media processing, and sampling retain their existing paths.
 DeepSeek passes token IDs into its hash-routed experts. Qwen3.5 and Inkling keep
 their recurrent/convolution state outside these graphs.
@@ -73,8 +81,9 @@ tokens to 32 failed its numerical comparison. Model integrations can restrict
 padding through the private region configuration without changing the public
 policy or creating another execution path.
 
-Prefill regions share input/output buffers per token bucket and one private
-capture memory pool, separate from decode. Larger buckets are captured first.
+Prefill regions share input/output buffers per token bucket and tensor layout,
+and a private capture memory pool per mode, separate from decode. Larger buckets
+are captured first.
 Regions execute serially: a caller must consume a region's output before
 another region overwrites the shared buffer. Concurrent replay on multiple
 streams is unsupported. Each current model consumes the output into a new
@@ -85,10 +94,19 @@ attention/residual tensor or persistent state before the next region.
 `runner.cuda_graph_stats` reports capture counts, replay counts, eager fallback
 reasons, shape capacities, capture time, and allocation deltas per mode. These
 deltas are not total retained/reserved graph memory. Prefill
-includes `capture_scope="feed_forward_regions"`. Its private shape keys are
+includes `capture_scope="feed_forward_regions"`. GPT-OSS and DeepSeek also report
+`prefill_attention`, with `capture_scope="attention_projections"` and named
+`captured_operations`. Both modes use private shape keys
 `(token_bucket, one_based_region_index)`. Explicit graph-break counts describe
 eager regions inside a `CudaGraphProgram`; they do not count host/model work
-between separate feed-forward graph calls.
+between separate tensor-region graph calls. In particular, eager attention
+between projection callbacks does not increment that counter.
+
+Projection graphs capture no request metadata or page tables. They consume the
+actual local rows selected by the ordinary CP path. Expert dispatch retains its
+shared bucket across attention-DP replicas; pure projections choose their own
+local bucket, because they have no collectives across those replicas. DeepSeek
+uses exact projection buckets to preserve FP8 GEMM row geometry.
 
 Run `uv run modal run deploy/modal_cuda_graphs.py` to exercise shared-buffer
 reuse, changed inputs, padding, and replay on a Blackwell GPU. The model smoke

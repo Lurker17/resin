@@ -14,6 +14,11 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+from deploy.graph_validation import (
+    prefill_plan_metadata,
+    validate_prefill_attention,
+    validate_prefill_attention_regions,
+)
 from deploy.jit_cache import ensure_kernel_cache_dirs, install_flashinfer_hash_cache
 from resin import BatchPhase, Engine, Parallelism, SamplingParams, SchedulerConfig
 from resin.backend.distributed import DistributedEngine, DistributedWorker
@@ -234,12 +239,17 @@ class _ObservedRunner:
             "tokens": context.num_tokens,
             "replica_sizes": context.replica_sizes,
             "sequence_ids": [] if plan is None else list(map(int, plan.sequence_ids)),
+            **(
+                prefill_plan_metadata(plan)
+                if context.phase == BatchPhase.PREFILL
+                else {}
+            ),
         }
         self.calls.append(call)
         self.runner._last_graph_logits = None
         result = self.runner.forward_distributed(plan, context)
         call["graph_replays"] = {
-            mode: stats["replay_count"] - before[mode]
+            mode: stats["replay_count"] - before.get(mode, 0)
             for mode, stats in self.runner.cuda_graph_stats.items()
         }
         logits = self.runner._last_graph_logits
@@ -588,6 +598,7 @@ def _ep_rank(
         # Hooks that transfer tensors to the host are installed only after
         # capture. Every rank captures the same catalog before serving steps.
         captured = runner.capture_cuda_graphs() if graphs else runner.cuda_graph_stats
+        projection_probes = validate_prefill_attention_regions(runner) if graphs else []
         capture = _Capture(runner)
         observed = _ObservedRunner(runner, capture)
         worker = DistributedWorker(observed, groups)
@@ -612,6 +623,7 @@ def _ep_rank(
                     "released_ids": observed.released,
                     "calls": observed.calls,
                     "graphs_after_capture": captured,
+                    "prefill_attention_same_path": projection_probes,
                     "graphs_after_workload": runner.cuda_graph_stats,
                     "driver_result": result,
                 }
@@ -655,6 +667,15 @@ def _check_case(records, case, vocab_size, *, graphs=False, collect_numerical=Fa
     parallelism = Parallelism(**case["parallelism"])
     attn_dp = parallelism.attn_dp
     numerical_errors = []
+    prefill_attention = (
+        validate_prefill_attention(
+            records,
+            stats_key="graphs_after_workload",
+            required_operations=("qkv_rope", "attention_output"),
+        )
+        if graphs
+        else None
+    )
     phases = [(call["step"], call["phase"]) for call in records[0]["calls"]]
     if not phases or any(
         [(call["step"], call["phase"]) for call in record["calls"]] != phases
@@ -708,7 +729,7 @@ def _check_case(records, case, vocab_size, *, graphs=False, collect_numerical=Fa
             for mode, replays in call["graph_replays"].items()
             if replays
         }
-        if idle_modes != {"prefill", "decode"}:
+        if not {"prefill", "decode"}.issubset(idle_modes):
             raise AssertionError(
                 "idle attention-DP ranks did not replay both graph modes"
             )
@@ -773,6 +794,7 @@ def _check_case(records, case, vocab_size, *, graphs=False, collect_numerical=Fa
         "parallelism": {**case["parallelism"], "expert_tp": parallelism.expert_tp},
         "coordinated_steps": len(phases),
         "numerical_errors": numerical_errors,
+        "prefill_attention": prefill_attention,
         "ranks": records,
     }
 

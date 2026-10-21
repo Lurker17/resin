@@ -90,11 +90,18 @@ GPT-OSS uses a different CP boundary with local hidden and FFN rows; see its
 
 ## CUDA graphs and current costs
 
-The explicit-group runner uses shared graph machinery for prefill FFN regions
-and full decode. Every rank captures matching catalogs at startup. Graph
+The explicit-group runner uses shared graph machinery for prefill FFN regions,
+attention projections, and full decode. `prefill_attention` captures the input
+projection/normalization, expanded query projection, and output projection with
+inverse RoPE. Sparse attention, indexer scoring, compression and cache updates
+remain eager. Non-bucket query lengths deliberately use the `padding` fallback
+for these projection regions to preserve FP8 GEMM row arithmetic. Every rank
+captures matching catalogs at startup. Graph
 readiness is validated before the coordinator's execution vote. Replicas agree
-on common buckets before GPU work; unsupported shapes force the entire domain
-to execute eagerly. Requested decode logprobs use retained graph logits.
+on common expert/decode buckets before GPU work; unsupported shapes force the
+entire domain to execute those regions eagerly. Projection buckets are local
+to the attention-TP group and contain no cross-replica expert collectives.
+Requested decode logprobs use retained graph logits.
 
 Captured expert dispatch all-gathers a fixed token capacity across the device
 world and reduce-scatters weighted partials to their origins. Device valid-row

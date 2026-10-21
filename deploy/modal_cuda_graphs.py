@@ -12,10 +12,14 @@ from deploy.modal_image import build_modal_image
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST_PATH = "/opt/resin/validation/test_cuda_prefill_graphs.py"
+TENSOR_TEST_PATH = "/opt/resin/validation/test_cuda_tensor_graphs.py"
 image = (
     build_modal_image(ROOT)
     .uv_pip_install("pytest>=8,<9")
     .add_local_file(ROOT / "tests/test_cuda_prefill_graphs.py", TEST_PATH, copy=True)
+    .add_local_file(
+        ROOT / "tests/test_cuda_tensor_graphs.py", TENSOR_TEST_PATH, copy=True
+    )
 )
 app = modal.App("resin-cuda-graphs", image=image)
 
@@ -29,7 +33,16 @@ def validate() -> dict[str, str]:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
         raise RuntimeError("CUDA graph validation requires an available Blackwell GPU")
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-c", "/dev/null", "-q", TEST_PATH],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-c",
+            "/dev/null",
+            "-q",
+            TEST_PATH,
+            TENSOR_TEST_PATH,
+        ],
         # Use the installed Linux wheel, without development pythonpath settings.
         cwd="/tmp",
         stdout=subprocess.PIPE,

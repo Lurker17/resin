@@ -16,6 +16,11 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+from deploy.graph_validation import (
+    prefill_plan_metadata,
+    validate_prefill_attention,
+    validate_prefill_attention_regions,
+)
 from resin import BatchPhase, Engine, Parallelism, SamplingParams, SchedulerConfig
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.backend.distributed import DistributedEngine, DistributedWorker
@@ -71,6 +76,10 @@ class _ObservedRunner:
         return self.runner.forward(plan)
 
     def forward_distributed(self, plan, context):
+        before = {
+            mode: stats["replay_count"]
+            for mode, stats in self.runner.cuda_graph_stats.items()
+        }
         self.calls.append(
             {
                 "step": context.step_id,
@@ -85,6 +94,11 @@ class _ObservedRunner:
                 "contexts": []
                 if plan is None
                 else list(map(int, plan.context_lengths)),
+                **(
+                    prefill_plan_metadata(plan)
+                    if context.phase == BatchPhase.PREFILL
+                    else {}
+                ),
             }
         )
         if self.decode_trace is not None:
@@ -93,6 +107,10 @@ class _ObservedRunner:
             )
         else:
             output = self.runner.forward_distributed(plan, context)
+        self.calls[-1]["graph_replays"] = {
+            mode: stats["replay_count"] - before.get(mode, 0)
+            for mode, stats in self.runner.cuda_graph_stats.items()
+        }
         if self.runner.speculative_tokens and context.phase == BatchPhase.DECODE:
             self.calls[-1]["output_lengths"] = _output_lengths(output)
         return output
@@ -452,6 +470,7 @@ def _run_rank(
                 speculative_tokens=speculative_tokens,
             )
         )
+        projection_probes = []
         if graphs:
             if not all(layer.ffn.routed.fused for layer in runner._model.layers):
                 raise AssertionError(
@@ -461,6 +480,7 @@ def _run_rank(
                 f"[deepseek-v4 rank={rank}] capturing prefill/decode graphs", flush=True
             )
             runner.capture_cuda_graphs()
+            projection_probes = validate_prefill_attention_regions(runner)
             print(f"[deepseek-v4 rank={rank}] graph startup complete", flush=True)
         torch.cuda.synchronize()
         dist.barrier()
@@ -489,6 +509,7 @@ def _run_rank(
             "elapsed_seconds": time.perf_counter() - start,
             "weight_load": runner.weight_load,
             "cuda_graph_stats": runner.cuda_graph_stats,
+            "prefill_attention_same_path": projection_probes,
             "speculative_stats": runner.speculative_stats,
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
             "free_memory_bytes": torch.cuda.mem_get_info()[0],
@@ -673,6 +694,7 @@ def _spawn(
 
 
 def _validate_records(records, attn_dp, vocab_size, *, topology=None, graphs=False):
+    prefill_attention = None
     drivers = [record["driver_result"] for record in records if record["driver"]]
     if len(drivers) != attn_dp:
         raise AssertionError("request Engine count does not match attention DP")
@@ -734,6 +756,11 @@ def _validate_records(records, attn_dp, vocab_size, *, topology=None, graphs=Fal
         ):
             raise AssertionError("active cancellation was not exercised")
     if graphs:
+        prefill_attention = validate_prefill_attention(
+            records,
+            stats_key="cuda_graph_stats",
+            required_operations=("project", "query", "finish"),
+        )
         if attn_dp > 1 and not any(
             call["phase"] == "decode"
             and min(rows for rows, _ in call["replica_sizes"]) > 0
@@ -773,6 +800,7 @@ def _validate_records(records, attn_dp, vocab_size, *, topology=None, graphs=Fal
             "independent_request_engines": attn_dp,
             "graphs_captured_and_replayed": graphs,
             "live_padded_decode_rows": graphs and attn_dp > 1,
+            "prefill_attention": prefill_attention,
         },
         "ranks": records,
     }

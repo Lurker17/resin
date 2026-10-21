@@ -87,10 +87,13 @@ namespace, and cache pool.
 
 ## CUDA graphs and current costs
 
-The shared runner captures prefill FFN regions and full decode, including expert
-communication and sampling. All ranks capture matching catalogs before serving.
-Replicas agree on a physical bucket or collectively fall back to eager
-execution. Device valid-row scalars mask padding. Graph readiness is checked
+The shared runner captures prefill FFN regions, QKV projection with RoPE, and
+attention output projections. `prefill_attention` reports those projection
+regions separately; FA4 attention, CP gathering and KV writes remain eager.
+Full decode captures expert communication and sampling. All ranks capture
+matching catalogs before serving. Replicas agree on an expert/decode bucket or
+collectively fall back to eager execution. Projection buckets are local to the
+attention-TP group. Device valid-row scalars mask expert padding. Graph readiness is checked
 before the coordinator's execution vote. Requested logprobs use retained decode
 logits after replay.
 

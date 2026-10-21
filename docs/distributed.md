@@ -34,7 +34,8 @@ blocks, and kernel capabilities still constrain valid layouts. DeepSeek-V4
 DSpark uses the same meshes for draft and target verification, including
 empty-replica participation and captured expert exchanges.
 Both explicit-group paths provide
-captured prefill FFN regions and full decode graphs. GPT-OSS EP additionally
+captured prefill FFN and attention-projection regions, plus full decode graphs.
+GPT-OSS EP additionally
 requires a kernel advertising FP32 local expert partials so the cross-rank
 combine does not add an intermediate activation rounding step.
 `DistributedWorker` validates a declared capability set collectively before
@@ -52,10 +53,13 @@ the same graph catalog and capture shapes in the same order. The shared CUDA
 runner checks those catalogs collectively, owns capture/replay, and chooses
 common physical buckets from the logical sizes in `StepContext`.
 
-Prefill captures the FFN regions while attention executes outside those regions.
+Prefill captures FFNs in `prefill` and row-independent attention projections in
+`prefill_attention`. The latter reports `capture_scope="attention_projections"`
+and the captured operation names. Attention kernels, page-table lowering and
+request-dependent cache/state updates remain eager between these callbacks.
 Decode captures the model forward and sampling. Each step votes on graph
 eligibility and capacity across the serving domain before issuing device work.
-If any replica needs an unsupported shape, every replica uses the eager path
+If any replica needs an unsupported expert/decode shape, every replica uses the eager path
 for that step. This keeps expert collectives in the same order even when request
 queues and batch sizes differ. Graph counters expose captures, replays, and
 eager fallback reasons.
