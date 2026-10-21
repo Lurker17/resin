@@ -126,6 +126,15 @@ than falling back after CUDA may have changed persistent state. See
 [the model authoring contract](model-forward-pass.md#cuda-graphs) for cache,
 continuation, speculative decode, and real-history validation requirements.
 
+The projection implementation passes 719 local tests (65 GPU skips), all 16
+shared-runtime checks on a [B300](https://modal.com/apps/ekzhang/main/ap-uO1BoGsDsOcdWhBlbmFcvm),
+and bounded full-checkpoint workloads with 32-token chunks on two GPUs. See the
+[GPT-OSS Hopper results](gpt-oss-parallelism.md#hopper-validation) and
+[DeepSeek Blackwell results](deepseek-v4-parallelism.md#cuda-graphs-and-current-costs).
+The GPU probes compare nonzero eager and captured projections exactly, and
+exercise changing contexts, chunk sizes, page ownership, and idle replicas.
+They do not establish full-model numerical parity across quantized layouts.
+
 ## Initial measurements
 
 The September 11, 2026 validation uses the pinned checkpoints and environments

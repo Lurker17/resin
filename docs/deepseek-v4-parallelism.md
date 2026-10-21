@@ -103,6 +103,33 @@ entire domain to execute those regions eagerly. Projection buckets are local
 to the attention-TP group and contain no cross-replica expert collectives.
 Requested decode logprobs use retained graph logits.
 
+The [prefill projection run](https://modal.com/apps/ekzhang/main/ap-zDESYAjZV2OQ85FzkQ5Rri)
+passes functional checks on two B300s for EP2+attention-TP2, EP2+CP2, and
+EP2+attention-DP2, with DSpark K=5. Each rank captures 774 projection shapes.
+TP/CP ranks replay 897 regions each; the independent DP replicas replay 510
+and 1,284. All 24 first/last-layer nonzero projection probes per rank match
+eager execution exactly, including changed positions. The workloads vary live
+chunk lengths and page maps, preserve exact isolated token scores, accept real
+draft tokens, recover all cache parents, and preserve null parent zero. Only
+intentional partial-tail `padding` fallbacks occur.
+
+First-layer, 32-token medians on rank zero of the attention-TP2 layout are:
+
+| Region | Eager (µs) | Graph with staging (µs) |
+| --- | ---: | ---: |
+| MLA input projection and Q normalization | 239 | 54 |
+| Expanded query projection | 140 | 46 |
+| Inverse RoPE and output projections | 808 | 131 |
+
+These are three alternating rounds of ten calls with warm weights and the
+region compute context, not end-to-end throughput or MFU measurements. The
+runtime workload uses 32-token prefill chunks. Four-rank allocations remained
+queued and were stopped; this change has no new four-rank GPU validation.
+Quantized cross-layout greedy and logit equivalence remains unqualified.
+The report is `artifacts/deepseek-v4-prefill-attention-projections.json`, with
+durable diagnostics at `resin-deepseek-v4-profiles-v1/composable-20261021T063533Z`
+and the complete report at `/profiles/parallel-20261021T064132Z.json`.
+
 Captured expert dispatch all-gathers a fixed token capacity across the device
 world and reduce-scatters weighted partials to their origins. Device valid-row
 scalars mask padding. Every callback receives `world_size * capacity` rows,

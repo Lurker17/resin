@@ -113,6 +113,22 @@ using reserved null cache storage, without writing live request pages.
 
 ## Hopper validation
 
+The [prefill QKV graph run](https://modal.com/apps/ekzhang/main/ap-UxCximYPdg8xJM0R4gsUap)
+passes on two H200s with EP2+CP2 and EP2+attention-DP2. Each rank captures
+144 QKV/RoPE shapes. The CP ranks replay 593 regions each; the independent DP
+replicas replay 449 and 593. All first/last-layer projection probes match eager
+execution exactly on nonzero inputs at 1, 16, and 32 rows, including changed
+inputs at 16 rows. Partial tails use the intentional `padding` fallback.
+The workloads vary contexts and physical page maps, preserve finite logprobs,
+and recover all 128 cache parents after cancellation and reuse. Full-model
+comparisons pass the existing numerical limits in both layouts.
+
+The report is `artifacts/gpt-oss-prefill-qkv-graphs.json`, stored durably at
+`resin-gpt-oss-profiles/gpt-oss-composable2-20261021T063209Z.json`.
+An intermediate TP2 probe still exceeds the full-model numerical limits;
+those values vary from the earlier TP diagnostics. Exact same-bucket projection
+checks do not qualify full-model accuracy across quantized TP layouts.
+
 The completed two-H200 runs below establish eager and graph-enabled EP2 with
 attention DP one and two for the preceding implementation. The expanded
 composable implementation has real two/eight-H100 full-model graph runs.
