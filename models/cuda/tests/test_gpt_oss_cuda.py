@@ -602,6 +602,68 @@ class TestGptOssCudaNativePlan:
 
 
 class TestGptOssCudaTinyOracle:
+    def test_attention_tp_projection_requests_fp32_output_from_bf16_gemm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
+        runner.tensor_parallel = SimpleNamespace(enabled=True)
+        projection = torch.nn.Linear(4, 3, bias=True, dtype=torch.bfloat16)
+        hidden = torch.randn(2, 4, dtype=torch.bfloat16)
+        calls = []
+        original_mm = torch.mm
+
+        def mm(left, right, *, out_dtype):
+            calls.append((left.dtype, right.dtype, out_dtype))
+            # CUDA supports this output-dtype overload; emulate its arithmetic
+            # on CPU while asserting that input tensors stay BF16.
+            return original_mm(left.float(), right.float())
+
+        monkeypatch.setattr(gpt_oss_runtime.torch, "mm", mm)
+        output = runner._attention_output_projection(projection, hidden)
+        expected = torch.nn.functional.linear(
+            hidden.float(), projection.weight.float(), projection.bias.float()
+        )
+        assert calls == [(torch.bfloat16, torch.bfloat16, torch.float32)]
+        assert output.dtype == torch.float32
+        torch.testing.assert_close(output, expected)
+
+        runner.tensor_parallel = SimpleNamespace(enabled=False)
+        calls.clear()
+        torch.testing.assert_close(
+            runner._attention_output_projection(projection, hidden), projection(hidden)
+        )
+        assert calls == []
+
+    def test_attention_tp_reduces_fp32_before_casting_for_residual_norm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
+        # The BF16-only fused all-reduce cannot preserve FP32 GEMM partials.
+        runner._allreduce_workspace = object()
+        partial = torch.full((1, 2, 4), 1000.75, dtype=torch.float32)
+        residual = torch.full((1, 2, 4), 0.5, dtype=torch.bfloat16)
+        calls = []
+
+        def reduce(tensor):
+            assert tensor.dtype == torch.float32
+            calls.append("reduce")
+            return tensor + (-998.75)
+
+        def norm(tensor, weight, *, residual, eps, prenorm):
+            assert tensor.dtype == residual.dtype == torch.bfloat16
+            torch.testing.assert_close(tensor, torch.full_like(residual, 2))
+            calls.append("norm")
+            return tensor, tensor + residual
+
+        runner.tensor_parallel = SimpleNamespace(sum=reduce)
+        monkeypatch.setattr(gpt_oss_runtime, "rmsnorm", norm)
+        normalized, combined = runner._allreduce_residual_rmsnorm(
+            partial, residual, torch.ones(4, dtype=torch.bfloat16), 1e-5
+        )
+        assert calls == ["reduce", "norm"]
+        torch.testing.assert_close(normalized, torch.full_like(residual, 2))
+        torch.testing.assert_close(combined, torch.full_like(residual, 2.5))
+
     def test_flashinfer_allreduce_fuses_residual_and_rmsnorm(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

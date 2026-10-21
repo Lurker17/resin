@@ -601,7 +601,19 @@ class GptOssCudaRunner(CudaRunner):
             output = output[0]
         if output.dtype is not torch.bfloat16:
             raise TypeError("FA4 output tensor must be bfloat16")
-        return attention.o_proj(output.reshape(1, token_count, -1))
+        return self._attention_output_projection(
+            attention.o_proj, output.reshape(token_count, -1)
+        ).unsqueeze(0)
+
+    def _attention_output_projection(self, projection, hidden: Tensor) -> Tensor:
+        """Keep row-parallel GEMM partials unrounded until their TP reduction."""
+
+        if not self.tensor_parallel.enabled:
+            return projection(hidden)
+        partial = torch.mm(hidden, projection.weight.t(), out_dtype=torch.float32)
+        if projection.bias is not None:
+            partial.add_(projection.bias.float())
+        return partial
 
     def _allreduce_residual_rmsnorm(
         self,
@@ -614,9 +626,14 @@ class GptOssCudaRunner(CudaRunner):
     ) -> tuple[Tensor, Tensor]:
         if partial.numel() == 0:
             return partial, residual
-        workspace = self._allreduce_workspace if reduce else None
+        workspace = (
+            self._allreduce_workspace
+            if reduce and partial.dtype == residual.dtype
+            else None
+        )
         if workspace is None:
             reduced = self.tensor_parallel.sum(partial) if reduce else partial
+            reduced = reduced.to(residual.dtype)
             normalized, combined = rmsnorm(
                 reduced,
                 weight,
