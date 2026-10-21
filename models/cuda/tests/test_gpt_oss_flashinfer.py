@@ -228,7 +228,7 @@ class TestFlashInferMXFP4Adapter:
         fused_moe = _FakeFusedMoE()
         monkeypatch.setattr(flashinfer, "torch", torch)
         kernel = FlashInferSM90MXFP4Kernel()
-        kernel._fused_moe = fused_moe
+        monkeypatch.setattr(kernel, "_fused_moe", fused_moe, raising=False)
         return kernel, torch, fused_moe
 
     def test_capabilities_implement_the_standard_contract(self, monkeypatch) -> None:

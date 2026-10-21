@@ -1358,7 +1358,7 @@ def _verify_attention_metadata_kernel(
     ct.scatter(
         sparse_lengths,
         (batch, query),
-        (window_size + compressed_complete).astype(ct.int32),
+        ct.astype(window_size + compressed_complete, ct.int32),
         mask=tile == 0,
     )
     ct.scatter(

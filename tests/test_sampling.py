@@ -178,7 +178,9 @@ class TestSharedSampler:
 
         assert sampler(logits, plan).tolist() == [1, 1, 1]
 
-    def test_flashinfer_sampler_receives_per_row_filter_and_rng_tensors(self) -> None:
+    def test_flashinfer_sampler_receives_per_row_filter_and_rng_tensors(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         calls = {}
         sampler = FlashInferSampler.__new__(FlashInferSampler)
 
@@ -197,8 +199,8 @@ class TestSharedSampler:
                 torch.tensor([True, True]),
             )
 
-        sampler._softmax = softmax
-        sampler._sample = sample
+        monkeypatch.setattr(sampler, "_softmax", softmax, raising=False)
+        monkeypatch.setattr(sampler, "_sample", sample, raising=False)
         plan = BatchPlan(
             [10, 11],
             [1, 2],
@@ -223,15 +225,26 @@ class TestSharedSampler:
         shifted = sampler.host_inputs(plan, 3, offset_delta=64)
         assert shifted["sampling_offsets"] == (128, 160)
 
-    def test_flashinfer_sampler_rejects_invalid_or_out_of_range_samples(self) -> None:
+    def test_flashinfer_sampler_rejects_invalid_or_out_of_range_samples(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         sampler = FlashInferSampler.__new__(FlashInferSampler)
-        setattr(sampler, "torch", torch)
-        sampler._softmax = lambda logits, *, temperature: torch.softmax(
-            logits / temperature[:, None], dim=-1
+        monkeypatch.setattr(
+            sampler,
+            "_softmax",
+            lambda logits, *, temperature: torch.softmax(
+                logits / temperature[:, None], dim=-1
+            ),
+            raising=False,
         )
-        sampler._sample = lambda *args, **kwargs: (
-            torch.tensor([-1, 99, 0], dtype=torch.int32),
-            torch.tensor([False, True, True]),
+        monkeypatch.setattr(
+            sampler,
+            "_sample",
+            lambda *args, **kwargs: (
+                torch.tensor([-1, 99, 0], dtype=torch.int32),
+                torch.tensor([False, True, True]),
+            ),
+            raising=False,
         )
         tensors = SamplingTensors(
             temperatures=torch.ones(3),

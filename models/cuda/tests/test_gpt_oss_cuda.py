@@ -653,7 +653,7 @@ class TestGptOssCudaTinyOracle:
     ) -> None:
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
         # The BF16-only fused all-reduce cannot preserve FP32 GEMM partials.
-        runner._allreduce_workspace = object()
+        monkeypatch.setattr(runner, "_allreduce_workspace", object(), raising=False)
         partial = torch.full((1, 2, 4), 1000.75, dtype=torch.float32)
         residual = torch.full((1, 2, 4), 0.5, dtype=torch.bfloat16)
         calls = []
@@ -684,7 +684,12 @@ class TestGptOssCudaTinyOracle:
         import torch
 
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        runner._allreduce_workspace = SimpleNamespace(backend="trtllm")
+        monkeypatch.setattr(
+            runner,
+            "_allreduce_workspace",
+            SimpleNamespace(backend="trtllm"),
+            raising=False,
+        )
         partial = torch.randn(1, 3, 8, dtype=torch.bfloat16)
         residual = torch.randn(1, 3, 8, dtype=torch.bfloat16)
         weight = torch.randn(8, dtype=torch.bfloat16)

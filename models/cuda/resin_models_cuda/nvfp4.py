@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Literal
 
 import torch
 from torch import Tensor, nn
@@ -10,12 +11,14 @@ from torch import Tensor, nn
 from resin.backend.loading import prepare_model
 
 
-def select_nvfp4_backend(requested: str, cudnn_version: int | None) -> str:
-    if requested not in {"auto", "cudnn", "cute-dsl"}:
-        raise ValueError("nvfp4_backend must be 'auto', 'cudnn', or 'cute-dsl'")
+def select_nvfp4_backend(
+    requested: str, cudnn_version: int | None
+) -> Literal["cudnn", "cute-dsl"]:
+    if requested == "cudnn" or requested == "cute-dsl":
+        return requested
     if requested == "auto":
         return "cudnn" if (cudnn_version or 0) >= 92301 else "cute-dsl"
-    return requested
+    raise ValueError("nvfp4_backend must be 'auto', 'cudnn', or 'cute-dsl'")
 
 
 def swizzle_block_scales(scales: Tensor) -> Tensor:
@@ -81,7 +84,7 @@ class Nvfp4Linear(nn.Module):
     def __init__(
         self,
         source: Nvfp4LinearWeights,
-        backend: str,
+        backend: Literal["cudnn", "cute-dsl"],
         *,
         prepare: Callable[..., tuple[Tensor, Tensor, Tensor | None]] | None = None,
         mm: Callable[..., Tensor] | None = None,
@@ -128,7 +131,9 @@ class Nvfp4Linear(nn.Module):
         return result.reshape(shape)
 
 
-def prepare_nvfp4_modules(model: nn.Module, backend: str) -> nn.Module:
+def prepare_nvfp4_modules(
+    model: nn.Module, backend: Literal["cudnn", "cute-dsl"]
+) -> nn.Module:
     """Lower checkpoint containers; already prepared modules pass through."""
 
     return prepare_model(

@@ -315,10 +315,14 @@ def install_flashinfer_hash_cache() -> None:
                 "artifact cache root disagrees with deployment namespace"
             )
 
-    core.JitSpec.build_and_load = wrap_flashinfer_build_and_load(
-        core.JitSpec.build_and_load,
-        _KERNEL_ARTIFACT_CACHE,
-        durable_artifact_resolver=_flashinfer_durable_artifact,
+    setattr(
+        core.JitSpec,
+        "build_and_load",
+        wrap_flashinfer_build_and_load(
+            core.JitSpec.build_and_load,
+            _KERNEL_ARTIFACT_CACHE,
+            durable_artifact_resolver=_flashinfer_durable_artifact,
+        ),
     )
 
 

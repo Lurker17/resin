@@ -92,3 +92,6 @@ unresolved-import = "ignore"
 
 # nn.Module declares forward as a writable Callable; model methods specialize it.
 invalid-mutable-override = "ignore"
+
+[tool.ty.environment]
+extra-paths = [".type-libs/sources"]
