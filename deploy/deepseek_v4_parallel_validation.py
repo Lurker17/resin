@@ -808,6 +808,7 @@ def run_composable_validation(
         "model_path": str(Path(model_path).resolve()),
         "world_size": world_size,
         "prompts": prompts,
+        "attention_contract": "fixed-swa128-canonical-selected-capacity",
     }
     if baseline_path is None:
         print(
@@ -828,7 +829,7 @@ def run_composable_validation(
         saved = torch.load(baseline_path, weights_only=True)
         if saved["identity"] != identity:
             raise ValueError(
-                "reused baseline must match checkpoint, GPU count and prompts"
+                "reused baseline must match checkpoint, GPU count, prompts and attention contract"
             )
         baseline, expected = saved["report"], saved["teacher_logits"]
         decode_reference = saved.get("decode_trace")
@@ -865,6 +866,7 @@ def run_composable_validation(
             "validation. CP replicates KV/compressor state."
         ),
         "cases": reports,
+        "numerical_errors": [],
         "status": "running",
     }
 
@@ -959,18 +961,33 @@ def run_composable_validation(
                 for record in records
                 if record["driver"]
             ]
+            if any(not value["contexts_match"] for value in decode_comparisons):
+                raise AssertionError("decode did not preserve baseline token contexts")
+            report["numerical_errors"] = [
+                {
+                    "kind": "same-context model logits",
+                    "rank": comparison["rank"],
+                    "comparison": comparison,
+                }
+                for comparison in comparisons
+                if not comparison["passed"]
+            ] + [
+                {
+                    "kind": "fixed-context decode logits",
+                    "rank": decoded["rank"],
+                    "comparison": comparison,
+                }
+                for decoded in decode_comparisons
+                for comparison in decoded["comparisons"]
+                if not comparison["passed"]
+            ]
+            report["status"] = "failed" if report["numerical_errors"] else "passed"
+            result["numerical_errors"].extend(
+                {"case": name, **error} for error in report["numerical_errors"]
+            )
             if directory is not None:
                 (directory / f"{name}.json").write_text(json.dumps(report, indent=2))
             persist()
-            if not all(comparison["passed"] for comparison in comparisons):
-                raise AssertionError(
-                    f"{name}: same-context model logits exceed tolerance: {comparisons}"
-                )
-            if not all(comparison["passed"] for comparison in decode_comparisons):
-                raise AssertionError(
-                    f"{name}: fixed-context decode logits exceed tolerance: "
-                    f"{decode_comparisons}"
-                )
         except BaseException as error:
             result.update(
                 status="failed",
@@ -979,6 +996,22 @@ def run_composable_validation(
             )
             persist()
             raise
+    if result["numerical_errors"]:
+        failed = [report["name"] for report in reports if report["numerical_errors"]]
+        failures = tuple(
+            dict.fromkeys(
+                f"{error['case']}: {error['kind']} exceed tolerance"
+                for error in result["numerical_errors"]
+            )
+        )
+        result.update(
+            status="failed",
+            failed_case=failed[0],
+            failed_cases=failed,
+            error="; ".join(failures),
+        )
+        persist()
+        raise AssertionError(result["error"])
     result["status"] = "passed"
     persist()
     return result

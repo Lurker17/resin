@@ -1628,6 +1628,8 @@ def main(
     parallel_baseline_path: str | None = None,
     parallel_graphs: bool = True,
     parallel_decode_capacity: int = 512,
+    parallel_world_size: int = 2,
+    parallel_gpu_type: str = "B300",
     report_path: str | None = None,
 ) -> None:
     model_spec = _model_spec(model)
@@ -1640,6 +1642,11 @@ def main(
     elif mode == "validate-parallel":
         report = validate_parallel.remote(model_spec.key, parallel_baseline)
     elif mode == "validate-composable":
+        if parallel_world_size not in (2, 4) or parallel_gpu_type not in (
+            "B200",
+            "B300",
+        ):
+            raise ValueError("composable validation uses two/four B200 or B300 GPUs")
         case_names = (
             None
             if parallel_cases is None
@@ -1647,7 +1654,14 @@ def main(
                 name.strip() for name in parallel_cases.split(",") if name.strip()
             )
         )
-        report = validate_composable.remote(
+        function = validate_composable
+        if parallel_world_size != 2 or parallel_gpu_type != "B300":
+            function = function.with_options(
+                gpu=f"{parallel_gpu_type}:{parallel_world_size}",
+                cpu=4 * parallel_world_size,
+                memory=32 * 1024 * parallel_world_size,
+            )
+        report = function.remote(
             model_spec.key,
             case_names,
             parallel_baseline_path,

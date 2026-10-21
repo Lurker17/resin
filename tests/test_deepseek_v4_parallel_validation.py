@@ -88,6 +88,22 @@ def test_failed_case_persists_logits_and_reuses_baseline_for_retry(
         "skipped_legacy_baseline"
     )
 
+    # Old compact-window baselines describe different attention semantics.
+    # Refuse them before starting workers even if checkpoint/prompts match.
+    baseline["identity"].pop("attention_contract")
+    incompatible_path = tmp_path / "old-baseline.pt"
+    torch.save(baseline, incompatible_path)
+    spawn.reset_mock()
+    with pytest.raises(ValueError, match="attention contract"):
+        validation.run_composable_validation(
+            tmp_path / "checkpoint",
+            prompts,
+            vocab_size=3,
+            case_names=(case,),
+            baseline_path=incompatible_path,
+        )
+    spawn.assert_not_called()
+
 
 def test_decode_trace_captures_genuine_graph_output_before_engine_override():
     shape = (1, 8)
@@ -210,3 +226,57 @@ def test_decode_numerical_failure_persists_genuine_and_forced_history(
     assert spawn.call_args.args[-2] is trace
     assert spawn.call_args.args[-1] == 32
     assert report["decode_shapes"] == [[1, 32], [2, 512]]
+
+
+@pytest.mark.parametrize("protocol_error", [False, True])
+def test_numerical_failures_allow_later_cases_but_protocol_errors_stop(
+    monkeypatch, tmp_path, protocol_error
+):
+    monkeypatch.setattr(validation.torch.cuda, "device_count", lambda: 2)
+    validator = (
+        Mock(side_effect=RuntimeError("protocol failure"))
+        if protocol_error
+        else (Mock(return_value={}))
+    )
+    monkeypatch.setattr(validation, "_validate_records", validator)
+    expected = torch.ones(4, 3)
+
+    def record(logits):
+        return {
+            "rank": 0,
+            "driver": True,
+            "driver_result": {"probes": [{"token_ids": [9]}]},
+            "_teacher_logits": logits,
+        }
+
+    cases = ("attention-tp-expert-tp", "ep-context")
+    spawn = Mock(
+        side_effect=[
+            [{"token_ids": [9], "_teacher_logits": expected}],
+            [record(expected * 2)],
+            [record(expected.clone())],
+        ]
+    )
+    monkeypatch.setattr(validation, "_spawn", spawn)
+    with pytest.raises(
+        RuntimeError if protocol_error else AssertionError,
+        match="protocol failure" if protocol_error else "same-context model logits",
+    ):
+        validation.run_composable_validation(
+            tmp_path / "checkpoint",
+            {"probe": [7]},
+            vocab_size=3,
+            diagnostic_path=tmp_path,
+            case_names=cases,
+        )
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["failed_case"] == cases[0]
+    assert spawn.call_count == (2 if protocol_error else 3)
+    assert len(report["cases"]) == (1 if protocol_error else 2)
+    if not protocol_error:
+        assert report["failed_cases"] == [cases[0]]
+        assert report["cases"][0]["status"] == "failed"
+        assert report["cases"][1]["status"] == "passed"
+        assert len(report["numerical_errors"]) == 1
+        assert (tmp_path / f"{cases[1]}-logits.pt").exists()
