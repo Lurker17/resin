@@ -174,6 +174,7 @@ def page_group_plan_inputs(
     *,
     label: str,
     names=_SLAB_NAMES,
+    padding_ids: Callable[[int], int] = lambda _index: 0,
 ) -> dict[str, object]:
     inputs = {}
     for index, (target, source) in enumerate(zip(groups, plan.groups, strict=True)):
@@ -181,6 +182,9 @@ def page_group_plan_inputs(
         if plan.rows > shape[0]:
             raise ValueError(f"{label} cache batch exceeds CUDA graph capacity")
         ids, slots = np.zeros(shape, dtype=np.uint32), np.zeros(shape, dtype=np.uint32)
+        # Padded requests may still write dummy tokens during graph replay.
+        # Use capture's scratch storage without making absent live history valid.
+        ids[plan.rows :] = padding_ids(index)
         for row in range(plan.rows):
             row_ids, row_slots = source.block_slabs(row), source.block_slots(row)
             if len(row_ids) > shape[1]:
@@ -238,6 +242,7 @@ class GraphPageTableArena:
             plan,
             label=self.graph_label,
             names=self.graph_input_names,
+            padding_ids=self._graph_padding_id,
         )
 
 
