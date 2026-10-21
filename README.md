@@ -39,6 +39,7 @@ The focused contracts are:
 - [GPT-OSS runner status](docs/gpt-oss-itl.md)
 - [persistent kernel artifacts](docs/kernel-cache.md)
 - [model recipe and streaming parser boundary](crates/resin-recipe/README.md)
+- [recipe differential fuzzing](tests/recipe_fuzz/README.md)
 
 ## Install for development
 

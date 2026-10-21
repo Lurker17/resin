@@ -29,6 +29,8 @@ deployment = [
   "transformers>=5.14.1",
 ]
 dev = [
+  "hypothesis>=6.140,<7",
+  "tml-renderers==0.2.0",
   "resin-models-torch",
   "resin-models-cuda",
   "maturin>=1.9,<2",
