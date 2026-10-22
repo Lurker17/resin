@@ -130,17 +130,18 @@ The report is `artifacts/deepseek-v4-prefill-attention-projections.json`, with
 durable diagnostics at `resin-deepseek-v4-profiles-v1/composable-20261021T063533Z`
 and the complete report at `/profiles/parallel-20261021T064132Z.json`.
 
-Captured expert dispatch all-gathers a fixed token capacity across the device
-world and reduce-scatters weighted partials to their origins. Device valid-row
-scalars mask padding. Every callback receives `world_size * capacity` rows,
-including foreign routes. Each attention copy dispatches its own origin, even
-when another copy has identical hidden rows. Eager dispatch packs selected
-owners and all their expert-TP lanes, reading split counts on the host.
+Captured expert dispatch uses GPU-driven sparse NVLink all-to-all/combine.
+Device valid-row scalars keep graph padding local, and inactive global expert
+IDs prevent unused receive slots from selecting expert GEMMs. Static receive
+storage remains `world_size * capacity`, while actual payload copies follow only
+the selected expert owners and their expert-TP lanes. MLA reconstructs CP query
+outputs before FFN, allowing one origin to dispatch for the entire attention-DP
+replica and broadcast its completed result. Eager dispatch uses variable-size
+NCCL all-to-all. See [transport limits](distributed.md) for NVLink-domain bounds;
+RDMA transport and communication overlap remain separate work.
 
-This dense transport is a correctness prototype. It adds communication,
-padding, scratch storage, and duplicated expert work; sparse graph-safe routing
-and communication overlap remain separate work. The DeepSeek adapter retains
-its existing FP4 kernel and arithmetic, so shared transport validation does not
+The DeepSeek adapter retains its existing FP4 kernel and arithmetic, so shared
+transport validation does not
 establish DeepSeek-specific numerical correctness.
 
 Sparse MLA metadata follows FlashInfer's fixed 128-column SWA prefix. Short

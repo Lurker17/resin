@@ -24,7 +24,9 @@ from resin.backend.cuda.graphs import (
     resolve_decode_graph_shapes,
 )
 from resin.backend.cuda.runner import CudaRunner, resolve_kv_cache_dtype
+from resin.backend.expert_parallel import ExpertParallelDispatch
 from resin.backend.resources import CachePoolBinding
+from resin.backend.topology import RankGroup
 
 
 # Empty shape catalogs must never invoke their builder.
@@ -188,6 +190,59 @@ class _DecodeOptions(TypedDict):
 
 
 class TestCudaGraph:
+    @pytest.mark.parametrize("allocated", [False, True])
+    def test_expert_workspace_cleanup_is_collective_once_and_only_if_allocated(
+        self, monkeypatch, allocated
+    ):
+        from torch import nn
+
+        events = []
+        group_closed = False
+
+        class Workspace:
+            def __del__(self):
+                events.append("unmap")
+
+        def barrier(*, group):
+            assert not group_closed, "cleanup reused a destroyed process group"
+            events.append("barrier")
+
+        model = nn.ModuleList([nn.Module(), nn.Module()])
+        dispatchers = [
+            ExpertParallelDispatch(
+                lambda hidden, indices, weights: hidden,
+                num_experts=2,
+                group=RankGroup((0, 1), object(), 0),
+            )
+            for _ in model
+        ]
+        for module, dispatch in zip(model, dispatchers, strict=True):
+            setattr(module, "dispatch", dispatch)
+        if allocated:
+            # A later layer owns storage even though the first layer is empty.
+            dispatchers[-1]._transports["test"] = Workspace()
+        monkeypatch.setattr(
+            runner_runtime.torch.cuda,
+            "synchronize",
+            lambda device: events.append("sync"),
+        )
+        runner = CudaRunner.__new__(CudaRunner)
+        runner.device = runner_runtime.torch.device("cuda:0")
+        runner._cuda_graph_executor = None
+        runner._prefill_buffers = {}
+        runner._expert_graph_model = model
+        runner._expert_graph_groups = SimpleNamespace(
+            distributed=SimpleNamespace(barrier=barrier),
+            domain=SimpleNamespace(handle=object()),
+        )
+
+        runner.close_cuda_graphs()
+        group_closed = True
+        runner.close_cuda_graphs()
+
+        assert events == (["sync", "barrier", "unmap"] if allocated else [])
+        assert all(not dispatch._transports for dispatch in dispatchers)
+
     def test_cuda_runner_owns_device_precision_sampler_and_cache_binding(
         self, monkeypatch
     ) -> None:
@@ -648,6 +703,8 @@ class TestCudaGraph:
         runner = CudaRunner.__new__(CudaRunner)
         runner._cuda_graph_executor = executor
         runner._prefill_buffers = {"retained": object()}
+        runner._expert_graph_model = None
+        runner._expert_graph_groups = None
 
         runner.close_cuda_graphs()
         runner.close_cuda_graphs()

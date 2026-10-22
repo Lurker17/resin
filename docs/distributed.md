@@ -71,33 +71,55 @@ destroying process groups. This waits for device work and releases captured
 NCCL references; keeping graphs alive during group destruction can hang shutdown.
 
 `ExpertParallelDispatch` has two transports behind the same local expert
-callback. With explicit `groups=`, every attention rank is an independent token
-origin. Eager execution sends each selected row to every expert-TP lane of its
-expert owner, reading split counts on the host. Captured execution all-gathers a
-fixed token capacity per origin across the device world, executes local experts,
-and reduce-scatters their weighted partials back to the source. Routing IDs and
-a device valid-row scalar determine active assignments without host reads or
-dynamic shapes. Returned rows are already complete across EP and expert TP;
+callback. Eager execution sends each selected row to every expert-TP lane of its
+expert owner with variable-size NCCL all-to-all, reading split counts on the host.
+CUDA graphs use FlashInfer's GPU-driven sparse dispatch/combine over a shared
+NVLink workspace. Only selected destination ranks receive token payloads; counts
+and routes stay on the GPU. Static receive storage has `world_size * capacity`
+slots, but unused slots carry the inactive expert sentinel and execute no expert
+GEMMs. Padded source rows stay local with inactive routes and zero weights.
+Returned rows are already complete across EP and expert TP;
 the model must not apply another attention-TP reduction to them. GPT-OSS retains
 FP32 partials through the combine. Sampling broadcasts use
 `groups.device_replica`, covering every rank executing one logical request
 replica. The older `group=` dispatcher API retains its optional single-source
-attention-replication behavior.
+attention-replication behavior. GPT-OSS dispatches one origin per attention TP and
+replication group, preserving distinct CP prefill segments. DeepSeek's MLA gathers
+CP outputs before FFN, so it dispatches one origin per complete attention replica.
+The combined result is broadcast back to the matching input copies.
 
 Eager combine groups returned partials by their origin while preserving owner
 rank order, then reduces each segment in that order. This avoids unordered CUDA
 atomic additions changing repeated greedy outputs. Both transports preserve the
 local callback's partial dtype until the final cast to the hidden-state dtype.
 
-This dense graph transport is a correctness prototype. Every expert owner
-receives `world_size * capacity` rows, including padding and foreign routes.
-It adds bandwidth, scratch memory, and padded kernel work; capture does not
-establish efficient wide-EP dispatch or communication overlap. Attention copies
-currently dispatch their own origins even when those rows are identical. This
-preserves independent meshes but duplicates expert work for replicated attention
-and attention TP.
+The sparse graph backend supports at most 64 physical ranks in one NVLink domain.
+FlashInfer's `SymmDeviceMemory` exchanges CUDA allocations cooperatively with Unix
+sockets, without `SYS_PTRACE`, or uses MNNVL fabric handles when available.
+Without MNNVL fabric, all ranks must share one host.
+Cross-host InfiniBand/RDMA graphs are unsupported and fail explicitly;
+eager NCCL remains available. More than 22 distinct transport routes use multiple
+rank-partitioned sparse passes. These limits describe the primitive, not an EP64
+or cross-node performance qualification. Static receive storage and routing work
+still scale with world size; communication/computation overlap is separate work.
 The model and kernel adapters remain responsible for capture-safe local expert
-execution and their own weight layouts.
+execution and their own weight layouts. Kernel token limits apply to the entire
+static receive shape, including inactive slots. Workspaces are shared across
+layers and released after `close_cuda_graphs()` synchronizes all ranks, before
+group teardown.
+
+Real H100 validation on 2026-10-21 covers four-GPU eager/graph transport with
+unequal and empty origins, changed routes and valid-row scalars on replay,
+attention replication, independent attention TP, attention DP, CP and expert TP.
+A forced two-partition case checks actual multi-pass dispatch/combine arithmetic.
+The [eight-H100 all-axes run](https://modal.com/apps/ekzhang/main/ap-mAC3PAVTWVWPU38FUCZMeF)
+also passes EP2/expert-TP4 with attention-DP2, CP2 and attention-TP2 together.
+Every graph comparison is exact against independent arithmetic. Device counters
+in the fully active EP4 fixture record 30 inter-GPU token copies versus the former
+dense transport's 60; deduplicated attention replication reduces that fixture to
+10. Idle replay transfers zero token payloads. Corresponding logical payloads
+are 3,600/1,200 versus 7,200 bytes, excluding synchronization and protocol traffic.
+These are transport checks, not full-model throughput or MFU measurements.
 
 Idle replicas replay the same expert collectives. Empty prefill replays FFN
 regions without attention. Empty decode replays padded model rows using reserved

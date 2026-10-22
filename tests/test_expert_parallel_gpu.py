@@ -81,9 +81,13 @@ def _dispatch_rank(rank, rendezvous, directory, replicated):
         )
         owner = groups.topology.coordinates(rank)[0]
         sizes = (
-            ((3,) if WORLD_SIZE == 2 else (0, 3))
+            (
+                (3,)
+                if WORLD_SIZE == 2
+                else tuple((0, 3)[i % 2] for i in range(WORLD_SIZE // 2))
+            )
             if replicated
-            else (0, 5, 1, 3)[:WORLD_SIZE]
+            else tuple((0, 5, 1, 3)[i % 4] for i in range(WORLD_SIZE))
         )
         errors = []
         for phase, count in enumerate((sizes[owner], 0, sizes[owner])):
@@ -201,8 +205,15 @@ def test_nccl_expert_dispatch_matches_reference_with_unequal_and_empty_rows(
     assert any(any(record["received_rows"]) for record in records)
 
 
-def _graph_dispatch_rank(rank, rendezvous, directory, replicated):
+def _graph_dispatch_rank(
+    rank, rendezvous, directory, replicated, layout=None, route_limit=None
+):
     from resin.backend.expert_parallel import ExpertParallelDispatch
+
+    if route_limit is not None:
+        import resin.backend.cuda.expert_parallel as transport
+
+        transport._MAX_DESTINATIONS_PER_PASS = route_limit
 
     faulthandler.dump_traceback_later(30, repeat=True)
 
@@ -226,37 +237,50 @@ def _graph_dispatch_rank(rank, rendezvous, directory, replicated):
     groups = ParallelGroups.create(
         Parallelism(
             world_size=WORLD_SIZE,
-            ep=WORLD_SIZE,
-            attn_dp=WORLD_SIZE // 2 if replicated else WORLD_SIZE,
+            **(
+                layout
+                or {
+                    "ep": WORLD_SIZE,
+                    "attn_dp": WORLD_SIZE // 2 if replicated else WORLD_SIZE,
+                }
+            ),
         )
     )
     progress("groups ready")
     graph = None
     try:
         capacity, width, top_k = 5, 16, 3
-        local_experts = 8 // WORLD_SIZE
+        local_experts = 8 // groups.ep.size
         start = local_experts * groups.ep.local_rank
         stop = start + local_experts
         coefficients = torch.arange(1, 9, device=device, dtype=torch.float32)
         # Distinct owners must retain these FP32 partials until combination.
         coefficients[0], coefficients[4] = 1000.75, -998.75
+        inspected = []
 
         def local(hidden, indices, weights):
+            inspected.append((hidden, indices))
             owned = (indices >= start) & (indices < stop)
-            factors = coefficients[indices.long()] * weights * owned
-            return hidden.float() * factors.sum(1, keepdim=True)
+            factors = coefficients[indices.long().clamp_max(7)] * weights * owned
+            return hidden.float() * factors.sum(1, keepdim=True) / groups.expert_tp.size
 
         dispatch = ExpertParallelDispatch(
             local,
             num_experts=8,
-            group=groups.ep,
-            replication=groups.attn_replication if replicated else None,
+            groups=groups if layout else None,
+            group=groups.ep if not layout else None,
+            replication=(groups.attn_tp, groups.attn_replication)
+            if layout
+            else groups.attn_replication
+            if replicated
+            else None,
         )
         hidden = torch.empty(capacity, width, device=device, dtype=torch.bfloat16)
         indices = torch.empty(capacity, top_k, device=device, dtype=torch.int32)
         weights = torch.empty(capacity, top_k, device=device, dtype=torch.float32)
         valid_rows = torch.empty((), device=device, dtype=torch.int32)
-        owner = groups.topology.coordinates(rank)[0]
+        dp_rank, cp_rank, _, _ = groups.topology.coordinates(rank)
+        owner = dp_rank * groups.cp.size + cp_rank
 
         def stage(phase):
             hidden.fill_(1)
@@ -286,6 +310,18 @@ def _graph_dispatch_rank(rank, rendezvous, directory, replicated):
             valid_rows.fill_(count)
 
         stage(0)
+        foreign_device = (
+            (rank + 1) % WORLD_SIZE if layout is None and not replicated else rank
+        )
+
+        def run_dispatch():
+            # Device-explicit runners must work even when their caller has a
+            # different current device. This covers first allocation and capture.
+            with torch.cuda.device(foreign_device):
+                output = dispatch(hidden, indices, weights)
+                assert torch.cuda.current_device() == foreign_device
+                return output
+
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
         with (
@@ -294,7 +330,7 @@ def _graph_dispatch_rank(rank, rendezvous, directory, replicated):
         ):
             for warmup in range(3):
                 progress(f"warmup {warmup}: launch")
-                dispatch(hidden, indices, weights)
+                run_dispatch()
                 progress(f"warmup {warmup}: enqueued")
         progress("warmup: synchronizing")
         stream.synchronize()
@@ -307,10 +343,23 @@ def _graph_dispatch_rank(rank, rendezvous, directory, replicated):
             dispatch.fixed_capacity(capacity, valid_rows=valid_rows),
         ):
             progress("capture: dispatch")
-            actual = dispatch(hidden, indices, weights)
+            actual = run_dispatch()
             progress("capture: dispatch enqueued")
         progress("capture: complete")
-        errors = []
+        errors, network_rows = [], []
+        from flashinfer.comm.trtllm_moe_alltoall import get_moe_alltoall_module
+
+        transport = next(iter(dispatch._transports.values()))
+        assert transport.workspace.device == hidden.device
+        assert all(key[-1] == hidden.device for key in dispatch._transports)
+        names, offsets = get_moe_alltoall_module().moe_a2a_get_metainfo_index_pairs()
+        metadata = dict(zip(names, offsets, strict=True))
+        offset = int(
+            transport.metainfo[int(metadata["MOE_A2A_SEND_COUNTERS_OFFSET_INDEX"])]
+        )
+        send_counts = transport.workspace[rank, offset : offset + 4 * WORLD_SIZE].view(
+            torch.int32
+        )
         for phase in (0, 1, 2, 3):
             progress(f"replay {phase}: staging")
             stage(phase)
@@ -325,6 +374,29 @@ def _graph_dispatch_rank(rank, rendezvous, directory, replicated):
                 (torch.arange(capacity, device=device) >= valid_rows)[:, None], 0
             )
             torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+            received_hidden, received_indices = inspected[-1]
+            padding = (received_hidden == 0).all(dim=1)
+            assert torch.all(received_indices[padding] == 8), (
+                "padding must select no expert GEMM"
+            )
+            # Count actual GPU-side copies, independently of the static receive
+            # allocation. Padding and redundant attention copies must stay local;
+            # a routed row is sent once to each selected physical expert owner.
+            counts = [0] * WORLD_SIZE
+            source = all(copy.local_rank == 0 for copy in dispatch.replication)
+            for row, expert_ids in enumerate(indices.cpu().tolist()):
+                destinations = {rank}
+                if source and row < int(valid_rows):
+                    destinations = {
+                        (expert // local_experts) * groups.expert_tp.size + lane
+                        for expert in expert_ids
+                        for lane in range(groups.expert_tp.size)
+                    }
+                for destination in destinations:
+                    counts[destination] += 1
+            if route_limit is None:
+                assert send_counts.cpu().tolist() == counts
+                network_rows.append(sum(counts) - counts[rank])
             progress(f"replay {phase}: assertion passed")
             errors.append(float((actual.float() - expected.float()).abs().max()))
         progress("replays: synchronizing")
@@ -333,7 +405,20 @@ def _graph_dispatch_rank(rank, rendezvous, directory, replicated):
         dist.barrier()
         progress("replays: barrier complete")
         Path(directory, f"{rank}.json").write_text(
-            json.dumps({"rank": rank, "replays": 4, "max_abs_errors": errors})
+            json.dumps(
+                {
+                    "rank": rank,
+                    "replays": 4,
+                    "max_abs_errors": errors,
+                    "network_rows": network_rows,
+                    "network_payload_bytes": [
+                        count * (width * 6 + top_k * 8) for count in network_rows
+                    ],
+                    "dense_payload_bytes": capacity
+                    * (WORLD_SIZE - 1)
+                    * (width * 6 + top_k * 8),
+                }
+            )
         )
     finally:
         if graph is not None:
@@ -351,11 +436,17 @@ def _graph_dispatch_rank(rank, rendezvous, directory, replicated):
 
 @pytest.mark.parametrize("replicated", [False, True])
 def test_nccl_expert_dispatch_cuda_graph_replays_routes_and_idle_rows(
-    tmp_path, replicated
+    tmp_path, replicated, layout=None, route_limit=None
 ):
     context = mp.spawn(
         _graph_dispatch_rank,
-        args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path), replicated),
+        args=(
+            f"file://{tmp_path / 'rendezvous'}",
+            str(tmp_path),
+            replicated,
+            layout,
+            route_limit,
+        ),
         nprocs=WORLD_SIZE,
         join=False,
     )
@@ -376,3 +467,52 @@ def test_nccl_expert_dispatch_cuda_graph_replays_routes_and_idle_rows(
     ]
     assert all(record["replays"] == 4 for record in records)
     assert all(record["max_abs_errors"] == [0.0] * 4 for record in records)
+    assert all(
+        not record["network_rows"] or record["network_rows"][1] == 0
+        for record in records
+    )
+    print(
+        "[sparse-expert-payload] "
+        + json.dumps({"layout": layout, "replicated": replicated, "ranks": records})
+    )
+
+
+@pytest.mark.skipif(
+    WORLD_SIZE not in (2, 4, 8), reason="composition checks use two/four/eight GPUs"
+)
+@pytest.mark.parametrize(
+    "layout",
+    (
+        [
+            {"ep": 2, "attn_dp": 2, "attn_tp": 2},
+            {"ep": 1, "attn_dp": 2, "attn_tp": 2},
+            {"ep": 2, "cp": 2, "attn_tp": 2},
+            {"ep": 2, "attn_tp": 2},
+        ]
+        if WORLD_SIZE == 4
+        else [{"ep": 2, "attn_dp": 2, "cp": 2, "attn_tp": 2}]
+        if WORLD_SIZE == 8
+        else [{"ep": 1, "attn_dp": 2}, {"ep": 2, "attn_tp": 2}, {"ep": 2, "cp": 2}]
+    ),
+)
+def test_sparse_expert_graph_composes_attention_mesh_and_expert_tp(tmp_path, layout):
+    test_nccl_expert_dispatch_cuda_graph_replays_routes_and_idle_rows(
+        tmp_path, False, layout
+    )
+
+
+@pytest.mark.skipif(
+    WORLD_SIZE not in (2, 4, 8),
+    reason="forced multi-pass check uses two/four/eight GPUs",
+)
+def test_sparse_expert_graph_rank_partitioned_multipass(tmp_path):
+    layout = (
+        {"ep": 1, "attn_dp": 2}
+        if WORLD_SIZE == 2
+        else {"ep": 2, "attn_dp": 2, "attn_tp": 2}
+        if WORLD_SIZE == 4
+        else {"ep": 2, "attn_dp": 2, "cp": 2, "attn_tp": 2}
+    )
+    test_nccl_expert_dispatch_cuda_graph_replays_routes_and_idle_rows(
+        tmp_path, False, layout, route_limit=1 if WORLD_SIZE == 2 else 2
+    )

@@ -217,6 +217,12 @@ def kernel_expert_factory(
                     self.forward_local,
                     num_experts=args.num_local_experts,
                     groups=parallel_groups,
+                    # CP prefill rows differ; head shards and attention copies
+                    # share the same complete FFN input rows.
+                    replication=(
+                        parallel_groups.attn_tp,
+                        parallel_groups.attn_replication,
+                    ),
                 )
                 if parallel_groups is not None
                 else None

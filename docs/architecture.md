@@ -139,11 +139,11 @@ borrowed NumPy columns.
 
 - one synchronous batch per Engine step;
 - no prefill/decode disaggregation;
-- dense graph-safe expert dispatch and duplicated attention-origin work remain
-  correctness prototypes; sparse routing and communication overlap are pending;
+- sparse graph-safe expert dispatch requires a shared NVLink domain and retains
+  static receive storage; RDMA graph transport and communication overlap are pending;
 - model dimensions, quantization blocks, and kernel capabilities constrain layouts;
-- the preceding two-H200 EP2/attention-DP eager and graph checks passed; expanded
-  composable GPU validation and DeepSeek-specific Blackwell validation are pending;
+- sparse transport passes composed meshes on up to eight H100s; DeepSeek-specific
+  Blackwell validation of the new transport is pending;
 - no multi-node serving;
 - model runtimes implement device collectives; the native scheduler owns local
   request and page lifetimes.

@@ -58,6 +58,9 @@ class RoutedExperts(nn.Module):
                 self.local,
                 num_experts=self.num_experts,
                 groups=groups,
+                # MLA gathers CP query outputs before FFN, so these rows are
+                # identical across every rank of one attention-DP replica.
+                replication=groups.device_replica,
             )
             if groups is not None
             else None

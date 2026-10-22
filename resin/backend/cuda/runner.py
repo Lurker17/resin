@@ -24,7 +24,11 @@ from resin.backend.cuda.sampling import (
     FlashInferSampler,
     SamplingTensors,
 )
-from resin.backend.expert_parallel import fixed_expert_capacity
+from resin.backend.expert_parallel import (
+    ExpertParallelDispatch,
+    close_expert_transports,
+    fixed_expert_capacity,
+)
 from resin.backend.resources import CachePoolBinding
 from resin.backend.topology import ParallelismCapabilities
 from resin.protocols import Runner
@@ -451,6 +455,22 @@ class CudaRunner(Runner):
         self._prefill_buffers.clear()
         for graphs in getattr(self, "_prefill_tensor_graphs", {}).values():
             graphs.buffers.clear()
+        if (
+            self._expert_graph_model is not None
+            and self._expert_graph_groups is not None
+            and any(
+                isinstance(value, ExpertParallelDispatch) and value._transports
+                for module in self._expert_graph_model.modules()
+                for value in vars(module).values()
+            )
+        ):
+            # Every peer must finish reading shared expert buffers before any
+            # rank unmaps them, including when a model is reloaded in-process.
+            torch.cuda.synchronize(self.device)
+            self._expert_graph_groups.distributed.barrier(
+                group=self._expert_graph_groups.domain.handle
+            )
+            close_expert_transports(self._expert_graph_model)
 
     def capture_cuda_graph(self, mode: str, shape: GraphShape) -> CudaGraphStats:
         """Capture one mode shape while honoring model-state hooks."""

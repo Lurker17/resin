@@ -262,6 +262,7 @@ def test_checkpoint_prepares_independent_attention_ep_and_expert_tp_shards(
     )
     groups = SimpleNamespace(
         attn_tp=RankGroup((0, 1), object(), 0),
+        attn_replication=RankGroup((0,), object(), 0),
         ep=RankGroup((1, 3), object(), 1),
         expert_tp=RankGroup((2, 3), object(), 1),
     )
@@ -269,8 +270,9 @@ def test_checkpoint_prepares_independent_attention_ep_and_expert_tp_shards(
     prepared = []
 
     class Dispatch:
-        def __init__(self, local, *, num_experts, groups):
+        def __init__(self, local, *, num_experts, groups, replication):
             dispatches.append((num_experts, groups))
+            assert replication == (groups.attn_tp, groups.attn_replication)
 
     class Kernel:
         capabilities = SimpleNamespace(supports_fp32_partial=True)
@@ -336,6 +338,7 @@ def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty(monke
     config = moe_kernel_config(local_args, "sm90")
     groups = SimpleNamespace(
         ep=RankGroup((0, 1), object(), 1),
+        attn_tp=RankGroup((1,), object(), 0),
         attn_replication=RankGroup((1,), object(), 0),
     )
     calls = []

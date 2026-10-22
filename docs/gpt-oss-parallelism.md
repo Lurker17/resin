@@ -99,14 +99,15 @@ before the coordinator's execution vote. Requested logprobs use retained decode
 logits after replay.
 
 Eager dispatch sends each row only to its selected expert owners and their
-expert-TP lanes, reading split counts on the host. Captured dispatch uses a
-fixed-capacity world all-gather and FP32 reduce-scatter; every local expert
-callback receives `world_size * capacity` rows, including padding and foreign
-routes. Replicated attention and attention-TP ranks currently dispatch their own
-origins even when their hidden rows are identical. This is a correctness
-prototype with extra communication, scratch memory, activation expansion, and
-duplicate expert work. Sparse graph-safe routing, communication overlap, and a
-native FP32-partial kernel remain separate work.
+expert-TP lanes, reading split counts on the host. Captured dispatch uses
+GPU-driven sparse NVLink all-to-all and FP32 combine. Static receive slots remain
+`world_size * capacity`, but inactive sentinels prevent padding from selecting
+expert GEMMs, and only selected owner ranks receive payloads. One attention
+TP/replication copy dispatches each origin, then shares the completed result;
+CP prefill segments remain independent. CP decode copies still dispatch separate
+origins. See [transport limits](distributed.md)
+for the 64-rank NVLink-domain bound and cross-host restrictions. Communication
+overlap and a native FP32-partial kernel remain separate work.
 
 Idle prefill replays only matching FFN regions. Idle decode replays padded rows
 using reserved null cache storage, without writing live request pages.

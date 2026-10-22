@@ -24,10 +24,9 @@ class ExpertParallelDispatch:
 
     Sources may have different batch sizes, including zero. Every rank joins
     the same collectives; top-k indices stay global so the local expert kernel
-    can filter its own contiguous expert interval. Counts are read on the host,
-    making variable-size dispatch an eager operation. ``fixed_capacity`` uses
-    equal-size exchanges instead, without reading GPU routing metadata on the
-    host, so the same local expert operation can participate in a CUDA graph.
+    can filter its own contiguous expert interval. Eager variable-size exchange
+    reads counts on the host. CUDA ``fixed_capacity`` uses GPU-driven sparse
+    dispatch instead, so graph replay never reads routing metadata on the host.
 
     The local callback must return one consistent dtype on all ranks, including
     empty inputs. That dtype is retained through exchange and replica broadcast;
@@ -40,11 +39,11 @@ class ExpertParallelDispatch:
         *,
         num_experts: int,
         group: RankGroup | None = None,
-        replication: RankGroup | None = None,
+        replication: RankGroup | tuple[RankGroup, ...] | None = None,
         groups: ParallelGroups | None = None,
     ) -> None:
         if groups is not None:
-            if group is not None or replication is not None:
+            if group is not None:
                 raise ValueError("pass groups or an expert group, not both")
             group = groups.device_domain
             expert_size = groups.ep.size
@@ -57,23 +56,30 @@ class ExpertParallelDispatch:
         if num_experts <= 0 or num_experts % expert_size:
             raise ValueError("the number of experts must be divisible by EP")
         self.local = local
+        self.num_experts = num_experts
         self.group = group
-        self.replication = replication
+        self.replication = (
+            ()
+            if replication is None
+            else replication
+            if isinstance(replication, tuple)
+            else (replication,)
+        )
         self.experts_per_rank = num_experts // expert_size
         self._capacity: int | None = None
         self._valid_rows: Tensor | None = None
+        self._transports = {}
 
     @contextmanager
     def fixed_capacity(self, rows: int, *, valid_rows: Tensor | None = None):
         """Use a common token capacity on every EP rank during this operation.
 
-        Each source all-gathers its padded rows to every expert owner. The local
-        kernel receives ``group.size * rows`` rows with zero weights on padding
-        and on redundant attention copies. Reduce-scatter combines owner
-        partials back to their sources. This dense transport deliberately trades
-        extra bandwidth and padded expert work for fixed shapes and capture-safe
-        collectives. Callers select the same capacity on every rank before
-        warmup/capture; replay then needs no Python dispatch.
+        CUDA sends rows only to their selected expert owners through a shared
+        NVLink workspace. Receive storage has a fixed shape, with unused slots
+        masked for the local expert operation. Inactive graph rows and redundant
+        attention copies stay local with zero weights. CPU uses equal-size
+        collectives as a portable correctness reference. Callers select a common
+        capacity before warmup/capture; replay needs no Python dispatch.
 
         ``valid_rows`` may be a device integer scalar updated before replay.
         It masks routing weights for padded model rows without a host read.
@@ -102,7 +108,7 @@ class ExpertParallelDispatch:
         group, replication = self.group, self.replication
         # Attention copies execute the same request rows. One copy dispatches;
         # the resulting rows are shared again after the expert exchange.
-        source = replication is None or replication.local_rank == 0
+        source = all(copy.local_rank == 0 for copy in replication)
         send_hidden = hidden if source else hidden[:0]
         send_indices = indices if source else indices[:0]
         send_weights = weights if source else weights[:0]
@@ -159,9 +165,14 @@ class ExpertParallelDispatch:
                 lengths=destinations.sum(1, dtype=torch.int64),
                 unsafe=True,  # Lengths partition the packed rows by construction.
             )
-        if replication is not None and replication.size > 1 and result.numel():
-            dist.broadcast(result, src=replication.source, group=replication.handle)
+        self._broadcast(result)
         return result.to(hidden.dtype)
+
+    def _broadcast(self, result: Tensor) -> None:
+        if result.numel():
+            for copy in self.replication:
+                if copy.size > 1:
+                    dist.broadcast(result, src=copy.source, group=copy.handle)
 
     def _fixed(
         self,
@@ -179,7 +190,52 @@ class ExpertParallelDispatch:
             )
         if valid_rows is not None and valid_rows.device != hidden.device:
             raise ValueError("valid expert rows must be on the input device")
-        source = replication is None or replication.local_rank == 0
+        source = all(copy.local_rank == 0 for copy in replication)
+
+        if hidden.is_cuda:
+            from resin.backend.cuda.expert_parallel import sparse_expert_transport
+
+            def pad(tensor: Tensor) -> Tensor:
+                padded = tensor.new_zeros((capacity, *tensor.shape[1:]))
+                if source:
+                    padded[:rows].copy_(tensor)
+                return padded
+
+            padded_hidden, padded_indices, padded_weights = (
+                pad(tensor) for tensor in (hidden, indices, weights)
+            )
+            active = torch.arange(capacity, device=hidden.device) < (
+                valid_rows if valid_rows is not None else rows
+            )
+            active &= source
+            owners = padded_indices.div(self.experts_per_rank, rounding_mode="floor")
+            owners = (
+                owners[..., None] * self.expert_tp
+                + torch.arange(self.expert_tp, device=hidden.device)
+            ).flatten(1)
+            key = (
+                capacity,
+                hidden.shape[1],
+                hidden.dtype,
+                indices.shape[1],
+                hidden.device,
+            )
+            # FlashInfer gets its stream from the current CUDA device. Torch
+            # tensor operations above do not change the caller's device context.
+            with torch.cuda.device(hidden.device):
+                if key not in self._transports:
+                    self._transports[key] = sparse_expert_transport(group, *key)
+                result = self._transports[key](
+                    self.local,
+                    padded_hidden,
+                    padded_indices,
+                    padded_weights,
+                    owners,
+                    active,
+                    self.num_experts,
+                )
+            self._broadcast(result)
+            return result[:rows].to(hidden.dtype)
 
         def exchange(tensor: Tensor, *, mask: bool = False) -> Tensor:
             # Routing stays on the GPU. Zero padding also makes every idle
@@ -202,8 +258,7 @@ class ExpertParallelDispatch:
         # have been combined. BF16 owner sums can lose small residuals.
         result = partial.new_empty((capacity, width))
         dist.reduce_scatter_tensor(result, partial.contiguous(), group=group.handle)
-        if replication is not None and replication.size > 1:
-            dist.broadcast(result, src=replication.source, group=replication.handle)
+        self._broadcast(result)
         return result[:rows].to(hidden.dtype)
 
 
@@ -211,7 +266,7 @@ class ExpertParallelDispatch:
 def fixed_expert_capacity(
     model: torch.nn.Module, capacity: int, *, valid_rows: Tensor | None = None
 ):
-    """Select padded all-gather/reduce-scatter throughout a captured model."""
+    """Select fixed-capacity expert transport throughout a captured model."""
 
     seen = set()
     with ExitStack() as contexts:
@@ -223,3 +278,11 @@ def fixed_expert_capacity(
                         value.fixed_capacity(capacity, valid_rows=valid_rows)
                     )
         yield
+
+
+def close_expert_transports(model: torch.nn.Module) -> None:
+    """Release shared workspaces after all ranks have destroyed their graphs."""
+    for module in model.modules():
+        for value in vars(module).values():
+            if isinstance(value, ExpertParallelDispatch):
+                value._transports.clear()
