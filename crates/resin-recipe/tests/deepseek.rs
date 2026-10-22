@@ -1,5 +1,8 @@
+mod common;
+use common::SemanticParser;
+
 use resin_recipe::{
-    Decoder, DeepSeekV4Parser, DeepSeekV4Tokens, Error, Event, FinishReason, ResponseParser,
+    AttributedText, Decoder, DeepSeekV4Parser, DeepSeekV4Tokens, Error, Event, FinishReason,
 };
 use serde_json::{Value, json};
 
@@ -15,7 +18,7 @@ const TOKENS: DeepSeekV4Tokens = DeepSeekV4Tokens {
 struct ByteDecoder(Vec<u8>);
 
 impl Decoder for ByteDecoder {
-    fn push(&mut self, ids: &[u32]) -> Result<String, Error> {
+    fn push(&mut self, ids: &[u32], _token_start: u32) -> Result<AttributedText, Error> {
         for &id in ids {
             self.0
                 .push(u8::try_from(id).map_err(|_| Error::new("invalid byte token"))?);
@@ -25,10 +28,14 @@ impl Decoder for ByteDecoder {
             Err(error) if error.error_len().is_none() => error.valid_up_to(),
             Err(_) => return Err(Error::new("invalid UTF-8")),
         };
-        Ok(String::from_utf8(self.0.drain(..length).collect()).unwrap())
+        Ok(AttributedText::plain(
+            String::from_utf8(self.0.drain(..length).collect()).unwrap(),
+        ))
     }
-    fn finish(&mut self) -> Result<String, Error> {
-        Ok(String::from_utf8_lossy(&std::mem::take(&mut self.0)).into_owned())
+    fn finish(&mut self) -> Result<AttributedText, Error> {
+        Ok(AttributedText::plain(
+            String::from_utf8_lossy(&std::mem::take(&mut self.0)).into_owned(),
+        ))
     }
     fn reset(&mut self) {
         self.0.clear();
@@ -102,9 +109,9 @@ fn streaming_reasoning_and_dsml_are_chunk_invariant() {
         let mut parser = parser(true);
         let mut events = Vec::new();
         for chunk in response.chunks(size) {
-            events.extend(parser.feed(chunk).unwrap());
+            events.extend(parser.semantic_feed(chunk).unwrap());
         }
-        events.extend(parser.finish(FinishReason::Stop).unwrap());
+        events.extend(parser.semantic_finish(FinishReason::Stop).unwrap());
         assert_eq!(
             semantic(&events),
             (
@@ -119,7 +126,12 @@ fn streaming_reasoning_and_dsml_are_chunk_invariant() {
                 ]
             )
         );
-        assert!(parser.finish(FinishReason::Stop).unwrap().is_empty());
+        assert!(
+            parser
+                .semantic_finish(FinishReason::Stop)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
@@ -130,31 +142,31 @@ fn literal_control_spellings_remain_content() {
     let mut parser = parser(false);
     let mut events = Vec::new();
     for id in ordinary {
-        events.extend(parser.feed(&[id]).unwrap());
+        events.extend(parser.semantic_feed(&[id]).unwrap());
     }
-    events.extend(parser.feed(&[TOKENS.eos]).unwrap());
+    events.extend(parser.semantic_feed(&[TOKENS.eos]).unwrap());
     assert_eq!(semantic(&events).1, text);
 }
 
 #[test]
 fn partial_marker_and_unicode_flush_when_generation_is_truncated() {
     let mut parser = parser(false);
-    let mut events = parser.feed(&ids("answer\n\n<")).unwrap();
+    let mut events = parser.semantic_feed(&ids("answer\n\n<")).unwrap();
     assert_eq!(semantic(&events).1, "answer");
-    events.extend(parser.finish(FinishReason::Length).unwrap());
+    events.extend(parser.semantic_finish(FinishReason::Length).unwrap());
     assert_eq!(semantic(&events).1, "answer\n\n<");
 
     let mut parser = self::parser(false);
-    let mut events = parser.feed(&[0xf0, 0x9f]).unwrap();
+    let mut events = parser.semantic_feed(&[0xf0, 0x9f]).unwrap();
     assert!(events.is_empty());
-    events.extend(parser.finish(FinishReason::Length).unwrap());
+    events.extend(parser.semantic_finish(FinishReason::Length).unwrap());
     assert_eq!(semantic(&events).1, "�");
 }
 
 #[test]
 fn tool_events_arrive_before_eos() {
     let mut parser = parser(false);
-    let events = parser.feed(&ids("\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n<｜DSML｜parameter name=\"q\" string=\"true\">value")).unwrap();
+    let events = parser.semantic_feed(&ids("\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n<｜DSML｜parameter name=\"q\" string=\"true\">value")).unwrap();
     assert!(
         events
             .iter()
@@ -163,7 +175,12 @@ fn tool_events_arrive_before_eos() {
     assert!(events.iter().any(
         |event| matches!(event, Event::ToolCallArgumentsDelta { delta, .. } if delta == "value")
     ));
-    assert!(parser.finish(FinishReason::Length).unwrap().is_empty());
+    assert!(
+        parser
+            .semantic_finish(FinishReason::Length)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -174,16 +191,16 @@ fn malformed_tool_arguments_and_control_tokens_are_rejected() {
     );
     assert!(
         parser
-            .feed(&response)
+            .semantic_feed(&response)
             .unwrap_err()
             .to_string()
             .contains("duplicate")
     );
     let mut parser = self::parser(true);
-    assert!(parser.feed(&[TOKENS.eos]).is_err());
+    assert!(parser.semantic_feed(&[TOKENS.eos]).is_err());
     let mut parser = self::parser(false);
     response = vec![TOKENS.thinking_start];
-    assert!(parser.feed(&response).is_err());
+    assert!(parser.semantic_feed(&response).is_err());
     let mut duplicate = TOKENS;
     duplicate.dsml = duplicate.eos;
     assert!(DeepSeekV4Parser::new(duplicate, Box::<ByteDecoder>::default(), &[], false).is_err());
@@ -198,7 +215,10 @@ fn prompt_parser_initial_stage_and_generation_suffix_agree() {
         false,
     )
     .unwrap();
-    assert_eq!(semantic(&parser.feed(&ids("reason")).unwrap()).0, "reason");
+    assert_eq!(
+        semantic(&parser.semantic_feed(&ids("reason")).unwrap()).0,
+        "reason"
+    );
     let prompt = resin_recipe::deepseek::render(&json!({"messages": [{"role": "user", "content": "hello"}], "add_generation_prompt": false})).unwrap();
     assert_eq!(
         prompt.rendered_text(),

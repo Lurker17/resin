@@ -1,21 +1,33 @@
 //! Join visible text with complete source-token scores after parser/stop buffering.
-use std::collections::BTreeMap;
+use std::collections::VecDeque;
 
 use resin_http::{GeneratedTokenLogprob, GenerationEvent};
 use resin_recipe::{AttributedEvent, AttributedText, Event};
 
 #[derive(Default)]
 pub(crate) struct OutputScores {
-    tokens: BTreeMap<usize, GeneratedTokenLogprob>,
+    // Scores arrive in generated-token order; retain capacity across emissions.
+    tokens: VecDeque<GeneratedTokenLogprob>,
     pending: AttributedText,
     retired_before: usize,
 }
 
 impl OutputScores {
     pub fn insert(&mut self, token: GeneratedTokenLogprob) {
-        if token.token_index >= self.retired_before {
-            self.tokens.insert(token.token_index, token);
+        if token.token_index >= self.retired_before && token.token.bytes.is_some() {
+            self.tokens.push_back(token);
         }
+    }
+
+    fn position(&self, token: u32) -> Option<usize> {
+        self.tokens
+            .binary_search_by_key(&(token as usize), |score| score.token_index)
+            .ok()
+    }
+
+    pub fn source_len(&self, token: u32) -> Option<usize> {
+        let score = &self.tokens[self.position(token)?];
+        score.token.bytes.as_ref().map(Vec::len)
     }
 
     pub fn push(&mut self, attributed: AttributedEvent) -> Vec<GenerationEvent> {
@@ -32,47 +44,39 @@ impl OutputScores {
                 });
                 return output;
             }
-            let text = AttributedText { text: delta, spans };
-            if self.pending.is_empty() {
-                self.pending = text;
-            } else {
-                self.pending.push(text);
-            }
+            self.pending.push(AttributedText { text: delta, spans });
             let mut boundary = self.pending.len();
             if let Some(last) = self.pending.spans.last() {
-                let fragments = self
-                    .pending
-                    .spans
-                    .iter()
-                    .filter(|span| span.token_index == last.token_index);
                 let mut covered = 0;
                 let mut start = boundary;
                 let mut contiguous = true;
-                for span in fragments {
-                    start = start.min(span.event_start);
-                    contiguous &= span.token_start == covered;
-                    covered = span.token_end;
+                for span in self
+                    .pending
+                    .spans
+                    .iter()
+                    .filter(|span| span.token == last.token)
+                {
+                    start = start.min(span.text.start as usize);
+                    contiguous &= span.source.start == covered;
+                    covered = span.source.end;
                 }
-                // A missing leading prefix cannot become a whole visible token.
-                // A trailing prefix can still be completed by the next event.
-                if contiguous && covered < last.token_len {
+                // Only a missing trailing suffix can still complete this token.
+                if contiguous
+                    && self
+                        .source_len(last.token)
+                        .is_some_and(|len| (covered as usize) < len)
+                {
                     boundary = start;
-                    let mut ranges = BTreeMap::<usize, (usize, usize)>::new();
-                    for span in &self.pending.spans {
-                        let range = ranges
-                            .entry(span.token_index)
-                            .or_insert((span.event_start, span.event_end));
-                        range.0 = range.0.min(span.event_start);
-                        range.1 = range.1.max(span.event_end);
-                    }
-                    // Byte tokens can overlap one Unicode character. Preserve
-                    // every source token connected to that held character too.
+                    // Split UTF-8 scalars connect tokens. Keep the entire source
+                    // token connected to a held character, without a range map.
                     loop {
                         let previous = boundary;
                         while !self.pending.is_char_boundary(boundary) {
                             boundary -= 1;
                         }
-                        for &(start, end) in ranges.values() {
+                        for group in self.pending.spans.chunk_by(|a, b| a.token == b.token) {
+                            let start = group.iter().map(|s| s.text.start as usize).min().unwrap();
+                            let end = group.iter().map(|s| s.text.end as usize).max().unwrap();
                             if start < boundary && end > boundary {
                                 boundary = start;
                             }
@@ -86,8 +90,8 @@ impl OutputScores {
             return self.emit(boundary).into_iter().collect();
         }
         let mut output = self.finish_text();
-        if let Some(last) = spans.iter().map(|span| span.token_index).max() {
-            self.retire(last + 1);
+        if let Some(last) = spans.last() {
+            self.retire(last.token as usize + 1);
         }
         output.push(match event {
             Event::ReasoningDelta { delta } => GenerationEvent::ReasoningDelta(delta),
@@ -116,33 +120,27 @@ impl OutputScores {
         if boundary == 0 {
             return None;
         }
-        let text = if boundary == self.pending.len() {
-            std::mem::take(&mut self.pending)
-        } else {
-            self.pending.take(boundary)
-        };
-        let mut coverage = BTreeMap::<usize, (usize, usize, bool)>::new();
-        for span in &text.spans {
-            let entry = coverage
-                .entry(span.token_index)
-                .or_insert((0, span.token_len, true));
-            entry.2 &= entry.0 == span.token_start
-                && entry.1 == span.token_len
-                && span.token_end <= span.token_len;
-            entry.0 = span.token_end;
-        }
+        let text = self.pending.take(boundary);
         let mut logprobs = Vec::new();
-        for (index, (covered, length, contiguous)) in &coverage {
-            if *contiguous
-                && covered == length
-                && let Some(mut token) = self.tokens.remove(index)
+        for group in text.spans.chunk_by(|a, b| a.token == b.token) {
+            let token = group[0].token;
+            let mut covered = 0;
+            let contiguous = group.iter().all(|span| {
+                let adjacent = covered == span.source.start;
+                covered = span.source.end;
+                adjacent
+            });
+            if contiguous
+                && self.source_len(token) == Some(covered as usize)
+                && let Some(position) = self.position(token)
             {
-                token.channel = Some("content".to_owned());
-                logprobs.push(token);
+                let mut score = self.tokens.remove(position).unwrap();
+                score.channel = Some("content".to_owned());
+                logprobs.push(score);
             }
         }
-        if let Some(last) = coverage.keys().next_back() {
-            self.retire(last + 1);
+        if let Some(last) = text.spans.last() {
+            self.retire(last.token as usize + 1);
         }
         Some(GenerationEvent::TextDelta {
             delta: text.text,
@@ -152,7 +150,13 @@ impl OutputScores {
 
     fn retire(&mut self, before: usize) {
         self.retired_before = self.retired_before.max(before);
-        self.tokens = self.tokens.split_off(&self.retired_before);
+        while self
+            .tokens
+            .front()
+            .is_some_and(|score| score.token_index < self.retired_before)
+        {
+            self.tokens.pop_front();
+        }
     }
 }
 
@@ -184,16 +188,12 @@ mod tests {
     fn span(
         index: usize,
         source: std::ops::Range<usize>,
-        length: usize,
         event: std::ops::Range<usize>,
     ) -> TokenSpan {
         TokenSpan {
-            token_index: index,
-            token_start: source.start,
-            token_end: source.end,
-            token_len: length,
-            event_start: event.start,
-            event_end: event.end,
+            token: index as u32,
+            source: source.start as u32..source.end as u32,
+            text: event.start as u32..event.end as u32,
         }
     }
 
@@ -223,10 +223,10 @@ mod tests {
         output.insert(original.clone());
         assert!(
             output
-                .push(text("hello", vec![span(0, 0..5, 6, 0..5)]))
+                .push(text("hello", vec![span(0, 0..5, 0..5)]))
                 .is_empty()
         );
-        let events = unpack(output.push(text(" ", vec![span(0, 5..6, 6, 0..1)])));
+        let events = unpack(output.push(text(" ", vec![span(0, 5..6, 0..1)])));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, "hello ");
         assert_eq!(events[0].1.len(), 1);
@@ -245,7 +245,7 @@ mod tests {
         output.insert(token(0, b"hello "));
         assert!(
             output
-                .push(text("hello", vec![span(0, 0..5, 6, 0..5)]))
+                .push(text("hello", vec![span(0, 0..5, 0..5)]))
                 .is_empty()
         );
         let events = unpack(output.finish());
@@ -253,7 +253,7 @@ mod tests {
         assert!(events[0].1.is_empty());
 
         output.insert(token(1, b" hello"));
-        let events = unpack(output.push(text("hello", vec![span(1, 1..6, 6, 0..5)])));
+        let events = unpack(output.push(text("hello", vec![span(1, 1..6, 0..5)])));
         assert_eq!(events[0].0, "hello");
         assert!(events[0].1.is_empty());
     }
@@ -265,12 +265,12 @@ mod tests {
         output.insert(token(1, b" two "));
         let events = unpack(output.push(text(
             "one two",
-            vec![span(0, 0..3, 3, 0..3), span(1, 0..4, 5, 3..7)],
+            vec![span(0, 0..3, 0..3), span(1, 0..4, 3..7)],
         )));
         assert_eq!(events[0].0, "one");
         assert_eq!(events[0].1[0].token_index, 0);
         output.insert(token(2, b"!"));
-        let events = unpack(output.push(text("!", vec![span(2, 0..1, 1, 0..1)])));
+        let events = unpack(output.push(text("!", vec![span(2, 0..1, 0..1)])));
         assert_eq!(events[0].0, " two!");
         assert_eq!(
             events[0]
@@ -291,13 +291,10 @@ mod tests {
         // a withheld space. Neither score can accompany a partial character.
         assert!(
             output
-                .push(text(
-                    "é",
-                    vec![span(0, 0..1, 1, 0..1), span(1, 0..1, 2, 1..2)]
-                ))
+                .push(text("é", vec![span(0, 0..1, 0..1), span(1, 0..1, 1..2)]))
                 .is_empty()
         );
-        let events = unpack(output.push(text(" ", vec![span(1, 1..2, 2, 0..1)])));
+        let events = unpack(output.push(text(" ", vec![span(1, 1..2, 0..1)])));
         assert_eq!(events[0].0, "é ");
         assert_eq!(
             events[0]
@@ -324,13 +321,10 @@ mod tests {
         output.insert(token(1, &[0xa9, b' ']));
         assert!(
             output
-                .push(text(
-                    "aé",
-                    vec![span(0, 0..2, 2, 0..3), span(1, 0..1, 2, 1..3)]
-                ))
+                .push(text("aé", vec![span(0, 0..2, 0..3), span(1, 0..1, 1..3)]))
                 .is_empty()
         );
-        let events = unpack(output.push(text(" ", vec![span(1, 1..2, 2, 0..1)])));
+        let events = unpack(output.push(text(" ", vec![span(1, 1..2, 0..1)])));
         assert_eq!(events[0].0, "aé ");
         assert_eq!(
             events[0]
@@ -348,7 +342,7 @@ mod tests {
         output.insert(token(0, b"text "));
         assert!(
             output
-                .push(text("text", vec![span(0, 0..4, 5, 0..4)]))
+                .push(text("text", vec![span(0, 0..4, 0..4)]))
                 .is_empty()
         );
         let events = output.push(
@@ -370,23 +364,27 @@ mod tests {
     #[test]
     fn scores_are_once_only_and_require_gapless_source_coverage() {
         let mut output = OutputScores::default();
-        let mut first = token(0, b"x");
-        // Provenance still supplies the byte extent when vocabulary bytes are unknown.
-        first.token.bytes = None;
+        let first = token(0, b"x");
         output.insert(first.clone());
-        let events = unpack(output.push(text("x", vec![span(0, 0..1, 1, 0..1)])));
+        let capacity = output.tokens.capacity();
+        let events = unpack(output.push(text("x", vec![span(0, 0..1, 0..1)])));
         assert_eq!(events[0].1.len(), 1);
-        assert!(events[0].1[0].token.bytes.is_none());
+        assert_eq!(output.tokens.capacity(), capacity);
         output.insert(first);
-        let events = unpack(output.push(text("x", vec![span(0, 0..1, 1, 0..1)])));
+        let events = unpack(output.push(text("x", vec![span(0, 0..1, 0..1)])));
         assert!(events[0].1.is_empty());
 
         output.insert(token(1, b"abcd"));
-        let events = unpack(output.push(text(
-            "acd",
-            vec![span(1, 0..1, 4, 0..1), span(1, 2..4, 4, 1..3)],
-        )));
+        let events =
+            unpack(output.push(text("acd", vec![span(1, 0..1, 0..1), span(1, 2..4, 1..3)])));
         assert_eq!(events[0].0, "acd");
+        assert!(events[0].1.is_empty());
+
+        // Without original vocabulary bytes, completeness cannot be established.
+        let mut unknown = token(2, b"x");
+        unknown.token.bytes = None;
+        output.insert(unknown);
+        let events = unpack(output.push(text("x", vec![span(2, 0..1, 0..1)])));
         assert!(events[0].1.is_empty());
     }
 }

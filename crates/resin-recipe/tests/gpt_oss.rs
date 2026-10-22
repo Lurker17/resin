@@ -1,5 +1,8 @@
+mod common;
+use common::SemanticParser;
+
 use resin_recipe::{
-    Decoder, Error, Event, FinishReason, GptOssParser, GptOssTokens, ResponseParser,
+    AttributedText, Decoder, Error, Event, FinishReason, GptOssParser, GptOssTokens,
 };
 
 const TOKENS: GptOssTokens = GptOssTokens {
@@ -16,7 +19,7 @@ const TOKENS: GptOssTokens = GptOssTokens {
 struct Bytes(Vec<u8>);
 
 impl Decoder for Bytes {
-    fn push(&mut self, ids: &[u32]) -> Result<String, Error> {
+    fn push(&mut self, ids: &[u32], _token_start: u32) -> Result<AttributedText, Error> {
         self.0
             .extend(ids.iter().map(|&id| u8::try_from(id).unwrap()));
         let length = match std::str::from_utf8(&self.0) {
@@ -24,12 +27,14 @@ impl Decoder for Bytes {
             Err(error) if error.error_len().is_none() => error.valid_up_to(),
             Err(_) => return Err(Error::new("invalid UTF-8")),
         };
-        Ok(String::from_utf8(self.0.drain(..length).collect()).unwrap())
+        Ok(AttributedText::plain(
+            String::from_utf8(self.0.drain(..length).collect()).unwrap(),
+        ))
     }
-    fn finish(&mut self) -> Result<String, Error> {
+    fn finish(&mut self) -> Result<AttributedText, Error> {
         let text = String::from_utf8_lossy(&self.0).into_owned();
         self.0.clear();
-        Ok(text)
+        Ok(AttributedText::plain(text))
     }
     fn reset(&mut self) {
         self.0.clear();
@@ -108,12 +113,17 @@ fn channel_headers_tools_and_unicode_are_independent_of_chunk_boundaries() {
         let mut parser = GptOssParser::new(TOKENS, Box::<Bytes>::default(), &prompt).unwrap();
         let mut events = Vec::new();
         for chunk in ids.chunks(width) {
-            events.extend(parser.feed(chunk).unwrap());
+            events.extend(parser.semantic_feed(chunk).unwrap());
         }
-        events.extend(parser.finish(FinishReason::Stop).unwrap());
+        events.extend(parser.semantic_finish(FinishReason::Stop).unwrap());
         assert_eq!(coalesce(events), expected, "chunk width {width}");
-        assert!(parser.finish(FinishReason::Length).unwrap().is_empty());
-        assert!(parser.feed(&[]).is_err());
+        assert!(
+            parser
+                .semantic_finish(FinishReason::Length)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parser.semantic_feed(&[]).is_err());
     }
 }
 
@@ -123,7 +133,7 @@ fn prompt_initialization_does_not_reemit_a_prompt_body() {
     prompt.extend(bytes("Already generated."));
     let mut parser = GptOssParser::new(TOKENS, Box::<Bytes>::default(), &prompt).unwrap();
     assert_eq!(
-        parser.feed(&bytes("New.")).unwrap(),
+        parser.semantic_feed(&bytes("New.")).unwrap(),
         vec![Event::ReasoningDelta {
             delta: "New.".into()
         }]
@@ -139,8 +149,13 @@ fn incomplete_and_invalid_tool_calls_stay_uncommitted() {
             &header("commentary", Some("functions.f")),
         )
         .unwrap();
-        assert!(parser.feed(&bytes(payload)).unwrap().is_empty());
-        assert!(parser.finish(FinishReason::Length).unwrap().is_empty());
+        assert!(parser.semantic_feed(&bytes(payload)).unwrap().is_empty());
+        assert!(
+            parser
+                .semantic_finish(FinishReason::Length)
+                .unwrap()
+                .is_empty()
+        );
     }
     let mut parser = GptOssParser::new(
         TOKENS,
@@ -150,7 +165,7 @@ fn incomplete_and_invalid_tool_calls_stay_uncommitted() {
     .unwrap();
     let mut ids = bytes("broken");
     ids.push(TOKENS.tool_end);
-    assert!(parser.feed(&ids).unwrap().is_empty());
+    assert!(parser.semantic_feed(&ids).unwrap().is_empty());
 }
 
 #[test]
@@ -164,7 +179,7 @@ fn tool_arguments_preserve_numeric_lexemes_and_whitespace() {
     .unwrap();
     let mut ids = bytes(payload);
     ids.push(TOKENS.tool_end);
-    let events = parser.feed(&ids).unwrap();
+    let events = parser.semantic_feed(&ids).unwrap();
     assert_eq!(
         events[1],
         Event::ToolCallArgumentsDelta {
@@ -179,7 +194,7 @@ fn partial_byte_sequence_flushes_at_a_model_control_boundary() {
     let mut parser =
         GptOssParser::new(TOKENS, Box::<Bytes>::default(), &header("analysis", None)).unwrap();
     assert_eq!(
-        parser.feed(&[0xf0, 0x9f, TOKENS.end]).unwrap(),
+        parser.semantic_feed(&[0xf0, 0x9f, TOKENS.end]).unwrap(),
         vec![Event::ReasoningDelta {
             delta: "�".into()
         }]
@@ -199,7 +214,7 @@ fn recipient_before_channel_and_constrained_headers_are_hidden() {
     ids.push(TOKENS.tool_end);
     let mut parser = GptOssParser::new(TOKENS, Box::<Bytes>::default(), &[]).unwrap();
     assert_eq!(
-        parser.feed(&ids).unwrap(),
+        parser.semantic_feed(&ids).unwrap(),
         vec![
             Event::ToolCallStart {
                 index: 0,

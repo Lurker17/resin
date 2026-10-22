@@ -54,19 +54,9 @@ class RenderedPrompt(TypedDict):
     media: NotRequired[MediaInput]
 
 
-class TokenSpan(TypedDict):
-    """Source-token bytes contributing to one semantic delta's UTF-8 bytes.
-
-    Token indices count all generated tokens, including controls. Byte offsets
-    are half-open; a Unicode character may span several vocabulary tokens.
-    """
-
-    token_index: int
-    token_start: int
-    token_end: int
-    token_len: int
-    event_start: int
-    event_end: int
+# (generated token index, source byte start/end, event text byte start/end).
+# Ranges are half-open u32 offsets; several tokens may share one UTF-8 character.
+TokenSpan = tuple[int, int, int, int, int]
 
 
 class ParserEvent(TypedDict, total=False):
@@ -81,23 +71,13 @@ class ParserEvent(TypedDict, total=False):
 
 
 class ResponseParser(Protocol):
-    """Incrementally turn generated token IDs into wire-level deltas."""
+    """Turn generated IDs into semantic deltas carrying source-byte spans.
 
-    def feed(self, token_ids: Sequence[int]) -> list[ParserEvent]: ...
-
-
-class AttributedResponseParser(ResponseParser, Protocol):
-    """Opt into source-aligned scores while keeping ordinary decoding cheap.
-
-    Scored requests call these methods instead of feed/finish. Token spans use
-    absolute generated-token indices; parser buffering must preserve them.
+    Preserve ``token_spans`` through buffering. Missing or empty spans identify
+    synthetic text or unknown provenance; they never imply a guessed token map.
     """
 
-    def feed_attributed(self, token_ids: Sequence[int]) -> list[ParserEvent]: ...
-
-    def finish_attributed(
-        self, reason: Literal["stop", "length"]
-    ) -> list[ParserEvent]: ...
+    def feed(self, token_ids: Sequence[int]) -> list[ParserEvent]: ...
 
 
 class FinalizingResponseParser(ResponseParser, Protocol):
@@ -138,7 +118,6 @@ class ManagedRunner(Runner, Protocol):
 
 
 __all__ = [
-    "AttributedResponseParser",
     "ConversationCodec",
     "FinalizingResponseParser",
     "ManagedRunner",

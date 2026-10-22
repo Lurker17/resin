@@ -12,8 +12,9 @@ use pyo3::{
 };
 use pythonize::{depythonize, pythonize};
 use resin_recipe::{
-    Decoder, Encoder, Error, Event, FinishReason, InklingParser, InklingTokens, ModelFormat,
-    Prompt, PromptSpan, ResponseParser, Tokenizer, TokenizerDecoder, TokenizerEncoder,
+    AttributedEvent, AttributedText, Decoder, Encoder, Error, FinishReason, InklingParser,
+    InklingTokens, ModelFormat, Prompt, PromptSpan, ResponseParser, Tokenizer, TokenizerDecoder,
+    TokenizerEncoder,
 };
 use serde_json::{Map, Value};
 
@@ -84,16 +85,16 @@ fn optional_attr<'py>(
 }
 
 impl RecipeTokenizer {
-    fn decoder(&self) -> Box<dyn Decoder> {
+    fn decoder(&self) -> Result<Box<dyn Decoder>, Error> {
         match &self.source {
             TokenizerSource::Native(tokenizer, _) => {
-                Box::new(TokenizerDecoder::new(tokenizer.clone()))
+                Ok(Box::new(TokenizerDecoder::new(tokenizer.clone())?))
             }
-            TokenizerSource::Python { decode, .. } => Box::new(PythonDecoder {
+            TokenizerSource::Python { decode, .. } => Ok(Box::new(PythonDecoder {
                 decode: decode.clone(),
                 ids: Vec::new(),
                 emitted: String::new(),
-            }),
+            })),
         }
     }
 }
@@ -131,20 +132,21 @@ impl PythonDecoder {
 }
 
 impl Decoder for PythonDecoder {
-    fn push(&mut self, ids: &[u32]) -> Result<String, Error> {
+    fn push(&mut self, ids: &[u32], _token_start: u32) -> Result<AttributedText, Error> {
         self.ids.extend_from_slice(ids);
         let text = self.decoded()?;
         self.delta(text.trim_end_matches('\u{fffd}'))
+            .map(AttributedText::plain)
     }
 
-    fn finish(&mut self) -> Result<String, Error> {
+    fn finish(&mut self) -> Result<AttributedText, Error> {
         if self.ids.is_empty() {
-            return Ok(String::new());
+            return Ok(AttributedText::default());
         }
         let text = self.decoded()?;
         let delta = self.delta(&text)?;
         self.reset();
-        Ok(delta)
+        Ok(AttributedText::plain(delta))
     }
 
     fn reset(&mut self) {
@@ -186,8 +188,12 @@ impl NativeInklingParser {
             content_model_end_sampling: get("<|content_model_end_sampling|>")?,
             end_message: get("<|end_message|>")?,
         };
-        let parser =
-            InklingParser::new(tokens, tokenizer.decoder(), &prompt_ids).map_err(recipe_error)?;
+        let parser = InklingParser::new(
+            tokens,
+            tokenizer.decoder().map_err(recipe_error)?,
+            &prompt_ids,
+        )
+        .map_err(recipe_error)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Box::new(parser))),
         })
@@ -198,17 +204,6 @@ impl NativeInklingParser {
         Ok(pythonize(py, &events)?.unbind())
     }
 
-    fn feed_attributed(&self, py: Python<'_>, token_ids: Vec<u32>) -> PyResult<Py<PyAny>> {
-        let events = py.detach(|| feed_attributed(&self.inner, &token_ids))?;
-        Ok(pythonize(py, &events)?.unbind())
-    }
-
-    fn finish_attributed(&self, py: Python<'_>, reason: &str) -> PyResult<Py<PyAny>> {
-        let reason = parse_finish_reason(reason)?;
-        let events = py.detach(|| finish_attributed(&self.inner, reason))?;
-        Ok(pythonize(py, &events)?.unbind())
-    }
-
     fn finish(&self, py: Python<'_>, reason: &str) -> PyResult<Py<PyAny>> {
         let reason = parse_finish_reason(reason)?;
         let events = py.detach(|| finish(&self.inner, reason))?;
@@ -216,7 +211,7 @@ impl NativeInklingParser {
     }
 }
 
-pub(crate) fn feed(parser: &SharedParser, ids: &[u32]) -> PyResult<Vec<Event>> {
+pub(crate) fn feed(parser: &SharedParser, ids: &[u32]) -> PyResult<Vec<AttributedEvent>> {
     parser
         .lock()
         .map_err(|_| PyValueError::new_err("response parser lock is poisoned"))?
@@ -224,33 +219,14 @@ pub(crate) fn feed(parser: &SharedParser, ids: &[u32]) -> PyResult<Vec<Event>> {
         .map_err(recipe_error)
 }
 
-pub(crate) fn finish(parser: &SharedParser, reason: FinishReason) -> PyResult<Vec<Event>> {
+pub(crate) fn finish(
+    parser: &SharedParser,
+    reason: FinishReason,
+) -> PyResult<Vec<AttributedEvent>> {
     parser
         .lock()
         .map_err(|_| PyValueError::new_err("response parser lock is poisoned"))?
         .finish(reason)
-        .map_err(recipe_error)
-}
-
-pub(crate) fn feed_attributed(
-    parser: &SharedParser,
-    ids: &[u32],
-) -> PyResult<Vec<resin_recipe::AttributedEvent>> {
-    parser
-        .lock()
-        .map_err(|_| PyValueError::new_err("response parser lock is poisoned"))?
-        .feed_attributed(ids)
-        .map_err(recipe_error)
-}
-
-pub(crate) fn finish_attributed(
-    parser: &SharedParser,
-    reason: FinishReason,
-) -> PyResult<Vec<resin_recipe::AttributedEvent>> {
-    parser
-        .lock()
-        .map_err(|_| PyValueError::new_err("response parser lock is poisoned"))?
-        .finish_attributed(reason)
         .map_err(recipe_error)
 }
 
@@ -340,16 +316,6 @@ impl NativeResponseParser {
         Ok(pythonize(py, &events)?.unbind())
     }
 
-    fn feed_attributed(&self, py: Python<'_>, token_ids: Vec<u32>) -> PyResult<Py<PyAny>> {
-        let events = py.detach(|| feed_attributed(&self.inner, &token_ids))?;
-        Ok(pythonize(py, &events)?.unbind())
-    }
-
-    fn finish_attributed(&self, py: Python<'_>, reason: &str) -> PyResult<Py<PyAny>> {
-        let reason = parse_finish_reason(reason)?;
-        let events = py.detach(|| finish_attributed(&self.inner, reason))?;
-        Ok(pythonize(py, &events)?.unbind())
-    }
     fn finish(&self, py: Python<'_>, reason: &str) -> PyResult<Py<PyAny>> {
         let reason = parse_finish_reason(reason)?;
         let events = py.detach(|| finish(&self.inner, reason))?;
@@ -451,7 +417,7 @@ impl ModelRecipe {
             self.model
                 .create_parser(
                     self.encoder.as_ref(),
-                    self.tokenizer.decoder(),
+                    self.tokenizer.decoder().map_err(recipe_error)?,
                     &request,
                     &prompt_ids,
                 )

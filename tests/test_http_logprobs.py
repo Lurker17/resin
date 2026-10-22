@@ -550,64 +550,76 @@ def test_prompt_scores_allow_zero_output_tokens(api, stream):
     )
 
 
-def custom_scored_codec(*, attributed, calls, invalid=False):
+def custom_scored_codec(*, with_spans, calls, invalid=None):
     backend = _byte_tokenizer()
     ids = backend.encode("ab").ids
 
     class Codec:
         tokenizer = backend
+        invalid_spans = invalid
 
         def render(self, _request):
             return {"token_ids": [0], "stop_token_ids": []}
 
         def create_parser(self, _request, _prompt_ids):
+            malformed = self.invalid_spans
+
             class Parser:
                 count = 0
 
                 def feed(self, token_ids):
                     calls.append("feed")
                     self.count += len(token_ids)
-                    # Ordinary parsers may return arbitrary extra metadata;
-                    # it must not become an accidental attribution opt-in.
-                    return [
-                        {
-                            "type": "text_delta",
-                            "delta": "ab"[self.count - 1],
-                            "token_spans": "ignored extra metadata",
-                        }
-                    ]
+                    # The ordinary API preserves provenance while buffering,
+                    # identically for scored and unscored requests.
+                    if with_spans and self.count < 2:
+                        return []
+                    if malformed == "event_order":
+                        return [
+                            {
+                                "type": "text_delta",
+                                "delta": "b",
+                                "token_spans": [(1, 0, 1, 0, 1)],
+                            },
+                            {
+                                "type": "text_delta",
+                                "delta": "a",
+                                "token_spans": [(0, 0, 1, 0, 1)],
+                            },
+                        ]
+                    event = {
+                        "type": "text_delta",
+                        "delta": "ab" if with_spans else "ab"[self.count - 1],
+                        "extra_metadata": "unreserved fields remain harmless",
+                    }
+                    spans: Any = [(index, 0, 1, index, index + 1) for index in range(2)]
+                    if malformed == "payload":
+                        spans = "reserved token_spans must not be ignored"
+                    elif malformed == "arity":
+                        spans[-1] = (1, 0, 1, 1)
+                    elif malformed == "negative":
+                        spans[-1] = (-1, 0, 1, 1, 2)
+                    elif malformed == "overflow":
+                        spans[-1] = (2**32, 0, 1, 1, 2)
+                    elif malformed == "future":
+                        spans[-1] = (2, 0, 1, 1, 2)
+                    elif malformed == "source":
+                        spans[-1] = (1, 0, 2, 1, 2)
+                    elif malformed == "text":
+                        spans[-1] = (1, 0, 1, 1, 3)
+                    elif malformed == "empty":
+                        spans[-1] = (1, 0, 0, 1, 2)
+                    elif malformed == "order":
+                        spans.reverse()
+                    if with_spans or malformed:
+                        event["token_spans"] = spans
+                    return [event]
 
                 def finish(self, _reason):
                     calls.append("finish")
                     return []
 
-            class AttributedParser(Parser):
-                def feed_attributed(self, token_ids):
-                    calls.append("feed_attributed")
-                    self.count += len(token_ids)
-                    # Hold source token 0 until source token 1 arrives.
-                    if self.count < 2:
-                        return []
-                    spans = [
-                        {
-                            "token_index": index,
-                            "token_start": 0,
-                            "token_end": 1,
-                            "token_len": 1,
-                            "event_start": index,
-                            "event_end": index + 1,
-                        }
-                        for index in range(2)
-                    ]
-                    if invalid:
-                        spans[-1]["event_end"] = 3
-                    return [{"type": "text_delta", "delta": "ab", "token_spans": spans}]
-
-                def finish_attributed(self, _reason):
-                    calls.append("finish_attributed")
-                    return []
-
-            return AttributedParser() if attributed else Parser()
+            return Parser()
 
     class Runner:
         def forward(self, plan):
@@ -625,14 +637,14 @@ def custom_scored_codec(*, attributed, calls, invalid=False):
     return Codec(), Runner(), ids
 
 
-@pytest.mark.parametrize("attributed", [False, True])
+@pytest.mark.parametrize("with_spans", [False, True])
 @pytest.mark.parametrize("scored", [False, True])
 @pytest.mark.parametrize("stream", [False, True])
-def test_custom_parser_attribution_is_explicit_and_only_used_when_scored(
-    attributed, scored, stream
+def test_custom_parser_ordinary_feed_preserves_provenance_for_all_requests(
+    with_spans, scored, stream
 ):
     calls = []
-    codec, runner, ids = custom_scored_codec(attributed=attributed, calls=calls)
+    codec, runner, ids = custom_scored_codec(with_spans=with_spans, calls=calls)
     with running_server(runner, codec) as (_, engine, _, errors, base, _):
         with request(
             base,
@@ -650,12 +662,12 @@ def test_custom_parser_attribution_is_explicit_and_only_used_when_scored(
                     response,
                     api="chat/completions",
                     stream=stream,
-                    partial_tokens=not attributed,
+                    partial_tokens=not with_spans,
                 )
                 assert result["text"] == "ab"
                 assert [score["token_id"] for score in result["raw"]] == ids
                 assert [score["token_id"] for score in result["canonical"]] == (
-                    ids if attributed else []
+                    ids if with_spans else []
                 )
             elif stream:
                 assert (
@@ -669,31 +681,50 @@ def test_custom_parser_attribution_is_explicit_and_only_used_when_scored(
             else:
                 assert json.load(response)["choices"][0]["message"]["content"] == "ab"
         assert not engine.poisoned and not engine.has_work() and errors == []
-    assert calls == (
-        ["feed_attributed", "feed_attributed", "finish_attributed"]
-        if attributed and scored
-        else ["feed", "feed", "finish"]
-    )
+    assert calls == ["feed", "feed", "finish"]
 
 
-def test_invalid_custom_source_span_fails_request_without_poisoning_engine():
+@pytest.mark.parametrize(
+    ("scored", "invalid"),
+    [
+        (scored, invalid)
+        for scored in (False, True)
+        for invalid in (
+            "payload",
+            "arity",
+            "negative",
+            "overflow",
+            "future",
+            "source",
+            "text",
+            "empty",
+            "order",
+            "event_order",
+        )
+        if scored or invalid != "source"
+    ],
+)
+def test_invalid_reserved_source_spans_fail_every_request_without_poisoning_engine(
+    scored, invalid
+):
     from urllib.error import HTTPError
 
     calls = []
-    codec, runner, _ = custom_scored_codec(attributed=True, calls=calls, invalid=True)
+    codec, runner, _ = custom_scored_codec(
+        with_spans=True, calls=calls, invalid=invalid
+    )
     body = {
         "model": "test",
         "messages": [{"role": "user", "content": "hi"}],
         "max_tokens": 2,
-        "logprobs": True,
+        "logprobs": scored,
     }
     with running_server(runner, codec) as (_, engine, _, errors, base, _):
         with pytest.raises(HTTPError) as caught:
             request(base, "/v1/chat/completions", body)
         assert caught.value.code == 500
-        assert "span" in caught.value.read().decode()
-        with request(
-            base, "/v1/chat/completions", {**body, "logprobs": False}
-        ) as response:
+        assert "parser" in caught.value.read().decode()
+        codec.invalid_spans = None
+        with request(base, "/v1/chat/completions", body) as response:
             assert json.load(response)["choices"][0]["message"]["content"] == "ab"
         assert not engine.poisoned and not engine.has_work() and errors == []

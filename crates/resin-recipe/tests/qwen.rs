@@ -1,4 +1,7 @@
-use resin_recipe::{Decoder, Error, Event, FinishReason, QwenParser, QwenTokens, ResponseParser};
+mod common;
+use common::SemanticParser;
+
+use resin_recipe::{AttributedText, Decoder, Error, Event, FinishReason, QwenParser, QwenTokens};
 
 const TOKENS: QwenTokens = QwenTokens {
     im_end: 1000,
@@ -11,7 +14,7 @@ const TOKENS: QwenTokens = QwenTokens {
 #[derive(Default)]
 struct Bytes(Vec<u8>);
 impl Decoder for Bytes {
-    fn push(&mut self, ids: &[u32]) -> Result<String, Error> {
+    fn push(&mut self, ids: &[u32], _token_start: u32) -> Result<AttributedText, Error> {
         self.0
             .extend(ids.iter().map(|&id| u8::try_from(id).unwrap()));
         let length = match std::str::from_utf8(&self.0) {
@@ -19,12 +22,14 @@ impl Decoder for Bytes {
             Err(error) if error.error_len().is_none() => error.valid_up_to(),
             Err(_) => return Err(Error::new("invalid bytes")),
         };
-        Ok(String::from_utf8(self.0.drain(..length).collect()).unwrap())
+        Ok(AttributedText::plain(
+            String::from_utf8(self.0.drain(..length).collect()).unwrap(),
+        ))
     }
-    fn finish(&mut self) -> Result<String, Error> {
+    fn finish(&mut self) -> Result<AttributedText, Error> {
         let text = String::from_utf8_lossy(&self.0).into_owned();
         self.0.clear();
-        Ok(text)
+        Ok(AttributedText::plain(text))
     }
     fn reset(&mut self) {
         self.0.clear();
@@ -90,12 +95,17 @@ fn reasoning_text_and_schema_aware_tools_are_chunk_invariant() {
             QwenParser::new(TOKENS, Box::<Bytes>::default(), &[TOKENS.think], &tools).unwrap();
         let mut events = Vec::new();
         for chunk in ids.chunks(width) {
-            events.extend(parser.feed(chunk).unwrap());
+            events.extend(parser.semantic_feed(chunk).unwrap());
         }
-        events.extend(parser.finish(FinishReason::Stop).unwrap());
+        events.extend(parser.semantic_finish(FinishReason::Stop).unwrap());
         assert_eq!(coalesce(events), expected, "width {width}");
-        assert!(parser.finish(FinishReason::Length).unwrap().is_empty());
-        assert!(parser.feed(&[]).is_err());
+        assert!(
+            parser
+                .semantic_finish(FinishReason::Length)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parser.semantic_feed(&[]).is_err());
     }
 }
 
@@ -110,8 +120,13 @@ fn incomplete_xml_stays_uncommitted_and_text_finalization_flushes_bytes() {
     .unwrap();
     let mut ids = vec![TOKENS.tool_call];
     ids.extend(bytes("<function=f><parameter=x>{"));
-    assert!(parser.feed(&ids).unwrap().is_empty());
-    assert!(parser.finish(FinishReason::Length).unwrap().is_empty());
+    assert!(parser.semantic_feed(&ids).unwrap().is_empty());
+    assert!(
+        parser
+            .semantic_finish(FinishReason::Length)
+            .unwrap()
+            .is_empty()
+    );
     let mut parser = QwenParser::new(
         TOKENS,
         Box::<Bytes>::default(),
@@ -119,9 +134,9 @@ fn incomplete_xml_stays_uncommitted_and_text_finalization_flushes_bytes() {
         &serde_json::Value::Null,
     )
     .unwrap();
-    assert!(parser.feed(&[0xf0, 0x9f]).unwrap().is_empty());
+    assert!(parser.semantic_feed(&[0xf0, 0x9f]).unwrap().is_empty());
     assert_eq!(
-        parser.finish(FinishReason::Length).unwrap(),
+        parser.semantic_finish(FinishReason::Length).unwrap(),
         vec![Event::TextDelta {
             delta: "�".into()
         }]
@@ -139,7 +154,7 @@ fn literal_control_spellings_never_change_response_state() {
     .unwrap();
     let text = "literal <think> and <tool_call> remain text";
     assert_eq!(
-        parser.feed(&bytes(text)).unwrap(),
+        parser.semantic_feed(&bytes(text)).unwrap(),
         vec![Event::TextDelta { delta: text.into() }]
     );
 }

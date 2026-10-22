@@ -80,46 +80,19 @@ impl std::error::Error for Error {}
 /// Each call returns only new stable text. `finish` flushes any buffered suffix;
 /// `reset` starts a fresh decoding segment at a model control-token boundary.
 pub trait Decoder: Send {
-    /// Whether this decoder can attribute ordinary text to source token bytes.
-    /// Preparation may be lazy; serving only queries this for scored requests.
-    fn supports_attribution(&mut self) -> bool {
-        false
-    }
-    fn push(&mut self, ids: &[u32]) -> Result<String, Error>;
-    fn finish(&mut self) -> Result<String, Error>;
+    fn push(&mut self, ids: &[u32], token_start: u32) -> Result<AttributedText, Error>;
+    fn finish(&mut self) -> Result<AttributedText, Error>;
     fn reset(&mut self);
-    fn push_attributed(
-        &mut self,
-        ids: &[u32],
-        _token_start: usize,
-    ) -> Result<AttributedText, Error> {
-        self.push(ids).map(AttributedText::plain)
-    }
-    fn finish_attributed(&mut self) -> Result<AttributedText, Error> {
-        self.finish().map(AttributedText::plain)
-    }
 }
 
 /// Parse generated tokens into semantic events.
 pub trait ResponseParser: Send {
-    /// Unsupported/custom parsers retain raw scores without a canonical joiner.
-    fn supports_attribution(&mut self) -> bool {
-        false
-    }
     /// A proven semantic lane for this complete token before it is fed.
     /// `None` means a header, mixed token, or grammar with deferred transforms.
     fn token_channel(&self, _id: u32) -> Option<&'static str> {
         None
     }
 
-    fn feed(&mut self, ids: &[u32]) -> Result<Vec<Event>, Error>;
-    fn finish(&mut self, reason: FinishReason) -> Result<Vec<Event>, Error>;
-    fn feed_attributed(&mut self, ids: &[u32]) -> Result<Vec<AttributedEvent>, Error> {
-        self.feed(ids)
-            .map(|events| events.into_iter().map(Into::into).collect())
-    }
-    fn finish_attributed(&mut self, reason: FinishReason) -> Result<Vec<AttributedEvent>, Error> {
-        self.finish(reason)
-            .map(|events| events.into_iter().map(Into::into).collect())
-    }
+    fn feed(&mut self, ids: &[u32]) -> Result<Vec<AttributedEvent>, Error>;
+    fn finish(&mut self, reason: FinishReason) -> Result<Vec<AttributedEvent>, Error>;
 }

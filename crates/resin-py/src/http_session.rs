@@ -46,8 +46,6 @@ enum Parser {
     Python {
         object: Py<PyAny>,
         finish: Option<Py<PyAny>>,
-        attributed_feed: Option<Py<PyAny>>,
-        attributed_finish: Option<Py<PyAny>>,
     },
 }
 
@@ -60,14 +58,7 @@ impl Parser {
             return Ok(Self::Native(native.borrow().inner.clone()));
         }
         let finish = optional_method(py, &object, "finish")?;
-        let attributed_feed = optional_method(py, &object, "feed_attributed")?;
-        let attributed_finish = optional_method(py, &object, "finish_attributed")?;
-        Ok(Self::Python {
-            object,
-            finish,
-            attributed_feed,
-            attributed_finish,
-        })
+        Ok(Self::Python { object, finish })
     }
 
     fn token_channel(&self, id: u32) -> Option<&'static str> {
@@ -80,76 +71,29 @@ impl Parser {
         }
     }
 
-    fn supports_attribution(&self) -> PyResult<bool> {
+    fn feed(&self, ids: &[u32]) -> PyResult<Vec<AttributedEvent>> {
         match self {
-            Self::Native(parser) => Ok(parser
-                .lock()
-                .map_err(|_| PyValueError::new_err("response parser lock is poisoned"))?
-                .supports_attribution()),
-            Self::Python {
-                attributed_feed, ..
-            } => Ok(attributed_feed.is_some()),
-        }
-    }
-
-    fn feed(&self, ids: &[u32], attributed: bool) -> PyResult<Vec<AttributedEvent>> {
-        match self {
-            Self::Native(parser) if attributed => recipe::feed_attributed(parser, ids),
-            Self::Native(parser) => {
-                recipe::feed(parser, ids).map(|events| events.into_iter().map(Into::into).collect())
-            }
-            Self::Python {
-                object,
-                attributed_feed,
-                ..
-            } => Python::attach(|py| {
-                let events = match attributed_feed {
-                    Some(method) if attributed => method.bind(py).call1((ids,))?,
-                    _ => object.bind(py).call_method1("feed", (ids,))?,
-                };
-                python_events(&events, attributed)
+            Self::Native(parser) => recipe::feed(parser, ids),
+            Self::Python { object, .. } => Python::attach(|py| {
+                depythonize(&object.bind(py).call_method1("feed", (ids,))?).map_err(Into::into)
             }),
         }
     }
 
-    fn finish(
-        &self,
-        reason: ParserFinishReason,
-        attributed: bool,
-    ) -> PyResult<Vec<AttributedEvent>> {
+    fn finish(&self, reason: ParserFinishReason) -> PyResult<Vec<AttributedEvent>> {
         match self {
-            Self::Native(parser) if attributed => recipe::finish_attributed(parser, reason),
-            Self::Native(parser) => recipe::finish(parser, reason)
-                .map(|events| events.into_iter().map(Into::into).collect()),
-            Self::Python {
-                finish,
-                attributed_finish,
-                ..
-            } => Python::attach(|py| {
-                let method = if attributed {
-                    attributed_finish.as_ref().or(finish.as_ref())
-                } else {
-                    finish.as_ref()
-                };
-                let Some(method) = method else {
+            Self::Native(parser) => recipe::finish(parser, reason),
+            Self::Python { finish, .. } => Python::attach(|py| {
+                let Some(method) = finish else {
                     return Ok(Vec::new());
                 };
                 let reason = match reason {
                     ParserFinishReason::Stop => "stop",
                     ParserFinishReason::Length => "length",
                 };
-                python_events(&method.bind(py).call1((reason,))?, attributed)
+                depythonize(&method.bind(py).call1((reason,))?).map_err(Into::into)
             }),
         }
-    }
-}
-
-fn python_events(events: &Bound<'_, PyAny>, attributed: bool) -> PyResult<Vec<AttributedEvent>> {
-    if attributed {
-        depythonize(events).map_err(Into::into)
-    } else {
-        let events: Vec<ParsedEvent> = depythonize(events)?;
-        Ok(events.into_iter().map(Into::into).collect())
     }
 }
 
@@ -178,6 +122,7 @@ struct ActiveRequest {
     input_tokens: usize,
     cached_tokens: usize,
     output_tokens: usize,
+    last_source: u32,
 }
 
 impl ActiveRequest {
@@ -196,7 +141,19 @@ impl ActiveRequest {
         event: AttributedEvent,
         output: &mut Vec<GenerationEvent>,
     ) -> PyResult<()> {
-        validate_spans(&event, self.output_tokens)?;
+        validate_spans(&event, self.output_tokens, self.scores.as_ref())?;
+        if event
+            .spans
+            .first()
+            .is_some_and(|span| span.token < self.last_source)
+        {
+            return Err(PyValueError::new_err(
+                "response-parser token spans moved backwards",
+            ));
+        }
+        if let Some(last) = event.spans.last() {
+            self.last_source = last.token;
+        }
         for event in self.stops.push(event) {
             self.emit(event, output);
         }
@@ -302,12 +259,8 @@ fn process(
         let mut scores = Vec::new();
         let parsed = (|| -> PyResult<Vec<GenerationEvent>> {
             let mut output = Vec::new();
-            let attributed = request.scores.is_some();
             if tokens.is_empty() {
-                for event in request
-                    .parser
-                    .finish(ParserFinishReason::Length, attributed)?
-                {
+                for event in request.parser.finish(ParserFinishReason::Length)? {
                     request.parsed(event, &mut output)?;
                 }
                 request.flush_stops(&mut output);
@@ -322,14 +275,15 @@ fn process(
                 if let Some(logprobs) = &token.logprobs {
                     let score =
                         vocabulary.generated(token.token_id, token.index, channel, logprobs);
-                    if !matches!(channel, Some("control" | "reasoning" | "tool"))
+                    if score.token.bytes.is_some()
+                        && !matches!(channel, Some("control" | "reasoning" | "tool"))
                         && let Some(output_scores) = &mut request.scores
                     {
                         output_scores.insert(score.clone());
                     }
                     scores.push(score);
                 }
-                let events = request.parser.feed(&[token.token_id], attributed)?;
+                let events = request.parser.feed(&[token.token_id])?;
                 for event in events {
                     request.parsed(event, &mut output)?;
                     if request.stops.stopped() {
@@ -348,13 +302,10 @@ fn process(
                 }
                 if let Some(reason) = token.finish_reason {
                     finished = Some(reason);
-                    for event in request.parser.finish(
-                        match reason {
-                            CompletionReason::Stop => ParserFinishReason::Stop,
-                            CompletionReason::Length => ParserFinishReason::Length,
-                        },
-                        attributed,
-                    )? {
+                    for event in request.parser.finish(match reason {
+                        CompletionReason::Stop => ParserFinishReason::Stop,
+                        CompletionReason::Length => ParserFinishReason::Length,
+                    })? {
                         request.parsed(event, &mut output)?;
                     }
                     request.flush_stops(&mut output);
@@ -475,8 +426,7 @@ fn admit(
             .call_method1("create_parser", (&request, rendered.token_ids.clone()))?
             .unbind();
         let parser = Parser::new(py, parser)?;
-        let scores =
-            (job.request.logprobs && parser.supports_attribution()?).then(OutputScores::default);
+        let scores = job.request.logprobs.then(OutputScores::default);
         let extra = pythonize(py, &job.request.extra)?.unbind();
         let stops = StopFilter::new(job.request.stop.clone())?;
         let prompt_ids = rendered.token_ids.clone();
@@ -542,6 +492,7 @@ fn admit(
                     input_tokens,
                     cached_tokens,
                     output_tokens: 0,
+                    last_source: 0,
                 },
             );
         }
@@ -665,7 +616,11 @@ fn format_python_error(context: &str, error: PyErr) -> String {
     format!("{context}: {error}")
 }
 
-fn validate_spans(event: &AttributedEvent, tokens: usize) -> PyResult<()> {
+fn validate_spans(
+    event: &AttributedEvent,
+    tokens: usize,
+    scores: Option<&OutputScores>,
+) -> PyResult<()> {
     let length = match &event.event {
         ParsedEvent::TextDelta { delta }
         | ParsedEvent::ReasoningDelta { delta }
@@ -673,19 +628,25 @@ fn validate_spans(event: &AttributedEvent, tokens: usize) -> PyResult<()> {
         ParsedEvent::ToolCallStart { .. } => 0,
     };
     if event.spans.iter().any(|span| {
-        span.token_index >= tokens
-            || span.token_start >= span.token_end
-            || span.token_end > span.token_len
-            || span.event_start >= span.event_end
-            || span.event_end > length
-    }) {
+        span.token as usize >= tokens
+            || span.source.start >= span.source.end
+            || span.text.start >= span.text.end
+            || span.text.end as usize > length
+            || scores
+                .and_then(|scores| scores.source_len(span.token))
+                .is_some_and(|length| span.source.end as usize > length)
+    }) || event
+        .spans
+        .windows(2)
+        .any(|pair| pair[0].token > pair[1].token)
+    {
         return Err(PyValueError::new_err("invalid response-parser token spans"));
     }
     Ok(())
 }
 
 fn push_event(events: &mut Vec<GenerationEvent>, event: GenerationEvent) {
-    match (events.last_mut(), &event) {
+    match (events.last_mut(), event) {
         (
             Some(GenerationEvent::TextDelta { delta, logprobs }),
             GenerationEvent::TextDelta {
@@ -693,11 +654,11 @@ fn push_event(events: &mut Vec<GenerationEvent>, event: GenerationEvent) {
                 logprobs: scores,
             },
         ) => {
-            delta.push_str(next);
-            logprobs.extend_from_slice(scores);
+            delta.push_str(&next);
+            logprobs.extend(scores);
         }
         (Some(GenerationEvent::ReasoningDelta(delta)), GenerationEvent::ReasoningDelta(next)) => {
-            delta.push_str(next);
+            delta.push_str(&next);
         }
         (
             Some(GenerationEvent::ToolCallArgumentsDelta { index, delta }),
@@ -705,7 +666,7 @@ fn push_event(events: &mut Vec<GenerationEvent>, event: GenerationEvent) {
                 index: next_index,
                 delta: next,
             },
-        ) if index == next_index => delta.push_str(next),
-        _ => events.push(event),
+        ) if *index == next_index => delta.push_str(&next),
+        (_, event) => events.push(event),
     }
 }

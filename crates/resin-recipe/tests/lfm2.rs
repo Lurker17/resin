@@ -1,4 +1,7 @@
-use resin_recipe::{Decoder, Error, Event, FinishReason, Lfm2Parser, Lfm2Tokens, ResponseParser};
+mod common;
+use common::SemanticParser;
+
+use resin_recipe::{AttributedText, Decoder, Error, Event, FinishReason, Lfm2Parser, Lfm2Tokens};
 use serde_json::{Value, json};
 
 const TOKENS: Lfm2Tokens = Lfm2Tokens {
@@ -14,17 +17,21 @@ const TOKENS: Lfm2Tokens = Lfm2Tokens {
 struct Bytes(Vec<u8>);
 
 impl Decoder for Bytes {
-    fn push(&mut self, ids: &[u32]) -> Result<String, Error> {
+    fn push(&mut self, ids: &[u32], _token_start: u32) -> Result<AttributedText, Error> {
         self.0
             .extend(ids.iter().map(|&id| u8::try_from(id).unwrap()));
         let length = match std::str::from_utf8(&self.0) {
             Ok(_) => self.0.len(),
             Err(error) => error.valid_up_to(),
         };
-        Ok(String::from_utf8(self.0.drain(..length).collect()).unwrap())
+        Ok(AttributedText::plain(
+            String::from_utf8(self.0.drain(..length).collect()).unwrap(),
+        ))
     }
-    fn finish(&mut self) -> Result<String, Error> {
-        Ok(String::from_utf8_lossy(&std::mem::take(&mut self.0)).into_owned())
+    fn finish(&mut self) -> Result<AttributedText, Error> {
+        Ok(AttributedText::plain(
+            String::from_utf8_lossy(&std::mem::take(&mut self.0)).into_owned(),
+        ))
     }
     fn reset(&mut self) {
         self.0.clear();
@@ -90,9 +97,9 @@ fn parses_thinking_text_and_literal_tool_calls_for_every_chunk_size() {
         let mut parser = parser();
         let mut events = Vec::new();
         for chunk in response.chunks(size) {
-            events.extend(parser.feed(chunk).unwrap());
+            events.extend(parser.semantic_feed(chunk).unwrap());
         }
-        events.extend(parser.finish(FinishReason::Stop).unwrap());
+        events.extend(parser.semantic_finish(FinishReason::Stop).unwrap());
         assert_eq!(
             summary(&events),
             (
@@ -113,15 +120,22 @@ fn parses_thinking_text_and_literal_tool_calls_for_every_chunk_size() {
 #[test]
 fn truncated_tools_stay_uncommitted_and_literal_markers_are_text() {
     let mut parser = parser();
-    let mut events = parser.feed(&ids("<think>literal</think>")).unwrap();
-    events.extend(parser.feed(&[TOKENS.tool_call_start]).unwrap());
-    events.extend(parser.feed(&ids("[f(q='unfinished")).unwrap());
-    events.extend(parser.finish(FinishReason::Length).unwrap());
+    let mut events = parser
+        .semantic_feed(&ids("<think>literal</think>"))
+        .unwrap();
+    events.extend(parser.semantic_feed(&[TOKENS.tool_call_start]).unwrap());
+    events.extend(parser.semantic_feed(&ids("[f(q='unfinished")).unwrap());
+    events.extend(parser.semantic_finish(FinishReason::Length).unwrap());
     assert_eq!(
         summary(&events),
         ("<think>literal</think>".into(), String::new(), vec![])
     );
-    assert!(parser.finish(FinishReason::Length).unwrap().is_empty());
+    assert!(
+        parser
+            .semantic_finish(FinishReason::Length)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -134,33 +148,33 @@ fn malformed_tool_calls_are_errors_instead_of_executable_expressions() {
         "[f(q=object.attr)]",
     ] {
         let mut parser = parser();
-        parser.feed(&[TOKENS.tool_call_start]).unwrap();
-        parser.feed(&ids(tool)).unwrap();
+        parser.semantic_feed(&[TOKENS.tool_call_start]).unwrap();
+        parser.semantic_feed(&ids(tool)).unwrap();
         assert!(
-            parser.feed(&[TOKENS.tool_call_end]).is_err(),
+            parser.semantic_feed(&[TOKENS.tool_call_end]).is_err(),
             "accepted {tool}"
         );
     }
     let mut parser = parser();
-    parser.feed(&[TOKENS.tool_call_start]).unwrap();
+    parser.semantic_feed(&[TOKENS.tool_call_start]).unwrap();
     parser
-        .feed(&ids(&format!(
+        .semantic_feed(&ids(&format!(
             "[f(q={}0{})]",
             "[".repeat(65),
             "]".repeat(65)
         )))
         .unwrap();
-    assert!(parser.feed(&[TOKENS.tool_call_end]).is_err());
+    assert!(parser.semantic_feed(&[TOKENS.tool_call_end]).is_err());
 }
 
 #[test]
 fn escaped_unicode_surrogate_pairs_in_json_arguments_decode_to_unicode() {
     let mut parser = parser();
-    parser.feed(&[TOKENS.tool_call_start]).unwrap();
+    parser.semantic_feed(&[TOKENS.tool_call_start]).unwrap();
     parser
-        .feed(&ids(r#"[f(q={"emoji": "\ud83d\ude00"})]"#))
+        .semantic_feed(&ids(r#"[f(q={"emoji": "\ud83d\ude00"})]"#))
         .unwrap();
-    let events = parser.feed(&[TOKENS.tool_call_end]).unwrap();
+    let events = parser.semantic_feed(&[TOKENS.tool_call_end]).unwrap();
     assert_eq!(
         summary(&events).2,
         vec![("f".into(), json!({"q": {"emoji": "😀"}}))]

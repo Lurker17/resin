@@ -1,10 +1,13 @@
+mod common;
+use common::SemanticParser;
+
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 
 use resin_recipe::{
-    Decoder, Error, Event, FinishReason, InklingParser, InklingTokens, ResponseParser,
+    AttributedText, Decoder, Error, Event, FinishReason, InklingParser, InklingTokens,
 };
 
 const TOKENS: InklingTokens = InklingTokens {
@@ -26,7 +29,7 @@ struct ByteDecoder {
 }
 
 impl Decoder for ByteDecoder {
-    fn push(&mut self, ids: &[u32]) -> Result<String, Error> {
+    fn push(&mut self, ids: &[u32], _token_start: u32) -> Result<AttributedText, Error> {
         self.pushes.fetch_add(1, Ordering::Relaxed);
         for &id in ids {
             if id == 900 {
@@ -43,13 +46,13 @@ impl Decoder for ByteDecoder {
             Err(_) => return Err(Error::new("invalid UTF-8")),
         };
         let text = String::from_utf8(self.pending.drain(..length).collect()).unwrap();
-        Ok(text)
+        Ok(AttributedText::plain(text))
     }
 
-    fn finish(&mut self) -> Result<String, Error> {
+    fn finish(&mut self) -> Result<AttributedText, Error> {
         let text = String::from_utf8_lossy(&self.pending).into_owned();
         self.pending.clear();
-        Ok(text)
+        Ok(AttributedText::plain(text))
     }
 
     fn reset(&mut self) {
@@ -136,9 +139,9 @@ fn chunk_boundaries_preserve_reasoning_text_and_tool_events() {
         let mut parser = parser(&[TOKENS.message_model]);
         let mut events = Vec::new();
         for chunk in ids.chunks(width) {
-            events.extend(parser.feed(chunk).unwrap());
+            events.extend(parser.semantic_feed(chunk).unwrap());
         }
-        events.extend(parser.finish(FinishReason::Stop).unwrap());
+        events.extend(parser.semantic_finish(FinishReason::Stop).unwrap());
         assert_eq!(coalesce(events), expected, "chunk width {width}");
     }
 }
@@ -149,22 +152,27 @@ fn prompt_tail_selects_the_open_block_and_headers_stay_hidden() {
     thinking_prompt.extend(text_ids("already open"));
     assert_eq!(
         parser(&thinking_prompt)
-            .feed(&text_ids("continued"))
+            .semantic_feed(&text_ids("continued"))
             .unwrap(),
         vec![reasoning("continued")]
     );
     assert_eq!(
         parser(&[TOKENS.content_text])
-            .feed(&text_ids("visible"))
+            .semantic_feed(&text_ids("visible"))
             .unwrap(),
         vec![text("visible")]
     );
 
     let mut parser = parser(&[TOKENS.content_thinking, TOKENS.end_message]);
-    assert!(parser.feed(&text_ids("hidden header")).unwrap().is_empty());
+    assert!(
+        parser
+            .semantic_feed(&text_ids("hidden header"))
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         parser
-            .feed(&[TOKENS.content_text, u32::from(b'x')])
+            .semantic_feed(&[TOKENS.content_text, u32::from(b'x')])
             .unwrap(),
         vec![text("x")]
     );
@@ -174,16 +182,16 @@ fn prompt_tail_selects_the_open_block_and_headers_stay_hidden() {
 fn only_control_token_ids_change_state() {
     let mut parser = parser(&[TOKENS.content_text]);
     assert_eq!(
-        parser.feed(&[900]).unwrap(),
+        parser.semantic_feed(&[900]).unwrap(),
         vec![text("<|content_thinking|>")]
     );
     assert_eq!(
-        parser.feed(&text_ids(" still text")).unwrap(),
+        parser.semantic_feed(&text_ids(" still text")).unwrap(),
         vec![text(" still text")]
     );
     for marker in [TOKENS.content_invoke_tool_text, TOKENS.content_tool_error] {
         assert_eq!(
-            parser.feed(&[marker, u32::from(b'x')]).unwrap(),
+            parser.semantic_feed(&[marker, u32::from(b'x')]).unwrap(),
             vec![text("x")]
         );
     }
@@ -201,7 +209,7 @@ fn decoder_batches_token_runs_and_flushes_at_control_boundaries() {
     ids.extend([0xf0, 0x9f, TOKENS.content_thinking]);
     ids.extend(text_ids("next"));
     assert_eq!(
-        parser.feed(&ids).unwrap(),
+        parser.semantic_feed(&ids).unwrap(),
         vec![text("hello"), text("�"), reasoning("next")]
     );
     assert_eq!(pushes.load(Ordering::Relaxed), 2);
@@ -211,12 +219,12 @@ fn decoder_batches_token_runs_and_flushes_at_control_boundaries() {
 fn finish_flushes_text_and_is_idempotent() {
     for reason in [FinishReason::Stop, FinishReason::Length] {
         let mut parser = parser(&[TOKENS.content_text]);
-        assert!(parser.feed(&[0xf0, 0x9f]).unwrap().is_empty());
-        assert_eq!(parser.finish(reason).unwrap(), vec![text("�")]);
-        assert!(parser.finish(reason).unwrap().is_empty());
+        assert!(parser.semantic_feed(&[0xf0, 0x9f]).unwrap().is_empty());
+        assert_eq!(parser.semantic_finish(reason).unwrap(), vec![text("�")]);
+        assert!(parser.semantic_finish(reason).unwrap().is_empty());
         assert!(
             parser
-                .feed(&[])
+                .semantic_feed(&[])
                 .unwrap_err()
                 .to_string()
                 .contains("after finish")
@@ -233,8 +241,13 @@ fn unfinished_tools_are_discarded_even_when_the_json_is_complete() {
         let mut parser = parser(&[TOKENS.message_model]);
         let mut ids = vec![TOKENS.content_invoke_tool_json];
         ids.extend(text_ids(payload));
-        assert!(parser.feed(&ids).unwrap().is_empty());
-        assert!(parser.finish(FinishReason::Length).unwrap().is_empty());
+        assert!(parser.semantic_feed(&ids).unwrap().is_empty());
+        assert!(
+            parser
+                .semantic_finish(FinishReason::Length)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
@@ -253,7 +266,7 @@ fn closed_tools_validate_json_names_and_argument_objects() {
         ids.push(TOKENS.end_message);
         assert!(
             parser
-                .feed(&ids)
+                .semantic_feed(&ids)
                 .unwrap_err()
                 .to_string()
                 .contains(expected),
@@ -263,7 +276,7 @@ fn closed_tools_validate_json_names_and_argument_objects() {
     let mut parser = parser(&[]);
     assert!(
         parser
-            .feed(&[TOKENS.content_invoke_tool_json, TOKENS.end_message])
+            .semantic_feed(&[TOKENS.content_invoke_tool_json, TOKENS.end_message])
             .unwrap()
             .is_empty()
     );

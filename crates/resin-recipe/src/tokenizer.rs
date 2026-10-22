@@ -18,20 +18,19 @@ pub struct TokenizerDecoder {
     ids: Vec<u32>,
     prefix: String,
     prefix_index: usize,
-    trace: Option<trace::Trace>,
-    untraced: bool,
+    trace: trace::Trace,
 }
 
 impl TokenizerDecoder {
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
-        Self {
+    pub fn new(tokenizer: Arc<Tokenizer>) -> Result<Self, Error> {
+        let trace = trace::Trace::new(&tokenizer)?;
+        Ok(Self {
             tokenizer,
             ids: Vec::new(),
             prefix: String::new(),
             prefix_index: 0,
-            trace: None,
-            untraced: false,
-        }
+            trace,
+        })
     }
     fn push_text(&mut self, ids: &[u32]) -> Result<String, Error> {
         if ids.is_empty() {
@@ -66,56 +65,21 @@ impl TokenizerDecoder {
 }
 
 impl Decoder for TokenizerDecoder {
-    fn supports_attribution(&mut self) -> bool {
-        self.trace
-            .get_or_insert_with(|| trace::Trace::new(&self.tokenizer))
-            .supported()
-    }
-    fn push(&mut self, ids: &[u32]) -> Result<String, Error> {
-        if !ids.is_empty() {
-            self.untraced = true;
-            if let Some(trace) = &mut self.trace {
-                trace.mark_unknown();
-            }
-        }
-        self.push_text(ids)
-    }
-    fn finish(&mut self) -> Result<String, Error> {
-        let text = self.finish_text()?;
-        self.reset();
-        Ok(text)
-    }
-    fn push_attributed(
-        &mut self,
-        ids: &[u32],
-        token_start: usize,
-    ) -> Result<AttributedText, Error> {
-        let trace = self
-            .trace
-            .get_or_insert_with(|| trace::Trace::new(&self.tokenizer));
-        if self.untraced {
-            trace.mark_unknown();
-        }
-        trace.push(&self.tokenizer, ids, token_start);
+    fn push(&mut self, ids: &[u32], token_start: u32) -> Result<AttributedText, Error> {
+        self.trace.push(&self.tokenizer, ids, token_start)?;
         let text = self.push_text(ids)?;
-        Ok(self.trace.as_mut().unwrap().output(text))
+        self.trace.output(text)
     }
 
-    fn finish_attributed(&mut self) -> Result<AttributedText, Error> {
+    fn finish(&mut self) -> Result<AttributedText, Error> {
         let text = self.finish_text()?;
-        let result = match &mut self.trace {
-            Some(trace) => trace.output(text),
-            None => AttributedText::plain(text),
-        };
+        let result = self.trace.output(text);
         self.reset();
-        Ok(result)
+        result
     }
 
     fn reset(&mut self) {
-        self.untraced = false;
-        if let Some(trace) = &mut self.trace {
-            trace.clear();
-        }
+        self.trace.clear();
         self.ids.clear();
         self.prefix.clear();
         self.prefix_index = 0;

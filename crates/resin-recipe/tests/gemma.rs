@@ -1,5 +1,8 @@
+mod common;
+use common::SemanticParser;
+
 use resin_recipe::{
-    Decoder, Error, Event, FinishReason, Gemma4Parser, Gemma4Tokens, PromptSpan, ResponseParser,
+    AttributedText, Decoder, Error, Event, FinishReason, Gemma4Parser, Gemma4Tokens, PromptSpan,
 };
 use serde_json::{Value, json};
 
@@ -19,7 +22,7 @@ const TOKENS: Gemma4Tokens = Gemma4Tokens {
 #[derive(Default)]
 struct ByteDecoder(Vec<u8>);
 impl Decoder for ByteDecoder {
-    fn push(&mut self, ids: &[u32]) -> Result<String, Error> {
+    fn push(&mut self, ids: &[u32], _token_start: u32) -> Result<AttributedText, Error> {
         for &id in ids {
             self.0
                 .push(u8::try_from(id).map_err(|_| Error::new("invalid byte token"))?);
@@ -29,10 +32,14 @@ impl Decoder for ByteDecoder {
             Err(error) if error.error_len().is_none() => error.valid_up_to(),
             Err(_) => return Err(Error::new("invalid UTF-8")),
         };
-        Ok(String::from_utf8(self.0.drain(..length).collect()).unwrap())
+        Ok(AttributedText::plain(
+            String::from_utf8(self.0.drain(..length).collect()).unwrap(),
+        ))
     }
-    fn finish(&mut self) -> Result<String, Error> {
-        Ok(String::from_utf8_lossy(&std::mem::take(&mut self.0)).into_owned())
+    fn finish(&mut self) -> Result<AttributedText, Error> {
+        Ok(AttributedText::plain(
+            String::from_utf8_lossy(&std::mem::take(&mut self.0)).into_owned(),
+        ))
     }
     fn reset(&mut self) {
         self.0.clear();
@@ -140,33 +147,40 @@ fn streaming_thoughts_and_nested_tools_are_chunk_invariant() {
     );
     for split in 0..=ids.len() {
         let mut parser = parser(&[]);
-        let mut events = parser.feed(&ids[..split]).unwrap();
-        events.extend(parser.feed(&ids[split..]).unwrap());
-        events.extend(parser.finish(FinishReason::Stop).unwrap());
+        let mut events = parser.semantic_feed(&ids[..split]).unwrap();
+        events.extend(parser.semantic_feed(&ids[split..]).unwrap());
+        events.extend(parser.semantic_finish(FinishReason::Stop).unwrap());
         assert_eq!(semantic(&events), expected, "split {split}");
-        assert!(parser.finish(FinishReason::Stop).unwrap().is_empty());
+        assert!(
+            parser
+                .semantic_finish(FinishReason::Stop)
+                .unwrap()
+                .is_empty()
+        );
     }
     let mut parser = parser(&[]);
     let mut events = Vec::new();
     for id in ids {
-        events.extend(parser.feed(&[id]).unwrap());
+        events.extend(parser.semantic_feed(&[id]).unwrap());
     }
-    events.extend(parser.finish(FinishReason::Stop).unwrap());
+    events.extend(parser.semantic_finish(FinishReason::Stop).unwrap());
     assert_eq!(semantic(&events), expected);
 }
 
 #[test]
 fn literal_markers_are_text_and_unfinished_tools_do_not_commit() {
     let mut parser = parser(&[TOKENS.channel_start, TOKENS.channel_end]);
-    let mut events = parser.feed(&bytes("literal <|tool_call> 🦀")).unwrap();
-    events.extend(parser.feed(&[TOKENS.tool_call_start]).unwrap());
-    events.extend(parser.feed(&bytes("call:f{a:")).unwrap());
-    events.extend(parser.finish(FinishReason::Length).unwrap());
+    let mut events = parser
+        .semantic_feed(&bytes("literal <|tool_call> 🦀"))
+        .unwrap();
+    events.extend(parser.semantic_feed(&[TOKENS.tool_call_start]).unwrap());
+    events.extend(parser.semantic_feed(&bytes("call:f{a:")).unwrap());
+    events.extend(parser.semantic_finish(FinishReason::Length).unwrap());
     assert_eq!(
         semantic(&events),
         (String::new(), "literal <|tool_call> 🦀".into(), Vec::new())
     );
-    assert!(parser.feed(&bytes("late")).is_err());
+    assert!(parser.semantic_feed(&bytes("late")).is_err());
 }
 
 #[test]
@@ -176,6 +190,6 @@ fn closed_malformed_tool_is_an_error() {
         let mut ids = vec![TOKENS.tool_call_start];
         ids.extend(bytes(payload));
         ids.push(TOKENS.tool_call_end);
-        assert!(parser.feed(&ids).is_err(), "{payload}");
+        assert!(parser.semantic_feed(&ids).is_err(), "{payload}");
     }
 }

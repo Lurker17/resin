@@ -58,6 +58,8 @@ def _coalesce(events: list[ParserEvent]) -> list[ParserEvent]:
     """Ignore event chunk boundaries when comparing semantic output."""
     result: list[ParserEvent] = []
     for event in events:
+        event = event.copy()
+        event.pop("token_spans", None)
         if (
             result
             and event["type"] in ("text_delta", "reasoning_delta")
@@ -65,7 +67,7 @@ def _coalesce(events: list[ParserEvent]) -> list[ParserEvent]:
         ):
             result[-1]["delta"] += event["delta"]
         else:
-            result.append(event.copy())
+            result.append(event)
     return result
 
 
@@ -150,9 +152,18 @@ def test_native_decoder_buffers_partial_utf8_between_feeds() -> None:
         prompt_ids=[markers["<|content_text|>"]],
     )
 
+    assert parser.feed([markers["<|content_text|>"]]) == []
     for token_id in ids[:-1]:
         assert parser.feed([token_id]) == []
-    assert parser.feed(ids[-1:]) == [{"type": "text_delta", "delta": "🦀"}]
+    assert parser.feed(ids[-1:]) == [
+        {
+            "type": "text_delta",
+            "delta": "🦀",
+            "token_spans": [(index, 0, 1, 0, 4) for index in range(1, 5)],
+        }
+    ]
+    assert not hasattr(parser, "feed_attributed")
+    assert not hasattr(parser, "finish_attributed")
     assert parser.finish("length") == []
 
 
@@ -167,7 +178,13 @@ def test_native_decoder_flushes_incomplete_utf8_at_finish() -> None:
     incomplete = backend.encode("🦀", add_special_tokens=False).ids[:2]
 
     assert parser.feed(incomplete) == []
-    assert parser.finish("length") == [{"type": "text_delta", "delta": "\ufffd"}]
+    assert parser.finish("length") == [
+        {
+            "type": "text_delta",
+            "delta": "\ufffd",
+            "token_spans": [(index, 0, 1, 0, 3) for index in range(2)],
+        }
+    ]
     assert parser.finish("length") == []
 
 
@@ -184,10 +201,34 @@ def test_native_tokenizer_is_a_snapshot_and_parsers_have_independent_state() -> 
     ]
     ids = backend.encode("café", add_special_tokens=False).ids
 
-    assert parsers[0].feed(ids) == [{"type": "text_delta", "delta": "café"}]
-    assert parsers[1].feed(ids) == [{"type": "text_delta", "delta": "café"}]
+    def expected(offset: int) -> list[ParserEvent]:
+        return [
+            {
+                "type": "text_delta",
+                "delta": "café",
+                "token_spans": [
+                    (offset, 0, 1, 0, 1),
+                    (offset + 1, 0, 1, 1, 2),
+                    (offset + 2, 0, 1, 2, 3),
+                    (offset + 3, 0, 1, 3, 5),
+                    (offset + 4, 0, 1, 3, 5),
+                ],
+            }
+        ]
+
+    assert parsers[0].feed(ids) == expected(0)
+    assert parsers[1].feed(ids) == expected(0)
     assert parsers[0].finish("stop") == []
-    assert parsers[1].feed(ids) == [{"type": "text_delta", "delta": "café"}]
+    assert parsers[1].feed(ids) == expected(5)
+
+
+def test_native_parser_rejects_an_unsupported_decoder_chain() -> None:
+    from tokenizers.decoders import WordPiece
+
+    backend = _byte_tokenizer()
+    backend.decoder = WordPiece()
+    with pytest.raises(ValueError, match="decoder"):
+        InklingResponseParser(Tokenizer(backend), _token_ids(backend))
 
 
 def test_custom_tokenizer_with_no_native_backend_uses_decode() -> None:

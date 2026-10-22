@@ -37,16 +37,16 @@ impl StopFilter {
             return vec![event];
         }
         let mut output = Vec::new();
-        if let Some(pending) = self.pending.take() {
+        if let Some(mut pending) = self.pending.take() {
             if same_lane(&pending.event, &event.event) {
-                let mut text = attributed_text(&pending).unwrap();
-                text.push(attributed_text(&event).unwrap());
+                let mut text = take_text(&mut pending).unwrap();
+                text.push(take_text(&mut event).unwrap());
                 event = with_text(pending, text);
             } else {
                 output.push(pending);
             }
         }
-        let Some(mut text) = attributed_text(&event) else {
+        let Some(mut text) = take_text(&mut event) else {
             output.push(event);
             return output;
         };
@@ -86,6 +86,7 @@ impl StopFilter {
     }
 }
 
+#[cfg(test)]
 fn delta(event: &Event) -> Option<&str> {
     match event {
         Event::TextDelta { delta }
@@ -95,10 +96,16 @@ fn delta(event: &Event) -> Option<&str> {
     }
 }
 
-fn attributed_text(event: &AttributedEvent) -> Option<AttributedText> {
+fn take_text(event: &mut AttributedEvent) -> Option<AttributedText> {
+    let delta = match &mut event.event {
+        Event::TextDelta { delta }
+        | Event::ReasoningDelta { delta }
+        | Event::ToolCallArgumentsDelta { delta, .. } => delta,
+        Event::ToolCallStart { .. } => return None,
+    };
     Some(AttributedText {
-        text: delta(&event.event)?.to_owned(),
-        spans: event.spans.clone(),
+        text: std::mem::take(delta),
+        spans: std::mem::take(&mut event.spans),
     })
 }
 
@@ -205,32 +212,26 @@ mod tests {
         let mut filter = filter(&["SX"]);
         let mut first = text("abS");
         first.spans.push(TokenSpan {
-            token_index: 0,
-            token_start: 0,
-            token_end: 3,
-            token_len: 3,
-            event_start: 0,
-            event_end: 3,
+            token: 0,
+            source: 0..3,
+            text: 0..3,
         });
         let head = filter.push(first);
         assert_eq!(delta(&head[0].event), Some("ab"));
-        assert_eq!(head[0].spans[0].token_end, 2);
+        assert_eq!(head[0].spans[0].source.end, 2);
         let mut next = text("Y");
         next.spans.push(TokenSpan {
-            token_index: 1,
-            token_start: 0,
-            token_end: 1,
-            token_len: 1,
-            event_start: 0,
-            event_end: 1,
+            token: 1,
+            source: 0..1,
+            text: 0..1,
         });
         let released = filter.push(next);
         assert_eq!(delta(&released[0].event), Some("SY"));
-        assert_eq!(released[0].spans[0].token_index, 0);
-        assert_eq!(released[0].spans[0].token_start, 2);
-        assert_eq!(released[0].spans[0].token_end, 3);
-        assert_eq!(released[0].spans[1].token_index, 1);
-        assert_eq!(released[0].spans[1].event_start, 1);
+        assert_eq!(released[0].spans[0].token, 0);
+        assert_eq!(released[0].spans[0].source.start, 2);
+        assert_eq!(released[0].spans[0].source.end, 3);
+        assert_eq!(released[0].spans[1].token, 1);
+        assert_eq!(released[0].spans[1].text.start, 1);
         assert!(!filter.stopped());
     }
 }

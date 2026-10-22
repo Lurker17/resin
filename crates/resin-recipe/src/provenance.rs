@@ -3,20 +3,67 @@ use crate::Event;
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, Range};
 
-/// One source-token fragment contributing bytes to a semantic text delta.
-/// All ranges are end-exclusive bytes. A Unicode scalar split across tokens
-/// gives each contributing token the scalar's whole event interval; intervals
-/// may therefore overlap. Source ranges always refer to `TokenBytes::get`.
+/// One token's source bytes mapped to a semantic delta's UTF-8 bytes.
+/// Ranges are end-exclusive. Split Unicode scalars give each contributing token
+/// the scalar's whole text interval, so text ranges may overlap.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(from = "(u32, u32, u32, u32, u32)", into = "(u32, u32, u32, u32, u32)")]
 pub struct TokenSpan {
-    /// Zero-based index in generated IDs, including headers and controls.
-    pub token_index: usize,
-    pub token_start: usize,
-    pub token_end: usize,
-    /// Full original token byte extent, before grammar or stop trimming.
-    pub token_len: usize,
-    pub event_start: usize,
-    pub event_end: usize,
+    /// Zero-based generated token index, including headers and controls.
+    pub token: u32,
+    pub source: Range<u32>,
+    pub text: Range<u32>,
+}
+impl From<(u32, u32, u32, u32, u32)> for TokenSpan {
+    fn from(
+        (token, source_start, source_end, text_start, text_end): (u32, u32, u32, u32, u32),
+    ) -> Self {
+        Self {
+            token,
+            source: source_start..source_end,
+            text: text_start..text_end,
+        }
+    }
+}
+impl From<TokenSpan> for (u32, u32, u32, u32, u32) {
+    fn from(span: TokenSpan) -> Self {
+        (
+            span.token,
+            span.source.start,
+            span.source.end,
+            span.text.start,
+            span.text.end,
+        )
+    }
+}
+impl TokenSpan {
+    pub(crate) fn clipped(&self, range: Range<u32>) -> Option<Self> {
+        let start = self.text.start.max(range.start);
+        let end = self.text.end.min(range.end);
+        if start >= end {
+            return None;
+        }
+        let mut source = self.source.clone();
+        if source.end - source.start == self.text.end - self.text.start {
+            source.start += start - self.text.start;
+            source.end = source.start + end - start;
+        } else if start != self.text.start || end != self.text.end {
+            // Split scalars and replacement characters have indivisible ownership.
+            return None;
+        }
+        Some(Self {
+            token: self.token,
+            source,
+            text: start - range.start..end - range.start,
+        })
+    }
+    fn joins(&self, next: &Self) -> bool {
+        self.token == next.token
+            && self.source.end == next.source.start
+            && self.text.end == next.text.start
+            && self.source.end - self.source.start == self.text.end - self.text.start
+            && next.source.end - next.source.start == next.text.end - next.text.start
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -55,59 +102,74 @@ impl AttributedText {
         }
     }
     pub fn slice(&self, range: Range<usize>) -> Self {
-        let spans = self
-            .spans
-            .iter()
-            .filter_map(|span| {
-                let start = span.event_start.max(range.start);
-                let end = span.event_end.min(range.end);
-                if start >= end {
-                    return None;
-                }
-                let mut clipped = span.clone();
-                if span.token_end - span.token_start == span.event_end - span.event_start {
-                    clipped.token_start += start - span.event_start;
-                    clipped.token_end = clipped.token_start + end - start;
-                } else if start != span.event_start || end != span.event_end {
-                    // A replacement character may represent one invalid source
-                    // byte. It cannot be subdivided into invented byte ownership.
-                    return None;
-                }
-                clipped.event_start = start - range.start;
-                clipped.event_end = end - range.start;
-                Some(clipped)
-            })
-            .collect();
+        let bytes = u32::try_from(range.start).expect("text range exceeds u32")
+            ..u32::try_from(range.end).expect("text range exceeds u32");
         Self {
             text: self.text[range].to_owned(),
-            spans,
+            spans: self
+                .spans
+                .iter()
+                .filter_map(|span| span.clipped(bytes.clone()))
+                .collect(),
         }
     }
     pub fn take(&mut self, length: usize) -> Self {
-        let head = self.slice(0..length);
-        *self = self.slice(length..self.text.len());
-        head
+        if length == self.text.len() {
+            return std::mem::take(self);
+        }
+        if length == 0 {
+            return Self::default();
+        }
+        let split = u32::try_from(length).expect("text range exceeds u32");
+        let end = u32::try_from(self.text.len()).expect("text range exceeds u32");
+        let tail = self.text.split_off(length);
+        let head = std::mem::replace(&mut self.text, tail);
+        let mut tail_spans = Vec::new();
+        self.spans.retain_mut(|span| {
+            if let Some(tail) = span.clipped(split..end) {
+                tail_spans.push(tail);
+            }
+            if let Some(head) = span.clipped(0..split) {
+                *span = head;
+                true
+            } else {
+                false
+            }
+        });
+        Self {
+            text: head,
+            spans: std::mem::replace(&mut self.spans, tail_spans),
+        }
     }
     pub fn push(&mut self, text: Self) {
-        let offset = self.text.len();
+        if self.text.is_empty() {
+            *self = text;
+            return;
+        }
+        let offset = u32::try_from(self.text.len()).expect("text range exceeds u32");
         self.text.push_str(&text.text);
         for mut span in text.spans {
-            span.event_start += offset;
-            span.event_end += offset;
-            if let Some(previous) = self.spans.last_mut()
-                && previous.token_index == span.token_index
-                && previous.token_len == span.token_len
-                && previous.token_end == span.token_start
-                && previous.event_end == span.event_start
-                && previous.token_end - previous.token_start
-                    == previous.event_end - previous.event_start
-                && span.token_end - span.token_start == span.event_end - span.event_start
-            {
-                previous.token_end = span.token_end;
-                previous.event_end = span.event_end;
-            } else {
-                self.spans.push(span);
-            }
+            span.text.start = span
+                .text
+                .start
+                .checked_add(offset)
+                .expect("text range exceeds u32");
+            span.text.end = span
+                .text
+                .end
+                .checked_add(offset)
+                .expect("text range exceeds u32");
+            self.push_span(span);
+        }
+    }
+    pub(crate) fn push_span(&mut self, span: TokenSpan) {
+        if let Some(previous) = self.spans.last_mut()
+            && previous.joins(&span)
+        {
+            previous.source.end = span.source.end;
+            previous.text.end = span.text.end;
+        } else {
+            self.spans.push(span);
         }
     }
     pub fn clear(&mut self) {

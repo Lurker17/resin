@@ -145,15 +145,33 @@ with a `logprobs` array. Canonical records accompany each
 response. Concatenating raw score arrays yields the same records as the
 non-streaming response, independently of semantic parser chunk boundaries.
 
-Custom parsers can implement `AttributedResponseParser` from `resin.protocols`.
-Scored requests then call `feed_attributed` and `finish_attributed`; ordinary
-requests retain `feed` and `finish`. Each returned `ParserEvent.token_spans`
-maps half-open source-token byte ranges (`token_start`, `token_end`, `token_len`)
-to UTF-8 byte ranges in that event (`event_start`, `event_end`), with an absolute
-generated `token_index` that includes control tokens. Preserve these spans across
-buffering. Custom parsers without this opt-in and unsupported tokenizer decoder
-chains still provide raw scores; canonical association stays unknown. Invalid
-span bounds fail that request without poisoning the engine.
+Every recipe parser returns provenance from its ordinary `feed` and `finish`
+methods, for scored and unscored requests. Custom parsers use the same
+`ResponseParser`/`FinalizingResponseParser` protocols from `resin.protocols`.
+Each `ParserEvent.token_spans` entry is a five-integer tuple:
+
+```python
+{"type": "text_delta", "delta": "ab", "token_spans": [(0, 0, 1, 0, 1), (1, 0, 1, 1, 2)]}
+```
+
+The fields are `(token_index, source_start, source_end, text_start, text_end)`.
+The example maps the full bytes of generated tokens 0 and 1 onto `a` and `b`.
+Token indices count all generated tokens, including headers and controls.
+Source ranges address the original vocabulary token's bytes; text ranges address
+the event delta's UTF-8 bytes. Both are half-open, and every field fits uint32.
+Several byte tokens can share one whole Unicode character's text range. Preserve
+these compact spans in source-token order through buffering; the native representation uses five u32
+values rather than six machine-sized offsets. Full-token byte lengths come from
+the tokenizer vocabulary instead of being repeated in each span.
+
+Missing or empty spans explicitly mean synthetic text or unknown provenance.
+They still allow raw scores, with no guessed canonical association. Custom Python
+tokenizers without a serialized backend can use this fallback; native parser
+creation rejects unsupported serialized decoder chains. `token_spans` is reserved
+metadata: malformed values, unseen or out-of-order source indices, empty/reversed
+ranges, and invalid text bounds fail the request even when scores are off,
+without poisoning the engine. Scored requests also check source byte extents
+against the raw vocabulary bytes when those bytes are available.
 
 Both APIs accept `prompt_logprobs: true`, independently of generated scores.
 Prompt top alternatives and target scoring are currently engine-only.

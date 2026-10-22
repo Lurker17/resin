@@ -37,7 +37,7 @@ pub struct Parser<G> {
     pub(crate) grammar: G,
     decoder: Box<dyn Decoder>,
     finished: bool,
-    pub(crate) next_token_index: usize,
+    pub(crate) next_token_index: u32,
 }
 
 impl<G: Grammar> Parser<G> {
@@ -49,39 +49,28 @@ impl<G: Grammar> Parser<G> {
             next_token_index: 0,
         }
     }
-    fn text(
-        &mut self,
-        ids: &[u32],
-        token_start: usize,
-        traced: bool,
-        events: &mut EventSink,
-    ) -> Result<(), Error> {
+    fn text(&mut self, ids: &[u32], token_start: u32, events: &mut EventSink) -> Result<(), Error> {
         if !ids.is_empty() {
-            let text = if traced {
-                self.decoder.push_attributed(ids, token_start)?
-            } else {
-                AttributedText::plain(self.decoder.push(ids)?)
-            };
+            let text = self.decoder.push(ids, token_start)?;
             self.grammar.text(text, events)?;
         }
         Ok(())
     }
-    fn flush(&mut self, traced: bool, events: &mut EventSink) -> Result<(), Error> {
-        let text = if traced {
-            self.decoder.finish_attributed()?
-        } else {
-            AttributedText::plain(self.decoder.finish()?)
-        };
+    fn flush(&mut self, events: &mut EventSink) -> Result<(), Error> {
+        let text = self.decoder.finish()?;
         self.grammar.text(text, events)?;
         self.decoder.reset();
         Ok(())
     }
-    fn feed_events(&mut self, ids: &[u32], traced: bool) -> Result<Vec<AttributedEvent>, Error> {
+    fn feed_events(&mut self, ids: &[u32]) -> Result<Vec<AttributedEvent>, Error> {
         if self.finished {
             return Err(Error::new("cannot feed a response parser after finish"));
         }
         let base = self.next_token_index;
-        self.next_token_index += ids.len();
+        self.next_token_index = u32::try_from(ids.len())
+            .ok()
+            .and_then(|length| base.checked_add(length))
+            .ok_or_else(|| Error::new("generated token indices exceed the u32 range"))?;
         let mut events = EventSink::default();
         let mut start = 0;
         for (index, &id) in ids.iter().enumerate() {
@@ -92,26 +81,22 @@ impl<G: Grammar> Parser<G> {
                 return Ok(events.0);
             }
             if self.grammar.is_control(id) {
-                self.text(&ids[start..index], base + start, traced, &mut events)?;
-                self.flush(traced, &mut events)?;
+                self.text(&ids[start..index], base + start as u32, &mut events)?;
+                self.flush(&mut events)?;
                 self.grammar.control(id, &mut events)?;
                 start = index + 1;
             }
         }
         if !self.grammar.ended() {
-            self.text(&ids[start..], base + start, traced, &mut events)?;
+            self.text(&ids[start..], base + start as u32, &mut events)?;
         }
         Ok(events.0)
     }
-    fn finish_events(
-        &mut self,
-        reason: FinishReason,
-        traced: bool,
-    ) -> Result<Vec<AttributedEvent>, Error> {
+    fn finish_events(&mut self, reason: FinishReason) -> Result<Vec<AttributedEvent>, Error> {
         let mut events = EventSink::default();
         if !self.finished {
             if !self.grammar.ended() {
-                self.flush(traced, &mut events)?;
+                self.flush(&mut events)?;
             }
             self.grammar.finish(reason, &mut events)?;
             self.finished = true;
@@ -121,9 +106,6 @@ impl<G: Grammar> Parser<G> {
 }
 
 impl<G: Grammar> ResponseParser for Parser<G> {
-    fn supports_attribution(&mut self) -> bool {
-        self.decoder.supports_attribution()
-    }
     fn token_channel(&self, id: u32) -> Option<&'static str> {
         if self.finished || self.grammar.ended() {
             None
@@ -133,19 +115,11 @@ impl<G: Grammar> ResponseParser for Parser<G> {
             self.grammar.channel()
         }
     }
-    fn feed(&mut self, ids: &[u32]) -> Result<Vec<Event>, Error> {
-        self.feed_events(ids, false)
-            .map(|events| events.into_iter().map(|item| item.event).collect())
+    fn feed(&mut self, ids: &[u32]) -> Result<Vec<AttributedEvent>, Error> {
+        self.feed_events(ids)
     }
-    fn finish(&mut self, reason: FinishReason) -> Result<Vec<Event>, Error> {
-        self.finish_events(reason, false)
-            .map(|events| events.into_iter().map(|item| item.event).collect())
-    }
-    fn feed_attributed(&mut self, ids: &[u32]) -> Result<Vec<AttributedEvent>, Error> {
-        self.feed_events(ids, true)
-    }
-    fn finish_attributed(&mut self, reason: FinishReason) -> Result<Vec<AttributedEvent>, Error> {
-        self.finish_events(reason, true)
+    fn finish(&mut self, reason: FinishReason) -> Result<Vec<AttributedEvent>, Error> {
+        self.finish_events(reason)
     }
 }
 
@@ -199,3 +173,39 @@ macro_rules! tokens {
     };
 }
 pub(crate) use tokens;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture;
+    impl Decoder for Fixture {
+        fn push(&mut self, _: &[u32], _: u32) -> Result<AttributedText, Error> {
+            panic!("overflow must be rejected before decoder state changes")
+        }
+        fn finish(&mut self) -> Result<AttributedText, Error> {
+            Ok(AttributedText::default())
+        }
+        fn reset(&mut self) {}
+    }
+    impl Grammar for Fixture {
+        fn is_control(&self, _: u32) -> bool {
+            false
+        }
+        fn text(&mut self, _: AttributedText, _: &mut EventSink) -> Result<(), Error> {
+            Ok(())
+        }
+        fn control(&mut self, _: u32, _: &mut EventSink) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn overflowing_source_indices_fail_before_decoder_mutation() {
+        let mut parser = Parser::with_grammar(Fixture, Box::new(Fixture));
+        parser.next_token_index = u32::MAX - 1;
+        assert!(parser.feed(&[1, 2]).is_err());
+        assert_eq!(parser.next_token_index, u32::MAX - 1);
+        assert!(parser.feed(&[]).unwrap().is_empty());
+    }
+}

@@ -2,7 +2,7 @@ use resin_recipe::{
     AttributedEvent, Decoder, Event, FinishReason, ModelFormat, ResponseParser, Tokenizer,
     TokenizerDecoder, TokenizerEncoder,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Map, json};
 use std::{collections::BTreeMap, sync::Arc};
 
 const CONTROLS: &[&str] = &[
@@ -87,7 +87,7 @@ fn parser(
     model
         .create_parser(
             &TokenizerEncoder::new(tokenizer.clone()).unwrap(),
-            Box::new(TokenizerDecoder::new(tokenizer)),
+            Box::new(TokenizerDecoder::new(tokenizer).unwrap()),
             &json!({}),
             prompt,
         )
@@ -115,13 +115,13 @@ fn normalize(events: Vec<AttributedEvent>) -> (String, String, Ownership) {
         };
         let base = target.0.len() - target.1;
         for span in event.spans {
-            assert!(span.event_end <= target.1);
-            assert!(span.token_end <= span.token_len);
-            owners.entry(span.token_index).or_default().push((
-                span.token_start,
-                span.token_end,
-                base + span.event_start,
-                base + span.event_end,
+            assert!(span.text.end as usize <= target.1);
+            assert!(span.source.start <= span.source.end);
+            owners.entry(span.token as usize).or_default().push((
+                span.source.start as usize,
+                span.source.end as usize,
+                base + span.text.start as usize,
+                base + span.text.end as usize,
                 target.2,
             ));
         }
@@ -181,13 +181,11 @@ fn all_model_grammars_preserve_unicode_and_source_indices_across_batching() {
             let mut expected = None;
             for chunk_size in [1, 2, 3, 7, generated.len()] {
                 let mut decoder = parser(model, tokenizer.clone(), &prompt);
-                assert!(decoder.supports_attribution());
                 let mut events = Vec::new();
                 for chunk in generated.chunks(chunk_size) {
-                    assert!(decoder.supports_attribution());
-                    events.extend(decoder.feed_attributed(chunk).unwrap());
+                    events.extend(decoder.feed(chunk).unwrap());
                 }
-                events.extend(decoder.finish_attributed(FinishReason::Length).unwrap());
+                events.extend(decoder.finish(FinishReason::Length).unwrap());
                 let actual = normalize(events);
                 assert_eq!(
                     (&actual.0, &actual.1),
@@ -210,9 +208,9 @@ fn qwen_trim_retains_delayed_internal_whitespace_and_marks_partial_tokens() {
     let mut parser = parser(ModelFormat::Qwen, tokenizer.clone(), &[]);
     let first = id(&tokenizer, "ĠhelloĠ");
     let second = id(&tokenizer, "worldĠ");
-    let mut events = parser.feed_attributed(&[first]).unwrap();
-    events.extend(parser.feed_attributed(&[second]).unwrap());
-    events.extend(parser.finish_attributed(FinishReason::Length).unwrap());
+    let mut events = parser.feed(&[first]).unwrap();
+    events.extend(parser.feed(&[second]).unwrap());
+    events.extend(parser.finish(FinishReason::Length).unwrap());
     let (text, _, owners) = normalize(events);
     assert_eq!(text, "hello world");
     assert_eq!(owners[&0], vec![(1, 6, 0, 5, 0), (6, 7, 5, 6, 0)]);
@@ -224,7 +222,7 @@ fn gemma_header_body_inside_one_token_and_deepseek_marker_prefix_are_attributed(
     let tokenizer = tokenizer(false, &["analysisĊbody", "aĊĊ<", "x"]);
     let mut gemma = parser(ModelFormat::Gemma, tokenizer.clone(), &[]);
     let events = gemma
-        .feed_attributed(&[
+        .feed(&[
             id(&tokenizer, "<|channel>"),
             id(&tokenizer, "analysisĊbody"),
         ])
@@ -233,86 +231,28 @@ fn gemma_header_body_inside_one_token_and_deepseek_marker_prefix_are_attributed(
     assert_eq!(reasoning, "body");
     assert_eq!(owners[&1], vec![(9, 13, 0, 4, 1)]);
     let mut deepseek = parser(ModelFormat::DeepSeek, tokenizer.clone(), &[]);
-    let mut events = deepseek.feed_attributed(&[id(&tokenizer, "aĊĊ<")]).unwrap();
-    events.extend(deepseek.feed_attributed(&[id(&tokenizer, "x")]).unwrap());
-    events.extend(deepseek.finish_attributed(FinishReason::Length).unwrap());
+    let mut events = deepseek.feed(&[id(&tokenizer, "aĊĊ<")]).unwrap();
+    events.extend(deepseek.feed(&[id(&tokenizer, "x")]).unwrap());
+    events.extend(deepseek.finish(FinishReason::Length).unwrap());
     let (text, _, owners) = normalize(events);
     assert_eq!(text, "a\n\n<x");
     assert_eq!(owners[&0], vec![(0, 1, 0, 1, 0), (1, 4, 1, 4, 0)]);
 }
 
 #[test]
-fn incomplete_utf8_flush_owns_replacements_and_custom_decoders_are_explicitly_unknown() {
+fn incomplete_utf8_flush_owns_replacements() {
     for fallback in [false, true] {
         let tokenizer = tokenizer(fallback, &[]);
-        let mut decoder = TokenizerDecoder::new(tokenizer);
-        assert!(
-            decoder
-                .push_attributed(&[0xF0, 0x9F], 7)
-                .unwrap()
-                .is_empty()
-        );
-        let tail = decoder.finish_attributed().unwrap();
+        let mut decoder = TokenizerDecoder::new(tokenizer).unwrap();
+        assert!(decoder.push(&[0xF0, 0x9F], 7).unwrap().is_empty());
+        let tail = decoder.finish().unwrap();
         assert_eq!(tail.text, if fallback { "��" } else { "�" });
         assert_eq!(
-            tail.spans.iter().map(|s| s.token_index).collect::<Vec<_>>(),
+            tail.spans.iter().map(|s| s.token).collect::<Vec<_>>(),
             vec![7, 8]
         );
-        assert!(
-            tail.spans
-                .iter()
-                .all(|s| s.token_start == 0 && s.token_end == 1 && s.token_len == 1)
-        );
+        assert!(tail.spans.iter().all(|s| s.source == (0..1)));
     }
-    struct Plain;
-    impl Decoder for Plain {
-        fn push(&mut self, _: &[u32]) -> Result<String, resin_recipe::Error> {
-            Ok("hello".into())
-        }
-        fn finish(&mut self) -> Result<String, resin_recipe::Error> {
-            Ok(String::new())
-        }
-        fn reset(&mut self) {}
-    }
-    let mut plain = Plain;
-    assert!(!plain.supports_attribution());
-    assert!(plain.push_attributed(&[1], 0).unwrap().spans.is_empty());
-}
-
-#[test]
-fn unscored_feed_never_calls_attributed_decoder() {
-    struct Unscored;
-    impl Decoder for Unscored {
-        fn push(&mut self, _: &[u32]) -> Result<String, resin_recipe::Error> {
-            Ok("x".into())
-        }
-        fn finish(&mut self) -> Result<String, resin_recipe::Error> {
-            Ok(String::new())
-        }
-        fn reset(&mut self) {}
-        fn push_attributed(
-            &mut self,
-            _: &[u32],
-            _: usize,
-        ) -> Result<resin_recipe::AttributedText, resin_recipe::Error> {
-            panic!("unscored path traced")
-        }
-    }
-    let tokenizer = tokenizer(false, &[]);
-    let mut parser = ModelFormat::Qwen
-        .create_parser(
-            &TokenizerEncoder::new(tokenizer).unwrap(),
-            Box::new(Unscored),
-            &Value::Null,
-            &[],
-        )
-        .unwrap();
-    assert!(!parser.supports_attribution());
-    assert_eq!(
-        parser.feed(&[1]).unwrap(),
-        vec![Event::TextDelta { delta: "x".into() }]
-    );
-    parser.finish(FinishReason::Length).unwrap();
 }
 
 #[test]
@@ -348,7 +288,7 @@ fn transformed_tools_have_no_fabricated_provenance_and_serde_keeps_flat_events()
         let mut ids = vec![id(&tokenizer, open)];
         ids.extend(bytes(body));
         ids.push(id(&tokenizer, close));
-        let events = parser.feed_attributed(&ids).unwrap();
+        let events = parser.feed(&ids).unwrap();
         assert!(
             events
                 .iter()
@@ -357,11 +297,11 @@ fn transformed_tools_have_no_fabricated_provenance_and_serde_keeps_flat_events()
         assert!(events.iter().all(|event| event.spans.is_empty()));
     }
     let mut parser = parser(ModelFormat::Qwen, tokenizer, &[]);
-    let event = parser.feed_attributed(&bytes("x")).unwrap().pop().unwrap();
+    let event = parser.feed(&bytes("x")).unwrap().pop().unwrap();
     let value = serde_json::to_value(&event).unwrap();
     assert_eq!(value["type"], "text_delta");
     assert_eq!(value["delta"], "x");
-    assert_eq!(value["token_spans"][0]["token_index"], 0);
+    assert_eq!(value["token_spans"][0], json!([0, 0, 1, 0, 1]));
     assert_eq!(
         serde_json::from_value::<AttributedEvent>(value).unwrap(),
         event
@@ -374,7 +314,7 @@ fn transformed_tools_have_no_fabricated_provenance_and_serde_keeps_flat_events()
 }
 
 #[test]
-fn source_bytes_share_decoder_conventions_and_unknown_decoders_stay_unknown() {
+fn source_bytes_share_decoder_conventions_and_unsupported_chains_fail_upfront() {
     use resin_recipe::TokenBytes;
     let tokenizer = tokenizer(true, &["▁hello", "<0x0000>", "<0xGG>"]);
     let bytes = TokenBytes::new(&tokenizer);
@@ -389,57 +329,7 @@ fn source_bytes_share_decoder_conventions_and_unknown_decoders_stay_unknown() {
         );
     }
     let tokenizer = Tokenizer::from_bytes(br#"{"version":"1.0","added_tokens":[],"decoder":{"type":"Fuse"},"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}"#).unwrap();
-    let mut decoder = TokenizerDecoder::new(Arc::new(tokenizer));
-    assert!(!decoder.supports_attribution());
-    let text = decoder.push_attributed(&[0], 0).unwrap();
-    assert_eq!(text.text, "hello");
-    assert!(text.spans.is_empty());
-}
-
-#[test]
-fn mixed_mode_utf8_is_unknown_until_the_next_control_boundary() {
-    let tokenizer = tokenizer(false, &[]);
-    let mut parser = parser(ModelFormat::Qwen, tokenizer.clone(), &[]);
-    assert!(parser.feed(&[0xF0, 0x9F]).unwrap().is_empty());
-    let mixed = parser.feed_attributed(&[0xA6, 0x80]).unwrap();
-    assert_eq!(
-        mixed[0].event,
-        Event::TextDelta {
-            delta: "🦀".into()
-        }
-    );
-    assert!(mixed[0].spans.is_empty());
-    let later = parser.feed_attributed(&bytes("old segment")).unwrap();
-    assert!(later.iter().all(|event| event.spans.is_empty()));
-    let mut ids = vec![id(&tokenizer, "<think>")];
-    ids.extend(bytes("new"));
-    let recovered = parser.feed_attributed(&ids).unwrap();
-    assert!(recovered.iter().any(|event| !event.spans.is_empty()));
-    assert!(recovered[0].spans.iter().all(|span| span.token_index >= 16));
-
-    let mut parser = crate::parser(ModelFormat::Qwen, tokenizer.clone(), &[]);
-    assert!(parser.feed_attributed(&[0xF0, 0x9F]).unwrap().is_empty());
-    assert_eq!(
-        parser.feed(&[0xA6, 0x80]).unwrap(),
-        vec![Event::TextDelta {
-            delta: "🦀".into()
-        }]
-    );
-    assert!(
-        parser
-            .feed_attributed(&bytes("🦀"))
-            .unwrap()
-            .iter()
-            .all(|event| event.spans.is_empty())
-    );
-    parser
-        .feed_attributed(&[id(&tokenizer, "<think>")])
-        .unwrap();
-    assert!(
-        !parser.feed_attributed(&bytes("x")).unwrap()[0]
-            .spans
-            .is_empty()
-    );
+    assert!(TokenizerDecoder::new(Arc::new(tokenizer)).is_err());
 }
 
 #[test]
@@ -449,23 +339,100 @@ fn qwen_and_deepseek_tool_channel_hints_exclude_deferred_content() {
     assert_eq!(qwen.token_channel(u32::from(b'x')), None);
     let open = id(&tokenizer, "<tool_call>");
     assert_eq!(qwen.token_channel(open), Some("control"));
-    qwen.feed_attributed(&[open]).unwrap();
+    qwen.feed(&[open]).unwrap();
     assert_eq!(qwen.token_channel(u32::from(b'x')), Some("tool"));
-    qwen.feed_attributed(&bytes("<function=f></function>"))
-        .unwrap();
-    qwen.feed_attributed(&[id(&tokenizer, "</tool_call>")])
-        .unwrap();
+    qwen.feed(&bytes("<function=f></function>")).unwrap();
+    qwen.feed(&[id(&tokenizer, "</tool_call>")]).unwrap();
     assert_eq!(qwen.token_channel(u32::from(b' ')), Some("tool"));
-    qwen.feed_attributed(&[id(&tokenizer, "<think>")]).unwrap();
+    qwen.feed(&[id(&tokenizer, "<think>")]).unwrap();
     assert_eq!(qwen.token_channel(u32::from(b'x')), None);
 
     let mut deepseek = parser(ModelFormat::DeepSeek, tokenizer.clone(), &[]);
-    deepseek.feed_attributed(&bytes("\n\n<")).unwrap();
+    deepseek.feed(&bytes("\n\n<")).unwrap();
     assert_eq!(deepseek.token_channel(u32::from(b'x')), None);
-    deepseek
-        .feed_attributed(&[id(&tokenizer, "｜DSML｜")])
-        .unwrap();
+    deepseek.feed(&[id(&tokenizer, "｜DSML｜")]).unwrap();
     assert_eq!(deepseek.token_channel(u32::from(b'x')), None);
-    deepseek.feed_attributed(&bytes("tool_calls>")).unwrap();
+    deepseek.feed(&bytes("tool_calls>")).unwrap();
     assert_eq!(deepseek.token_channel(u32::from(b'<')), Some("tool"));
+}
+
+#[test]
+fn compact_spans_keep_split_scalars_and_move_full_buffers() {
+    use resin_recipe::{AttributedText, TokenSpan};
+    assert_eq!(std::mem::size_of::<TokenSpan>(), 20);
+    let first = format!("a{}", byte_character(0xC3));
+    let second = format!("{}{}", byte_character(0xA9), byte_character(b' '));
+    let tokenizer = tokenizer(false, &[&first, &second]);
+    let mut decoder = TokenizerDecoder::new(tokenizer.clone()).unwrap();
+    assert!(
+        decoder
+            .push(&[id(&tokenizer, &first)], 0)
+            .unwrap()
+            .is_empty()
+    );
+    let mut text = decoder.push(&[id(&tokenizer, &second)], 1).unwrap();
+    assert_eq!(text.text, "aé ");
+    assert_eq!(
+        text.spans,
+        vec![
+            TokenSpan {
+                token: 0,
+                source: 0..1,
+                text: 0..1
+            },
+            TokenSpan {
+                token: 0,
+                source: 1..2,
+                text: 1..3
+            },
+            TokenSpan {
+                token: 1,
+                source: 0..1,
+                text: 1..3
+            },
+            TokenSpan {
+                token: 1,
+                source: 1..2,
+                text: 3..4
+            },
+        ]
+    );
+    let (text_ptr, spans_ptr) = (text.text.as_ptr(), text.spans.as_ptr());
+    let whole = text.take(text.len());
+    assert_eq!(
+        (whole.text.as_ptr(), whole.spans.as_ptr()),
+        (text_ptr, spans_ptr)
+    );
+    let mut empty = AttributedText::default();
+    empty.push(whole);
+    assert_eq!(
+        (empty.text.as_ptr(), empty.spans.as_ptr()),
+        (text_ptr, spans_ptr)
+    );
+    let head = empty.take(1);
+    assert_eq!(head.text, "a");
+    assert_eq!(empty.text, "é ");
+    assert_eq!(
+        empty.spans[0],
+        TokenSpan {
+            token: 0,
+            source: 1..2,
+            text: 0..2
+        }
+    );
+}
+
+#[test]
+fn invalid_byte_groups_preserve_the_exact_native_replacement_policy() {
+    for fallback in [false, true] {
+        let mut decoder = TokenizerDecoder::new(tokenizer(fallback, &[])).unwrap();
+        let mut text = decoder.push(&[b'a' as u32, 0xF0, 0x9F], 0).unwrap();
+        text.push(decoder.finish().unwrap());
+        assert_eq!(text.text, if fallback { "���" } else { "a�" });
+        assert_eq!(
+            text.spans.iter().map(|s| s.token).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert!(text.spans.iter().all(|s| s.source == (0..1)));
+    }
 }
