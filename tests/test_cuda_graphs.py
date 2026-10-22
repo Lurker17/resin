@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import NoReturn, TypedDict
 
@@ -131,19 +132,26 @@ class _Cuda:
     def __init__(self):
         self.graphs = []
         self.pools = []
+        self._current_stream = _Stream()
+        self.capturing = False
 
     def memory_allocated(self, _device):
         return 100
 
     def current_stream(self, _device):
-        return _Stream()
+        return self._current_stream
 
     def Stream(self, *, device):
         del device
         return _Stream()
 
-    def stream(self, _stream):
-        return _Context()
+    @contextmanager
+    def stream(self, stream):
+        previous, self._current_stream = self._current_stream, stream
+        try:
+            yield
+        finally:
+            self._current_stream = previous
 
     def synchronize(self, _device):
         pass
@@ -161,9 +169,16 @@ class _Cuda:
         self.pools.append(pool)
         return pool
 
-    def graph(self, graph, *, pool=None):
+    @contextmanager
+    def graph(self, graph, *, pool=None, stream=None):
         graph.pool = pool
-        return _Context()
+        graph.stream = stream
+        with self.stream(stream if stream is not None else _Stream()):
+            previous, self.capturing = self.capturing, True
+            try:
+                yield
+            finally:
+                self.capturing = previous
 
 
 class _Torch:
@@ -674,6 +689,55 @@ class TestCudaGraph:
         graphs.capture_all()
         assert len(torch.cuda.pools) == 2
         assert graphs.mode("prefill").run((1, 4), {"value": [2]}) == [2]
+
+    def test_capture_warms_stream_local_kernel_state_and_preserves_breaks_and_pool(
+        self, monkeypatch
+    ):
+        torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
+        monkeypatch.setattr(graph_runtime, "torch", torch)
+        caller = torch.cuda.current_stream("cuda:0")
+        initialized, events = set(), []
+
+        def launch(name):
+            stream = torch.cuda.current_stream("cuda:0")
+            if stream not in initialized:
+                assert not torch.cuda.capturing, (
+                    "first kernel use cannot allocate in capture"
+                )
+                initialized.add(stream)
+            events.append((name, stream))
+
+        cache = CudaGraphCache(
+            "cuda:0",
+            ((1, 4), (2, 4)),
+            build=lambda _: CudaGraphProgram(
+                {},
+                _Tensor([0]),
+                (
+                    CudaGraphRegion("first", lambda: launch("first")),
+                    CudaGraphRegion("break", lambda: launch("break"), capture=False),
+                    CudaGraphRegion("last", lambda: launch("last")),
+                ),
+            ),
+            synchronize_failure=lambda: None,
+            share_pool=True,
+        )
+        cache.capture_all(lambda _: {})
+        assert len(initialized) == 1
+        stream = next(iter(initialized))
+        assert stream is not caller
+        assert all(graph.stream is stream for graph in torch.cuda.graphs)
+        assert all(graph.pool is torch.cuda.pools[0] for graph in torch.cuda.graphs)
+        # Three warmups, then capture in region order, then one eager break
+        # during parity replay. The fake graphs themselves record only replays.
+        assert [name for name, _ in events] == (
+            ["first", "break", "last"] * 4 + ["break"]
+        ) * 2
+        assert all(current is stream for _, current in events)
+        assert torch.cuda.current_stream("cuda:0") is caller
+        cache.close()
+        assert cache._capture_stream is None
 
     def test_cache_close_resets_graphs_after_synchronizing_and_is_idempotent(
         self, monkeypatch

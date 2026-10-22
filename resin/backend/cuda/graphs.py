@@ -342,6 +342,7 @@ class CudaGraphCache:
         self._poison: str | None = None
         self._share_pool = share_pool
         self._pool: Any | None = None
+        self._capture_stream: Any | None = None
         self._closed = False
         self._closed_stats: CudaGraphStats | None = None
 
@@ -398,6 +399,7 @@ class CudaGraphCache:
             entry.program = None
             entry.staging = None
         self._pool = None
+        self._capture_stream = None
         self._closed_stats = stats
         self._closed = True
 
@@ -515,7 +517,9 @@ class CudaGraphCache:
         program = entry.program
         assert program is not None
         current = torch.cuda.current_stream(self.device)
-        warmup = torch.cuda.Stream(device=self.device)
+        if self._capture_stream is None:
+            self._capture_stream = torch.cuda.Stream(device=self.device)
+        warmup = self._capture_stream
         warmup.wait_stream(current)
         with torch.cuda.stream(warmup), torch.inference_mode():
             for _ in range(3):
@@ -528,13 +532,16 @@ class CudaGraphCache:
         torch.cuda.synchronize(self.device)
 
         started = perf_counter()
-        with torch.cuda.device(self.device):
+        # Stream-local kernel state must be initialized by the warmup, and
+        # captures sharing a memory pool must use the same explicit stream.
+        with torch.cuda.device(self.device), torch.cuda.stream(warmup):
             if program.prepare is not None:
                 program.prepare()
-            graphs = self._capture_regions(entry)
+            graphs = self._capture_regions(entry, warmup)
             if program.prepare is not None:
                 program.prepare()
             self._replay(program, graphs)
+        current.wait_stream(warmup)
         torch.cuda.synchronize(self.device)
         if program.validate_eager_output:
             if not _outputs_equal(expected, program.output):
@@ -568,7 +575,7 @@ class CudaGraphCache:
         for region in program.regions:
             region.launch()
 
-    def _capture_regions(self, entry: _GraphEntry) -> tuple[Any | None, ...]:
+    def _capture_regions(self, entry: _GraphEntry, stream) -> tuple[Any | None, ...]:
         program = entry.program
         assert program is not None
         if self._share_pool and self._pool is None:
@@ -585,7 +592,10 @@ class CudaGraphCache:
             # Keep ownership even when capture or parity validation fails, so
             # close() can release NCCL graph references before communicator teardown.
             entry.graphs = tuple(graphs)
-            with torch.cuda.graph(graph, pool=self._pool), torch.inference_mode():
+            with (
+                torch.cuda.graph(graph, pool=self._pool, stream=stream),
+                torch.inference_mode(),
+            ):
                 region.launch()
         return tuple(graphs)
 
