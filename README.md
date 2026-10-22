@@ -345,6 +345,9 @@ uv run python scripts/cloc.py
 GPU validation is model- and machine-specific; local tests use fakes or skip
 unavailable accelerator libraries.
 
+For resident prefill/decode sweeps, fixed speculative acceptance, balanced
+expert routing, and throughput/latency charts, see [benchmarking](docs/benchmarks.md).
+
 ## Repository map
 
 - `crates/resin-core/src/engine.rs` — request lifecycle and execution transactions

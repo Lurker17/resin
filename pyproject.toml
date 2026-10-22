@@ -44,6 +44,7 @@ dev = [
   "ty>=0.0.90",
   "deepseek-recipe==0.2.0",
   "openai-harmony==0.0.8",
+  "matplotlib>=3.10,<4",
 ]
 
 [tool.maturin]

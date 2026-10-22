@@ -14,7 +14,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_partial_cuda_graph_replays_active_and_idle_routes():
+@pytest.mark.parametrize("num_tokens", [3, 2051])
+def test_partial_cuda_graph_replays_active_and_idle_routes(num_tokens):
     device = torch.device("cuda")
     config = MoEKernelConfig(
         architecture="sm90",
@@ -58,19 +59,15 @@ def test_partial_cuda_graph_replays_active_and_idle_routes():
         config,
     )
     hidden = torch.randn(
-        (3, 128), device=device, dtype=torch.bfloat16, generator=generator
+        (num_tokens, 128), device=device, dtype=torch.bfloat16, generator=generator
     )
-    indices = torch.tensor(
-        [[0, 1, 4, 4], [2, 3, 4, 4], [0, 2, 3, 4]],
-        device=device,
-        dtype=torch.int32,
+    indices = torch.arange(4, device=device, dtype=torch.int32).repeat(num_tokens, 1)
+    probabilities = torch.randn(
+        num_tokens, 4, device=device, generator=generator
+    ).softmax(-1)
+    routing = MoERouting(
+        torch.zeros(num_tokens, 4, device=device), indices, probabilities
     )
-    probabilities = torch.tensor(
-        [[0.6, 0.4, 0, 0], [0.3, 0.7, 0, 0], [0.25, 0.5, 0.25, 0]],
-        device=device,
-        dtype=torch.float32,
-    )
-    routing = MoERouting(torch.zeros(3, 4, device=device), indices, probabilities)
     output = torch.empty_like(hidden, dtype=torch.float32)
 
     def launch():
@@ -95,13 +92,15 @@ def test_partial_cuda_graph_replays_active_and_idle_routes():
             indices.fill_(config.num_experts)
             probabilities.zero_()
         else:
-            indices.copy_(original_indices.flip(0) if phase else original_indices)
+            indices.copy_(original_indices.roll(1, 1) if phase else original_indices)
             probabilities.copy_(original_probabilities)
         reference = kernel.forward_partial(hidden, routing, prepared, config)
         graph.replay()
         torch.cuda.synchronize()
         assert output.dtype == torch.float32
         assert torch.isfinite(output).all()
-        torch.testing.assert_close(output, reference, rtol=1e-5, atol=1e-5)
+        # Four nonzero FP32 contributions expose unordered atomic reductions;
+        # 2051 tokens also cross the 8192-assignment kernel chunk boundary.
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
         if phase == 1:
             assert not output.any()

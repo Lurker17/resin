@@ -466,7 +466,25 @@ class FlashInferSM90MXFP4Kernel:
                 output += weights.fc2_bias[safe_experts, : config.hidden_size].float()
             output *= flat_weights[start:stop, None].float()
             output.masked_fill_(~selected_active[:, None], 0)
-            result.index_add_(0, token_rows, output)
+            # Assignments are contiguous in token/top-k order. Reduce each
+            # token's segment in that order instead of racing FP32 atomics;
+            # a chunk may begin or end partway through its four assignments.
+            first, last = start // config.top_k, (stop - 1) // config.top_k + 1
+            if start % config.top_k == 0 and count % config.top_k == 0:
+                torch.sum(
+                    output.view(-1, config.top_k, config.hidden_size),
+                    dim=1,
+                    out=result[first:last],
+                )
+                continue
+            boundaries = (
+                torch.arange(first, last + 1, device=hidden_states.device)
+                * config.top_k
+            ).clamp(start, stop)
+            summed = torch.segment_reduce(  # ty: ignore[unresolved-attribute]  # Missing in Torch stubs.
+                output, "sum", lengths=boundaries.diff(), unsafe=True
+            )
+            result[first:last].add_(summed)
         return result
 
     def forward(

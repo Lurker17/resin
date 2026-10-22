@@ -13,6 +13,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from resin.backend.torch import benchmark_expert_indices
 from resin.backend.transformer import RMSNorm
 from resin.models.gpt_oss.config import GptOssConfig
 
@@ -142,6 +143,8 @@ class TopKRouter(nn.Module):
     def __init__(self, config: GptOssConfig) -> None:
         super().__init__()
         self.top_k = config.num_experts_per_tok
+        self.benchmark_balanced_experts = False
+        self.benchmark_replica = 0
         self.weight = nn.Parameter(
             torch.empty(config.num_local_experts, config.hidden_size)
         )
@@ -149,7 +152,13 @@ class TopKRouter(nn.Module):
 
     def forward(self, hidden: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         logits = F.linear(hidden, self.weight, self.bias)
-        values, indices = torch.topk(logits, self.top_k, dim=-1, sorted=True)
+        if self.benchmark_balanced_experts:
+            indices = benchmark_expert_indices(
+                logits, self.top_k, self.benchmark_replica
+            )
+            values = logits.gather(1, indices)
+        else:
+            values, indices = torch.topk(logits, self.top_k, dim=-1, sorted=True)
         return logits, torch.softmax(values, dim=-1), indices
 
 

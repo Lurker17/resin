@@ -802,7 +802,9 @@ class TestGptOssCudaTinyOracle:
     ) -> None:
         import torch
 
-        official = cast(TopKRouter, SimpleNamespace(top_k=4))
+        official = cast(
+            TopKRouter, SimpleNamespace(top_k=4, benchmark_balanced_experts=False)
+        )
         logits = torch.randn(32, 128, dtype=torch.bfloat16)
         expected_values, expected_indices = torch.topk(logits, 4, dim=-1, sorted=True)
         expected_weights = torch.softmax(expected_values, dim=-1)
@@ -820,7 +822,9 @@ class TestGptOssCudaTinyOracle:
         torch.testing.assert_close(indices, expected_indices.to(torch.int32))
         torch.testing.assert_close(weights, expected_weights.to(torch.float32))
 
-        generic = cast(TopKRouter, SimpleNamespace(top_k=2))
+        generic = cast(
+            TopKRouter, SimpleNamespace(top_k=2, benchmark_balanced_experts=False)
+        )
         indices, weights = _route(generic, logits[:, :16])
         values, expected_indices = torch.topk(logits[:, :16], 2, dim=-1, sorted=True)
         torch.testing.assert_close(indices, expected_indices)

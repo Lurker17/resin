@@ -52,6 +52,30 @@ class _Tensor:
     def clone(self):
         return _Tensor(self.values, dtype=self.dtype)
 
+    def float(self):
+        return _Tensor(self.values.astype(np.float32), dtype="float")
+
+    def __sub__(self, other):
+        return _Tensor(self.values - other.values, dtype=self.dtype)
+
+    def __ne__(self, other):
+        return _Tensor(self.values != other.values)
+
+    def abs(self):
+        return _Tensor(np.abs(self.values), dtype=self.dtype)
+
+    def nan_to_num(self, **options):
+        return _Tensor(np.nan_to_num(self.values, **options), dtype=self.dtype)
+
+    def max(self):
+        return _Tensor(self.values.max(), dtype=self.dtype)
+
+    def sum(self):
+        return _Tensor(self.values.sum(), dtype=self.dtype)
+
+    def item(self):
+        return self.values.item()
+
     def numel(self):
         return self.values.size
 
@@ -174,6 +198,20 @@ def _cache(shapes, build, synchronize_failure=lambda: None):
         graph_shapes(shapes, dimensions=2),
         build=build,
         synchronize_failure=synchronize_failure,
+    )
+
+
+def test_mismatch_diagnostics_measure_full_tensor_after_identical_prefix():
+    import torch
+
+    expected = torch.zeros(1024, 32, dtype=torch.bfloat16)
+    actual = expected.clone()
+    actual[-1, -1] = 0.0078125
+    assert graph_runtime._output_summary(expected) == graph_runtime._output_summary(
+        actual
+    )
+    assert graph_runtime._output_difference(expected, actual) == (
+        "mismatched=1/32768, max_abs=0.0078125"
     )
 
 

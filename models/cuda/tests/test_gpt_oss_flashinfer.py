@@ -404,8 +404,9 @@ class TestFlashInferMXFP4Adapter:
             output[:, 0], torch.tensor([1.75, 1.0], dtype=torch.bfloat16)
         )
 
+    @pytest.mark.parametrize("limit", [2, 5, 8])
     def test_fp32_partials_preserve_cancellation_and_chunk_expanded_routes(
-        self, monkeypatch
+        self, monkeypatch, limit
     ):
         import torch
 
@@ -413,7 +414,7 @@ class TestFlashInferMXFP4Adapter:
 
         config = _config(num_experts=4, hidden_size=32, intermediate_size=32)
         kernel = adapter.FlashInferSM90MXFP4Kernel()
-        kernel.capabilities = replace(kernel.capabilities, max_tokens=2)
+        kernel.capabilities = replace(kernel.capabilities, max_tokens=limit)
         packed = torch.empty(1, dtype=torch.uint8)
         bias = torch.zeros(4, 32, dtype=torch.bfloat16)
         bias[0] = 0.75
@@ -439,7 +440,7 @@ class TestFlashInferMXFP4Adapter:
 
         def unweighted(hidden, routing, weights, actual):
             assert actual is config
-            assert len(hidden) <= 2
+            assert len(hidden) <= limit
             assert weights.fc1_weights is packed and weights.fc2_weights is packed
             assert weights.fc1_bias is prepared.fc1_bias
             assert not weights.fc2_bias.any()
@@ -449,7 +450,7 @@ class TestFlashInferMXFP4Adapter:
             assert not routing.expert_weights[:, 1:].any()
             calls.append(len(hidden))
             values = torch.tensor(
-                [1000, -1000, 4, 0, float("nan")], dtype=torch.bfloat16
+                [1000, -1000, 4, -8, float("nan")], dtype=torch.bfloat16
             )
             return values[routing.selected_experts[:, 0].long(), None].expand(-1, 32)
 
@@ -460,16 +461,28 @@ class TestFlashInferMXFP4Adapter:
             pytest.fail("partial execution must not compact routes dynamically")  # ty: ignore[invalid-argument-type]
 
         monkeypatch.setattr(torch.Tensor, "nonzero", dynamic_shape)
-        hidden = torch.ones(3, 32, dtype=torch.bfloat16)
-        ids = torch.tensor([[0, 4, 4, 4], [1, 4, 4, 4], [0, 1, 2, 4]])
-        scales = torch.tensor([[1, 0, 0, 0], [1, 0, 0, 0], [0.25, 0.5, 0.25, 0]])
-        routing = MoERouting(torch.zeros(3, 4), ids, scales)
+        hidden = torch.ones(4, 32, dtype=torch.bfloat16)
+        ids = torch.tensor([[0, 4, 4, 4], [1, 4, 4, 4], [0, 1, 2, 4], [0, 1, 2, 3]])
+        scales = torch.tensor(
+            [
+                [1, 0, 0, 0],
+                [1, 0, 0, 0],
+                [0.25, 0.5, 0.25, 0],
+                [0.25, 0.5, 0.125, 0.125],
+            ]
+        )
+        routing = MoERouting(torch.zeros(4, 4), ids, scales)
         output = kernel.forward_partial(hidden, routing, prepared, config)
         assert output.dtype == torch.float32
         torch.testing.assert_close(
-            output[:, 0], torch.tensor([1000.75, -998.75, -248.1875])
+            output[:, 0], torch.tensor([1000.75, -998.75, -248.1875, -249.6875])
         )
-        assert calls == [2] * 6
+        values = torch.tensor([1000.75, -998.75, 4, -8, 0])
+        torch.testing.assert_close(
+            output[:, 0], (values[ids] * scales).sum(1), rtol=0, atol=0
+        )
+        expected_calls = [min(limit, 16 - start) for start in range(0, 16, limit)]
+        assert calls == expected_calls
         assert output[0, 0] + output[1, 0] == 2
         assert output[:2, 0].bfloat16().float().sum() == 0
         assert prepared.fc2_bias is bias and bias[0, 0] == 0.75
@@ -480,16 +493,16 @@ class TestFlashInferMXFP4Adapter:
             config,
         )
         assert empty.shape == (0, 32) and empty.dtype == torch.float32
-        assert calls == [2] * 6
+        assert calls == expected_calls
 
         # Replaying the same row shape with different active routes keeps all
         # kernel shapes and chunk counts stable, including entirely idle input.
         idle = kernel.forward_partial(
             hidden,
-            MoERouting(torch.zeros(3, 4), ids, torch.zeros_like(scales)),
+            MoERouting(torch.zeros(4, 4), ids, torch.zeros_like(scales)),
             prepared,
             config,
         )
         assert idle.dtype == torch.float32
         assert torch.equal(idle, torch.zeros_like(idle))
-        assert calls == [2] * 12
+        assert calls == expected_calls * 2

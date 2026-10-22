@@ -62,6 +62,7 @@ from resin.backend.paged_attention import PagedAttentionBatch
 from resin.backend.quantization import QuantizationConfig
 from resin.backend.sampling import format_output, prompt_scores
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
+from resin.backend.torch import benchmark_expert_indices
 from resin.models.gpt_oss.config import GptOssConfig
 from resin.models.gpt_oss.plan import (
     PAGE_SIZE,
@@ -1151,6 +1152,11 @@ def _router_logits(router: TopKRouter, hidden: Tensor) -> Tensor:
 
 
 def _route(router: TopKRouter, logits: Tensor) -> tuple[Tensor, Tensor]:
+    if router.benchmark_balanced_experts:
+        indices = benchmark_expert_indices(
+            logits, router.top_k, router.benchmark_replica
+        )
+        return indices, torch.softmax(logits.gather(1, indices), dim=-1)
     if router.top_k == 4 and logits.shape[-1] == 128:
         return top4_softmax(logits)
     values, indices = torch.topk(logits, router.top_k, dim=-1, sorted=True)

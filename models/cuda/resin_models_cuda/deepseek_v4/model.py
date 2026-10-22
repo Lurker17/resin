@@ -24,7 +24,7 @@ from resin.backend.cuda.parallel import (
     TensorShard,
 )
 from resin.backend.loading import prepare_model
-from resin.backend.torch import use_default_dtype
+from resin.backend.torch import benchmark_expert_indices, use_default_dtype
 from resin.backend.transformer import RMSNorm as SharedRMSNorm
 from resin_models_cuda.deepseek_v4.attention import (
     sparse_decode_attention,
@@ -1455,6 +1455,8 @@ class Gate(nn.Module):
         super().__init__()
         self.dim = args.dim
         self.topk = args.n_activated_experts
+        self.benchmark_balanced_experts = False
+        self.benchmark_replica = 0
         self.score_func = args.score_func
         self.route_scale = args.route_scale
         self.hash = layer_id < args.n_hash_layers
@@ -1478,7 +1480,12 @@ class Gate(nn.Module):
         input_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         scores = bf16_linear_fp32(x, self.weight)
-        if self.hash and self.score_func == "sqrtsoftplus" and self.topk == 6:
+        if (
+            not self.benchmark_balanced_experts
+            and self.hash
+            and self.score_func == "sqrtsoftplus"
+            and self.topk == 6
+        ):
             return hash_sqrt_softplus(
                 scores,
                 input_ids,
@@ -1486,7 +1493,8 @@ class Gate(nn.Module):
                 self.route_scale,
             )
         if (
-            (scores.shape[-1] & (scores.shape[-1] - 1)) == 0
+            not self.benchmark_balanced_experts
+            and (scores.shape[-1] & (scores.shape[-1] - 1)) == 0
             and self.topk == 6
             and self.score_func == "sqrtsoftplus"
             and self.bias is not None
@@ -1502,7 +1510,11 @@ class Gate(nn.Module):
         # Bias shifts scores for expert selection (topk) but does not affect routing weights.
         if self.bias is not None:
             scores = scores + self.bias
-        if self.hash:
+        if self.benchmark_balanced_experts:
+            indices = benchmark_expert_indices(
+                scores, self.topk, self.benchmark_replica
+            )
+        elif self.hash:
             indices = self.tid2eid[input_ids]
         else:
             indices = scores.topk(self.topk, dim=-1)[1]

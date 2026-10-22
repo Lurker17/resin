@@ -250,6 +250,33 @@ def _output_summary(output: Any) -> str:
     )
 
 
+def _output_difference(expected: Any, actual: Any) -> str:
+    """Compute bounded diagnostics only after strict replay validation fails."""
+    if isinstance(expected, tuple) and isinstance(actual, tuple):
+        return (
+            "("
+            + ", ".join(_output_difference(a, b) for a, b in zip(expected, actual))
+            + ")"
+        )
+    if (
+        isinstance(expected, tuple)
+        or isinstance(actual, tuple)
+        or expected.shape != actual.shape
+    ):
+        return "output structure differs"
+    mismatched = (expected != actual).sum().item()
+    maximum = (
+        (expected.float() - actual.float())
+        .abs()
+        .nan_to_num(nan=float("inf"), posinf=float("inf"))
+        .max()
+        .item()
+        if expected.numel()
+        else 0
+    )
+    return f"mismatched={mismatched}/{expected.numel()}, max_abs={maximum}"
+
+
 @dataclass(frozen=True, slots=True)
 class CudaGraphMode:
     """One independently bucketed execution mode in a CUDA graph runner.
@@ -513,7 +540,8 @@ class CudaGraphCache:
             if not _outputs_equal(expected, program.output):
                 raise RuntimeError(
                     "CUDA graph replay differs from eager warmup "
-                    f"(expected: {_output_summary(expected)}; "
+                    f"({_output_difference(expected, program.output)}; "
+                    f"expected: {_output_summary(expected)}; "
                     f"actual: {_output_summary(program.output)})"
                 )
         else:
@@ -523,7 +551,8 @@ class CudaGraphCache:
             if not _outputs_equal(expected_replay, program.output):
                 raise RuntimeError(
                     "CUDA graph replays are not deterministic "
-                    f"(expected: {_output_summary(expected_replay)}; "
+                    f"({_output_difference(expected_replay, program.output)}; "
+                    f"expected: {_output_summary(expected_replay)}; "
                     f"actual: {_output_summary(program.output)})"
                 )
         entry.graphs = graphs
