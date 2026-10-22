@@ -206,7 +206,13 @@ def test_nccl_expert_dispatch_matches_reference_with_unequal_and_empty_rows(
 
 
 def _graph_dispatch_rank(
-    rank, rendezvous, directory, replicated, layout=None, route_limit=None
+    rank,
+    rendezvous,
+    directory,
+    replicated,
+    layout=None,
+    route_limit=None,
+    weight_dtype=torch.float32,
 ):
     from resin.backend.expert_parallel import ExpertParallelDispatch
 
@@ -259,6 +265,7 @@ def _graph_dispatch_rank(
         inspected = []
 
         def local(hidden, indices, weights):
+            assert weights.dtype == weight_dtype
             inspected.append((hidden, indices))
             owned = (indices >= start) & (indices < stop)
             factors = coefficients[indices.long().clamp_max(7)] * weights * owned
@@ -277,7 +284,7 @@ def _graph_dispatch_rank(
         )
         hidden = torch.empty(capacity, width, device=device, dtype=torch.bfloat16)
         indices = torch.empty(capacity, top_k, device=device, dtype=torch.int32)
-        weights = torch.empty(capacity, top_k, device=device, dtype=torch.float32)
+        weights = torch.empty(capacity, top_k, device=device, dtype=weight_dtype)
         valid_rows = torch.empty((), device=device, dtype=torch.int32)
         dp_rank, cp_rank, _, _ = groups.topology.coordinates(rank)
         owner = dp_rank * groups.cp.size + cp_rank
@@ -436,7 +443,7 @@ def _graph_dispatch_rank(
 
 @pytest.mark.parametrize("replicated", [False, True])
 def test_nccl_expert_dispatch_cuda_graph_replays_routes_and_idle_rows(
-    tmp_path, replicated, layout=None, route_limit=None
+    tmp_path, replicated, layout=None, route_limit=None, weight_dtype=torch.float32
 ):
     context = mp.spawn(
         _graph_dispatch_rank,
@@ -446,6 +453,7 @@ def test_nccl_expert_dispatch_cuda_graph_replays_routes_and_idle_rows(
             replicated,
             layout,
             route_limit,
+            weight_dtype,
         ),
         nprocs=WORLD_SIZE,
         join=False,
@@ -515,4 +523,10 @@ def test_sparse_expert_graph_rank_partitioned_multipass(tmp_path):
     )
     test_nccl_expert_dispatch_cuda_graph_replays_routes_and_idle_rows(
         tmp_path, False, layout, route_limit=1 if WORLD_SIZE == 2 else 2
+    )
+
+
+def test_sparse_expert_graph_preserves_bf16_router_weights(tmp_path):
+    test_nccl_expert_dispatch_cuda_graph_replays_routes_and_idle_rows(
+        tmp_path, False, weight_dtype=torch.bfloat16
     )

@@ -148,6 +148,13 @@ class CudaRunner(Runner):
     ):
         """Vote before GPU work so every attention replica chooses the same path."""
 
+        eligible = eligible and (
+            self.cuda_graph_decode != "disabled"
+            if mode == "decode"
+            else self.cuda_graph_prefill == "breakable"
+            if mode == "prefill"
+            else True
+        )
         cache = self._require_cuda_graph_executor().mode(mode)
         values = self._graph_domain_values(
             (bool(eligible), tuple(required_shape), cache.shapes)
@@ -504,6 +511,13 @@ class CudaRunner(Runner):
         """Select one physical shape and account for an eager fallback."""
 
         cache = self._require_cuda_graph_executor().mode(mode)
+        if (
+            mode == "decode"
+            and self.cuda_graph_decode == "disabled"
+            or mode == "prefill"
+            and self.cuda_graph_prefill != "breakable"
+        ):
+            return None
         if not cache.shapes:
             return None
         shape = cache.match(match)

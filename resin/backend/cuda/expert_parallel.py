@@ -143,7 +143,11 @@ class SparseExpertTransport:
                 num_experts,
             )
             valid = received_indices[..., 0] < num_experts
-            received_weights = received_weights.masked_fill(~valid[..., None], 0)
+            # The transport ABI stores routing weights in FP32. Local expert
+            # kernels retain the caller's dtype contract (BF16 for DeepSeek).
+            received_weights = received_weights.masked_fill(~valid[..., None], 0).to(
+                weights.dtype
+            )
             received_hidden = received_hidden.masked_fill(~valid[..., None], 0)
             partial = local(
                 received_hidden.flatten(0, 1),

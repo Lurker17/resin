@@ -7,6 +7,7 @@ import os
 import socket
 import time
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import NoReturn
 
 import pytest
@@ -259,6 +260,22 @@ def _selection_worker(rank, rendezvous):
         runner._cuda_graph_executor.capture_all = lambda **_: launched.append(True)
         runner.capture_cuda_graphs()
         assert launched == [True]
+        # A live policy switch votes eager without editing captured catalogs;
+        # followers keep their original configured policy and still participate.
+        if rank == 0:
+            runner.cuda_graph_decode = "disabled"
+        catalog = runner._require_cuda_graph_executor().mode("decode").shapes
+        assert (
+            runner._select_distributed_cuda_graph(
+                "decode", context, required_shape=(1, 1)
+            )
+            is None
+        )
+        assert runner._require_cuda_graph_executor().mode("decode").shapes == catalog
+        runner.cuda_graph_decode = "full"
+        assert runner._select_distributed_cuda_graph(
+            "decode", context, required_shape=(1, 1)
+        ) == (1, 4)
         _prefill_rounds(groups)
     finally:
         if groups is not None:
@@ -286,3 +303,48 @@ def test_graph_selection_and_startup_capture_agree_across_attention_replicas(tmp
             if process.is_alive():
                 process.kill()
             process.join()
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+def test_driver_policy_disables_every_peer_without_hiding_catalogs(
+    monkeypatch, rank, mode
+):
+    runner = _CpuRunner(None)
+    runner._configure_prefill_graphs(
+        (lambda hidden, ids: hidden,), hidden_size=2, max_tokens=4
+    )
+    setattr(
+        runner,
+        f"cuda_graph_{mode}",
+        "disabled" if rank == 0 else "full" if mode == "decode" else "breakable",
+    )
+    cache = runner._require_cuda_graph_executor().mode(mode)
+    catalog = cache.shapes
+
+    def gather(value):
+        assert value[0] == (rank == 1)
+        return [(False, value[1], value[2]), (True, value[1], value[2])]
+
+    monkeypatch.setattr(runner, "_graph_domain_values", gather)
+    context = SimpleNamespace(max_num_tokens=2)
+    assert (
+        runner._select_distributed_cuda_graph(mode, context, required_shape=catalog[0])
+        is None
+    )
+    assert cache.shapes == catalog
+    assert cache.stats["fallback_counts"] == {"distributed_eligibility": 1}
+    if mode == "prefill":
+        with runner._distributed_prefill_graphs(context):
+            assert runner._distributed_prefill_bucket is None
+            assert not runner._prefill_graph_active
+            with runner._prefill_graphs():
+                assert not runner._prefill_graph_active
+    if rank == 0:
+
+        def cannot_select(_shape):
+            raise AssertionError(
+                "disabled local policy must not consider a captured shape"
+            )
+
+        assert runner._select_cuda_graph(mode, match=cannot_select) is None
