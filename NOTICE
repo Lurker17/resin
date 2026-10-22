@@ -30,6 +30,15 @@ models/cuda/resin_models_cuda/deepseek_v4 contain portions adapted from DeepSeek
 
 DeepSeek-V4 is licensed under the MIT License.
 
+The DeepSeek-V4.1 architecture, quantization kernels, and Engram implementation in
+models/cuda/resin_models_cuda/deepseek_v41 contain portions adapted from:
+
+  Copyright (c) 2023 DeepSeek
+  https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
+  revision 1bae0e1088993b9b82de08f59de5be5a34e42170
+
+The MIT notice is retained in that model directory's LICENSE.
+
 The TileLang MHC kernel in
 models/cuda/resin_models_cuda/deepseek_v4/tilelang_kernels.py contains portions adapted
 from SGLang:
@@ -40,7 +49,7 @@ from SGLang:
 SGLang is licensed under the Apache License, Version 2.0.
 
 Model weights are not distributed with Resin. Users who download Liquid AI or
-OpenAI checkpoints are responsible for the checkpoints' separate license terms.
+OpenAI or DeepSeek checkpoints are responsible for the checkpoints' separate license terms.
 
 The native conversation formats in crates/resin-recipe follow the checkpoint
 chat templates for thinkingmachines/Inkling-Small-NVFP4, Qwen/Qwen3.5,
@@ -56,4 +65,34 @@ https://github.com/openai/harmony
 The DeepSeek V4 conversation format and tools prompt in crates/resin-recipe
 are adapted from encoding/encoding_dsv4.py in DeepSeek-V4-Flash-0731 and
 DeepSeek-V4-Pro-0813, Copyright (c) 2023 DeepSeek, MIT License.
+The V4.1 variant also follows encoding/encoding.py in
+DeepSeek-V4.1-Flash-1017, revision 1bae0e1088993b9b82de08f59de5be5a34e42170,
+under the same copyright and MIT License.
 The MIT notice is retained at crates/resin-recipe/licenses/deepseek-MIT.txt.
+
+The shared-expert scale layout in resin/backend/cuda/mega_moe.py and the
+validation reference code in deploy/deepinfer_kernel_probe.py are adapted
+from DeepGEMM at revision 1fc9c66975ee322d628b3288534ca0e9ce12a64d:
+https://github.com/deepseek-ai/DeepGEMM
+
+MIT License
+
+Copyright (c) 2025 DeepSeek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

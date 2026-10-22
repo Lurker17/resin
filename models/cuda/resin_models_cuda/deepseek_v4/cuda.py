@@ -282,7 +282,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             indexer_reducer=reduce_index_scores,
         )
         self.weight_load = self._load_weights()
-        self._model.prepare_weights(self._allreduce.sum)
+        self._prepare_model_weights()
         self._configure_expert_parallel_graphs(self._model, parallel_groups)
 
         cache_backend = self._cache_backend()
@@ -402,6 +402,9 @@ class DeepSeekV4CudaRunner(CudaRunner):
             tensor_parallel_size=self.tensor_parallel_size,
             device=self.device,
         )
+
+    def _prepare_model_weights(self):
+        self._model.prepare_weights(self._allreduce.sum)
 
     def _configure_prefill_attention_graphs(self) -> None:
         """Capture dense projections around the ordinary eager sparse attention."""

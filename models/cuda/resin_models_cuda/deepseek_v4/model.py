@@ -1788,6 +1788,14 @@ class MoE(nn.Module):
         self.routed = routed
         self.decode_overlap_stream = source.decode_overlap_stream
 
+    def forward_empty(self):
+        hidden = self.gate.weight.new_empty((0, self.dim))
+        self.routed(
+            hidden,
+            torch.empty((0, self.gate.topk), dtype=torch.int32, device=hidden.device),
+            hidden.new_empty((0, self.gate.topk)),
+        )
+
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
@@ -2312,14 +2320,9 @@ class Transformer(nn.Module):
         if stage not in ("target", "draft"):
             raise ValueError("expert round stage must be target or draft")
         layers = self.layers if stage == "target" else self.mtp
-        hidden = self.embed.weight.new_empty((0, self.embed.dim))
         for layer in layers:
             ffn = cast(MoE, layer.ffn)
-            indices = torch.empty(
-                (0, ffn.gate.topk), device=hidden.device, dtype=torch.int32
-            )
-            weights = hidden.new_empty(indices.shape)
-            ffn.routed(hidden, indices, weights)
+            ffn.forward_empty()
 
     def set_allreduce(
         self,
