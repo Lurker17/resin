@@ -7,7 +7,6 @@ from typing import NoReturn, TypedDict
 import numpy as np
 import pytest
 
-from resin.backend.expert_parallel import ExpertParallelDispatch
 from resin.backend.cuda import graphs as graph_runtime
 from resin.backend.cuda import runner as runner_runtime
 from resin.backend.cuda import staging
@@ -26,6 +25,7 @@ from resin.backend.cuda.graphs import (
     resolve_decode_graph_shapes,
 )
 from resin.backend.cuda.runner import CudaRunner, resolve_kv_cache_dtype
+from resin.backend.expert_parallel import ExpertParallelDispatch
 from resin.backend.resources import CachePoolBinding
 from resin.backend.topology import RankGroup
 
