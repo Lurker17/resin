@@ -8,7 +8,9 @@ import modal
 
 _DEPENDENCY_ROOT = "/opt/resin-deps"
 _SOURCE_ROOT = "/opt/resin"
-_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_SYSTEM_PATH = (
+    "/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+)
 _PYTHON_SOURCE_IGNORE = ("**/__pycache__", "**/*.py[co]")
 
 
@@ -29,10 +31,21 @@ def build_modal_image(
         modal.Image.from_registry(
             "nvidia/cuda:13.3.1-devel-ubuntu22.04", add_python="3.12"
         )
-        .apt_install("build-essential", "curl", "git", "ninja-build")
+        .apt_install(
+            "build-essential",
+            "curl",
+            "git",
+            "ninja-build",
+            "software-properties-common",
+            "libdw-dev",
+            "libelf-dev",
+        )
         .run_commands(
+            "add-apt-repository -y ppa:ubuntu-toolchain-r/test",
+            "apt-get update && apt-get install -y gcc-13 g++-13",
+            "git config --global url.https://github.com/.insteadOf git@github.com:",
             "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | "
-            "sh -s -- -y --profile minimal"
+            "sh -s -- -y --profile minimal",
         )
         .env(
             {
@@ -40,6 +53,10 @@ def build_modal_image(
                 "HF_HUB_DISABLE_PROGRESS_BARS": "1",
                 "MAX_JOBS": "16",
                 "CMAKE_BUILD_PARALLEL_LEVEL": "16",
+                "CUDA_HOME": "/usr/local/cuda",
+                "CC": "gcc-13",
+                "CXX": "g++-13",
+                "NVCC_PREPEND_FLAGS": "-ccbin /usr/bin/g++-13",
             }
         )
         .pip_install("uv==0.12.5")

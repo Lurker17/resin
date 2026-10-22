@@ -24,6 +24,10 @@ overrides = [
     { name = "nvidia-cutlass-dsl-libs-base", marker = "sys_platform == 'linux'", specifier = "==4.6.2" },
 ]
 
+[[manifest.dependency-metadata]]
+name = "deep-gemm"
+version = "2.8.2"
+
 [[package]]
 name = "aiohappyeyeballs"
 version = "2.7.1"
@@ -778,6 +782,11 @@ sdist = { url = "https://files.pythonhosted.org/packages/a9/95/a3dbbb5028f35eafb
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e7/05/c19819d5e3d95294a6f5947fb9b9629efb316b96de511b418c53d245aae6/cycler-0.12.1-py3-none-any.whl", hash = "sha256:85cef7cff222d8644161529808465972e51340599459b8ac3ccbac5a854e0d30", size = 8321, upload-time = "2023-10-07T05:32:16.783Z" },
 ]
+
+[[package]]
+name = "deep-gemm"
+version = "2.8.2"
+source = { git = "https://github.com/deepseek-ai/DeepGEMM?rev=1fc9c66975ee322d628b3288534ca0e9ce12a64d#1fc9c66975ee322d628b3288534ca0e9ce12a64d" }
 
 [[package]]
 name = "deepseek-recipe"
@@ -3113,6 +3122,7 @@ source = { editable = "models/cuda" }
 dependencies = [
     { name = "apache-tvm-ffi", marker = "sys_platform == 'linux'" },
     { name = "cuda-tile", marker = "sys_platform == 'linux'" },
+    { name = "deep-gemm", marker = "sys_platform == 'linux'" },
     { name = "flash-attn-4", marker = "sys_platform == 'linux'" },
     { name = "flash-linear-attention", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux'" },
@@ -3124,7 +3134,6 @@ dependencies = [
     { name = "resin", extra = ["cuda"] },
     { name = "resin-models-torch" },
     { name = "safetensors" },
-    { name = "sgl-deep-gemm", marker = "sys_platform == 'linux'" },
     { name = "tile-kernels", marker = "sys_platform == 'linux'" },
     { name = "tilelang", marker = "sys_platform == 'linux'" },
     { name = "torch" },
@@ -3137,6 +3146,7 @@ dependencies = [
 requires-dist = [
     { name = "apache-tvm-ffi", marker = "sys_platform == 'linux'", specifier = "==0.1.12" },
     { name = "cuda-tile", marker = "sys_platform == 'linux'", specifier = "==1.5.0" },
+    { name = "deep-gemm", marker = "sys_platform == 'linux'", git = "https://github.com/deepseek-ai/DeepGEMM?rev=1fc9c66975ee322d628b3288534ca0e9ce12a64d" },
     { name = "flash-attn-4", marker = "sys_platform == 'linux'", specifier = "==4.0.0b26" },
     { name = "flash-linear-attention", marker = "sys_platform == 'linux'", specifier = "==0.5.2" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux'", specifier = "==0.6.15.post1" },
@@ -3148,7 +3158,6 @@ requires-dist = [
     { name = "resin", extras = ["cuda"], editable = "." },
     { name = "resin-models-torch", editable = "models/torch" },
     { name = "safetensors", specifier = ">=0.5" },
-    { name = "sgl-deep-gemm", marker = "sys_platform == 'linux'", specifier = "==0.1.5.post2" },
     { name = "tile-kernels", marker = "sys_platform == 'linux'", specifier = "==1.0.0" },
     { name = "tilelang", marker = "sys_platform == 'linux'", specifier = "==0.1.14" },
     { name = "torch", specifier = "==2.13.0" },
@@ -3245,18 +3254,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/6d/44/f5da03a8ef95d369145c5bb53050e7877c9f3d312e128605fd9504829143/setuptools-84.0.0.tar.gz", hash = "sha256:f4695c21257f0d9b537ec2692c941d02ee143b7cc1276941349a546573b2ef73", size = 1168449, upload-time = "2026-08-08T18:27:58.365Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/95/9c/c510029fc6ef33a6275cd2c5d3cecd6613dfd6aa401d57c54f1c18852ccf/setuptools-84.0.0-py3-none-any.whl", hash = "sha256:51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670", size = 818216, upload-time = "2026-08-08T18:27:56.719Z" },
-]
-
-[[package]]
-name = "sgl-deep-gemm"
-version = "0.1.5.post2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "apache-tvm-ffi" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/6b/fb/a64a7b2aca5e259bf1b6c7327d4edcce60d1a6eaa5df6a4086656e8af440/sgl_deep_gemm-0.1.5.post2-py3-none-manylinux2014_aarch64.whl", hash = "sha256:ba29193265ddd2cad51797cb1d73eeeb6909ace2e95f2ca3baee98ccfbbf7e02", size = 4678048, upload-time = "2026-08-05T08:40:50.959Z" },
-    { url = "https://files.pythonhosted.org/packages/ee/a4/c249b5b933c9a55095f31a7fed01b69ca15a2377c8b71bc90bd5abe95224/sgl_deep_gemm-0.1.5.post2-py3-none-manylinux2014_x86_64.whl", hash = "sha256:8673d096a00a3c5ce8f6f3449f56e10d0799b62325f45f715b2e8c0f64f971c2", size = 4819192, upload-time = "2026-08-05T08:40:52.874Z" },
 ]
 
 [[package]]

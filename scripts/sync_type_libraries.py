@@ -7,12 +7,13 @@ import importlib.metadata
 import io
 import re
 import shutil
+import stat
 import tempfile
 import tomllib
 import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 # These upstream packages add import roots using executable .pth/setup code.
@@ -114,6 +115,100 @@ def wheel_bytes(package, cache: Path) -> bytes:
     return data
 
 
+def git_bytes(package, cache: Path) -> tuple[bytes, str]:
+    """Fetch an immutable source snapshot without running repository code."""
+
+    source = urlsplit(package["source"]["git"])
+    commit = source.fragment
+    query = parse_qs(source.query)
+    if not re.fullmatch(r"[0-9a-f]{40}", commit) or query not in (
+        {},
+        {"rev": [commit]},
+    ):
+        raise ValueError(f"Git source must pin a full commit for {package['name']}")
+    parts = source.path.removesuffix(".git").strip("/").split("/")
+    if (
+        source.scheme != "https"
+        or source.netloc != "github.com"
+        or len(parts) != 2
+        or any(
+            part in {".", ".."} or not re.fullmatch(r"[\w.-]+", part) for part in parts
+        )
+    ):
+        raise ValueError(f"unsupported Git source for {package['name']}")
+    url = f"https://codeload.github.com/{'/'.join(parts)}/zip/{commit}"
+    identity = hashlib.sha256(url.encode()).hexdigest()
+    cached, checksum = cache / f"git-{identity}.zip", cache / f"git-{identity}.sha256"
+    if cached.exists():
+        data = cached.read_bytes()
+        if (
+            not checksum.exists()
+            or hashlib.sha256(data).hexdigest() != checksum.read_text().strip()
+        ):
+            raise ValueError(f"Git snapshot checksum mismatch for {package['name']}")
+    else:
+        print(f"Downloading {package['name']}@{commit}", flush=True)
+        data = download(url)
+        temporary = cached.with_suffix(".tmp")
+        temporary.write_bytes(data)
+        checksum.write_text(hashlib.sha256(data).hexdigest() + "\n")
+        temporary.replace(cached)
+    return data, commit
+
+
+def extract_git(data: bytes, commit: str, destination: Path) -> int:
+    """Expose package sources, excluding repository tooling and native code."""
+
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        members = []
+        roots = set()
+        for member in archive.infolist():
+            path = PurePosixPath(member.filename)
+            if path.is_absolute() or ".." in path.parts or not path.parts:
+                raise ValueError(f"unsafe Git snapshot path: {member.filename}")
+            roots.add(path.parts[0])
+            if stat.S_ISLNK(member.external_attr >> 16):
+                raise ValueError(f"unsafe Git snapshot symlink: {member.filename}")
+            if not member.is_dir() and len(path.parts) > 1:
+                members.append((member, PurePosixPath(*path.parts[1:])))
+        if len(roots) != 1 or not next(iter(roots)).endswith(f"-{commit}"):
+            raise ValueError("Git snapshot does not match its pinned commit")
+        # Support ordinary repository packages and the conventional src/ layout.
+        packages = {
+            path.parent
+            for _, path in members
+            if path.name in {"__init__.py", "__init__.pyi", "py.typed"}
+            and len(path.parts) == (3 if path.parts[0] == "src" else 2)
+        }
+        excluded = {"tests", "scripts", "examples", "benchmarks", "docs", "tools"}
+        count = 0
+        for member, path in members:
+            if path.parts[0] == "src":
+                if len(path.parts) == 1:
+                    continue
+                path = PurePosixPath(*path.parts[1:])
+                root = PurePosixPath("src", path.parts[0])
+            else:
+                root = PurePosixPath(path.parts[0])
+            if (
+                root not in packages
+                or not path.parts[0].isidentifier()
+                or path.parts[0] in excluded
+                or (path.suffix not in {".py", ".pyi"} and path.name != "py.typed")
+            ):
+                continue
+            output = destination / path
+            contents = archive.read(member)
+            if output.exists() and output.read_bytes() != contents:
+                raise ValueError(f"conflicting type-library source: {path}")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(contents)
+            count += 1
+        if not count:
+            raise ValueError("Git snapshot contains no importable Python packages")
+        return count
+
+
 def extract(data: bytes, destination: Path) -> int:
     count = 0
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -156,7 +251,7 @@ def extract(data: bytes, destination: Path) -> int:
 def sync(root: Path = ROOT) -> Path:
     """Refresh all Linux interfaces and local overlays from uv.lock.
 
-    Verified wheels are cached for offline reuse. Namespace packages are merged
+    Wheels and pinned Git snapshots are cached for offline reuse. Packages merge
     before the generated source tree is replaced, so failures preserve the old
     interfaces. Nothing is installed, imported, or added to sys.path.
     """
@@ -171,7 +266,11 @@ def sync(root: Path = ROOT) -> Path:
         source = stage / "sources"
         source.mkdir()
         for package in linux_packages(lock):
-            count = extract(wheel_bytes(package, cache), source)
+            if "git" in package.get("source", {}):
+                data, commit = git_bytes(package, cache)
+                count = extract_git(data, commit, source)
+            else:
+                count = extract(wheel_bytes(package, cache), source)
             reports.append(
                 f"{package['name']}=={package['version']}: {count} Python/type files"
             )

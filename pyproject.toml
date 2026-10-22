@@ -83,6 +83,27 @@ override-dependencies = [
   "nvidia-cutlass-dsl-libs-base==4.6.2; sys_platform == 'linux'",
 ]
 
+# DeepGEMM's setup.py imports CUDA while computing metadata. Keep resolution
+# portable; build its pinned source only on Linux, against the runtime Torch.
+[[tool.uv.dependency-metadata]]
+name = "deep-gemm"
+version = "2.8.2"
+requires-dist = []
+
+[tool.uv.extra-build-dependencies]
+deep-gemm = [
+  { requirement = "torch", match-runtime = true },
+  "setuptools==80.9.0",
+  "packaging>=24",
+  "wheel==0.45.1",
+  "pybind11==3.0.1",
+  "tree-sitter==0.26.0",
+  "tree-sitter-cpp==0.23.4",
+]
+
+[tool.uv.extra-build-variables]
+deep-gemm = { DG_USE_LOCAL_VERSION = "0", DG_FORCE_BUILD = "1" }
+
 [tool.uv.sources]
 resin-models-cuda = { workspace = true }
 resin-models-torch = { workspace = true }

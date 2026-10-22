@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import stat
 import subprocess
 import sys
 from pathlib import Path
-from zipfile import ZipFile
+from zipfile import ZipFile, ZipInfo
 
 import pytest
 
+from scripts import sync_type_libraries
 from scripts.sync_type_libraries import sync
+
+COMMIT = "1fc9c66975ee322d628b3288534ca0e9ce12a64d"
+GIT_SOURCE = f"https://github.com/deepseek-ai/DeepGEMM?rev={COMMIT}#{COMMIT}"
 
 
 def _wheel(
@@ -68,6 +74,163 @@ def _existing_library(root: Path) -> Path:
     package.mkdir(parents=True)
     (package / "previous.py").write_text("previous = True\n")
     return package
+
+
+def _git_lock(root: Path, source: str = GIT_SOURCE) -> None:
+    _lock(root, {"deep-gemm": None}, roots=("deep-gemm",))
+    with (root / "uv.lock").open("a") as lock:
+        lock.write(f'\nsource = {{ git = "{source}" }}\n')
+
+
+def _snapshot(entries: dict[str, str], *, root=f"DeepGEMM-{COMMIT}") -> bytes:
+    buffer = io.BytesIO()
+    with ZipFile(buffer, "w") as archive:
+        for path, contents in entries.items():
+            archive.writestr(f"{root}/{path}", contents)
+    return buffer.getvalue()
+
+
+def test_git_snapshot_exposes_only_packages_without_running_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _git_lock(tmp_path)
+    snapshot = _snapshot(
+        {
+            "deep_gemm/__init__.py": "raise AssertionError('must not import CUDA')\n",
+            "deep_gemm/mega/mega_moe.py": "def mega_moe(value: int) -> int: return value\n",
+            "deep_gemm/_C.pyi": "def bf16_mega_gate() -> None: ...\n",
+            "deep_gemm/py.typed": "",
+            "deep_gemm/_C.so": "native binary",
+            "src/another/__init__.py": "value = 1\n",
+            "tests/__init__.py": "raise AssertionError('test helper')\n",
+            "scripts/__init__.py": "raise AssertionError('script helper')\n",
+            "examples/__init__.py": "raise AssertionError('example helper')\n",
+            "setup.py": "raise AssertionError('must not run setup')\n",
+            "build_backend.py": "raise AssertionError('must not run build')\n",
+        }
+    )
+    urls = []
+
+    def download(url: str) -> bytes:
+        urls.append(url)
+        return snapshot
+
+    monkeypatch.setattr(sync_type_libraries, "download", download)
+    target = sync(tmp_path)
+    assert urls == [f"https://codeload.github.com/deepseek-ai/DeepGEMM/zip/{COMMIT}"]
+    assert {
+        path.relative_to(target).as_posix()
+        for path in target.rglob("*")
+        if path.is_file()
+    } == {
+        "deep_gemm/__init__.py",
+        "deep_gemm/mega/mega_moe.py",
+        "deep_gemm/_C.pyi",
+        "deep_gemm/py.typed",
+        "another/__init__.py",
+    }
+    (target / "deep_gemm/stale.py").write_text("stale = True\n")
+
+    def offline(url: str) -> bytes:
+        raise AssertionError(f"offline sync must use its cached snapshot: {url}")
+
+    monkeypatch.setattr(sync_type_libraries, "download", offline)
+    sync(tmp_path)
+    assert not (target / "deep_gemm/stale.py").exists()
+    assert (target / "deep_gemm/_C.pyi").exists()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://github.com/deepseek-ai/DeepGEMM?rev=main#main",
+        f"https://github.com/deepseek-ai/DeepGEMM?rev=main#{COMMIT}",
+        f"https://github.com/deepseek-ai/DeepGEMM?rev={'0' * 40}#{COMMIT}",
+        f"https://gitlab.com/deepseek-ai/DeepGEMM?rev={COMMIT}#{COMMIT}",
+    ],
+)
+def test_git_requires_supported_immutable_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+):
+    package = _existing_library(tmp_path)
+    _git_lock(tmp_path, source)
+
+    def unexpected(url: str) -> bytes:
+        raise AssertionError(f"invalid source must not be fetched: {url}")
+
+    monkeypatch.setattr(sync_type_libraries, "download", unexpected)
+    with pytest.raises(ValueError, match="(?i)Git source"):
+        sync(tmp_path)
+    assert (package / "previous.py").exists()
+
+
+@pytest.mark.parametrize("unsafe_path", ["../../escape.py", "/escape.py"])
+def test_git_unsafe_snapshot_preserves_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe_path: str
+):
+    package = _existing_library(tmp_path)
+    _git_lock(tmp_path)
+    buffer = io.BytesIO()
+    with ZipFile(buffer, "w") as archive:
+        archive.writestr(f"DeepGEMM-{COMMIT}/deep_gemm/__init__.py", "new = True\n")
+        archive.writestr(unsafe_path, "escaped = True\n")
+    monkeypatch.setattr(sync_type_libraries, "download", lambda url: buffer.getvalue())
+    with pytest.raises(ValueError, match="unsafe Git snapshot"):
+        sync(tmp_path)
+    assert (package / "previous.py").exists()
+    assert not (package.parent / "deep_gemm").exists()
+    assert not list(tmp_path.rglob("escape.py"))
+
+
+def test_git_rejects_symlinks_and_wrong_commit(tmp_path: Path):
+    buffer = io.BytesIO()
+    with ZipFile(buffer, "w") as archive:
+        link = ZipInfo(f"DeepGEMM-{COMMIT}/deep_gemm/__init__.py")
+        link.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(link, "../../outside.py")
+    with pytest.raises(ValueError, match="symlink"):
+        sync_type_libraries.extract_git(buffer.getvalue(), COMMIT, tmp_path)
+    with pytest.raises(ValueError, match="pinned commit"):
+        sync_type_libraries.extract_git(
+            _snapshot({"deep_gemm/__init__.py": ""}, root="DeepGEMM-main"),
+            COMMIT,
+            tmp_path,
+        )
+
+
+def test_corrupted_git_cache_preserves_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _git_lock(tmp_path)
+    snapshot = _snapshot({"deep_gemm/__init__.py": "old = True\n"})
+    monkeypatch.setattr(sync_type_libraries, "download", lambda url: snapshot)
+    package = sync(tmp_path) / "deep_gemm"
+    cached = next((tmp_path / ".type-libs/.wheels").glob("git-*.zip"))
+    cached.write_bytes(snapshot + b"corruption")
+    with pytest.raises(ValueError, match="Git snapshot checksum mismatch"):
+        sync(tmp_path)
+    assert (package / "__init__.py").read_text() == "old = True\n"
+
+
+def test_git_commit_change_replaces_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _git_lock(tmp_path)
+    snapshots = {
+        COMMIT: _snapshot({"deep_gemm/__init__.py": "old = True\n"}),
+        "a" * 40: _snapshot(
+            {"deep_gemm/__init__.py": "new = True\n", "deep_gemm/new.py": ""},
+            root=f"DeepGEMM-{'a' * 40}",
+        ),
+    }
+    monkeypatch.setattr(
+        sync_type_libraries, "download", lambda url: snapshots[url.rsplit("/", 1)[1]]
+    )
+    package = sync(tmp_path) / "deep_gemm"
+    _git_lock(tmp_path, GIT_SOURCE.replace(COMMIT, "a" * 40))
+    sync(tmp_path)
+    assert (package / "__init__.py").read_text() == "new = True\n"
+    assert (package / "new.py").exists()
 
 
 def test_sync_exposes_sources_and_overlay_without_importing(tmp_path: Path):
