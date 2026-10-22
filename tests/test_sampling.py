@@ -195,13 +195,15 @@ class TestSharedSampler:
             calls["temperatures"] = temperature.clone()
             return torch.softmax(logits / temperature[:, None], dim=-1)
 
-        def sample(probabilities, top_p, **kwargs):
+        def renorm(probabilities, top_p, *, is_deterministic):
             calls["probabilities"] = probabilities.clone()
             calls["top_p"] = top_p.clone()
-            calls["seed"] = kwargs["seed"].clone()
-            calls["offset"] = kwargs["offset"].clone()
-            calls["return_valid"] = kwargs["return_valid"]
-            assert kwargs["deterministic"] is True
+            assert is_deterministic is True
+            return probabilities
+
+        def sample(probabilities, seeds, offsets):
+            calls["seed"] = seeds.clone()
+            calls["offset"] = offsets.clone()
             return (
                 torch.tensor([2, 0], dtype=torch.int32),
                 torch.tensor([True, True]),
@@ -209,6 +211,7 @@ class TestSharedSampler:
 
         monkeypatch.setattr(sampler, "_mask_logits", mask_logits, raising=False)
         monkeypatch.setattr(sampler, "_softmax", softmax, raising=False)
+        monkeypatch.setattr(sampler, "_renorm", renorm, raising=False)
         monkeypatch.setattr(sampler, "_sample", sample, raising=False)
         plan = BatchPlan(
             [10, 11],
@@ -233,7 +236,6 @@ class TestSharedSampler:
         torch.testing.assert_close(calls["top_p"], torch.tensor([0.8, 1.0]))
         assert calls["seed"].tolist() == [31, 32]
         assert calls["offset"].tolist() == [64, 96]
-        assert calls["return_valid"] is True
 
         shifted = sampler.host_inputs(plan, 3, offset_delta=64)
         assert shifted["sampling_offsets"] == (128, 160)
@@ -251,6 +253,12 @@ class TestSharedSampler:
             lambda logits, *, temperature: torch.softmax(
                 logits / temperature[:, None], dim=-1
             ),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            sampler,
+            "_renorm",
+            lambda probabilities, top_p, **kwargs: probabilities,
             raising=False,
         )
         monkeypatch.setattr(

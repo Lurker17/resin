@@ -22,7 +22,7 @@ class SamplingTensors:
 class FlashInferSampler:
     """Temperature, top-k, and top-p sampling over row-aligned batch plans.
 
-    FlashInfer receives per-row seed and offset tensors, so a request's random
+    Sampling uses per-row seed and offset tensors, so a request's random
     stream is independent of batch composition. Greedy and unsampled rows still
     enter the fixed-shape CUDA kernels when mixed with sampled rows, but their
     random result is discarded and their native offset is not advanced.
@@ -32,12 +32,15 @@ class FlashInferSampler:
         from flashinfer.sampling import (
             softmax,
             top_k_mask_logits,
-            top_p_sampling_from_probs,
+            top_p_renorm_probs,
         )
+
+        from resin.backend.cuda.categorical import sample_categorical
 
         self._mask_logits = top_k_mask_logits
         self._softmax = softmax
-        self._sample = top_p_sampling_from_probs
+        self._renorm = top_p_renorm_probs
+        self._sample = sample_categorical
 
     @staticmethod
     def host_inputs(
@@ -93,14 +96,14 @@ class FlashInferSampler:
         # atomics across CTAs, even when the later sampler is deterministic.
         masked_logits = self._mask_logits(logits, tensors.top_ks)
         probabilities = self._softmax(masked_logits, temperature=tensors.temperatures)
-        sampled, valid = self._sample(
+        probabilities = self._renorm(
             probabilities,
             tensors.top_ps,
-            deterministic=True,
-            seed=tensors.seeds,
-            offset=tensors.offsets,
-            return_valid=True,
+            is_deterministic=True,
         )
+        # FlashInfer 0.6.15 reads only seed[0]/offset[0] when drawing samples.
+        # Own the draw so requests keep their random stream when batches change.
+        sampled, valid = self._sample(probabilities, tensors.seeds, tensors.offsets)
         sampled = sampled.to(dtype=greedy.dtype)
         in_range = (sampled >= 0) & (sampled < logits.shape[-1])
         safe_sampled = sampled.clamp(0, logits.shape[-1] - 1)
