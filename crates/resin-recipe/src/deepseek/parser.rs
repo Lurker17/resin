@@ -329,6 +329,9 @@ impl DeepSeekV4Grammar {
 
 impl Grammar for DeepSeekV4Grammar {
     const STRICT_END: bool = true;
+    fn channel(&self) -> Option<&'static str> {
+        (!matches!(self.stage, Stage::Content | Stage::Reasoning)).then_some("tool")
+    }
     fn is_control(&self, id: u32) -> bool {
         self.tokens.ids().contains(&id)
     }

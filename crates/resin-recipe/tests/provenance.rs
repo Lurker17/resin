@@ -181,8 +181,10 @@ fn all_model_grammars_preserve_unicode_and_source_indices_across_batching() {
             let mut expected = None;
             for chunk_size in [1, 2, 3, 7, generated.len()] {
                 let mut decoder = parser(model, tokenizer.clone(), &prompt);
+                assert!(decoder.supports_attribution());
                 let mut events = Vec::new();
                 for chunk in generated.chunks(chunk_size) {
+                    assert!(decoder.supports_attribution());
                     events.extend(decoder.feed_attributed(chunk).unwrap());
                 }
                 events.extend(decoder.finish_attributed(FinishReason::Length).unwrap());
@@ -273,6 +275,7 @@ fn incomplete_utf8_flush_owns_replacements_and_custom_decoders_are_explicitly_un
         fn reset(&mut self) {}
     }
     let mut plain = Plain;
+    assert!(!plain.supports_attribution());
     assert!(plain.push_attributed(&[1], 0).unwrap().spans.is_empty());
 }
 
@@ -304,6 +307,7 @@ fn unscored_feed_never_calls_attributed_decoder() {
             &[],
         )
         .unwrap();
+    assert!(!parser.supports_attribution());
     assert_eq!(
         parser.feed(&[1]).unwrap(),
         vec![Event::TextDelta { delta: "x".into() }]
@@ -386,6 +390,7 @@ fn source_bytes_share_decoder_conventions_and_unknown_decoders_stay_unknown() {
     }
     let tokenizer = Tokenizer::from_bytes(br#"{"version":"1.0","added_tokens":[],"decoder":{"type":"Fuse"},"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}"#).unwrap();
     let mut decoder = TokenizerDecoder::new(Arc::new(tokenizer));
+    assert!(!decoder.supports_attribution());
     let text = decoder.push_attributed(&[0], 0).unwrap();
     assert_eq!(text.text, "hello");
     assert!(text.spans.is_empty());
@@ -435,4 +440,32 @@ fn mixed_mode_utf8_is_unknown_until_the_next_control_boundary() {
             .spans
             .is_empty()
     );
+}
+
+#[test]
+fn qwen_and_deepseek_tool_channel_hints_exclude_deferred_content() {
+    let tokenizer = tokenizer(false, &[]);
+    let mut qwen = parser(ModelFormat::Qwen, tokenizer.clone(), &[]);
+    assert_eq!(qwen.token_channel(u32::from(b'x')), None);
+    let open = id(&tokenizer, "<tool_call>");
+    assert_eq!(qwen.token_channel(open), Some("control"));
+    qwen.feed_attributed(&[open]).unwrap();
+    assert_eq!(qwen.token_channel(u32::from(b'x')), Some("tool"));
+    qwen.feed_attributed(&bytes("<function=f></function>"))
+        .unwrap();
+    qwen.feed_attributed(&[id(&tokenizer, "</tool_call>")])
+        .unwrap();
+    assert_eq!(qwen.token_channel(u32::from(b' ')), Some("tool"));
+    qwen.feed_attributed(&[id(&tokenizer, "<think>")]).unwrap();
+    assert_eq!(qwen.token_channel(u32::from(b'x')), None);
+
+    let mut deepseek = parser(ModelFormat::DeepSeek, tokenizer.clone(), &[]);
+    deepseek.feed_attributed(&bytes("\n\n<")).unwrap();
+    assert_eq!(deepseek.token_channel(u32::from(b'x')), None);
+    deepseek
+        .feed_attributed(&[id(&tokenizer, "｜DSML｜")])
+        .unwrap();
+    assert_eq!(deepseek.token_channel(u32::from(b'x')), None);
+    deepseek.feed_attributed(&bytes("tool_calls>")).unwrap();
+    assert_eq!(deepseek.token_channel(u32::from(b'<')), Some("tool"));
 }

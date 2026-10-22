@@ -121,6 +121,9 @@ impl<G: Grammar> Parser<G> {
 }
 
 impl<G: Grammar> ResponseParser for Parser<G> {
+    fn supports_attribution(&mut self) -> bool {
+        self.decoder.supports_attribution()
+    }
     fn token_channel(&self, id: u32) -> Option<&'static str> {
         if self.finished || self.grammar.ended() {
             None

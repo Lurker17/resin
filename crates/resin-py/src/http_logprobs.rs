@@ -1,15 +1,11 @@
 //! Token representations prepared once, independently of semantic parsing.
 use pyo3::{exceptions::PyAttributeError, prelude::*};
 use resin_http::{GeneratedTokenLogprob, TokenLogprob};
-use resin_recipe::Tokenizer;
-use std::collections::HashSet;
+use resin_recipe::{TokenBytes, Tokenizer};
 
 pub(crate) struct Vocabulary {
     tokenizer: Option<Tokenizer>,
-    byte_level: bool,
-    byte_fallback: bool,
-    metaspace: bool,
-    special_ids: HashSet<u32>,
+    bytes: Option<TokenBytes>,
 }
 
 impl Vocabulary {
@@ -31,28 +27,8 @@ impl Vocabulary {
             Err(error) if error.is_instance_of::<PyAttributeError>(py) => None,
             Err(error) => return Err(error),
         };
-        let decoder = tokenizer
-            .as_ref()
-            .and_then(|tokenizer| tokenizer.get_decoder())
-            .and_then(|decoder| serde_json::to_value(decoder).ok());
-        let decoder = decoder.unwrap_or_default();
-        let special_ids = tokenizer
-            .as_ref()
-            .map(|tokenizer| {
-                tokenizer
-                    .get_added_tokens_decoder()
-                    .into_iter()
-                    .filter_map(|(id, token)| token.special.then_some(id))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(Self {
-            tokenizer,
-            special_ids,
-            byte_level: has_decoder(&decoder, "ByteLevel"),
-            byte_fallback: has_decoder(&decoder, "ByteFallback"),
-            metaspace: has_decoder(&decoder, "Metaspace") || replaces_metaspace(&decoder),
-        })
+        let bytes = tokenizer.as_ref().map(TokenBytes::new);
+        Ok(Self { tokenizer, bytes })
     }
 
     pub fn token(&self, token_id: u32, logprob: f32) -> TokenLogprob {
@@ -65,36 +41,10 @@ impl Vocabulary {
             };
         };
         let spelling = tokenizer.id_to_token(token_id).unwrap_or_default();
-        let special = self.special_ids.contains(&token_id);
-        let bytes = if special {
-            Some(spelling.as_bytes().to_vec())
-        } else if self.byte_level {
-            // ByteLevel falls back to literal UTF-8 for an added token that
-            // contains characters outside its byte alphabet.
-            Some(
-                spelling
-                    .chars()
-                    .map(byte_level_byte)
-                    .collect::<Option<Vec<_>>>()
-                    .unwrap_or_else(|| spelling.as_bytes().to_vec()),
-            )
-        } else if self.byte_fallback
-            && spelling.len() == 6
-            && spelling.starts_with("<0x")
-            && spelling.ends_with('>')
-        {
-            u8::from_str_radix(&spelling[3..spelling.len() - 1], 16)
-                .ok()
-                .map(|byte| vec![byte])
-        } else if self.byte_fallback {
-            Some(if self.metaspace {
-                spelling.replace('▁', " ").into_bytes()
-            } else {
-                spelling.as_bytes().to_vec()
-            })
-        } else {
-            None
-        };
+        let bytes = self
+            .bytes
+            .as_ref()
+            .and_then(|bytes| bytes.get(token_id, &spelling));
         let token = bytes
             .as_ref()
             .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
@@ -125,38 +75,4 @@ impl Vocabulary {
                 .collect(),
         }
     }
-}
-
-fn has_decoder(value: &serde_json::Value, kind: &str) -> bool {
-    value["type"] == kind
-        || value["decoders"]
-            .as_array()
-            .is_some_and(|children| children.iter().any(|child| has_decoder(child, kind)))
-}
-
-fn replaces_metaspace(value: &serde_json::Value) -> bool {
-    (value["type"] == "Replace" && value["pattern"]["String"] == "▁" && value["content"] == " ")
-        || value["decoders"]
-            .as_array()
-            .is_some_and(|children| children.iter().any(replaces_metaspace))
-}
-
-fn byte_level_byte(character: char) -> Option<u8> {
-    let code = character as u32;
-    if (33..=126).contains(&code) || (161..=172).contains(&code) || (174..=255).contains(&code) {
-        return Some(code as u8);
-    }
-    let mut encoded = 256;
-    for byte in 0..=255_u8 {
-        if !(33..=126).contains(&byte)
-            && !(161..=172).contains(&byte)
-            && !(174..=255).contains(&byte)
-        {
-            if code == encoded {
-                return Some(byte);
-            }
-            encoded += 1;
-        }
-    }
-    None
 }

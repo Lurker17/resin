@@ -1,5 +1,6 @@
 //! Shared request lifecycle for local serving and routed attention-DP drivers.
 use crate::http_logprobs::Vocabulary;
+use crate::http_output::OutputScores;
 use crate::http_stop::StopFilter;
 use crate::recipe::{self, NativeInklingParser, NativeResponseParser, SharedParser};
 use crate::{CompletionReason, Engine, RequestLease, SamplingParams, TokenEvent};
@@ -12,7 +13,7 @@ use pythonize::{depythonize, pythonize};
 use resin_http::{
     ConversationRequest, EVENT_QUEUE_CAPACITY, FinishReason, GenerationEvent, GenerationJob,
 };
-use resin_recipe::{Event as ParsedEvent, FinishReason as ParserFinishReason};
+use resin_recipe::{AttributedEvent, Event as ParsedEvent, FinishReason as ParserFinishReason};
 use serde::Deserialize;
 use std::{collections::HashMap, sync::Mutex, time::Instant};
 use tokio::sync::mpsc;
@@ -27,7 +28,10 @@ struct RenderedPrompt {
 fn into_http(event: ParsedEvent) -> GenerationEvent {
     match event {
         ParsedEvent::ReasoningDelta { delta } => GenerationEvent::ReasoningDelta(delta),
-        ParsedEvent::TextDelta { delta } => GenerationEvent::TextDelta(delta),
+        ParsedEvent::TextDelta { delta } => GenerationEvent::TextDelta {
+            delta,
+            logprobs: Vec::new(),
+        },
         ParsedEvent::ToolCallStart { index, id, name } => {
             GenerationEvent::ToolCallStart { index, id, name }
         }
@@ -42,6 +46,8 @@ enum Parser {
     Python {
         object: Py<PyAny>,
         finish: Option<Py<PyAny>>,
+        attributed_feed: Option<Py<PyAny>>,
+        attributed_finish: Option<Py<PyAny>>,
     },
 }
 
@@ -53,13 +59,15 @@ impl Parser {
         if let Ok(native) = object.bind(py).cast::<NativeInklingParser>() {
             return Ok(Self::Native(native.borrow().inner.clone()));
         }
-        let finish = match object.bind(py).getattr("finish") {
-            Ok(method) if method.is_callable() => Some(method.unbind()),
-            Ok(_) => return Err(PyValueError::new_err("parser.finish must be callable")),
-            Err(error) if error.is_instance_of::<PyAttributeError>(py) => None,
-            Err(error) => return Err(error),
-        };
-        Ok(Self::Python { object, finish })
+        let finish = optional_method(py, &object, "finish")?;
+        let attributed_feed = optional_method(py, &object, "feed_attributed")?;
+        let attributed_finish = optional_method(py, &object, "finish_attributed")?;
+        Ok(Self::Python {
+            object,
+            finish,
+            attributed_feed,
+            attributed_finish,
+        })
     }
 
     fn token_channel(&self, id: u32) -> Option<&'static str> {
@@ -72,31 +80,87 @@ impl Parser {
         }
     }
 
-    fn feed(&self, ids: &[u32]) -> PyResult<Vec<ParsedEvent>> {
+    fn supports_attribution(&self) -> PyResult<bool> {
         match self {
-            Self::Native(parser) => recipe::feed(parser, ids),
-            Self::Python { object, .. } => Python::attach(|py| {
-                let events = object.bind(py).call_method1("feed", (ids,))?;
-                depythonize(&events).map_err(Into::into)
+            Self::Native(parser) => Ok(parser
+                .lock()
+                .map_err(|_| PyValueError::new_err("response parser lock is poisoned"))?
+                .supports_attribution()),
+            Self::Python {
+                attributed_feed, ..
+            } => Ok(attributed_feed.is_some()),
+        }
+    }
+
+    fn feed(&self, ids: &[u32], attributed: bool) -> PyResult<Vec<AttributedEvent>> {
+        match self {
+            Self::Native(parser) if attributed => recipe::feed_attributed(parser, ids),
+            Self::Native(parser) => {
+                recipe::feed(parser, ids).map(|events| events.into_iter().map(Into::into).collect())
+            }
+            Self::Python {
+                object,
+                attributed_feed,
+                ..
+            } => Python::attach(|py| {
+                let events = match attributed_feed {
+                    Some(method) if attributed => method.bind(py).call1((ids,))?,
+                    _ => object.bind(py).call_method1("feed", (ids,))?,
+                };
+                python_events(&events, attributed)
             }),
         }
     }
 
-    fn finish(&self, reason: ParserFinishReason) -> PyResult<Vec<ParsedEvent>> {
+    fn finish(
+        &self,
+        reason: ParserFinishReason,
+        attributed: bool,
+    ) -> PyResult<Vec<AttributedEvent>> {
         match self {
-            Self::Native(parser) => recipe::finish(parser, reason),
+            Self::Native(parser) if attributed => recipe::finish_attributed(parser, reason),
+            Self::Native(parser) => recipe::finish(parser, reason)
+                .map(|events| events.into_iter().map(Into::into).collect()),
             Self::Python {
-                finish: Some(method),
+                finish,
+                attributed_finish,
                 ..
             } => Python::attach(|py| {
+                let method = if attributed {
+                    attributed_finish.as_ref().or(finish.as_ref())
+                } else {
+                    finish.as_ref()
+                };
+                let Some(method) = method else {
+                    return Ok(Vec::new());
+                };
                 let reason = match reason {
                     ParserFinishReason::Stop => "stop",
                     ParserFinishReason::Length => "length",
                 };
-                depythonize(&method.bind(py).call1((reason,))?).map_err(Into::into)
+                python_events(&method.bind(py).call1((reason,))?, attributed)
             }),
-            Self::Python { finish: None, .. } => Ok(Vec::new()),
         }
+    }
+}
+
+fn python_events(events: &Bound<'_, PyAny>, attributed: bool) -> PyResult<Vec<AttributedEvent>> {
+    if attributed {
+        depythonize(events).map_err(Into::into)
+    } else {
+        let events: Vec<ParsedEvent> = depythonize(events)?;
+        Ok(events.into_iter().map(Into::into).collect())
+    }
+}
+
+fn optional_method(py: Python<'_>, object: &Py<PyAny>, name: &str) -> PyResult<Option<Py<PyAny>>> {
+    match object.bind(py).getattr(name) {
+        Ok(method) if method.is_callable() => Ok(Some(method.unbind())),
+        Ok(_) => Err(PyValueError::new_err(format!(
+            "parser.{name} must be callable"
+        ))),
+        Err(error) if error.is_instance_of::<PyAttributeError>(py) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -105,7 +169,7 @@ struct ActiveRequest {
     lease: Py<RequestLease>,
     parser: Parser,
     stops: StopFilter,
-    has_stop_strings: bool,
+    scores: Option<OutputScores>,
     prompt_logprobs: bool,
     prompt_ids: Vec<u32>,
     events: mpsc::Sender<GenerationEvent>,
@@ -114,6 +178,36 @@ struct ActiveRequest {
     input_tokens: usize,
     cached_tokens: usize,
     output_tokens: usize,
+}
+
+impl ActiveRequest {
+    fn emit(&mut self, event: AttributedEvent, output: &mut Vec<GenerationEvent>) {
+        if let Some(scores) = &mut self.scores {
+            for event in scores.push(event) {
+                push_event(output, event);
+            }
+        } else {
+            push_event(output, into_http(event.event));
+        }
+    }
+
+    fn parsed(
+        &mut self,
+        event: AttributedEvent,
+        output: &mut Vec<GenerationEvent>,
+    ) -> PyResult<()> {
+        validate_spans(&event, self.output_tokens)?;
+        for event in self.stops.push(event) {
+            self.emit(event, output);
+        }
+        Ok(())
+    }
+
+    fn flush_stops(&mut self, output: &mut Vec<GenerationEvent>) {
+        for event in self.stops.finish() {
+            self.emit(event, output);
+        }
+    }
 }
 
 pub(crate) struct Session {
@@ -206,50 +300,38 @@ fn process(
         }
         let mut finished = tokens.is_empty().then_some(CompletionReason::Length);
         let mut scores = Vec::new();
-        let parsed = (|| -> PyResult<Vec<ParsedEvent>> {
+        let parsed = (|| -> PyResult<Vec<GenerationEvent>> {
             let mut output = Vec::new();
+            let attributed = request.scores.is_some();
             if tokens.is_empty() {
-                for event in request.parser.finish(ParserFinishReason::Length)? {
-                    for event in request.stops.push(event) {
-                        push_event(&mut output, event);
-                    }
+                for event in request
+                    .parser
+                    .finish(ParserFinishReason::Length, attributed)?
+                {
+                    request.parsed(event, &mut output)?;
                 }
-                for event in request.stops.finish() {
-                    push_event(&mut output, event);
-                }
+                request.flush_stops(&mut output);
             }
             for token in tokens {
                 request.output_tokens += 1;
-                let channel = if token.logprobs.is_none() || request.has_stop_strings {
+                let channel = if token.logprobs.is_none() {
                     None
                 } else {
                     request.parser.token_channel(token.token_id)
                 };
-                let events = request.parser.feed(&[token.token_id])?;
                 if let Some(logprobs) = &token.logprobs {
-                    let mut score =
+                    let score =
                         vocabulary.generated(token.token_id, token.index, channel, logprobs);
-                    // Deferred grammars may trim or transform text. A token
-                    // is still proven when its complete bytes are exactly
-                    // the one semantic delta emitted by this feed.
-                    if score.channel.is_none() && !request.has_stop_strings {
-                        let semantic = match events.as_slice() {
-                            [ParsedEvent::TextDelta { delta }] => Some(("content", delta)),
-                            [ParsedEvent::ReasoningDelta { delta }] => Some(("reasoning", delta)),
-                            _ => None,
-                        };
-                        if let Some((channel, delta)) = semantic
-                            && score.token.bytes.as_deref() == Some(delta.as_bytes())
-                        {
-                            score.channel = Some(channel.to_owned());
-                        }
+                    if !matches!(channel, Some("control" | "reasoning" | "tool"))
+                        && let Some(output_scores) = &mut request.scores
+                    {
+                        output_scores.insert(score.clone());
                     }
                     scores.push(score);
                 }
+                let events = request.parser.feed(&[token.token_id], attributed)?;
                 for event in events {
-                    for event in request.stops.push(event) {
-                        push_event(&mut output, event);
-                    }
+                    request.parsed(event, &mut output)?;
                     if request.stops.stopped() {
                         break;
                     }
@@ -266,21 +348,27 @@ fn process(
                 }
                 if let Some(reason) = token.finish_reason {
                     finished = Some(reason);
-                    for event in request.parser.finish(match reason {
-                        CompletionReason::Stop => ParserFinishReason::Stop,
-                        CompletionReason::Length => ParserFinishReason::Length,
-                    })? {
-                        for event in request.stops.push(event) {
-                            push_event(&mut output, event);
-                        }
+                    for event in request.parser.finish(
+                        match reason {
+                            CompletionReason::Stop => ParserFinishReason::Stop,
+                            CompletionReason::Length => ParserFinishReason::Length,
+                        },
+                        attributed,
+                    )? {
+                        request.parsed(event, &mut output)?;
                     }
-                    for event in request.stops.finish() {
-                        push_event(&mut output, event);
-                    }
+                    request.flush_stops(&mut output);
                     if request.stops.stopped() {
                         finished = Some(CompletionReason::Stop);
                     }
                     break;
+                }
+            }
+            if finished.is_some()
+                && let Some(scores) = &mut request.scores
+            {
+                for event in scores.finish() {
+                    push_event(&mut output, event);
                 }
             }
             Ok(output)
@@ -289,7 +377,7 @@ fn process(
             Ok(events) => {
                 let delivered = events
                     .into_iter()
-                    .all(|event| request.events.try_send(into_http(event)).is_ok());
+                    .all(|event| request.events.try_send(event).is_ok());
                 delivered
                     && (scores.is_empty()
                         || request
@@ -387,6 +475,8 @@ fn admit(
             .call_method1("create_parser", (&request, rendered.token_ids.clone()))?
             .unbind();
         let parser = Parser::new(py, parser)?;
+        let scores =
+            (job.request.logprobs && parser.supports_attribution()?).then(OutputScores::default);
         let extra = pythonize(py, &job.request.extra)?.unbind();
         let stops = StopFilter::new(job.request.stop.clone())?;
         let prompt_ids = rendered.token_ids.clone();
@@ -422,6 +512,7 @@ fn admit(
             request_id,
             lease,
             parser,
+            scores,
             stops,
             prompt_ids,
             input_tokens,
@@ -429,7 +520,7 @@ fn admit(
         ))
     });
     match result {
-        Ok((request_id, lease, parser, stops, prompt_ids, input_tokens, cached_tokens)) => {
+        Ok((request_id, lease, parser, scores, stops, prompt_ids, input_tokens, cached_tokens)) => {
             let _ = job
                 .events
                 .try_send(GenerationEvent::Started { input_tokens });
@@ -440,7 +531,7 @@ fn admit(
                     lease,
                     parser,
                     stops,
-                    has_stop_strings: !job.request.stop.is_empty(),
+                    scores,
                     prompt_logprobs: job.request.prompt_logprobs,
                     prompt_ids,
                     events: job.events,
@@ -572,16 +663,43 @@ fn format_python_error(context: &str, error: PyErr) -> String {
     format!("{context}: {error}")
 }
 
-fn push_event(events: &mut Vec<ParsedEvent>, event: ParsedEvent) {
+fn validate_spans(event: &AttributedEvent, tokens: usize) -> PyResult<()> {
+    let length = match &event.event {
+        ParsedEvent::TextDelta { delta }
+        | ParsedEvent::ReasoningDelta { delta }
+        | ParsedEvent::ToolCallArgumentsDelta { delta, .. } => delta.len(),
+        ParsedEvent::ToolCallStart { .. } => 0,
+    };
+    if event.spans.iter().any(|span| {
+        span.token_index >= tokens
+            || span.token_start >= span.token_end
+            || span.token_end > span.token_len
+            || span.event_start >= span.event_end
+            || span.event_end > length
+    }) {
+        return Err(PyValueError::new_err("invalid response-parser token spans"));
+    }
+    Ok(())
+}
+
+fn push_event(events: &mut Vec<GenerationEvent>, event: GenerationEvent) {
     match (events.last_mut(), &event) {
-        (Some(ParsedEvent::TextDelta { delta }), ParsedEvent::TextDelta { delta: next })
-        | (
-            Some(ParsedEvent::ReasoningDelta { delta }),
-            ParsedEvent::ReasoningDelta { delta: next },
-        ) => delta.push_str(next),
         (
-            Some(ParsedEvent::ToolCallArgumentsDelta { index, delta }),
-            ParsedEvent::ToolCallArgumentsDelta {
+            Some(GenerationEvent::TextDelta { delta, logprobs }),
+            GenerationEvent::TextDelta {
+                delta: next,
+                logprobs: scores,
+            },
+        ) => {
+            delta.push_str(next);
+            logprobs.extend_from_slice(scores);
+        }
+        (Some(GenerationEvent::ReasoningDelta(delta)), GenerationEvent::ReasoningDelta(next)) => {
+            delta.push_str(next);
+        }
+        (
+            Some(GenerationEvent::ToolCallArgumentsDelta { index, delta }),
+            GenerationEvent::ToolCallArgumentsDelta {
                 index: next_index,
                 delta: next,
             },

@@ -66,6 +66,11 @@ impl TokenizerDecoder {
 }
 
 impl Decoder for TokenizerDecoder {
+    fn supports_attribution(&mut self) -> bool {
+        self.trace
+            .get_or_insert_with(|| trace::Trace::new(&self.tokenizer))
+            .supported()
+    }
     fn push(&mut self, ids: &[u32]) -> Result<String, Error> {
         if !ids.is_empty() {
             self.untraced = true;

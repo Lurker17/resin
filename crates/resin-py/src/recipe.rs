@@ -198,16 +198,19 @@ impl NativeInklingParser {
         Ok(pythonize(py, &events)?.unbind())
     }
 
+    fn feed_attributed(&self, py: Python<'_>, token_ids: Vec<u32>) -> PyResult<Py<PyAny>> {
+        let events = py.detach(|| feed_attributed(&self.inner, &token_ids))?;
+        Ok(pythonize(py, &events)?.unbind())
+    }
+
+    fn finish_attributed(&self, py: Python<'_>, reason: &str) -> PyResult<Py<PyAny>> {
+        let reason = parse_finish_reason(reason)?;
+        let events = py.detach(|| finish_attributed(&self.inner, reason))?;
+        Ok(pythonize(py, &events)?.unbind())
+    }
+
     fn finish(&self, py: Python<'_>, reason: &str) -> PyResult<Py<PyAny>> {
-        let reason = match reason {
-            "stop" => FinishReason::Stop,
-            "length" => FinishReason::Length,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "finish reason must be 'stop' or 'length'",
-                ));
-            }
-        };
+        let reason = parse_finish_reason(reason)?;
         let events = py.detach(|| finish(&self.inner, reason))?;
         Ok(pythonize(py, &events)?.unbind())
     }
@@ -227,6 +230,38 @@ pub(crate) fn finish(parser: &SharedParser, reason: FinishReason) -> PyResult<Ve
         .map_err(|_| PyValueError::new_err("response parser lock is poisoned"))?
         .finish(reason)
         .map_err(recipe_error)
+}
+
+pub(crate) fn feed_attributed(
+    parser: &SharedParser,
+    ids: &[u32],
+) -> PyResult<Vec<resin_recipe::AttributedEvent>> {
+    parser
+        .lock()
+        .map_err(|_| PyValueError::new_err("response parser lock is poisoned"))?
+        .feed_attributed(ids)
+        .map_err(recipe_error)
+}
+
+pub(crate) fn finish_attributed(
+    parser: &SharedParser,
+    reason: FinishReason,
+) -> PyResult<Vec<resin_recipe::AttributedEvent>> {
+    parser
+        .lock()
+        .map_err(|_| PyValueError::new_err("response parser lock is poisoned"))?
+        .finish_attributed(reason)
+        .map_err(recipe_error)
+}
+
+fn parse_finish_reason(reason: &str) -> PyResult<FinishReason> {
+    match reason {
+        "stop" => Ok(FinishReason::Stop),
+        "length" => Ok(FinishReason::Length),
+        _ => Err(PyValueError::new_err(
+            "finish reason must be 'stop' or 'length'",
+        )),
+    }
 }
 
 fn recipe_error(error: Error) -> PyErr {
@@ -304,16 +339,19 @@ impl NativeResponseParser {
         let events = py.detach(|| feed(&self.inner, &token_ids))?;
         Ok(pythonize(py, &events)?.unbind())
     }
+
+    fn feed_attributed(&self, py: Python<'_>, token_ids: Vec<u32>) -> PyResult<Py<PyAny>> {
+        let events = py.detach(|| feed_attributed(&self.inner, &token_ids))?;
+        Ok(pythonize(py, &events)?.unbind())
+    }
+
+    fn finish_attributed(&self, py: Python<'_>, reason: &str) -> PyResult<Py<PyAny>> {
+        let reason = parse_finish_reason(reason)?;
+        let events = py.detach(|| finish_attributed(&self.inner, reason))?;
+        Ok(pythonize(py, &events)?.unbind())
+    }
     fn finish(&self, py: Python<'_>, reason: &str) -> PyResult<Py<PyAny>> {
-        let reason = match reason {
-            "stop" => FinishReason::Stop,
-            "length" => FinishReason::Length,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "finish reason must be 'stop' or 'length'",
-                ));
-            }
-        };
+        let reason = parse_finish_reason(reason)?;
         let events = py.detach(|| finish(&self.inner, reason))?;
         Ok(pythonize(py, &events)?.unbind())
     }

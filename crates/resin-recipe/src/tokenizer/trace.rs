@@ -34,6 +34,9 @@ impl Trace {
             pending: VecDeque::new(),
         }
     }
+    pub fn supported(&self) -> bool {
+        self.kind.is_some()
+    }
     pub fn clear(&mut self) {
         self.pending.clear();
         self.unknown = false;

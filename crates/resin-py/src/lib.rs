@@ -11,6 +11,7 @@ mod cache;
 mod http;
 mod http_distributed;
 mod http_logprobs;
+mod http_output;
 mod http_session;
 mod http_stop;
 mod output;

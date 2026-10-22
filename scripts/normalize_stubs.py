@@ -24,6 +24,10 @@ PARAMETERS = {
     },
     ("RecipeResponseParser", "feed"): {"token_ids": "Sequence[int]"},
     ("RecipeResponseParser", "finish"): {"reason": 'Literal["stop", "length"]'},
+    ("RecipeResponseParser", "feed_attributed"): {"token_ids": "Sequence[int]"},
+    ("RecipeResponseParser", "finish_attributed"): {
+        "reason": 'Literal["stop", "length"]'
+    },
     ("BatchPlan", "__new__"): {
         "sequence_ids": "Sequence[int] | npt.NDArray[np.uint64]",
         "context_lengths": U32_INPUT,
@@ -58,6 +62,10 @@ PARAMETERS = {
     },
     ("InklingResponseParser", "feed"): {"token_ids": "Sequence[int]"},
     ("InklingResponseParser", "finish"): {"reason": 'Literal["stop", "length"]'},
+    ("InklingResponseParser", "feed_attributed"): {"token_ids": "Sequence[int]"},
+    ("InklingResponseParser", "finish_attributed"): {
+        "reason": 'Literal["stop", "length"]'
+    },
 }
 
 RETURNS = {
@@ -65,6 +73,10 @@ RETURNS = {
     ("RecipeResponseParser", "finish"): "list[ParserEvent]",
     ("InklingResponseParser", "feed"): "list[ParserEvent]",
     ("InklingResponseParser", "finish"): "list[ParserEvent]",
+    ("RecipeResponseParser", "feed_attributed"): "list[ParserEvent]",
+    ("RecipeResponseParser", "finish_attributed"): "list[ParserEvent]",
+    ("InklingResponseParser", "feed_attributed"): "list[ParserEvent]",
+    ("InklingResponseParser", "finish_attributed"): "list[ParserEvent]",
     ("BatchPlan", "sequence_ids"): "npt.NDArray[np.uint64]",
     **{
         (owner, name): "npt.NDArray[np.uint32]"

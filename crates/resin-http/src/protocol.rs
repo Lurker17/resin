@@ -65,7 +65,12 @@ pub enum GenerationEvent {
         input_tokens: usize,
     },
     ReasoningDelta(String),
-    TextDelta(String),
+    TextDelta {
+        delta: String,
+        /// Scores proven to belong to this visible text, independent of raw-token events.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        logprobs: Vec<GeneratedTokenLogprob>,
+    },
     Logprobs(Vec<GeneratedTokenLogprob>),
     PromptLogprobs(Vec<Option<TokenLogprob>>),
     StopSequence(String),
@@ -127,6 +132,7 @@ pub(crate) struct ResponseAccumulator {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
     pub logprobs: Vec<GeneratedTokenLogprob>,
+    pub content_logprobs: Vec<GeneratedTokenLogprob>,
     pub prompt_logprobs: Vec<Option<TokenLogprob>>,
     pub stop_sequence: Option<String>,
     pub reason: Option<FinishReason>,
@@ -163,7 +169,10 @@ impl ResponseAccumulator {
         match event {
             GenerationEvent::Started { input_tokens } => self.input_tokens = *input_tokens,
             GenerationEvent::ReasoningDelta(delta) => self.reasoning.push_str(delta),
-            GenerationEvent::TextDelta(delta) => self.text.push_str(delta),
+            GenerationEvent::TextDelta { delta, logprobs } => {
+                self.text.push_str(delta);
+                self.content_logprobs.extend_from_slice(logprobs);
+            }
             GenerationEvent::Logprobs(tokens) => self.logprobs.extend_from_slice(tokens),
             GenerationEvent::PromptLogprobs(tokens) => self.prompt_logprobs.clone_from(tokens),
             GenerationEvent::StopSequence(sequence) => self.stop_sequence = Some(sequence.clone()),

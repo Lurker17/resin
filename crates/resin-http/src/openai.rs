@@ -241,7 +241,7 @@ async fn chat_response(
     if !tool_calls.is_empty() {
         message["tool_calls"] = json!(tool_calls);
     }
-    let logprobs = chat_logprobs(&request, &response.logprobs);
+    let logprobs = chat_logprobs(&request, &response.content_logprobs);
     Json(json!({
         "id": request.id,
         "object": "chat.completion",
@@ -272,7 +272,11 @@ fn chat_stream(
             let value = match event {
                 GenerationEvent::Started { .. } => chat_chunk(&request, created, json!({"role": "assistant", "content": ""}), None),
                 GenerationEvent::ReasoningDelta(delta) => chat_chunk(&request, created, json!({"reasoning_content": delta}), None),
-                GenerationEvent::TextDelta(delta) => chat_chunk(&request, created, json!({"content": delta}), None),
+                GenerationEvent::TextDelta { delta, logprobs } => {
+                    let mut chunk = chat_chunk(&request, created, json!({"content": delta}), None);
+                    chunk["choices"][0]["logprobs"] = chat_logprobs(&request, &logprobs);
+                    chunk
+                }
                 GenerationEvent::ToolCallStart { index, id, name } => {
                     has_tool_calls = true;
                     chat_chunk(&request, created, json!({"tool_calls": [{
@@ -285,7 +289,6 @@ fn chat_stream(
                 }]}), None),
                 GenerationEvent::Logprobs(tokens) => {
                     let mut chunk = chat_chunk(&request, created, json!({}), None);
-                    chunk["choices"][0]["logprobs"] = chat_logprobs(&request, &tokens);
                     chunk["resin"] = json!({"generation_logprobs": tokens});
                     chunk
                 }
@@ -502,7 +505,7 @@ fn response_object(request: &ConversationRequest, response: &ResponseAccumulator
             "type": "message",
             "status": "completed",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": response.text, "annotations": [], "logprobs": content_scores(&response.logprobs)}],
+            "content": [{"type": "output_text", "text": response.text, "annotations": [], "logprobs": response.content_logprobs}],
         }));
     }
     json!({
@@ -565,7 +568,7 @@ fn responses_stream(
                     }
                     yield Ok(Event::default().data(event_json("response.reasoning_summary_text.delta", sequence, json!({"item_id": format!("rs_{}", &request.id[5..]), "output_index": 0, "summary_index": 0, "delta": delta})).to_string())); sequence += 1;
                 }
-                GenerationEvent::TextDelta(delta) => {
+                GenerationEvent::TextDelta { delta, logprobs } => {
                     if !text_open {
                         text_open = true;
                         let output_index = usize::from(reasoning_open) + tool_open.len();
@@ -573,7 +576,7 @@ fn responses_stream(
                         yield Ok(Event::default().data(event_json("response.content_part.added", sequence, json!({"item_id": format!("msg_{}", &request.id[5..]), "output_index": output_index, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": [], "logprobs": []}})).to_string())); sequence += 1;
                     }
                     let output_index = usize::from(reasoning_open) + tool_open.len();
-                    yield Ok(Event::default().data(event_json("response.output_text.delta", sequence, json!({"item_id": format!("msg_{}", &request.id[5..]), "output_index": output_index, "content_index": 0, "delta": delta, "logprobs": []})).to_string())); sequence += 1;
+                    yield Ok(Event::default().data(event_json("response.output_text.delta", sequence, json!({"item_id": format!("msg_{}", &request.id[5..]), "output_index": output_index, "content_index": 0, "delta": delta, "logprobs": logprobs})).to_string())); sequence += 1;
                 }
                 GenerationEvent::ToolCallStart { index, id, name } => {
                     if tool_open.len() <= index { tool_open.resize(index + 1, false); }
@@ -609,9 +612,9 @@ fn responses_stream(
                     if text_open {
                         let output_index = usize::from(reasoning_open) + accumulator.tool_calls.len();
                         let id = format!("msg_{}", &request.id[5..]);
-                        yield Ok(Event::default().data(event_json("response.output_text.done", sequence, json!({"item_id": id, "output_index": output_index, "content_index": 0, "text": accumulator.text, "logprobs": content_scores(&accumulator.logprobs)})).to_string())); sequence += 1;
-                        yield Ok(Event::default().data(event_json("response.content_part.done", sequence, json!({"item_id": id, "output_index": output_index, "content_index": 0, "part": {"type": "output_text", "text": accumulator.text, "annotations": [], "logprobs": content_scores(&accumulator.logprobs)}})).to_string())); sequence += 1;
-                        yield Ok(Event::default().data(event_json("response.output_item.done", sequence, json!({"output_index": output_index, "item": {"id": id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": accumulator.text, "annotations": [], "logprobs": content_scores(&accumulator.logprobs)}]}})).to_string())); sequence += 1;
+                        yield Ok(Event::default().data(event_json("response.output_text.done", sequence, json!({"item_id": id, "output_index": output_index, "content_index": 0, "text": accumulator.text, "logprobs": accumulator.content_logprobs})).to_string())); sequence += 1;
+                        yield Ok(Event::default().data(event_json("response.content_part.done", sequence, json!({"item_id": id, "output_index": output_index, "content_index": 0, "part": {"type": "output_text", "text": accumulator.text, "annotations": [], "logprobs": accumulator.content_logprobs}})).to_string())); sequence += 1;
+                        yield Ok(Event::default().data(event_json("response.output_item.done", sequence, json!({"output_index": output_index, "item": {"id": id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": accumulator.text, "annotations": [], "logprobs": accumulator.content_logprobs}]}})).to_string())); sequence += 1;
                     }
                     yield Ok(Event::default().data(event_json("response.completed", sequence, json!({"response": response_object(&request, &accumulator)})).to_string()));
                     break;
@@ -763,16 +766,9 @@ pub(crate) fn routed_rank(
     Ok(rank)
 }
 
-fn content_scores(tokens: &[crate::GeneratedTokenLogprob]) -> Vec<&crate::GeneratedTokenLogprob> {
-    tokens
-        .iter()
-        .filter(|token| token.channel.as_deref() == Some("content"))
-        .collect()
-}
-
 fn chat_logprobs(request: &ConversationRequest, tokens: &[crate::GeneratedTokenLogprob]) -> Value {
     if request.logprobs {
-        json!({"content": content_scores(tokens), "refusal": null})
+        json!({"content": tokens, "refusal": null})
     } else {
         Value::Null
     }

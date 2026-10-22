@@ -148,6 +148,9 @@ impl QwenGrammar {
 }
 
 impl Grammar for QwenGrammar {
+    fn channel(&self) -> Option<&'static str> {
+        matches!(self.state, State::Tool | State::BetweenTools).then_some("tool")
+    }
     fn is_control(&self, id: u32) -> bool {
         self.tokens.ids().contains(&id)
     }

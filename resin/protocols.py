@@ -54,6 +54,21 @@ class RenderedPrompt(TypedDict):
     media: NotRequired[MediaInput]
 
 
+class TokenSpan(TypedDict):
+    """Source-token bytes contributing to one semantic delta's UTF-8 bytes.
+
+    Token indices count all generated tokens, including controls. Byte offsets
+    are half-open; a Unicode character may span several vocabulary tokens.
+    """
+
+    token_index: int
+    token_start: int
+    token_end: int
+    token_len: int
+    event_start: int
+    event_end: int
+
+
 class ParserEvent(TypedDict, total=False):
     """One incremental semantic event produced by a response parser."""
 
@@ -62,12 +77,27 @@ class ParserEvent(TypedDict, total=False):
     index: int
     id: str
     name: str
+    token_spans: list[TokenSpan]
 
 
 class ResponseParser(Protocol):
     """Incrementally turn generated token IDs into wire-level deltas."""
 
     def feed(self, token_ids: Sequence[int]) -> list[ParserEvent]: ...
+
+
+class AttributedResponseParser(ResponseParser, Protocol):
+    """Opt into source-aligned scores while keeping ordinary decoding cheap.
+
+    Scored requests call these methods instead of feed/finish. Token spans use
+    absolute generated-token indices; parser buffering must preserve them.
+    """
+
+    def feed_attributed(self, token_ids: Sequence[int]) -> list[ParserEvent]: ...
+
+    def finish_attributed(
+        self, reason: Literal["stop", "length"]
+    ) -> list[ParserEvent]: ...
 
 
 class FinalizingResponseParser(ResponseParser, Protocol):
@@ -108,6 +138,7 @@ class ManagedRunner(Runner, Protocol):
 
 
 __all__ = [
+    "AttributedResponseParser",
     "ConversationCodec",
     "FinalizingResponseParser",
     "ManagedRunner",
@@ -117,4 +148,5 @@ __all__ = [
     "RenderedPrompt",
     "ResponseParser",
     "Runner",
+    "TokenSpan",
 ]

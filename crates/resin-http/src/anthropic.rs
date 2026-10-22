@@ -320,7 +320,7 @@ fn messages_stream(
                     }
                     yield named_event("content_block_delta", json!({"type": "content_block_delta", "index": block_index, "delta": {"type": "thinking_delta", "thinking": delta}}));
                 }
-                GenerationEvent::TextDelta(delta) => {
+                GenerationEvent::TextDelta { delta, .. } => {
                     if reasoning_open && !text_open {
                         yield named_event("content_block_stop", json!({"type": "content_block_stop", "index": block_index}));
                         block_index += 1;
