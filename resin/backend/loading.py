@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import torch
 
@@ -24,15 +25,23 @@ def prepare_model(
     the executable model need not retain the checkpoint's module structure.
     """
 
-    prepared: dict[int, torch.nn.Module] = {}
+    # Unchanged checkpoint children must not keep their backing storage alive
+    # after a parent is replaced. Shared originals retain their replacement
+    # until their last alias has been visited.
+    prepared: WeakKeyDictionary[torch.nn.Module, torch.nn.Module | None] = (
+        WeakKeyDictionary()
+    )
 
     def visit(module: torch.nn.Module) -> torch.nn.Module:
-        if id(module) not in prepared:
-            for name, child in tuple(module._modules.items()):
-                if child is not None:
-                    module._modules[name] = visit(child)
-            prepared[id(module)] = lower(module)
-        return prepared[id(module)]
+        if module in prepared:
+            replacement = prepared[module]
+            return module if replacement is None else replacement
+        for name, child in tuple(module._modules.items()):
+            if child is not None:
+                module._modules[name] = visit(child)
+        replacement = lower(module)
+        prepared[module] = None if replacement is module else replacement
+        return replacement
 
     return visit(model)
 

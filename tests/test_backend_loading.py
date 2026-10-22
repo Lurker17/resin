@@ -80,3 +80,35 @@ def test_preparation_preserves_aliases_and_can_fuse_loaded_children() -> None:
     assert runtime[0] is runtime[1] is runtime[2]
     assert runtime[0].weight is shared.weight
     torch.testing.assert_close(runtime[2](hidden), expected)
+
+
+def test_preparation_releases_consumed_weight_storage_between_layers() -> None:
+    import weakref
+
+    class Checkpoint(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.projection = torch.nn.Linear(3, 3, bias=False)
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ffn = Checkpoint()
+
+    first, second = Layer(), Layer()
+    model = torch.nn.ModuleList([first, second])
+    old_weight = weakref.ref(first.ffn.projection.weight)
+    converted = 0
+
+    def lower(module):
+        nonlocal converted
+        if isinstance(module, Checkpoint):
+            if converted:
+                assert old_weight() is None
+            converted += 1
+            return torch.nn.Identity()
+        return module
+
+    prepare_model(model, lower)
+    assert converted == 2
+    assert old_weight() is None
