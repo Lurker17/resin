@@ -6,6 +6,7 @@ import pytest
 import resin
 from resin import (
     BatchPlan,
+    CacheGroupFamily,
     CacheGroupLayout,
     CacheGroupPlan,
     CacheLayout,
@@ -115,6 +116,32 @@ class TestFlatCacheApi:
         with pytest.raises(TypeError):
             # Invalid retention type must fail at runtime.
             CacheGroupLayout(4, retention="state")  # ty: ignore[invalid-argument-type]
+
+    def test_layout_estimates_packed_retained_cohort_without_allocating(self) -> None:
+        layout = CacheLayout(
+            1,
+            [
+                CacheGroupLayout(4, blocks_per_slab=2),
+                CacheGroupLayout(
+                    4,
+                    blocks_per_slab=4,
+                    retention=CacheRetention.WINDOW,
+                    window_tokens=5,
+                    read_window_tokens=2,
+                ),
+                CacheGroupLayout(8, blocks_per_slab=2, family=CacheGroupFamily.STATE),
+            ],
+        )
+        assert layout.estimated_parent_count([]) == 0
+        assert layout.estimated_parent_count([0, 0]) == 0
+        assert layout.estimated_parent_count([0, 1, 4, 5, 17]) == 10
+        assert layout.estimated_parent_count((0, 1, 4, 5, 17)) == 10
+        assert (
+            layout.parent_capacity == 1
+        )  # Demand is reported even when it cannot fit.
+        for invalid in (-1, 2**32):
+            with pytest.raises(OverflowError):
+                layout.estimated_parent_count([invalid])
 
     def test_manual_sparse_group_plan_is_the_only_batch_cache_metadata(self) -> None:
         group = CacheGroupPlan(

@@ -232,20 +232,9 @@ impl PagedKvResources {
 
     /// Physical-parent budget for a set of estimated request contexts.
     pub fn estimated_parent_count(&self, contexts: &[u32]) -> Result<u64, CachePoolError> {
-        let mut parents = 0u64;
-        for (index, group) in self.layout.groups().iter().copied().enumerate() {
-            let blocks = contexts.iter().try_fold(0u64, |total, context| {
-                let (_, blocks) = active_blocks(group, *context);
-                total
-                    .checked_add(u64::from(blocks))
-                    .ok_or(CachePoolError::DemandOverflow)
-            })?;
-            let packing = u64::from(self.pool.blocks_per_slab(GroupId::new(index as u32))?.get());
-            parents = parents
-                .checked_add(blocks.div_ceil(packing))
-                .ok_or(CachePoolError::DemandOverflow)?;
-        }
-        Ok(parents)
+        self.layout
+            .estimated_parent_count(contexts)
+            .map_err(|_| CachePoolError::DemandOverflow)
     }
 
     pub fn retire(&mut self, state: RequestPages) -> Result<(), RetireRequestFailure> {
@@ -259,7 +248,7 @@ impl PagedKvResources {
             .copied()
             .enumerate()
             .map(|(index, group)| {
-                let (_, blocks) = active_blocks(group, context);
+                let (_, blocks) = group.active_blocks(context);
                 GroupDemand::new(GroupId::new(index as u32), blocks as usize)
             })
             .collect()
@@ -359,7 +348,7 @@ impl PagedKvResources {
                 } else {
                     post_length
                 };
-                let (first, count) = active_blocks(group, leased_length);
+                let (first, count) = group.active_blocks(leased_length);
                 if count as usize > table.pages().len() {
                     return Err(Self::invalid(format!(
                         "request {} cache group {group_index} needs {count} blocks but reserved {}",
@@ -475,21 +464,6 @@ impl From<KvPlanError> for PagedKvError {
     }
 }
 
-fn active_blocks(group: KvGroupLayout, post_length: u32) -> (u32, u32) {
-    let total = post_length.div_ceil(group.block_tokens().get());
-    if group.is_recurrent() {
-        let count = total.min(2);
-        return (total - count, count);
-    }
-    match group.retention() {
-        KvRetention::FullContext => (0, total),
-        KvRetention::SlidingWindow { .. } => {
-            let count = total.min(group.window_resident_blocks().unwrap().get());
-            (total - count, count)
-        }
-    }
-}
-
 fn page_for<R>(group: KvGroupLayout, pages: &[R], logical: u32) -> Option<&R> {
     page_index(group, pages.len(), logical).and_then(|index| pages.get(index))
 }
@@ -515,6 +489,59 @@ mod tests {
     use crate::{Phase, TokenRange};
 
     use super::*;
+
+    #[test]
+    fn layout_estimate_matches_fresh_pool_allocation() {
+        let layout = KvLayout::new(
+            20,
+            vec![
+                KvGroupLayout::new(4, 2, KvRetention::FullContext).unwrap(),
+                KvGroupLayout::new(
+                    4,
+                    4,
+                    KvRetention::SlidingWindow {
+                        tokens: NonZeroU32::new(5).unwrap(),
+                    },
+                )
+                .unwrap(),
+                KvGroupLayout::new_with_family(
+                    8,
+                    2,
+                    KvRetention::FullContext,
+                    super::super::kv::KvGroupFamily::State,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let contexts = [0, 1, 4, 5, 17];
+        let expected = layout.estimated_parent_count(&contexts).unwrap();
+        let mut resources = PagedKvResources::new(layout).unwrap();
+        assert_eq!(
+            resources.estimated_parent_count(&contexts).unwrap(),
+            expected
+        );
+        let states: Vec<_> = contexts
+            .into_iter()
+            .enumerate()
+            .map(|(index, context)| {
+                resources
+                    .attach(
+                        RequestId::new(NonZeroU64::new(index as u64 + 1).unwrap()),
+                        context,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            u64::from(resources.parent_capacity()) - resources.pool().free_parent_count() as u64,
+            expected
+        );
+        for state in states {
+            resources.retire(state).unwrap();
+        }
+        assert_eq!(resources.pool().free_parent_count(), 20);
+    }
 
     #[test]
     fn full_and_sliding_groups_share_one_current_batch_lease() {

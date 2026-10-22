@@ -328,6 +328,15 @@ impl CacheLayout {
         })
     }
 
+    /// Physical slabs needed for independent contexts in an empty pool.
+    /// Applies retention and packing across requests without allocating pages;
+    /// shared prefixes are excluded and the result may exceed parent_capacity.
+    fn estimated_parent_count(&self, context_lengths: Vec<u32>) -> PyResult<u64> {
+        self.inner
+            .estimated_parent_count(&context_lengths)
+            .map_err(layout_error)
+    }
+
     fn __repr__(&self) -> String {
         self.repr_string()
     }

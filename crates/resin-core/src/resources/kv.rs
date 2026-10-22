@@ -155,6 +155,17 @@ impl KvGroupLayout {
             KvRetention::FullContext => None,
         }
     }
+
+    pub(crate) fn active_blocks(self, context: u32) -> (u32, u32) {
+        let total = context.div_ceil(self.block_tokens.get());
+        let count = if self.is_recurrent() {
+            total.min(2)
+        } else {
+            self.window_resident_blocks()
+                .map_or(total, |maximum| total.min(maximum.get()))
+        };
+        (total - count, count)
+    }
 }
 
 /// Frozen geometry for every cache group sharing one parent pool.
@@ -244,6 +255,23 @@ impl KvLayout {
     pub fn kernel_page_count(&self, group_index: u32) -> Option<u64> {
         self.kernel_page_capacity(group_index)
             .map(|capacity| u64::from(capacity) + 1)
+    }
+
+    /// Physical-parent demand for independent request contexts in an empty pool.
+    /// Applies each group's retention, then packs blocks across requests. The
+    /// estimate excludes shared prefixes and may exceed this layout's capacity.
+    pub fn estimated_parent_count(&self, context_lengths: &[u32]) -> Result<u64, KvLayoutError> {
+        let overflow = || KvLayoutError::new("estimated cache demand overflows u64");
+        self.groups.iter().try_fold(0u64, |parents, group| {
+            let blocks = context_lengths.iter().try_fold(0u64, |total, context| {
+                total
+                    .checked_add(u64::from(group.active_blocks(*context).1))
+                    .ok_or_else(overflow)
+            })?;
+            parents
+                .checked_add(blocks.div_ceil(u64::from(group.blocks_per_slab.get())))
+                .ok_or_else(overflow)
+        })
     }
 }
 
@@ -414,6 +442,39 @@ mod tests {
         assert_eq!(layout.kernel_page_capacity(0), Some(8));
         assert_eq!(layout.kernel_page_count(1), Some(33));
         assert!(KvLayout::new(MAX_KERNEL_VALUE, vec![full(1, 2)]).is_err());
+    }
+
+    #[test]
+    fn parent_estimate_uses_retention_and_packs_across_requests() {
+        let window = KvGroupLayout::new(
+            4,
+            4,
+            KvRetention::SlidingWindow {
+                tokens: NonZeroU32::new(5).unwrap(),
+            },
+        )
+        .unwrap()
+        .with_read_window_tokens(2)
+        .unwrap();
+        let state =
+            KvGroupLayout::new_with_family(8, 2, KvRetention::FullContext, KvGroupFamily::State)
+                .unwrap();
+        let layout = KvLayout::new(1, vec![full(4, 2), window, state]).unwrap();
+        assert_eq!(layout.estimated_parent_count(&[]).unwrap(), 0);
+        assert_eq!(layout.estimated_parent_count(&[0, 0]).unwrap(), 0);
+        // 9 full blocks / 2 + 6 window blocks / 4 + 5 state blocks / 2,
+        // rounding each group up after summing across requests.
+        assert_eq!(
+            layout.estimated_parent_count(&[0, 1, 4, 5, 17]).unwrap(),
+            10
+        );
+        assert_eq!(window.active_blocks(17), (3, 2));
+        assert_eq!(state.active_blocks(17), (1, 2));
+        let large = KvLayout::new(1, vec![full(1, 1)]).unwrap();
+        assert_eq!(
+            large.estimated_parent_count(&[u32::MAX, u32::MAX]).unwrap(),
+            2 * u64::from(u32::MAX)
+        );
     }
 
     #[test]
