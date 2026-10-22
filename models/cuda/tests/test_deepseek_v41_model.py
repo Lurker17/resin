@@ -266,20 +266,18 @@ def test_attention_bounds_sparse_active_lengths_for_short_queries(
     monkeypatch.setattr(
         implementation, "apply_rotary_emb", lambda values, *args, **kwargs: values
     )
-    monkeypatch.setattr(
-        implementation,
-        "sparse_topk_lengths",
-        lambda complete, width, window: complete.clamp_max(width).int() + window,
-    )
+    monkeypatch.setattr(implementation, "pack_kv", lambda value, **kwargs: value)
+    monkeypatch.setattr(implementation, "store_kv", lambda *args: None)
     observed = {}
 
-    def sparse(
-        query, window, compressed, sinks, indices, lengths, seq_lens, *args, **kwargs
-    ):
-        observed.update(lengths=lengths, indices=indices, seq_lens=seq_lens)
+    def fused(attention, query, positions, window, indices, **kwargs):
+        observed.update(
+            positions=positions, indices=indices, extra=kwargs["extra_indices"]
+        )
         return torch.zeros_like(query)
 
-    monkeypatch.setattr(implementation, "sparse_verify_attention", sparse)
+    monkeypatch.setattr(implementation, "fused_attention", fused)
+    attention._finish = lambda output, positions: output.squeeze(2)
     positions = torch.tensor([[0, 1, 2, 127, 128, 129]])
     selected = torch.arange(16).expand(1, 6, -1)
     selected = selected.masked_fill(
@@ -291,13 +289,14 @@ def test_attention_bounds_sparse_active_lengths_for_short_queries(
         256,
         cache,
         {"indices": selected},
-        prefill=True,
     )
-    assert observed["lengths"].tolist() == [expected]
-    # The fixed SWA segment starts with its valid prefix, including p=0.
+    assert (observed["extra"] >= 0).sum(-1).tolist() == [
+        [value - 128 for value in expected]
+    ]
+    assert (observed["indices"] >= 0).sum(-1).tolist() == [[1, 2, 3, 128, 128, 128]]
     assert observed["indices"][0, 0, 0] >= 0
-    assert (observed["indices"][0, 0, 1:128] == -1).all()
-    assert observed["seq_lens"].tolist() == [[1, 2, 3, 128, 129, 130]]
+    assert (observed["indices"][0, 0, 1:] == -1).all()
+    assert torch.equal(observed["positions"], positions)
 
 
 @pytest.mark.parametrize("prefill,batch_size", [(False, 4), (True, 1)])
@@ -341,20 +340,26 @@ def test_batched_verification_bypasses_single_sequence_prefill_callbacks(
         query,
         finish,
     )
-    monkeypatch.setattr(implementation, "act_quant", lambda value, *args: value)
+    monkeypatch.setattr(implementation, "pack_kv", lambda value, **kwargs: value)
+    monkeypatch.setattr(implementation, "store_kv", lambda *args: None)
     monkeypatch.setattr(
-        implementation, "sparse_verify_attention", lambda query, *args: query
+        implementation,
+        "fused_attention",
+        lambda attention, query, *args, **kwargs: query,
+    )
+    monkeypatch.setattr(
+        implementation,
+        "gather_kv",
+        lambda packed, indices: torch.zeros(indices.numel(), 64),
     )
     cache = SimpleNamespace(
-        latents=torch.zeros(1, 64),
+        window_cache=lambda layer: torch.zeros(1, 128, 1, 528, dtype=torch.uint8),
         window_rows=lambda layer, positions: torch.zeros_like(positions),
     )
     hidden = torch.randn(batch_size, 5, 64)
     positions = torch.arange(5)[None].expand(batch_size, -1)
     result = attention(hidden, positions, 5, cache, {}, prefill=prefill)
-    expected = hidden.clone()
-    implementation.apply_rotary_emb(expected, attention.freqs_cis[positions])
-    torch.testing.assert_close(result, expected)
+    torch.testing.assert_close(result, hidden)
     assert result.shape == (batch_size, 5, 64)
     assert calls == (["project", "query", "finish"] if prefill else [])
 

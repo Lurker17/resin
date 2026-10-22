@@ -17,11 +17,6 @@ from resin.backend.cuda.context_parallel import ContextParallelTokens
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.backend.loading import prepare_model
 from resin.backend.torch import benchmark_expert_indices
-from resin_models_cuda.deepseek_v4.attention import (
-    sparse_topk_lengths,
-    sparse_verify_attention,
-)
-from resin_models_cuda.deepseek_v4.cutile import dspark_attention_metadata
 from resin_models_cuda.deepseek_v4.experts import RoutedExperts as V4RoutedExperts
 from resin_models_cuda.deepseek_v4.gemm import fp4_fused_moe
 from resin_models_cuda.deepseek_v4.model import (
@@ -36,7 +31,12 @@ from resin_models_cuda.deepseek_v4.model import (
     apply_rotary_emb,
     precompute_freqs_cis,
 )
-from resin_models_cuda.deepseek_v41.engram import ParallelEngramEmbedding
+from resin_models_cuda.deepseek_v41.attention import (
+    fused_attention,
+    gather_kv,
+    pack_kv,
+    store_kv,
+)
 from resin_models_cuda.deepseek_v41.kernels import (
     act_quant,
     fp4_act_quant,
@@ -268,7 +268,6 @@ class Indexer(nn.Module):
 
 class Attention(nn.Module):
     freqs_cis: torch.Tensor
-    attention_workspace: torch.Tensor
 
     def __init__(self, layer, args, tp):
         super().__init__()
@@ -296,7 +295,6 @@ class Attention(nn.Module):
         self.wo_a = Linear(
             args.n_heads * args.head_dim // args.o_groups,
             args.o_groups * args.o_lora_rank,
-            dtype=torch.bfloat16,
             tensor_parallel=tp,
             axis=0,
         )
@@ -329,22 +327,16 @@ class Attention(nn.Module):
         return self.q_norm(self.wq_a(hidden)), self.wkv(hidden)
 
     def _finish(self, output, positions):
-        apply_rotary_emb(
-            output[..., -self.rope_head_dim :], self.freqs_cis[positions], inverse=True
-        )
-        output = output.reshape(*output.shape[:2], self.n_local_groups, -1)
-        act_quant(output, 32, "ue8m0", torch.float8_e8m0fnu, True)
-        weights = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        return self.wo_b(torch.einsum("bsgd,grd->bsgr", output, weights).flatten(2))
+        output = self.wo_a(*output)
+        return self.wo_b(output.reshape(*positions.shape, -1))
 
     def store(self, hidden, positions, cache):
         kv = self.kv_norm(self.wkv(hidden))
         apply_rotary_emb(kv[..., -self.rope_head_dim :], self.freqs_cis[positions])
-        act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
-        cache.latents.view(-1, self.head_dim).index_copy_(
-            0,
-            cache.window_rows(self.layer_id, positions).flatten().long(),
-            kv.reshape(-1, self.head_dim),
+        store_kv(
+            cache.window_cache(self.layer_id),
+            cache.window_rows(self.layer_id, positions),
+            pack_kv(kv),
         )
 
     def forward(
@@ -365,11 +357,10 @@ class Attention(nn.Module):
         )(hidden)
         kv = self.kv_norm(kv)
         apply_rotary_emb(kv[..., -self.rope_head_dim :], self.freqs_cis[positions])
-        act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
-        cache.latents.view(-1, self.head_dim).index_copy_(
-            0,
-            cache.window_rows(self.layer_id, positions).flatten().long(),
-            kv.reshape(-1, self.head_dim),
+        store_kv(
+            cache.window_cache(self.layer_id),
+            cache.window_rows(self.layer_id, positions),
+            pack_kv(kv),
         )
         latent = (
             self.compressor(hidden, positions, cache)
@@ -385,13 +376,10 @@ class Attention(nn.Module):
                 latent[..., -self.rope_head_dim :],
                 self.freqs_cis[positions - positions.remainder(self.ratio)],
             )
-            fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)
-            cache.latents.view(-1, self.head_dim).index_copy_(
-                0,
-                cache.compressed_rows(self.layer_id, self.ratio, positions)
-                .flatten()
-                .long(),
-                latent.reshape(-1, self.head_dim),
+            store_kv(
+                cache.compressed_cache(self.layer_id),
+                cache.compressed_rows(self.layer_id, self.ratio, positions),
+                pack_kv(latent, fp4=True),
             )
         if context_parallel is not None:
             qr, positions = (
@@ -403,12 +391,13 @@ class Attention(nn.Module):
         query = (self.prefill_query if prefill and self.prefill_query else self.wq_b)(
             qr
         ).unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb(query[..., -self.rope_head_dim :], self.freqs_cis[positions])
         columns = torch.arange(self.window_size, device=hidden.device)
         counts = (positions + 1).clamp_max(self.window_size)
         windows = positions[..., None] + 1 - counts[..., None] + columns
-        window_rows = cache.window_rows(self.layer_id, windows)
-        indices = torch.where(columns < counts[..., None], window_rows, -1)
+        indices = torch.where(
+            columns < counts[..., None], cache.window_rows(self.layer_id, windows), -1
+        )
+        extra_cache = extra_indices = None
         if self.ratio:
             selected = runtime["indices"]
             if context_parallel is not None:
@@ -416,25 +405,48 @@ class Attention(nn.Module):
             physical = cache.compressed_rows(
                 self.layer_id, self.ratio, selected.clamp_min(0) * self.ratio
             )
-            indices = torch.cat((indices, torch.where(selected >= 0, physical, -1)), -1)
-        lengths = (
-            sparse_topk_lengths(
-                (positions + 1) // self.ratio, selected.shape[-1], self.window_size
+            extra_cache = cache.compressed_cache(self.layer_id)
+            extra_indices = torch.where(selected >= 0, physical, -1)
+        if prefill:
+            # Gather compact BF16 inputs for the upstream prefill kernel;
+            # retained history stays packed in the shared slab pool.
+            start = max(0, capacity - hidden.shape[1] - self.window_size + 1)
+            history = torch.arange(start, capacity, device=hidden.device)[None]
+            values = gather_kv(
+                cache.window_cache(self.layer_id),
+                cache.window_rows(self.layer_id, history),
             )
-            if self.ratio
-            else torch.full_like(positions, self.window_size, dtype=torch.int32)
-        )
-        output = sparse_verify_attention(
-            query,
-            cache.latents,
-            cache.latents,
-            self.attn_sink,
-            indices.int(),
-            lengths,
-            (positions + 1).int(),
-            self.attention_workspace,
-            self.softmax_scale,
-        )
+            indices = torch.where(columns < counts[..., None], windows - start, -1)
+            if self.ratio:
+                compressed = (
+                    torch.arange(capacity // self.ratio, device=hidden.device)[None]
+                    * self.ratio
+                )
+                extra = gather_kv(
+                    extra_cache,
+                    cache.compressed_rows(self.layer_id, self.ratio, compressed),
+                )
+                indices = torch.cat(
+                    (
+                        indices,
+                        torch.where(selected >= 0, selected + values.shape[0], -1),
+                    ),
+                    -1,
+                )
+                values = torch.cat((values, extra))
+            output = fused_attention(
+                self, query, positions, values[:, None], indices, prefill=True
+            )
+        else:
+            output = fused_attention(
+                self,
+                query,
+                positions,
+                cache.window_cache(self.layer_id),
+                indices,
+                extra_cache=extra_cache,
+                extra_indices=extra_indices,
+            )
         output = (
             self.prefill_finish if prefill and self.prefill_finish else self._finish
         )(output, positions)
@@ -574,7 +586,6 @@ class ConfidenceHead(nn.Module):
 class Transformer(nn.Module):
     layers: Sequence[Block]
     mtp: Sequence[Block]
-    _attention_workspace: torch.Tensor
     """The V4.1 model on Engine-owned pages; no per-request Python state."""
 
     def __init__(
@@ -630,20 +641,22 @@ class Transformer(nn.Module):
         self.target_layer_ids = frozenset(
             args.dspark_target_layer_ids if self.mtp else ()
         )
-        self.register_buffer(
-            "_attention_workspace",
-            torch.zeros(128 * 1024 * 1024, dtype=torch.uint8),
-            persistent=False,
-        )
-        for layer in (*self.layers, *self.mtp):
-            layer.attn.attention_workspace = self._attention_workspace
         if args.engram_layer_ids:
+            from resin.backend.embedding import ShardedEmbeddingLookup
             from resin_models_cuda.deepseek_v41.engram import Engram, NgramHash
 
             self.engram_hash = NgramHash(args, tokenizer)
+            lookup = (
+                ShardedEmbeddingLookup(
+                    parallel_groups.device_domain, args.engram_head_dim
+                )
+                if parallel_groups is not None
+                and parallel_groups.device_domain.size > 1
+                else None
+            )
             for layer in self.layers:
                 if layer.layer_id in args.engram_layer_ids:
-                    layer.engram = Engram(args, layer.layer_id, tensor_parallel=tp)
+                    layer.engram = Engram(args, layer.layer_id, lookup=lookup)
         else:
             self.engram_hash = None
         if self.mtp:
@@ -672,6 +685,10 @@ class Transformer(nn.Module):
             raise ValueError(f"unknown expert backend: {expert_backend}")
 
         def lower(source):
+            if isinstance(source, Attention):
+                from resin_models_cuda.deepseek_v41.attention import prepare_attention
+
+                prepare_attention(source)
             if isinstance(source, Block) and collective is not None:
                 from resin_models_cuda.deepseek_v41.hc import mega_ffn_transition
 
@@ -702,7 +719,7 @@ class Transformer(nn.Module):
     def set_allreduce(self, reducer, *, indexer_reducer=None):
         for module in self.modules():
             if (
-                isinstance(module, (ParallelEmbedding, ParallelEngramEmbedding))
+                isinstance(module, ParallelEmbedding)
                 or isinstance(module, Linear)
                 and module.axis == 1
             ):
@@ -713,9 +730,21 @@ class Transformer(nn.Module):
     def bind_cache_arena(self, _arena):
         pass  # Every state access receives the current immutable page tables.
 
-    def forward_experts_empty(self, *, stage="target"):
+    def forward_experts_empty(self, *, stage="target", prefill=False):
         for layer in self.layers if stage == "target" else self.mtp:
-            layer.ffn.forward_empty()
+            if layer.engram is not None:
+                layer.engram.embed.forward_empty(layer.engram.hash_columns)
+            if prefill:
+                weight = self.embed.weight
+                operation = layer.prefill_ffn
+                if operation is None:
+                    raise RuntimeError("empty prefill requires prepared FFN callbacks")
+                operation(
+                    weight.new_empty((0, self.args.dim)),
+                    weight.new_empty((0,), dtype=torch.int64),
+                )
+            else:
+                layer.ffn.forward_empty()
 
     def _run(self, ids, positions, capacity, cache, cp=None, *, prefill=False):
         hashes = (
@@ -811,39 +840,39 @@ class Transformer(nn.Module):
             layer.attn.store(hidden, positions, cache)
 
     def _draft_attention(self, attention, hidden, position, cache):
-        positions = position[:, None] + torch.arange(
-            hidden.shape[1], device=hidden.device
-        )
+        batch, block = hidden.shape[:2]
+        positions = position[:, None] + torch.arange(block, device=hidden.device)
         qr, kv = attention._project(hidden)
         query = attention.wq_b(qr).unflatten(
             -1, (attention.n_local_heads, attention.head_dim)
-        )
-        apply_rotary_emb(
-            query[..., -attention.rope_head_dim :], attention.freqs_cis[positions]
         )
         kv = attention.kv_norm(kv)
         apply_rotary_emb(
             kv[..., -attention.rope_head_dim :], attention.freqs_cis[positions]
         )
-        act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
-        indices, lengths, sequence_lengths = dspark_attention_metadata(
-            position,
-            hidden.shape[1],
-            attention.window_size,
-            attention.window_size,
-            window_mapping=cache.window_mapping(attention.layer_id),
+        drafts = torch.arange(batch, device=hidden.device)[
+            :, None
+        ] * cache.geometry.draft_tokens + torch.arange(block, device=hidden.device)
+        # Draft keys are transient and bidirectional within this block. They
+        # must never overwrite the committed main-hidden history at the anchor.
+        store_kv(cache.draft_cache, drafts, pack_kv(kv))
+        columns = torch.arange(attention.window_size, device=hidden.device)
+        counts = position.clamp_max(attention.window_size)
+        history = position[:, None] - counts[:, None] + columns
+        indices = torch.where(
+            columns < counts[:, None],
+            cache.window_rows(attention.layer_id, history),
+            -1,
         )
-        output = sparse_verify_attention(
+        indices = indices[:, None].expand(batch, block, -1)
+        output = fused_attention(
+            attention,
             query,
-            cache.latents,
-            kv.contiguous(),
-            attention.attn_sink,
+            positions,
+            cache.window_cache(attention.layer_id),
             indices,
-            lengths,
-            sequence_lengths,
-            attention.attention_workspace,
-            attention.softmax_scale,
-            enable_pdl=False,
+            extra_cache=cache.draft_cache,
+            extra_indices=drafts[:, None].expand(batch, block, -1),
         )
         return attention._finish(output, positions)
 

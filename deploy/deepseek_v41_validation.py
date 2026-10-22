@@ -1,7 +1,6 @@
 """Blackwell primitive probes and real-checkpoint eager/captured validation."""
 
 from contextlib import contextmanager
-from dataclasses import replace
 
 import torch
 
@@ -176,136 +175,9 @@ def _attention_reference(query, cache, sinks, indices, scale):
 
 
 def _attention():
-    from resin.backend.cuda.parallel import TensorParallelContext
-    from resin.backend.cuda.slab import DevicePageGroup
-    from resin_models_cuda.deepseek_v41 import model
-    from resin_models_cuda.deepseek_v41.cache import CacheArena, CacheGeometry
+    from deploy.flashmla_validation import run_probe
 
-    args = model.ModelArgs(
-        dim=64,
-        n_layers=2,
-        n_mtp_layers=0,
-        n_heads=32,
-        head_dim=512,
-        q_lora_rank=64,
-        o_lora_rank=64,
-        o_groups=1,
-        rope_head_dim=64,
-        max_seq_len=256,
-        window_size=128,
-        compress_ratios=(1, 1),
-        kv_source_layers=(0,),
-        index_source_layers=(0, 1),
-        index_n_heads=8,
-        index_head_dim=128,
-        index_topk=16,
-        candidate_source_layer=0,
-        candidate_topk_blocks=2,
-    )
-    geometry = CacheGeometry.build(args, prefill_chunk_size=32)
-    # Exercise released physical strides with only the tiny model's payload.
-    geometry = replace(geometry, parent_rows=5504, packings=(1, 8, 2, 64))
-    arena = CacheArena("cuda", geometry.layout(8), geometry, dtype=torch.bfloat16)
-    groups = tuple(
-        DevicePageGroup(
-            torch.tensor([[i + 1, i + 5]], device="cuda", dtype=torch.int32),
-            torch.tensor([[packing - 1, 0]], device="cuda", dtype=torch.int32),
-            torch.zeros(1, device="cuda", dtype=torch.int32),
-        )
-        for i, packing in enumerate(geometry.packings)
-    )
-    cache = arena._make_graph_cache(groups)
-    positions = torch.tensor(
-        [[0, 1, 2, 127, 128, 129]], device="cuda", dtype=torch.int32
-    )
-    hidden = torch.randn(1, 6, args.dim, device="cuda", dtype=torch.bfloat16) * 0.1
-    with torch.device("cuda"), _bf16_default():
-        layers = [model.Attention(i, args, TensorParallelContext()) for i in range(2)]
-    workspace = torch.zeros(128 * 1024 * 1024, device="cuda", dtype=torch.uint8)
-    for layer in layers:
-        layer.attention_workspace = workspace
-        for name, parameter in layer.named_parameters():
-            if name.endswith("scale"):
-                parameter.fill_(1 / 32)
-            elif name.endswith("norm.weight"):
-                parameter.fill_(1)
-            else:
-                parameter.copy_(
-                    (torch.randn(parameter.shape, device="cuda") * 0.1).to(
-                        parameter.dtype
-                    )
-                )
-
-    def forward():
-        arena.storage.zero_()
-        runtime = {}
-        value = hidden
-        for layer in layers:
-            value = layer(value, positions, 256, cache, runtime)
-        return value
-
-    native = model.sparse_verify_attention
-    comparisons = []
-
-    def checked(
-        query: torch.Tensor,
-        window_cache: torch.Tensor,
-        compressed_cache: torch.Tensor,
-        sinks: torch.Tensor,
-        indices: torch.Tensor,
-        sparse_lengths: torch.Tensor,
-        sequence_lengths: torch.Tensor,
-        workspace: torch.Tensor,
-        softmax_scale: float,
-        *,
-        enable_pdl: bool = True,
-    ) -> torch.Tensor:
-        output = native(
-            query,
-            window_cache,
-            compressed_cache,
-            sinks,
-            indices,
-            sparse_lengths,
-            sequence_lengths,
-            workspace,
-            softmax_scale,
-            enable_pdl=enable_pdl,
-        )
-        expected = _attention_reference(
-            query, window_cache, sinks, indices, softmax_scale
-        )
-        comparisons.append(_check(output, expected, atol=0.003, rtol=0.02))
-        return output
-
-    setattr(model, "sparse_verify_attention", checked)
-    try:
-        eager = forward().clone()
-    finally:
-        model.sparse_verify_attention = native
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(3):
-            forward()
-    torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = forward()
-    graph.replay()
-    torch.cuda.synchronize()
-    result = {
-        "physical_layout": {
-            "parent_rows": geometry.parent_rows,
-            "packings": list(geometry.packings),
-            "child_slots": [[packing - 1, 0] for packing in geometry.packings],
-        },
-        "source_and_consumer_sparse": comparisons,
-        "captured": _check(captured, eager),
-    }
-    graph.reset()
-    return result
+    return run_probe()
 
 
 @torch.inference_mode()

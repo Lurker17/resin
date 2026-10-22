@@ -24,7 +24,12 @@ PROBE_PYTHON = "/opt/resin-deps/.venv/bin/python"
 CACHE = modal.Volume.from_name("resin-deepinfer-kernels-v1", create_if_missing=True)
 
 image = build_modal_image(
-    ROOT, env={"DG_JIT_CACHE_DIR": "/kernel-cache/deep_gemm"}
+    ROOT,
+    env={
+        "DG_JIT_CACHE_DIR": "/kernel-cache/deep_gemm",
+        "TILELANG_CACHE_DIR": "/kernel-cache/tilelang",
+        "TRITON_CACHE_DIR": "/kernel-cache/triton",
+    },
 ).run_commands(
     'python -c "import deep_gemm; '
     "assert deep_gemm.__version__ == '2.8.2'; "
@@ -37,6 +42,8 @@ for helper in (
     "bench",
     "deepseek_v41_validation",
     "v41_engine_smoke",
+    "engram_validation",
+    "flashmla_validation",
 ):
     image = image.add_local_file(
         ROOT / f"deploy/{helper}.py", f"/root/deploy/{helper}.py", copy=True
@@ -53,8 +60,10 @@ app = modal.App("resin-deepinfer-kernels", image=image)
     single_use_containers=True,
 )
 def probe(mode: str = "kernels", tokens_per_rank: int = 8) -> dict:
-    if mode not in {"kernels", "mega-moe", "engine-smoke"}:
-        raise ValueError("mode must be kernels, mega-moe or engine-smoke")
+    if mode not in {"kernels", "mega-moe", "engine-smoke", "memory", "engram"}:
+        raise ValueError(
+            "mode must be kernels, mega-moe, engine-smoke, memory or engram"
+        )
     if tokens_per_rank < 1:
         raise ValueError("tokens_per_rank must be positive")
     try:

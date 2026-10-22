@@ -11,8 +11,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from resin.backend.cuda.parallel import TensorParallelContext
-
 
 def build_compressed_token_map(tokenizer):
     """Collapse normalized spellings, retaining partial UTF-8 tokens by raw form."""
@@ -172,44 +170,69 @@ class NgramHash(nn.Module):
 
 
 class ParallelEngramEmbedding(nn.Module):
-    """FP8 tables keep row scales compressed until the lookup, then sum TP shards."""
+    """World-sharded FP8 rows, independent of attention or expert ownership."""
 
-    def __init__(self, rows, dim, tensor_parallel):
+    def __init__(self, rows, dim, lookup=None):
         super().__init__()
         if dim % 32:
             raise ValueError("Engram head dimension must be divisible by block32")
-        width = (rows + tensor_parallel.size - 1) // tensor_parallel.size
+        self.lookup = lookup
+        group = None if lookup is None else lookup.group
+        width = (rows + (1 if group is None else group.size) - 1) // (
+            1 if group is None else group.size
+        )
+        rank = 0 if group is None else group.local_rank
         self.start, self.stop = (
-            tensor_parallel.rank * width,
-            (tensor_parallel.rank + 1) * width,
+            rank * width,
+            (rank + 1) * width,
         )
         self.weight = nn.Parameter(torch.empty(width, dim, dtype=torch.float8_e4m3fn))
         self.scale = nn.Parameter(
             torch.empty(width, dim // 32, dtype=torch.float8_e8m0fnu)
         )
-        self.allreduce = tensor_parallel.sum
 
     def forward(self, indices):
+        return (
+            self.local(indices)
+            if self.lookup is None
+            else self.lookup(indices, self.local)
+        )
+
+    def local(self, indices, output=None):
+        if indices.is_cuda:
+            from resin.backend.cuda.embedding import fp8_embedding
+
+            return fp8_embedding(
+                indices, self.weight, self.scale, self.start, self.stop, output
+            )
         mask = (indices < self.start) | (indices >= self.stop)
         local = (indices - self.start).masked_fill(mask, 0)
         values = F.embedding(local, self.weight).float().unflatten(-1, (-1, 32))
         scales = F.embedding(local, self.scale).float().unsqueeze(-1)
-        output = (values * scales).flatten(-2).bfloat16()
-        return self.allreduce(output.masked_fill(mask.unsqueeze(-1), 0))
+        value = (
+            (values * scales).flatten(-2).bfloat16().masked_fill(mask.unsqueeze(-1), 0)
+        )
+        if output is not None:
+            output.copy_(value)
+            return output
+        return value
+
+    def forward_empty(self, columns):
+        return self(self.weight.new_empty((0, columns), dtype=torch.int64))
 
 
 class Engram(nn.Module):
-    def __init__(self, args, layer, *, tensor_parallel=None):
+    def __init__(self, args, layer, *, lookup=None):
         super().__init__()
         from resin_models_cuda.deepseek_v41.linear import Linear
 
         layout = EngramLayout.from_args(args)
         self.layer_hash_index = layout.layer_ids.index(layer)
         self.dim, self.hc_mult, self.eps = args.dim, args.hc_mult, args.norm_eps
-        tp = tensor_parallel or TensorParallelContext()
         self.embed = ParallelEngramEmbedding(
-            layout.num_embeddings[self.layer_hash_index], layout.head_dim, tp
+            layout.num_embeddings[self.layer_hash_index], layout.head_dim, lookup
         )
+        self.hash_columns = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = Linear(
             (layout.max_ngram_size - 1) * layout.n_heads * layout.head_dim,
             args.dim * (args.hc_mult + 1),

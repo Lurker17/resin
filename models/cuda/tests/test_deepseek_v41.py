@@ -156,9 +156,16 @@ def test_shared_kv_and_index_pages_alias_only_their_declared_source():
     # Shared source KV and its keys occupy disjoint bytes in the same slab.
     main = cache.compressed_rows(1, 2, positions).long()
     index = cache.index_rows(1, positions).long()
-    cache.latents.view(-1, 512)[main] = 2
+    packed = cache.compressed_cache(1)
+    pages, offsets = (
+        main.div(packed.shape[1], rounding_mode="floor"),
+        main % packed.shape[1],
+    )
+    packed[pages, offsets, 0] = 2
     cache.index_keys.view(-1, 128)[index] = 3
-    assert (cache.latents.view(-1, 512)[main] == 2).all()
+    assert (packed[pages, offsets, 0] == 2).all()
+    assert packed.storage_offset() == cache.compressed_cache(2).storage_offset()
+    assert packed.storage_offset() != cache.compressed_cache(3).storage_offset()
     assert (cache.index_keys.view(-1, 128)[index] == 3).all()
     assert arena.geometry.bytes_per_parent < 2 << 20
 
@@ -195,17 +202,16 @@ def test_window_guard_bands_preserve_draft_and_ngram_predecessors():
 def test_pinned_cache_packing_does_not_inflate_parent_or_b256_budget():
     args = SimpleNamespace(**json.loads((FIXTURES / "inference.json").read_text()))
     geometry = CacheGeometry.build(args, prefill_chunk_size=128, max_batch_size=256)
-    assert geometry.parent_rows == 5504
-    assert geometry.packings == (1, 8, 2, 64)
-    assert geometry.bytes_per_parent == 5_636_096
-    assert geometry.graph_scratch_parents == 420
+    assert geometry.packings == (1, 16, 1, 2048)
+    assert geometry.bytes_per_parent == 3_244_032
+    assert geometry.graph_scratch_parents == 530
     layout = geometry.layout(4096)
     # The first speculative decode crosses the 4096-token compressed-page edge.
     resident = layout.estimated_parent_count([4101] * 256)
-    assert resident == 2092
+    assert resident == 1809
     assert (
         resident + 1 + geometry.graph_scratch_parents
-    ) * geometry.bytes_per_parent == 14_163_509_248
+    ) * geometry.bytes_per_parent == 7_591_034_880
 
 
 @pytest.mark.parametrize(
@@ -229,32 +235,44 @@ def test_pinned_packed_children_hold_every_physical_view_without_overlap(group):
         starts = indices.flatten().unique().long() * width
         spans.append(torch.stack((starts, starts + width), -1))
 
+    def record_packed(view, indices):
+        indices = indices.flatten().unique().long()
+        starts = (
+            view.storage_offset()
+            + indices.div(view.shape[1], rounding_mode="floor") * view.stride(0)
+            + indices.remainder(view.shape[1]) * view.stride(1)
+        )
+        spans.append(torch.stack((starts, starts + view.shape[-1]), -1))
+
     if group == 0:
         for layer in range(geometry.attention_layers):
-            record(cache.window_rows(layer, positions), 1024)
-        payload_rows = 43 * 128
+            record_packed(
+                cache.window_cache(layer), cache.window_rows(layer, positions)
+            )
+        payload_bytes = 43 * 128 * 528
     elif group == 1:
         for layer in geometry.kv_sources:
-            record(
-                cache.compressed_rows(layer, geometry.ratios[layer], positions), 1024
+            record_packed(
+                cache.compressed_cache(layer),
+                cache.compressed_rows(layer, geometry.ratios[layer], positions),
             )
             record(cache.index_rows(layer, positions), 256)
-        payload_rows = 400
+        payload_bytes = (3 * 64 + 128) * (288 + 256)
     elif group == 2:
         for layer in geometry.compressor_sources:
             for rows in cache.compressor_rows(layer, positions):
                 record(rows, 2048)
-        payload_rows = 1536
+        payload_bytes = 3 * 128 * 2 * 2048
     else:
         record(cache.token_rows(positions), 8)
-        payload_rows = 1
+        payload_bytes = 128 * 8
     ranges = torch.cat(spans)
     ranges = ranges[ranges[:, 0].argsort()]
     assert (ranges[1:, 0] >= ranges[:-1, 1]).all()
     parent_bytes = geometry.bytes_per_parent
     offsets = ranges - parent_bytes  # All children use physical parent 1.
     stride = parent_bytes // packing
-    assert stride % 2048 == 0  # Even BF16 rows keep FP32 and int64 aliases aligned.
+    assert stride % (2048 if group == 2 else 8) == 0
     assert offsets.min() >= 0 and offsets.max() <= parent_bytes
     slots = offsets[:, 0] // stride
     assert (offsets[:, 1] <= (slots + 1) * stride).all()
@@ -262,7 +280,7 @@ def test_pinned_packed_children_hold_every_physical_view_without_overlap(group):
     payloads = torch.zeros(packing, dtype=torch.int64).index_add_(
         0, slots, ranges[:, 1] - ranges[:, 0]
     )
-    assert payloads.eq(payload_rows * 1024).all()
+    assert payloads.eq(payload_bytes).all()
 
 
 def test_batched_graph_capture_reserves_disjoint_writable_scratch_children():
@@ -284,7 +302,10 @@ def test_batched_graph_capture_reserves_disjoint_writable_scratch_children():
     by_group = [addresses[group * 4 : (group + 1) * 4] for group in range(4)]
     assert all(len(set(group)) == 4 for group in by_group)
     assert all(parent > arena.layout.parent_capacity for parent, _ in addresses)
-    assert len({parent for parent, _ in addresses}) == geometry.graph_scratch_parents
+    assert (
+        len({parent for parent, _ in addresses})
+        == geometry.graph_scratch_parents - geometry.guard_parents
+    )
     assert (
         arena.storage.shape[0]
         == arena.layout.parent_capacity + 1 + geometry.graph_scratch_parents
@@ -294,8 +315,6 @@ def test_batched_graph_capture_reserves_disjoint_writable_scratch_children():
     )
     positions = torch.tensor([[2, 3]]).expand(4, -1)
     rows = (
-        (cache.latents.view(-1, 512), cache.window_rows(0, positions)),
-        (cache.latents.view(-1, 512), cache.compressed_rows(1, 2, positions)),
         (cache.compressor_values, cache.compressor_rows(1, positions)[0]),
         (cache.token_values, cache.token_rows(positions)),
     )
@@ -320,6 +339,19 @@ def test_batched_graph_capture_reserves_disjoint_writable_scratch_children():
             .expand_as(actual)
         )
         torch.testing.assert_close(actual, expected)
+    for packed, indices in (
+        (cache.window_cache(0), cache.window_rows(0, positions)),
+        (cache.compressed_cache(1), cache.compressed_rows(1, 2, positions)),
+    ):
+        pages, offsets = (
+            indices.long().div(packed.shape[1], rounding_mode="floor"),
+            indices.long() % packed.shape[1],
+        )
+        values = torch.arange(1, 5, dtype=torch.uint8)[:, None, None].expand(
+            4, 2, packed.shape[-1]
+        )
+        packed[pages, offsets, 0] = values
+        assert torch.equal(packed[pages, offsets, 0], values)
     assert not arena.storage[: arena.layout.parent_capacity + 1].count_nonzero()
     arena.reset_scratch()
     assert not arena.storage.count_nonzero()
@@ -398,7 +430,7 @@ def test_token_history_addresses_remain_int64_above_sixteen_gibibytes():
 
     geometry = CacheGeometry.build(_args(), prefill_chunk_size=32)
     # No giant allocation: only compute the address of a high physical slab.
-    geometry = replace(geometry, parent_rows=8192, packings=(1, 8, 2, 4096))
+    geometry = replace(geometry, parent_bytes=8192 * 1024, packings=(1, 8, 2, 4096))
     groups = tuple(
         DevicePageGroup(
             torch.tensor([[4096]], dtype=torch.int32),
@@ -407,9 +439,7 @@ def test_token_history_addresses_remain_int64_above_sixteen_gibibytes():
         )
         for _ in range(4)
     )
-    cache = DeviceCache(
-        geometry, groups, torch.empty(0), torch.empty(0), torch.empty(0)
-    )
+    cache = DeviceCache(geometry, groups, torch.empty(0, dtype=torch.uint8))
     actual = cache.token_rows(torch.tensor([[0, 127]]))
     expected = 4096 * 8192 * 128 + 7 * (8192 * 128 // 4096)
     assert actual.dtype == torch.int64

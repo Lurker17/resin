@@ -87,6 +87,11 @@ image = (
         "/root/deploy/deepseek_v41_validation.py",
         copy=True,
     )
+    .add_local_file(
+        ROOT / "deploy/flashmla_validation.py",
+        "/root/deploy/flashmla_validation.py",
+        copy=True,
+    )
 )
 app = modal.App(
     "resin-bench",

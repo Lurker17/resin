@@ -226,14 +226,18 @@ def test_fp32_compressor_sources_and_packed_index_keys_never_alias():
             source, cache.geometry.ratios[source], positions
         ).long()
         keys = cache.index_rows(source, positions).long()
-        cache.latents.view(-1, 512)[rows] = source + 30
+        packed = cache.compressed_cache(source)
+        packed[rows // packed.shape[1], rows % packed.shape[1], 0] = source + 30
         cache.index_keys.view(-1, 128)[keys] = source + 40
     for source in (1, 3, 5):
         rows = cache.compressed_rows(
             source, cache.geometry.ratios[source], positions
         ).long()
         keys = cache.index_rows(source, positions).long()
-        assert (cache.latents.view(-1, 512)[rows] == source + 30).all()
+        packed = cache.compressed_cache(source)
+        assert (
+            packed[rows // packed.shape[1], rows % packed.shape[1], 0] == source + 30
+        ).all()
         assert (cache.index_keys.view(-1, 128)[keys] == source + 40).all()
     for rows, value in saved:
         assert (cache.compressor_values[rows] == value).all()
@@ -244,7 +248,7 @@ def test_published_index_query_sources_share_keys_from_latest_kv_owner():
     args = SimpleNamespace(**json.loads(path.read_text()))
     geometry = CacheGeometry.build(args, prefill_chunk_size=4096)
     assert geometry.compressor_sources == (2, 8, 14)
-    assert geometry.index_base_rows == 3 * 64 + 128
+    assert geometry.index_offsets[2] == (3 * 64 + 128) * 288
     for layer in (20, 24, 28, 32, 36, 39):
         assert geometry.compressed_offsets[layer] == geometry.compressed_offsets[20]
         assert geometry.index_offsets[layer] == geometry.index_offsets[20]
@@ -340,26 +344,40 @@ def test_dspark_query_rope_starts_at_anchor_while_main_history_ends_before_it(
         "apply_rotary_emb",
         lambda value, freqs: observed.append(("rope", freqs.clone())),
     )
-    monkeypatch.setattr(implementation, "act_quant", lambda value, *args: value)
-
-    def metadata(position, block, window, capacity, *, window_mapping):
-        observed.append(("history_anchor", position.clone()))
-        return None, None, None
-
-    monkeypatch.setattr(implementation, "dspark_attention_metadata", metadata)
+    monkeypatch.setattr(implementation, "pack_kv", lambda value, **kwargs: value)
+    draft_cache, window_cache = object(), object()
+    written = []
     monkeypatch.setattr(
-        implementation, "sparse_verify_attention", lambda query, *args, **kwargs: query
+        implementation,
+        "store_kv",
+        lambda target, indices, values: written.append((target, indices.clone())),
     )
-    cache = SimpleNamespace(window_mapping=lambda layer: layer, latents=None)
+    calls = []
+
+    def fused(attention, query, positions, cache, indices, **kwargs):
+        calls.append((positions.clone(), cache, indices.clone(), kwargs))
+        return query
+
+    monkeypatch.setattr(implementation, "fused_attention", fused)
+    cache = SimpleNamespace(
+        geometry=SimpleNamespace(draft_tokens=8),
+        draft_cache=draft_cache,
+        window_cache=lambda layer: window_cache,
+        window_rows=lambda layer, positions: positions,
+    )
     anchor = torch.tensor([7, 130])
     model._draft_attention(attention, hidden, anchor, cache)
     positions = torch.tensor([[7, 8, 9], [130, 131, 132]])
-    assert [name for name, _ in observed] == [
-        "rope",
-        "rope",
-        "history_anchor",
-        "finish",
-    ]
-    for _, actual in (observed[0], observed[1], observed[3]):
+    assert [name for name, _ in observed] == ["rope", "finish"]
+    for _, actual in observed:
         torch.testing.assert_close(actual, positions)
-    torch.testing.assert_close(observed[2][1], anchor)
+    query_positions, history_cache, history, extra = calls[0]
+    assert history_cache is window_cache and extra["extra_cache"] is draft_cache
+    torch.testing.assert_close(query_positions, positions)
+    for row, start in enumerate((0, 2)):
+        expected = torch.arange(start, int(anchor[row]))
+        for query in history[row]:
+            torch.testing.assert_close(query[query >= 0], expected)
+    assert written[0][0] is draft_cache
+    assert written[0][1].tolist() == [[0, 1, 2], [8, 9, 10]]
+    assert extra["extra_indices"].tolist() == [[[0, 1, 2]] * 3, [[8, 9, 10]] * 3]

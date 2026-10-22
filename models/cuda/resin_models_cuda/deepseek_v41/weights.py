@@ -52,10 +52,9 @@ def load_weights(model_path, model, *, rank, tensor_parallel_size, device):
             tensor = reader.read(files[name], name)
             target = targets[name]
             if ".engram.embed." in name:
-                width = (
-                    tensor.shape[0] + tensor_parallel_size - 1
-                ) // tensor_parallel_size
-                tensor = tensor[rank * width : (rank + 1) * width]
+                embedding = model.get_submodule(name.rsplit(".", 1)[0])
+                width = target.shape[0]
+                tensor = tensor[embedding.start : embedding.stop]
                 # Last row-shard is padded exactly as in the official converter.
                 if tensor.shape[0] < width:
                     tensor = torch.cat(
@@ -70,15 +69,6 @@ def load_weights(model_path, model, *, rank, tensor_parallel_size, device):
             else:
                 tensor = _attention_shard(tensor, name, rank, tensor_parallel_size)
                 tensor = _shard_routed_expert(tensor, name, model)
-            if name.endswith(".wo_a.weight"):
-                scale_name = name.removesuffix("weight") + "scale"
-                scale = _attention_shard(
-                    reader.read(files[scale_name], scale_name),
-                    scale_name,
-                    rank,
-                    tensor_parallel_size,
-                )
-                tensor = _dequantize_output(tensor, scale)
             tensor = _coerce_for_target(tensor, target)
             target.copy_(tensor)
             total += target.numel() * target.element_size()

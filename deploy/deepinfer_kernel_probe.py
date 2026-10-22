@@ -539,6 +539,63 @@ def run_mega_moe(tokens_per_rank: int = 8):
         }
 
 
+def _memory_rank(rank, rendezvous, directory, packed_attention):
+    import json
+
+    from deploy.deepseek_v41_validation import run_probes
+    from deploy.engram_validation import run_probe as engram_probe
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=rendezvous,
+        world_size=2,
+        rank=rank,
+        device_id=torch.device("cuda", rank),
+        timeout=timedelta(minutes=5),
+    )
+    try:
+        result = {"rank": rank}
+        if packed_attention:
+            result["packed_attention"] = run_probes()
+            print(
+                json.dumps(
+                    {"rank": rank, "packed_attention": result["packed_attention"]}
+                ),
+                flush=True,
+            )
+        result["engram"] = engram_probe(dist.group.WORLD)
+        Path(directory, f"rank{rank}.json").write_text(json.dumps(result))
+    finally:
+        torch.cuda.synchronize()
+        dist.destroy_process_group()
+
+
+def run_memory(*, packed_attention=True):
+    import json
+    import socket
+
+    if torch.cuda.device_count() != 2:
+        raise ValueError("the memory probe requires two visible GPUs")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        rendezvous = f"tcp://127.0.0.1:{listener.getsockname()[1]}"
+    with tempfile.TemporaryDirectory(prefix="packed-memory-") as directory:
+        torch.multiprocessing.spawn(
+            _memory_rank,
+            args=(rendezvous, directory, packed_attention),
+            nprocs=2,
+            join=True,
+        )
+        return {
+            "world_size": 2,
+            "ranks": [
+                json.loads(Path(directory, f"rank{rank}.json").read_text())
+                for rank in range(2)
+            ],
+        }
+
+
 if __name__ == "__main__":
     import argparse
     import json
@@ -546,13 +603,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
     parser.add_argument(
-        "mode", choices=("kernels", "mega-moe"), nargs="?", default="kernels"
+        "mode",
+        choices=("kernels", "mega-moe", "memory", "engram"),
+        nargs="?",
+        default="kernels",
     )
     parser.add_argument("--tokens-per-rank", type=int, default=8)
     args = parser.parse_args()
     if args.tokens_per_rank < 1:
         parser.error("--tokens-per-rank must be positive")
-    result = (
-        run_mega_moe(args.tokens_per_rank) if args.mode == "mega-moe" else run_probe()
-    )
+    if args.mode in ("memory", "engram"):
+        result = run_memory(packed_attention=args.mode == "memory")
+    elif args.mode == "mega-moe":
+        result = run_mega_moe(args.tokens_per_rank)
+    else:
+        result = run_probe()
     args.output.write_text(json.dumps(result, indent=2))

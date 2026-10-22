@@ -5,10 +5,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from test_deepseek_v41_model import implementation as implementation
 from tokenizers import Tokenizer, decoders, models
 from torch import nn
 
-from resin.backend.cuda.parallel import TensorParallelContext
 from resin_models_cuda.deepseek_v41.engram import (
     Engram,
     EngramLayout,
@@ -217,10 +217,16 @@ def test_compressed_vocabulary_mismatch_is_rejected_before_inference():
 
 
 def test_row_shards_keep_fp8_storage_and_mask_other_ranks():
+    class LocalLookup:
+        def __init__(self, rank):
+            self.group = SimpleNamespace(size=2, local_rank=rank)
+
+        def __call__(self, indices, local):
+            return local(indices)
+
     shards = []
     for rank in range(2):
-        tp = SimpleNamespace(size=2, rank=rank, sum=lambda tensor: tensor)
-        table = ParallelEngramEmbedding(5, 32, tp)
+        table = ParallelEngramEmbedding(5, 32, LocalLookup(rank))
         assert table.weight.shape == (3, 32)
         assert table.weight.dtype == torch.float8_e4m3fn
         assert table.scale.dtype == torch.float8_e8m0fnu
@@ -241,7 +247,7 @@ def test_engram_gate_normalizes_each_hc_copy_and_preserves_mask(monkeypatch):
         return nn.Linear(inputs, outputs, bias=False)
 
     monkeypatch.setattr(linear, "Linear", projection)
-    module = Engram(args(), 14, tensor_parallel=TensorParallelContext())
+    module = Engram(args(), 14)
     assert module.layer_hash_index == 1
     monkeypatch.setattr(module, "embed", nn.Embedding(600, 32))
     generator = torch.Generator().manual_seed(13)
@@ -271,3 +277,63 @@ def test_engram_gate_normalizes_each_hc_copy_and_preserves_mask(monkeypatch):
                 )
                 expected[batch, position, hc] += gate * value[batch, position]
     torch.testing.assert_close(module(hidden, hashes, mask), expected)
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_idle_rank_joins_engram_before_each_layer_collective(
+    implementation, prefill, monkeypatch
+):
+    Transformer = implementation.Transformer
+    calls = []
+
+    class Layer(nn.Module):
+        def __init__(self, index, *, engram=False):
+            super().__init__()
+            self.engram = (
+                SimpleNamespace(
+                    hash_columns=24,
+                    embed=SimpleNamespace(
+                        forward_empty=lambda columns: calls.append(
+                            ("engram", index, columns)
+                        )
+                    ),
+                )
+                if engram
+                else None
+            )
+            self.ffn = SimpleNamespace(
+                forward_empty=lambda: calls.append(("ffn", index))
+            )
+
+            def empty_ffn(hidden, ids):
+                assert hidden.shape == (0, 8)
+                assert hidden.dtype == torch.bfloat16
+                assert ids.shape == (0,) and ids.dtype == torch.int64
+                calls.append(("ffn", index))
+
+            self.prefill_ffn = empty_ffn
+
+    model = Transformer.__new__(Transformer)
+    nn.Module.__init__(model)
+    monkeypatch.setattr(
+        model,
+        "layers",
+        nn.ModuleList([Layer(0), Layer(1, engram=True), Layer(2, engram=True)]),
+        raising=False,
+    )
+    monkeypatch.setattr(model, "mtp", nn.ModuleList([Layer(3)]), raising=False)
+    monkeypatch.setattr(model, "args", SimpleNamespace(dim=8), raising=False)
+    monkeypatch.setattr(
+        model, "embed", nn.Embedding(4, 8, dtype=torch.bfloat16), raising=False
+    )
+    Transformer.forward_experts_empty(model, prefill=prefill)
+    assert calls == [
+        ("ffn", 0),
+        ("engram", 1, 24),
+        ("ffn", 1),
+        ("engram", 2, 24),
+        ("ffn", 2),
+    ]
+    calls.clear()
+    Transformer.forward_experts_empty(model, stage="draft")
+    assert calls == [("ffn", 3)]

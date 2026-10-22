@@ -96,6 +96,79 @@ class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
             ),
         )
 
+    def _configure_prefill_attention_graphs(self):
+        from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
+
+        regions = []
+        for layer in self._model.layers:
+            attention = layer.attn
+            width = (
+                attention.n_local_heads // attention.n_local_groups * attention.head_dim
+            )
+
+            def project(hidden, attention=attention):
+                return tuple(
+                    value.squeeze(0) for value in attention._project(hidden[None])
+                )
+
+            def finish(values, scales, attention=attention):
+                return attention.wo_b(attention.wo_a(values, scales).flatten(1))
+
+            regions.extend(
+                (
+                    CudaGraphTensorRegion(
+                        f"layer.{layer.layer_id}.project",
+                        project,
+                        (TensorSpec((attention.dim,)),),
+                        (
+                            TensorSpec((attention.q_lora_rank,)),
+                            TensorSpec((attention.head_dim,)),
+                        ),
+                    ),
+                    CudaGraphTensorRegion(
+                        f"layer.{layer.layer_id}.query",
+                        attention.wq_b,
+                        (TensorSpec((attention.q_lora_rank,)),),
+                        TensorSpec((attention.n_local_heads * attention.head_dim,)),
+                    ),
+                    CudaGraphTensorRegion(
+                        f"layer.{layer.layer_id}.finish",
+                        finish,
+                        (
+                            TensorSpec(
+                                (attention.n_local_groups, width), torch.float8_e4m3fn
+                            ),
+                            TensorSpec(
+                                (attention.n_local_groups, width // 128), torch.int32
+                            ),
+                        ),
+                        TensorSpec((attention.dim,)),
+                    ),
+                )
+            )
+        callbacks = self._configure_prefill_tensor_graphs(
+            tuple(regions),
+            max_tokens=self.prefill_chunk_size,
+            pad_up_to=0,
+            capture_context=self._prefill_compute_context,
+        )
+        for index, layer in enumerate(self._model.layers):
+            project, query, finish = callbacks[3 * index : 3 * index + 3]
+            layer.attn.prefill_project = lambda hidden, invoke=project: tuple(
+                value[None] for value in invoke(hidden.squeeze(0))
+            )
+            layer.attn.prefill_query = lambda qr, invoke=query: invoke(qr.squeeze(0))[
+                None
+            ]
+            layer.attn.prefill_finish = lambda output, positions, invoke=finish: invoke(
+                *output
+            )[None]
+
+    def _empty_prefill_regions(self):
+        if not self._prefill_graph_active:
+            raise RuntimeError("empty prefill regions require an aligned graph bucket")
+        self._model.forward_experts_empty(prefill=True)
+
     def _validate_plan(self, plan):
         if 129264 in plan.token_ids:
             raise ValueError("DeepSeek-V4.1 image inputs require the vision runner")

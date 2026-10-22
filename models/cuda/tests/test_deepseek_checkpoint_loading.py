@@ -31,9 +31,13 @@ def checkpoint(tmp_path, *, columns=4):
 
 
 def model():
+    class Embedding(nn.Module):
+        start: int = 0
+        stop: int = 9
+
     result = nn.Module()
     layer = nn.Module()
-    engram, embedding = nn.Module(), nn.Module()
+    engram, embedding = nn.Module(), Embedding()
     embedding.register_buffer("weight", torch.full((9, 4), -1, dtype=torch.bfloat16))
     engram.add_module("embed", embedding)
     layer.add_module("engram", engram)
@@ -81,3 +85,48 @@ def test_loader_rejects_shape_mismatch_before_copy(loader, tmp_path, monkeypatch
     with pytest.raises(ValueError, match="checkpoint shape.*does not match model"):
         loader(tmp_path, target, rank=0, tensor_parallel_size=1, device="cpu")
     assert target.layers[0].engram.embed.weight.eq(-1).all()
+
+
+def test_v41_loader_uses_embedding_ownership_independent_of_attention_rank(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from resin_models_cuda.deepseek_v41.engram import ParallelEngramEmbedding
+
+    embedding = ParallelEngramEmbedding(
+        13, 32, SimpleNamespace(group=SimpleNamespace(size=4, local_rank=3))
+    )
+    target, layer, engram = nn.Module(), nn.Module(), nn.Module()
+    engram.add_module("embed", embedding)
+    layer.add_module("engram", engram)
+    target.layers = nn.ModuleList([layer])
+    values = {
+        "layers.0.engram.embed.weight": torch.arange(13 * 32)
+        .reshape(13, 32)
+        .remainder(16)
+        .to(torch.float8_e4m3fn),
+        "layers.0.engram.embed.scale": torch.full(
+            (13, 1), 2, dtype=torch.float8_e8m0fnu
+        ),
+    }
+    save_file(values, tmp_path / "model.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: "model.safetensors" for name in values}})
+    )
+    forbid_source_device_copy(monkeypatch)
+    report = load_weights(
+        tmp_path, target, rank=0, tensor_parallel_size=1, device="cpu"
+    )
+    assert (embedding.start, embedding.stop, embedding.weight.shape) == (
+        12,
+        16,
+        (4, 32),
+    )
+    torch.testing.assert_close(
+        embedding.weight[:1].float(), values[next(iter(values))][12:].float()
+    )
+    assert embedding.weight[1:].float().eq(0).all()
+    assert embedding.scale[:1].float().eq(2).all()
+    assert embedding.scale[1:].float().eq(1).all()
+    assert report == {"tensors": 2, "bytes": 132}

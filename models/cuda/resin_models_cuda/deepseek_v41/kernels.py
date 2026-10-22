@@ -24,6 +24,7 @@ if sys.platform == "linux":
     BF16 = "bfloat16"
     FP32 = "float32"
     INT32 = "int32"
+    UINT8 = "uint8"
 
     def fast_log2_ceil(x):
         """Compute ceil(log2(x)) via IEEE 754 bit manipulation. Avoids slow log/ceil intrinsics."""
@@ -449,8 +450,74 @@ if sys.platform == "linux":
             comb.view(-1, hc_mult, hc_mult),
         )
         return pre, post, comb
+
+    @tilelang.jit(pass_configs=pass_configs)
+    def unpack_kv_kernel(page_tokens, row_bytes, page_stride):
+        pages, rows = T.symbolic("pages"), T.symbolic("rows")
+        is_fp4 = row_bytes == 288
+
+        @T.prim_func
+        def run(
+            cache: T.StridedTensor[
+                (pages, page_tokens, 1, row_bytes),
+                (page_stride, row_bytes, row_bytes, 1),
+                UINT8,
+            ],
+            indices: T.Tensor[(rows,), INT32],
+            output: T.Tensor[(rows, 512), BF16],
+        ):
+            with T.Kernel(rows, threads=128) as row:
+                index = indices[row]
+                for column in T.Parallel(512):
+                    value = T.alloc_var(FP32, 0.0)
+                    if index >= 0:
+                        page, offset = index // page_tokens, index % page_tokens
+                        if is_fp4:
+                            byte = cache[page, offset, 0, column // 2]
+                            code = (byte >> ((column % 2) * 4)) & 15
+                            magnitude = code & 7
+                            value = T.if_then_else(
+                                magnitude < 4,
+                                T.cast(magnitude, FP32) * 0.5,
+                                T.if_then_else(
+                                    magnitude < 6,
+                                    T.cast(magnitude, FP32) - 2,
+                                    (T.cast(magnitude, FP32) - 4) * 2,
+                                ),
+                            )
+                            value *= T.if_then_else(code >= 8, -1, 1)
+                            scale = T.cast(
+                                T.reinterpret(
+                                    FP8, cache[page, offset, 0, 256 + column // 16]
+                                ),
+                                FP32,
+                            )
+                        else:
+                            value = T.cast(
+                                T.reinterpret(FP8, cache[page, offset, 0, column]), FP32
+                            )
+                            scale = T.reinterpret(
+                                FP32,
+                                T.cast(
+                                    cache[page, offset, 0, 512 + column // 32], "uint32"
+                                )
+                                << 23,
+                            )
+                        value *= scale
+                    output[row, column] = T.cast(value, BF16)
+
+        return run
+
+    def unpack_kv(cache, indices):
+        output = cache.new_empty(indices.numel(), 512, dtype=torch.bfloat16)
+        unpack_kv_kernel(cache.shape[1], cache.shape[-1], cache.stride(0))(
+            cache, indices, output
+        )
+        return output
+
 else:
     act_quant: Any = None
     fp4_act_quant: Any = None
     fp8_gemm: Any = None
     hc_split_sinkhorn: Any = None
+    unpack_kv: Any = None
