@@ -79,8 +79,9 @@ def build_modal_image(
         )
         .run_commands(
             # FlashMLA's post-build spill checker probes PCI devices even on
-            # CPU builders. Modal hides PCI sysfs there. Give only this build
-            # an empty inventory; its real cuobjdump spill check still runs.
+            # CPU builders. Modal hides PCI sysfs even in GPU-backed builds.
+            # Give only this build an empty inventory; the real cuobjdump
+            # spill check still runs.
             "mkdir -p /tmp/resin-build-bin",
             "printf '%s\\n' '#!/bin/sh' "
             "'exec /usr/bin/lspci -F /dev/null \"$@\"' "

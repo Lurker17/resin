@@ -254,3 +254,60 @@ The reusable measurement API is `resin.bench.run_sweep`; the Modal launcher is
 `deploy/modal_bench.py`. The harness observes the real runner and scheduler;
 it does not substitute a synthetic latency model. Plot tests use explicitly
 synthetic fixtures only.
+
+## Recorded decode sweeps
+
+The 2026-10-22 GPT-OSS-120B comparison uses actual H100 80GB HBM3 GPUs,
+checkpoint revision `b5c939de8f754692c1647ca79fbf85e8c1e70f8a`, and clean runtime
+commit `b2f7c3c`. All five meshes use independent 8,192-token prompts, balanced
+experts, no drafts, full decode graphs, a 32-token prefill chunk, and 0.95 memory
+utilization. Each point retains its complete 20-warmup/100-measurement window;
+measured contexts advance from 8,212 to 8,312 tokens. All 25 points retain the
+full requested cohort and report zero measured decode fallbacks.
+
+TP meshes use attention TP equal to world size, attention DP1, and EP1. EP meshes
+use attention DP and EP equal to world size, with attention TP1. CP is 1 throughout.
+TP1 sweeps batches 1/2/4/8/14; the other meshes sweep 1/4/16/32/64. Point labels
+count requests per attention-DP replica, so EP4 batch 64 means 256 global requests.
+
+| Mesh | Batch at best measured throughput | Output tokens/s/GPU | Per-user tokens/s |
+| --- | ---: | ---: | ---: |
+| TP1 | 14 | 574.750 | 41.054 |
+| TP2 | 64 | 488.915 | 15.279 |
+| TP4 | 64 | 286.481 | 17.905 |
+| EP2 | 64 | 988.479 | 15.445 |
+| EP4 | 64 | 1,013.632 | 15.838 |
+
+The largest per-point timing CV is 4.05%; the largest half-window drift is
+4.93%. These are complete fixed-window means. Raw JSONL files and PNG/SVG charts
+are saved locally under `artifacts/benchmarks/2026-10-22-gpt-oss-120b-h100-*`;
+the combined chart is in the `comparison` directory and the summary is
+`2026-10-22-gpt-oss-120b-h100-summary.json`.
+
+The separate V4.1 EP8/ADP8 sweep uses eight B300s at runtime commit `41e7814`,
+131,072-token contexts with a physically shared 126,976-token prefix and a
+4,096-token private suffix, and fixed three-of-four draft acceptance. Its
+five-warmup/20-measurement windows reach 1,430.895 output tokens/s/GPU at batch
+256 per replica, or 5.589 tokens/s/user. Its source and protocol are retained
+separately in `artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-128k` and the
+[family qualification record](../models/cuda/resin_models_cuda/deepseek_v41/README.md).
+
+## Shared sampler checks
+
+On a CUDA environment with deployment dependencies, run:
+
+```bash
+uv run pytest tests/test_sampling_cuda.py -q
+```
+
+These checks cover request-local random streams across batch permutations and
+padding, high seed and offset bits, conditional top-k/top-p distributions, and
+mutable graph inputs. The graph catalogue captures batches 1 through 128 in a
+shared pool, and the vocabulary smoke uses 201,088 classes. Environments without
+CUDA skip these tests; the CPU sampler contract tests remain in the normal suite.
+
+Filtering uses FlashInfer with deterministic nucleus normalization. A shared
+categorical kernel owns the random draw: the full request seed is its Philox key,
+while sampling offset and vocabulary index occupy separate counter words. This
+keeps the stream independent of physical batch position, including when a graph
+replays with new request state.
