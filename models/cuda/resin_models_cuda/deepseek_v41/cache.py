@@ -74,14 +74,13 @@ class CacheGeometry:
             max(1, len(state_sources)) * PAGE_TOKENS * 4,
             1,  # 128 int64 compressed token IDs fit one 512D BF16 row.
         )
-        largest = max(raw_rows)
-        packings = tuple(1 << max(0, (largest // x).bit_length() - 1) for x in raw_rows)
-        # Every child starts at a whole 128D index page and a pair of BF16
-        # rows, permitting FP32 and int64 aliases without misaligned storage.
-        alignment = math.lcm(128, *packings)
-        parent_rows = (
-            math.ceil(max(x * p for x, p in zip(raw_rows, packings)) / alignment)
-            * alignment
+        parent_rows = math.ceil(max(raw_rows) / PAGE_TOKENS) * PAGE_TOKENS
+        # Pack divisors with even child-row strides for FP32/int64 aliases;
+        # tiny token history must not inflate every physical parent.
+        max_packing = (parent_rows & -parent_rows) // 2
+        packings = tuple(
+            min(max_packing, 1 << ((parent_rows // rows).bit_length() - 1))
+            for rows in raw_rows
         )
         return cls(
             count,

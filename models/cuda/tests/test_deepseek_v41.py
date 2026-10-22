@@ -192,6 +192,79 @@ def test_window_guard_bands_preserve_draft_and_ngram_predecessors():
     assert geometry.compressed_offsets[3] == geometry.compressed_offsets[4]
 
 
+def test_pinned_cache_packing_does_not_inflate_parent_or_b256_budget():
+    args = SimpleNamespace(**json.loads((FIXTURES / "inference.json").read_text()))
+    geometry = CacheGeometry.build(args, prefill_chunk_size=128, max_batch_size=256)
+    assert geometry.parent_rows == 5504
+    assert geometry.packings == (1, 8, 2, 64)
+    assert geometry.bytes_per_parent == 5_636_096
+    assert geometry.graph_scratch_parents == 420
+    layout = geometry.layout(4096)
+    # The first speculative decode crosses the 4096-token compressed-page edge.
+    resident = layout.estimated_parent_count([4101] * 256)
+    assert resident == 2092
+    assert (
+        resident + 1 + geometry.graph_scratch_parents
+    ) * geometry.bytes_per_parent == 14_163_509_248
+
+
+@pytest.mark.parametrize(
+    "group", range(4), ids=["window", "compressed_and_index", "compressor", "tokens"]
+)
+def test_pinned_packed_children_hold_every_physical_view_without_overlap(group):
+    args = SimpleNamespace(**json.loads((FIXTURES / "inference.json").read_text()))
+    geometry = CacheGeometry.build(args, prefill_chunk_size=128)
+    arena = CacheArena("cpu", geometry.layout(3), geometry, dtype=torch.bfloat16)
+    packing = geometry.packings[group]
+    table = DevicePageGroup(
+        torch.ones(packing, 1, dtype=torch.int32),
+        torch.arange(packing, dtype=torch.int32)[:, None],
+        torch.zeros(packing, dtype=torch.int32),
+    )
+    cache = arena._make_graph_cache((table,) * 4)
+    positions = torch.arange(128)[None].expand(packing, -1)
+    spans = []
+
+    def record(indices, width):
+        starts = indices.flatten().unique().long() * width
+        spans.append(torch.stack((starts, starts + width), -1))
+
+    if group == 0:
+        for layer in range(geometry.attention_layers):
+            record(cache.window_rows(layer, positions), 1024)
+        payload_rows = 43 * 128
+    elif group == 1:
+        for layer in geometry.kv_sources:
+            record(
+                cache.compressed_rows(layer, geometry.ratios[layer], positions), 1024
+            )
+            record(cache.index_rows(layer, positions), 256)
+        payload_rows = 400
+    elif group == 2:
+        for layer in geometry.compressor_sources:
+            for rows in cache.compressor_rows(layer, positions):
+                record(rows, 2048)
+        payload_rows = 1536
+    else:
+        record(cache.token_rows(positions), 8)
+        payload_rows = 1
+    ranges = torch.cat(spans)
+    ranges = ranges[ranges[:, 0].argsort()]
+    assert (ranges[1:, 0] >= ranges[:-1, 1]).all()
+    parent_bytes = geometry.bytes_per_parent
+    offsets = ranges - parent_bytes  # All children use physical parent 1.
+    stride = parent_bytes // packing
+    assert stride % 2048 == 0  # Even BF16 rows keep FP32 and int64 aliases aligned.
+    assert offsets.min() >= 0 and offsets.max() <= parent_bytes
+    slots = offsets[:, 0] // stride
+    assert (offsets[:, 1] <= (slots + 1) * stride).all()
+    assert torch.equal(slots.unique(), torch.arange(packing))
+    payloads = torch.zeros(packing, dtype=torch.int64).index_add_(
+        0, slots, ranges[:, 1] - ranges[:, 0]
+    )
+    assert payloads.eq(payload_rows * 1024).all()
+
+
 def test_batched_graph_capture_reserves_disjoint_writable_scratch_children():
     geometry = CacheGeometry.build(_args(), prefill_chunk_size=32, max_batch_size=4)
     arena = CacheArena("cpu", geometry.layout(8), geometry, dtype=torch.bfloat16)
