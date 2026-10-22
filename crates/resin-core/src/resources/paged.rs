@@ -66,8 +66,7 @@ struct WriterId(u64);
 impl PageHandle {
     /// One-based physical parent id.  Parent zero is reserved for the device
     /// null page and is never allocated.
-    #[cfg(test)]
-    pub const fn parent(self) -> u32 {
+    pub(crate) const fn parent(self) -> u32 {
         self.parent
     }
 

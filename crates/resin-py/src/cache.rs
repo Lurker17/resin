@@ -328,12 +328,17 @@ impl CacheLayout {
         })
     }
 
-    /// Physical slabs needed for independent contexts in an empty pool.
+    /// Physical slabs needed for contexts in an empty pool.
     /// Applies retention and packing across requests without allocating pages;
-    /// shared prefixes are excluded and the result may exceed parent_capacity.
-    fn estimated_parent_count(&self, context_lengths: Vec<u32>) -> PyResult<u64> {
+    /// an aligned shared prefix may be declared, and demand may exceed capacity.
+    #[pyo3(signature = (context_lengths, *, shared_prefix_tokens=0))]
+    fn estimated_parent_count(
+        &self,
+        context_lengths: Vec<u32>,
+        shared_prefix_tokens: u32,
+    ) -> PyResult<u64> {
         self.inner
-            .estimated_parent_count(&context_lengths)
+            .estimated_parent_count_with_shared_prefix(&context_lengths, shared_prefix_tokens)
             .map_err(layout_error)
     }
 

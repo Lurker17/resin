@@ -137,6 +137,13 @@ class TestFlatCacheApi:
         assert layout.estimated_parent_count([0, 1, 4, 5, 17]) == 10
         assert layout.estimated_parent_count((0, 1, 4, 5, 17)) == 10
         assert (
+            layout.estimated_parent_count([24, 24, 24], shared_prefix_tokens=16) == 10
+        )
+        with pytest.raises(ValueError, match="align"):
+            layout.estimated_parent_count([24, 24], shared_prefix_tokens=15)
+        with pytest.raises(ValueError, match="exceeds"):
+            layout.estimated_parent_count([12, 24], shared_prefix_tokens=16)
+        assert (
             layout.parent_capacity == 1
         )  # Demand is reported even when it cannot fit.
         for invalid in (-1, 2**32):

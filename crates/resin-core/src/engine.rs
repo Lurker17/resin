@@ -1401,27 +1401,28 @@ impl<P: Clone> EngineCore<P> {
             return Ok(selected.len());
         }
 
-        let mut contexts = self
+        let mut estimate = resources.admission_estimate();
+        let running = self
             .scheduler
             .iter()
             .filter(|request| request.is_running())
-            .map(|request| self.estimated_context(request))
             .collect::<Vec<_>>();
-        let running_count = contexts.len();
+        for request in &running {
+            estimate.include(request.cache.as_ref(), self.estimated_context(request))?;
+        }
+        let running_count = running.len();
         let selected_running = selected
             .iter()
             .take_while(|request| request.is_running())
             .count();
         let mut admitted = selected_running;
         for request in &selected[selected_running..] {
-            contexts.push(self.estimated_context(request));
-            let parents = resources
-                .estimated_parent_count(&contexts)
+            let parents = estimate
+                .include(request.cache.as_ref(), self.estimated_context(request))
                 .map_err(Error::from)?;
             if parents > u64::from(resources.parent_capacity())
                 && (running_count != 0 || admitted != 0)
             {
-                contexts.pop();
                 break;
             }
             admitted += 1;

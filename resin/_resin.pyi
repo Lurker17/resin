@@ -336,11 +336,13 @@ class CacheLayout:
         cls, /, parent_capacity: int, groups: Sequence[CacheGroupLayout]
     ) -> CacheLayout: ...
     def __repr__(self, /) -> str: ...
-    def estimated_parent_count(self, /, context_lengths: Sequence[int]) -> int:
+    def estimated_parent_count(
+        self, /, context_lengths: Sequence[int], *, shared_prefix_tokens: int = 0
+    ) -> int:
         """
-        Physical slabs needed for independent contexts in an empty pool.
+        Physical slabs needed for contexts in an empty pool.
         Applies retention and packing across requests without allocating pages;
-        shared prefixes are excluded and the result may exceed parent_capacity.
+        an aligned shared prefix may be declared, and demand may exceed capacity.
         """
     @property
     def group_count(self, /) -> int:

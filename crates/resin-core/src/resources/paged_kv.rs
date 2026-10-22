@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::num::NonZeroU32;
 
@@ -5,7 +6,7 @@ use crate::{RequestId, SequenceStep};
 
 use super::kv::{KvGroupLayout, KvGroupPlan, KvLayout, KvPlanError, KvRetention};
 use super::paged::{
-    CachePool, CachePoolError, GroupDemand, GroupId, PageAccessClaim, RequestPages,
+    CachePool, CachePoolError, GroupDemand, GroupId, PageAccessClaim, PageHandle, RequestPages,
     RetireRequestFailure, SequenceId, WriterAccessLease,
 };
 use super::prefix::PrefixCache;
@@ -237,6 +238,17 @@ impl PagedKvResources {
             .map_err(|_| CachePoolError::DemandOverflow)
     }
 
+    /// Accumulate admission demand, crediting only pages physically shared by
+    /// the selected requests. Merely equal token prefixes receive no credit.
+    pub(crate) fn admission_estimate(&self) -> AdmissionEstimate<'_> {
+        AdmissionEstimate {
+            layout: &self.layout,
+            blocks: vec![0; self.layout.groups().len()],
+            occupied_parents: vec![HashSet::new(); self.layout.groups().len()],
+            shared: HashSet::new(),
+        }
+    }
+
     pub fn retire(&mut self, state: RequestPages) -> Result<(), RetireRequestFailure> {
         self.pool.retire_request(state)
     }
@@ -415,6 +427,51 @@ impl PagedKvResources {
     }
 }
 
+pub(crate) struct AdmissionEstimate<'a> {
+    layout: &'a KvLayout,
+    blocks: Vec<u64>,
+    occupied_parents: Vec<HashSet<u32>>,
+    shared: HashSet<PageHandle>,
+}
+
+impl AdmissionEstimate<'_> {
+    pub(crate) fn include(
+        &mut self,
+        pages: Option<&RequestPages>,
+        context: u32,
+    ) -> Result<u64, CachePoolError> {
+        let mut parents = 0u64;
+        for (index, group) in self.layout.groups().iter().copied().enumerate() {
+            let count = group.active_blocks(context).1;
+            let mut added = u64::from(count);
+            if let Some(pages) = pages {
+                for page in pages.groups()[index].pages().iter().take(count as usize) {
+                    self.occupied_parents[index].insert(page.handle().parent());
+                    if group.retention() == KvRetention::FullContext
+                        && !group.is_recurrent()
+                        && !page.is_writable()
+                        && !self.shared.insert(page.handle())
+                    {
+                        added -= 1;
+                    }
+                }
+            }
+            self.blocks[index] = self.blocks[index]
+                .checked_add(added)
+                .ok_or(CachePoolError::DemandOverflow)?;
+            // Live pages cannot relocate to achieve the ideal packing. Their
+            // parent identities provide a floor even for fragmented prefixes.
+            let group_parents = self.blocks[index]
+                .div_ceil(u64::from(group.blocks_per_slab().get()))
+                .max(self.occupied_parents[index].len() as u64);
+            parents = parents
+                .checked_add(group_parents)
+                .ok_or(CachePoolError::DemandOverflow)?;
+        }
+        Ok(parents)
+    }
+}
+
 fn prefix_alignment(layout: &KvLayout) -> Result<u32, CachePoolError> {
     fn gcd(mut left: u32, mut right: u32) -> u32 {
         while right != 0 {
@@ -541,6 +598,74 @@ mod tests {
             resources.retire(state).unwrap();
         }
         assert_eq!(resources.pool().free_parent_count(), 20);
+    }
+
+    #[test]
+    fn admission_preserves_fragmented_shared_prefix_parents() {
+        let layout = KvLayout::new(
+            8,
+            vec![
+                KvGroupLayout::new(1, 8, KvRetention::FullContext).unwrap(),
+                KvGroupLayout::new(8, 1, KvRetention::FullContext).unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::new(layout).unwrap();
+        let id = |value| RequestId::new(NonZeroU64::new(value).unwrap());
+        let demands = |blocks| {
+            [
+                GroupDemand::new(GroupId::new(0), blocks),
+                GroupDemand::new(GroupId::new(1), 0),
+            ]
+        };
+        let mut seed = resources.attach(id(1), 0).unwrap();
+        let mut fillers = Vec::new();
+        for blocks in 1..=3 {
+            resources
+                .pool
+                .grow_request(&mut seed, &demands(blocks))
+                .unwrap();
+            // Fill each parent before growing the prefix into another parent.
+            let mut filler = resources.attach(id(10 + blocks as u64), 0).unwrap();
+            resources
+                .pool
+                .grow_request(&mut filler, &demands(7))
+                .unwrap();
+            fillers.push(filler);
+        }
+        let prefix = resources
+            .pool
+            .share_request_prefix(&mut seed, &demands(3))
+            .unwrap();
+        for filler in fillers {
+            resources.retire(filler).unwrap();
+        }
+        resources.retire(seed).unwrap();
+
+        let mut requests = Vec::new();
+        for index in 0..2 {
+            let mut request = resources.attach(id(20 + index), 0).unwrap();
+            resources
+                .pool
+                .attach_shared_prefix(&mut request, &prefix)
+                .unwrap();
+            resources.ensure_context(&mut request, 3, 4).unwrap();
+            requests.push(request);
+        }
+        let mut estimate = resources.admission_estimate();
+        assert_eq!(estimate.include(Some(&requests[0]), 4).unwrap(), 4);
+        assert_eq!(estimate.include(Some(&requests[1]), 4).unwrap(), 5);
+        // Three immutable child handles count once, but pin three parents.
+        // Each request also owns one private child and a second-group parent.
+        assert_eq!(estimate.blocks, [5, 2]);
+        assert_eq!(resources.estimated_parent_count(&[4, 4]).unwrap(), 3);
+        assert_eq!(8 - resources.pool().free_parent_count(), 5);
+        drop(estimate);
+        for request in requests {
+            resources.retire(request).unwrap();
+        }
+        resources.pool.retire_cached_prefix(prefix).unwrap();
+        assert_eq!(resources.pool().free_parent_count(), 8);
     }
 
     #[test]

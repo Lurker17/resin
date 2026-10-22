@@ -258,16 +258,46 @@ impl KvLayout {
     }
 
     /// Physical-parent demand for independent request contexts in an empty pool.
-    /// Applies each group's retention, then packs blocks across requests. The
-    /// estimate excludes shared prefixes and may exceed this layout's capacity.
     pub fn estimated_parent_count(&self, context_lengths: &[u32]) -> Result<u64, KvLayoutError> {
+        self.estimated_parent_count_with_shared_prefix(context_lengths, 0)
+    }
+
+    /// Estimate contexts sharing one block-complete prefix. Full history pages
+    /// count once; window and recurrent pages retain private write capacity.
+    /// This describes a workload, not a promise that a prefix cache hit exists.
+    pub fn estimated_parent_count_with_shared_prefix(
+        &self,
+        context_lengths: &[u32],
+        shared_prefix_tokens: u32,
+    ) -> Result<u64, KvLayoutError> {
+        if context_lengths
+            .iter()
+            .any(|context| *context < shared_prefix_tokens)
+        {
+            return Err(KvLayoutError::new(
+                "shared prefix exceeds a request context",
+            ));
+        }
         let overflow = || KvLayoutError::new("estimated cache demand overflows u64");
         self.groups.iter().try_fold(0u64, |parents, group| {
-            let blocks = context_lengths.iter().try_fold(0u64, |total, context| {
+            let mut blocks = context_lengths.iter().try_fold(0u64, |total, context| {
                 total
                     .checked_add(u64::from(group.active_blocks(*context).1))
                     .ok_or_else(overflow)
             })?;
+            if group.retention == KvRetention::FullContext && !group.is_recurrent() {
+                if !shared_prefix_tokens.is_multiple_of(group.block_tokens.get()) {
+                    return Err(KvLayoutError::new(
+                        "shared prefix must align to full-history blocks",
+                    ));
+                }
+                let shared_blocks = u64::from(shared_prefix_tokens / group.block_tokens.get());
+                let extra_copies = u64::try_from(context_lengths.len().saturating_sub(1))
+                    .map_err(|_| overflow())?;
+                blocks -= shared_blocks
+                    .checked_mul(extra_copies)
+                    .ok_or_else(overflow)?;
+            }
             parents
                 .checked_add(blocks.div_ceil(u64::from(group.blocks_per_slab.get())))
                 .ok_or_else(overflow)
@@ -474,6 +504,47 @@ mod tests {
         assert_eq!(
             large.estimated_parent_count(&[u32::MAX, u32::MAX]).unwrap(),
             2 * u64::from(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn shared_prefix_estimate_preserves_private_window_and_state_capacity() {
+        let window = KvGroupLayout::new(
+            4,
+            2,
+            KvRetention::SlidingWindow {
+                tokens: NonZeroU32::new(5).unwrap(),
+            },
+        )
+        .unwrap();
+        let state =
+            KvGroupLayout::new_with_family(4, 2, KvRetention::FullContext, KvGroupFamily::State)
+                .unwrap();
+        let layout = KvLayout::new(1, vec![full(4, 2), window, state]).unwrap();
+        // Shared 16-token history plus two private blocks per request: five
+        // parents. Window and recurrent state each reserve three more.
+        assert_eq!(
+            layout
+                .estimated_parent_count_with_shared_prefix(&[24; 3], 16)
+                .unwrap(),
+            11
+        );
+        assert_eq!(layout.estimated_parent_count(&[24; 3]).unwrap(), 15);
+        assert!(
+            layout
+                .estimated_parent_count_with_shared_prefix(&[24; 3], 15)
+                .is_err()
+        );
+        assert!(
+            layout
+                .estimated_parent_count_with_shared_prefix(&[24; 3], 28)
+                .is_err()
+        );
+        assert_eq!(
+            layout
+                .estimated_parent_count_with_shared_prefix(&[], 16)
+                .unwrap(),
+            0
         );
     }
 

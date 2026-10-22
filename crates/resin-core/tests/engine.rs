@@ -62,6 +62,82 @@ fn input(tokens: Vec<u32>, limit: usize) -> Submission<&'static str> {
 }
 
 #[test]
+fn admission_credits_restored_physical_prefix_pages_only() {
+    for cache_hit in [true, false] {
+        let mut engine = EngineCore::new(
+            RunnerConfig {
+                cache_layout: Some(
+                    KvLayout::new(
+                        8,
+                        vec![KvGroupLayout::new(2, 1, KvRetention::FullContext).unwrap()],
+                    )
+                    .unwrap(),
+                ),
+                continuation_prefill: true,
+                ..Default::default()
+            },
+            4,
+            32,
+            SchedulerConfig {
+                max_batch_tokens: NonZeroU32::new(32),
+                prefill_chunk_size: NonZeroU32::new(32).unwrap(),
+                ..Default::default()
+            },
+            None,
+            true,
+        )
+        .unwrap();
+        let mut model = Model::default();
+        let prefix: Vec<u32> = (0..8).collect();
+        let seed = engine.submit(input(prefix.clone(), 1)).unwrap();
+        while engine.has_work() {
+            engine.step(&mut model).unwrap();
+        }
+        seed.take_result().unwrap();
+        let requests: Vec<_> = (0..4)
+            .map(|index| {
+                let mut prompt = prefix.clone();
+                if !cache_hit {
+                    prompt[0] = 90;
+                }
+                prompt.extend([100 + index, 200]);
+                engine.submit(input(prompt, 1)).unwrap()
+            })
+            .collect();
+        let events = engine.step(&mut model).unwrap();
+        let plan = model.plans.last().unwrap();
+        assert_eq!(plan.sequence_ids.len(), if cache_hit { 4 } else { 1 });
+        if cache_hit {
+            assert_eq!(events.len(), 4);
+            assert_eq!(plan.context_lengths, [8; 4]);
+            assert_eq!(plan.token_ids.len(), 8);
+            let tables: Vec<_> = plan.cache_groups[0]
+                .block_slab_ids
+                .as_chunks::<5>()
+                .0
+                .iter()
+                .collect();
+            assert_eq!(tables.len(), 4);
+            for table in &tables[1..] {
+                assert_eq!(&table[..4], &tables[0][..4]);
+            }
+            assert_eq!(
+                tables
+                    .iter()
+                    .map(|table| table[4])
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                4
+            );
+            for request in requests {
+                request.take_result().unwrap();
+            }
+        }
+        engine.close(&mut model).unwrap();
+    }
+}
+
+#[test]
 fn a_native_model_uses_the_complete_lifecycle_without_python() {
     let mut engine = engine(0, 2);
     let mut model = Model::default();
