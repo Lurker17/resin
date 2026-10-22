@@ -19,7 +19,12 @@ FIXED_METADATA = (
     "quant",
     "expert_backend",
 )
-FIXED_CASE = ("draft_tokens", "accepted_drafts", "balanced_experts")
+FIXED_CASE = (
+    "draft_tokens",
+    "accepted_drafts",
+    "balanced_experts",
+    "shared_prefix_tokens",
+)
 
 
 def _number(value, name, *, integer=False, minimum=0):
@@ -54,6 +59,18 @@ def _validate(record):
         _number(record[name], name, integer=True, minimum=1)
     for name in ("draft_tokens", "warmup_steps", "input_tokens", "committed_tokens"):
         _number(record[name], name, integer=True)
+    shared = _number(
+        record.setdefault("shared_prefix_tokens", 0),
+        "shared_prefix_tokens",
+        integer=True,
+    )
+    if shared >= record["context_length"]:
+        raise ValueError("shared_prefix_tokens must be less than context_length")
+    if shared and any(
+        record.get(name) != shared
+        for name in ("cached_tokens_min", "cached_tokens_max")
+    ):
+        raise ValueError("shared-prefix records must verify exact cached token counts")
     _number(record["prefill_tokens"], "prefill_tokens")
     _number(record["window_seconds"], "window_seconds", minimum=math.nextafter(0, 1))
     steps = record["step_seconds"]
@@ -210,6 +227,8 @@ def plot(records, phase, output_dir, *, draft_tokens=4, accept_rate=0.75):
         f"{name}: {policy}" for name, policy in metadata["graphs"].items()
     )
     subtitle = f"{metadata['model']} | {mesh} | quant={metadata['quant']} | experts={metadata['expert_backend']} | graphs={graphs} | balanced experts={first['balanced_experts']}"
+    if shared := first.get("shared_prefix_tokens", 0):
+        subtitle += f" | shared prefix={shared:,} tokens"
     figure, axis = plt.subplots(figsize=(9, 6.4))
     try:
         for curve_index, (context, points) in enumerate(sorted(curves.items())):

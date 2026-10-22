@@ -23,6 +23,7 @@ class BenchCase:
     phase: Literal["prefill", "decode"]
     context_length: int
     batch_size: int
+    shared_prefix_tokens: int = 0
 
     def __post_init__(self):
         if self.phase not in {"prefill", "decode"}:
@@ -31,6 +32,13 @@ class BenchCase:
             type(n) is not int or n < 1 for n in (self.context_length, self.batch_size)
         ):
             raise ValueError("context_length and batch_size must be positive integers")
+        if (
+            type(self.shared_prefix_tokens) is not int
+            or not 0 <= self.shared_prefix_tokens < self.context_length
+        ):
+            raise ValueError(
+                "shared_prefix_tokens must be an integer in [0, context_length)"
+            )
 
 
 class BenchmarkRunner:
@@ -270,21 +278,56 @@ def run_sweep(
         samples = []
         warmed = 0
         result = None
+        nonce = 0
+        cached_tokens = []
+        shared = case.shared_prefix_tokens
 
         def admit(max_new_tokens):
-            local.clear_prefix_cache()
+            nonlocal nonce
+            if not shared:
+                local.clear_prefix_cache()
             leases.clear()
             for _ in range(case.batch_size):
+                request_tokens = tokens
+                if shared:
+                    if nonce >= runner.vocab_size:
+                        raise ValueError(
+                            "shared-prefix sweep exhausted distinct private tokens"
+                        )
+                    request_tokens = tokens.copy()
+                    request_tokens[shared] = nonce
+                    nonce += 1
+                lease = engine.submit(
+                    request_tokens,
+                    max_new_tokens,
+                    stop_token_ids=[],
+                    sampling_params=SamplingParams(temperature=0.0),
+                )
+                leases.append(lease)
+                cached_tokens.append(lease.cached_tokens)
+                if lease.cached_tokens != shared:
+                    raise ValueError(
+                        f"shared prefix reuse differs from requested checkpoint: "
+                        f"requested={shared}, cached={lease.cached_tokens}"
+                    )
+
+        try:
+            local.clear_prefix_cache()
+            if shared:
+                if local.prefix_cache_stats is None:
+                    raise ValueError(
+                        "shared-prefix benchmarks require Engine(prefix_cache=True)"
+                    )
                 leases.append(
                     engine.submit(
-                        tokens,
-                        max_new_tokens,
+                        tokens[:shared],
+                        1,
                         stop_token_ids=[],
                         sampling_params=SamplingParams(temperature=0.0),
                     )
                 )
-
-        try:
+                while not leases[0].done:
+                    step()  # Seed the one shared prefix outside warmup/measurement.
             if case.phase == "prefill":
                 for target, measured in ((warmup_steps, False), (measure_steps, True)):
                     count = 0
@@ -338,6 +381,10 @@ def run_sweep(
                     "schema_version": 1,
                     "phase": case.phase,
                     "context_length": case.context_length,
+                    "shared_prefix_tokens": shared,
+                    "private_prompt_tokens": case.context_length - shared,
+                    "cached_tokens_min": min(cached_tokens),
+                    "cached_tokens_max": max(cached_tokens),
                     "batch_size": case.batch_size,
                     "global_batch_size": case.batch_size * attn_dp,
                     "measured_global_batch_size_min": min(

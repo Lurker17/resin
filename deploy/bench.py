@@ -109,12 +109,12 @@ def _cache_preflight(raw, cases, options, groups=None):
             context += (options["warmup_steps"] + options["measure_steps"] + 1) * (
                 options["draft_tokens"] + 1
             ) + options["draft_tokens"]
-        parents = layout.estimated_parent_count([context] * case.batch_size)
+        parents = layout.estimated_parent_count(
+            [context] * case.batch_size, shared_prefix_tokens=case.shared_prefix_tokens
+        )
         requirements.append(
             dict(
-                phase=case.phase,
-                context_length=case.context_length,
-                batch_size=case.batch_size,
+                **asdict(case),
                 peak_context=context,
                 required_parents=parents,
             )
@@ -325,6 +325,7 @@ def _rank(
     engine_options: dict[str, Any] = dict(
         max_running_requests=max(case.batch_size for case in cases),
         context_length=capacity,
+        prefix_cache=any(case.shared_prefix_tokens for case in cases),
         eos_token_id=None,
         scheduler_config=SchedulerConfig(
             max_batch_tokens=prefill_budget,

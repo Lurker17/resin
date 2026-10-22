@@ -31,6 +31,24 @@ uv run modal run deploy/modal_bench.py \
 uv run scripts/plot_bench.py bench/deepseek-v4.jsonl
 ```
 
+To reuse one long prefix within each attention replica, set `--shared-prefix-tokens`.
+`--context-lengths` still specifies the total context; the remainder is private:
+
+```bash
+uv run modal run deploy/modal_bench.py \
+  --model deepseek-v41 --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 \
+  --expert-backend deepgemm --context-lengths 131072 \
+  --shared-prefix-tokens 126976 --batch-sizes 1,4,16,64,256 \
+  --output bench/deepseek-v41-shared.jsonl
+```
+
+The shared prefix is seeded once per case outside timing. Each request receives
+a distinct private suffix, and its reported cached length must exactly match the
+requested prefix. Unsupported cache/checkpoint reuse fails explicitly. Records
+include shared/private token counts and actual cached-length bounds; prefill
+throughput counts newly processed inputs. Independent and shared-prefix points
+must use separate chart files. The default is zero shared tokens.
+
 The default DeepSeek workload uses four draft tokens, forces three accepted
 drafts per verification step, and balances expert routing. These are controlled
 performance measurements, rather than measurements of natural acceptance or

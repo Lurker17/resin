@@ -224,6 +224,7 @@ def main(
     ep: int = 8,
     phases: str = "prefill,decode",
     context_lengths: str = "4096",
+    shared_prefix_tokens: int = 0,
     batch_sizes: str = "1,2,4,8",
     draft_tokens: int = 4,
     accepted_drafts: int = -1,
@@ -264,7 +265,12 @@ def main(
     )
     Parallelism(**topology)
     cases: list[dict[str, Any]] = [
-        dict(phase=phase, context_length=int(context), batch_size=int(batch))
+        dict(
+            phase=phase,
+            context_length=int(context),
+            batch_size=int(batch),
+            shared_prefix_tokens=shared_prefix_tokens,
+        )
         for phase in phases.split(",")
         for context in context_lengths.split(",")
         for batch in batch_sizes.split(",")

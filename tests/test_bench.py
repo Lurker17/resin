@@ -18,6 +18,8 @@ from resin.bench import BenchCase, BenchmarkRunner, distributed_reducer, run_swe
 
 
 class Runner:
+    vocab_size = 1024
+
     def __init__(self, *, chunked=False, drafts=0):
         self.runner_config = RunnerConfig(
             max_batch_tokens=5 if chunked else None,
@@ -510,3 +512,80 @@ def test_decode_reports_when_cache_admission_only_fits_part_of_the_cohort(capsys
     assert diagnostic["cache"]["ready_request_count"] == 4
     assert diagnostic["cache"]["active_request_count"] == 4
     assert not engine.has_work()
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_shared_prefix_is_seeded_once_and_forks_real_pages_for_private_work(phase):
+    raw = Runner()
+    raw.runner_config = RunnerConfig(
+        cache_layout=CacheLayout(
+            4 if phase == "prefill" else 64, [CacheGroupLayout(4)]
+        ),
+        continuation_prefill=True,
+        prefill_chunk_size=4,
+        max_batch_tokens=8,
+    )
+    runner = BenchmarkRunner(raw)
+    engine = Engine(
+        runner, max_running_requests=2, context_length=64, prefix_cache=True
+    )
+    record = run_sweep(
+        engine,
+        [
+            BenchCase(
+                phase=phase, context_length=12, batch_size=2, shared_prefix_tokens=8
+            )
+        ],
+        runner=runner,
+        prompt_tokens=[10],
+        warmup_steps=1,
+        measure_steps=1,
+    )[0]
+    assert (
+        record["shared_prefix_tokens"]
+        == record["cached_tokens_min"]
+        == record["cached_tokens_max"]
+        == 8
+    )
+    assert record["private_prompt_tokens"] == 4
+    if phase == "prefill":
+        assert record["input_tokens"] == record["prefill_tokens"] == 8
+        assert record["measured_context_start_min"] == 8
+        assert record["measured_context_end_max"] == 12
+    else:
+        assert record["measured_context_start_min"] == 13
+        assert record["measured_context_end_max"] == 14
+    # Two seed chunks, followed only by private suffixes on all later prefill rows.
+    prefills = [plan for plan in raw.plans if plan.phase == BatchPhase.PREFILL]
+    assert [plan.context_lengths.tolist() for plan in prefills[:2]] == [[0], [4]]
+    assert all(plan.context_lengths.tolist() == [8, 8] for plan in prefills[2:])
+    group = prefills[2].cache_groups[0]
+    first, second = group.block_slab_ids[:3], group.block_slab_ids[3:]
+    assert first[:2].tolist() == second[:2].tolist()  # Shared physical parents.
+    assert first[2] != second[2]  # Private suffixes own distinct parents.
+    assert not engine.has_work() and engine.cache_occupied_block_count == 0
+
+
+def test_shared_prefix_requires_real_enabled_cache_and_exact_checkpoint_reuse():
+    raw = Runner()
+    raw.runner_config = RunnerConfig(
+        cache_layout=CacheLayout(64, [CacheGroupLayout(4)]), continuation_prefill=True
+    )
+    runner = BenchmarkRunner(raw)
+    case = BenchCase(
+        phase="prefill", context_length=12, batch_size=2, shared_prefix_tokens=7
+    )
+    for enabled, error in ((False, "require Engine"), (True, "requested=7, cached=4")):
+        engine = Engine(
+            runner, max_running_requests=2, context_length=64, prefix_cache=enabled
+        )
+        with pytest.raises(ValueError, match=error):
+            run_sweep(
+                engine,
+                [case],
+                runner=runner,
+                prompt_tokens=[1],
+                warmup_steps=0,
+                measure_steps=1,
+            )
+        assert not engine.has_work()

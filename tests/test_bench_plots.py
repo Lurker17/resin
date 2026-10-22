@@ -240,3 +240,18 @@ def test_cli_renders_two_pngs_and_two_svgs(tmp_path, capsys, contexts):
     for context in contexts:
         assert f"Context {context:,}" in svg
     assert "decode.png" in capsys.readouterr().out
+
+
+def test_shared_prefix_geometry_cannot_mix_with_independent_points(tmp_path):
+    path = tmp_path / "shared.jsonl"
+    independent = record()
+    shared = record(
+        shared_prefix_tokens=2048, cached_tokens_min=2048, cached_tokens_max=2048
+    )
+    path.write_text(json.dumps(independent) + "\n" + json.dumps(shared) + "\n")
+    with pytest.raises(ValueError, match="mixed model"):
+        load_records([path])
+    shared["cached_tokens_min"] = 1024
+    path.write_text(json.dumps(shared) + "\n")
+    with pytest.raises(ValueError, match="exact cached token counts"):
+        load_records([path])

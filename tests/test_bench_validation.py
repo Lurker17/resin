@@ -249,3 +249,28 @@ def test_cache_preflight_propagates_a_peers_capacity_failure():
             dict(warmup_steps=0, measure_steps=1, draft_tokens=0),
             groups,
         )
+
+
+def test_cache_preflight_credits_only_the_configured_shared_history():
+    from resin import CacheGroupLayout, CacheLayout
+    from resin.backend.capacity import plan_cache_capacity
+    from resin.bench import BenchCase
+
+    raw = SimpleNamespace(
+        cache_layout=CacheLayout(4, [CacheGroupLayout(4)]),
+        cache_capacity_plan=plan_cache_capacity(100, 100, 0.5, 10),
+    )
+    options = dict(warmup_steps=0, measure_steps=1, draft_tokens=0)
+    bench._cache_preflight(
+        raw,
+        [
+            BenchCase(
+                phase="prefill", context_length=12, batch_size=2, shared_prefix_tokens=8
+            )
+        ],
+        options,
+    )
+    with pytest.raises(ValueError, match="needs 6 cache parents, capacity=4"):
+        bench._cache_preflight(
+            raw, [BenchCase(phase="prefill", context_length=12, batch_size=2)], options
+        )
