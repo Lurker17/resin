@@ -36,6 +36,7 @@ def build_modal_image(
             "curl",
             "git",
             "ninja-build",
+            "pciutils",
             "software-properties-common",
             "libdw-dev",
             "libelf-dev",
@@ -77,13 +78,33 @@ def build_modal_image(
             copy=True,
         )
         .run_commands(
-            "uv sync "
+            # FlashMLA's post-build spill checker probes PCI devices even on
+            # CPU builders. Modal hides PCI sysfs there. Give only this build
+            # an empty inventory; its real cuobjdump spill check still runs.
+            "mkdir -p /tmp/resin-build-bin",
+            "printf '%s\\n' '#!/bin/sh' "
+            "'exec /usr/bin/lspci -F /dev/null \"$@\"' "
+            "> /tmp/resin-build-bin/lspci",
+            "chmod +x /tmp/resin-build-bin/lspci",
+            "PATH=/tmp/resin-build-bin:$PATH uv sync "
             f"--project {_DEPENDENCY_ROOT} "
             "--frozen --no-install-workspace --no-default-groups "
-            "--group deployment --compile-bytecode"
+            "--group deployment --compile-bytecode",
+            "rm /tmp/resin-build-bin/lspci",
+            "rmdir /tmp/resin-build-bin",
         )
         .env(
             {"PATH": (f"{_DEPENDENCY_ROOT}/.venv/bin:/root/.cargo/bin:{_SYSTEM_PATH}")}
+        )
+        .add_local_file(
+            root / "scripts/check_flashmla_artifact.py",
+            "/tmp/check_flashmla_artifact.py",
+            copy=True,
+        )
+        .run_commands(
+            "python /tmp/check_flashmla_artifact.py "
+            f"> {_DEPENDENCY_ROOT}/flashmla-resources.json",
+            "rm /tmp/check_flashmla_artifact.py",
         )
         # These accelerator-specific supplement wheels live outside PyPI.
         .uv_pip_install(

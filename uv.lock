@@ -28,6 +28,10 @@ overrides = [
 name = "deep-gemm"
 version = "2.8.2"
 
+[[manifest.dependency-metadata]]
+name = "flash-mla"
+version = "1.0.0"
+
 [[package]]
 name = "aiohappyeyeballs"
 version = "2.7.1"
@@ -870,6 +874,11 @@ sdist = { url = "https://files.pythonhosted.org/packages/d2/76/c180949eae5161b9f
 wheels = [
     { url = "https://files.pythonhosted.org/packages/90/d2/2070e3cf2148c5cce99ca4876633c4b7b89ec085323600bd3d47aeacd306/flash_linear_attention-0.5.2-py3-none-any.whl", hash = "sha256:dcf405d81f5426393b59037097aa700d0f4a841465d5028d5aa543f4502f2400", size = 399590, upload-time = "2026-07-27T18:26:17.912Z" },
 ]
+
+[[package]]
+name = "flash-mla"
+version = "1.0.0"
+source = { git = "https://github.com/deepseek-ai/FlashMLA?rev=2e5429fc5653bab6e081f09477126f731882a6a9#2e5429fc5653bab6e081f09477126f731882a6a9" }
 
 [[package]]
 name = "flashinfer-python"
@@ -3125,6 +3134,7 @@ dependencies = [
     { name = "deep-gemm", marker = "sys_platform == 'linux'" },
     { name = "flash-attn-4", marker = "sys_platform == 'linux'" },
     { name = "flash-linear-attention", marker = "sys_platform == 'linux'" },
+    { name = "flash-mla", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux'" },
     { name = "huggingface-hub" },
     { name = "nvidia-cutlass-dsl", marker = "sys_platform == 'linux'" },
@@ -3149,6 +3159,7 @@ requires-dist = [
     { name = "deep-gemm", marker = "sys_platform == 'linux'", git = "https://github.com/deepseek-ai/DeepGEMM?rev=1fc9c66975ee322d628b3288534ca0e9ce12a64d" },
     { name = "flash-attn-4", marker = "sys_platform == 'linux'", specifier = "==4.0.0b26" },
     { name = "flash-linear-attention", marker = "sys_platform == 'linux'", specifier = "==0.5.2" },
+    { name = "flash-mla", marker = "sys_platform == 'linux'", git = "https://github.com/deepseek-ai/FlashMLA?rev=2e5429fc5653bab6e081f09477126f731882a6a9" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux'", specifier = "==0.6.15.post1" },
     { name = "huggingface-hub", specifier = ">=0.35" },
     { name = "nvidia-cutlass-dsl", marker = "sys_platform == 'linux'", specifier = "==4.6.2" },
