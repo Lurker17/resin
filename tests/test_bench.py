@@ -3,7 +3,15 @@ from __future__ import annotations
 import pytest
 import torch
 
-from resin import BatchPhase, CacheGroupLayout, CacheLayout, Engine, RunnerConfig
+from resin import (
+    BatchPhase,
+    CacheGroupLayout,
+    CacheLayout,
+    Engine,
+    Parallelism,
+    RunnerConfig,
+    SchedulerConfig,
+)
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import benchmark_expert_indices
 from resin.bench import BenchCase, BenchmarkRunner, distributed_reducer, run_sweep
@@ -58,11 +66,98 @@ def test_prefill_measures_actual_chunked_inputs_and_keeps_engine_resident():
     assert record["measure_steps"] > 1  # A whole cohort spans several steps.
     assert record["warmup_steps"] == record["measure_steps"]
     assert record["committed_tokens"] == 2
+    assert record["measured_global_batch_size_min"] == 2
+    assert record["measured_global_batch_size_max"] == 2
     assert record["window_seconds"] == sum(record["step_seconds"])
     assert record["metadata"] == {"model": "test"}
     assert not engine.has_work()
     # run_sweep never closes a caller-owned resident engine.
     assert engine.submit([1], 1).cached_tokens == 0
+
+
+@pytest.mark.parametrize("budget,actual_batch", [(4, 1), (16, 4)])
+def test_prefill_cohort_budget_and_gpt_capacity_cover_the_measured_batch(
+    monkeypatch, budget, actual_batch
+):
+    from deploy.bench import _runner
+    from resin_models_cuda.gpt_oss import cuda
+
+    class GptRunner(Runner):
+        prefill_chunk_size = 1
+
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.runner_config = RunnerConfig(
+                max_batch_tokens=self.prefill_chunk_size,
+                prefill_chunk_size=self.prefill_chunk_size,
+                continuation_prefill=True,
+            )
+
+    monkeypatch.setattr(cuda, "GptOssCudaRunner", GptRunner)
+    cases = [BenchCase(phase="prefill", context_length=4, batch_size=4)]
+    raw = _runner(
+        "gpt-oss-20b",
+        "unused",
+        device="cpu",
+        groups=None,
+        cases=cases,
+        options=dict(
+            prefill_chunk_size=4,
+            prefill_graph="breakable",
+            decode_graph="disabled",
+            gpu_memory_utilization=0.9,
+            validate_model=False,
+            draft_tokens=0,
+        ),
+        context_capacity=64,
+    )
+    assert raw.runner_config.max_batch_tokens == 16
+    runner = BenchmarkRunner(raw)
+    engine = Engine(
+        runner,
+        max_running_requests=4,
+        context_length=64,
+        scheduler_config=SchedulerConfig(max_batch_tokens=budget, prefill_chunk_size=4),
+    )
+    record = run_sweep(
+        engine,
+        cases,
+        runner=runner,
+        prompt_tokens=[1],
+        warmup_steps=0,
+        measure_steps=1,
+    )[0]
+    assert record["input_tokens"] == 16
+    assert record["prefill_tokens"] == budget
+    assert record["measure_steps"] == 4 // actual_batch
+    assert record["measured_global_batch_size_min"] == actual_batch
+    assert record["measured_global_batch_size_max"] == actual_batch
+
+
+@pytest.mark.parametrize(
+    "world,batch,error",
+    [
+        (1, 3, "single-GPU GPT-OSS prefill budget 12288.*8192-token limit"),
+        (1, 2, "requires 1 visible GPUs"),
+        (2, 3, "requires 2 visible GPUs"),
+    ],
+)
+def test_gpt_single_gpu_prefill_budget_respects_normal_kernel_capacity(
+    monkeypatch, world, batch, error
+):
+    from deploy.bench import run_benchmark
+
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    with pytest.raises(ValueError, match=error):
+        run_benchmark(
+            "gpt-oss-20b",
+            "unused",
+            [dict(phase="prefill", context_length=128, batch_size=batch)],
+            parallelism=Parallelism(world_size=world),
+            draft_tokens=0,
+            accepted_drafts=0,
+            prefill_chunk_size=4096,
+        )
 
 
 def test_decode_counts_real_steps_and_disables_eos_without_retiring_cohort():

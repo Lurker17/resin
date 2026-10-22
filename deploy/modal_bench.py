@@ -47,6 +47,14 @@ CHECKPOINTS = {
         "deepseek-ai/DeepSeek-V4-Flash-0731",
         "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
     ),
+    "deepseek-v41": (
+        "resin-deepseek-v4-models-v1",
+        1,
+        "/models/deepseek",
+        "flash-1017",
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "1bae0e1088993b9b82de08f59de5be5a34e42170",
+    ),
 }
 MODEL_VOLUMES = {
     mount: modal.Volume.from_name(name, version=version, create_if_missing=True)
@@ -60,18 +68,26 @@ HOPPER_KERNEL_VOLUME = modal.Volume.from_name(
     version=KERNEL_CACHE_VOLUME_VERSION,
     create_if_missing=True,
 )
-image = build_modal_image(
-    ROOT,
-    env={
-        **KERNEL_CACHE_ENV,
-        "CC": "gcc",
-        "CXX": "g++",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        "DG_JIT_CACHE_DIR": "/kernel-cache/.cache/deep_gemm",
-        "TILELANG_CACHE_DIR": "/kernel-cache/.cache/tilelang",
-        "CUDA_TILE_CACHE_DIR": "/kernel-cache/.cache/cutile-python",
-    },
-).add_local_file(ROOT / "deploy/bench.py", "/root/deploy/bench.py", copy=True)
+image = (
+    build_modal_image(
+        ROOT,
+        env={
+            **KERNEL_CACHE_ENV,
+            "CC": "gcc-13",
+            "CXX": "g++-13",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "DG_JIT_CACHE_DIR": "/kernel-cache/.cache/deep_gemm",
+            "TILELANG_CACHE_DIR": "/kernel-cache/.cache/tilelang",
+            "CUDA_TILE_CACHE_DIR": "/kernel-cache/.cache/cutile-python",
+        },
+    )
+    .add_local_file(ROOT / "deploy/bench.py", "/root/deploy/bench.py", copy=True)
+    .add_local_file(
+        ROOT / "deploy/deepseek_v41_validation.py",
+        "/root/deploy/deepseek_v41_validation.py",
+        copy=True,
+    )
+)
 app = modal.App(
     "resin-bench",
     image=image,
@@ -89,27 +105,46 @@ def _checkpoint(model: str) -> tuple[Path, str, str]:
 
 
 @app.function(cpu=16, memory=32768, timeout=4 * 60 * 60)
-def download(model: str) -> dict:
+def download(model: str, metadata_only: bool = False) -> dict:
     """Publish a complete pinned checkpoint using a CPU worker."""
-    from huggingface_hub import snapshot_download
-
     target, repo, revision = _checkpoint(model)
-    target.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo,
-        revision=revision,
-        local_dir=target,
-        allow_patterns=[
-            "config.json",
-            "model*.safetensors",
-            "model.safetensors.index.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "inference/config.json",
-        ],
-    )
-    MODEL_VOLUMES[CHECKPOINTS[model][2]].commit()
-    return {"repo_id": repo, "revision": revision, "path": str(target)}
+    volume = MODEL_VOLUMES[CHECKPOINTS[model][2]]
+    volume.reload()
+    if metadata_only and not model.startswith("deepseek"):
+        raise ValueError(
+            "metadata-only publication currently targets DeepSeek checkpoints"
+        )
+    if not metadata_only:
+        from huggingface_hub import snapshot_download
+
+        target.mkdir(parents=True, exist_ok=True)
+        snapshot_download(
+            repo,
+            revision=revision,
+            local_dir=target,
+            allow_patterns=[
+                "config.json",
+                "model*.safetensors",
+                "model.safetensors.index.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "inference/config.json",
+            ],
+        )
+    inventory = {}
+    if model.startswith("deepseek"):
+        from deploy.checkpoint_cache import publish_checkpoint
+
+        inventory = publish_checkpoint(target, repo, revision)
+    volume.commit()
+    return {
+        "repo_id": repo,
+        "revision": revision,
+        "path": str(target),
+        "metadata_only": metadata_only,
+        "files": len(inventory),
+        "bytes": sum(inventory.values()),
+    }
 
 
 @app.function(cpu=32, memory=262144, timeout=4 * 60 * 60, single_use_containers=True)
@@ -130,7 +165,15 @@ def sweep(model: str, cases: list[dict], topology: dict, options: dict) -> list[
     from resin import Parallelism
 
     target, repo, revision = _checkpoint(model)
-    if not (target / "config.json").is_file():
+    if model.startswith("deepseek"):
+        from deploy.checkpoint_cache import checkpoint_is_complete
+
+        if not checkpoint_is_complete(target, repo, revision):
+            raise FileNotFoundError(
+                f"download the pinned {model} checkpoint first; use --publish-only "
+                "to validate and publish files already present in the volume"
+            )
+    elif not (target / "config.json").is_file():
         raise FileNotFoundError(f"download the pinned {model} checkpoint first")
     if model.startswith("gpt-oss"):
         ensure_kernel_cache_dirs()
@@ -153,15 +196,32 @@ def sweep(model: str, cases: list[dict], topology: dict, options: dict) -> list[
         HOPPER_KERNEL_VOLUME.commit()
 
 
+@app.function(cpu=16, memory=32768, timeout=30 * 60, single_use_containers=True)
+def probe() -> dict:
+    for name in (
+        "TORCH_CUDA_ARCH_LIST",
+        "FLASHINFER_CUDA_ARCH_LIST",
+        "FLASH_ATTENTION_ARCH",
+        "CUTE_DSL_ARCH",
+    ):
+        os.environ.pop(name, None)
+    from deploy.deepseek_v41_validation import run_probes
+
+    try:
+        return run_probes()
+    finally:
+        KERNEL_VOLUME.commit()
+
+
 @app.local_entrypoint()
 def main(
     model: str = "deepseek-v4",
     gpu: str = "B300",
-    world_size: int = 4,
-    attn_dp: int = 1,
-    attn_tp: int = 4,
+    world_size: int = 8,
+    attn_dp: int = 8,
+    attn_tp: int = 1,
     cp: int = 1,
-    ep: int = 1,
+    ep: int = 8,
     phases: str = "prefill,decode",
     context_lengths: str = "4096",
     batch_sizes: str = "1,2,4,8",
@@ -177,6 +237,10 @@ def main(
     gpu_memory_utilization: float = 0.9,
     output: str = "bench/results.jsonl",
     download_only: bool = False,
+    publish_only: bool = False,
+    probe_only: bool = False,
+    validate_model: bool = False,
+    expert_backend: str = "flashinfer",
 ):
     from deploy.bench import write_results
     from resin import Parallelism
@@ -184,8 +248,16 @@ def main(
 
     if model not in CHECKPOINTS:
         raise ValueError(f"model must be one of {list(CHECKPOINTS)}")
-    if download_only:
-        print(json.dumps(download.remote(model), indent=2))
+    if probe_only:
+        print(json.dumps(probe.with_options(gpu=gpu).remote(), indent=2))
+        return
+    if download_only or publish_only:
+        function = (
+            download.with_options(cpu=2, memory=2048, timeout=300)
+            if publish_only
+            else download
+        )
+        print(json.dumps(function.remote(model, publish_only), indent=2))
         return
     topology = dict(
         world_size=world_size, attn_dp=attn_dp, attn_tp=attn_tp, cp=cp, ep=ep
@@ -234,6 +306,8 @@ def main(
         prefill_graph=prefill_graph,
         decode_graph=decode_graph,
         gpu_memory_utilization=gpu_memory_utilization,
+        validate_model=validate_model,
+        expert_backend=expert_backend,
         metadata={
             "git_commit": git_revision,
             "dirty": dirty,
@@ -243,5 +317,15 @@ def main(
     records = sweep.with_options(gpu=f"{gpu}:{world_size}").remote(
         model, cases, topology, options
     )
+    if validate_model:
+        target = Path(output)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(records, indent=2))
+        print(json.dumps(records, indent=2))
+        if not all(record.get("ok") is True for record in records):
+            raise RuntimeError(
+                f"checkpoint validation failed; reports saved to {target}"
+            )
+        return
     write_results(output, records)
     print(f"Appended {len(records)} raw points to {output}")

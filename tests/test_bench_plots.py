@@ -46,6 +46,7 @@ def record(phase="decode", **changes):
             },
             "graphs": {"prefill": "breakable", "decode": "full"},
             "quant": {"experts": "mxfp4"},
+            "expert_backend": "flashinfer",
         },
     }
     if phase == "prefill":
@@ -101,6 +102,7 @@ def test_context_curves_and_latest_repeated_point_are_kept_separate(tmp_path):
         "parallelism",
         "graphs",
         "quant",
+        "expert_backend",
     ],
 )
 def test_mixed_fixed_metadata_is_rejected_before_duplicate_selection(tmp_path, field):
@@ -161,10 +163,11 @@ def test_nonobject_json_has_source_location(tmp_path, row):
         load_records([path])
 
 
-def test_changed_prefill_chunk_configuration_is_rejected(tmp_path):
+@pytest.mark.parametrize("field", ["prefill_chunk_size", "max_batch_tokens"])
+def test_changed_prefill_budget_configuration_is_rejected(tmp_path, field):
     first, second = record(), record()
-    first["metadata"]["prefill_chunk_size"] = 4096
-    second["metadata"]["prefill_chunk_size"] = 8192
+    first["metadata"][field] = 4096
+    second["metadata"][field] = 8192
     path = write(tmp_path / "mixed.jsonl", first, second)
     with pytest.raises(ValueError, match="mixed .*configurations"):
         load_records([path])

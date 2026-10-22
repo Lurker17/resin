@@ -4,6 +4,8 @@ The sweep loads one model per GPU, keeps it resident across cases, and measures
 synchronous engine steps after warmup. It writes raw measurements to JSONL;
 plotting runs locally without importing PyTorch. Startup, weight loading, and
 graph capture are outside the measured windows and recorded separately.
+The chart axes and speculative projection follow
+[DeepInfer's sweep plotter](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/examples/sweep/plot_pareto.py).
 
 Download the pinned checkpoint before allocating GPUs:
 
@@ -15,7 +17,7 @@ Run prefill and decode sweeps, then produce both charts:
 
 ```bash
 uv run modal run deploy/modal_bench.py \
-  --model deepseek-v4 --gpu B300 --world-size 4 --attn-tp 4 \
+  --model deepseek-v4 --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 \
   --context-lengths 4096,8192 --batch-sizes 1,2,4,8 \
   --output bench/deepseek-v4.jsonl
 uv run scripts/plot_bench.py bench/deepseek-v4.jsonl
@@ -28,20 +30,89 @@ routing. Use `--natural-acceptance` to run the actual verifier and
 `--no-balanced-experts` to preserve model routing. The JSONL records both the
 configured acceptance policy and the observed acceptance rate.
 
-Available model names are `deepseek-v4`, `gpt-oss-20b`, and
+V4.1 uses the pinned `DeepSeek-V4.1-Flash-1017` checkpoint and its own native text
+architecture and recipe. Download and sweep it with:
+
+```bash
+uv run modal run deploy/modal_bench.py --model deepseek-v41 --download-only
+uv run modal run deploy/modal_bench.py \
+  --model deepseek-v41 --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 \
+  --expert-backend deepgemm \
+  --context-lengths 4096,8192 --batch-sizes 1,2,4,8 \
+  --output bench/deepseek-v41.jsonl
+uv run scripts/plot_bench.py bench/deepseek-v41.jsonl
+```
+
+`--expert-backend deepgemm` selects the upstream fused MoE operation, including
+sparse EP exchange and shared experts. Its initial mesh is ADP=EP=world size,
+attention TP1, CP1, and expert TP1. The default `flashinfer` backend retains the
+existing prepared expert path. Backend identity is recorded and checked when
+combining chart points. The two-GPU B300 kernel/adapter probe passes numerical,
+idle-rank, changing-route, and CUDA graph checks; this is separate from full
+checkpoint qualification below.
+
+Both DeepSeek launchers share the same checkpoint volume and completion marker.
+For an older generic download whose files are already complete, publish only
+the small inventory marker with
+`uv run modal run deploy/modal_bench.py --model deepseek-v41 --publish-only`.
+This CPU operation stats the indexed files and publishes metadata atomically;
+it does not download or read the weight bodies. New downloads publish the marker
+automatically. GPU sweeps require that complete inventory. The legacy
+`modal_deepseek_v4.py` run/serve/benchmark paths use attention TP and now reject
+these one-KV-head MLA models; their checkpoint download remains usable.
+
+Attention TP means KV-head sharding, so both DeepSeek MLA families require
+`attn_tp=1`. Earlier four-GPU TP4 debug reports sliced query heads while
+replicating KV; their results do not qualify this contract. The initial V4.1
+target is eight B300s with attention DP8/EP8 and replicated Engram tables.
+Estimated weights alone occupy 237.24 GiB per GPU; runtime memory headroom and
+full-checkpoint qualification on this layout remain pending. Four GPUs with
+ADP4/EP4 require 271.70 GiB of weights each before workspaces and caches.
+
+Run the target comparison with normal routing and no speculation:
+
+```bash
+uv run modal run deploy/modal_bench.py \
+  --model deepseek-v41 --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 \
+  --expert-backend deepgemm \
+  --draft-tokens 0 --natural-acceptance --no-balanced-experts --validate-model \
+  --prefill-chunk-size 8 --context-lengths 64 --batch-sizes 1 \
+  --output artifacts/benchmarks/deepseek-v41-adp8ep8-target-validation.json
+```
+
+Run a separate natural four-draft DSpark comparison with:
+
+```bash
+uv run modal run deploy/modal_bench.py \
+  --model deepseek-v41 --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 \
+  --expert-backend deepgemm \
+  --draft-tokens 4 --natural-acceptance --no-balanced-experts --validate-model \
+  --prefill-chunk-size 8 --context-lengths 64 --batch-sizes 1 \
+  --output artifacts/benchmarks/deepseek-v41-adp8ep8-dspark-validation.json
+```
+
+Validation writes a JSON report rather than chart measurements. The implementation uses fixed-width greedy
+proposals, loads the confidence head without applying its length policy, and
+supports up to the released five-token block. Benchmark defaults remain four
+drafts. Wider meshes, longer contexts, and throughput tuning need separate qualification;
+see the [family limits](../models/cuda/resin_models_cuda/deepseek_v41/README.md).
+
+Available model names are `deepseek-v4`, `deepseek-v41`, `gpt-oss-20b`, and
 `gpt-oss-120b`. The GPT-OSS benchmark path currently uses the Hopper expert kernel
 and has no draft model:
 
 ```bash
 uv run modal run deploy/modal_bench.py \
-  --model gpt-oss-20b --gpu H100 --world-size 1 --attn-tp 1 \
-  --draft-tokens 0 --output bench/gpt-oss-20b.jsonl
+  --model gpt-oss-20b --gpu H100 --world-size 1 --attn-dp 1 --attn-tp 1 --ep 1 \
+  --draft-tokens 0 --prefill-chunk-size 1024 --output bench/gpt-oss-20b.jsonl
 uv run scripts/plot_bench.py bench/gpt-oss-20b.jsonl --draft-tokens 0
 ```
 
 Use `--phases decode` or `--phases prefill` for one phase and the matching
 `--mode decode` or `--mode prefill` when plotting. Parallelism is configured with
-`--world-size`, `--attn-dp`, `--attn-tp`, `--cp`, and `--ep`. Batch sizes count
+`--world-size`, `--attn-dp`, `--attn-tp`, `--cp`, and `--ep`. The launcher defaults
+to eight GPUs, attention DP8, attention TP1, CP1, and EP8 for DeepSeek; override
+all relevant fields when selecting another model. Batch sizes count
 requests **per attention-DP replica**; the global batch is `batch_size * attn_dp`.
 `--prefill-chunk-size`, `--prefill-graph`, and `--decode-graph` select execution
 policies. Defaults are a 4,096-token prefill chunk, breakable prefill graphs,
@@ -89,12 +160,18 @@ prefill inputs; `prefill_tokens` is their measured per-step mean.
 workload. A null `accepted_drafts` means natural verification.
 
 Balanced routing covers physical router rows, including any padding used by a
-captured prefill bucket. Attention-DP replicas receive different portions of the
-round-robin assignment; attention TP/CP copies keep the same assignment.
-`graph_counts` records replay and fallback counter changes during measurement,
-excluding warmup. Distributed timings use the slowest replica driver per step;
+captured prefill bucket. Successive assignments cycle through EP owners first,
+then through experts within each owner, so even a small batch exercises balanced
+communication. Attention-DP replicas receive offset portions of that assignment;
+other attention ranks apply the same ordinal rule to their router rows. The real router GEMM still runs,
+and selected router scores still determine weights.
+`graph_counts` sums replay and fallback counter changes over unique attention-DP
+drivers during measurement, excluding warmup. Distributed timings use the slowest replica driver per step;
 token counts are summed over unique drivers. `window_seconds` sums timed
 `Engine.step` calls, excluding admission and benchmark metric reductions.
+`context_length` is the requested prompt length; the
+`measured_context_start_min/max` and `measured_context_end_min/max` fields record
+the actual contexts after warmup and measurement as decode advances.
 
 Metadata records the model, checkpoint revision, Git commit and source digest,
 hardware, parallelism, graph policies, checkpoint quantization, and prefill

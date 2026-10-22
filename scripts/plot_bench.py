@@ -17,6 +17,7 @@ FIXED_METADATA = (
     "parallelism",
     "graphs",
     "quant",
+    "expert_backend",
 )
 FIXED_CASE = ("draft_tokens", "accepted_drafts", "balanced_experts")
 
@@ -120,13 +121,14 @@ def load_records(paths: list[Path]) -> list[dict]:
                 fixed["prefill_chunk_size"] = record["metadata"].get(
                     "prefill_chunk_size"
                 )
+                fixed["max_batch_tokens"] = record["metadata"].get("max_batch_tokens")
                 # Context is the only fixed configuration allowed to form separate curves.
                 fixed.update(gpu_count=record["gpu_count"], attn_dp=record["attn_dp"])
                 signature = json.dumps(fixed, sort_keys=True)
                 previous = configs.setdefault(record["phase"], signature)
                 if signature != previous:
                     raise ValueError(
-                        "mixed model/topology/graphs/quant/balance/acceptance configurations; use separate files"
+                        "mixed model/topology/graphs/quant/kernels/balance/acceptance configurations; use separate files"
                     )
                 records.append(record)
             except (KeyError, TypeError, ValueError) as error:
@@ -204,7 +206,7 @@ def plot(records, phase, output_dir, *, draft_tokens=4, accept_rate=0.75):
     graphs = ", ".join(
         f"{name}: {policy}" for name, policy in metadata["graphs"].items()
     )
-    subtitle = f"{metadata['model']} | {mesh} | quant={metadata['quant']} | graphs={graphs} | balanced experts={first['balanced_experts']}"
+    subtitle = f"{metadata['model']} | {mesh} | quant={metadata['quant']} | experts={metadata['expert_backend']} | graphs={graphs} | balanced experts={first['balanced_experts']}"
     figure, axis = plt.subplots(figsize=(9, 6.4))
     try:
         for curve_index, (context, points) in enumerate(sorted(curves.items())):

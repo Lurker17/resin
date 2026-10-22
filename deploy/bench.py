@@ -26,6 +26,7 @@ def _runner(model, checkpoint, *, device, groups, cases, options, context_capaci
         cuda_graph_prefill=options["prefill_graph"],
         cuda_graph_decode=options["decode_graph"],
         gpu_memory_utilization=options["gpu_memory_utilization"],
+        cache_parent_capacity=128 if options["validate_model"] else None,
         fast_allreduce=False,
     )
     batches = sorted({case.batch_size for case in cases})
@@ -37,7 +38,7 @@ def _runner(model, checkpoint, *, device, groups, cases, options, context_capaci
             raise ValueError("GPT-OSS has no draft model; pass --draft-tokens 0")
 
         class BenchGptRunner(GptOssCudaRunner):
-            prefill_chunk_size = options["prefill_chunk_size"]
+            prefill_chunk_size = max(batches) * options["prefill_chunk_size"]
 
         return BenchGptRunner(
             checkpoint,
@@ -53,10 +54,19 @@ def _runner(model, checkpoint, *, device, groups, cases, options, context_capaci
         from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 
         runner_type = DeepSeekV4CudaRunner
+    elif model == "deepseek-v41":
+        from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
+
+        runner_type = DeepSeekV41CudaRunner
     else:
         raise ValueError(f"unknown benchmark model: {model}")
     return runner_type(
         checkpoint,
+        **(
+            {"expert_backend": options["expert_backend"]}
+            if model == "deepseek-v41"
+            else {}
+        ),
         max_seq_len=context_capacity,
         max_batch_size=max(batches),
         speculative_tokens=options["draft_tokens"],
@@ -68,6 +78,83 @@ def _runner(model, checkpoint, *, device, groups, cases, options, context_capaci
         ),
         **common,
     )
+
+
+def _checkpoint_validation(raw, engine, checkpoint, metadata, groups):
+    from tokenizers import Tokenizer
+
+    from deploy.deepseek_v41_validation import _validation_stage, validate_model
+    from resin.models.deepseek_v41.codec import DeepSeekV41Codec
+
+    drivers = None if groups is None else groups.drivers
+    rank = 0 if groups is None else groups.rank
+
+    def gather(stage, value):
+        if drivers is None or drivers.size == 1:
+            return [value]
+        values = [None] * drivers.size
+        groups.distributed.all_gather_object(
+            values, (stage, value), group=drivers.handle
+        )
+        if any(value is None or value[0] != stage for value in values):
+            raise RuntimeError("validation drivers reached different stages")
+        return [value[1] for value in values if value is not None]
+
+    def coordinate(stage, error):
+        errors = gather(
+            stage, None if error is None else f"{type(error).__name__}: {error}"
+        )
+        failures = [
+            f"rank {source}: {error}"
+            for source, error in zip(
+                (rank,) if drivers is None else drivers.ranks, errors, strict=True
+            )
+            if error is not None
+        ]
+        if failures:
+            raise RuntimeError(f"validation {stage}: " + "; ".join(failures))
+
+    try:
+        with _validation_stage("prompt", coordinate):
+            recipe = DeepSeekV41Codec(
+                Tokenizer.from_file(str(Path(checkpoint) / "tokenizer.json"))
+            )
+            prompt = recipe.render_ids(
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Count from 1 to 20, putting each number on its own line. "
+                            "Do not add an introduction."
+                        ),
+                    }
+                ]
+            )
+        local = {
+            "rank": rank,
+            **validate_model(
+                raw,
+                engine,
+                prompt_tokens=prompt,
+                synchronize=torch.cuda.synchronize,
+                coordinate=coordinate,
+            ),
+        }
+    except Exception as error:
+        local = {"rank": rank, "ok": False, "error": f"{type(error).__name__}: {error}"}
+    reports = gather("reports", local)
+    if len(reports) == 1:
+        return [
+            {key: value for key, value in reports[0].items() if key != "rank"}
+            | {"metadata": metadata}
+        ]
+    return [
+        {
+            "ok": all(report["ok"] for report in reports),
+            "drivers": reports,
+            "metadata": metadata,
+        }
+    ]
 
 
 def _rank(rank, port, report_path, model, checkpoint, case_values, topology, options):
@@ -95,12 +182,17 @@ def _rank(rank, port, report_path, model, checkpoint, case_values, topology, opt
         )
         groups = ParallelGroups.create(topology)
     cases = [BenchCase(**case) for case in case_values]
+    prefill_budget = (
+        max(case.batch_size for case in cases) * options["prefill_chunk_size"]
+    )
     # Reserve real generated positions, including draft write lookahead. Context
     # lengths on the charts remain the prompt lengths recorded by the harness.
     headroom = (options["warmup_steps"] + options["measure_steps"] + 2) * (
         options["draft_tokens"] + 1
     )
     capacity = max(case.context_length for case in cases) + headroom
+    if rank == 0:
+        print(f"[bench] loading {model} over {topology.world_size} GPUs", flush=True)
     started = time.perf_counter()
     raw = _runner(
         model,
@@ -118,10 +210,17 @@ def _rank(rank, port, report_path, model, checkpoint, case_values, topology, opt
     )
     torch.cuda.synchronize()
     loaded_seconds = time.perf_counter() - started
+    if rank == 0:
+        print(
+            f"[bench] weights ready in {loaded_seconds:.1f}s; capturing graphs",
+            flush=True,
+        )
     started = time.perf_counter()
     raw.capture_cuda_graphs()
     torch.cuda.synchronize()
     capture_seconds = time.perf_counter() - started
+    if rank == 0:
+        print(f"[bench] graphs ready in {capture_seconds:.1f}s", flush=True)
     metadata = {
         **options["metadata"],
         "model": model,
@@ -136,16 +235,18 @@ def _rank(rank, port, report_path, model, checkpoint, case_values, topology, opt
             "decode": options["decode_graph"],
         },
         "quant": "checkpoint",
+        "expert_backend": options["expert_backend"],
         "load_seconds": loaded_seconds,
         "capture_seconds": capture_seconds,
         "prefill_chunk_size": options["prefill_chunk_size"],
+        "max_batch_tokens": prefill_budget,
     }
     engine_options: dict[str, Any] = dict(
         max_running_requests=max(case.batch_size for case in cases),
         context_length=capacity,
         eos_token_id=None,
         scheduler_config=SchedulerConfig(
-            max_batch_tokens=options["prefill_chunk_size"],
+            max_batch_tokens=prefill_budget,
             prefill_chunk_size=options["prefill_chunk_size"],
         ),
     )
@@ -165,19 +266,22 @@ def _rank(rank, port, report_path, model, checkpoint, case_values, topology, opt
         prompt = torch.randint(
             1000, min(30_000, raw.vocab_size), (capacity,), generator=generator
         ).tolist()
-        records = run_sweep(
-            engine,
-            cases,
-            runner=observed,
-            prompt_tokens=prompt,
-            warmup_steps=options["warmup_steps"],
-            measure_steps=options["measure_steps"],
-            gpu_count=topology.world_size,
-            attn_dp=topology.attn_dp,
-            synchronize=torch.cuda.synchronize,
-            reduce_step=None if groups is None else distributed_reducer(groups),
-            metadata=metadata,
-        )
+        if options["validate_model"]:
+            records = _checkpoint_validation(raw, engine, checkpoint, metadata, groups)
+        else:
+            records = run_sweep(
+                engine,
+                cases,
+                runner=observed,
+                prompt_tokens=prompt,
+                warmup_steps=options["warmup_steps"],
+                measure_steps=options["measure_steps"],
+                gpu_count=topology.world_size,
+                attn_dp=topology.attn_dp,
+                synchronize=torch.cuda.synchronize,
+                reduce_step=None if groups is None else distributed_reducer(groups),
+                metadata=metadata,
+            )
         if rank == 0:
             Path(report_path).write_text(json.dumps(records))
     finally:
@@ -203,11 +307,33 @@ def run_benchmark(
     decode_graph: str = "full",
     gpu_memory_utilization: float = 0.9,
     metadata: dict | None = None,
+    validate_model: bool = False,
+    expert_backend: str = "flashinfer",
 ) -> list[dict]:
     """One load and graph catalog for all compatible points in this sweep."""
     from resin.bench import BenchCase
 
     topology = parallelism or Parallelism()
+    if validate_model and model != "deepseek-v41":
+        raise ValueError("checkpoint validation currently requires V4.1")
+    if expert_backend not in ("flashinfer", "deepgemm"):
+        raise ValueError(f"unknown expert backend: {expert_backend}")
+    if expert_backend == "deepgemm":
+        if model != "deepseek-v41":
+            raise ValueError("the DeepGEMM expert backend currently requires V4.1")
+        if topology.world_size == 1:
+            raise ValueError(
+                "DeepGEMM sweeps require at least two ranks with explicit parallel groups"
+            )
+        if (
+            topology.attn_tp != 1
+            or topology.cp != 1
+            or topology.attn_dp != topology.world_size
+            or topology.ep != topology.world_size
+        ):
+            raise ValueError("DeepGEMM requires ADP=EP=world_size, attn_tp=1, and cp=1")
+    if validate_model:
+        accepted_drafts, balanced_experts = None, False
     if not cases:
         raise ValueError("the benchmark needs at least one case")
     for values in cases:
@@ -220,6 +346,16 @@ def run_benchmark(
         raise ValueError("accepted drafts must be between zero and draft tokens")
     if model.startswith("gpt-oss") and draft_tokens:
         raise ValueError("GPT-OSS has no draft model; pass --draft-tokens 0")
+    if model.startswith("gpt-oss") and topology.world_size == 1:
+        from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
+
+        limit = FlashInferSM90MXFP4Kernel.capabilities.max_tokens
+        budget = max(case["batch_size"] for case in cases) * prefill_chunk_size
+        if limit is not None and budget > limit:
+            raise ValueError(
+                f"single-GPU GPT-OSS prefill budget {budget} exceeds the kernel's "
+                f"{limit}-token limit; reduce batch size or prefill_chunk_size"
+            )
     if torch.cuda.device_count() < topology.world_size:
         raise ValueError(f"the sweep requires {topology.world_size} visible GPUs")
     options = dict(
@@ -233,6 +369,8 @@ def run_benchmark(
         decode_graph=decode_graph,
         gpu_memory_utilization=gpu_memory_utilization,
         metadata=metadata or {},
+        validate_model=validate_model,
+        expert_backend=expert_backend,
     )
     with tempfile.TemporaryDirectory(prefix="resin-bench-") as directory:
         output = Path(directory) / "results.json"

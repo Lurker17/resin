@@ -192,9 +192,9 @@ the CPU when no accelerator is available.
 
 ## Modal HTTP endpoints
 
-The DeepSeek-V4 and GPT-OSS Modal apps also expose the native server as public,
+The GPT-OSS Modal app also exposes the native server as public,
 unauthenticated Web Functions. Populate the pinned checkpoint volumes before
-the first request, then deploy the apps:
+the first request, then deploy the app:
 
 ```bash
 # GPT-OSS publishes separate 20B and 120B URLs.
@@ -202,10 +202,13 @@ uv run modal run deploy/modal_gpt_oss.py --mode download --model 20b
 uv run modal run deploy/modal_gpt_oss.py --mode download --model 120b
 uv run modal deploy deploy/modal_gpt_oss.py
 
-# DeepSeek-V4 publishes one TP4 B300 URL.
-uv run modal run deploy/modal_deepseek_v4.py --mode download
-uv run modal deploy deploy/modal_deepseek_v4.py
 ```
+
+The legacy DeepSeek TP-only HTTP deployment needs migration to the attention-DP
+coordinator. Both MLA families have one KV head and require `attn_tp=1`;
+query-head slicing with replicated KV is not supported attention TP.
+Use the [benchmark launcher](docs/benchmarks.md) for explicit attention-DP/EP
+execution and checkpoint downloads.
 
 Each deployed URL serves `/`, `/health`, `/v1/models`,
 `/v1/chat/completions`, `/v1/responses`, and `/v1/messages`. The functions
@@ -275,7 +278,8 @@ writable; the runner copies only when input and output pages differ. LRU entries
 use spare capacity in the same pool and are evicted when live requests need it.
 
 Implemented runner modules include a synchronous PyTorch LFM2 reference and
-local CUDA implementations for GPT-OSS and DeepSeek-V4-Flash. The GPT-OSS CUDA
+local CUDA implementations for GPT-OSS, DeepSeek-V4-Flash, and
+[DeepSeek-V4.1-Flash-1017](models/cuda/resin_models_cuda/deepseek_v41/README.md). The GPT-OSS CUDA
 path uses one History group and one Window group over the flat pool. Its
 deployment harness supports intra-container tensor parallel sizes 1, 2, 4, and
 8, with matching multi-H200 allocations and reusable distributed decode CUDA
@@ -292,13 +296,24 @@ tails are cache-like rolling token rows rather than whole-request checkpoints,
 so aligned prefix snapshots share them exactly like attention pages. The Modal
 web deployment enables the native exact-token LRU prefix cache.
 
-Current limits include synchronous runner steps, no prefill/decode
-disaggregation and no production multi-node serving. A
+V4.1 owns shifted hyper-connections, block32 quantization, Engram, shared source
+KV, CED selection, and its changed DSpark stages. Four cache groups hold sliding
+KV, shared compressed KV/index keys, compressor state, and Engram token history.
+Its initial deployment target is eight B300s with attention DP8, EP8, and
+attention TP1. Engram tables are currently replicated; sharded table lookup is
+not implemented. Full-checkpoint validation and performance qualification on
+this layout remain pending. Earlier TP4 debug runs used replicated KV and do
+not qualify the supported attention-TP contract. Vision inputs are rejected.
+See the family README for memory and optimization limits.
+
+Current limits include synchronous runner steps and no prefill/decode
+disaggregation. A
 [distributed coordinator prototype](docs/distributed.md) covers explicit TP, CP,
 attention DP, and EP groups with synchronous steps.
 [DeepSeek-V4 Flash](docs/deepseek-v4-parallelism.md) and
-[GPT-OSS](docs/gpt-oss-parallelism.md) have eager EP and attention-DP paths.
-CP model execution and production multi-node serving remain unimplemented.
+[GPT-OSS](docs/gpt-oss-parallelism.md) describe their composed attention TP/DP,
+CP, EP, and expert-TP execution paths and validation. Production multi-node
+serving remains unimplemented.
 Device collectives use explicit model rank groups.
 [Generated-token logprobs](docs/logprobs.md) use borrowed NumPy output columns.
 

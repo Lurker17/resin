@@ -327,6 +327,12 @@ def run_sweep(
                     "context_length": case.context_length,
                     "batch_size": case.batch_size,
                     "global_batch_size": case.batch_size * attn_dp,
+                    "measured_global_batch_size_min": min(
+                        s["sequences"] for s in samples
+                    ),
+                    "measured_global_batch_size_max": max(
+                        s["sequences"] for s in samples
+                    ),
                     "gpu_count": gpu_count,
                     "attn_dp": attn_dp,
                     "prefill_tokens": inputs / len(samples),

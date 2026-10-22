@@ -13,12 +13,29 @@ prompt scores, speculative acceptance, failure handling, and distributed steps.
 Prepared FP4 experts and sparse expert transport also reuse the V4 adapters.
 
 `expert_backend="deepgemm"` selects the pinned DeepGEMM mega-MoE operation,
-including sparse EP dispatch/combine and the shared expert. Checkpoint weights
+including sparse EP dispatch/combine and the shared expert, plus the fused gate
+and attention-to-FFN shifted-HC transition. Checkpoint weights
 are transformed once during preparation, and serial layers share one symmetric
 workspace per expert layout. This backend currently requires
 `attn_dp=ep=world_size` with expert TP1; unsupported meshes fail before loading.
 `expert_backend="flashinfer"` selects the existing prepared expert path and is
 the current default. Selecting DeepGEMM never silently falls back to it.
+
+The actual prepared adapter passes on two B300s against independently decoded
+FP4/FP8 FFNs, including shared experts, changing routes, balanced routes, empty
+participation, and bitwise graph replay. The actual Block HC wiring also passes
+the unfused checkpoint equations and graph replay. Reproduce these checks with:
+
+```bash
+uv run modal run deploy/modal_deepinfer_kernels.py --mode mega-moe \
+  --output artifacts/benchmarks/deepinfer-megakernels-ep2-validation.json
+```
+
+This small synthetic expert mesh validates the integration; full checkpoint and
+throughput qualification remain separate below. FlashMLA's fused attention is
+not integrated yet: it requires packed 528-byte FP8 sliding KV, 288-byte FP4
+compressed KV, and matching prepared projections. Those can use strided views
+over the existing shared slab pool without changing scheduler ownership.
 
 The DeepGEMM path also fuses the BF16 gate projection and top-k directly into
 the expert workspace, preserving BF16-rounded route weights and the exact
