@@ -5,7 +5,7 @@ mod values;
 use serde_json::Value;
 
 use crate::render::{function, list as array, messages, option, text as string, truthy};
-use crate::{Decoder, Error, Event, FinishReason, Prompt};
+use crate::{AttributedText, Decoder, Error, FinishReason, Prompt};
 
 fn strip_thinking(text: &str) -> String {
     text.split("<channel|>")
@@ -244,7 +244,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
     Ok(prompt)
 }
 
-use crate::parser::{Grammar, Parser, emit_tool, tokens};
+use crate::parser::{EventSink, Grammar, Parser, emit_tool, tokens};
 
 tokens! { Gemma4Tokens {
     turn_start => ["<|turn>"], turn_end => ["<turn|>"],
@@ -270,7 +270,7 @@ pub type Gemma4Parser = Parser<Gemma4Grammar>;
 pub struct Gemma4Grammar {
     tokens: Gemma4Tokens,
     state: State,
-    header: String,
+    header: AttributedText,
     tool: Vec<values::Character>,
     tool_index: usize,
 }
@@ -306,7 +306,7 @@ impl Gemma4Parser {
             Gemma4Grammar {
                 tokens,
                 state,
-                header: String::new(),
+                header: AttributedText::default(),
                 tool: Vec::new(),
                 tool_index: 0,
             },
@@ -331,16 +331,16 @@ impl Grammar for Gemma4Grammar {
     fn ended(&self) -> bool {
         self.state == State::Ended
     }
-    fn text(&mut self, text: String, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn text(&mut self, text: AttributedText, events: &mut EventSink) -> Result<(), Error> {
         if !text.is_empty() {
             match self.state {
-                State::Content => events.push(Event::TextDelta { delta: text }),
-                State::Reasoning => events.push(Event::ReasoningDelta { delta: text }),
+                State::Content => events.text(text, false),
+                State::Reasoning => events.text(text, true),
                 State::Tool => self.tool.extend(text.chars().map(values::Character::Text)),
                 State::ChannelHeader | State::TurnHeader => {
-                    self.header.push_str(&text);
-                    if let Some((_, body)) = self.header.split_once('\n') {
-                        let body = body.to_owned();
+                    self.header.push(text);
+                    if let Some(offset) = self.header.find('\n') {
+                        let body = self.header.slice(offset + 1..self.header.len());
                         self.header.clear();
                         self.state = if self.state == State::ChannelHeader {
                             State::Reasoning
@@ -355,7 +355,7 @@ impl Grammar for Gemma4Grammar {
         }
         Ok(())
     }
-    fn control(&mut self, id: u32, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn control(&mut self, id: u32, events: &mut EventSink) -> Result<(), Error> {
         let t = self.tokens;
         if id == t.escape {
             if self.state == State::Tool {
@@ -389,7 +389,7 @@ impl Grammar for Gemma4Grammar {
         }
         Ok(())
     }
-    fn finish(&mut self, _reason: FinishReason, _events: &mut Vec<Event>) -> Result<(), Error> {
+    fn finish(&mut self, _reason: FinishReason, _events: &mut EventSink) -> Result<(), Error> {
         self.tool.clear();
         Ok(())
     }

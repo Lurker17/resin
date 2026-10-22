@@ -1,8 +1,8 @@
 mod render;
 pub use render::render;
 
-use crate::parser::{Grammar, Parser, emit_tool, tokens};
-use crate::{Decoder, Error, Event, FinishReason};
+use crate::parser::{EventSink, Grammar, Parser, emit_tool, tokens};
+use crate::{AttributedText, Decoder, Error, FinishReason};
 use serde_json::Value;
 
 tokens! { InklingTokens {
@@ -80,18 +80,18 @@ impl Grammar for InklingGrammar {
     fn is_control(&self, id: u32) -> bool {
         self.tokens.ids().contains(&id)
     }
-    fn text(&mut self, text: String, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn text(&mut self, text: AttributedText, events: &mut EventSink) -> Result<(), Error> {
         if !text.is_empty() {
             match self.state {
                 State::Header => {}
-                State::Content => events.push(Event::TextDelta { delta: text }),
-                State::Reasoning => events.push(Event::ReasoningDelta { delta: text }),
+                State::Content => events.text(text, false),
+                State::Reasoning => events.text(text, true),
                 State::Tool => self.tool.push_str(&text),
             }
         }
         Ok(())
     }
-    fn control(&mut self, id: u32, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn control(&mut self, id: u32, events: &mut EventSink) -> Result<(), Error> {
         if matches!(self.state, State::Tool) && !self.tool.is_empty() {
             let payload: Value = serde_json::from_str(&self.tool)
                 .map_err(|_| Error::new("Inkling emitted an invalid JSON tool call"))?;
@@ -121,7 +121,7 @@ impl Grammar for InklingGrammar {
         };
         Ok(())
     }
-    fn finish(&mut self, _reason: FinishReason, _events: &mut Vec<Event>) -> Result<(), Error> {
+    fn finish(&mut self, _reason: FinishReason, _events: &mut EventSink) -> Result<(), Error> {
         self.tool.clear();
         Ok(())
     }

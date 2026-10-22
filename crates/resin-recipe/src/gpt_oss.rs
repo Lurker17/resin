@@ -5,7 +5,7 @@ mod schema;
 use serde_json::Value;
 
 use crate::render::{function, list, messages, option};
-use crate::{Decoder, Error, Event, FinishReason, Prompt, ResponseParser};
+use crate::{AttributedText, Decoder, Error, FinishReason, Prompt, ResponseParser};
 
 fn content(value: Option<&Value>) -> String {
     match value {
@@ -252,7 +252,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
     Ok(prompt)
 }
 
-use crate::parser::{Grammar, Parser, emit_tool, tokens};
+use crate::parser::{EventSink, Grammar, Parser, emit_tool, tokens};
 
 tokens! { GptOssTokens {
     start => ["<|im_start|>", "<|start|>"],
@@ -310,6 +310,7 @@ impl GptOssParser {
             let end = tail.iter().position(|&id| id == tokens.message);
             parser.feed(&tail[..end.map_or(tail.len(), |end| end + 1)])?;
         }
+        parser.next_token_index = 0;
         Ok(parser)
     }
 }
@@ -334,7 +335,7 @@ impl GptOssGrammar {
             State::Text
         };
     }
-    fn close_body(&mut self, events: &mut Vec<Event>) {
+    fn close_body(&mut self, events: &mut EventSink) {
         if let State::Tool(name) = &self.state
             && !name.is_empty()
             && serde_json::from_str::<Value>(&self.tool_text).is_ok()
@@ -363,19 +364,19 @@ impl Grammar for GptOssGrammar {
     fn ended(&self) -> bool {
         self.ended
     }
-    fn text(&mut self, text: String, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn text(&mut self, text: AttributedText, events: &mut EventSink) -> Result<(), Error> {
         if !text.is_empty() {
             match self.state {
                 State::Header => self.header.push_str(&text),
-                State::Text => events.push(Event::TextDelta { delta: text }),
-                State::Reasoning => events.push(Event::ReasoningDelta { delta: text }),
+                State::Text => events.text(text, false),
+                State::Reasoning => events.text(text, true),
                 State::Tool(_) => self.tool_text.push_str(&text),
                 State::Ignore => {}
             }
         }
         Ok(())
     }
-    fn control(&mut self, id: u32, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn control(&mut self, id: u32, events: &mut EventSink) -> Result<(), Error> {
         if id == self.tokens.start {
             self.tool_text.clear();
             self.header.clear();
@@ -394,7 +395,7 @@ impl Grammar for GptOssGrammar {
         }
         Ok(())
     }
-    fn finish(&mut self, _reason: FinishReason, _events: &mut Vec<Event>) -> Result<(), Error> {
+    fn finish(&mut self, _reason: FinishReason, _events: &mut EventSink) -> Result<(), Error> {
         self.tool_text.clear();
         Ok(())
     }

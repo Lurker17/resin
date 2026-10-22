@@ -9,6 +9,7 @@ pub mod lfm2;
 mod model;
 mod parser;
 mod prompt;
+mod provenance;
 pub mod qwen;
 mod render;
 mod tokenizer;
@@ -24,8 +25,9 @@ pub use inkling::{InklingParser, InklingTokens};
 pub use lfm2::{Lfm2Parser, Lfm2Tokens};
 pub use model::ModelFormat;
 pub use prompt::{Encoder, Prompt, PromptSpan, TokenizerEncoder};
+pub use provenance::{AttributedEvent, AttributedText, TokenSpan};
 pub use qwen::{QwenParser, QwenTokens};
-pub use tokenizer::{Tokenizer, TokenizerDecoder};
+pub use tokenizer::{TokenBytes, Tokenizer, TokenizerDecoder};
 
 /// A semantic response event, shared by streaming and complete responses.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -81,6 +83,16 @@ pub trait Decoder: Send {
     fn push(&mut self, ids: &[u32]) -> Result<String, Error>;
     fn finish(&mut self) -> Result<String, Error>;
     fn reset(&mut self);
+    fn push_attributed(
+        &mut self,
+        ids: &[u32],
+        _token_start: usize,
+    ) -> Result<AttributedText, Error> {
+        self.push(ids).map(AttributedText::plain)
+    }
+    fn finish_attributed(&mut self) -> Result<AttributedText, Error> {
+        self.finish().map(AttributedText::plain)
+    }
 }
 
 /// Parse generated tokens into semantic events.
@@ -93,4 +105,12 @@ pub trait ResponseParser: Send {
 
     fn feed(&mut self, ids: &[u32]) -> Result<Vec<Event>, Error>;
     fn finish(&mut self, reason: FinishReason) -> Result<Vec<Event>, Error>;
+    fn feed_attributed(&mut self, ids: &[u32]) -> Result<Vec<AttributedEvent>, Error> {
+        self.feed(ids)
+            .map(|events| events.into_iter().map(Into::into).collect())
+    }
+    fn finish_attributed(&mut self, reason: FinishReason) -> Result<Vec<AttributedEvent>, Error> {
+        self.finish(reason)
+            .map(|events| events.into_iter().map(Into::into).collect())
+    }
 }

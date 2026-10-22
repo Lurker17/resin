@@ -5,7 +5,7 @@ mod literals;
 use crate::render::{function, list, messages, object_arguments, text_content};
 use serde_json::Value;
 
-use crate::{Decoder, Error, Event, FinishReason, Prompt};
+use crate::{AttributedText, Decoder, Error, FinishReason, Prompt};
 
 const BOS: &str = "<|startoftext|>";
 const START: &str = "<|im_start|>";
@@ -150,7 +150,7 @@ fn render_calls(prompt: &mut Prompt, calls: &[Value]) -> Result<(), Error> {
     Ok(())
 }
 
-use crate::parser::{Grammar, Parser, emit_tool, tokens};
+use crate::parser::{EventSink, Grammar, Parser, emit_tool, tokens};
 
 // Think/tool delimiters are added tokens marked `special=false` upstream.
 // Their actual IDs still delimit LFM2's grammar; literal spellings do not.
@@ -213,16 +213,16 @@ impl Grammar for Lfm2Grammar {
     fn is_control(&self, id: u32) -> bool {
         self.tokens.ids().contains(&id)
     }
-    fn text(&mut self, text: String, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn text(&mut self, text: AttributedText, events: &mut EventSink) -> Result<(), Error> {
         if !text.is_empty() {
             match self.stage {
-                Stage::Content => events.push(Event::TextDelta { delta: text }),
-                Stage::Reasoning => events.push(Event::ReasoningDelta { delta: text }),
+                Stage::Content => events.text(text, false),
+                Stage::Reasoning => events.text(text, true),
                 Stage::Tool => self.tool.push_str(&text),
                 Stage::Header => {
-                    if let Some((_, content)) = text.split_once('\n') {
+                    if let Some(offset) = text.find('\n') {
                         self.stage = Stage::Content;
-                        self.text(content.to_owned(), events)?;
+                        self.text(text.slice(offset + 1..text.len()), events)?;
                     }
                 }
                 Stage::Done => {}
@@ -230,7 +230,7 @@ impl Grammar for Lfm2Grammar {
         }
         Ok(())
     }
-    fn control(&mut self, id: u32, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn control(&mut self, id: u32, events: &mut EventSink) -> Result<(), Error> {
         if id == self.tokens.tool_call_end {
             if self.stage != Stage::Tool {
                 return Err(Error::new(
@@ -257,7 +257,7 @@ impl Grammar for Lfm2Grammar {
         }
         Ok(())
     }
-    fn finish(&mut self, _reason: FinishReason, _events: &mut Vec<Event>) -> Result<(), Error> {
+    fn finish(&mut self, _reason: FinishReason, _events: &mut EventSink) -> Result<(), Error> {
         self.tool.clear();
         Ok(())
     }

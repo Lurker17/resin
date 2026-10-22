@@ -1,5 +1,5 @@
-use crate::parser::{Grammar, Parser, emit_tool, tokens};
-use crate::{Decoder, Error, Event, FinishReason};
+use crate::parser::{EventSink, Grammar, Parser, emit_tool, tokens};
+use crate::{AttributedText, Decoder, Error, FinishReason};
 use serde_json::{Map, Value};
 
 tokens! { QwenTokens {
@@ -21,23 +21,24 @@ enum State {
 #[derive(Default)]
 struct Trim {
     started: bool,
-    pending: String,
+    pending: AttributedText,
 }
 impl Trim {
-    fn push(&mut self, text: &str) -> String {
-        let text = if self.started {
-            text
+    fn push(&mut self, text: AttributedText) -> AttributedText {
+        let start = if self.started {
+            0
         } else {
-            text.trim_start_matches(super::whitespace)
+            text.len() - text.trim_start_matches(super::whitespace).len()
         };
-        let stable = text.trim_end_matches(super::whitespace);
-        if stable.is_empty() {
-            self.pending.push_str(text);
-            return String::new();
+        let text = text.slice(start..text.len());
+        let stable_len = text.trim_end_matches(super::whitespace).len();
+        if stable_len == 0 {
+            self.pending.push(text);
+            return AttributedText::default();
         }
         let mut result = std::mem::take(&mut self.pending);
-        result.push_str(stable);
-        self.pending.push_str(&text[stable.len()..]);
+        result.push(text.slice(0..stable_len));
+        self.pending.push(text.slice(stable_len..text.len()));
         self.started = true;
         result
     }
@@ -96,7 +97,7 @@ impl QwenParser {
 }
 
 impl QwenGrammar {
-    fn emit_tool(&mut self, events: &mut Vec<Event>) {
+    fn emit_tool(&mut self, events: &mut EventSink) {
         let Some((_, function)) = self.tool_text.split_once("<function=") else {
             return;
         };
@@ -153,7 +154,7 @@ impl Grammar for QwenGrammar {
     fn ended(&self) -> bool {
         self.ended
     }
-    fn text(&mut self, text: String, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn text(&mut self, text: AttributedText, events: &mut EventSink) -> Result<(), Error> {
         if self.state == State::Tool {
             self.tool_text.push_str(&text);
             return Ok(());
@@ -161,17 +162,13 @@ impl Grammar for QwenGrammar {
         if self.state == State::BetweenTools {
             return Ok(());
         }
-        let delta = self.trim.push(&text);
+        let delta = self.trim.push(text);
         if !delta.is_empty() {
-            events.push(if self.state == State::Reasoning {
-                Event::ReasoningDelta { delta }
-            } else {
-                Event::TextDelta { delta }
-            });
+            events.text(delta, self.state == State::Reasoning);
         }
         Ok(())
     }
-    fn control(&mut self, id: u32, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn control(&mut self, id: u32, events: &mut EventSink) -> Result<(), Error> {
         if id == self.tokens.im_end || id == self.tokens.endoftext {
             self.ended = true;
         } else if id == self.tokens.tool_call {
@@ -191,7 +188,7 @@ impl Grammar for QwenGrammar {
         self.trim = Trim::default();
         Ok(())
     }
-    fn finish(&mut self, _reason: FinishReason, _events: &mut Vec<Event>) -> Result<(), Error> {
+    fn finish(&mut self, _reason: FinishReason, _events: &mut EventSink) -> Result<(), Error> {
         self.tool_text.clear();
         Ok(())
     }

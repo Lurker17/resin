@@ -1,6 +1,6 @@
 use super::{BOS, DSML, EOS, THINKING_END, THINKING_START};
-use crate::parser::{Grammar, Parser, tokens};
-use crate::{Decoder, Error, Event, FinishReason};
+use crate::parser::{EventSink, Grammar, Parser, tokens};
+use crate::{AttributedText, Decoder, Error, Event, FinishReason};
 use std::collections::HashSet;
 
 tokens! { DeepSeekV4Tokens {
@@ -47,20 +47,20 @@ impl Marker {
 /// or parameter key that must be complete before it can be JSON escaped.
 #[derive(Default)]
 struct Buffer {
-    text: String,
+    text: AttributedText,
     special: Vec<bool>,
 }
 
 impl Buffer {
-    fn push(&mut self, text: &str, special: bool) {
-        self.text.push_str(text);
+    fn push(&mut self, text: AttributedText, special: bool) {
         self.special
             .extend(std::iter::repeat_n(special, text.len()));
+        self.text.push(text);
     }
 
-    fn take(&mut self, length: usize) -> String {
+    fn take(&mut self, length: usize) -> AttributedText {
         self.special.drain(..length);
-        self.text.drain(..length).collect()
+        self.text.take(length)
     }
 
     fn clear(&mut self) {
@@ -74,7 +74,7 @@ impl Buffer {
     }
 
     /// Return stable text before a marker, consuming a complete marker if found.
-    fn until(&mut self, marker: &Marker) -> (String, bool) {
+    fn until(&mut self, marker: &Marker) -> (AttributedText, bool) {
         let mut offset = 0;
         while let Some(at) = self.text[offset..].find(&marker.text) {
             let at = offset + at;
@@ -179,7 +179,7 @@ impl DeepSeekV4Parser {
 }
 
 impl DeepSeekV4Grammar {
-    fn argument(&self, text: String, events: &mut Vec<Event>) {
+    fn argument(&self, text: String, events: &mut EventSink) {
         if !text.is_empty() {
             events.push(Event::ToolCallArgumentsDelta {
                 index: self.tool_index,
@@ -188,21 +188,26 @@ impl DeepSeekV4Grammar {
         }
     }
 
-    fn push(&mut self, text: &str, special: bool, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn push(
+        &mut self,
+        text: AttributedText,
+        special: bool,
+        events: &mut EventSink,
+    ) -> Result<(), Error> {
         self.buffer.push(text, special);
         loop {
             match self.stage {
                 Stage::Reasoning => {
                     let text = self.buffer.take(self.buffer.text.len());
                     if !text.is_empty() {
-                        events.push(Event::ReasoningDelta { delta: text });
+                        events.text(text, true);
                     }
                     break;
                 }
                 Stage::Content => {
                     let (text, found) = self.buffer.until(&Marker::dsml("\n\n<", "tool_calls>"));
                     if !text.is_empty() {
-                        events.push(Event::TextDelta { delta: text });
+                        events.text(text, false);
                     }
                     if !found {
                         break;
@@ -296,10 +301,10 @@ impl DeepSeekV4Grammar {
                 Stage::ParameterValue { string } => {
                     let (text, found) = self.buffer.until(&Marker::dsml("</", "parameter>"));
                     let text = if string {
-                        let quoted = serde_json::to_string(&text).unwrap();
+                        let quoted = serde_json::to_string(&text.text).unwrap();
                         quoted[1..quoted.len() - 1].to_owned()
                     } else {
-                        text
+                        text.text
                     };
                     self.argument(text, events);
                     if !found {
@@ -330,16 +335,16 @@ impl Grammar for DeepSeekV4Grammar {
     fn ended(&self) -> bool {
         self.ended
     }
-    fn text(&mut self, text: String, events: &mut Vec<Event>) -> Result<(), Error> {
-        self.push(&text, false, events)
+    fn text(&mut self, text: AttributedText, events: &mut EventSink) -> Result<(), Error> {
+        self.push(text, false, events)
     }
-    fn control(&mut self, id: u32, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn control(&mut self, id: u32, events: &mut EventSink) -> Result<(), Error> {
         if id == self.tokens.eos {
             match self.stage {
                 Stage::Content => {
                     let delta = self.buffer.take(self.buffer.text.len());
                     if !delta.is_empty() {
-                        events.push(Event::TextDelta { delta });
+                        events.text(delta, false);
                     }
                 }
                 Stage::Done => {}
@@ -358,7 +363,7 @@ impl Grammar for DeepSeekV4Grammar {
             }
             self.stage = Stage::Content;
         } else if id == self.tokens.dsml {
-            self.push(DSML, true, events)?;
+            self.push(AttributedText::plain(DSML), true, events)?;
         } else {
             return Err(Error::new(
                 "DeepSeek emitted an unexpected response control token",
@@ -366,14 +371,12 @@ impl Grammar for DeepSeekV4Grammar {
         }
         Ok(())
     }
-    fn finish(&mut self, _reason: FinishReason, events: &mut Vec<Event>) -> Result<(), Error> {
+    fn finish(&mut self, _reason: FinishReason, events: &mut EventSink) -> Result<(), Error> {
         if !self.ended {
             let delta = self.buffer.take(self.buffer.text.len());
             match self.stage {
-                Stage::Reasoning if !delta.is_empty() => {
-                    events.push(Event::ReasoningDelta { delta })
-                }
-                Stage::Content if !delta.is_empty() => events.push(Event::TextDelta { delta }),
+                Stage::Reasoning if !delta.is_empty() => events.text(delta, true),
+                Stage::Content if !delta.is_empty() => events.text(delta, false),
                 _ => {}
             }
         }
