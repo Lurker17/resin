@@ -138,7 +138,7 @@ def load_deepseek_v4_weights(
             loaded_bytes += tensor.numel() * tensor.element_size()
             loaded_tensors += 1
             with torch.no_grad():
-                targets[name].copy_(tensor.to(device=device))
+                targets[name].copy_(tensor)
 
     return {"tensors": loaded_tensors, "bytes": loaded_bytes}
 

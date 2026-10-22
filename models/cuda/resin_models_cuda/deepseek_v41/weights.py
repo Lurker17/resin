@@ -80,7 +80,7 @@ def load_weights(model_path, model, *, rank, tensor_parallel_size, device):
                 )
                 tensor = _dequantize_output(tensor, scale)
             tensor = _coerce_for_target(tensor, target)
-            target.copy_(tensor.to(device=device))
+            target.copy_(tensor)
             total += target.numel() * target.element_size()
             count += 1
     return {"tensors": count, "bytes": total}
