@@ -10,6 +10,11 @@ import numpy as np
 import torch
 
 from resin import BatchPhase, ResourceBinding, RunnerConfig
+from resin.backend.collectives import (
+    close_layer_collectives,
+    fixed_layer_capacity,
+    layer_collectives,
+)
 from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
     CudaGraphExecutor,
@@ -23,11 +28,6 @@ from resin.backend.cuda.sampling import (
     SAMPLING_OFFSET_STRIDE,
     FlashInferSampler,
     SamplingTensors,
-)
-from resin.backend.expert_parallel import (
-    close_expert_transports,
-    expert_collectives,
-    fixed_expert_capacity,
 )
 from resin.backend.resources import CachePoolBinding
 from resin.backend.topology import ParallelismCapabilities
@@ -112,7 +112,7 @@ class CudaRunner(Runner):
             return nullcontext()
         model = self._expert_graph_model
         assert model is not None
-        return fixed_expert_capacity(model, capacity, valid_rows=valid_rows)
+        return fixed_layer_capacity(model, capacity, valid_rows=valid_rows)
 
     def _graph_domain_values(self, value):
         groups = getattr(self, "_expert_graph_groups", None)
@@ -466,17 +466,16 @@ class CudaRunner(Runner):
             self._expert_graph_model is not None
             and self._expert_graph_groups is not None
             and any(
-                value.allocated
-                for value in expert_collectives(self._expert_graph_model)
+                value.allocated for value in layer_collectives(self._expert_graph_model)
             )
         ):
-            # Every peer must finish reading shared expert buffers before any
+            # Every peer must finish reading shared layer buffers before any
             # rank unmaps them, including when a model is reloaded in-process.
             torch.cuda.synchronize(self.device)
             self._expert_graph_groups.distributed.barrier(
                 group=self._expert_graph_groups.domain.handle
             )
-            close_expert_transports(self._expert_graph_model)
+            close_layer_collectives(self._expert_graph_model)
 
     def capture_cuda_graph(self, mode: str, shape: GraphShape) -> CudaGraphStats:
         """Capture one mode shape while honoring model-state hooks."""

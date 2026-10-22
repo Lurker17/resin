@@ -11,13 +11,13 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from resin.backend.expert_parallel import (
-    ExpertCollective,
-    ExpertParallelDispatch,
-    close_expert_transports,
-    expert_collectives,
-    fixed_expert_capacity,
+from resin.backend.collectives import (
+    LayerCollective,
+    close_layer_collectives,
+    fixed_layer_capacity,
+    layer_collectives,
 )
+from resin.backend.expert_parallel import ExpertParallelDispatch
 from resin.backend.topology import RankGroup
 
 
@@ -238,7 +238,7 @@ def test_model_context_selects_and_restores_all_expert_transports():
             ),
         )
     valid_rows = torch.tensor(2, dtype=torch.int32)
-    with fixed_expert_capacity(model, 4, valid_rows=valid_rows):
+    with fixed_layer_capacity(model, 4, valid_rows=valid_rows):
         for layer in layers:
             assert layer.dispatch._capacity == 4
             assert layer.dispatch._valid_rows is valid_rows
@@ -250,7 +250,7 @@ def test_model_context_selects_and_restores_all_expert_transports():
 def test_shared_manager_and_module_collectives_are_visited_once_and_restore_on_error(
     monkeypatch,
 ):
-    class Collective(ExpertCollective):
+    class Collective(LayerCollective):
         def __init__(self):
             super().__init__()
             self.entries = self.closes = 0
@@ -280,10 +280,10 @@ def test_shared_manager_and_module_collectives_are_visited_once_and_restore_on_e
     model = torch.nn.ModuleList([torch.nn.Module(), module])
     monkeypatch.setattr(model[0], "collective", shared, raising=False)
     monkeypatch.setattr(module, "collective", shared, raising=False)
-    assert list(expert_collectives(model)) == [shared, module]
+    assert list(layer_collectives(model)) == [shared, module]
     valid_rows = torch.tensor(2, dtype=torch.int32)
     with pytest.raises(RuntimeError, match="model failed"):
-        with fixed_expert_capacity(model, 4, valid_rows=valid_rows):
+        with fixed_layer_capacity(model, 4, valid_rows=valid_rows):
             for value in (shared, module):
                 assert value._capacity == 4
                 assert value._valid_rows is valid_rows
@@ -291,8 +291,8 @@ def test_shared_manager_and_module_collectives_are_visited_once_and_restore_on_e
     for value in (shared, module):
         assert value._capacity is value._valid_rows is None
         assert value.entries == 1
-    close_expert_transports(model)
-    close_expert_transports(model)
+    close_layer_collectives(model)
+    close_layer_collectives(model)
     for value in (shared, module):
         assert not value.allocated
         assert value.closes == 1

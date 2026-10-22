@@ -7,7 +7,7 @@ from collections.abc import Callable
 import torch
 from torch import Tensor, nn
 
-from resin.backend.expert_parallel import ExpertCollective
+from resin.backend.collectives import LayerCollective
 from resin.backend.topology import RankGroup
 
 
@@ -38,7 +38,7 @@ def shared_scale_rows(rows: int, block_m: int, *, device):
     )
 
 
-class MegaMoeCollective(ExpertCollective):
+class MegaMoeCollective(LayerCollective):
     """One symmetric workspace per expert layout, shared by serial FFN layers."""
 
     def __init__(self, group: RankGroup, max_tokens: int):

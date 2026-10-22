@@ -7,55 +7,20 @@ It supports CPU and CUDA tensors; kernel and quantization choices stay local.
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from resin.backend.collectives import LayerCollective
+
 if TYPE_CHECKING:
     from resin.backend.topology import ParallelGroups, RankGroup
 
 
-class ExpertCollective(ABC):
-    """An expert operation's fixed-capacity context and shared buffer lifetime."""
-
-    def __init__(self) -> None:
-        self._capacity: int | None = None
-        self._valid_rows: Tensor | None = None
-
-    @property
-    @abstractmethod
-    def allocated(self) -> bool:
-        """Whether this operation owns shared buffers requiring coordinated close."""
-
-    @abstractmethod
-    def close(self) -> None:
-        """Release shared buffers; repeated calls must be harmless."""
-
-    @contextmanager
-    def fixed_capacity(self, rows: int, *, valid_rows: Tensor | None = None):
-        """Select common EP capacity and optionally a device scalar of valid rows."""
-        if type(rows) is not int or rows <= 0:
-            raise ValueError("expert dispatch capacity must be a positive integer")
-        if valid_rows is not None and (
-            valid_rows.numel() != 1
-            or valid_rows.dtype not in (torch.int32, torch.int64)
-        ):
-            raise ValueError("valid expert rows must be one integer tensor value")
-        previous, self._capacity = self._capacity, rows
-        previous_valid, self._valid_rows = self._valid_rows, valid_rows
-        try:
-            yield
-        finally:
-            self._capacity = previous
-            self._valid_rows = previous_valid
-
-
-class ExpertParallelDispatch(ExpertCollective):
+class ExpertParallelDispatch(LayerCollective):
     """Dispatch rows to expert owners and return their complete weighted sum.
 
     Sources may have different batch sizes, including zero. Every rank joins
@@ -272,33 +237,3 @@ class ExpertParallelDispatch(ExpertCollective):
         dist.reduce_scatter_tensor(result, partial.contiguous(), group=group.handle)
         self._broadcast(result)
         return result[:rows].to(hidden.dtype)
-
-
-@contextmanager
-def fixed_expert_capacity(
-    model: torch.nn.Module, capacity: int, *, valid_rows: Tensor | None = None
-):
-    """Select fixed-capacity expert transport throughout a captured model."""
-
-    with ExitStack() as contexts:
-        for collective in expert_collectives(model):
-            contexts.enter_context(
-                collective.fixed_capacity(capacity, valid_rows=valid_rows)
-            )
-        yield
-
-
-def expert_collectives(model: torch.nn.Module) -> Iterator[ExpertCollective]:
-    """Visit each expert collective once, including collectives that are modules."""
-    seen = set()
-    for module in model.modules():
-        for value in (module, *vars(module).values()):
-            if isinstance(value, ExpertCollective) and id(value) not in seen:
-                seen.add(id(value))
-                yield value
-
-
-def close_expert_transports(model: torch.nn.Module) -> None:
-    """Release shared workspaces after all ranks have destroyed their graphs."""
-    for collective in expert_collectives(model):
-        collective.close()
