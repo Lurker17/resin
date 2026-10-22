@@ -25,8 +25,8 @@ from resin.backend.cuda.sampling import (
     SamplingTensors,
 )
 from resin.backend.expert_parallel import (
-    ExpertParallelDispatch,
     close_expert_transports,
+    expert_collectives,
     fixed_expert_capacity,
 )
 from resin.backend.resources import CachePoolBinding
@@ -466,9 +466,8 @@ class CudaRunner(Runner):
             self._expert_graph_model is not None
             and self._expert_graph_groups is not None
             and any(
-                isinstance(value, ExpertParallelDispatch) and value._transports
-                for module in self._expert_graph_model.modules()
-                for value in vars(module).values()
+                value.allocated
+                for value in expert_collectives(self._expert_graph_model)
             )
         ):
             # Every peer must finish reading shared expert buffers before any

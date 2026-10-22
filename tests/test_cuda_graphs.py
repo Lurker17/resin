@@ -228,9 +228,10 @@ class _DecodeOptions(TypedDict):
 
 
 class TestCudaGraph:
+    @pytest.mark.parametrize("kind", ["dispatch", "shared", "module"])
     @pytest.mark.parametrize("allocated", [False, True])
     def test_expert_workspace_cleanup_is_collective_once_and_only_if_allocated(
-        self, monkeypatch, allocated
+        self, monkeypatch, allocated, kind
     ):
         from torch import nn
 
@@ -245,20 +246,43 @@ class TestCudaGraph:
             assert not group_closed, "cleanup reused a destroyed process group"
             events.append("barrier")
 
+        from resin.backend.expert_parallel import ExpertCollective
+
+        class Manager(ExpertCollective):
+            def __init__(self):
+                super().__init__()
+                self.workspace = Workspace() if allocated else None
+
+            @property
+            def allocated(self):
+                return self.workspace is not None
+
+            def close(self):
+                self.workspace = None
+
+        class ModuleManager(nn.Module, Manager):
+            def __init__(self):
+                nn.Module.__init__(self)
+                Manager.__init__(self)
+
         model = nn.ModuleList([nn.Module(), nn.Module()])
-        dispatchers = [
-            ExpertParallelDispatch(
-                lambda hidden, indices, weights: hidden,
-                num_experts=2,
-                group=RankGroup((0, 1), object(), 0),
-            )
-            for _ in model
-        ]
-        for module, dispatch in zip(model, dispatchers, strict=True):
-            setattr(module, "dispatch", dispatch)
-        if allocated:
-            # A later layer owns storage even though the first layer is empty.
-            dispatchers[-1]._transports["test"] = Workspace()
+        if kind == "dispatch":
+            collectives = [
+                ExpertParallelDispatch(
+                    lambda hidden, indices, weights: hidden,
+                    num_experts=2,
+                    group=RankGroup((0, 1), object(), 0),
+                )
+                for _ in model
+            ]
+            if allocated:
+                # A later layer owns storage even though the first layer is empty.
+                collectives[-1]._transports["test"] = Workspace()
+        else:
+            manager = ModuleManager() if kind == "module" else Manager()
+            collectives = [manager, manager]
+        for module, collective in zip(model, collectives, strict=True):
+            setattr(module, "collective", collective)
         monkeypatch.setattr(
             runner_runtime.torch.cuda,
             "synchronize",
@@ -279,7 +303,7 @@ class TestCudaGraph:
         runner.close_cuda_graphs()
 
         assert events == (["sync", "barrier", "unmap"] if allocated else [])
-        assert all(not dispatch._transports for dispatch in dispatchers)
+        assert all(not collective.allocated for collective in collectives)
 
     def test_cuda_runner_owns_device_precision_sampler_and_cache_binding(
         self, monkeypatch

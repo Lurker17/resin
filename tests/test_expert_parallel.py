@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import multiprocessing
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 
 import pytest
 import torch
 import torch.distributed as dist
 
-from resin.backend.expert_parallel import ExpertParallelDispatch, fixed_expert_capacity
+from resin.backend.expert_parallel import (
+    ExpertCollective,
+    ExpertParallelDispatch,
+    close_expert_transports,
+    expert_collectives,
+    fixed_expert_capacity,
+)
 from resin.backend.topology import RankGroup
 
 
@@ -239,3 +245,54 @@ def test_model_context_selects_and_restores_all_expert_transports():
     for layer in layers:
         assert layer.dispatch._capacity is None
         assert layer.dispatch._valid_rows is None
+
+
+def test_shared_manager_and_module_collectives_are_visited_once_and_restore_on_error(
+    monkeypatch,
+):
+    class Collective(ExpertCollective):
+        def __init__(self):
+            super().__init__()
+            self.entries = self.closes = 0
+            self.live = True
+
+        @property
+        def allocated(self):
+            return self.live
+
+        def close(self):
+            if self.live:
+                self.closes += 1
+                self.live = False
+
+        @contextmanager
+        def fixed_capacity(self, rows, *, valid_rows=None):
+            self.entries += 1
+            with super().fixed_capacity(rows, valid_rows=valid_rows):
+                yield
+
+    class ModuleCollective(torch.nn.Module, Collective):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            Collective.__init__(self)
+
+    shared, module = Collective(), ModuleCollective()
+    model = torch.nn.ModuleList([torch.nn.Module(), module])
+    monkeypatch.setattr(model[0], "collective", shared, raising=False)
+    monkeypatch.setattr(module, "collective", shared, raising=False)
+    assert list(expert_collectives(model)) == [shared, module]
+    valid_rows = torch.tensor(2, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="model failed"):
+        with fixed_expert_capacity(model, 4, valid_rows=valid_rows):
+            for value in (shared, module):
+                assert value._capacity == 4
+                assert value._valid_rows is valid_rows
+            raise RuntimeError("model failed")
+    for value in (shared, module):
+        assert value._capacity is value._valid_rows is None
+        assert value.entries == 1
+    close_expert_transports(model)
+    close_expert_transports(model)
+    for value in (shared, module):
+        assert not value.allocated
+        assert value.closes == 1

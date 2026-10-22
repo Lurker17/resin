@@ -7,7 +7,8 @@ It supports CPU and CUDA tensors; kernel and quantization choices stay local.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING
 
@@ -19,7 +20,42 @@ if TYPE_CHECKING:
     from resin.backend.topology import ParallelGroups, RankGroup
 
 
-class ExpertParallelDispatch:
+class ExpertCollective(ABC):
+    """An expert operation's fixed-capacity context and shared buffer lifetime."""
+
+    def __init__(self) -> None:
+        self._capacity: int | None = None
+        self._valid_rows: Tensor | None = None
+
+    @property
+    @abstractmethod
+    def allocated(self) -> bool:
+        """Whether this operation owns shared buffers requiring coordinated close."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Release shared buffers; repeated calls must be harmless."""
+
+    @contextmanager
+    def fixed_capacity(self, rows: int, *, valid_rows: Tensor | None = None):
+        """Select common EP capacity and optionally a device scalar of valid rows."""
+        if type(rows) is not int or rows <= 0:
+            raise ValueError("expert dispatch capacity must be a positive integer")
+        if valid_rows is not None and (
+            valid_rows.numel() != 1
+            or valid_rows.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError("valid expert rows must be one integer tensor value")
+        previous, self._capacity = self._capacity, rows
+        previous_valid, self._valid_rows = self._valid_rows, valid_rows
+        try:
+            yield
+        finally:
+            self._capacity = previous
+            self._valid_rows = previous_valid
+
+
+class ExpertParallelDispatch(ExpertCollective):
     """Dispatch rows to expert owners and return their complete weighted sum.
 
     Sources may have different batch sizes, including zero. Every rank joins
@@ -42,6 +78,7 @@ class ExpertParallelDispatch:
         replication: RankGroup | tuple[RankGroup, ...] | None = None,
         groups: ParallelGroups | None = None,
     ) -> None:
+        super().__init__()
         if groups is not None:
             if group is not None:
                 raise ValueError("pass groups or an expert group, not both")
@@ -66,39 +103,14 @@ class ExpertParallelDispatch:
             else (replication,)
         )
         self.experts_per_rank = num_experts // expert_size
-        self._capacity: int | None = None
-        self._valid_rows: Tensor | None = None
         self._transports = {}
 
-    @contextmanager
-    def fixed_capacity(self, rows: int, *, valid_rows: Tensor | None = None):
-        """Use a common token capacity on every EP rank during this operation.
+    @property
+    def allocated(self) -> bool:
+        return bool(self._transports)
 
-        CUDA sends rows only to their selected expert owners through a shared
-        NVLink workspace. Receive storage has a fixed shape, with unused slots
-        masked for the local expert operation. Inactive graph rows and redundant
-        attention copies stay local with zero weights. CPU uses equal-size
-        collectives as a portable correctness reference. Callers select a common
-        capacity before warmup/capture; replay needs no Python dispatch.
-
-        ``valid_rows`` may be a device integer scalar updated before replay.
-        It masks routing weights for padded model rows without a host read.
-        """
-
-        if type(rows) is not int or rows <= 0:
-            raise ValueError("expert dispatch capacity must be a positive integer")
-        if valid_rows is not None and (
-            valid_rows.numel() != 1
-            or valid_rows.dtype not in (torch.int32, torch.int64)
-        ):
-            raise ValueError("valid expert rows must be one integer tensor value")
-        previous, self._capacity = self._capacity, rows
-        previous_valid, self._valid_rows = self._valid_rows, valid_rows
-        try:
-            yield
-        finally:
-            self._capacity = previous
-            self._valid_rows = previous_valid
+    def close(self) -> None:
+        self._transports.clear()
 
     def __call__(self, hidden: Tensor, indices: Tensor, weights: Tensor) -> Tensor:
         if self._capacity is not None:
@@ -268,21 +280,25 @@ def fixed_expert_capacity(
 ):
     """Select fixed-capacity expert transport throughout a captured model."""
 
-    seen = set()
     with ExitStack() as contexts:
-        for module in model.modules():
-            for value in vars(module).values():
-                if isinstance(value, ExpertParallelDispatch) and id(value) not in seen:
-                    seen.add(id(value))
-                    contexts.enter_context(
-                        value.fixed_capacity(capacity, valid_rows=valid_rows)
-                    )
+        for collective in expert_collectives(model):
+            contexts.enter_context(
+                collective.fixed_capacity(capacity, valid_rows=valid_rows)
+            )
         yield
+
+
+def expert_collectives(model: torch.nn.Module) -> Iterator[ExpertCollective]:
+    """Visit each expert collective once, including collectives that are modules."""
+    seen = set()
+    for module in model.modules():
+        for value in (module, *vars(module).values()):
+            if isinstance(value, ExpertCollective) and id(value) not in seen:
+                seen.add(id(value))
+                yield value
 
 
 def close_expert_transports(model: torch.nn.Module) -> None:
     """Release shared workspaces after all ranks have destroyed their graphs."""
-    for module in model.modules():
-        for value in vars(module).values():
-            if isinstance(value, ExpertParallelDispatch):
-                value._transports.clear()
+    for collective in expert_collectives(model):
+        collective.close()
