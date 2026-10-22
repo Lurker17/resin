@@ -136,6 +136,11 @@ def _configuration(record):
     return fixed
 
 
+def _range(values):
+    low, high = min(values), max(values)
+    return f"{low:,}" if low == high else f"{low:,}–{high:,}"
+
+
 def load_records(paths: list[Path], *, compare_topologies=False) -> list[dict]:
     """Validate every row before selecting the latest repeat of a sweep point."""
     records = []
@@ -422,6 +427,9 @@ def plot(
             > 1
         ):
             note += "\nMeshes reserve different prefill capacities; decode timing excludes prefill."
+        warmup = _range([row["warmup_steps"] for row in selected])
+        measured = _range([row["measure_steps"] for row in selected])
+        note += f"\nWindow per point: {warmup} warmup steps, {measured} measured steps."
         figure.text(0.5, 0.025, note, ha="center", fontsize=9, color="#555555")
         figure.tight_layout(rect=(0, 0.05 + 0.025 * (note.count("\n") + 1), 1, 0.94))
         _annotate_points(axis, annotations)

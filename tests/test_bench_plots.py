@@ -413,3 +413,29 @@ def test_batch_labels_stay_inside_axes_and_avoid_crowded_endpoints():
             assert not any(box.overlaps(other) for other in boxes[:index])
     finally:
         plt.close(figure)
+
+
+def test_plot_window_note_reports_actual_mixed_step_counts(tmp_path):
+    first = topology_record(warmup_steps=5)
+    second = topology_record(
+        warmup_steps=20,
+        measure_steps=3,
+        step_seconds=[0.1, 0.2, 0.3],
+        window_seconds=0.6,
+    )
+    second.update(batch_size=16, global_batch_size=16)
+    path = write(tmp_path / "windows.jsonl", first, second)
+    output = tmp_path / "plots"
+    main(
+        [
+            str(path),
+            "--draft-tokens",
+            "0",
+            "--mode",
+            "decode",
+            "--output-dir",
+            str(output),
+        ]
+    )
+    svg = (output / "decode.svg").read_text()
+    assert "Window per point: 5–20 warmup steps, 2–3 measured steps." in svg

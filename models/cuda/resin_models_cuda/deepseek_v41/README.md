@@ -143,10 +143,33 @@ The eight-GPU K0 run reported 208,370,466,816 free bytes (194.06012 GiB) per
 GPU before cache reservation. Its validation harness requested 128 usable
 parents plus six reserved parents, allocating 434,700,288 bytes (414.5625 MiB)
 per GPU. This small validation allocation is separate from the declared B256
-demand above and from a benchmark's budget-sized arena. Long-context, wider EP
-and throughput qualification of the new memory path remain separate targets.
+demand above and from a benchmark's budget-sized arena.
 In the tested Modal GPU image build, `nvidia-smi` saw the B300s, while `lspci`
 failed and the sysfs PCI device inventory was empty.
+
+A 128K decode sweep passes on ADP8/EP8 with the packed/sharded path
+([Modal run](https://modal.com/apps/ekzhang/main/ap-zYfGn4MBfzHHNDRSsHqnXO)).
+Each request has 126,976 physically shared prefix tokens plus a 4,096-token
+private suffix. With four drafts, three forced acceptances, balanced experts,
+five warmup and 20 measured steps, the measured results are:
+
+| Requests per GPU | ms/step | Output tokens/s/user | Output tokens/s/GPU |
+| ---: | ---: | ---: | ---: |
+| 1 | 76.56 | 52.24 | 52.24 |
+| 4 | 85.08 | 47.02 | 188.06 |
+| 16 | 113.89 | 35.12 | 561.94 |
+| 64 | 229.34 | 17.44 | 1,116.24 |
+| 256 | 715.64 | 5.59 | 1,430.90 |
+
+Every point schedules the full global cohort, measures context 131,092–131,172,
+and records 160 full decode replays with zero fallbacks. The sweep uses a
+1,024-token prefill chunk and memory utilization 0.5; its 58.36 GiB cache arena
+leaves workspace for captured graphs and eager prefill. The earlier 0.85 budget
+passed capacity preflight but exhausted temporary workspace while seeding the
+prefix. Raw points, validation, attempts and PNG/SVG charts are saved locally
+under `artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-128k/`.
+Independent 128K histories, wider EP, and broader quality/performance workloads
+remain unqualified.
 
 The earlier full-checkpoint K0/K4 validation and prefill/decode sweeps used
 replicated Engram and BF16 KV. The original short validation reports remain at
@@ -171,8 +194,8 @@ Initial prefill executes all 40 backbone layers at every scheduled query
 position; the bounded decoder-tail replay optimization is not implemented.
 Sparse attention/indexing, cache updates, and Engram hashing execute outside
 prefill projection/FFN graphs. Full decode uses the existing captured path.
-Large-context metadata, wide meshes, and throughput remain separate
-qualification targets; implementing those paths does not establish performance.
+Context/workload ranges beyond the recorded sweeps and wider meshes remain
+separate qualification targets.
 
 DSpark uses a requested fixed width of greedy proposals. The checkpoint's
 confidence head is loaded, but its policy does not choose proposal lengths.
