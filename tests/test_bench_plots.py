@@ -91,6 +91,17 @@ def test_context_curves_and_latest_repeated_point_are_kept_separate(tmp_path):
     }
 
 
+def test_older_records_keep_their_original_flashinfer_backend(tmp_path):
+    old, current = record(), record()
+    del old["metadata"]["expert_backend"]
+    path = write(tmp_path / "compatible.jsonl", old, current)
+    assert len(load_records([path])) == 1
+    current["metadata"]["expert_backend"] = "deepgemm"
+    write(path, old, current)
+    with pytest.raises(ValueError, match="mixed .*configurations"):
+        load_records([path])
+
+
 @pytest.mark.parametrize(
     "field",
     [

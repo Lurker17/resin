@@ -75,6 +75,9 @@ def _validate(record):
     if record["global_batch_size"] != record["batch_size"] * record["attn_dp"]:
         raise ValueError("global_batch_size must equal batch_size * attn_dp")
     metadata = record["metadata"]
+    if isinstance(metadata, dict):
+        # Earlier schema-1 measurements had only the FlashInfer expert path.
+        metadata.setdefault("expert_backend", "flashinfer")
     if not isinstance(metadata, dict) or any(
         name not in metadata for name in FIXED_METADATA
     ):
