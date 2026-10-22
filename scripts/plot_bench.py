@@ -123,10 +123,24 @@ def _validate(record):
         )
 
 
-def load_records(paths: list[Path]) -> list[dict]:
+def _topology(record):
+    return json.dumps(record["metadata"]["parallelism"], sort_keys=True)
+
+
+def _configuration(record):
+    fixed = {name: record[name] for name in FIXED_CASE}
+    fixed.update({name: record["metadata"][name] for name in FIXED_METADATA})
+    for name in ("prefill_chunk_size", "max_batch_tokens"):
+        fixed[name] = record["metadata"].get(name)
+    fixed.update(gpu_count=record["gpu_count"], attn_dp=record["attn_dp"])
+    return fixed
+
+
+def load_records(paths: list[Path], *, compare_topologies=False) -> list[dict]:
     """Validate every row before selecting the latest repeat of a sweep point."""
     records = []
     configs = {}
+    comparisons = {}
     for path in paths:
         for number, line in enumerate(path.read_text().splitlines(), 1):
             if not line.strip():
@@ -134,22 +148,32 @@ def load_records(paths: list[Path]) -> list[dict]:
             try:
                 record = json.loads(line)
                 _validate(record)
-                fixed = {name: record[name] for name in FIXED_CASE}
-                fixed.update(
-                    {name: record["metadata"][name] for name in FIXED_METADATA}
-                )
-                fixed["prefill_chunk_size"] = record["metadata"].get(
-                    "prefill_chunk_size"
-                )
-                fixed["max_batch_tokens"] = record["metadata"].get("max_batch_tokens")
-                # Context is the only fixed configuration allowed to form separate curves.
-                fixed.update(gpu_count=record["gpu_count"], attn_dp=record["attn_dp"])
+                fixed = _configuration(record)
                 signature = json.dumps(fixed, sort_keys=True)
-                previous = configs.setdefault(record["phase"], signature)
+                curve = (
+                    record["phase"],
+                    _topology(record) if compare_topologies else None,
+                )
+                previous = configs.setdefault(curve, signature)
                 if signature != previous:
                     raise ValueError(
                         "mixed model/topology/graphs/quant/kernels/balance/acceptance configurations; use separate files"
                     )
+                if compare_topologies:
+                    # A comparison permits independent meshes, never different
+                    # implementations or workload policies within/between curves.
+                    for name in ("parallelism", "gpu_count", "attn_dp"):
+                        fixed.pop(name)
+                    if record["phase"] == "decode":
+                        # These capacities affect loading/prefill, outside timing.
+                        for name in ("prefill_chunk_size", "max_batch_tokens"):
+                            fixed.pop(name)
+                    signature = json.dumps(fixed, sort_keys=True)
+                    previous = comparisons.setdefault(record["phase"], signature)
+                    if signature != previous:
+                        raise ValueError(
+                            "topology comparisons require matching model/source/graphs/quant/kernels/balance/acceptance configurations"
+                        )
                 records.append(record)
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError(f"{path}:{number}: {error}") from error
@@ -162,12 +186,13 @@ def load_records(paths: list[Path]) -> list[dict]:
             record["context_length"],
             record["batch_size"],
             record["prefill_tokens"],
+            _topology(record),
         )
         latest[key] = record
     return list(latest.values())
 
 
-def axes(records, phase, *, draft_tokens=4, accept_rate=0.75):
+def axes(records, phase, *, draft_tokens=4, accept_rate=0.75, compare_topologies=False):
     """Normalize measured engine steps; decode acceptance is an explicit projection."""
     _number(draft_tokens, "draft_tokens", integer=True)
     if _number(accept_rate, "accept_rate") > 1:
@@ -181,6 +206,17 @@ def axes(records, phase, *, draft_tokens=4, accept_rate=0.75):
             continue
         seconds, steps = record["window_seconds"], len(record["step_seconds"])
         if phase == "decode":
+            if any(
+                record.get(name, record["global_batch_size"])
+                != record["global_batch_size"]
+                for name in (
+                    "measured_global_batch_size_min",
+                    "measured_global_batch_size_max",
+                )
+            ):
+                raise ValueError(
+                    "decode throughput requires a fully active requested batch"
+                )
             if record["draft_tokens"] != draft_tokens:
                 raise ValueError(
                     "--draft-tokens must match the measured decode draft_tokens"
@@ -199,14 +235,42 @@ def axes(records, phase, *, draft_tokens=4, accept_rate=0.75):
                 record["input_tokens"] / seconds / record["gpu_count"],
                 label,
             )
-        result.setdefault(record["context_length"], []).append(point)
+        key = record["context_length"]
+        if compare_topologies:
+            topology = record["metadata"]["parallelism"]
+            mesh = " ".join(
+                f"{label}{topology.get(name, 1)}"
+                for label, name in (
+                    ("TP", "attn_tp"),
+                    ("EP", "ep"),
+                    ("ADP", "attn_dp"),
+                    ("CP", "cp"),
+                )
+            )
+            gpu_label = "GPU" if record["gpu_count"] == 1 else "GPUs"
+            key = key, f"{mesh} ({record['gpu_count']} {gpu_label})"
+        result.setdefault(key, []).append(point)
     if not result:
         raise ValueError(f"no {phase} measurements found")
     return result
 
 
-def plot(records, phase, output_dir, *, draft_tokens=4, accept_rate=0.75):
-    curves = axes(records, phase, draft_tokens=draft_tokens, accept_rate=accept_rate)
+def plot(
+    records,
+    phase,
+    output_dir,
+    *,
+    draft_tokens=4,
+    accept_rate=0.75,
+    compare_topologies=False,
+):
+    curves = axes(
+        records,
+        phase,
+        draft_tokens=draft_tokens,
+        accept_rate=accept_rate,
+        compare_topologies=compare_topologies,
+    )
     # Loading/validating JSONL and --help do not need Matplotlib installed.
     import matplotlib
 
@@ -226,14 +290,21 @@ def plot(records, phase, output_dir, *, draft_tokens=4, accept_rate=0.75):
     graphs = ", ".join(
         f"{name}: {policy}" for name, policy in metadata["graphs"].items()
     )
-    subtitle = f"{metadata['model']} | {mesh} | quant={metadata['quant']} | experts={metadata['expert_backend']} | graphs={graphs} | balanced experts={first['balanced_experts']}"
+    layout = "Mesh comparison" if compare_topologies else mesh
+    subtitle = f"{metadata['model']} | {metadata['hardware']} | {layout} | quant={metadata['quant']} | experts={metadata['expert_backend']} | graphs={graphs} | balanced experts={first['balanced_experts']}"
     if shared := first.get("shared_prefix_tokens", 0):
-        subtitle += f" | shared prefix={shared:,} tokens"
+        private = first["context_length"] - shared
+        subtitle += f" | shared prefix={shared:,}, private suffix={private:,} tokens"
     figure, axis = plt.subplots(figsize=(9, 6.4))
     try:
         for curve_index, (context, points) in enumerate(sorted(curves.items())):
             xs, ys, labels = zip(*points, strict=True)
-            (line,) = axis.plot(xs, ys, "o-", linewidth=2, label=f"Context {context:,}")
+            label = (
+                f"{context[1]}; context {context[0]:,}"
+                if compare_topologies
+                else f"Context {context:,}"
+            )
+            (line,) = axis.plot(xs, ys, "o-", linewidth=2, label=label)
             for x, y, label in points:
                 axis.annotate(
                     label,
@@ -293,8 +364,29 @@ def plot(records, phase, output_dir, *, draft_tokens=4, accept_rate=0.75):
                 note = "Ordinary decode (no drafts), τ=1.\nPoint labels: requests per attention-DP replica."
         else:
             note = "Point labels: measured unique input tokens per global prefill step."
+        if all(
+            "measured_context_start_min" in row and "measured_context_end_max" in row
+            for row in selected
+        ):
+            start = min(row["measured_context_start_min"] for row in selected)
+            end = max(row["measured_context_end_max"] for row in selected)
+            note += f"\nMeasured context range: {start:,}–{end:,} tokens."
+        if (
+            compare_topologies
+            and len(
+                {
+                    (
+                        row["metadata"].get("prefill_chunk_size"),
+                        row["metadata"].get("max_batch_tokens"),
+                    )
+                    for row in selected
+                }
+            )
+            > 1
+        ):
+            note += "\nMeshes reserve different prefill capacities; decode timing excludes prefill."
         figure.text(0.5, 0.025, note, ha="center", fontsize=9, color="#555555")
-        figure.tight_layout(rect=(0, 0.09, 1, 0.94))
+        figure.tight_layout(rect=(0, 0.05 + 0.025 * (note.count("\n") + 1), 1, 0.94))
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         paths = tuple(output_dir / f"{phase}.{suffix}" for suffix in ("png", "svg"))
@@ -317,9 +409,14 @@ def main(argv=None):
     parser.add_argument("--mode", choices=("both", "decode", "prefill"), default="both")
     parser.add_argument("--draft-tokens", type=int, default=4)
     parser.add_argument("--accept-rate", type=float, default=0.75)
+    parser.add_argument(
+        "--compare-topologies",
+        action="store_true",
+        help="plot separate mesh curves with matching model and execution policies",
+    )
     args = parser.parse_args(argv)
     try:
-        records = load_records(args.results)
+        records = load_records(args.results, compare_topologies=args.compare_topologies)
         phases = ("decode", "prefill") if args.mode == "both" else (args.mode,)
         output = args.output_dir or args.results[0].parent / "plots"
         for phase in phases:
@@ -329,6 +426,7 @@ def main(argv=None):
                 output,
                 draft_tokens=args.draft_tokens,
                 accept_rate=args.accept_rate,
+                compare_topologies=args.compare_topologies,
             ):
                 print(path.resolve())
     except (OSError, ValueError) as error:

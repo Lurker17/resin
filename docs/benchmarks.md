@@ -101,10 +101,14 @@ these one-KV-head MLA models; their checkpoint download remains usable.
 Attention TP means KV-head sharding, so both DeepSeek MLA families require
 `attn_tp=1`. Earlier four-GPU TP4 debug reports sliced query heads while
 replicating KV; their results do not qualify this contract. The initial V4.1
-target is eight B300s with attention DP8/EP8 and replicated Engram tables.
-Estimated weights alone occupy 237.24 GiB per GPU. The full checkpoint now loads
-and passes eager/captured checks on this layout. Four GPUs with
-ADP4/EP4 require 271.70 GiB of weights each before workspaces and caches.
+target used eight B300s with attention DP8/EP8 and replicated Engram tables.
+The current runner shards Engram rows across the device domain and stores packed
+FP8 sliding KV and FP4 compressed KV. On eight ranks, Engram table storage drops
+from 188.83 to 23.60 GiB per GPU. The full checkpoint passes eager/captured K0
+checks on both ADP2/EP2 and ADP8/EP8, and K4 on ADP8/EP8. See the
+[family memory and qualification details](../models/cuda/resin_models_cuda/deepseek_v41/README.md)
+for exact allocations and the distinction between the current path and older
+replicated-table/BF16-cache measurements.
 
 Run the target comparison with normal routing and no speculation:
 
@@ -166,6 +170,18 @@ measure additional steps to finish its request cohort.
 The plotter saves `decode.png`, `decode.svg`, `prefill.png`, and `prefill.svg`
 under the JSONL directory's `plots/` folder. Use `--output-dir` to change it.
 Different context lengths form separate curves.
+
+To compare meshes for the same model, pass their result files together with
+`--compare-topologies`. Each topology becomes a separate curve; model revision,
+source, kernels, graph and workload policies must still match. Decode comparisons
+allow different prefill capacities between meshes because prefill runs outside
+the timed decode window:
+
+```bash
+uv run scripts/plot_bench.py bench/gpt-oss-120b-{tp1,tp2,tp4,ep2,ep4}.jsonl \
+  --compare-topologies --draft-tokens 0 --mode decode \
+  --output-dir bench/gpt-oss-120b-comparison
+```
 
 The decode chart has per-user output tokens/s on the horizontal axis and output
 tokens/s/GPU on the vertical axis. Point labels are requests per attention-DP

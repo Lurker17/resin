@@ -1,6 +1,7 @@
 """Chart normalization and compatibility checks use synthetic measurements only."""
 
 import json
+import re
 import subprocess
 import sys
 from copy import deepcopy
@@ -235,6 +236,7 @@ def test_cli_renders_two_pngs_and_two_svgs(tmp_path, capsys, contexts):
     }
     assert all(file.stat().st_size > 1000 for file in output.iterdir())
     svg = (output / "decode.svg").read_text()
+    assert "fixture GPU" in svg
     assert "Projected acceptance 75%" in svg
     assert "measured acceptance 25.0%" in svg
     for context in contexts:
@@ -255,3 +257,130 @@ def test_shared_prefix_geometry_cannot_mix_with_independent_points(tmp_path):
     path.write_text(json.dumps(shared) + "\n")
     with pytest.raises(ValueError, match="exact cached token counts"):
         load_records([path])
+
+
+def topology_record(*, world=1, tp=1, ep=1, **changes):
+    row = record(
+        context_length=8192,
+        gpu_count=world,
+        attn_dp=1,
+        global_batch_size=8,
+        draft_tokens=0,
+        accepted_drafts=0,
+        measured_accept_rate=None,
+        **changes,
+    )
+    row["metadata"]["parallelism"].update(
+        world_size=world, attn_dp=1, attn_tp=tp, ep=ep
+    )
+    return row
+
+
+def test_explicit_comparison_keeps_meshes_and_latest_repeats_separate(tmp_path):
+    first = topology_record()
+    second = topology_record(world=2, tp=2)
+    repeated = topology_record(window_seconds=0.8)
+    path = write(tmp_path / "meshes.jsonl", first, second, repeated)
+    with pytest.raises(ValueError, match="mixed .*configurations"):
+        load_records([path])
+    rows = load_records([path], compare_topologies=True)
+    assert len(rows) == 2
+    assert axes(rows, "decode", draft_tokens=0, compare_topologies=True) == {
+        (8192, "TP1 EP1 ADP1 CP1 (1 GPU)"): [(2.5, 20, "8")],
+        (8192, "TP2 EP1 ADP1 CP1 (2 GPUs)"): [(5, 20, "8")],
+    }
+
+
+@pytest.mark.parametrize(
+    "field", ["model", "source_digest", "graphs", "quant", "expert_backend"]
+)
+def test_topology_comparison_still_rejects_different_implementations(tmp_path, field):
+    first, second = topology_record(), topology_record(world=2, ep=2)
+    second["metadata"][field] = "different"
+    path = write(tmp_path / "incompatible.jsonl", first, second)
+    with pytest.raises(ValueError, match="topology comparisons require matching"):
+        load_records([path], compare_topologies=True)
+
+
+def test_decode_comparison_allows_prefill_capacity_variation_only_between_meshes(
+    tmp_path,
+):
+    first, second = topology_record(), topology_record(world=2, tp=2)
+    first["metadata"].update(prefill_chunk_size=128, max_batch_tokens=4096)
+    second["metadata"].update(prefill_chunk_size=128, max_batch_tokens=16384)
+    path = write(tmp_path / "capacities.jsonl", first, second)
+    assert len(load_records([path], compare_topologies=True)) == 2
+    changed = deepcopy(second)
+    changed["metadata"]["max_batch_tokens"] = 32768
+    write(path, first, second, changed)
+    with pytest.raises(ValueError, match="mixed .*configurations"):
+        load_records([path], compare_topologies=True)
+
+
+def test_prefill_comparison_preserves_equal_capacity_requirement(tmp_path):
+    first, second = (
+        topology_record(phase="prefill"),
+        topology_record(phase="prefill", world=2, tp=2),
+    )
+    first["metadata"]["max_batch_tokens"] = 4096
+    second["metadata"]["max_batch_tokens"] = 16384
+    path = write(tmp_path / "prefill.jsonl", first, second)
+    with pytest.raises(ValueError, match="topology comparisons require matching"):
+        load_records([path], compare_topologies=True)
+
+
+def test_decode_rejects_partial_measured_batches_instead_of_overstating_throughput():
+    row = topology_record(
+        measured_global_batch_size_min=4, measured_global_batch_size_max=8
+    )
+    with pytest.raises(ValueError, match="fully active requested batch"):
+        axes([row], "decode", draft_tokens=0)
+
+
+def test_comparison_cli_labels_meshes_contexts_and_unequal_prefill_capacities(tmp_path):
+    first, second = topology_record(), topology_record(world=2, ep=2)
+    for row, budget in ((first, 4096), (second, 16384)):
+        row["metadata"].update(prefill_chunk_size=128, max_batch_tokens=budget)
+        row.update(measured_context_start_min=8197, measured_context_end_max=8218)
+    path = write(tmp_path / "comparison.jsonl", first, second)
+    output = tmp_path / "plots"
+    main(
+        [
+            str(path),
+            "--compare-topologies",
+            "--draft-tokens",
+            "0",
+            "--mode",
+            "decode",
+            "--output-dir",
+            str(output),
+        ]
+    )
+    assert {file.suffix for file in output.iterdir()} == {".png", ".svg"}
+    svg = (output / "decode.svg").read_text()
+    assert "TP1 EP1 ADP1 CP1 (1 GPU); context 8,192" in svg
+    assert "TP1 EP2 ADP1 CP1 (2 GPUs); context 8,192" in svg
+    assert "Measured context range: 8,197–8,218" in svg
+    assert "Meshes reserve different prefill capacities" in svg
+
+
+def test_shared_prefix_plot_labels_both_shared_and_private_context(tmp_path):
+    row = topology_record(
+        shared_prefix_tokens=4096, cached_tokens_min=4096, cached_tokens_max=4096
+    )
+    path = write(tmp_path / "shared.jsonl", row)
+    output = tmp_path / "plots"
+    main(
+        [
+            str(path),
+            "--draft-tokens",
+            "0",
+            "--mode",
+            "decode",
+            "--output-dir",
+            str(output),
+        ]
+    )
+    svg = (output / "decode.svg").read_text()
+    captions = " ".join(re.findall(r"<!-- (.*?) -->", svg))
+    assert "shared prefix=4,096, private suffix=4,096 tokens" in captions
