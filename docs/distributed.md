@@ -374,8 +374,8 @@ groups.close()
 
 The prototype uses object collectives for control metadata. It establishes the
 ownership and execution contract; it does not claim DeepInfer's control-path
-performance. Shared-memory command transport, sparse capture-safe routing,
-communication overlap, throughput validation, expert load balancing, and
+performance. Shared-memory command transport, communication overlap,
+throughput validation, expert load balancing, and
 prefix-aware replica routing remain separate work.
 
 ## Source references and validation

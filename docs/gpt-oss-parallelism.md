@@ -194,6 +194,36 @@ still fail. The complete diagnostic report is
 `artifacts/gpt-oss-composable-all-axes-diagnostics.json`, also stored at
 `resin-gpt-oss-profiles/gpt-oss-composable8-20261021T013452Z.json`.
 
+### Sparse transport qualification
+
+The [four-H100 sparse full-model run](https://modal.com/apps/ekzhang/main/ap-N0wMpfwNbuzaeQUuQH7jft)
+completes EP2+attention-DP2+attention-TP2 and EP2+CP2+attention-TP2 with
+matching greedy probes and actual prefill/decode graph replays. Nine fixed
+numerical comparisons fail, retained in
+`artifacts/gpt-oss-sparse-expert-parallel.json`; this is not a full-model accuracy
+pass. A [bounded real-checkpoint expert probe](https://modal.com/apps/ekzhang/main/ap-EvzcAxZHhzbykqH3zrQWC8)
+separately verifies the same prepared shards: sparse eager equals variable-size
+eager exactly, and three captured replays are bitwise identical on every rank,
+including idle origins. Its strict unsplit expert-block comparison also passes.
+
+Unchunked prompt logprobs match the actual raw output-head distribution within 1.91e-6.
+However, [single-GPU chunked versus unchunked scoring](https://modal.com/apps/ekzhang/main/ap-1Roe4kUsfpXJXV9f3dMY8x)
+differs by up to 5.15 nats, independently of EP or TP; cross-chunk numerical
+equivalence remains unqualified. A [first-layer attention check](https://modal.com/apps/ekzhang/main/ap-FasvATBT14nPXXMCnH0stM)
+using actual Q/K/V and FP32 causal/window attention with the learned sink passes
+all seven chunk shapes (maximum absolute error 0.01993, relative L2 below 0.00174).
+These checks isolate transport and first-layer attention, without identifying
+the cause of the full-model batch-shape sensitivity.
+
+Durable reports in `resin-gpt-oss-profiles` are
+`gpt-oss-composable4-20261022T031241Z.json`,
+`expert-transport-isolation-20261022T032942Z.json`, and
+`prompt-scoring-isolation-20261022T033120Z.json`. The last report's matching `.pt`
+contains the first-layer attention inputs and outputs for replay without another
+checkpoint load. Reproduce the bounded checks with
+`--expert-transport-probe --expert-reference-path <saved-expert.pt>` or
+`--prompt-scoring-probe --attention-oracle` on `deploy/modal_gpt_oss_parallel.py`.
+
 ### Completed graph run
 
 On October 20, 2026, the [graph validation run](https://modal.com/apps/ekzhang/main/ap-xZU7DoXI7fIgUyVCtk8vJj)

@@ -116,3 +116,26 @@ entries carry token IDs, text, bytes, and scores. Set `max_completion_tokens: 0`
 (Chat) or `max_output_tokens: 0` (Responses) for input scoring without generation.
 Chat streams send one `resin.prompt_logprobs` field; Responses streams send one
 `resin.prompt_logprobs` event with a `logprobs` array before completion.
+
+## GPU validation limits
+
+On the pinned GPT-OSS-20B checkpoint, an independent raw output-head
+`log_softmax` oracle matches unchunked input scores within 1.91e-6 with
+temperature/top-k/top-p enabled. Input-only requests return no generated events,
+retain the initial `None`, and complete on one H100 or with composed EP/attention
+DP/attention TP/CP and prefill graph replay. The composed full-model run retains
+nine failed strict numerical comparisons despite matching greedy probes;
+[the model validation record](gpt-oss-parallelism.md#sparse-transport-qualification)
+separates those failures from the exact same-shard sparse transport checks.
+
+Cross-batch numerical parity remains unqualified: the same
+[single-H100 checkpoint](https://modal.com/apps/ekzhang/main/ap-1Roe4kUsfpXJXV9f3dMY8x)
+scores a 180-token prompt differently in one chunk versus 32-token chunks
+(maximum 5.15 nats, relative L2 0.0892). This reproduces without EP or TP.
+[Actual first-layer FA4 inputs](https://modal.com/apps/ekzhang/main/ap-FasvATBT14nPXXMCnH0stM)
+pass an explicit FP32 causal/window attention oracle including the learned sink
+for all seven shapes; the cause of the full-model sensitivity is not established.
+The durable reports in `resin-gpt-oss-profiles` are
+`prompt-scoring-isolation-20261022T032541Z.json` and
+`prompt-scoring-isolation-20261022T033120Z.json`; the latter also has matching
+`.pt` attention inputs/outputs for bounded follow-up.

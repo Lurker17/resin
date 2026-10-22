@@ -52,12 +52,14 @@ def _initialize(rank, port, world_size):
     install_flashinfer_hash_cache()
 
 
-def _new_runner(rank, model_path, *, groups=None, graphs=False):
+def _new_runner(
+    rank, model_path, *, groups=None, graphs=False, chunk_size=PREFILL_CHUNK_SIZE
+):
     from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
     from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
 
     class ValidationGptRunner(GptOssCudaRunner):
-        prefill_chunk_size = PREFILL_CHUNK_SIZE
+        prefill_chunk_size = chunk_size
 
     options = {} if groups is None else {"parallel_groups": groups}
     if graphs:
@@ -78,14 +80,14 @@ def _sampling():
     return SamplingParams(temperature=0.0, logprobs=True, top_logprobs=3)
 
 
-def _engine_options():
+def _engine_options(chunk_size=PREFILL_CHUNK_SIZE):
     return {
         "max_running_requests": 2,
         "context_length": CONTEXT_LENGTH,
         "eos_token_id": None,
         "scheduler_config": SchedulerConfig(
-            max_batch_tokens=PREFILL_CHUNK_SIZE,
-            prefill_chunk_size=PREFILL_CHUNK_SIZE,
+            max_batch_tokens=chunk_size,
+            prefill_chunk_size=chunk_size,
         ),
     }
 
@@ -111,6 +113,76 @@ def _drain(engine, *, inject=None):
         if inject is not None:
             inject(steps)
     return {"steps": steps, "events": events}
+
+
+def _score_prompt(engine, prompt, *, oracle_head=None):
+    """Score an isolated prompt; optionally verify against independent raw logits."""
+    oracle, head_calls, offset = [], 0, 0
+
+    def observe(_module, _inputs, output):
+        nonlocal head_calls, offset
+        head_calls += 1
+        # GPT-OSS first projects the one final hidden row used by its ordinary
+        # sampler, then projects the requested predecessor rows in bounded chunks.
+        if head_calls == 1:
+            return
+        count = output.shape[0]
+        targets = torch.tensor(
+            prompt[1 + offset : 1 + offset + count], device=output.device
+        )
+        if len(targets) != count:
+            raise AssertionError("prompt oracle received unexpected output-head rows")
+        selected = output.float().log_softmax(-1).gather(1, targets[:, None]).squeeze(1)
+        oracle.extend(selected.detach().cpu().tolist())
+        offset += count
+
+    hook = None if oracle_head is None else oracle_head.register_forward_hook(observe)
+    try:
+        request = engine.submit(
+            prompt,
+            max_new_tokens=0,
+            sampling_params=SamplingParams(
+                temperature=0.37, top_k=1, top_p=0.5, prompt_logprobs=True
+            ),
+        )
+        progress = _drain(engine)
+        if progress["events"] or request.take_result():
+            raise AssertionError("prompt-only scoring unexpectedly generated tokens")
+        values = request.prompt_logprobs
+        if values is None or len(values) != len(prompt) or values[0] is not None:
+            raise AssertionError(
+                "prompt scores must preserve input order and first None"
+            )
+        scores = [None]
+        for value in values[1:]:
+            if value is None or not math.isfinite(value.logprob) or value.logprob > 0:
+                raise AssertionError("prompt scoring omitted finite raw logprobs")
+            scores.append(float(value.logprob))
+        report = {
+            "prompt_tokens": len(prompt),
+            "scores": scores,
+            "sampling": {"temperature": 0.37, "top_k": 1, "top_p": 0.5},
+            **progress,
+        }
+        if oracle_head is not None:
+            if progress["steps"] != 1 or len(oracle) != len(prompt) - 1:
+                raise AssertionError(
+                    "the independent prompt baseline must be unchunked"
+                )
+            report["raw_distribution"] = _metrics(
+                torch.tensor(scores[1:]),
+                torch.tensor(oracle),
+                maximum=1e-5,
+                relative=1e-6,
+            )
+            if not report["raw_distribution"]["passed"]:
+                raise AssertionError(
+                    "prompt scores differ from untempered raw log_softmax"
+                )
+        return report
+    finally:
+        if hook is not None:
+            hook.remove()
 
 
 class _Capture:
@@ -293,9 +365,9 @@ def _metrics(actual, expected, *, maximum, relative):
 def _baseline_rank(rank, port, directory, model_path, prompts, world_size):
     _initialize(rank, port, world_size)
     start = time.perf_counter()
-    runner = _new_runner(rank, model_path)
+    runner = _new_runner(rank, model_path, chunk_size=CONTEXT_LENGTH)
     capture = _Capture(runner, expert=True)
-    engine = Engine(runner, **_engine_options())
+    engine = Engine(runner, **_engine_options(CONTEXT_LENGTH))
     try:
         teachers, teacher_reports = {}, {}
         for name in ("short", "long", "probe"):
@@ -362,6 +434,12 @@ def _baseline_rank(rank, port, directory, model_path, prompts, world_size):
             raise AssertionError(
                 "baseline did not capture real checkpoint expert execution"
             )
+        # Score after teacher/history captures have been finalized: the extra
+        # output-head projections must not overwrite any teacher comparison.
+        capture.close()
+        prompt_scoring = _score_prompt(
+            engine, prompts["long"], oracle_head=runner._model.lm_head
+        )
         torch.save(
             {
                 "teachers": teachers,
@@ -377,6 +455,7 @@ def _baseline_rank(rank, port, directory, model_path, prompts, world_size):
             "teacher_forced": teacher_reports,
             "generation": generation,
             "repeatability": repeatability,
+            "prompt_scoring": prompt_scoring,
             "cache_free_parents": engine.cache_free_parent_count,
             "cache_parent_capacity": engine.cache_parent_capacity,
         }
@@ -388,7 +467,54 @@ def _baseline_rank(rank, port, directory, model_path, prompts, world_size):
         dist.destroy_process_group()
 
 
-def _expert_comparisons(runner, groups, reference):
+def _sparse_expert_graph_probe(expert, inputs, eager, groups, capacity):
+    """Isolate sparse capture with the same prepared shards and checkpoint rows."""
+    dispatch = expert._dispatch
+    stream = torch.cuda.Stream(device=inputs[0].device)
+    stream.wait_stream(torch.cuda.current_stream(inputs[0].device))
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with (
+            torch.cuda.stream(stream),
+            torch.inference_mode(),
+            dispatch.fixed_capacity(capacity),
+        ):
+            for _ in range(3):
+                fixed = expert(*inputs)
+            expected = fixed.detach().clone()
+        stream.synchronize()
+        dist.barrier(group=groups.device_domain.handle)
+        with (
+            torch.cuda.graph(graph, stream=stream),
+            torch.inference_mode(),
+            dispatch.fixed_capacity(capacity),
+        ):
+            captured = expert(*inputs)
+        comparisons = []
+        for replay in range(3):
+            graph.replay()
+            torch.cuda.synchronize(inputs[0].device)
+            comparisons.append(
+                {
+                    "replay": replay,
+                    **_metrics(captured, expected, maximum=0.0, relative=0.0),
+                }
+            )
+        dist.barrier(group=groups.device_domain.handle)
+        return {
+            "rows": len(inputs[0]),
+            "capacity": capacity,
+            "warmup_calls": 3,
+            "capture_count": 1,
+            "fixed_vs_eager": _metrics(expected, eager, maximum=0.25, relative=0.025),
+            "graph_vs_fixed": comparisons,
+        }
+    finally:
+        torch.cuda.synchronize(inputs[0].device)
+        graph.reset()
+
+
+def _expert_comparisons(runner, groups, reference, *, graphs=False):
     expert = runner._model.model.layers[0].mlp.experts
     results = []
     count = reference["hidden"].shape[0]
@@ -401,7 +527,7 @@ def _expert_comparisons(runner, groups, reference):
     # Replicated attention must use the same rows on every rank.
     if groups.topology.attn_dp == 1:
         selections[1] = torch.arange(min(count, 5))
-    for selection in selections:
+    for index, selection in enumerate(selections):
         inputs = [
             reference[name][selection].to(runner.device).contiguous()
             for name in ("hidden", "indices", "weights", "logits")
@@ -431,6 +557,14 @@ def _expert_comparisons(runner, groups, reference):
                 output = expert(*inputs)
         finally:
             expert._dispatch.local = original_local
+        # Reuse one existing eager checkpoint probe. The second selection also
+        # includes an idle attention-DP source; every physical rank captures the
+        # same sparse capacity, with its actual prepared expert/TP shards.
+        sparse_graph = (
+            _sparse_expert_graph_probe(expert, inputs, output, groups, max(1, count))
+            if graphs and index == 1
+            else None
+        )
         actual = output.detach().float().cpu()
         expected = reference["output"][selection].float()
         difference = (actual - expected).abs()
@@ -456,6 +590,7 @@ def _expert_comparisons(runner, groups, reference):
                 "rows": len(selection),
                 "local_partials": partials,
                 "largest_errors": errors,
+                **({"same_shard_sparse_graph": sparse_graph} if sparse_graph else {}),
                 **_metrics(
                     output, reference["output"][selection], maximum=0.25, relative=0.025
                 ),
@@ -571,6 +706,28 @@ def _driver_workload(worker, capture, reference, prompts, baseline, *, graphs=Fa
                 probe["token_ids"] == baseline["generation"]["token_ids"]
             )
             probes.append(probe)
+        # All drivers submit the same isolated scoring request after the teacher
+        # and decode probes. The real checkpoint now runs in 32-token chunks,
+        # with the composed attention/expert mesh and captured prefill regions.
+        before = worker.runner.cuda_graph_stats["prefill"]["replay_count"]
+        prompt_scoring = _score_prompt(engine, prompts["long"])
+        prompt_scoring["prefill_graph_replays"] = (
+            worker.runner.cuda_graph_stats["prefill"]["replay_count"] - before
+        )
+        if prompt_scoring["steps"] <= 1:
+            raise AssertionError(
+                "prompt-scoring validation did not cross a prefill chunk"
+            )
+        if graphs and not prompt_scoring["prefill_graph_replays"]:
+            raise AssertionError(
+                "prompt scoring did not replay captured prefill regions"
+            )
+        prompt_scoring["comparison"] = _metrics(
+            torch.tensor(prompt_scoring["scores"][1:]),
+            torch.tensor(baseline["prompt_scoring"]["scores"][1:]),
+            maximum=0.5,
+            relative=0.02,
+        )
         return {
             "dp": dp,
             "teacher_forced": teachers,
@@ -586,6 +743,7 @@ def _driver_workload(worker, capture, reference, prompts, baseline, *, graphs=Fa
             "workload": progress,
             "cancellations": cancellations,
             "probes": probes,
+            "prompt_scoring": prompt_scoring,
             "free_after_workload": free_after_workload,
             "free_after_replay": engine.local.cache_free_parent_count,
             "cache_parent_capacity": engine.local.cache_parent_capacity,
@@ -605,7 +763,7 @@ def _ep_rank(
         runner = _new_runner(rank, model_path, groups=groups, graphs=graphs)
         reference = torch.load(Path(directory, "baseline-0.pt"), weights_only=True)
         baseline = json.loads(Path(directory, "baseline-0.json").read_text())
-        expert = _expert_comparisons(runner, groups, reference["expert"])
+        expert = _expert_comparisons(runner, groups, reference["expert"], graphs=graphs)
         # Hooks that transfer tensors to the host are installed only after
         # capture. Every rank captures the same catalog before serving steps.
         captured = runner.capture_cuda_graphs() if graphs else runner.cuda_graph_stats
@@ -647,6 +805,97 @@ def _ep_rank(
             runner.close_cuda_graphs()
         groups.close()
         dist.destroy_process_group()
+
+
+def _expert_transport_rank(
+    rank, port, directory, model_path, reference_path, world_size
+):
+    """Load one prepared checkpoint shard and exercise only its first expert block."""
+    _initialize(rank, port, world_size)
+    groups = ParallelGroups.create(
+        Parallelism(world_size=world_size, ep=2, attn_dp=2, attn_tp=2)
+    )
+    runner = None
+    try:
+        runner = _new_runner(rank, model_path, groups=groups)
+        reference = torch.load(reference_path, weights_only=True)
+        comparisons = _expert_comparisons(runner, groups, reference, graphs=True)
+        torch.cuda.synchronize()
+        dist.barrier()
+        Path(directory, f"expert-transport-{rank}.json").write_text(
+            json.dumps({"rank": rank, "expert_comparisons": comparisons})
+        )
+    finally:
+        if runner is not None:
+            runner.close_cuda_graphs()
+        groups.close()
+        dist.destroy_process_group()
+
+
+def run_expert_transport_probe(
+    model_path, reference_path, *, world_size=4, diagnostic_path=None
+):
+    """Validate sparse eager/capture on existing real-checkpoint expert inputs.
+
+    This runs one EP2/attention-DP2/attention-TP2 model load, one prepared expert
+    block, and no language-model generation. Strict unsplit-baseline comparisons
+    remain in the report; the transport verdict uses the same-shard checks only.
+    """
+    if world_size != 4 or torch.cuda.device_count() != world_size:
+        raise ValueError(
+            "the bounded expert transport probe requires exactly four GPUs"
+        )
+    with tempfile.TemporaryDirectory(prefix="resin-gpt-oss-transport-") as directory:
+        _spawn(
+            _expert_transport_rank,
+            directory,
+            model_path,
+            str(reference_path),
+            world_size,
+        )
+        records = [
+            json.loads(Path(directory, f"expert-transport-{rank}.json").read_text())
+            for rank in range(world_size)
+        ]
+    failures, unsplit_failures = [], []
+    for record in records:
+        probes = []
+        for comparison in record["expert_comparisons"]:
+            if not comparison["passed"]:
+                unsplit_failures.append(
+                    {"rank": record["rank"], "comparison": comparison}
+                )
+            if "same_shard_sparse_graph" in comparison:
+                probes.append(comparison["same_shard_sparse_graph"])
+        if len(probes) != 1 or len(probes[0]["graph_vs_fixed"]) != 3:
+            raise AssertionError(
+                "each rank must capture one expert block and replay three times"
+            )
+        for kind, checks in (
+            ("fixed_vs_eager", [probes[0]["fixed_vs_eager"]]),
+            ("graph_vs_fixed", probes[0]["graph_vs_fixed"]),
+        ):
+            failures.extend(
+                {"rank": record["rank"], "kind": kind, "comparison": check}
+                for check in checks
+                if not check["passed"]
+            )
+    report = {
+        "probe": "same_shard_sparse_expert_graph",
+        "parallelism": {"world_size": 4, "ep": 2, "attn_dp": 2, "attn_tp": 2},
+        "transport_passed": not failures,
+        "transport_errors": failures,
+        "unsplit_baseline_passed": not unsplit_failures,
+        "unsplit_baseline_errors": unsplit_failures,
+        "ranks": records,
+    }
+    if diagnostic_path is not None:
+        Path(diagnostic_path).write_text(json.dumps(report, indent=2, sort_keys=True))
+    if failures:
+        raise AssertionError(
+            f"same-shard expert transport comparisons failed: {failures}"
+        )
+    return report
 
 
 def _spawn(target, directory, model_path, prompts, world_size, *extra):
@@ -715,6 +964,21 @@ def _check_case(records, case, vocab_size, *, graphs=False, collect_numerical=Fa
                         f"{final['fallback_counts']}"
                     )
         for comparison in record["expert_comparisons"]:
+            sparse_graph = comparison.get("same_shard_sparse_graph")
+            if sparse_graph is not None:
+                for kind, checks in (
+                    ("same_shard_sparse_eager", [sparse_graph["fixed_vs_eager"]]),
+                    ("same_shard_sparse_graph", sparse_graph["graph_vs_fixed"]),
+                ):
+                    for check in checks:
+                        if not check["passed"]:
+                            numerical_errors.append(
+                                {
+                                    "kind": kind,
+                                    "rank": record["rank"],
+                                    "comparison": check,
+                                }
+                            )
             if not comparison["passed"]:
                 numerical_errors.append(
                     {
@@ -745,6 +1009,14 @@ def _check_case(records, case, vocab_size, *, graphs=False, collect_numerical=Fa
                 "idle attention-DP ranks did not replay both graph modes"
             )
     for driver in drivers:
+        if not driver["prompt_scoring"]["comparison"]["passed"]:
+            numerical_errors.append(
+                {
+                    "kind": "prompt_logprobs",
+                    "dp": driver["dp"],
+                    "comparison": driver["prompt_scoring"]["comparison"],
+                }
+            )
         for teacher in driver["teacher_forced"].values():
             if not teacher["logits"]["passed"]:
                 numerical_errors.append(
@@ -842,6 +1114,15 @@ def _case_summary(records, case):
                         "teacher_forced_decode": record["driver_result"][
                             "teacher_forced_decode"
                         ]["comparisons"],
+                        "prompt_scoring": {
+                            field: record["driver_result"]["prompt_scoring"][field]
+                            for field in (
+                                "prompt_tokens",
+                                "steps",
+                                "prefill_graph_replays",
+                                "comparison",
+                            )
+                        },
                         "greedy_probes": [
                             {
                                 "token_ids": probe["token_ids"],
@@ -940,6 +1221,8 @@ def run_validation(
         for ids in prompts.values()
     ):
         raise ValueError("validation prompts do not fit the bounded context")
+    if len(prompts["long"]) <= PREFILL_CHUNK_SIZE:
+        raise ValueError("the prompt-scoring probe must cross a prefill chunk")
     with tempfile.TemporaryDirectory(prefix="resin-gpt-oss-ep-") as directory:
         print(
             "[parallel-validation] loading independent full20B single-GPU baselines",
