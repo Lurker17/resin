@@ -348,6 +348,15 @@ impl GptOssGrammar {
 }
 
 impl Grammar for GptOssGrammar {
+    fn channel(&self) -> Option<&'static str> {
+        match self.state {
+            State::Text => Some("content"),
+            State::Reasoning => Some("reasoning"),
+            State::Tool(_) => Some("tool"),
+            _ => None,
+        }
+    }
+
     fn is_control(&self, id: u32) -> bool {
         self.tokens.ids().contains(&id)
     }

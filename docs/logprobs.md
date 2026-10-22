@@ -1,19 +1,34 @@
-# Generated token logprobs
+# Token logprobs
 
 Request scores with `SamplingParams(logprobs=True)` or alternatives with
 `SamplingParams(top_logprobs=5)`. Each returned `TokenEvent.logprobs` contains the
 selected token's `logprob` and a list of `(token_id, logprob)` alternatives.
 Scores describe the raw model distribution, before temperature, top-k, or top-p
-sampling; requesting them does not change token selection. Prompt scoring is not
-implemented in this prototype.
+sampling; requesting them does not change token selection.
+
+Request input scores independently with `SamplingParams(prompt_logprobs=True)`.
+`RequestLease.prompt_logprobs` contains one entry per prompt token. The first is
+`None` because it has no predecessor; other entries contain raw-model scores
+after their prefill chunk commits. Unprocessed entries remain `None`. Set
+`max_new_tokens=0` to score only the input and complete without output events.
+All stock runners reuse the same prefill hidden states and project scores in
+bounded chunks, with no second transformer pass. Cross-chunk targets are part
+of the execution plan, so the final predecessor in a chunk scores the first
+token of the next chunk.
+
+Scoring requests bypass prefix restoration: KV cache entries do not retain
+the predecessor distributions needed to score a cached prefix. They still
+publish reusable KV prefixes for ordinary requests. Generated-token scoring,
+including speculative acceptance, keeps its existing behavior.
 
 Model runners use `resin.backend.sampling.format_output(logits, tokens, plan)`
 for ordinary and speculative output. Verification positions must align with the
 returned accepted tokens. Unrequested and continuation-prefill rows carry no
-scores. CUDA runners currently use eager execution for scored requests; captured
-graphs retain their existing token-only output contract. `BatchPlan.needs_logprobs`
-checks the score flag natively, so unscored graph replay does not create Python
-sampling-policy objects merely to decide whether scores are needed.
+scores. Generation scores use the retained output logits after execution;
+model runners keep their existing graph eligibility and eager fallback rules.
+`BatchPlan.needs_logprobs` checks the score flag natively, so unscored graph
+replay does not create Python sampling-policy objects merely to decide whether
+scores are needed.
 
 ## Array boundary
 
@@ -28,6 +43,8 @@ Runners return a `ForwardOutput` with contiguous one-dimensional NumPy arrays:
 | `top_indptr` | uint32 | Alternative offsets, length scored tokens + 1 |
 | `top_token_ids` | uint32 | Packed alternative token IDs |
 | `top_logprobs` | float32 | Packed alternative scores |
+| `prompt_logprobs` | float32 | Packed requested predecessor scores |
+| `prompt_logprob_indptr` | uint32 | Prompt-score row offsets, length batch + 1 |
 
 The three `top_*` columns are supplied together or omitted. An empty score row
 opts out; every other score row must cover its complete raw token row, including
@@ -51,5 +68,50 @@ Native Rust runners can expose the same borrowed columns through
 before committing any request, including scores that EOS would otherwise hide.
 Invalid outputs follow the existing execution quarantine path.
 
-This API is currently available through `Engine` and its runner protocol. HTTP
-response serialization and prompt-token scoring are separate work.
+Prompt-score columns are supplied together, independently of generated-token
+scores. `BatchPlan.prompt_score_indices` selects flattened prefill predecessor
+rows, `prompt_score_token_ids` supplies their next prompt tokens, and
+`prompt_score_indptr` partitions them by sequence. Runners return every requested
+score, including on intermediate prefill chunks with no sampled output. Native
+runners expose these columns through `Runner::prompt_logprobs()`; invalid or
+missing scores quarantine the entire execution before progress becomes visible.
+
+## HTTP
+
+Chat Completions accepts `logprobs: true` and `top_logprobs: 0..20`. Responses
+accepts `include: ["message.output_text.logprobs"]` and `top_logprobs`; a positive
+alternative count also enables selected-token scores. These flags reach the
+same native `SamplingParams` and NumPy score columns used by direct Engine calls.
+
+Every scored generated token appears in `resin.generation_logprobs`, with
+`token_id`, zero-based `token_index`, display `token`, `bytes`, `logprob`, optional
+semantic `channel`, and `top_logprobs`. Alternatives include their IDs, display
+text, bytes, and scores. Byte-level and byte-fallback tokenizers retain the actual
+bytes, including incomplete UTF-8; concatenating display strings can introduce
+replacement characters, so use `bytes` to reconstruct text. Unsupported decoder
+formats and custom codecs without a serialized tokenizer report `bytes: null`.
+JSON represents a valid negative-infinite logprob as `null`.
+
+The complete raw list includes reasoning, tool markup, headers, and model
+terminators. Canonical Chat `choices[0].logprobs.content` and Responses
+`output_text.logprobs` contain only tokens proven to belong wholly to visible
+content. Parsers that trim, buffer, or transform a token can leave its channel
+unknown; custom parsers have the same conservative fallback. User stop strings
+also disable canonical content association because a held prefix can consume
+part of a token. The raw list remains complete through the token that matches
+the stop, with no records for the remaining verified-block suffix.
+
+Chat streams publish the raw records on chunks under
+`resin.generation_logprobs`; their canonical content records accompany the same
+chunk. Responses streams publish `resin.generation_logprobs.delta` events with a
+`logprobs` array, and include canonical content records on the completed text
+part and final response. Concatenating raw score arrays yields the same records
+as the non-streaming response, independently of semantic parser chunk boundaries.
+
+Both APIs accept `prompt_logprobs: true`, independently of generated scores.
+The result's `resin.prompt_logprobs` follows the complete rendered prompt,
+including model scaffold and control tokens. Its first entry is `null`; later
+entries carry token IDs, text, bytes, and scores. Set `max_completion_tokens: 0`
+(Chat) or `max_output_tokens: 0` (Responses) for input scoring without generation.
+Chat streams send one `resin.prompt_logprobs` field; Responses streams send one
+`resin.prompt_logprobs` event with a `logprobs` array before completion.

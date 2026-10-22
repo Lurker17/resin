@@ -39,9 +39,7 @@ class Recipe:
     def render(self, request: dict[str, Any]) -> RenderedPrompt:
         return {
             "token_ids": self._native.render_ids(request),
-            "stop_token_ids": self._native.get_stop_token_ids(
-                request.get("stop") or []
-            ),
+            "stop_token_ids": self._native.get_stop_token_ids(),
         }
 
     def render_ids(

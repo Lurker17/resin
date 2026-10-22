@@ -201,7 +201,7 @@ def test_parser_finalization_deltas_precede_completion(stream, completion_reason
                     for choice in choices
                     if choice["delta"].get("content")
                 ]
-                assert deltas == ["before", "-after"]
+                assert "".join(deltas) == "before-after"
                 assert choices[-1]["finish_reason"] == completion_reason
                 assert all(choice["finish_reason"] is None for choice in choices[:-1])
             else:

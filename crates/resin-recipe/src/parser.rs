@@ -4,6 +4,9 @@ use crate::{Decoder, Encoder, Error, Event, FinishReason, ResponseParser};
 
 pub trait Grammar: Send {
     const STRICT_END: bool = false;
+    fn channel(&self) -> Option<&'static str> {
+        None
+    }
     fn is_control(&self, id: u32) -> bool;
     fn text(&mut self, text: String, events: &mut Vec<Event>) -> Result<(), Error>;
     fn control(&mut self, id: u32, events: &mut Vec<Event>) -> Result<(), Error>;
@@ -45,6 +48,16 @@ impl<G: Grammar> Parser<G> {
 }
 
 impl<G: Grammar> ResponseParser for Parser<G> {
+    fn token_channel(&self, id: u32) -> Option<&'static str> {
+        if self.finished || self.grammar.ended() {
+            None
+        } else if self.grammar.is_control(id) {
+            Some("control")
+        } else {
+            self.grammar.channel()
+        }
+    }
+
     fn feed(&mut self, ids: &[u32]) -> Result<Vec<Event>, Error> {
         if self.finished {
             return Err(Error::new("cannot feed a response parser after finish"));

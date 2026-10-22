@@ -77,6 +77,184 @@ async fn json_response(app: axum::Router, request: Request<Body>) -> (StatusCode
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
+#[test]
+fn coordinator_score_transport_preserves_valid_negative_infinity() {
+    let event = GenerationEvent::Logprobs(vec![resin_http::GeneratedTokenLogprob {
+        token: resin_http::TokenLogprob {
+            token_id: 42,
+            token: "x".to_owned(),
+            bytes: Some(vec![b'x']),
+            logprob: f32::NEG_INFINITY,
+        },
+        token_index: 0,
+        channel: Some("content".to_owned()),
+        top_logprobs: vec![],
+    }]);
+    let wire = serde_json::to_string(&vec![("global-id", event)]).unwrap();
+    let restored: Vec<(String, GenerationEvent)> = serde_json::from_str(&wire).unwrap();
+    assert_eq!(restored[0].0, "global-id");
+    let GenerationEvent::Logprobs(tokens) = &restored[0].1 else {
+        panic!("wrong event")
+    };
+    assert_eq!(tokens[0].token.logprob, f32::NEG_INFINITY);
+    assert_eq!(tokens[0].token.bytes, Some(vec![b'x']));
+}
+
+fn recording_router(ranks: usize) -> axum::Router {
+    let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(32);
+    tokio::spawn(async move {
+        while let Some(job) = receiver.recv().await {
+            let request = serde_json::to_string(&job.request).unwrap();
+            let _ = job.events.send(GenerationEvent::TextDelta(request)).await;
+            let _ = job
+                .events
+                .send(GenerationEvent::Finished {
+                    reason: FinishReason::Stop,
+                    input_tokens: 1,
+                    cached_tokens: 0,
+                    output_tokens: 1,
+                    elapsed_ms: 1.0,
+                    generation_elapsed_ms: 1.0,
+                    time_to_first_token_ms: 0.0,
+                })
+                .await;
+        }
+    });
+    router(
+        "test-model",
+        jobs,
+        RouteConfig {
+            routed_dp_size: ranks,
+            ..RouteConfig::default()
+        },
+    )
+}
+
+#[tokio::test]
+async fn routing_metadata_uses_only_explicit_body_or_unprefixed_header() {
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages": [{"role":"user","content":"hi"}]}),
+        ),
+        ("/v1/responses", json!({"input":"hi"})),
+        (
+            "/v1/messages",
+            json!({"messages": [{"role":"user","content":"hi"}], "max_tokens":1}),
+        ),
+    ] {
+        for (body_rank, header_rank, expected) in [
+            (Value::Null, None, Value::Null),
+            (json!(2), None, json!(2)),
+            (json!(2), Some("1"), json!(1)),
+            (
+                json!("invalid body overridden by header"),
+                Some("0"),
+                json!(0),
+            ),
+        ] {
+            let mut body = body.clone();
+            body["model"] = json!("test-model");
+            body["routed_dp_rank"] = body_rank;
+            let mut request = Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Data-Parallel-Rank", "3")
+                .header("data-parallel-rank", "3");
+            if let Some(rank) = header_rank {
+                request = request.header("routed-dp-rank", rank);
+            }
+            let (status, response) = json_response(
+                recording_router(4),
+                request.body(Body::from(body.to_string())).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}: {response}");
+            let content = match path {
+                "/v1/chat/completions" => &response["choices"][0]["message"]["content"],
+                "/v1/responses" => &response["output"][0]["content"][0]["text"],
+                _ => &response["content"][0]["text"],
+            };
+            let normalized: Value = serde_json::from_str(content.as_str().unwrap()).unwrap();
+            assert_eq!(normalized["routed_dp_rank"], expected);
+        }
+        for rank in [json!(-1), json!(4), json!(1.5), json!(true), json!("1")] {
+            let mut body = body.clone();
+            body["model"] = json!("test-model");
+            body["routed_dp_rank"] = rank;
+            let (status, _) = json_response(
+                recording_router(4),
+                Request::post(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        }
+        for rank in ["-1", "4", "1.5", "banana", ""] {
+            let mut body = body.clone();
+            body["model"] = json!("test-model");
+            let (status, _) = json_response(
+                recording_router(4),
+                Request::post(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("routed-dp-rank", rank)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {rank}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn score_options_are_explicit_normalized_request_fields() {
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages": [{"role":"user","content":"hi"}], "logprobs":true}),
+        ),
+        (
+            "/v1/responses",
+            json!({"input":"hi", "include":["message.output_text.logprobs"]}),
+        ),
+    ] {
+        let mut body = body;
+        body["model"] = json!("test-model");
+        body["top_logprobs"] = json!(3);
+        body["prompt_logprobs"] = json!(true);
+        let (status, response) = json_response(
+            recording_router(1),
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let content = if path.ends_with("completions") {
+            &response["choices"][0]["message"]["content"]
+        } else {
+            &response["output"][0]["content"][0]["text"]
+        };
+        let normalized: Value = serde_json::from_str(content.as_str().unwrap()).unwrap();
+        assert_eq!(normalized["logprobs"], true);
+        assert_eq!(normalized["top_logprobs"], 3);
+        assert_eq!(normalized["prompt_logprobs"], true);
+        body["top_logprobs"] = json!(21);
+        let (status, _) = json_response(
+            recording_router(1),
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+}
+
 #[tokio::test]
 async fn chat_completions_returns_reasoning_text_and_usage() {
     let request = Request::post("/v1/chat/completions")
@@ -154,6 +332,7 @@ async fn route_flags_remove_disabled_apis_and_demo() {
             enable_openai: false,
             enable_anthropic: false,
             enable_demo: false,
+            ..RouteConfig::default()
         },
     );
     for path in ["/", "/v1/models", "/v1/chat/completions", "/v1/messages"] {

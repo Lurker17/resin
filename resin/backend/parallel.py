@@ -52,11 +52,15 @@ def batch_plan_payload(plan: BatchPlan) -> dict[str, Any]:
                 "seed": params.seed,
                 "logprobs": params.logprobs,
                 "top_logprobs": params.top_logprobs,
+                "prompt_logprobs": params.prompt_logprobs,
                 "extra": params.extra,
             }
             for params in plan.sampling_params
         ],
         "sampling_mask": plan.sampling_mask,
+        "prompt_score_indices": plan.prompt_score_indices,
+        "prompt_score_token_ids": plan.prompt_score_token_ids,
+        "prompt_score_indptr": plan.prompt_score_indptr,
         "media": plan.media,
         "cache_groups": [
             {
@@ -95,6 +99,9 @@ def batch_plan_from_payload(payload: dict[str, Any]) -> BatchPlan:
         sampling_mask=payload["sampling_mask"],
         sampling_params=sampling_params,
         media=payload["media"],
+        prompt_score_indices=payload.get("prompt_score_indices"),
+        prompt_score_token_ids=payload.get("prompt_score_token_ids"),
+        prompt_score_indptr=payload.get("prompt_score_indptr"),
     )
 
 

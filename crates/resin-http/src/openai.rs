@@ -8,7 +8,7 @@ use async_stream::stream;
 use axum::{
     Json,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         Html, IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -62,6 +62,11 @@ pub(crate) struct ChatRequest {
     top_p: f64,
     top_k: Option<u32>,
     seed: Option<i64>,
+    logprobs: Option<bool>,
+    top_logprobs: Option<usize>,
+    #[serde(default)]
+    prompt_logprobs: bool,
+    routed_dp_rank: Option<Value>,
     stop: Option<OneOrManyStrings>,
     reasoning_effort: Option<String>,
     #[serde(default)]
@@ -77,6 +82,9 @@ pub(crate) struct ChatRequest {
 pub(crate) struct ResponsesRequest {
     model: String,
     input: Value,
+    stop: Option<OneOrManyStrings>,
+    #[serde(default)]
+    include: Vec<String>,
     instructions: Option<String>,
     #[serde(default)]
     tools: Vec<Value>,
@@ -87,6 +95,11 @@ pub(crate) struct ResponsesRequest {
     top_p: f64,
     top_k: Option<u32>,
     seed: Option<i64>,
+    logprobs: Option<bool>,
+    top_logprobs: Option<usize>,
+    #[serde(default)]
+    prompt_logprobs: bool,
+    routed_dp_rank: Option<Value>,
     reasoning: Option<Value>,
     #[serde(default)]
     stream: bool,
@@ -132,8 +145,13 @@ pub async fn models(State(state): State<AppState>) -> Json<Value> {
 
 pub async fn chat_completions(
     State(state): State<AppState>,
-    Json(body): Json<ChatRequest>,
+    headers: HeaderMap,
+    Json(mut body): Json<ChatRequest>,
 ) -> Response {
+    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
+        Ok(rank) => rank.map(|rank| json!(rank)),
+        Err(response) => return *response,
+    };
     let stream = body.stream;
     let include_usage = body.stream_options.include_usage;
     let request = match chat_request(&state, body) {
@@ -156,6 +174,8 @@ pub async fn chat_completions(
 fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<ConversationRequest> {
     validate_model(state, &body.model)?;
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
+    validate_logprobs(body.top_logprobs)?;
+    validate_stops(body.stop.as_ref())?;
     if body.messages.is_empty() {
         return Err(invalid_request("messages must not be empty"));
     }
@@ -166,8 +186,10 @@ fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<Conversati
         .max_completion_tokens
         .or(body.max_tokens)
         .unwrap_or(16_384);
-    if max_output_tokens == 0 {
-        return Err(invalid_request("max_completion_tokens must be positive"));
+    if max_output_tokens == 0 && !body.prompt_logprobs {
+        return Err(invalid_request(
+            "max_completion_tokens must be positive unless prompt_logprobs is enabled",
+        ));
     }
     Ok(ConversationRequest {
         id: state.request_id("chatcmpl"),
@@ -179,6 +201,13 @@ fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<Conversati
         top_p: body.top_p,
         top_k: body.top_k,
         seed: body.seed,
+        logprobs: body.logprobs.unwrap_or(false) || body.top_logprobs.unwrap_or(0) > 0,
+        top_logprobs: body.top_logprobs.unwrap_or(0),
+        prompt_logprobs: body.prompt_logprobs,
+        routed_dp_rank: body
+            .routed_dp_rank
+            .and_then(|rank| rank.as_u64())
+            .map(|rank| rank as usize),
         stop: body.stop.map_or_else(Vec::new, OneOrManyStrings::into_vec),
         reasoning_effort: body.reasoning_effort,
         extra: body.extra,
@@ -212,6 +241,7 @@ async fn chat_response(
     if !tool_calls.is_empty() {
         message["tool_calls"] = json!(tool_calls);
     }
+    let logprobs = chat_logprobs(&request, &response.logprobs);
     Json(json!({
         "id": request.id,
         "object": "chat.completion",
@@ -221,9 +251,10 @@ async fn chat_response(
             "index": 0,
             "message": message,
             "finish_reason": reason.openai(!response.tool_calls.is_empty()),
-            "logprobs": null,
+            "logprobs": logprobs,
         }],
         "usage": usage(response.input_tokens, response.cached_tokens, response.output_tokens),
+        "resin": raw_scores(&request, &response),
     }))
     .into_response()
 }
@@ -252,6 +283,18 @@ fn chat_stream(
                 GenerationEvent::ToolCallArgumentsDelta { index, delta } => chat_chunk(&request, created, json!({"tool_calls": [{
                     "index": index, "function": {"arguments": delta}
                 }]}), None),
+                GenerationEvent::Logprobs(tokens) => {
+                    let mut chunk = chat_chunk(&request, created, json!({}), None);
+                    chunk["choices"][0]["logprobs"] = chat_logprobs(&request, &tokens);
+                    chunk["resin"] = json!({"generation_logprobs": tokens});
+                    chunk
+                }
+                GenerationEvent::StopSequence(_) => continue,
+                GenerationEvent::PromptLogprobs(tokens) => {
+                    let mut chunk = chat_chunk(&request, created, json!({}), None);
+                    chunk["resin"] = json!({"prompt_logprobs": tokens});
+                    chunk
+                }
                 GenerationEvent::Finished { reason, input_tokens, cached_tokens, output_tokens, elapsed_ms, generation_elapsed_ms, time_to_first_token_ms } => {
                     terminated = true;
                     let mut chunk = chat_chunk(&request, created, json!({}), Some(reason.openai(has_tool_calls)));
@@ -311,8 +354,13 @@ fn chat_chunk(
 
 pub async fn responses(
     State(state): State<AppState>,
-    Json(body): Json<ResponsesRequest>,
+    headers: HeaderMap,
+    Json(mut body): Json<ResponsesRequest>,
 ) -> Response {
+    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
+        Ok(rank) => rank.map(|rank| json!(rank)),
+        Err(response) => return *response,
+    };
     let stream = body.stream;
     let request = match responses_request(&state, body) {
         Ok(request) => request,
@@ -337,6 +385,15 @@ fn responses_request(
 ) -> RequestResult<ConversationRequest> {
     validate_model(state, &body.model)?;
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
+    validate_logprobs(body.top_logprobs)?;
+    validate_stops(body.stop.as_ref())?;
+    body.logprobs = Some(
+        body.logprobs.unwrap_or(false)
+            || body
+                .include
+                .iter()
+                .any(|field| field == "message.output_text.logprobs"),
+    );
     let mut messages = response_input_messages(body.input)?;
     if let Some(instructions) = body.instructions {
         messages.insert(0, json!({"role": "developer", "content": instructions}));
@@ -345,8 +402,10 @@ fn responses_request(
         return Err(invalid_request("input must not be empty"));
     }
     let max_output_tokens = body.max_output_tokens.unwrap_or(16_384);
-    if max_output_tokens == 0 {
-        return Err(invalid_request("max_output_tokens must be positive"));
+    if max_output_tokens == 0 && !body.prompt_logprobs {
+        return Err(invalid_request(
+            "max_output_tokens must be positive unless prompt_logprobs is enabled",
+        ));
     }
     let reasoning_effort = body
         .reasoning
@@ -367,7 +426,14 @@ fn responses_request(
         top_p: body.top_p,
         top_k: body.top_k,
         seed: body.seed,
-        stop: Vec::new(),
+        logprobs: body.logprobs.unwrap_or(false) || body.top_logprobs.unwrap_or(0) > 0,
+        top_logprobs: body.top_logprobs.unwrap_or(0),
+        prompt_logprobs: body.prompt_logprobs,
+        routed_dp_rank: body
+            .routed_dp_rank
+            .and_then(|rank| rank.as_u64())
+            .map(|rank| rank as usize),
+        stop: body.stop.map_or_else(Vec::new, OneOrManyStrings::into_vec),
         reasoning_effort,
         extra: body.extra,
     })
@@ -436,7 +502,7 @@ fn response_object(request: &ConversationRequest, response: &ResponseAccumulator
             "type": "message",
             "status": "completed",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": response.text, "annotations": [], "logprobs": []}],
+            "content": [{"type": "output_text", "text": response.text, "annotations": [], "logprobs": content_scores(&response.logprobs)}],
         }));
     }
     json!({
@@ -468,6 +534,7 @@ fn response_object(request: &ConversationRequest, response: &ResponseAccumulator
             "total_tokens": response.input_tokens + response.output_tokens,
         },
         "metadata": {},
+        "resin": raw_scores(request, response),
     })
 }
 
@@ -518,6 +585,13 @@ fn responses_stream(
                     let output_index = usize::from(reasoning_open) + index;
                     yield Ok(Event::default().data(event_json("response.function_call_arguments.delta", sequence, json!({"item_id": format!("fc_{}_{index}", &request.id[5..]), "output_index": output_index, "delta": delta})).to_string())); sequence += 1;
                 }
+                GenerationEvent::Logprobs(tokens) => {
+                    yield Ok(Event::default().data(event_json("resin.generation_logprobs.delta", sequence, json!({"logprobs": tokens})).to_string())); sequence += 1;
+                }
+                GenerationEvent::StopSequence(_) => continue,
+                GenerationEvent::PromptLogprobs(tokens) => {
+                    yield Ok(Event::default().data(event_json("resin.prompt_logprobs", sequence, json!({"logprobs": tokens})).to_string())); sequence += 1;
+                }
                 GenerationEvent::Finished { .. } => {
                     terminated = true;
                     if reasoning_open {
@@ -535,9 +609,9 @@ fn responses_stream(
                     if text_open {
                         let output_index = usize::from(reasoning_open) + accumulator.tool_calls.len();
                         let id = format!("msg_{}", &request.id[5..]);
-                        yield Ok(Event::default().data(event_json("response.output_text.done", sequence, json!({"item_id": id, "output_index": output_index, "content_index": 0, "text": accumulator.text, "logprobs": []})).to_string())); sequence += 1;
-                        yield Ok(Event::default().data(event_json("response.content_part.done", sequence, json!({"item_id": id, "output_index": output_index, "content_index": 0, "part": {"type": "output_text", "text": accumulator.text, "annotations": [], "logprobs": []}})).to_string())); sequence += 1;
-                        yield Ok(Event::default().data(event_json("response.output_item.done", sequence, json!({"output_index": output_index, "item": {"id": id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": accumulator.text, "annotations": [], "logprobs": []}]}})).to_string())); sequence += 1;
+                        yield Ok(Event::default().data(event_json("response.output_text.done", sequence, json!({"item_id": id, "output_index": output_index, "content_index": 0, "text": accumulator.text, "logprobs": content_scores(&accumulator.logprobs)})).to_string())); sequence += 1;
+                        yield Ok(Event::default().data(event_json("response.content_part.done", sequence, json!({"item_id": id, "output_index": output_index, "content_index": 0, "part": {"type": "output_text", "text": accumulator.text, "annotations": [], "logprobs": content_scores(&accumulator.logprobs)}})).to_string())); sequence += 1;
+                        yield Ok(Event::default().data(event_json("response.output_item.done", sequence, json!({"output_index": output_index, "item": {"id": id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": accumulator.text, "annotations": [], "logprobs": content_scores(&accumulator.logprobs)}]}})).to_string())); sequence += 1;
                     }
                     yield Ok(Event::default().data(event_json("response.completed", sequence, json!({"response": response_object(&request, &accumulator)})).to_string()));
                     break;
@@ -648,4 +722,80 @@ fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+fn validate_logprobs(top_logprobs: Option<usize>) -> RequestResult<()> {
+    if top_logprobs.is_some_and(|count| count > 20) {
+        return Err(invalid_request("top_logprobs must be between 0 and 20"));
+    }
+    Ok(())
+}
+
+pub(crate) fn routed_rank(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Option<Value>,
+) -> RequestResult<Option<usize>> {
+    let rank = match headers.get("routed-dp-rank") {
+        Some(value) => Some(
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or_else(|| invalid_request("routed-dp-rank must be a nonnegative integer"))?,
+        ),
+        None => body
+            .map(|rank| {
+                rank.as_u64()
+                    .and_then(|rank| usize::try_from(rank).ok())
+                    .ok_or_else(|| invalid_request("routed_dp_rank must be a nonnegative integer"))
+            })
+            .transpose()?,
+    };
+    if rank.is_some_and(|rank| rank >= state.routed_dp_size) {
+        return Err(invalid_request(format!(
+            "routed_dp_rank must be less than {}",
+            state.routed_dp_size
+        )));
+    }
+    Ok(rank)
+}
+
+fn content_scores(tokens: &[crate::GeneratedTokenLogprob]) -> Vec<&crate::GeneratedTokenLogprob> {
+    tokens
+        .iter()
+        .filter(|token| token.channel.as_deref() == Some("content"))
+        .collect()
+}
+
+fn chat_logprobs(request: &ConversationRequest, tokens: &[crate::GeneratedTokenLogprob]) -> Value {
+    if request.logprobs {
+        json!({"content": content_scores(tokens), "refusal": null})
+    } else {
+        Value::Null
+    }
+}
+
+fn raw_scores(request: &ConversationRequest, response: &ResponseAccumulator) -> Value {
+    let mut scores = json!({});
+    if request.logprobs {
+        scores["generation_logprobs"] = json!(response.logprobs);
+    }
+    if request.prompt_logprobs {
+        scores["prompt_logprobs"] = json!(response.prompt_logprobs);
+    }
+    scores
+}
+
+fn validate_stops(stops: Option<&OneOrManyStrings>) -> RequestResult<()> {
+    let empty = match stops {
+        Some(OneOrManyStrings::One(stop)) => stop.is_empty(),
+        Some(OneOrManyStrings::Many(stops)) => stops.iter().any(String::is_empty),
+        None => false,
+    };
+    if empty {
+        Err(invalid_request("stop sequences must not be empty"))
+    } else {
+        Ok(())
+    }
 }

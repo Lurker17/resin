@@ -36,7 +36,7 @@ from resin.backend.cuda.sampling import (
     SamplingTensors,
 )
 from resin.backend.resources import CachePoolBinding
-from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, format_output
+from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, format_output, prompt_scores
 from resin.backend.speculative import SpeculativeStats
 from resin.models.gemma4.config import SLIDING_ATTENTION
 from resin.models.gemma4.media import Gemma4Media
@@ -1505,7 +1505,13 @@ class Gemma4CudaRunner(CudaRunner):
                 batch.last_token_indices, dtype=torch.int64, device=self.device
             )
             logits = self._model.logits(hidden[last])
-            return format_output(logits, self._sample_target(logits, plan, 0), plan)
+            scores = prompt_scores(plan, hidden, self._model.logits)
+            return format_output(
+                logits,
+                self._sample_target(logits, plan, 0),
+                plan,
+                prompt_logprobs=scores,
+            )
 
 
 __all__ = [

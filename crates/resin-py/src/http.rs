@@ -1,118 +1,30 @@
 use std::{
-    collections::HashMap,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use pyo3::{
-    exceptions::{PyAttributeError, PyRuntimeError, PyValueError},
+    exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
-    types::PyDict,
 };
-use pythonize::{depythonize, pythonize};
-use resin_http::{FinishReason, GenerationEvent, GenerationJob, JOB_QUEUE_CAPACITY, RouteConfig};
-use resin_recipe::{Event as ParsedEvent, FinishReason as ParserFinishReason};
-use serde::Deserialize;
+use resin_http::{GenerationJob, JOB_QUEUE_CAPACITY, RouteConfig};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::recipe::{self, NativeInklingParser, NativeResponseParser, SharedParser};
-use crate::{CompletionReason, Engine, RequestLease, SamplingParams};
+use crate::Engine;
+use crate::http_session::Session;
 
-const MAX_ACTIVE_REQUESTS: usize = 128;
-const ADMISSIONS_PER_STEP: usize = 4;
-
-#[derive(Debug, Deserialize)]
-struct RenderedPrompt {
-    token_ids: Vec<u32>,
-    #[serde(default)]
-    stop_token_ids: Vec<u32>,
-}
-
-fn into_http(event: ParsedEvent) -> GenerationEvent {
-    match event {
-        ParsedEvent::ReasoningDelta { delta } => GenerationEvent::ReasoningDelta(delta),
-        ParsedEvent::TextDelta { delta } => GenerationEvent::TextDelta(delta),
-        ParsedEvent::ToolCallStart { index, id, name } => {
-            GenerationEvent::ToolCallStart { index, id, name }
-        }
-        ParsedEvent::ToolCallArgumentsDelta { index, delta } => {
-            GenerationEvent::ToolCallArgumentsDelta { index, delta }
-        }
-    }
-}
-
-enum Parser {
-    Native(SharedParser),
-    Python {
-        object: Py<PyAny>,
-        finish: Option<Py<PyAny>>,
-    },
-}
-
-impl Parser {
-    fn new(py: Python<'_>, object: Py<PyAny>) -> PyResult<Self> {
-        if let Ok(native) = object.bind(py).cast::<NativeResponseParser>() {
-            return Ok(Self::Native(native.borrow().inner.clone()));
-        }
-        if let Ok(native) = object.bind(py).cast::<NativeInklingParser>() {
-            return Ok(Self::Native(native.borrow().inner.clone()));
-        }
-        let finish = match object.bind(py).getattr("finish") {
-            Ok(method) if method.is_callable() => Some(method.unbind()),
-            Ok(_) => return Err(PyValueError::new_err("parser.finish must be callable")),
-            Err(error) if error.is_instance_of::<PyAttributeError>(py) => None,
-            Err(error) => return Err(error),
-        };
-        Ok(Self::Python { object, finish })
-    }
-
-    fn feed(&self, ids: &[u32]) -> PyResult<Vec<ParsedEvent>> {
-        match self {
-            Self::Native(parser) => recipe::feed(parser, ids),
-            Self::Python { object, .. } => Python::attach(|py| {
-                let events = object.bind(py).call_method1("feed", (ids,))?;
-                depythonize(&events).map_err(Into::into)
-            }),
-        }
-    }
-
-    fn finish(&self, reason: ParserFinishReason) -> PyResult<Vec<ParsedEvent>> {
-        match self {
-            Self::Native(parser) => recipe::finish(parser, reason),
-            Self::Python {
-                finish: Some(method),
-                ..
-            } => Python::attach(|py| {
-                let reason = match reason {
-                    ParserFinishReason::Stop => "stop",
-                    ParserFinishReason::Length => "length",
-                };
-                depythonize(&method.bind(py).call1((reason,))?).map_err(Into::into)
-            }),
-            Self::Python { finish: None, .. } => Ok(Vec::new()),
-        }
-    }
-}
-
-struct ActiveRequest {
-    lease: Py<RequestLease>,
-    parser: Parser,
-    events: mpsc::Sender<GenerationEvent>,
-    started: Instant,
-    first_token_at: Option<Instant>,
-    input_tokens: usize,
-    cached_tokens: usize,
-    output_tokens: usize,
-}
+pub(crate) const MAX_ACTIVE_REQUESTS: usize = 128;
+pub(crate) const ADMISSIONS_PER_STEP: usize = 4;
 
 #[pyclass(name = "_HttpServer", module = "resin._resin")]
 pub(crate) struct NativeHttpServer {
     engine: Py<Engine>,
+    distributed: Option<Py<PyAny>>,
     codec: Py<PyAny>,
     model: String,
     routes: RouteConfig,
@@ -130,7 +42,8 @@ impl NativeHttpServer {
         model,
         enable_openai = true,
         enable_anthropic = true,
-        enable_demo = true
+        enable_demo = true,
+        distributed = None
     ))]
     fn new(
         engine: Py<Engine>,
@@ -139,7 +52,18 @@ impl NativeHttpServer {
         enable_openai: bool,
         enable_anthropic: bool,
         enable_demo: bool,
+        distributed: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
+        let routed_dp_size = distributed
+            .as_ref()
+            .map(|coordinator| {
+                Python::attach(|py| coordinator.bind(py).getattr("size")?.extract::<usize>())
+            })
+            .transpose()?
+            .unwrap_or(1);
+        if routed_dp_size == 0 {
+            return Err(PyValueError::new_err("routed_dp_size must be positive"));
+        }
         if model.trim().is_empty() {
             return Err(PyValueError::new_err("model must be nonempty"));
         }
@@ -150,12 +74,14 @@ impl NativeHttpServer {
         }
         Ok(Self {
             engine,
+            distributed,
             codec,
             model,
             routes: RouteConfig {
                 enable_openai,
                 enable_anthropic,
                 enable_demo,
+                routed_dp_size,
             },
             running: AtomicBool::new(false),
             shutdown: Mutex::new(None),
@@ -179,11 +105,21 @@ impl NativeHttpServer {
             *slot = Some(shutdown.clone());
         }
         let engine = self.engine.clone_ref(py);
+        let distributed = self.distributed.as_ref().map(|value| value.clone_ref(py));
         let codec = self.codec.clone_ref(py);
         let model = self.model.clone();
         let routes = self.routes;
-        let result =
-            py.detach(move || run_server(engine, codec, model, routes, host, port, shutdown));
+        let result = py.detach(move || {
+            run_server(
+                engine,
+                distributed,
+                codec,
+                model,
+                routes,
+                SocketAddr::new(host, port),
+                shutdown,
+            )
+        });
         {
             let mut slot = self
                 .shutdown
@@ -231,11 +167,11 @@ impl NativeHttpServer {
 
 fn run_server(
     engine: Py<Engine>,
+    distributed: Option<Py<PyAny>>,
     codec: Py<PyAny>,
     model: String,
     routes: RouteConfig,
-    host: IpAddr,
-    port: u16,
+    address: SocketAddr,
     shutdown: watch::Sender<bool>,
 ) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -243,15 +179,24 @@ fn run_server(
         .build()
         .map_err(|error| format!("failed to create the HTTP runtime: {error}"))?;
     let listener = runtime
-        .block_on(tokio::net::TcpListener::bind((host, port)))
-        .map_err(|error| format!("failed to bind {host}:{port}: {error}"))?;
+        .block_on(tokio::net::TcpListener::bind(address))
+        .map_err(|error| format!("failed to bind {address}: {error}"))?;
     let (jobs, receiver) = mpsc::channel(JOB_QUEUE_CAPACITY);
     let actor_shutdown = shutdown.subscribe();
     let (actor_finished, actor_done) = oneshot::channel();
     let actor = thread::Builder::new()
         .name("resin-http-engine".to_owned())
         .spawn(move || {
-            let result = engine_actor(engine, codec, receiver, actor_shutdown);
+            let result = if let Some(coordinator) = distributed {
+                crate::http_distributed::run(
+                    coordinator,
+                    receiver,
+                    actor_shutdown,
+                    routes.routed_dp_size,
+                )
+            } else {
+                engine_actor(engine, codec, receiver, actor_shutdown)
+            };
             if let Err(error) = &result {
                 eprintln!("[resin-http] inference actor failed: {error}");
             }
@@ -292,23 +237,16 @@ fn engine_actor(
     mut jobs: mpsc::Receiver<GenerationJob>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), String> {
-    let mut active = HashMap::<u64, ActiveRequest>::new();
+    let mut session = Python::attach(|py| Session::new(py, engine.clone_ref(py), codec))
+        .map_err(|error| format_python_error("HTTP session preparation failed", error))?;
     let mut disconnected = false;
-    Python::attach(|py| {
-        let engine = engine.bind(py).borrow();
-        if engine.closed() || engine.poisoned() {
-            Err("the inference engine is closed or poisoned".to_owned())
-        } else {
-            Ok(())
-        }
-    })?;
     loop {
         for _ in 0..ADMISSIONS_PER_STEP {
-            if disconnected || *shutdown.borrow() || active.len() >= MAX_ACTIVE_REQUESTS {
+            if disconnected || *shutdown.borrow() || session.active_count() >= MAX_ACTIVE_REQUESTS {
                 break;
             }
             match jobs.try_recv() {
-                Ok(job) => admit(&engine, &codec, job, &mut active),
+                Ok(job) => session.admit(job),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -317,18 +255,16 @@ fn engine_actor(
             }
         }
         if disconnected || *shutdown.borrow() {
-            Python::attach(|py| {
-                let mut engine = engine.bind(py).borrow_mut();
-                for request in active.values() {
-                    let _ = engine.cancel(py, request.lease.bind(py).borrow());
-                }
-                engine.close(py)
-            })
-            .map_err(|error| format_python_error("failed to stop the inference engine", error))?;
+            session
+                .close()
+                .map_err(|error| format_python_error("failed to cancel HTTP requests", error))?;
+            Python::attach(|py| engine.bind(py).borrow_mut().close(py)).map_err(|error| {
+                format_python_error("failed to stop the inference engine", error)
+            })?;
             return Ok(());
         }
-        cancel_disconnected(&engine, &mut active)?;
-        if active.is_empty() && !engine_has_work(&engine)? {
+        session.cancel_disconnected()?;
+        if session.active_count() == 0 && !engine_has_work(&engine)? {
             thread::sleep(Duration::from_millis(1));
             continue;
         }
@@ -339,7 +275,7 @@ fn engine_actor(
                     .into_iter()
                     .map(|event| {
                         let event = event.bind(py).borrow();
-                        (event.request_id, event.token_id, event.finish_reason)
+                        event.clone()
                     })
                     .collect::<Vec<_>>()
             })
@@ -348,186 +284,9 @@ fn engine_actor(
 
         if token_events.is_empty() {
             thread::sleep(Duration::from_micros(50));
-            continue;
         }
-        let mut grouped = HashMap::<u64, Vec<(u32, Option<CompletionReason>)>>::new();
-        for (request_id, token_id, reason) in token_events {
-            grouped
-                .entry(request_id)
-                .or_default()
-                .push((token_id, reason));
-        }
-        for (request_id, tokens) in grouped {
-            let Some(request) = active.get_mut(&request_id) else {
-                continue;
-            };
-            request.first_token_at.get_or_insert_with(Instant::now);
-            request.output_tokens += tokens.len();
-            let token_ids = tokens.iter().map(|(token, _)| *token).collect::<Vec<_>>();
-            let finished = tokens.iter().find_map(|(_, reason)| *reason);
-            let parsed = request.parser.feed(&token_ids).and_then(|mut events| {
-                if let Some(reason) = finished {
-                    events.extend(request.parser.finish(match reason {
-                        CompletionReason::Stop => ParserFinishReason::Stop,
-                        CompletionReason::Length => ParserFinishReason::Length,
-                    })?);
-                }
-                Ok(events)
-            });
-            let delivered = match parsed {
-                Ok(events) => events
-                    .into_iter()
-                    .all(|event| request.events.try_send(into_http(event)).is_ok()),
-                Err(error) => {
-                    let _ = request.events.try_send(GenerationEvent::Error {
-                        message: format_python_error("response parser failed", error),
-                    });
-                    false
-                }
-            };
-            if !delivered {
-                // A full output queue belongs to this client only. Never wait
-                // for it from the one inference actor and stall every request.
-                Python::attach(|py| {
-                    engine
-                        .bind(py)
-                        .borrow_mut()
-                        .cancel(py, request.lease.bind(py).borrow())
-                })
-                .map_err(|error| format_python_error("request cancellation failed", error))?;
-                active.remove(&request_id);
-                continue;
-            }
-            if let Some(reason) = finished {
-                let reason = match reason {
-                    CompletionReason::Stop => FinishReason::Stop,
-                    CompletionReason::Length => FinishReason::Length,
-                };
-                let _ = request.events.try_send(GenerationEvent::Finished {
-                    reason,
-                    input_tokens: request.input_tokens,
-                    cached_tokens: request.cached_tokens,
-                    output_tokens: request.output_tokens,
-                    elapsed_ms: request.started.elapsed().as_secs_f64() * 1000.0,
-                    generation_elapsed_ms: request
-                        .first_token_at
-                        .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0),
-                    time_to_first_token_ms: request.first_token_at.map_or(0.0, |first| {
-                        first.duration_since(request.started).as_secs_f64() * 1000.0
-                    }),
-                });
-                active.remove(&request_id);
-            }
-        }
+        session.process(token_events)?;
     }
-}
-
-fn admit(
-    engine: &Py<Engine>,
-    codec: &Py<PyAny>,
-    job: GenerationJob,
-    active: &mut HashMap<u64, ActiveRequest>,
-) {
-    if job.events.is_closed() {
-        return;
-    }
-    let result = Python::attach(|py| {
-        let request = pythonize(py, &job.request)?;
-        let rendered = codec.bind(py).call_method1("render", (&request,))?;
-        let media = rendered
-            .cast::<PyDict>()?
-            .get_item("media")?
-            .filter(|value| !value.is_none())
-            .map(Bound::unbind);
-        let rendered: RenderedPrompt = depythonize(&rendered)?;
-        if rendered.token_ids.is_empty() {
-            return Err(PyValueError::new_err(
-                "codec.render returned an empty token_ids sequence",
-            ));
-        }
-        let parser = codec
-            .bind(py)
-            .call_method1("create_parser", (&request, rendered.token_ids.clone()))?
-            .unbind();
-        let parser = Parser::new(py, parser)?;
-        let extra = pythonize(py, &job.request.extra)?.unbind();
-        let sampling_params = Py::new(
-            py,
-            SamplingParams::new(
-                job.request.temperature,
-                job.request.top_p,
-                job.request.top_k,
-                job.request.seed,
-                false,
-                0,
-                Some(extra),
-            )?,
-        )?;
-        let input_tokens = rendered.token_ids.len();
-        let lease = engine.bind(py).borrow_mut().submit(
-            py,
-            Some(rendered.token_ids),
-            Some(job.request.max_output_tokens),
-            0,
-            None,
-            Some(sampling_params),
-            Some(rendered.stop_token_ids),
-            media,
-        )?;
-        let lease_ref = lease.bind(py).borrow();
-        let request_id = lease_ref.request_id();
-        let cached_tokens = lease_ref.cached_tokens() as usize;
-        drop(lease_ref);
-        Ok::<_, PyErr>((request_id, lease, parser, input_tokens, cached_tokens))
-    });
-    match result {
-        Ok((request_id, lease, parser, input_tokens, cached_tokens)) => {
-            let _ = job
-                .events
-                .try_send(GenerationEvent::Started { input_tokens });
-            active.insert(
-                request_id,
-                ActiveRequest {
-                    lease,
-                    parser,
-                    events: job.events,
-                    started: Instant::now(),
-                    first_token_at: None,
-                    input_tokens,
-                    cached_tokens,
-                    output_tokens: 0,
-                },
-            );
-        }
-        Err(error) => {
-            let _ = job.events.try_send(GenerationEvent::Error {
-                message: format_python_error("request admission failed", error),
-            });
-        }
-    }
-}
-
-fn cancel_disconnected(
-    engine: &Py<Engine>,
-    active: &mut HashMap<u64, ActiveRequest>,
-) -> Result<(), String> {
-    let disconnected = active
-        .iter()
-        .filter_map(|(request_id, request)| request.events.is_closed().then_some(*request_id))
-        .collect::<Vec<_>>();
-    for request_id in disconnected {
-        let request = active
-            .remove(&request_id)
-            .expect("request id came from the active map");
-        Python::attach(|py| {
-            engine
-                .bind(py)
-                .borrow_mut()
-                .cancel(py, request.lease.bind(py).borrow())
-        })
-        .map_err(|error| format_python_error("request cancellation failed", error))?;
-    }
-    Ok(())
 }
 
 fn engine_has_work(engine: &Py<Engine>) -> Result<bool, String> {

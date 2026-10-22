@@ -185,7 +185,9 @@ def test_prefill_uses_one_paged_path_for_fresh_and_continuation_rows() -> None:
         torch.tensor(plan.positions, dtype=torch.long),
     )
 
-    assert logits.argmax(dim=-1).tolist() == [3, 9]
+    values, prompt_scores = logits
+    assert values.argmax(dim=-1).tolist() == [3, 9]
+    assert prompt_scores is None
     assert runner._model.calls == [
         ("continue", [[2, 3]], 0, "cache-row-0"),
         ("continue", [[8, 9]], 128, "cache-row-1"),

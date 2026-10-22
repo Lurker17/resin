@@ -30,7 +30,7 @@ from resin.backend.cuda.sampling import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
-from resin.backend.sampling import format_output
+from resin.backend.sampling import format_output, prompt_scores
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
 from resin.models.inkling.media import InklingMedia
@@ -386,6 +386,7 @@ class InklingCudaRunner(CudaRunner):
         positions: torch.Tensor,
     ) -> list[int] | ForwardOutput:
         logits = []
+        prompt_rows = []
         for row, (start, end) in enumerate(rows):
             row_cache = cache.row(row)
             row_ids = token_ids[start:end][None]
@@ -408,15 +409,30 @@ class InklingCudaRunner(CudaRunner):
                 state,
                 row_positions[:, -1] + 1,
                 context + end - start,
-                full_logits=False,
+                full_logits=plan.needs_prompt_logprobs,
+                **({"return_hidden": True} if plan.needs_prompt_logprobs else {}),
                 prefill=True,
                 input_embeddings=input_embeddings,
             )
             self._store_state(row_cache, row_positions[:, -1], final_state)
             self._draft.inject_target(taps, row_positions, row_cache)
+            if plan.needs_prompt_logprobs:
+
+                def project(hidden):
+                    return self._model.target.unembed(hidden)[
+                        ..., : self.config.unpadded_vocab_size
+                    ]
+
+                prompt_rows.append(
+                    prompt_scores(plan, row_logits[0], project, token_start=start)
+                )
+                row_logits = project(row_logits[:, -1:])
             logits.append(row_logits[:, -1])
         values = torch.cat(logits)
-        return format_output(values, self._sample(values, plan), plan)
+        scores = torch.cat(prompt_rows) if prompt_rows else None
+        return format_output(
+            values, self._sample(values, plan), plan, prompt_logprobs=scores
+        )
 
     def _features_for(self, sequence_id: int, media: InklingMedia) -> torch.Tensor:
         existing = self._media_features.get(sequence_id)

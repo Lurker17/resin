@@ -118,12 +118,69 @@ def test_native_prompt_provenance_and_stop_encoding(recipe_adapter):
     assert rendered["token_ids"].count(marker_id) == baseline["token_ids"].count(
         marker_id
     )
-    # Raw tokenizers return Encoding objects in Python; stop encoding must use
-    # the prepared native tokenizer rather than assuming Transformers' list API.
-    bang = adapter.ordinary.encode("!", add_special_tokens=False).ids
-    assert len(bang) == 1
-    assert rendered["stop_token_ids"] == [*adapter.codec.get_stop_token_ids(), *bang]
-    with pytest.raises(ValueError, match="multi-token stop sequences"):
+    # Conversation formats supply model terminators. User stop strings belong
+    # to serving and must not depend on how the tokenizer splits the marker.
+    assert rendered["stop_token_ids"] == adapter.codec.get_stop_token_ids()
+    assert (
         adapter.codec.render(
             {"messages": [{"role": "user", "content": "hello"}], "stop": ["long stop"]}
-        )
+        )["stop_token_ids"]
+        == rendered["stop_token_ids"]
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_stock_recipe_stops_match_decoded_output(recipe_adapter, stream):
+    name, adapter = recipe_adapter
+    case = getattr(adapter, "case", lambda value: value)(
+        Case((Part("text", "prefix STOP suffix"),))
+    )
+    output = adapter.encode(case)
+    expected = "".join(
+        part.value
+        for part in normalize(adapter.oracles[0][1](case))
+        if part.kind == "text" and isinstance(part.value, str)
+    ).split("STOP")[0]
+    request = {"messages": [{"role": "user", "content": "hello"}]}
+    if name == "deepseek_v4":
+        request["reasoning_effort"] = "medium"
+
+    class Runner:
+        position = 0
+
+        def forward(self, plan):
+            token = output[self.position]
+            self.position += 1
+            return [token]
+
+    with running_server(Runner(), adapter.codec) as (_, engine, _, errors, base, _):
+        with post(
+            base,
+            json.dumps(
+                {
+                    "model": "test",
+                    **request,
+                    "stream": stream,
+                    "max_tokens": len(output) + 1,
+                    "stop": ["STOP"],
+                }
+            ).encode(),
+        ) as response:
+            if stream:
+                choices = [
+                    json.loads(line[6:])["choices"][0]
+                    for line in response.read().decode().splitlines()
+                    if line.startswith("data: ") and line != "data: [DONE]"
+                ]
+                text = "".join(
+                    choice["delta"].get("content") or "" for choice in choices
+                )
+                reason = choices[-1]["finish_reason"]
+            else:
+                choice = json.load(response)["choices"][0]
+                text, reason = choice["message"]["content"], choice["finish_reason"]
+        assert text == expected
+        assert reason == "stop"
+        assert not engine.has_work()
+        assert not engine.poisoned
+        assert errors == []

@@ -180,6 +180,7 @@ struct RequestLeaseState {
     cancelled: bool,
     cached_tokens: u32,
     result: Option<Vec<u32>>,
+    prompt_logprobs: Option<Vec<Option<TokenLogprobs>>>,
 }
 #[derive(Clone, Debug)]
 pub struct RequestHandle {
@@ -188,6 +189,13 @@ pub struct RequestHandle {
     state: Arc<Mutex<RequestLeaseState>>,
 }
 impl RequestHandle {
+    pub fn prompt_logprobs(&self) -> Option<Vec<Option<TokenLogprobs>>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prompt_logprobs
+            .clone()
+    }
     pub fn id(&self) -> u64 {
         self.request_id
     }
@@ -242,6 +250,7 @@ fn complete_request_lease(
 /// Frontends normalize media and sampling into token controls and an opaque payload.
 #[derive(Clone, Debug)]
 pub struct Submission<P> {
+    pub prompt_logprobs: bool,
     pub token_ids: Vec<u32>,
     pub max_new_tokens: Option<usize>,
     pub priority: i32,
@@ -255,6 +264,7 @@ pub struct Submission<P> {
 impl<P> Submission<P> {
     pub fn new(token_ids: Vec<u32>, payload: P) -> Self {
         Self {
+            prompt_logprobs: false,
             token_ids,
             payload,
             max_new_tokens: None,
@@ -271,6 +281,10 @@ impl<P> Submission<P> {
 /// Owned numeric plan; the runner may move its arrays into a language adapter.
 #[derive(Clone, Debug)]
 pub struct ExecutionPlan<P> {
+    /// Flattened predecessor rows and their next prompt tokens, partitioned by sequence.
+    pub prompt_score_indices: Vec<u32>,
+    pub prompt_score_token_ids: Vec<u32>,
+    pub prompt_score_indptr: Vec<u32>,
     pub batch_id: u64,
     pub batch_key: Option<u64>,
     pub phase: Phase,
@@ -295,12 +309,16 @@ pub trait Runner<P> {
     fn logprobs(&self) -> Option<LogprobView<'_>> {
         None
     }
+    fn prompt_logprobs(&self) -> Option<LogprobView<'_>> {
+        None
+    }
     fn release(&mut self, _request_ids: &[u64]) -> Result<()> {
         Ok(())
     }
 }
 #[derive(Debug)]
 struct Request<P> {
+    prompt_logprobs: bool,
     id: u64,
     lease: Arc<Mutex<RequestLeaseState>>,
     priority: i32,
@@ -348,7 +366,7 @@ impl<P> Request<P> {
     }
 
     fn sample_at_prefill_end(&self) -> bool {
-        self.generated.is_empty()
+        self.max_new_tokens > 0 && self.generated.is_empty()
     }
 
     /// Check the frozen row both before execution and before committing progress.
@@ -624,6 +642,7 @@ impl<P: Clone> EngineCore<P> {
     ) -> Result<H> {
         self.raise_if_open()?;
         let Submission {
+            prompt_logprobs,
             token_ids,
             max_new_tokens,
             priority,
@@ -665,15 +684,17 @@ impl<P: Clone> EngineCore<P> {
             }
             previous_end = end;
         }
-        if max_new_tokens == Some(0) {
-            return Err(Error::invalid("max_new_tokens must be positive"));
+        if max_new_tokens == Some(0) && !prompt_logprobs {
+            return Err(Error::invalid(
+                "max_new_tokens must be positive unless prompt_logprobs is enabled",
+            ));
         }
         let max_new_tokens = max_new_tokens.unwrap_or_else(|| {
             (self.context_length.get() as usize).saturating_sub(token_ids.len()) + 1
         });
         let max_input_tokens = token_ids
             .len()
-            .checked_add(max_new_tokens - 1)
+            .checked_add(max_new_tokens.saturating_sub(1))
             .filter(|length| *length <= u32::MAX as usize)
             .ok_or_else(|| {
                 Error::invalid("maximum request input length exceeds the u32 metadata range")
@@ -696,7 +717,10 @@ impl<P: Clone> EngineCore<P> {
         // Create the caller-owned lease before any native admission side
         // effect. A Python allocation failure therefore leaves submission
         // fully transactional.
-        let lease_state = Arc::new(Mutex::new(RequestLeaseState::default()));
+        let lease_state = Arc::new(Mutex::new(RequestLeaseState {
+            prompt_logprobs: prompt_logprobs.then(|| vec![None; token_ids.len()]),
+            ..RequestLeaseState::default()
+        }));
         let lease = make_handle(RequestHandle {
             engine_id: self.engine_id,
             request_id,
@@ -717,6 +741,9 @@ impl<P: Clone> EngineCore<P> {
         let cache_identity = cache_prompt
             .as_deref()
             .or_else(|| cacheable.then_some(token_ids.as_slice()));
+        // KV entries do not retain predecessor distributions. Scoring must run
+        // the prompt once, even when an ordinary request could reuse its KV.
+        let cache_identity = cache_identity.filter(|_| !prompt_logprobs);
         let resident_tokens = match (&mut self.kv_resources, &mut pages, cache_identity) {
             (Some(resources), Some(pages), Some(identity)) => resources
                 .restore_prefix(pages, identity)
@@ -729,6 +756,7 @@ impl<P: Clone> EngineCore<P> {
             .cached_tokens = resident_tokens;
         self.next_request_id = next_request_id;
         self.scheduler.enqueue(Request {
+            prompt_logprobs,
             id: request_id,
             lease: lease_state,
             priority,
@@ -836,7 +864,13 @@ impl<P: Clone> EngineCore<P> {
             }
             if scheduled_rows
                 .iter()
-                .any(|row| row.phase == Phase::Prefill && !row.sample)
+                .zip(&selected_requests)
+                .any(|(row, request)| {
+                    row.phase == Phase::Prefill
+                        && !row.sample
+                        && (row.token_start() != 0
+                            || row.token_end() != Some(request.prompt_length()))
+                })
                 && !self.runner_config.continuation_prefill
             {
                 return Err(Error::invalid(
@@ -993,6 +1027,46 @@ impl<P: Clone> EngineCore<P> {
             .first()
             .is_some_and(|row| row.scheduled.phase == Phase::Decode);
 
+        let prompt_logprobs =
+            match execution_call("prompt logprob access", || Ok(runner.prompt_logprobs())) {
+                Ok(scores) => scores,
+                Err(error) => {
+                    return self.quarantine(batch, "runner prompt logprob access failed", error);
+                }
+            };
+        let prompt_counts = batch
+            .rows
+            .iter()
+            .map(|row| {
+                if row.request.prompt_logprobs && row.scheduled.phase == Phase::Prefill {
+                    (row.scheduled.token_end().unwrap() as usize)
+                        .min(row.request.prompt.len().saturating_sub(1))
+                        .saturating_sub(row.scheduled.token_start() as usize)
+                } else {
+                    0
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = match prompt_logprobs {
+            Some(scores) => scores.validate_required_lengths(&prompt_counts),
+            None if prompt_counts.iter().any(|&count| count > 0) => Err(Error::execution(
+                "runner did not return requested prompt logprobs",
+            )),
+            None => Ok(()),
+        } {
+            return self.quarantine(batch, "invalid prompt scores", error);
+        }
+        // Prepare owned scores before cleanup; publish them with logical progress.
+        let prompt_updates = prompt_counts
+            .iter()
+            .enumerate()
+            .map(|(row, &count)| {
+                (0..count)
+                    .map(|column| prompt_logprobs.unwrap().token(row, column))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
         let mut retired = Vec::with_capacity(batch.rows.len());
         let mut retired_ids = Vec::new();
         let event_capacity = output_token_ids.iter().map(Vec::len).sum();
@@ -1001,7 +1075,12 @@ impl<P: Clone> EngineCore<P> {
         for (row_index, (row, token_ids)) in batch.rows.iter().zip(&output_token_ids).enumerate() {
             let request = &row.request;
             if !row.scheduled.sample {
-                retired.push(false);
+                let finished = request.max_new_tokens == 0
+                    && row.scheduled.token_end() == Some(request.prompt_length());
+                retired.push(finished);
+                if finished {
+                    retired_ids.push(request.id);
+                }
                 committed_token_ids.push(token_ids.clone());
                 continue;
             }
@@ -1103,6 +1182,22 @@ impl<P: Clone> EngineCore<P> {
         // Logical progress becomes visible only after every fallible physical
         // cleanup step has completed.
         Self::apply_scheduled_progress(&mut batch.rows, prepared_progress);
+        for (row, updates) in batch.rows.iter().zip(prompt_updates) {
+            if updates.is_empty() {
+                continue;
+            }
+            let mut state = row
+                .request
+                .lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let scores = state
+                .prompt_logprobs
+                .as_mut()
+                .expect("scored request owns score storage");
+            let start = row.scheduled.token_start() as usize + 1;
+            scores[start..start + updates.len()].clone_from_slice(&updates);
+        }
         for (row, retire) in batch.rows.drain(..).zip(retired) {
             let request = row.request;
             if retire {
@@ -1601,12 +1696,24 @@ fn build_plan<P: Clone>(
     let mut context_lengths = Vec::with_capacity(requests.len());
     let mut payloads = Vec::with_capacity(requests.len());
     let mut sampling_mask = Vec::with_capacity(requests.len());
+    let mut prompt_score_indices = Vec::new();
+    let mut prompt_score_token_ids = Vec::new();
+    let mut prompt_score_indptr = vec![0];
     token_indptr.push(0);
 
     for (request, scheduled) in requests.iter().zip(scheduled_rows) {
         sequence_ids.push(request.id);
         payloads.push(request.payload.clone());
         let token_end = request.validate_step(*scheduled)?;
+        if request.prompt_logprobs && scheduled.phase == Phase::Prefill {
+            let start = scheduled.token_start() as usize;
+            for position in start..(token_end as usize).min(request.prompt.len().saturating_sub(1))
+            {
+                prompt_score_indices.push((token_ids.len() + position - start) as u32);
+                prompt_score_token_ids.push(request.prompt[position + 1]);
+            }
+        }
+        prompt_score_indptr.push(prompt_score_indices.len() as u32);
         match scheduled.phase {
             Phase::Prefill => {
                 let start = scheduled.token_start() as usize;
@@ -1639,6 +1746,9 @@ fn build_plan<P: Clone>(
     // payload clone. The batch keeps the independent lease through execution.
     let cache_groups = kv_view.map_or_else(Vec::new, |view| std::mem::take(&mut view.groups));
     Ok(ExecutionPlan {
+        prompt_score_indices,
+        prompt_score_token_ids,
+        prompt_score_indptr,
         sequence_ids,
         context_lengths,
         token_ids,
@@ -1683,6 +1793,7 @@ mod tests {
         pages: Option<RequestPages>,
     ) -> Request<()> {
         Request {
+            prompt_logprobs: false,
             id,
             lease: Arc::new(Mutex::new(RequestLeaseState::default())),
             priority: 0,

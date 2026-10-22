@@ -16,7 +16,7 @@ from resin.backend.loading import (
     resolve_model,
 )
 from resin.backend.plans import plan_rows
-from resin.backend.sampling import TorchSampler, format_output
+from resin.backend.sampling import TorchSampler, format_output, prompt_scores
 from resin.backend.topology import ParallelismCapabilities
 from resin.protocols import Runner
 from resin_models_torch.lfm2.config import Lfm2Config
@@ -90,6 +90,7 @@ class Lfm2TorchRunner(Runner):
 
     def forward(self, plan: BatchPlan) -> list[int] | ForwardOutput:
         logits_rows = []
+        prompt_rows = []
         self.forward_calls += 1
         rows = plan_rows(plan, self._cache, self.vocab_size)
 
@@ -114,15 +115,21 @@ class Lfm2TorchRunner(Runner):
                 )
                 logits = self._model.forward_batch(inputs, caches, position_tensor)
                 logits_rows.append(logits[:, -1, :])
+                if plan.needs_prompt_logprobs:
+                    prompt_rows.append(prompt_scores(plan, logits[:, 0]))
             else:
-                self._forward_rows(rows, logits_rows)
+                self._forward_rows(rows, logits_rows, plan, prompt_rows)
         sampler = getattr(self, "_sampler", None)
         if sampler is None:
             sampler = self._sampler = TorchSampler()
         logits = torch.cat(logits_rows)
-        return format_output(logits, sampler(logits, plan), plan)
+        scores = torch.cat(prompt_rows) if prompt_rows else None
+        return format_output(
+            logits, sampler(logits, plan), plan, prompt_logprobs=scores
+        )
 
-    def _forward_rows(self, rows, logits_rows) -> None:
+    def _forward_rows(self, rows, logits_rows, plan, prompt_rows) -> None:
+        token_start = 0
         for row in rows:
             cache = row.cache
             if cache is None:
@@ -134,8 +141,22 @@ class Lfm2TorchRunner(Runner):
             position_tensor = torch.tensor(
                 row.positions[None], dtype=torch.long, device=self.device
             )
-            logits = self._model(inputs, cache, position_tensor, logits_to_keep=1)
+            logits = self._model(
+                inputs,
+                cache,
+                position_tensor,
+                logits_to_keep=None if plan.needs_prompt_logprobs else 1,
+                **({"return_hidden": True} if plan.needs_prompt_logprobs else {}),
+            )
+            if plan.needs_prompt_logprobs:
+                prompt_rows.append(
+                    prompt_scores(
+                        plan, logits[0], self._model.logits, token_start=token_start
+                    )
+                )
+                logits = self._model.logits(logits[:, -1:])
             logits_rows.append(logits[:, -1, :])
+            token_start += len(row.token_ids)
 
     def release(self, request_ids: list[int]) -> None:
         for request_id in request_ids:

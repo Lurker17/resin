@@ -8,7 +8,6 @@ from typing import Any
 from resin.models.gemma4.media import Gemma4Media
 from resin.protocols import FinalizingResponseParser, RenderedPrompt
 from resin.recipe import Recipe
-from resin.server import encode_stop_tokens
 from resin.server.media import prepare_recipe_inputs
 
 
@@ -27,9 +26,7 @@ class Gemma4Codec:
         )
         return {
             "token_ids": list(media.token_ids),
-            "stop_token_ids": encode_stop_tokens(
-                self.tokenizer, self.eos_token_ids, request.get("stop") or []
-            ),
+            "stop_token_ids": list(self.eos_token_ids),
             "media": media,
         }
 

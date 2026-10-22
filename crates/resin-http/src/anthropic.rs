@@ -4,6 +4,7 @@ use async_stream::stream;
 use axum::{
     Json,
     extract::State,
+    http::HeaderMap,
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -15,13 +16,14 @@ use tokio::sync::mpsc;
 
 use crate::{
     AppState,
-    openai::{RequestResult, invalid_request, validate_sampling},
+    openai::{RequestResult, invalid_request, routed_rank, validate_sampling},
     protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error},
 };
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MessagesRequest {
     model: String,
+    routed_dp_rank: Option<Value>,
     messages: Vec<Value>,
     system: Option<Value>,
     #[serde(default)]
@@ -51,8 +53,13 @@ const fn default_top_p() -> f64 {
 
 pub async fn messages(
     State(state): State<AppState>,
-    Json(body): Json<MessagesRequest>,
+    headers: HeaderMap,
+    Json(mut body): Json<MessagesRequest>,
 ) -> Response {
+    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
+        Ok(rank) => rank.map(|rank| json!(rank)),
+        Err(response) => return *response,
+    };
     let stream = body.stream;
     let request = match conversation_request(&state, body) {
         Ok(request) => request,
@@ -97,6 +104,9 @@ fn conversation_request(
         return Err(invalid_request("max_tokens must be positive"));
     }
     validate_sampling(body.temperature, body.top_p, body.top_k, None)?;
+    if body.stop_sequences.iter().any(String::is_empty) {
+        return Err(invalid_request("stop sequences must not be empty"));
+    }
     let mut messages = Vec::new();
     if let Some(system) = body.system {
         messages.push(json!({"role": "system", "content": content_text(&system)?}));
@@ -131,6 +141,13 @@ fn conversation_request(
         top_p: body.top_p,
         top_k: body.top_k,
         seed: None,
+        logprobs: false,
+        top_logprobs: 0,
+        prompt_logprobs: false,
+        routed_dp_rank: body
+            .routed_dp_rank
+            .and_then(|rank| rank.as_u64())
+            .map(|rank| rank as usize),
         stop: body.stop_sequences,
         reasoning_effort: None,
         extra: body.extra,
@@ -267,8 +284,8 @@ async fn messages_response(
         "role": "assistant",
         "model": request.model,
         "content": content,
-        "stop_reason": reason.anthropic(!response.tool_calls.is_empty()),
-        "stop_sequence": null,
+        "stop_reason": if response.stop_sequence.is_some() { "stop_sequence" } else { reason.anthropic(!response.tool_calls.is_empty()) },
+        "stop_sequence": response.stop_sequence,
         "usage": {"input_tokens": response.input_tokens, "output_tokens": response.output_tokens},
     }))
     .into_response()
@@ -280,6 +297,7 @@ fn messages_stream(
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
     let output = stream! {
         let mut terminated = false;
+        let mut stop_sequence: Option<String> = None;
         let mut input_tokens = 0;
         let mut block_index = 0_usize;
         let mut reasoning_open = false;
@@ -335,6 +353,8 @@ fn messages_stream(
                     let wire_index = tool_indices.get(index).copied().unwrap_or(index);
                     yield named_event("content_block_delta", json!({"type": "content_block_delta", "index": wire_index, "delta": {"type": "input_json_delta", "partial_json": delta}}));
                 }
+                GenerationEvent::Logprobs(_) | GenerationEvent::PromptLogprobs(_) => {}
+                GenerationEvent::StopSequence(sequence) => { stop_sequence = Some(sequence); }
                 GenerationEvent::Finished { reason, output_tokens, .. } => {
                     terminated = true;
                     if reasoning_open || text_open {
@@ -343,7 +363,7 @@ fn messages_stream(
                     for index in tool_indices.into_iter().filter(|index| *index != usize::MAX) {
                         yield named_event("content_block_stop", json!({"type": "content_block_stop", "index": index}));
                     }
-                    yield named_event("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": reason.anthropic(has_tool_calls), "stop_sequence": null}, "usage": {"output_tokens": output_tokens, "input_tokens": input_tokens}}));
+                    yield named_event("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": if stop_sequence.is_some() { "stop_sequence" } else { reason.anthropic(has_tool_calls) }, "stop_sequence": stop_sequence}, "usage": {"output_tokens": output_tokens, "input_tokens": input_tokens}}));
                     yield named_event("message_stop", json!({"type": "message_stop"}));
                     break;
                 }

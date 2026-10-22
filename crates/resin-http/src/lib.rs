@@ -20,7 +20,10 @@ use axum::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-pub use protocol::{ConversationRequest, FinishReason, GenerationEvent, GenerationJob};
+pub use protocol::{
+    ConversationRequest, FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob,
+    TokenLogprob,
+};
 
 pub const JOB_QUEUE_CAPACITY: usize = 32;
 pub const EVENT_QUEUE_CAPACITY: usize = 64;
@@ -30,6 +33,7 @@ pub struct RouteConfig {
     pub enable_openai: bool,
     pub enable_anthropic: bool,
     pub enable_demo: bool,
+    pub routed_dp_size: usize,
 }
 
 impl Default for RouteConfig {
@@ -38,6 +42,7 @@ impl Default for RouteConfig {
             enable_openai: true,
             enable_anthropic: true,
             enable_demo: true,
+            routed_dp_size: 1,
         }
     }
 }
@@ -47,6 +52,7 @@ struct AppState {
     jobs: mpsc::Sender<GenerationJob>,
     model: Arc<str>,
     next_id: Arc<AtomicU64>,
+    routed_dp_size: usize,
 }
 
 impl AppState {
@@ -83,6 +89,7 @@ pub fn router(
         jobs,
         model: model.into(),
         next_id: Arc::new(AtomicU64::new(1)),
+        routed_dp_size: routes.routed_dp_size,
     };
     let mut router = Router::new().route("/health", get(openai::health));
     if routes.enable_demo {

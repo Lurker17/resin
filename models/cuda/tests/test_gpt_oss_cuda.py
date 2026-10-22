@@ -136,6 +136,7 @@ def _flat_plan(
         token_indptr,
     )
     return SimpleNamespace(
+        needs_prompt_logprobs=False,
         cache_pool_id=cache_pool_id,
         cache_groups=(history, window),
         token_ids=list(range(1, len(positions) + 1)),
@@ -373,7 +374,7 @@ class TestGptOssCudaNativePlan:
         )
         events = []
 
-        def forward(*_):
+        def forward(*_, **kwargs):
             events.append(runner._prefill_graph_active)
             return torch.tensor([[0, 1], [1, 0]], dtype=torch.bfloat16)
 

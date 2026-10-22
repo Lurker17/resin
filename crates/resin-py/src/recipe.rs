@@ -84,17 +84,6 @@ fn optional_attr<'py>(
 }
 
 impl RecipeTokenizer {
-    fn encode_stop(&self, text: &str) -> Result<Vec<u32>, Error> {
-        match &self.source {
-            TokenizerSource::Native(tokenizer, _) => tokenizer
-                .encode_fast(text, false)
-                .map(|encoding| encoding.get_ids().to_vec())
-                .map_err(|error| Error::new(error.to_string())),
-            TokenizerSource::Python { object, .. } => {
-                PythonEncoder(object.clone()).encode_raw(text)
-            }
-        }
-    }
     fn decoder(&self) -> Box<dyn Decoder> {
         match &self.source {
             TokenizerSource::Native(tokenizer, _) => {
@@ -261,11 +250,6 @@ impl PythonEncoder {
             .call_method("encode", (text,), Some(&kwargs))?
             .extract()
     }
-
-    fn encode_raw(&self, text: &str) -> Result<Vec<u32>, Error> {
-        Python::attach(|py| Self::raw(self.0.bind(py), text))
-            .map_err(|error| Error::new(error.to_string()))
-    }
 }
 impl Encoder for PythonEncoder {
     fn encode_text(&self, text: &str) -> Result<Vec<u32>, Error> {
@@ -413,25 +397,10 @@ impl ModelRecipe {
                 .map_err(recipe_error)
         })
     }
-    #[pyo3(signature = (stop_strings=Vec::new()))]
-    fn get_stop_token_ids(&self, stop_strings: Vec<String>) -> PyResult<Vec<u32>> {
-        let mut ids = self
-            .model
+    fn get_stop_token_ids(&self) -> PyResult<Vec<u32>> {
+        self.model
             .stop_token_ids(self.encoder.as_ref())
-            .map_err(recipe_error)?;
-        for stop in stop_strings {
-            let encoded = self.tokenizer.encode_stop(&stop).map_err(recipe_error)?;
-            if encoded.len() != 1 {
-                return Err(PyValueError::new_err(format!(
-                    "stop sequence {stop:?} encodes to {} tokens; multi-token stop sequences are not supported yet",
-                    encoded.len()
-                )));
-            }
-            if !ids.contains(&encoded[0]) {
-                ids.push(encoded[0]);
-            }
-        }
-        Ok(ids)
+            .map_err(recipe_error)
     }
     fn create_parser(
         &self,

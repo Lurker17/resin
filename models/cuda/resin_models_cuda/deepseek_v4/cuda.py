@@ -44,7 +44,7 @@ from resin.backend.cuda.sampling import (
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
 from resin.backend.plans import BatchView, PagedCachePlan
-from resin.backend.sampling import format_output
+from resin.backend.sampling import format_output, prompt_scores
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
@@ -766,17 +766,30 @@ class DeepSeekV4CudaRunner(CudaRunner):
         cache,
         token_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Prefill fresh prompts eagerly and replay only a restored suffix."""
 
         logits = []
+        prompt_rows = []
         for slot, (start, end) in enumerate(rows):
             row_cache = cache.row(slot)
             input_ids = token_ids[start:end].unsqueeze(0)
             context = int(plan.context_lengths[slot])
             row_logits, main_hidden = self._model.forward_prefill(
-                input_ids, context, cache=row_cache
+                input_ids,
+                context,
+                cache=row_cache,
+                **({"return_hidden": True} if plan.needs_prompt_logprobs else {}),
             )
+            if plan.needs_prompt_logprobs:
+
+                def project(hidden):
+                    return self._model.head(hidden[None], full_logits=True)[0]
+
+                prompt_rows.append(
+                    prompt_scores(plan, row_logits[0], project, token_start=start)
+                )
+                row_logits = self._model.head(row_logits[:, -1:])
             if self.speculative_tokens:
                 if main_hidden is None:
                     raise RuntimeError("target did not produce DSpark hidden states")
@@ -789,7 +802,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
                         cache=row_cache,
                     )
             logits.append(row_logits)
-        return torch.cat(logits, dim=0)
+        return torch.cat(logits, dim=0), torch.cat(prompt_rows) if prompt_rows else None
 
     def _broadcast_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
         groups = self.parallel_groups
@@ -898,7 +911,9 @@ class DeepSeekV4CudaRunner(CudaRunner):
             ):
                 if plan.phase == BatchPhase.PREFILL:
                     with self._prefill_graphs():
-                        logits = self._prefill(plan, rows, cache, token_ids, positions)
+                        logits, scores = self._prefill(
+                            plan, rows, cache, token_ids, positions
+                        )
                 elif self.speculative_tokens:
                     return self._speculative_decode(plan, cache, token_ids, positions)
                 else:
@@ -909,8 +924,9 @@ class DeepSeekV4CudaRunner(CudaRunner):
                         int(np.max(plan.positions)) + 1,
                         cache=cache,
                     )
+                    scores = None
                 output = self._sample_target(logits, plan, 0)
-            return format_output(logits, output, plan)
+            return format_output(logits, output, plan, prompt_logprobs=scores)
 
     def validate_distributed(
         self, plan: BatchPlan | None, context: StepContext
@@ -973,10 +989,15 @@ class DeepSeekV4CudaRunner(CudaRunner):
             ):
                 if context.phase == BatchPhase.PREFILL:
                     with self._distributed_prefill_graphs(context, per_sequence=True):
-                        output_logits = (
+                        prefill_output = (
                             self._prefill(plan, rows, cache, token_ids, positions)
                             if plan is not None
                             else None
+                        )
+                        output_logits, scores = (
+                            prefill_output
+                            if prefill_output is not None
+                            else (None, None)
                         )
                         for _ in range(context.max_num_sequences - len(rows)):
                             if self._prefill_graph_active:
@@ -992,6 +1013,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
                         int(np.max(plan.positions)) + 1,
                         cache=cache,
                     )
+                    scores = None
                 else:
                     if self.speculative_tokens:
                         self._model.forward_experts_empty(stage="draft")
@@ -1004,7 +1026,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
                     return None
                 assert output_logits is not None
                 output = self._sample_target(output_logits, plan, 0)
-            return format_output(output_logits, output, plan)
+            return format_output(output_logits, output, plan, prompt_logprobs=scores)
 
     def _distributed_decode_graph(
         self, plan: BatchPlan | None, context: StepContext

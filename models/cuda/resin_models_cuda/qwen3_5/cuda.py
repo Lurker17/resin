@@ -30,7 +30,7 @@ from resin.backend.cuda.sampling import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
-from resin.backend.sampling import format_output
+from resin.backend.sampling import format_output, prompt_scores
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
 from resin.models.qwen3_5.media import Qwen35Media
@@ -804,6 +804,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         positions: torch.Tensor,
     ) -> list[int] | ForwardOutput:
         final_logits = []
+        prompt_rows = []
         outputs = []
         states = []
         for row, (start, end) in enumerate(rows):
@@ -830,6 +831,12 @@ class Qwen3_5CudaRunner(CudaRunner):
                 rotary_positions=self._prefill_rotary_positions(media, row_positions),
             )
             final_logits.append(self._model.logits(hidden[:, -1]))
+            if plan.needs_prompt_logprobs:
+                prompt_rows.append(
+                    prompt_scores(
+                        plan, hidden[0], self._model.logits, token_start=start
+                    )
+                )
             states.append(
                 (
                     row_cache,
@@ -875,7 +882,8 @@ class Qwen3_5CudaRunner(CudaRunner):
                 hidden[:, -1],
             )
             outputs.append(int(sampled[row]))
-        return format_output(logits, outputs, plan)
+        scores = torch.cat(prompt_rows) if prompt_rows else None
+        return format_output(logits, outputs, plan, prompt_logprobs=scores)
 
     def _ordinary_decode(
         self,

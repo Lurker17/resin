@@ -214,12 +214,15 @@ per replica; `attn_dp` does not scale one shared cache pool. The runner supplies
 a logical cache layout backed by every rank in that replica. Attention TP can
 reduce per-rank KV head storage; CP currently retains complete KV copies and
 does not multiply logical capacity. The native configuration type does not add a global
-request router or move the current Python serving coordinator into Rust.
+request router or move the current Python serving coordinator into Rust. The
+HTTP bridge below adds explicit replica routing above these local engines.
 
 ## One synchronous step
 
 Drivers in the same world call `has_work()`, `step()`, and `close()` in matching
-order. `submit()` and `cancel()` remain local operations; there is no request router.
+order. `submit()` and `cancel()` remain local operations. Applications can drive
+this loop directly or use the HTTP coordinator to route ingress and keep all
+drivers stepping together.
 
 1. Drivers exchange read-only `Engine.next_phase()` proposals. When replicas
    propose different phases, drivers alternate prefill and decode. The proposal shares the native admission
@@ -292,6 +295,39 @@ explicit-group paths use `forward_distributed` for composed layouts.
 
 ## Process integration
 
+For HTTP serving, every attention-DP driver constructs the same server and
+calls `serve()`. Non-driver ranks stay in the existing worker loop:
+
+```python
+worker = DistributedWorker(runner, groups)
+if groups.is_driver:
+    engine = DistributedEngine(worker, max_running_requests=256)
+    HttpServer(engine, codec=codec, model=model_name).serve(host="0.0.0.0", port=8000)
+else:
+    worker.serve()
+```
+
+Only the first driver binds a listener. Requests select an attention-DP replica
+using `routed_dp_rank` in JSON or the `routed-dp-rank` header. The header takes
+precedence; invalid or out-of-range ranks return HTTP 400. Unassigned requests
+use round robin. Each selected driver owns the actual native request lease,
+codec, media preprocessing, incremental parser, scheduler, and cache. Client
+disconnects and stalled response channels cancel the request on its owner.
+Generated and prompt logprobs travel through the same response bridge.
+
+`DistributedHttpCoordinator` exchanges ingress before each coordinated step,
+including steps where a replica is idle. Native `_HttpSession` instances reuse
+the ordinary HTTP lifecycle on each driver; the frontend retains client
+channels and receives serialized semantic events. Session initialization,
+admission infrastructure, execution, and parser errors are voted before the
+next phase. Request rendering failures remain local request errors. Frontend
+bind failure or shutdown closes waiting driver loops and model followers.
+This control transport uses Gloo object collectives and JSON event batches;
+it is a functional routing boundary, with throughput optimization still ahead.
+
+For direct engine integration, applications can continue to own local
+admission and event consumption explicitly:
+
 After initializing distributed communication and preparing each rank's runtime:
 
 ```python
@@ -317,8 +353,8 @@ groups.close()
 The prototype uses object collectives for control metadata. It establishes the
 ownership and execution contract; it does not claim DeepInfer's control-path
 performance. Shared-memory command transport, sparse capture-safe routing,
-communication overlap, throughput validation, HTTP integration, expert load balancing, and a
-replica request router remain separate work.
+communication overlap, throughput validation, expert load balancing, and
+prefix-aware replica routing remain separate work.
 
 ## Source references and validation
 

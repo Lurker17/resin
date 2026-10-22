@@ -758,6 +758,7 @@ class InklingTarget(nn.Module):
         prefill: bool = False,
         input_embeddings: Tensor | None = None,
         state_inputs_out: Tensor | None = None,
+        return_hidden: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
         if state.shape != (
             token_ids.shape[0],
@@ -811,9 +812,12 @@ class InklingTarget(nn.Module):
                 taps.append(tap)
         normalized = self.norm(hidden)
         selected = normalized if full_logits else normalized[:, -1:]
-        logits = self.unembed(selected / self.config.logits_mup_width_multiplier)[
-            ..., : self.config.unpadded_vocab_size
-        ]
+        logits = selected / self.config.logits_mup_width_multiplier
+        logits = (
+            logits
+            if return_hidden
+            else self.unembed(logits)[..., : self.config.unpadded_vocab_size]
+        )
         target_taps = torch.cat(taps, dim=-1)
         return (
             logits,

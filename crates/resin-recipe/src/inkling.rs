@@ -68,6 +68,15 @@ impl InklingParser {
 }
 
 impl Grammar for InklingGrammar {
+    fn channel(&self) -> Option<&'static str> {
+        match self.state {
+            State::Content => Some("content"),
+            State::Reasoning => Some("reasoning"),
+            State::Tool => Some("tool"),
+            _ => None,
+        }
+    }
+
     fn is_control(&self, id: u32) -> bool {
         self.tokens.ids().contains(&id)
     }

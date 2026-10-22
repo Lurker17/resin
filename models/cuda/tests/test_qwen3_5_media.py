@@ -113,7 +113,7 @@ def test_qwen_codec_normalizes_images_and_attaches_processor_sidecar(
         }
     )
 
-    assert output["stop_token_ids"] == [1, 12]
+    assert output["stop_token_ids"] == [1]
     assert isinstance(output["media"], Qwen35Media)
     assert RecordingRecipe.request is not None
     assert RecordingRecipe.request["messages"][0]["content"] == [

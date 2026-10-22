@@ -19,6 +19,10 @@ use crate::core_error;
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 pub struct ForwardOutput {
     #[pyo3(get)]
+    prompt_logprobs: Option<Py<PyArray1<f32>>>,
+    #[pyo3(get)]
+    prompt_logprob_indptr: Option<Py<PyArray1<u32>>>,
+    #[pyo3(get)]
     token_ids: Py<PyArray1<u32>>,
     #[pyo3(get)]
     token_indptr: Py<PyArray1<u32>>,
@@ -37,7 +41,7 @@ pub struct ForwardOutput {
 #[pymethods]
 impl ForwardOutput {
     #[new]
-    #[pyo3(signature = (token_ids, token_indptr, *, logprobs = None, logprob_indptr = None, top_indptr = None, top_token_ids = None, top_logprobs = None))]
+    #[pyo3(signature = (token_ids, token_indptr, *, logprobs = None, logprob_indptr = None, top_indptr = None, top_token_ids = None, top_logprobs = None, prompt_logprobs = None, prompt_logprob_indptr = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -48,7 +52,14 @@ impl ForwardOutput {
         top_indptr: Option<Py<PyArray1<u32>>>,
         top_token_ids: Option<Py<PyArray1<u32>>>,
         top_logprobs: Option<Py<PyArray1<f32>>>,
+        prompt_logprobs: Option<Py<PyArray1<f32>>>,
+        prompt_logprob_indptr: Option<Py<PyArray1<u32>>>,
     ) -> PyResult<Self> {
+        if prompt_logprobs.is_some() != prompt_logprob_indptr.is_some() {
+            return Err(PyValueError::new_err(
+                "prompt scores require both prompt_logprobs and prompt_logprob_indptr",
+            ));
+        }
         let top_count = usize::from(top_indptr.is_some())
             + usize::from(top_token_ids.is_some())
             + usize::from(top_logprobs.is_some());
@@ -66,6 +77,8 @@ impl ForwardOutput {
             .as_ref()
             .map(|_| logprob_indptr.unwrap_or_else(|| token_indptr.clone_ref(py)));
         Ok(Self {
+            prompt_logprobs,
+            prompt_logprob_indptr,
             token_ids,
             token_indptr,
             logprobs,
@@ -105,6 +118,12 @@ pub struct BorrowedLogprobs<'py> {
     top: Option<BorrowedTop<'py>>,
 }
 
+pub struct BorrowedOutput<'py> {
+    pub tokens: Vec<Vec<u32>>,
+    pub logprobs: Option<BorrowedLogprobs<'py>>,
+    pub prompt_logprobs: Option<BorrowedLogprobs<'py>>,
+}
+
 impl BorrowedLogprobs<'_> {
     pub fn view(&self) -> LogprobView<'_> {
         // Contiguity is checked when each guard is acquired. Guards retain the
@@ -126,7 +145,7 @@ impl ForwardOutput {
         &self,
         py: Python<'py>,
         expected_rows: usize,
-    ) -> PyResult<(Vec<Vec<u32>>, Option<BorrowedLogprobs<'py>>)> {
+    ) -> PyResult<BorrowedOutput<'py>> {
         let tokens = borrow(&self.token_ids, py)?;
         let offsets = borrow(&self.token_indptr, py)?;
         let tokens = tokens.as_slice().unwrap();
@@ -160,6 +179,21 @@ impl ForwardOutput {
                 })
             })
             .transpose()?;
-        Ok((rows, logprobs))
+        let prompt_logprobs = self
+            .prompt_logprobs
+            .as_ref()
+            .map(|values| {
+                Ok::<_, PyErr>(BorrowedLogprobs {
+                    indptr: borrow(self.prompt_logprob_indptr.as_ref().unwrap(), py)?,
+                    values: borrow(values, py)?,
+                    top: None,
+                })
+            })
+            .transpose()?;
+        Ok(BorrowedOutput {
+            tokens: rows,
+            logprobs,
+            prompt_logprobs,
+        })
     }
 }

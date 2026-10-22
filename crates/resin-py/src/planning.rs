@@ -13,6 +13,9 @@ pub(super) fn from_core(plan: ExecutionPlan<RequestPayload>) -> BatchPlan {
     // The core constructs this plan from validated request and allocator state.
     // Public Python constructors still validate untrusted caller-provided arrays.
     BatchPlan {
+        prompt_score_indices: plan.prompt_score_indices,
+        prompt_score_token_ids: plan.prompt_score_token_ids,
+        prompt_score_indptr: plan.prompt_score_indptr,
         sequence_ids: plan.sequence_ids,
         context_lengths: plan.context_lengths,
         token_ids: plan.token_ids,

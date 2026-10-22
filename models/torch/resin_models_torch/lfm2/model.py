@@ -363,6 +363,7 @@ class Lfm2ForCausalLM(nn.Module):
         positions: Tensor | None = None,
         *,
         logits_to_keep: int | None = None,
+        return_hidden: bool = False,
     ) -> Tensor:
         if tokens.ndim != 2 or tokens.shape[0] != 1:
             raise ValueError("tokens must contain exactly one sequence")
@@ -382,6 +383,9 @@ class Lfm2ForCausalLM(nn.Module):
             if logits_to_keep <= 0:
                 raise ValueError("logits_to_keep must be positive")
             hidden = hidden[:, -logits_to_keep:]
+        return hidden if return_hidden else self.logits(hidden)
+
+    def logits(self, hidden: Tensor) -> Tensor:
         return F.linear(hidden, self.model.embed_tokens.weight)
 
     def forward_batch(

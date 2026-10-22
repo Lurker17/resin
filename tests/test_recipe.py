@@ -247,7 +247,7 @@ class _CallbackTokenizer:
         return bytes(ids).decode(errors="replace")
 
 
-def test_callback_tokenizer_prefers_ordinary_encoding_and_raw_user_stops():
+def test_callback_tokenizer_keeps_ordinary_encoding_and_serving_stops_separate():
     tokenizer = _CallbackTokenizer()
     recipe = Recipe(tokenizer, model="inkling")
     marker = "<|content_model_end_sampling|>"
@@ -258,7 +258,7 @@ def test_callback_tokenizer_prefers_ordinary_encoding_and_raw_user_stops():
     assert recipe.render({**request, "stop": [marker]})["stop_token_ids"] == [
         tokenizer.markers[marker]
     ]
-    assert tokenizer.raw_encodes == [marker]
+    assert tokenizer.raw_encodes == []
 
 
 @pytest.mark.parametrize("invalid_id", [0, True])

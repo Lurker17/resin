@@ -60,7 +60,7 @@ from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
 from resin.backend.paged_attention import PagedAttentionBatch
 from resin.backend.quantization import QuantizationConfig
-from resin.backend.sampling import format_output
+from resin.backend.sampling import format_output, prompt_scores
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.models.gpt_oss.config import GptOssConfig
 from resin.models.gpt_oss.plan import (
@@ -753,6 +753,7 @@ class GptOssCudaRunner(CudaRunner):
         batch: DevicePagedAttentionBatch,
         *,
         context_parallel: ContextParallelTokens | None = None,
+        full_hidden: bool = False,
     ):
         selected_tokens = token_ids.index_select(0, batch.token_indices)
         selected_positions = positions.index_select(0, batch.token_indices)
@@ -809,7 +810,11 @@ class GptOssCudaRunner(CudaRunner):
         final_hidden = normalized.squeeze(0)
         if context_parallel is not None:
             final_hidden = context_parallel.gather(final_hidden)
-        return final_hidden.index_select(0, batch.last_token_indices)
+        return (
+            final_hidden
+            if full_hidden
+            else final_hidden.index_select(0, batch.last_token_indices)
+        )
 
     @staticmethod
     def _pad_page_table(batch: PagedAttentionBatch, width: int):
@@ -991,28 +996,53 @@ class GptOssCudaRunner(CudaRunner):
                 dtype=torch.bfloat16,
                 device=self.device,
             )
+            prompt_hidden = (
+                torch.empty(
+                    (len(plan.token_ids), self.hidden_size),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+                if plan.needs_prompt_logprobs
+                else None
+            )
             with torch.inference_mode():
                 with self._prefill_graphs():
                     for index, host_batch in enumerate(prefill_batches):
                         batch = self._tensorize(host_batch, staging, f"prefill.{index}")
                         groups = self.parallel_groups
-                        arguments = {}
+                        context_parallel = None
                         if groups is not None and groups.cp.size > 1:
-                            arguments["context_parallel"] = ContextParallelTokens(
+                            context_parallel = ContextParallelTokens(
                                 host_batch.query_lengths,
                                 groups.cp,
                                 device=self.device,
                                 distributed=groups.distributed,
                             )
                         last_hidden = self._forward_batch(
-                            token_ids, positions, batch, **arguments
+                            token_ids,
+                            positions,
+                            batch,
+                            context_parallel=context_parallel,
+                            full_hidden=prompt_hidden is not None,
                         )
+                        if prompt_hidden is not None:
+                            prompt_hidden.index_copy_(
+                                0, batch.token_indices, last_hidden
+                            )
+                            last_hidden = last_hidden.index_select(
+                                0, batch.last_token_indices
+                            )
                         final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
                 if decode_batch is not None:
                     batch = self._tensorize(decode_batch, staging, "decode")
                     last_hidden = self._forward_batch(token_ids, positions, batch)
                     final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
                 logits = self._model.lm_head(final_hidden)
+                scores = (
+                    prompt_scores(plan, prompt_hidden, self._model.lm_head)
+                    if prompt_hidden is not None
+                    else None
+                )
 
             tokens = self._sampler(logits, plan)
             groups = getattr(self, "parallel_groups", None)
@@ -1022,7 +1052,7 @@ class GptOssCudaRunner(CudaRunner):
                     src=groups.device_replica.source,
                     group=groups.device_replica.handle,
                 )
-            return format_output(logits, tokens, plan)
+            return format_output(logits, tokens, plan, prompt_logprobs=scores)
 
     def validate_distributed(
         self, plan: BatchPlan | None, context: StepContext

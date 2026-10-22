@@ -9,6 +9,10 @@ use pyo3::types::PyTuple;
 mod arrays;
 mod cache;
 mod http;
+mod http_distributed;
+mod http_logprobs;
+mod http_session;
+mod http_stop;
 mod output;
 mod parallelism;
 mod planning;
@@ -16,7 +20,7 @@ mod recipe;
 mod runner;
 
 use cache::{CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention};
-use output::{BorrowedLogprobs, ForwardOutput};
+use output::{BorrowedLogprobs, BorrowedOutput, ForwardOutput};
 use parallelism::Parallelism;
 use resin_core::engine::{self as core, CompletionReason};
 use runner::{
@@ -155,6 +159,7 @@ struct SamplingParams {
     seed: Option<i64>,
     logprobs: bool,
     top_logprobs: usize,
+    prompt_logprobs: bool,
     extra: Option<Arc<Py<PyAny>>>,
 }
 
@@ -167,6 +172,7 @@ impl Default for SamplingParams {
             seed: None,
             logprobs: false,
             top_logprobs: 0,
+            prompt_logprobs: false,
             extra: None,
         }
     }
@@ -175,7 +181,8 @@ impl Default for SamplingParams {
 #[pymethods]
 impl SamplingParams {
     #[new]
-    #[pyo3(signature = (*, temperature = 1.0, top_p = 1.0, top_k = None, seed = None, logprobs = false, top_logprobs = 0, extra = None))]
+    #[pyo3(signature = (*, temperature = 1.0, top_p = 1.0, top_k = None, seed = None, logprobs = false, top_logprobs = 0, prompt_logprobs = false, extra = None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         temperature: f64,
         top_p: f64,
@@ -183,6 +190,7 @@ impl SamplingParams {
         seed: Option<i64>,
         logprobs: bool,
         top_logprobs: usize,
+        prompt_logprobs: bool,
         extra: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         if !temperature.is_finite() || temperature < 0.0 {
@@ -217,6 +225,7 @@ impl SamplingParams {
             seed,
             logprobs: logprobs || top_logprobs > 0,
             top_logprobs,
+            prompt_logprobs,
             extra: extra.map(Arc::new),
         })
     }
@@ -244,6 +253,10 @@ impl SamplingParams {
     #[getter]
     fn logprobs(&self) -> bool {
         self.logprobs
+    }
+    #[getter]
+    fn prompt_logprobs(&self) -> bool {
+        self.prompt_logprobs
     }
 
     #[getter]
@@ -290,6 +303,9 @@ impl SamplingParams {
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug)]
 struct BatchPlan {
+    prompt_score_indices: Vec<u32>,
+    prompt_score_token_ids: Vec<u32>,
+    prompt_score_indptr: Vec<u32>,
     sequence_ids: Vec<u64>,
     context_lengths: Vec<u32>,
     token_ids: Vec<u32>,
@@ -392,6 +408,28 @@ impl BatchPlan {
         }
 
         plan.validate_cache()?;
+        resin_core::logprobs::validate_indptr(
+            &plan.prompt_score_indptr,
+            sequence_ids.len(),
+            plan.prompt_score_indices.len(),
+        )
+        .map_err(core_error)?;
+        if plan.prompt_score_token_ids.len() != plan.prompt_score_indices.len()
+            || plan
+                .prompt_score_indptr
+                .windows(2)
+                .enumerate()
+                .any(|(row, range)| {
+                    plan.prompt_score_indices[range[0] as usize..range[1] as usize]
+                        .iter()
+                        .any(|&index| index < token_indptr[row] || index >= token_indptr[row + 1])
+                })
+            || plan.phase != BatchPhase::Prefill && !plan.prompt_score_indices.is_empty()
+        {
+            return Err(PyValueError::new_err(
+                "prompt score indices and targets must align with their prefill sequence",
+            ));
+        }
 
         Ok(plan)
     }
@@ -462,7 +500,10 @@ impl BatchPlan {
         cache_groups = None,
         sampling_mask = None,
         sampling_params = None,
-        media = None
+        media = None,
+        prompt_score_indices = None,
+        prompt_score_token_ids = None,
+        prompt_score_indptr = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -478,6 +519,9 @@ impl BatchPlan {
         sampling_mask: Option<PyArrayLike1<'_, bool>>,
         sampling_params: Option<Vec<Py<SamplingParams>>>,
         media: Option<Vec<Option<Py<PyAny>>>>,
+        prompt_score_indices: Option<PyArrayLike1<'_, u32>>,
+        prompt_score_token_ids: Option<PyArrayLike1<'_, u32>>,
+        prompt_score_indptr: Option<PyArrayLike1<'_, u32>>,
     ) -> PyResult<Self> {
         let sequence_ids = arrays::owned_vec(sequence_ids);
         let context_lengths = arrays::owned_vec(context_lengths);
@@ -511,6 +555,15 @@ impl BatchPlan {
             .map(|payload| payload.map(Arc::new))
             .collect();
         Self::checked(Self {
+            prompt_score_indices: prompt_score_indices
+                .map(arrays::owned_vec)
+                .unwrap_or_default(),
+            prompt_score_token_ids: prompt_score_token_ids
+                .map(arrays::owned_vec)
+                .unwrap_or_default(),
+            prompt_score_indptr: prompt_score_indptr
+                .map(arrays::owned_vec)
+                .unwrap_or_else(|| vec![0; sequence_count + 1]),
             sequence_ids,
             context_lengths,
             token_ids,
@@ -614,6 +667,22 @@ impl BatchPlan {
             .iter()
             .zip(&self.sampling_params)
             .any(|(sample, params)| *sample && params.logprobs)
+    }
+    #[getter]
+    fn needs_prompt_logprobs(&self) -> bool {
+        !self.prompt_score_indices.is_empty()
+    }
+    #[getter]
+    fn prompt_score_indices<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        arrays::readonly_view(this.clone().into_any(), &this.get().prompt_score_indices)
+    }
+    #[getter]
+    fn prompt_score_token_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        arrays::readonly_view(this.clone().into_any(), &this.get().prompt_score_token_ids)
+    }
+    #[getter]
+    fn prompt_score_indptr<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        arrays::readonly_view(this.clone().into_any(), &this.get().prompt_score_indptr)
     }
 
     /// Effective sampling parameters, one per sequence.
@@ -772,6 +841,16 @@ struct RequestLease {
 }
 #[pymethods]
 impl RequestLease {
+    /// Raw input-token logprobs; the first token has no predecessor and is None.
+    #[getter]
+    fn prompt_logprobs(&self) -> Option<Vec<Option<TokenLogprobs>>> {
+        self.inner.prompt_logprobs().map(|scores| {
+            scores
+                .into_iter()
+                .map(|score| score.map(|inner| TokenLogprobs { inner }))
+                .collect()
+        })
+    }
     #[getter]
     fn id(&self) -> u64 {
         self.inner.id()
@@ -841,6 +920,7 @@ struct PythonRunner<'a, 'py> {
     release: Option<&'a Py<PyAny>>,
     error: Option<PyErr>,
     logprobs: Option<BorrowedLogprobs<'py>>,
+    prompt_logprobs: Option<BorrowedLogprobs<'py>>,
 }
 impl PythonRunner<'_, '_> {
     fn failed(&mut self, error: PyErr, accepted: bool) -> core::Error {
@@ -872,13 +952,17 @@ impl<'py> core::Runner<RequestPayload> for PythonRunner<'_, 'py> {
                 self.failed(error, accepted)
             })?;
         let plan = plan.borrow(self.py);
-        let (tokens, logprobs) =
+        let output =
             extract_runner_output(&output, &plan).map_err(|error| self.failed(error, true))?;
-        self.logprobs = logprobs;
-        Ok(tokens)
+        self.logprobs = output.logprobs;
+        self.prompt_logprobs = output.prompt_logprobs;
+        Ok(output.tokens)
     }
     fn logprobs(&self) -> Option<core::LogprobView<'_>> {
         self.logprobs.as_ref().map(BorrowedLogprobs::view)
+    }
+    fn prompt_logprobs(&self) -> Option<core::LogprobView<'_>> {
+        self.prompt_logprobs.as_ref().map(BorrowedLogprobs::view)
     }
     fn release(&mut self, ids: &[u64]) -> core::Result<()> {
         if let Some(release) = self.release {
@@ -1035,6 +1119,7 @@ impl Engine {
         });
         let cacheable = media.is_none() || cache_prompt.is_some();
         let input = core::Submission {
+            prompt_logprobs: sampling_params.prompt_logprobs,
             token_ids,
             max_new_tokens,
             priority,
@@ -1067,6 +1152,7 @@ impl Engine {
             release: self.runner_release.as_ref(),
             error: None,
             logprobs: None,
+            prompt_logprobs: None,
         };
         let mut event_error = None;
         let result = self
@@ -1121,6 +1207,7 @@ impl Engine {
             release: self.runner_release.as_ref(),
             error: None,
             logprobs: None,
+            prompt_logprobs: None,
         };
         let result = self.core.cancel(&mut runner, &request.inner);
         runner.result(result)
@@ -1132,6 +1219,7 @@ impl Engine {
             release: self.runner_release.as_ref(),
             error: None,
             logprobs: None,
+            prompt_logprobs: None,
         };
         let result = self.core.close(&mut runner);
         runner.result(result)
@@ -1320,17 +1408,23 @@ fn extract_runner_token_rows(
 fn extract_runner_output<'py>(
     output: &Bound<'py, PyAny>,
     plan: &BatchPlan,
-) -> PyResult<(Vec<Vec<u32>>, Option<BorrowedLogprobs<'py>>)> {
-    let (tokens, logprobs) = if let Ok(output) = output.cast::<ForwardOutput>() {
+) -> PyResult<BorrowedOutput<'py>> {
+    let output = if let Ok(output) = output.cast::<ForwardOutput>() {
         output
             .borrow()
             .borrow(output.py(), plan.sequence_ids.len())?
     } else {
-        (
-            extract_runner_token_rows(output, plan.sequence_ids.len())?,
-            None,
-        )
+        BorrowedOutput {
+            tokens: extract_runner_token_rows(output, plan.sequence_ids.len())?,
+            logprobs: None,
+            prompt_logprobs: None,
+        }
     };
+    let BorrowedOutput {
+        tokens,
+        logprobs,
+        prompt_logprobs,
+    } = &output;
     let view = logprobs.as_ref().map(BorrowedLogprobs::view);
     for (row, params) in plan.sampling_params.iter().enumerate() {
         if !params.logprobs || !plan.sampling_mask[row] {
@@ -1364,7 +1458,22 @@ fn extract_runner_output<'py>(
             }
         }
     }
-    Ok((tokens, logprobs))
+    let prompt_view = prompt_logprobs.as_ref().map(BorrowedLogprobs::view);
+    if let Some(scores) = prompt_view {
+        let lengths = plan
+            .prompt_score_indptr
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]) as usize)
+            .collect::<Vec<_>>();
+        scores
+            .validate_required_lengths(&lengths)
+            .map_err(core_error)?;
+    } else if plan.needs_prompt_logprobs() {
+        return Err(PyRuntimeError::new_err(
+            "runner did not return requested prompt logprobs",
+        ));
+    }
+    Ok(output)
 }
 
 #[pymodule(name = "_resin")]
@@ -1378,6 +1487,9 @@ mod _resin {
 
     #[pymodule_export]
     use crate::http::NativeHttpServer;
+
+    #[pymodule_export]
+    use crate::http_session::NativeHttpSession;
 
     #[pymodule_export]
     use crate::recipe::{ModelRecipe, NativeInklingParser, NativeResponseParser, RecipeTokenizer};
@@ -1405,6 +1517,9 @@ mod tests {
         )
         .unwrap();
         let plan = BatchPlan {
+            prompt_score_indices: Vec::new(),
+            prompt_score_token_ids: Vec::new(),
+            prompt_score_indptr: vec![0, 0],
             sequence_ids: vec![1],
             context_lengths: vec![0],
             token_ids: vec![1, 2],

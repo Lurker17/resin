@@ -2416,6 +2416,7 @@ class Transformer(nn.Module):
         start_position: int,
         *,
         cache: DeviceCache,
+        return_hidden: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Prefill one cached suffix and return only its final-token logits."""
 
@@ -2450,6 +2451,8 @@ class Transformer(nn.Module):
                     ),
                 ),
             )
+            if return_hidden:
+                return self.norm(h), main_hidden
             return self._target_output(h, main_hidden)
 
     @torch.inference_mode()

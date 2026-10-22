@@ -201,6 +201,15 @@ impl Lfm2Parser {
 }
 
 impl Grammar for Lfm2Grammar {
+    fn channel(&self) -> Option<&'static str> {
+        match self.stage {
+            Stage::Content => Some("content"),
+            Stage::Reasoning => Some("reasoning"),
+            Stage::Tool => Some("tool"),
+            _ => None,
+        }
+    }
+
     fn is_control(&self, id: u32) -> bool {
         self.tokens.ids().contains(&id)
     }

@@ -8,7 +8,6 @@ from typing import Any
 from resin.models.qwen3_5.media import Qwen35Media
 from resin.protocols import FinalizingResponseParser, RenderedPrompt
 from resin.recipe import Recipe
-from resin.server import encode_stop_tokens
 from resin.server.media import prepare_recipe_inputs
 
 
@@ -33,11 +32,7 @@ class Qwen35Codec:
             raise ValueError("Qwen codec expects one conversation")
         result: RenderedPrompt = {
             "token_ids": [int(token) for token in token_ids[0]],
-            "stop_token_ids": encode_stop_tokens(
-                self.tokenizer,
-                self.recipe.get_stop_token_ids(),
-                request.get("stop") or [],
-            ),
+            "stop_token_ids": self.recipe.get_stop_token_ids(),
         }
         if output.get("pixel_values") is not None:
             result["media"] = Qwen35Media.from_processor_output(

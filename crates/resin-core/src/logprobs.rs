@@ -36,6 +36,25 @@ pub fn validate_indptr(indptr: &[u32], rows: usize, values: usize) -> Result<()>
 }
 
 impl LogprobView<'_> {
+    pub fn validate_required_lengths(&self, lengths: &[usize]) -> Result<()> {
+        validate_indptr(self.indptr, lengths.len(), self.values.len())?;
+        if self
+            .indptr
+            .windows(2)
+            .zip(lengths)
+            .any(|(pair, &count)| (pair[1] - pair[0]) as usize != count)
+            || self
+                .values
+                .iter()
+                .any(|value| value.is_nan() || *value > 0.0)
+            || self.top.is_some()
+        {
+            return Err(Error::execution(
+                "prompt logprobs must cover every requested predecessor with non-positive scores",
+            ));
+        }
+        Ok(())
+    }
     pub fn validate(&self, token_rows: &[Vec<u32>]) -> Result<()> {
         validate_indptr(self.indptr, token_rows.len(), self.values.len())?;
         for (row, pair) in token_rows.iter().zip(self.indptr.windows(2)) {

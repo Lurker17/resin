@@ -48,6 +48,9 @@ class BatchPlan:
         sampling_mask: Sequence[bool] | npt.NDArray[np.bool_] | None = None,
         sampling_params: Sequence[SamplingParams] | None = None,
         media: Sequence[MediaInput | None] | None = None,
+        prompt_score_indices: Sequence[int] | npt.NDArray[np.uint32] | None = None,
+        prompt_score_token_ids: Sequence[int] | npt.NDArray[np.uint32] | None = None,
+        prompt_score_indptr: Sequence[int] | npt.NDArray[np.uint32] | None = None,
     ) -> BatchPlan: ...
     def __repr__(self, /) -> str: ...
     @property
@@ -83,6 +86,8 @@ class BatchPlan:
         Check natively so token-only graph replay does not box per-row policies.
         """
     @property
+    def needs_prompt_logprobs(self, /) -> bool: ...
+    @property
     def num_sequences(self, /) -> int:
         """
         Number of sequences (batch size).
@@ -102,6 +107,12 @@ class BatchPlan:
         """
         Absolute position of every flattened scheduled token.
         """
+    @property
+    def prompt_score_indices(self, /) -> npt.NDArray[np.uint32]: ...
+    @property
+    def prompt_score_indptr(self, /) -> npt.NDArray[np.uint32]: ...
+    @property
+    def prompt_score_token_ids(self, /) -> npt.NDArray[np.uint32]: ...
     @property
     def sampling_mask(self, /) -> npt.NDArray[np.bool_]:
         """
@@ -454,11 +465,17 @@ class ForwardOutput:
         top_indptr: npt.NDArray[np.uint32] | None = None,
         top_token_ids: npt.NDArray[np.uint32] | None = None,
         top_logprobs: npt.NDArray[np.float32] | None = None,
+        prompt_logprobs: npt.NDArray[np.float32] | None = None,
+        prompt_logprob_indptr: npt.NDArray[np.uint32] | None = None,
     ) -> ForwardOutput: ...
     @property
     def logprob_indptr(self, /) -> npt.NDArray[np.uint32] | None: ...
     @property
     def logprobs(self, /) -> npt.NDArray[np.float32] | None: ...
+    @property
+    def prompt_logprob_indptr(self, /) -> npt.NDArray[np.uint32] | None: ...
+    @property
+    def prompt_logprobs(self, /) -> npt.NDArray[np.float32] | None: ...
     @property
     def token_ids(self, /) -> npt.NDArray[np.uint32]: ...
     @property
@@ -497,7 +514,7 @@ class ModelRecipe:
     def create_parser(
         self, /, request: Any, prompt_ids: Sequence[int]
     ) -> RecipeResponseParser: ...
-    def get_stop_token_ids(self, /, stop_strings: Sequence[str] = ...) -> list[int]: ...
+    def get_stop_token_ids(self, /) -> list[int]: ...
     def render_ids(
         self,
         /,
@@ -597,6 +614,11 @@ class RequestLease:
     @property
     def id(self, /) -> int: ...
     @property
+    def prompt_logprobs(self, /) -> list[TokenLogprobs | None] | None:
+        """
+        Raw input-token logprobs; the first token has no predecessor and is None.
+        """
+    @property
     def request_id(self, /) -> int: ...
     def take_result(self, /) -> list[int]:
         """
@@ -661,6 +683,7 @@ class SamplingParams:
         seed: int | None = None,
         logprobs: bool = False,
         top_logprobs: int = 0,
+        prompt_logprobs: bool = False,
         extra: Any | None = None,
     ) -> SamplingParams: ...
     def __repr__(self, /) -> str: ...
@@ -668,6 +691,8 @@ class SamplingParams:
     def extra(self, /) -> Any | None: ...
     @property
     def logprobs(self, /) -> bool: ...
+    @property
+    def prompt_logprobs(self, /) -> bool: ...
     @property
     def seed(self, /) -> int | None: ...
     @property
@@ -738,6 +763,7 @@ class _HttpServer:
         enable_openai: bool = True,
         enable_anthropic: bool = True,
         enable_demo: bool = True,
+        distributed: Any | None = None,
     ) -> _HttpServer: ...
     def __repr__(self, /) -> str: ...
     @property
@@ -750,3 +776,16 @@ class _HttpServer:
         Request shutdown from another thread; serve returns after the current
         inference step has finished and its requests have been cancelled.
         """
+
+@final
+class _HttpSession:
+    """
+    The same native lifecycle used by the ordinary actor, attached to one DP driver.
+    """
+    def __new__(cls, /, engine: Engine, codec: Any) -> _HttpSession: ...
+    @property
+    def active_count(self, /) -> int: ...
+    def admit(self, /, requests_json: str) -> None: ...
+    def cancel(self, /, ids: Sequence[str]) -> None: ...
+    def close(self, /) -> None: ...
+    def process(self, /, events: Sequence[TokenEvent]) -> str: ...

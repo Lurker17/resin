@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ConversationRequest {
     pub id: String,
     pub model: String,
@@ -15,12 +15,17 @@ pub struct ConversationRequest {
     pub top_p: f64,
     pub top_k: Option<u32>,
     pub seed: Option<i64>,
+    pub logprobs: bool,
+    pub top_logprobs: usize,
+    pub prompt_logprobs: bool,
+    pub routed_dp_rank: Option<usize>,
     pub stop: Vec<String>,
     pub reasoning_effort: Option<String>,
     pub extra: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
     Length,
@@ -53,13 +58,17 @@ impl FinishReason {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum GenerationEvent {
     Started {
         input_tokens: usize,
     },
     ReasoningDelta(String),
     TextDelta(String),
+    Logprobs(Vec<GeneratedTokenLogprob>),
+    PromptLogprobs(Vec<Option<TokenLogprob>>),
+    StopSequence(String),
     ToolCallStart {
         index: usize,
         id: String,
@@ -83,6 +92,26 @@ pub enum GenerationEvent {
     },
 }
 
+/// A vocabulary token, independent of response parsing and UTF-8 buffering.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TokenLogprob {
+    pub token_id: u32,
+    pub token: String,
+    pub bytes: Option<Vec<u8>>,
+    #[serde(deserialize_with = "deserialize_logprob")]
+    pub logprob: f32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GeneratedTokenLogprob {
+    #[serde(flatten)]
+    pub token: TokenLogprob,
+    pub token_index: usize,
+    /// Only populated when the parser can prove the token's semantic channel.
+    pub channel: Option<String>,
+    pub top_logprobs: Vec<TokenLogprob>,
+}
+
 #[derive(Debug)]
 pub struct GenerationJob {
     pub request: ConversationRequest,
@@ -97,6 +126,9 @@ pub(crate) struct ResponseAccumulator {
     pub reasoning: String,
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    pub logprobs: Vec<GeneratedTokenLogprob>,
+    pub prompt_logprobs: Vec<Option<TokenLogprob>>,
+    pub stop_sequence: Option<String>,
     pub reason: Option<FinishReason>,
     pub elapsed_ms: f64,
     pub generation_elapsed_ms: f64,
@@ -132,6 +164,9 @@ impl ResponseAccumulator {
             GenerationEvent::Started { input_tokens } => self.input_tokens = *input_tokens,
             GenerationEvent::ReasoningDelta(delta) => self.reasoning.push_str(delta),
             GenerationEvent::TextDelta(delta) => self.text.push_str(delta),
+            GenerationEvent::Logprobs(tokens) => self.logprobs.extend_from_slice(tokens),
+            GenerationEvent::PromptLogprobs(tokens) => self.prompt_logprobs.clone_from(tokens),
+            GenerationEvent::StopSequence(sequence) => self.stop_sequence = Some(sequence.clone()),
             GenerationEvent::ToolCallStart { index, id, name } => {
                 if self.tool_calls.len() <= *index {
                     self.tool_calls.resize_with(*index + 1, ToolCall::default);
@@ -174,4 +209,10 @@ pub(crate) fn json_error(message: impl Into<String>, error_type: &str) -> Value 
             "type": error_type,
         }
     })
+}
+
+// JSON has no infinity literal. Null preserves a valid negative-infinite score
+// across the private coordinator transport without changing finite values.
+fn deserialize_logprob<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    Option::<f32>::deserialize(deserializer).map(|value| value.unwrap_or(f32::NEG_INFINITY))
 }

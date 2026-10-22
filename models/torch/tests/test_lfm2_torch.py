@@ -151,6 +151,39 @@ class TestLfm2Torch:
         assert "model.embedding_norm.weight" in keys
         assert not any(".operator." in key for key in keys)
 
+    @pytest.mark.parametrize("chunk", [1, 2, 8])
+    def test_prompt_scores_match_full_context_without_extra_forwards(self, chunk):
+        from resin import Engine, SamplingParams, SchedulerConfig
+        from resin_models_torch.lfm2 import Lfm2TorchRunner
+
+        runner = Lfm2TorchRunner.__new__(Lfm2TorchRunner)
+        runner.device = torch.device("cpu")
+        runner._model = self.model
+        runner.vocab_size = self.args.vocab_size
+        runner._cache = {}
+        runner.forward_calls = 0
+        tokens = [1, 2, 3, 4, 5]
+        with torch.inference_mode():
+            logits = self.model(torch.tensor([tokens]), self.model.make_cache())[0]
+            expected = logits[:-1].log_softmax(-1)[range(len(tokens) - 1), tokens[1:]]
+        engine = Engine(
+            runner, scheduler_config=SchedulerConfig(prefill_chunk_size=chunk)
+        )
+        request = engine.submit(
+            tokens,
+            max_new_tokens=0,
+            sampling_params=SamplingParams(prompt_logprobs=True),
+        )
+        while engine.has_work():
+            assert engine.step() == []
+        scores = request.prompt_logprobs
+        assert scores is not None and scores[0] is None
+        assert [
+            score.logprob for score in scores[1:] if score is not None
+        ] == pytest.approx(expected.tolist(), abs=1e-5)
+        assert runner.forward_calls == (len(tokens) + chunk - 1) // chunk
+        assert runner.live_cache_count == 0
+
     def test_runner_consumes_batch_plan_and_releases_per_request_cache(self) -> None:
         from resin import BatchPhase, BatchPlan
         from resin_models_torch.lfm2 import Lfm2TorchRunner

@@ -8,7 +8,6 @@ from typing import Any
 from resin.models.inkling.media import InklingMedia
 from resin.protocols import FinalizingResponseParser, RenderedPrompt
 from resin.recipe import Recipe
-from resin.server import encode_stop_tokens
 from resin.server.media import prepare_recipe_inputs
 
 
@@ -36,11 +35,7 @@ class InklingCodec:
         )
         rendered: RenderedPrompt = {
             "token_ids": list(media.token_ids),
-            "stop_token_ids": encode_stop_tokens(
-                self.tokenizer,
-                self.recipe.get_stop_token_ids(),
-                request.get("stop") or [],
-            ),
+            "stop_token_ids": self.recipe.get_stop_token_ids(),
         }
         if media.pixel_values is not None:
             rendered["media"] = media

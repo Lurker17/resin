@@ -98,6 +98,7 @@ def _runner(monkeypatch, groups):
     def batches(plan, cache_layout):
         assert cache_layout is runner.cache_layout
         batch = SimpleNamespace(
+            token_indices=torch.arange(len(plan.token_ids)),
             sequence_indices=tuple(range(plan.num_sequences)),
             last_token_indices=torch.tensor(plan.token_indptr[1:].astype(np.int64) - 1),
             phase=plan.phase,
@@ -111,14 +112,18 @@ def _runner(monkeypatch, groups):
     def tensorize(host, staging, prefix):
         tensorized.append(prefix)
         return SimpleNamespace(
+            token_indices=host.token_indices,
             sequence_indices=torch.tensor(host.sequence_indices),
             last_token_indices=host.last_token_indices,
         )
 
-    def forward(token_ids, positions, batch):
+    def forward(
+        token_ids, positions, batch, *, context_parallel=None, full_hidden=False
+    ):
         calls.append(("batch", len(token_ids), positions.tolist()))
         return torch.nn.functional.one_hot(
-            token_ids[batch.last_token_indices], num_classes=runner.hidden_size
+            token_ids if full_hidden else token_ids[batch.last_token_indices],
+            num_classes=runner.hidden_size,
         ).bfloat16()
 
     monkeypatch.setattr(implementation, "build_attention_batches", batches)
@@ -173,6 +178,39 @@ def test_distributed_forward_packs_unequal_replica_rows_once(monkeypatch, phase)
             "prefill.0" if phase == BatchPhase.PREFILL else "decode"
         ]
         assert groups.broadcasts == []
+
+
+def test_distributed_prefill_scores_all_predecessors_from_one_forward(monkeypatch):
+    groups = _groups(Parallelism(world_size=2, ep=2, attn_dp=2))
+    runner = _runner(monkeypatch, groups)
+    plan = BatchPlan(
+        [7, 8],
+        [0, 9],
+        [2, 2, 4, 5, 5],
+        [0, 3, 5],
+        sampling_params=[SamplingParams(prompt_logprobs=True)] * 2,
+        prompt_score_indices=[0, 1, 2, 3],
+        prompt_score_token_ids=[2, 4, 9, 5],
+        prompt_score_indptr=[0, 3, 4],
+    )
+    output = runner.forward_distributed(
+        plan, _context(groups, BatchPhase.PREFILL, ((2, 5), (0, 0)), plan)
+    )
+    assert isinstance(output, ForwardOutput)
+    logits = (
+        torch.nn.functional.one_hot(
+            torch.tensor(plan.token_ids.astype(np.int64)),
+            num_classes=runner.hidden_size,
+        )
+        .float()
+        .log_softmax(-1)
+    )
+    np.testing.assert_allclose(
+        output.prompt_logprobs, logits[[0, 1, 2, 3], [2, 4, 9, 5]].numpy(), atol=1e-6
+    )
+    np.testing.assert_array_equal(output.prompt_logprob_indptr, [0, 3, 4])
+    np.testing.assert_array_equal(output.token_ids, [4, 5])
+    assert len(runner.calls) == 1
 
 
 @pytest.mark.parametrize("phase", [BatchPhase.PREFILL, BatchPhase.DECODE])

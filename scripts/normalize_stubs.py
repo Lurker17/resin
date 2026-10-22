@@ -13,6 +13,8 @@ OUTPUT_COLUMNS = {
     "top_indptr": "npt.NDArray[np.uint32] | None",
     "top_token_ids": "npt.NDArray[np.uint32] | None",
     "top_logprobs": "npt.NDArray[np.float32] | None",
+    "prompt_logprobs": "npt.NDArray[np.float32] | None",
+    "prompt_logprob_indptr": "npt.NDArray[np.uint32] | None",
 }
 
 PARAMETERS = {
@@ -28,6 +30,9 @@ PARAMETERS = {
         "token_ids": U32_INPUT,
         "token_indptr": U32_INPUT,
         "sampling_mask": "Sequence[bool] | npt.NDArray[np.bool_] | None",
+        "prompt_score_indices": f"{U32_INPUT} | None",
+        "prompt_score_token_ids": f"{U32_INPUT} | None",
+        "prompt_score_indptr": f"{U32_INPUT} | None",
         "media": "Sequence[MediaInput | None] | None",
     },
     ("CacheGroupPlan", "__new__"): {
@@ -71,6 +76,9 @@ RETURNS = {
                     "token_ids",
                     "token_indptr",
                     "positions",
+                    "prompt_score_indices",
+                    "prompt_score_token_ids",
+                    "prompt_score_indptr",
                 ),
             ),
             (

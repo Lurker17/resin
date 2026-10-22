@@ -13,7 +13,28 @@ from resin import SamplingParams
 SAMPLING_OFFSET_STRIDE = 32
 
 
-def format_output(logits, token_ids, plan):
+def prompt_scores(plan, hidden, project=None, *, token_start=0):
+    """Score prompt predecessors from this forward, projecting bounded chunks."""
+    if not plan.needs_prompt_logprobs:
+        return None
+    indices = plan.prompt_score_indices
+    keep = (indices >= token_start) & (indices < token_start + hidden.shape[0])
+    selected = torch.as_tensor(
+        indices[keep].astype(np.int64) - token_start, device=hidden.device
+    )
+    targets = torch.as_tensor(
+        plan.prompt_score_token_ids[keep].astype(np.int64), device=hidden.device
+    )
+    scores = []
+    for start in range(0, len(selected), 128):
+        values = hidden.index_select(0, selected[start : start + 128])
+        values = (project(values) if project is not None else values).float()
+        chosen = values.gather(1, targets[start : start + 128, None]).squeeze(1)
+        scores.append(chosen - values.logsumexp(dim=-1))
+    return torch.cat(scores) if scores else hidden.new_empty(0, dtype=torch.float32)
+
+
+def format_output(logits, token_ids, plan, *, prompt_logprobs=None):
     """Attach raw-model logprobs to generated tokens, including verified blocks.
 
     Logits have shape [rows, vocab] or [rows, verification positions, vocab].
@@ -24,7 +45,7 @@ def format_output(logits, token_ids, plan):
 
     from resin import ForwardOutput
 
-    if not plan.needs_logprobs:
+    if not plan.needs_logprobs and not plan.needs_prompt_logprobs:
         return token_ids.tolist() if isinstance(token_ids, torch.Tensor) else token_ids
 
     if isinstance(token_ids, torch.Tensor):
@@ -44,6 +65,20 @@ def format_output(logits, token_ids, plan):
         lengths = np.fromiter(map(len, rows), dtype=np.uint32)
         ids = np.fromiter((token for row in rows for token in row), dtype=np.uint32)
     offsets = np.concatenate((np.zeros(1, np.uint32), lengths.cumsum(dtype=np.uint32)))
+    prompt_columns = {}
+    if plan.needs_prompt_logprobs:
+        if prompt_logprobs is None:
+            raise ValueError("prefill did not provide requested prompt scores")
+        prompt_columns = {
+            "prompt_logprobs": prompt_logprobs.detach()
+            .to(device="cpu", dtype=torch.float32)
+            .numpy(),
+            "prompt_logprob_indptr": np.asarray(
+                plan.prompt_score_indptr, dtype=np.uint32
+            ),
+        }
+    if not plan.needs_logprobs:
+        return ForwardOutput(ids, offsets, **prompt_columns)
     if logits.ndim == 2:
         logits = logits[:, None, :]
     if logits.ndim != 3 or len(lengths) != logits.shape[0]:
@@ -106,6 +141,7 @@ def format_output(logits, token_ids, plan):
         logprobs=chosen.cpu().numpy(),
         logprob_indptr=score_offsets,
         **columns,
+        **prompt_columns,
     )
 
 
@@ -218,4 +254,5 @@ __all__ = [
     "TorchSampler",
     "batch_sampling_inputs",
     "format_output",
+    "prompt_scores",
 ]

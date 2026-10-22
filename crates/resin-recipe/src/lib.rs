@@ -85,6 +85,12 @@ pub trait Decoder: Send {
 
 /// Parse generated tokens into semantic events.
 pub trait ResponseParser: Send {
+    /// A proven semantic lane for this complete token before it is fed.
+    /// `None` means a header, mixed token, or grammar with deferred transforms.
+    fn token_channel(&self, _id: u32) -> Option<&'static str> {
+        None
+    }
+
     fn feed(&mut self, ids: &[u32]) -> Result<Vec<Event>, Error>;
     fn finish(&mut self, reason: FinishReason) -> Result<Vec<Event>, Error>;
 }
