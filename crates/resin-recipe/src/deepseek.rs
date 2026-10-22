@@ -1,8 +1,8 @@
-//! The conversation format shipped with DeepSeek V4 Flash-0731 and Pro-0813.
+//! Checkpoint-owned DeepSeek V4 and V4.1 conversation variants.
 //!
-//! Those two pinned checkpoints have identical encoders. Their history format
-//! differs from the later V4/V4.1 encoders in `deepseek-recipe`; keep the version
-//! boundary explicit instead of silently changing prompts with an oracle update.
+//! Flash-0731 and Pro-0813 have identical encoders. Flash-1017 changes tag
+//! spellings, effort budgets and system-message handling. Keep that boundary
+//! explicit while sharing the rendering and incremental parsing machinery.
 
 mod parser;
 
@@ -22,14 +22,78 @@ pub const THINKING_END: &str = "</think>";
 pub const DSML: &str = "｜DSML｜";
 const USER: &str = "<｜User｜>";
 const ASSISTANT: &str = "<｜Assistant｜>";
+const SYSTEM: &str = "<｜System｜>";
 const REMINDER: &str = "<｜latest_reminder｜>";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Version {
+    V4,
+    V41,
+}
+
+impl Version {
+    pub(crate) fn tags(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::V4 => ("tool_calls", "invoke", "parameter"),
+            Self::V41 => (" calls", " invoke", " parameter"),
+        }
+    }
+
+    pub(crate) fn settings(self, request: &Value) -> Result<(bool, String), Error> {
+        if self == Self::V4 {
+            let (thinking, effort) = thinking_settings(request)?;
+            return Ok((
+                thinking,
+                match effort {
+                    "high" => HIGH_EFFORT,
+                    "max" => MAX_EFFORT,
+                    _ => "",
+                }
+                .into(),
+            ));
+        }
+        let effort = option(request, "reasoning_effort");
+        let budget = match effort {
+            None => 75,
+            Some(Value::String(value)) => match value.as_str() {
+                "low" => 50,
+                "high" => 75,
+                "max" => 100,
+                _ => {
+                    return Err(Error::new(
+                        "V4.1 reasoning_effort must be low, high, max, or an integer in 1..100",
+                    ));
+                }
+            },
+            Some(value) => value
+                .as_u64()
+                .filter(|n| (1..=100).contains(n))
+                .ok_or_else(|| Error::new("V4.1 reasoning_effort must be an integer in 1..100"))?,
+        };
+        Ok((
+            thinking_mode(request, effort.is_some())?,
+            format!(
+                "Reasoning Effort: {budget} (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+            ),
+        ))
+    }
+
+    fn starts_turn(self, index: usize, message: &Value) -> bool {
+        if self == Self::V4 {
+            return matches!(message["role"].as_str(), Some("user" | "developer"));
+        }
+        (message["role"] == "user" || (message["role"] == "system" && index > 0))
+            && message["content_blocks"].as_array().is_none_or(|blocks| {
+                blocks.is_empty() || blocks.iter().any(|b| b["type"] == "text")
+            })
+    }
+}
 
 const HIGH_EFFORT: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 const MAX_EFFORT: &str = "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\nYou MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\nDo not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
 
 /// Resolve Resin's API effort aliases without changing the checkpoint default.
 pub fn thinking_settings(request: &Value) -> Result<(bool, &'static str), Error> {
-    let extra = &request["extra"];
     let configured_effort = option(request, "reasoning_effort");
     let effort = match configured_effort {
         None => "low",
@@ -45,18 +109,28 @@ pub fn thinking_settings(request: &Value) -> Result<(bool, &'static str), Error>
         },
         Some(_) => return Err(Error::new("reasoning_effort must be a string")),
     };
-    let thinking = match extra.get("thinking_mode").filter(|value| !value.is_null()) {
-        Some(Value::String(value)) if value == "chat" => false,
-        Some(Value::String(value)) if value == "thinking" => true,
-        Some(_) => return Err(Error::new("thinking_mode must be 'chat' or 'thinking'")),
-        None => configured_effort.is_some() || extra["thinking"]["type"] == "enabled",
-    };
-    Ok((thinking, effort))
+    Ok((thinking_mode(request, configured_effort.is_some())?, effort))
+}
+
+fn thinking_mode(request: &Value, configured_effort: bool) -> Result<bool, Error> {
+    let extra = &request["extra"];
+    Ok(
+        match extra.get("thinking_mode").filter(|value| !value.is_null()) {
+            Some(Value::String(value)) if value == "chat" => false,
+            Some(Value::String(value)) if value == "thinking" => true,
+            Some(_) => return Err(Error::new("thinking_mode must be 'chat' or 'thinking'")),
+            None => configured_effort || extra["thinking"]["type"] == "enabled",
+        },
+    )
 }
 
 /// Render the pinned checkpoint's text format, with explicit control spans.
 pub fn render(request: &Value) -> Result<Prompt, Error> {
-    let (thinking, effort) = thinking_settings(request)?;
+    render_version(request, Version::V4)
+}
+
+pub fn render_version(request: &Value, version: Version) -> Result<Prompt, Error> {
+    let (thinking, effort_prefix) = version.settings(request)?;
     let mut messages = request["messages"]
         .as_array()
         .ok_or_else(|| Error::new("messages must be an array"))?
@@ -81,7 +155,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
             messages[0]["response_format"] = format.clone();
         }
     }
-    let messages = merge_messages(messages)?;
+    let messages = merge_messages(messages, version)?;
     let drop_thinking = !messages.iter().any(|message| {
         message["tools"]
             .as_array()
@@ -89,7 +163,8 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
     });
     let last_user = messages
         .iter()
-        .rposition(|message| matches!(message["role"].as_str(), Some("user" | "developer")));
+        .enumerate()
+        .rposition(|(index, message)| version.starts_turn(index, message));
     let messages: Vec<_> = messages
         .into_iter()
         .enumerate()
@@ -108,15 +183,15 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
         .collect();
     let last_user = messages
         .iter()
-        .rposition(|message| matches!(message["role"].as_str(), Some("user" | "developer")));
+        .enumerate()
+        .rposition(|(index, message)| version.starts_turn(index, message));
     let mut prompt = Prompt::new();
     prompt.special(BOS);
+    if version == Version::V41 && (thinking || messages[0]["role"] == "system") {
+        prompt.special(SYSTEM);
+    }
     if thinking {
-        prompt.text(match effort {
-            "high" => HIGH_EFFORT,
-            "max" => MAX_EFFORT,
-            _ => "",
-        });
+        prompt.text(effort_prefix);
     }
     for (index, message) in messages.iter().enumerate() {
         let role = message["role"]
@@ -124,6 +199,14 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
             .ok_or_else(|| Error::new("message role must be a string"))?;
         match role {
             "system" | "developer" => {
+                if version == Version::V41 && role == "developer" {
+                    return Err(Error::new(
+                        "DeepSeek V4.1 uses system messages for instructions",
+                    ));
+                }
+                if version == Version::V41 && index > 0 {
+                    prompt.special(SYSTEM);
+                }
                 if role == "developer" {
                     prompt.special(USER);
                 }
@@ -133,7 +216,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                     .filter(|tools| !tools.is_empty())
                 {
                     prompt.text("\n\n");
-                    render_tools(&mut prompt, tools)?;
+                    render_tools(&mut prompt, tools, version)?;
                 }
                 if let Some(format) = message
                     .get("response_format")
@@ -185,7 +268,7 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                     .as_array()
                     .filter(|calls| !calls.is_empty())
                 {
-                    render_tool_calls(&mut prompt, calls)?;
+                    render_tool_calls(&mut prompt, calls, version)?;
                 }
                 if message["wo_eos"] != true {
                     prompt.special(EOS);
@@ -228,7 +311,10 @@ pub fn render(request: &Value) -> Result<Prompt, Error> {
                     });
                 }
                 prompt.special(format!("<｜{task}｜>"));
-            } else if role == "user" || role == "developer" {
+            } else if role == "user"
+                || role == "developer"
+                || (version == Version::V41 && role == "system" && index > 0)
+            {
                 prompt.special(ASSISTANT);
                 prompt.special(
                     if thinking && (!drop_thinking || last_user.is_none_or(|last| index >= last)) {
@@ -253,15 +339,26 @@ fn text_value(value: &Value) -> Result<String, Error> {
     })
 }
 
-fn merge_messages(messages: Vec<Value>) -> Result<Vec<Value>, Error> {
+fn merge_messages(messages: Vec<Value>, version: Version) -> Result<Vec<Value>, Error> {
     let mut merged: Vec<Value> = Vec::new();
     for mut message in messages {
         let role = message["role"].as_str();
         if matches!(role, Some("user" | "tool")) {
-            let block = if role == Some("tool") {
-                serde_json::json!({"type": "tool_result", "tool_use_id": message["tool_call_id"], "content": content(&message)?})
+            let existing = (version == Version::V41 && role == Some("user"))
+                .then(|| {
+                    message["content_blocks"]
+                        .as_array()
+                        .or_else(|| message["content"].as_array())
+                })
+                .flatten();
+            let blocks = if let Some(blocks) = existing {
+                blocks.clone()
+            } else if role == Some("tool") {
+                vec![
+                    serde_json::json!({"type": "tool_result", "tool_use_id": message["tool_call_id"], "content": content(&message)?}),
+                ]
             } else {
-                serde_json::json!({"type": "text", "text": content(&message)?})
+                vec![serde_json::json!({"type": "text", "text": content(&message)?})]
             };
             if let Some(previous) = merged.last_mut().filter(|previous| {
                 previous["role"] == "user"
@@ -271,10 +368,10 @@ fn merge_messages(messages: Vec<Value>) -> Result<Vec<Value>, Error> {
                 previous["content_blocks"]
                     .as_array_mut()
                     .unwrap()
-                    .push(block);
+                    .extend(blocks);
             } else {
                 message["role"] = Value::String("user".into());
-                message["content_blocks"] = Value::Array(vec![block]);
+                message["content_blocks"] = Value::Array(blocks);
                 merged.push(message);
             }
         } else {
@@ -322,9 +419,14 @@ fn merge_messages(messages: Vec<Value>) -> Result<Vec<Value>, Error> {
     Ok(merged)
 }
 
-fn render_tools(prompt: &mut Prompt, tools: &[Value]) -> Result<(), Error> {
+fn render_tools(prompt: &mut Prompt, tools: &[Value], version: Version) -> Result<(), Error> {
     // Only the template's delimiters are control tokens; schemas remain text.
-    let mut template = include_str!("deepseek/tools.txt");
+    let (calls, invoke, parameter) = version.tags();
+    let adapted = include_str!("deepseek/tools.txt")
+        .replace("｜DSML｜tool_calls", &format!("{DSML}{calls}"))
+        .replace("｜DSML｜invoke", &format!("{DSML}{invoke}"))
+        .replace("｜DSML｜parameter", &format!("{DSML}{parameter}"));
+    let mut template = adapted.as_str();
     while let Some((at, marker)) = [DSML, THINKING_START, THINKING_END]
         .into_iter()
         .filter_map(|marker| template.find(marker).map(|at| (at, marker)))
@@ -336,11 +438,11 @@ fn render_tools(prompt: &mut Prompt, tools: &[Value]) -> Result<(), Error> {
     }
     prompt.text(template);
     for tool in tools {
-        let tool = function(tool);
+        let tool = qualified_function(tool, version)?;
         if !tool.is_object() {
             return Err(Error::new("tool schema must be an object"));
         }
-        prompt.text(json_spaced(tool));
+        prompt.text(json_spaced(&tool));
         prompt.text("\n");
     }
     prompt.text("\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n");
@@ -353,34 +455,40 @@ fn tag(prompt: &mut Prompt, prefix: &str, suffix: &str) {
     prompt.text(suffix);
 }
 
-fn render_tool_calls(prompt: &mut Prompt, calls: &[Value]) -> Result<(), Error> {
-    tag(prompt, "\n\n<", "tool_calls>\n");
+fn render_tool_calls(prompt: &mut Prompt, calls: &[Value], version: Version) -> Result<(), Error> {
+    let (block, invoke, parameter) = version.tags();
+    tag(prompt, "\n\n<", &format!("{block}>\n"));
     for (index, call) in calls.iter().enumerate() {
         if index > 0 {
             prompt.text("\n");
         }
-        let function = function(call);
+        let function = qualified_function(call, version)?;
         let name = function["name"]
             .as_str()
             .ok_or_else(|| Error::new("tool call name must be a string"))?;
-        tag(prompt, "<", "invoke name=\"");
+        tag(prompt, "<", &format!("{invoke} name=\""));
         prompt.text(name);
         prompt.text("\">\n");
-        let arguments = function["arguments"]
-            .as_str()
-            .ok_or_else(|| Error::new("tool call arguments must be a JSON string"))?;
-        let arguments: serde_json::Map<String, Value> = serde_json::from_str(arguments)
-            .unwrap_or_else(|_| {
-                serde_json::Map::from_iter([(
-                    "arguments".to_owned(),
-                    Value::String(arguments.to_owned()),
-                )])
-            });
+        let original = &function["arguments"];
+        if version == Version::V4 && !original.is_string() {
+            return Err(Error::new("tool call arguments must be a JSON string"));
+        }
+        let mut arguments = original.clone();
+        for _ in 0..if version == Version::V41 { 2 } else { 1 } {
+            if let Some(text) = arguments.as_str()
+                && let Ok(parsed) = serde_json::from_str(text)
+            {
+                arguments = parsed;
+            }
+        }
+        let arguments = arguments.as_object().cloned().unwrap_or_else(|| {
+            serde_json::Map::from_iter([("arguments".to_owned(), original.clone())])
+        });
         for (index, (key, value)) in arguments.iter().enumerate() {
             if index > 0 {
                 prompt.text("\n");
             }
-            tag(prompt, "<", "parameter name=\"");
+            tag(prompt, "<", &format!("{parameter} name=\""));
             prompt.text(key);
             prompt.text(if value.is_string() {
                 "\" string=\"true\">"
@@ -393,12 +501,47 @@ fn render_tool_calls(prompt: &mut Prompt, calls: &[Value]) -> Result<(), Error> 
                     .map(str::to_owned)
                     .unwrap_or_else(|| json_spaced(value)),
             );
-            tag(prompt, "</", "parameter>");
+            tag(prompt, "</", &format!("{parameter}>"));
         }
-        tag(prompt, "\n</", "invoke>");
+        tag(prompt, "\n</", &format!("{invoke}>"));
     }
-    tag(prompt, "\n</", "tool_calls>");
+    tag(prompt, "\n</", &format!("{block}>"));
     Ok(())
+}
+
+fn qualified_function(value: &Value, version: Version) -> Result<Value, Error> {
+    let mut result = function(value).clone();
+    if version == Version::V41 {
+        let namespace = value
+            .get("namespace")
+            .filter(|v| !v.is_null())
+            .or_else(|| result.get("namespace").filter(|v| !v.is_null()));
+        let explicit = namespace.and_then(|v| v.as_str().or_else(|| v["name"].as_str()));
+        let name = result["name"]
+            .as_str()
+            .ok_or_else(|| Error::new("tool name must be a string"))?;
+        let (prefix, name) = name
+            .split_once("::")
+            .map_or((explicit, name), |(prefix, name)| (Some(prefix), name));
+        if prefix.is_some_and(|p| p.contains("::") || explicit.is_some_and(|e| e != p))
+            || name.contains("::")
+        {
+            return Err(Error::new("invalid or conflicting tool namespace"));
+        }
+        let qualified = prefix.map_or_else(|| name.to_owned(), |p| format!("{p}::{name}"));
+        let description = namespace
+            .and_then(|n| n["description"].as_str())
+            .map(str::to_owned);
+        if let Some(description) = description {
+            result["description"] = Value::String(format!(
+                "{description}\n{}",
+                result["description"].as_str().unwrap_or("")
+            ));
+        }
+        result["name"] = Value::String(qualified);
+        result.as_object_mut().unwrap().remove("namespace");
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

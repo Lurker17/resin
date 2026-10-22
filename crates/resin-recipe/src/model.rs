@@ -11,6 +11,7 @@ pub enum ModelFormat {
     Inkling,
     GptOss,
     DeepSeek,
+    DeepSeekV41,
     Qwen,
     Gemma,
     Lfm2,
@@ -21,6 +22,7 @@ impl ModelFormat {
             "inkling" => Ok(Self::Inkling),
             "gpt_oss" => Ok(Self::GptOss),
             "deepseek_v4" => Ok(Self::DeepSeek),
+            "deepseek_v41" => Ok(Self::DeepSeekV41),
             "qwen3_5" => Ok(Self::Qwen),
             "gemma4" => Ok(Self::Gemma),
             "lfm2" => Ok(Self::Lfm2),
@@ -32,6 +34,9 @@ impl ModelFormat {
             Self::Inkling => crate::inkling::render(request),
             Self::GptOss => crate::gpt_oss::render(request),
             Self::DeepSeek => crate::deepseek::render(request),
+            Self::DeepSeekV41 => {
+                crate::deepseek::render_version(request, crate::deepseek::Version::V41)
+            }
             Self::Qwen => crate::qwen::render(request),
             Self::Gemma => crate::gemma::render(request),
             Self::Lfm2 => crate::lfm2::render(request),
@@ -74,11 +79,12 @@ impl ModelFormat {
                 decoder,
                 prompt_ids,
             )?),
-            Self::DeepSeek => Box::new(DeepSeekV4Parser::new(
+            Self::DeepSeek | Self::DeepSeekV41 => Box::new(DeepSeekV4Parser::with_version(
                 DeepSeekV4Tokens::resolve(encoder)?,
                 decoder,
                 prompt_ids,
-                crate::deepseek::thinking_settings(request)?.0,
+                self.deepseek_version().settings(request)?.0,
+                self.deepseek_version(),
             )?),
         })
     }
@@ -91,10 +97,18 @@ impl ModelFormat {
                 alias(&["<|fim_suffix|>", "<|return|>"])?,
                 alias(&["<|ghissue|>", "<|call|>"])?,
             ]),
-            Self::DeepSeek => Ok(vec![id(crate::deepseek::EOS)?]),
+            Self::DeepSeek | Self::DeepSeekV41 => Ok(vec![id(crate::deepseek::EOS)?]),
             Self::Lfm2 => Ok(vec![id("<|im_end|>")?]),
             Self::Qwen => Ok(vec![id("<|im_end|>")?, id("<|endoftext|>")?]),
             Self::Gemma => Ok(vec![id("<turn|>")?, id("<eos>")?]),
+        }
+    }
+
+    fn deepseek_version(self) -> crate::deepseek::Version {
+        if matches!(self, Self::DeepSeekV41) {
+            crate::deepseek::Version::V41
+        } else {
+            crate::deepseek::Version::V4
         }
     }
 }

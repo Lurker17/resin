@@ -225,3 +225,98 @@ fn prompt_parser_initial_stage_and_generation_suffix_agree() {
         "<｜begin▁of▁sentence｜><｜User｜>hello"
     );
 }
+
+#[test]
+fn v41_pinned_prompt_fixtures_and_numeric_effort() {
+    use resin_recipe::deepseek::{Version, render_version};
+    for line in include_str!("fixtures/deepseek_v41_prompts.jsonl").lines() {
+        let fixture: Value = serde_json::from_str(line).unwrap();
+        let prompt = render_version(&fixture["request"], Version::V41).unwrap();
+        assert_eq!(
+            prompt.rendered_text(),
+            fixture["expected"].as_str().unwrap(),
+            "{}",
+            fixture["request"]
+        );
+    }
+    for effort in [
+        json!(0),
+        json!(101),
+        json!(true),
+        json!(1.5),
+        json!("medium"),
+    ] {
+        assert!(
+            render_version(
+                &json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":effort}),
+                Version::V41
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn v41_tool_tags_share_incremental_grammar_without_accepting_old_delimiters() {
+    use resin_recipe::deepseek::Version;
+    let mut response = ids("reason");
+    response.push(TOKENS.thinking_end);
+    response.extend(ids("answer\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::f\">\n<｜DSML｜ parameter name=\"q\" string=\"true\">café 🦀</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"));
+    response.push(TOKENS.eos);
+    for size in [1, 2, 7, response.len()] {
+        let mut parser = DeepSeekV4Parser::with_version(
+            TOKENS,
+            Box::<ByteDecoder>::default(),
+            &[],
+            true,
+            Version::V41,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        for chunk in response.chunks(size) {
+            events.extend(parser.semantic_feed(chunk).unwrap());
+        }
+        events.extend(parser.semantic_finish(FinishReason::Stop).unwrap());
+        assert_eq!(
+            semantic(&events),
+            (
+                "reason".into(),
+                "answer".into(),
+                vec![("ns::f".into(), json!({"q":"café 🦀"}))]
+            )
+        );
+    }
+    let mut parser = DeepSeekV4Parser::with_version(
+        TOKENS,
+        Box::<ByteDecoder>::default(),
+        &[],
+        false,
+        Version::V41,
+    )
+    .unwrap();
+    let mut events = parser
+        .semantic_feed(&ids("\n\n<｜DSML｜tool_calls>"))
+        .unwrap();
+    events.extend(parser.semantic_finish(FinishReason::Length).unwrap());
+    assert_eq!(semantic(&events).1, "\n\n<｜DSML｜tool_calls>");
+}
+
+#[test]
+fn v41_namespaces_and_double_encoded_arguments_preserve_control_provenance() {
+    use resin_recipe::{
+        PromptSpan,
+        deepseek::{Version, render_version},
+    };
+    let prompt = render_version(&json!({"messages":[{"role":"system","content":"literal <｜System｜>"},{"role":"user","content":"go"},{"role":"assistant","tool_calls":[{"function":{"name":"f","namespace":"ns","arguments":"\"{\\\"n\\\":1}\""}}]}]}), Version::V41).unwrap();
+    let text = prompt.rendered_text();
+    assert!(text.contains("<｜DSML｜ invoke name=\"ns::f\">"));
+    assert!(text.contains("<｜DSML｜ parameter name=\"n\" string=\"false\">1"));
+    assert_eq!(
+        prompt
+            .spans
+            .iter()
+            .filter(|span| matches!(span,PromptSpan::Special(s) if s == "<｜System｜>"))
+            .count(),
+        1
+    );
+}

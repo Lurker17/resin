@@ -1,4 +1,4 @@
-use super::{BOS, DSML, EOS, THINKING_END, THINKING_START};
+use super::{BOS, DSML, EOS, THINKING_END, THINKING_START, Version};
 use crate::parser::{EventSink, Grammar, Parser, tokens};
 use crate::{AttributedText, Decoder, Error, Event, FinishReason};
 use std::collections::HashSet;
@@ -125,6 +125,7 @@ impl Buffer {
 /// Incremental DSML parsing. Only actual control IDs introduce DSML markers.
 pub type DeepSeekV4Parser = Parser<DeepSeekV4Grammar>;
 pub struct DeepSeekV4Grammar {
+    version: Version,
     tokens: DeepSeekV4Tokens,
     stage: Stage,
     buffer: Buffer,
@@ -143,6 +144,16 @@ impl DeepSeekV4Parser {
         prompt_ids: &[u32],
         thinking: bool,
     ) -> Result<Self, Error> {
+        Self::with_version(tokens, decoder, prompt_ids, thinking, Version::V4)
+    }
+
+    pub fn with_version(
+        tokens: DeepSeekV4Tokens,
+        decoder: Box<dyn Decoder>,
+        prompt_ids: &[u32],
+        thinking: bool,
+        version: Version,
+    ) -> Result<Self, Error> {
         tokens.validate()?;
         let thinking = prompt_ids
             .iter()
@@ -159,6 +170,7 @@ impl DeepSeekV4Parser {
             .unwrap_or(thinking);
         Ok(Self::with_grammar(
             DeepSeekV4Grammar {
+                version,
                 tokens,
                 stage: if thinking {
                     Stage::Reasoning
@@ -194,6 +206,7 @@ impl DeepSeekV4Grammar {
         special: bool,
         events: &mut EventSink,
     ) -> Result<(), Error> {
+        let (calls, invoke, parameter) = self.version.tags();
         self.buffer.push(text, special);
         loop {
             match self.stage {
@@ -205,7 +218,9 @@ impl DeepSeekV4Grammar {
                     break;
                 }
                 Stage::Content => {
-                    let (text, found) = self.buffer.until(&Marker::dsml("\n\n<", "tool_calls>"));
+                    let (text, found) = self
+                        .buffer
+                        .until(&Marker::dsml("\n\n<", &format!("{calls}>")));
                     if !text.is_empty() {
                         events.text(text, false);
                     }
@@ -217,8 +232,8 @@ impl DeepSeekV4Grammar {
                 Stage::Calls => {
                     self.buffer.skip_whitespace();
                     match self.buffer.expect(&[
-                        Marker::dsml("<", "invoke name=\""),
-                        Marker::dsml("</", "tool_calls>"),
+                        Marker::dsml("<", &format!("{invoke} name=\"")),
+                        Marker::dsml("</", &format!("{calls}>")),
                     ])? {
                         None => break,
                         Some(0) => {
@@ -248,8 +263,8 @@ impl DeepSeekV4Grammar {
                 Stage::Arguments => {
                     self.buffer.skip_whitespace();
                     match self.buffer.expect(&[
-                        Marker::dsml("<", "parameter name=\""),
-                        Marker::dsml("</", "invoke>"),
+                        Marker::dsml("<", &format!("{parameter} name=\"")),
+                        Marker::dsml("</", &format!("{invoke}>")),
                     ])? {
                         None => break,
                         Some(0) => {
@@ -299,7 +314,9 @@ impl DeepSeekV4Grammar {
                     }
                 }
                 Stage::ParameterValue { string } => {
-                    let (text, found) = self.buffer.until(&Marker::dsml("</", "parameter>"));
+                    let (text, found) = self
+                        .buffer
+                        .until(&Marker::dsml("</", &format!("{parameter}>")));
                     let text = if string {
                         let quoted = serde_json::to_string(&text.text).unwrap();
                         quoted[1..quoted.len() - 1].to_owned()

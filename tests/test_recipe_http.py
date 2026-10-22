@@ -28,8 +28,8 @@ def test_stock_recipe_http_events(recipe_adapter, stream, completion_reason):
     expected = normalize(adapter.oracles[0][1](case))
     # DeepSeek's generated continuation begins in its rendered thinking prefix.
     request = {"messages": [{"role": "user", "content": "hello"}]}
-    if name == "deepseek_v4":
-        request["reasoning_effort"] = "medium"
+    if name.startswith("deepseek_"):
+        request["reasoning_effort"] = "high"
 
     class Runner:
         step = 0
@@ -142,8 +142,8 @@ def test_stock_recipe_stops_match_decoded_output(recipe_adapter, stream):
         if part.kind == "text" and isinstance(part.value, str)
     ).split("STOP")[0]
     request = {"messages": [{"role": "user", "content": "hello"}]}
-    if name == "deepseek_v4":
-        request["reasoning_effort"] = "medium"
+    if name.startswith("deepseek_"):
+        request["reasoning_effort"] = "high"
 
     class Runner:
         position = 0

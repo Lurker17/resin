@@ -321,7 +321,7 @@ def scored_exchange(
 
 
 def recipe_controls(name):
-    return {"reasoning_effort": "medium"} if name == "deepseek_v4" else {}
+    return {"reasoning_effort": "high"} if name.startswith("deepseek_") else {}
 
 
 @pytest.mark.parametrize("api", ["chat/completions", "responses"])
@@ -392,7 +392,7 @@ def test_stock_codec_stop_buffer_preserves_whole_token_scores(
             if ids[index : index + len(text_ids)] == text_ids
         )
         ids = ids[: at + len(text_ids)]
-        expected = ("C:" if name == "deepseek_v4" else "") + text
+        expected = ("C:" if name.startswith("deepseek_") else "") + text
     elif stop_case == "match":
         expected = expected.split("STOP")[0]
     result = scored_exchange(

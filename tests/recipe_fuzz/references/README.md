@@ -28,3 +28,12 @@ distinct from the independent reference-parser checks used for other models.
 DeepSeek's released `deepseek-recipe` package is the primary response-parser
 oracle. Its newer V4 history rendering differs from the two stock checkpoints,
 so it cannot substitute for their pinned prompt encoder.
+
+V4.1 uses the package's separate `DeepseekV41Encoding` and V4.1 stream parser
+as its fast oracle. Native fixtures also pin the 1017 numeric-effort template,
+middle-system headers and tool-only history semantics against
+`DeepSeek-V4.1-Flash-1017@1bae0e1088993b9b82de08f59de5be5a34e42170/encoding/encoding.py`.
+That checkpoint skips tool-result-only blocks when finding the last user turn;
+the package's conversation conversion differs there, so this case has an
+explicit stock-format fixture. Numeric budgets 1–100 are supported by the
+native codec and `extra.reasoning_effort`; HTTP aliases are low/high/max.

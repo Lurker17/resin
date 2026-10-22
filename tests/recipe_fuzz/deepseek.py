@@ -10,6 +10,7 @@ from pathlib import Path
 from deepseek_recipe import (
     ChatCompletionRequest,
     ConversionOptions,
+    DeepseekV41Encoding,
     InferenceChunk,
     InferenceFinishReason,
     ParsingOptions,
@@ -30,6 +31,7 @@ from resin.recipe import Recipe
 
 MARKERS = (
     "<｜User｜>",
+    "<｜System｜>",
     "<｜Assistant｜>",
     "<｜begin▁of▁sentence｜>",
     "<｜end▁of▁sentence｜>",
@@ -41,6 +43,9 @@ MARKERS = (
 
 class DeepSeekAdapter:
     commits_tools_at_close = False
+    model = "deepseek_v4"
+    reference_model = "DeepSeek-V4-Pro"
+    tag_names = ("tool_calls", "invoke", "parameter")
 
     @staticmethod
     def case(case):
@@ -73,19 +78,21 @@ class DeepSeekAdapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.codec = Recipe(backend, model="deepseek_v4")
+        self.codec = Recipe(backend, model=self.model)
         self.reference = DeepSeekTokenizer.from_str(backend.to_str())
-        self.tml = renderers.DeepSeekV4()
-        _, self.tml_parser = self.tml.render_for_completion(
-            chat.OpenAIMessage.from_oss_messages([{"role": "user", "content": "hi"}])
-        )
-        self.oracles = (
-            ("deepseek-recipe", self.oracle),
-            ("tml-deepseek-v4", self.tml_oracle),
-        )
+        self.oracles = (("deepseek-recipe", self.oracle),)
+        if self.model == "deepseek_v4":
+            self.tml = renderers.DeepSeekV4()
+            _, self.tml_parser = self.tml.render_for_completion(
+                chat.OpenAIMessage.from_oss_messages(
+                    [{"role": "user", "content": "hi"}]
+                )
+            )
+            self.oracles += (("tml-deepseek-v4", self.tml_oracle),)
 
-    @staticmethod
-    def fragments(case, *, terminal=True):
+    @classmethod
+    def fragments(cls, case, *, terminal=True):
+        calls, invoke, parameter = cls.tag_names
         # One DeepSeek assistant turn has reasoning, then answer, then calls.
         # Reorder the common grammar cases into that model's legal sequence.
         # Non-newline guards avoid the newer official parser's newline trimming;
@@ -105,11 +112,11 @@ class DeepSeekAdapter:
         if tools:
             yield False, "\n\n<"
             yield True, "｜DSML｜"
-            yield False, "tool_calls>\n"
+            yield False, f"{calls}>\n"
             for tool in tools:
                 yield False, "<"
                 yield True, "｜DSML｜"
-                yield False, f'invoke name="{tool["name"]}">\n'
+                yield False, f'{invoke} name="{tool["name"]}">\n'
                 if not tool["args"]:
                     # The pinned template has one newline on either side of
                     # the arguments, including an empty argument list.
@@ -120,7 +127,7 @@ class DeepSeekAdapter:
                     string = isinstance(value, str)
                     yield (
                         False,
-                        f'parameter name="{name}" string="{str(string).lower()}">',
+                        f'{parameter} name="{name}" string="{str(string).lower()}">',
                     )
                     yield (
                         False,
@@ -128,13 +135,13 @@ class DeepSeekAdapter:
                     )
                     yield False, "</"
                     yield True, "｜DSML｜"
-                    yield False, "parameter>\n"
+                    yield False, f"{parameter}>\n"
                 yield False, "</"
                 yield True, "｜DSML｜"
-                yield False, "invoke>\n"
+                yield False, f"{invoke}>\n"
             yield False, "</"
             yield True, "｜DSML｜"
-            yield False, "tool_calls>"
+            yield False, f"{calls}>"
         if terminal:
             yield True, "<｜end▁of▁sentence｜>"
 
@@ -230,7 +237,7 @@ class DeepSeekAdapter:
     def oracle(self, case):
         converted = ChatCompletionRequest(
             {
-                "model": "DeepSeek-V4-Pro",
+                "model": self.reference_model,
                 "messages": [{"role": "user", "content": "hi"}],
             }
         ).convert(ConversionOptions())
@@ -298,6 +305,54 @@ class DeepSeekAdapter:
                 case other:
                     raise AssertionError(f"unexpected DeepSeek content {other}")
         return normalize(parts)
+
+
+class DeepSeekV41Adapter(DeepSeekAdapter):
+    model = "deepseek_v41"
+    reference_model = "DeepSeek-V4.1-Flash"
+    tag_names = (" calls", " invoke", " parameter")
+
+    @staticmethod
+    def prompt_case(case):
+        request = DeepSeekAdapter.prompt_case(case)
+        # The protocol oracle inserts an assistant header into malformed
+        # system->assistant histories; keep generated conversations valid.
+        request["messages"].insert(1, {"role": "user", "content": "Begin."})
+        messages = []
+        for message in request["messages"]:
+            if message["role"] == "assistant" and messages[-1]["role"] == "assistant":
+                messages.append({"role": "user", "content": "Continue."})
+            messages.append(message)
+        request["messages"] = messages
+        request["reasoning_effort"] = {"low": "low", "medium": "high", "xhigh": "max"}[
+            request["reasoning_effort"]
+        ]
+        request["messages"].insert(-1, {"role": "system", "content": "Be precise."})
+        return request
+
+    @staticmethod
+    def prompt_oracle(request):
+        body = {
+            "model": "DeepSeek-V4.1-Flash",
+            "messages": deepcopy(request["messages"]),
+            "thinking": {
+                "type": "enabled"
+                if request["extra"]["thinking_mode"] == "thinking"
+                else "disabled"
+            },
+        }
+        for message in body["messages"]:
+            for call in message.get("tool_calls", []):
+                call.setdefault("type", "function")
+        if "reasoning_effort" in request:
+            body["reasoning_effort"] = request["reasoning_effort"]
+        if tools := request.get("tools"):
+            body["tools"] = [
+                tool if "function" in tool else {"type": "function", "function": tool}
+                for tool in tools
+            ]
+        converted = ChatCompletionRequest(body).convert(ConversionOptions())
+        return DeepseekV41Encoding().render_conversation(converted.conversation).prompt
 
 
 @cache

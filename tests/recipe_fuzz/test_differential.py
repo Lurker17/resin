@@ -14,7 +14,7 @@ from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 
-from recipe_fuzz.deepseek import DeepSeekAdapter
+from recipe_fuzz.deepseek import DeepSeekAdapter, DeepSeekV41Adapter
 from recipe_fuzz.gemma import GemmaAdapter
 from recipe_fuzz.gpt_oss import GptOssAdapter
 from recipe_fuzz.harness import (
@@ -233,6 +233,7 @@ ADAPTERS = {
     "inkling": InklingAdapter,
     "gpt_oss": GptOssAdapter,
     "deepseek_v4": DeepSeekAdapter,
+    "deepseek_v41": DeepSeekV41Adapter,
     "qwen3_5": QwenAdapter,
     "lfm2": Lfm2Adapter,
     "gemma4": GemmaAdapter,

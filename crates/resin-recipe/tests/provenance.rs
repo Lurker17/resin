@@ -135,6 +135,7 @@ fn all_model_grammars_preserve_unicode_and_source_indices_across_batching() {
         ModelFormat::GptOss,
         ModelFormat::Inkling,
         ModelFormat::DeepSeek,
+        ModelFormat::DeepSeekV41,
         ModelFormat::Qwen,
         ModelFormat::Gemma,
         ModelFormat::Lfm2,
@@ -154,7 +155,7 @@ fn all_model_grammars_preserve_unicode_and_source_indices_across_batching() {
                     vec![id(&tokenizer, "<|content_thinking|>")],
                     bytes("hi 🦀!"),
                 ),
-                ModelFormat::DeepSeek | ModelFormat::Qwen => {
+                ModelFormat::DeepSeek | ModelFormat::DeepSeekV41 | ModelFormat::Qwen => {
                     (vec![id(&tokenizer, "<think>")], bytes("hi 🦀!"))
                 }
                 ModelFormat::Lfm2 => {
@@ -172,9 +173,10 @@ fn all_model_grammars_preserve_unicode_and_source_indices_across_batching() {
                     generated.push(id(&tokenizer, "<|im_sep|>"));
                 }
                 ModelFormat::Inkling => generated.push(id(&tokenizer, "<|content_text|>")),
-                ModelFormat::DeepSeek | ModelFormat::Qwen | ModelFormat::Lfm2 => {
-                    generated.push(id(&tokenizer, "</think>"))
-                }
+                ModelFormat::DeepSeek
+                | ModelFormat::DeepSeekV41
+                | ModelFormat::Qwen
+                | ModelFormat::Lfm2 => generated.push(id(&tokenizer, "</think>")),
                 ModelFormat::Gemma => generated.push(id(&tokenizer, "<channel|>")),
             }
             generated.extend(bytes("ok 🧠!"));
