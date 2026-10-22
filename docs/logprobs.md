@@ -9,7 +9,8 @@ sampling; requesting them does not change token selection.
 Request input scores independently with `SamplingParams(prompt_logprobs=True)`.
 `RequestLease.prompt_logprobs` contains one entry per prompt token. The first is
 `None` because it has no predecessor; other entries contain raw-model scores
-after their prefill chunk commits. Unprocessed entries remain `None`. Set
+after the predecessor token's prefill chunk commits. Unprocessed entries remain
+`None`. Set
 `max_new_tokens=0` to score only the input and complete without output events.
 All stock runners reuse the same prefill hidden states and project scores in
 bounded chunks, with no second transformer pass. Cross-chunk targets are part

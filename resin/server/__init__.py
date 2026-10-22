@@ -27,7 +27,7 @@ class HttpServer:
     With DistributedEngine, every attention-DP driver constructs a server and
     calls serve. The first driver listens; the others participate in coordinated
     inference. Requests select a replica with routed_dp_rank or the
-    routed-dp-rank header; unassigned requests use round robin.
+    resin-routed-dp-rank header; unassigned requests use round robin.
     """
 
     def __init__(

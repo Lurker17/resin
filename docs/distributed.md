@@ -308,7 +308,7 @@ else:
 ```
 
 Only the first driver binds a listener. Requests select an attention-DP replica
-using `routed_dp_rank` in JSON or the `routed-dp-rank` header. The header takes
+using `routed_dp_rank` in JSON or the `resin-routed-dp-rank` header. The header takes
 precedence; invalid or out-of-range ranks return HTTP 400. Unassigned requests
 use round robin. Each selected driver owns the actual native request lease,
 codec, media preprocessing, incremental parser, scheduler, and cache. Client

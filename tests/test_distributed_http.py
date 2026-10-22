@@ -266,12 +266,12 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
             # scores still cross replicas, while content-only scores stay empty.
             assert output["choices"][0]["logprobs"]["content"] == []
             assert len(output["resin"]["generation_logprobs"]) == 2
-            with _post(base, headers={"routed-dp-rank": "1"}) as response:
+            with _post(base, headers={"resin-routed-dp-rank": "1"}) as response:
                 assert json.load(response)["choices"][0]["message"]["content"] == "11"
-            with _post(base, 999, headers={"routed-dp-rank": "1"}) as response:
+            with _post(base, 999, headers={"resin-routed-dp-rank": "1"}) as response:
                 assert json.load(response)["choices"][0]["message"]["content"] == "11"
             with pytest.raises(urllib.error.HTTPError) as failure:
-                _post(base, 0, headers={"routed-dp-rank": "bad"})
+                _post(base, 0, headers={"resin-routed-dp-rank": "bad"})
             assert failure.value.code == 400
             with _post(base, 1, max_tokens=0, prompt_logprobs=True) as response:
                 output = json.load(response)

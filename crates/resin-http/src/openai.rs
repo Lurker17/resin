@@ -736,13 +736,15 @@ pub(crate) fn routed_rank(
     headers: &HeaderMap,
     body: Option<Value>,
 ) -> RequestResult<Option<usize>> {
-    let rank = match headers.get("routed-dp-rank") {
+    let rank = match headers.get("resin-routed-dp-rank") {
         Some(value) => Some(
             value
                 .to_str()
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
-                .ok_or_else(|| invalid_request("routed-dp-rank must be a nonnegative integer"))?,
+                .ok_or_else(|| {
+                    invalid_request("resin-routed-dp-rank must be a nonnegative integer")
+                })?,
         ),
         None => body
             .map(|rank| {

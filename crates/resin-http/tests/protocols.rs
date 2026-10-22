@@ -131,7 +131,7 @@ fn recording_router(ranks: usize) -> axum::Router {
 }
 
 #[tokio::test]
-async fn routing_metadata_uses_only_explicit_body_or_unprefixed_header() {
+async fn routing_metadata_uses_only_explicit_body_or_resin_header() {
     for (path, body) in [
         (
             "/v1/chat/completions",
@@ -159,9 +159,10 @@ async fn routing_metadata_uses_only_explicit_body_or_unprefixed_header() {
             let mut request = Request::post(path)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("X-Data-Parallel-Rank", "3")
+                .header("routed-dp-rank", "3")
                 .header("data-parallel-rank", "3");
             if let Some(rank) = header_rank {
-                request = request.header("routed-dp-rank", rank);
+                request = request.header("resin-routed-dp-rank", rank);
             }
             let (status, response) = json_response(
                 recording_router(4),
@@ -198,7 +199,7 @@ async fn routing_metadata_uses_only_explicit_body_or_unprefixed_header() {
                 recording_router(4),
                 Request::post(path)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header("routed-dp-rank", rank)
+                    .header("resin-routed-dp-rank", rank)
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
