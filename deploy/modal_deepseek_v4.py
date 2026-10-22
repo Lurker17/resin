@@ -1,4 +1,4 @@
-"""Run DeepSeek-V4 checkpoints with DSpark on Modal B300 nodes."""
+"""Cache DeepSeek checkpoints and retain legacy TP-only diagnostic commands."""
 
 from __future__ import annotations
 
@@ -19,6 +19,11 @@ import torch.distributed as dist
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from deploy.checkpoint_cache import (
+    checkpoint_inventory,
+    checkpoint_is_complete,
+    publish_checkpoint,
+)
 from deploy.graph_validation import capture_cuda_graphs, validate_prefill_graphs
 from deploy.modal_image import build_modal_image
 from resin import Engine, SamplingParams, SchedulerConfig
@@ -45,6 +50,7 @@ PROFILE_MOUNT = "/profiles"
 PROFILE_VOLUME_NAME = "resin-deepseek-v4-profiles-v1"
 DEFAULT_MODEL_KEY = "flash-0731"
 PRO_MODEL_KEY = "pro-0813"
+V41_MODEL_KEY = "flash-1017"
 DEFAULT_TP_SIZE = 4
 DSPARK_TOKENS = 5
 BENCHMARK_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
@@ -62,8 +68,8 @@ image = (
     build_modal_image(
         ROOT,
         env={
-            "CC": "gcc",
-            "CXX": "g++",
+            "CC": "gcc-13",
+            "CXX": "g++-13",
             "TORCH_CUDA_ARCH_LIST": "10.3",
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             "FLASHINFER_WORKSPACE_BASE": "/kernel-cache",
@@ -79,6 +85,9 @@ image = (
             "DG_JIT_PRINT_LOAD_TIME": "1",
             "TRITON_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/triton",
             "TILELANG_CACHE_DIR": f"{KERNEL_CACHE_MOUNT}/tilelang",
+            "RESIN_DEEPSEEK_MODEL": os.environ.get(
+                "RESIN_DEEPSEEK_MODEL", DEFAULT_MODEL_KEY
+            ),
         },
     )
     .add_local_file(
@@ -95,6 +104,12 @@ image = (
 
 with image.imports():
     from resin_models_cuda.deepseek_v4.checkpoint import DEFAULT_MODEL, DEFAULT_REVISION
+    from resin_models_cuda.deepseek_v41.checkpoint import (
+        DEFAULT_MODEL as V41_MODEL,
+    )
+    from resin_models_cuda.deepseek_v41.checkpoint import (
+        DEFAULT_REVISION as V41_REVISION,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +128,7 @@ MODEL_SPECS = {
         "deepseek-ai/DeepSeek-V4-Pro-0813",
         "72e1d3230f6c080a530b0a1d46f8eb4602340597",
     ),
+    V41_MODEL_KEY: ModelSpec(V41_MODEL_KEY, V41_MODEL, V41_REVISION),
 }
 
 model_cache_volume = modal.Volume.from_name(
@@ -149,58 +165,34 @@ def _model_path(model: ModelSpec) -> Path:
     return Path(MODEL_CACHE_MOUNT) / model.key / model.revision
 
 
-def _marker_path(model: ModelSpec) -> Path:
-    return _model_path(model) / ".resin-checkpoint.json"
+def _check_legacy_topology(model: ModelSpec, attn_tp: int) -> None:
+    if attn_tp > 1:
+        raise ValueError(
+            f"{model.key} has one KV head and requires attn_tp=1; this legacy "
+            f"deployment uses attention TP{attn_tp}. Use deploy/modal_bench.py "
+            "with --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 instead."
+        )
+
+
+def _implementation(model_path: Path):
+    """Select the native architecture from checkpoint data, without remote code."""
+    values = json.loads((model_path / "config.json").read_text())
+    if values.get("model_type") == "deepseek_v41":
+        from resin.models.deepseek_v41.codec import DeepSeekV41Codec
+        from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
+
+        return DeepSeekV41CudaRunner, DeepSeekV41Codec
+    from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
+
+    return DeepSeekV4CudaRunner, DeepSeekV4Codec
 
 
 def _checkpoint_inventory(model: ModelSpec) -> dict[str, int]:
-    root = _model_path(model)
-    index = root / "model.safetensors.index.json"
-    try:
-        index_data = json.loads(index.read_text())
-        weight_map = index_data["weight_map"]
-    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
-        raise RuntimeError("checkpoint has an invalid safetensor index") from error
-    if not isinstance(weight_map, dict) or not weight_map:
-        raise RuntimeError("checkpoint safetensor index has no weights")
-    filenames = set(weight_map.values())
-    if not all(
-        isinstance(filename, str)
-        and Path(filename).name == filename
-        and filename.endswith(".safetensors")
-        for filename in filenames
-    ):
-        raise RuntimeError("checkpoint safetensor index has invalid shard paths")
-    weights = sorted(root / filename for filename in filenames)
-    required = [
-        root / "config.json",
-        index,
-        root / "tokenizer.json",
-        root / "tokenizer_config.json",
-        root / "inference/config.json",
-    ]
-    files = [*required, *weights]
-    if missing := [str(path.relative_to(root)) for path in files if not path.is_file()]:
-        raise RuntimeError(f"checkpoint is missing files: {missing}")
-    if empty := [
-        str(path.relative_to(root)) for path in files if path.stat().st_size <= 0
-    ]:
-        raise RuntimeError(f"checkpoint contains empty files: {empty}")
-    return {str(path.relative_to(root)): path.stat().st_size for path in sorted(files)}
+    return checkpoint_inventory(_model_path(model))
 
 
 def _checkpoint_is_complete(model: ModelSpec) -> bool:
-    try:
-        marker = json.loads(_marker_path(model).read_text())
-        inventory = _checkpoint_inventory(model)
-    except (OSError, RuntimeError, json.JSONDecodeError):
-        return False
-    return marker == {
-        "schema": 1,
-        "repo_id": model.repo_id,
-        "revision": model.revision,
-        "files": inventory,
-    }
+    return checkpoint_is_complete(_model_path(model), model.repo_id, model.revision)
 
 
 def _download_checkpoint(model: ModelSpec) -> dict[str, object]:
@@ -216,15 +208,7 @@ def _download_checkpoint(model: ModelSpec) -> dict[str, object]:
             allow_patterns=list(CHECKPOINT_PATTERNS),
             local_dir=target,
         )
-        marker = {
-            "schema": 1,
-            "repo_id": model.repo_id,
-            "revision": model.revision,
-            "files": _checkpoint_inventory(model),
-        }
-        temporary = target / f".resin-checkpoint.{os.getpid()}.tmp"
-        temporary.write_text(json.dumps(marker, sort_keys=True))
-        temporary.replace(_marker_path(model))
+        publish_checkpoint(target, model.repo_id, model.revision)
         model_cache_volume.commit()
     if not _checkpoint_is_complete(model):
         raise RuntimeError("checkpoint publication did not complete")
@@ -371,8 +355,6 @@ def _run_rank_workload(
     profile_run_id: str | None,
     speculative_tokens: int,
 ) -> dict[str, object]:
-    from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
-
     if rank == 0:
         print(
             f"[deepseek-v4] loading TP={tensor_parallel.size} checkpoint",
@@ -383,7 +365,8 @@ def _run_rank_workload(
     graph_capacity = (
         max(len(row) for row in prompt_rows) + max_new_tokens + speculative_tokens + 1
     )
-    runner = DeepSeekV4CudaRunner(
+    runner_type, _ = _implementation(model_path)
+    runner = runner_type(
         model_path,
         max_seq_len=context_length,
         max_batch_size=batch_size,
@@ -851,8 +834,6 @@ def _run_rank_benchmark(
     batch_sizes: tuple[int, ...],
     use_cuda_graphs: bool,
 ) -> None:
-    from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
-
     tensor_parallel = _initialize_tensor_parallel(
         rank, master_port, tensor_parallel_size
     )
@@ -865,7 +846,8 @@ def _run_rank_benchmark(
             flush=True,
         )
     load_start = time.perf_counter()
-    runner = DeepSeekV4CudaRunner(
+    runner_type, _ = _implementation(model_path)
+    runner = runner_type(
         model_path,
         max_seq_len=context_length,
         max_batch_size=max_batch_size,
@@ -999,6 +981,7 @@ def _benchmark_remote(
 ) -> dict[str, object]:
     if input_tokens <= 0 or max_new_tokens <= 1:
         raise ValueError("benchmark token counts must be positive")
+    _check_legacy_topology(model, tensor_parallel_size)
     model_path, checkpoint = _require_checkpoint(model)
     tokenizer = cast(
         PreTrainedTokenizerBase,
@@ -1006,7 +989,8 @@ def _benchmark_remote(
             str(model_path), local_files_only=True, trust_remote_code=False
         ),
     )
-    recipe = DeepSeekV4Codec(tokenizer)
+    _, codec_type = _implementation(model_path)
+    recipe = codec_type(tokenizer)
     seed_prompt = _encode_prompt(
         recipe,
         "Measure inference throughput with a stable synthetic prompt.",
@@ -1039,11 +1023,10 @@ def _serve_http_rank(
 ) -> None:
     """Run one TP rank; rank zero additionally owns the public HTTP listener."""
 
-    from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
-
     tensor_parallel = _initialize_tensor_parallel(rank, master_port, DEFAULT_TP_SIZE)
     control_group = dist.new_group(backend="gloo", timeout=timedelta(minutes=30))
-    runner = DeepSeekV4CudaRunner(
+    runner_type, codec_type = _implementation(model_path)
+    runner = runner_type(
         model_path,
         max_seq_len=32768,
         max_batch_size=DEFAULT_MAX_NUM_SEQS,
@@ -1073,7 +1056,7 @@ def _serve_http_rank(
             str(model_path), local_files_only=True, trust_remote_code=False
         ),
     )
-    recipe = DeepSeekV4Codec(tokenizer)
+    recipe = codec_type(tokenizer)
     coordinated_runner = TensorParallelRunner(runner, control_group, dist)
     engine = Engine(
         coordinated_runner,
@@ -1169,7 +1152,9 @@ def _serve_http_rank(
     requires_proxy_auth=False,
 )
 def serve_deepseek_v4() -> None:
-    model = _model_spec(DEFAULT_MODEL_KEY)
+    """The legacy TP-only HTTP route requires an attention-DP coordinator migration."""
+    model = _model_spec(os.environ.get("RESIN_DEEPSEEK_MODEL", DEFAULT_MODEL_KEY))
+    _check_legacy_topology(model, DEFAULT_TP_SIZE)
     model_path, _ = _require_checkpoint(model)
     kernel_cache_volume.reload()
     process_context = torch.multiprocessing.spawn(
@@ -1189,8 +1174,8 @@ def serve_deepseek_v4() -> None:
     timeout=8 * 60 * 60,
     single_use_containers=True,
 )
-def benchmark_tp2() -> dict[str, object]:
-    return _benchmark_remote(_model_spec(DEFAULT_MODEL_KEY), 2)
+def benchmark_tp2(model_key: str = DEFAULT_MODEL_KEY) -> dict[str, object]:
+    return _benchmark_remote(_model_spec(model_key), 2)
 
 
 @app.function(
@@ -1320,6 +1305,9 @@ def _validate_parallel(
     speculative_tokens: int = 0,
 ) -> dict[str, object]:
     """Share checkpoint, routing reference and report handling across GPU sizes."""
+
+    if model_key == V41_MODEL_KEY:
+        raise ValueError("legacy parallel validation targets V4-0731, not V4.1-1017")
 
     import subprocess
 
@@ -1490,8 +1478,8 @@ def validate_composable(
     timeout=8 * 60 * 60,
     single_use_containers=True,
 )
-def benchmark_tp4() -> dict[str, object]:
-    return _benchmark_remote(_model_spec(DEFAULT_MODEL_KEY), 4)
+def benchmark_tp4(model_key: str = DEFAULT_MODEL_KEY) -> dict[str, object]:
+    return _benchmark_remote(_model_spec(model_key), 4)
 
 
 @app.function(
@@ -1528,6 +1516,7 @@ def run_model_tp4(
     if profile and max_new_tokens < 32:
         raise ValueError("profile runs require at least 32 output tokens")
     model = _model_spec(model_key)
+    _check_legacy_topology(model, DEFAULT_TP_SIZE)
     model_path, checkpoint = _require_checkpoint(model)
     tokenizer = cast(
         PreTrainedTokenizerBase,
@@ -1535,7 +1524,8 @@ def run_model_tp4(
             str(model_path), local_files_only=True, trust_remote_code=False
         ),
     )
-    recipe = DeepSeekV4Codec(tokenizer)
+    _, codec_type = _implementation(model_path)
+    recipe = codec_type(tokenizer)
     prompt_ids = (
         _real_prompt_ids(tokenizer, profile_input_tokens)
         if profile_input_tokens is not None
@@ -1624,6 +1614,16 @@ def main(
     report_path: str | None = None,
 ) -> None:
     model_spec = _model_spec(model)
+    if mode in {"bench-tp2", "bench-tp4", "run", "real", "profile"}:
+        _check_legacy_topology(model_spec, 2 if mode == "bench-tp2" else 4)
+    if model == V41_MODEL_KEY and mode in {
+        "validate-kernels",
+        "validate-window",
+        "probe-experts",
+        "validate-parallel",
+        "validate-composable",
+    }:
+        raise ValueError("legacy validation/probe modes target V4-0731, not V4.1-1017")
     if mode == "download":
         report = cache_checkpoint.remote(model_spec.key)
     elif mode in {"validate-kernels", "validate-window"}:
@@ -1661,13 +1661,13 @@ def main(
             parallel_speculative_tokens,
         )
     elif mode == "bench-tp2":
-        if model_spec.key != DEFAULT_MODEL_KEY:
-            raise ValueError("bench-tp2 currently supports only flash-0731")
-        report = benchmark_tp2.remote()
+        if model_spec.key not in {DEFAULT_MODEL_KEY, V41_MODEL_KEY}:
+            raise ValueError("bench-tp2 supports flash-0731 or flash-1017")
+        report = benchmark_tp2.remote(model_spec.key)
     elif mode == "bench-tp4":
-        if model_spec.key != DEFAULT_MODEL_KEY:
-            raise ValueError("bench-tp4 currently supports only flash-0731")
-        report = benchmark_tp4.remote()
+        if model_spec.key not in {DEFAULT_MODEL_KEY, V41_MODEL_KEY}:
+            raise ValueError("bench-tp4 supports flash-0731 or flash-1017")
+        report = benchmark_tp4.remote(model_spec.key)
     elif mode in {"run", "real", "profile"}:
         capture_profile = profile or mode == "profile"
         report = run_model_tp4.remote(

@@ -109,6 +109,11 @@ def build_modal_image(
         .add_local_file(
             root / "deploy/modal_image.py", "/root/deploy/modal_image.py", copy=True
         )
+        .add_local_file(
+            root / "deploy/checkpoint_cache.py",
+            "/root/deploy/checkpoint_cache.py",
+            copy=True,
+        )
         .add_local_file(root / "Cargo.toml", f"{_SOURCE_ROOT}/Cargo.toml", copy=True)
         .add_local_file(root / "Cargo.lock", f"{_SOURCE_ROOT}/Cargo.lock", copy=True)
         .add_local_file(
