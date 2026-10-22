@@ -48,8 +48,19 @@ sparse EP exchange and shared experts. Its initial mesh is ADP=EP=world size,
 attention TP1, CP1, and expert TP1. The default `flashinfer` backend retains the
 existing prepared expert path. Backend identity is recorded and checked when
 combining chart points. The two-GPU B300 kernel/adapter probe passes numerical,
-idle-rank, changing-route, and CUDA graph checks; this is separate from full
-checkpoint qualification below.
+idle-rank, changing-route, and CUDA graph checks, including 1,280 physical rows
+per rank (batch 256 with four draft positions). The separate Engine smoke needs
+only two B300s and generates deterministic synthetic weights locally:
+
+```bash
+uv run modal run deploy/modal_deepinfer_kernels.py --mode engine-smoke \
+  --output artifacts/benchmarks/deepseek-v41-synthetic-engine-validation.json
+```
+
+It runs the production V4.1 runner, pages, EP/ADP coordinator, scoring, and graph
+paths at K0 and K4. Its unrelated draft weights exercise rejection and rollback;
+the real-checkpoint check below additionally exercises accepted drafts. This
+synthetic smoke does not test model quality or Engram tables.
 
 Both DeepSeek launchers share the same checkpoint volume and completion marker.
 For an older generic download whose files are already complete, publish only
@@ -65,8 +76,8 @@ Attention TP means KV-head sharding, so both DeepSeek MLA families require
 `attn_tp=1`. Earlier four-GPU TP4 debug reports sliced query heads while
 replicating KV; their results do not qualify this contract. The initial V4.1
 target is eight B300s with attention DP8/EP8 and replicated Engram tables.
-Estimated weights alone occupy 237.24 GiB per GPU; runtime memory headroom and
-full-checkpoint qualification on this layout remain pending. Four GPUs with
+Estimated weights alone occupy 237.24 GiB per GPU. The full checkpoint now loads
+and passes eager/captured checks on this layout. Four GPUs with
 ADP4/EP4 require 271.70 GiB of weights each before workspaces and caches.
 
 Run the target comparison with normal routing and no speculation:
@@ -94,7 +105,12 @@ uv run modal run deploy/modal_bench.py \
 Validation writes a JSON report rather than chart measurements. The implementation uses fixed-width greedy
 proposals, loads the confidence head without applying its length policy, and
 supports up to the released five-token block. Benchmark defaults remain four
-drafts. Wider meshes, longer contexts, and throughput tuning need separate qualification;
+drafts. On 2026-10-22, both commands passed on all eight B300 drivers: K0 replayed
+seven full decode graphs, while natural K4 replayed three and accepted all 12
+proposed drafts on the short counting prompt. Eager/captured generated IDs,
+selected-token scores, and prompt scores matched exactly; the first eight
+K4 IDs also matched K0. These are focused execution checks, not a model-quality
+evaluation or a natural-acceptance estimate. Wider meshes, longer contexts, and throughput tuning need separate qualification;
 see the [family limits](../models/cuda/resin_models_cuda/deepseek_v41/README.md).
 
 Available model names are `deepseek-v4`, `deepseek-v41`, `gpt-oss-20b`, and

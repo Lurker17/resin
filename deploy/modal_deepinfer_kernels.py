@@ -31,16 +31,16 @@ image = build_modal_image(
     "assert all(callable(getattr(deep_gemm, name)) for name in "
     "('bf16_mega_gate', 'mega_mhc', 'SymmBuffer', 'fp8_fp4_mega_moe'))\""
 )
-image = image.add_local_file(
-    ROOT / "deploy/deepinfer_kernel_probe.py",
-    "/root/deploy/deepinfer_kernel_probe.py",
-    copy=True,
-)
-image = image.add_local_file(
-    ROOT / "deploy/mega_moe_validation.py",
-    "/root/deploy/mega_moe_validation.py",
-    copy=True,
-)
+for helper in (
+    "deepinfer_kernel_probe",
+    "mega_moe_validation",
+    "bench",
+    "deepseek_v41_validation",
+    "v41_engine_smoke",
+):
+    image = image.add_local_file(
+        ROOT / f"deploy/{helper}.py", f"/root/deploy/{helper}.py", copy=True
+    )
 app = modal.App("resin-deepinfer-kernels", image=image)
 
 
@@ -53,24 +53,27 @@ app = modal.App("resin-deepinfer-kernels", image=image)
     single_use_containers=True,
 )
 def probe(mode: str = "kernels", tokens_per_rank: int = 8) -> dict:
-    if mode not in {"kernels", "mega-moe"}:
-        raise ValueError("mode must be kernels or mega-moe")
+    if mode not in {"kernels", "mega-moe", "engine-smoke"}:
+        raise ValueError("mode must be kernels, mega-moe or engine-smoke")
     if tokens_per_rank < 1:
         raise ValueError("tokens_per_rank must be positive")
     try:
         # Run the same locked environment as the model deployment.
         with tempfile.TemporaryDirectory(prefix="deepinfer-kernels-") as directory:
             output = Path(directory) / "result.json"
-            subprocess.run(
-                [
-                    PROBE_PYTHON,
-                    "-m",
+            command = [PROBE_PYTHON, "-m"]
+            if mode == "engine-smoke":
+                command += ["deploy.v41_engine_smoke", str(output)]
+            else:
+                command += [
                     "deploy.deepinfer_kernel_probe",
                     str(output),
                     mode,
                     "--tokens-per-rank",
                     str(tokens_per_rank),
-                ],
+                ]
+            subprocess.run(
+                command,
                 cwd="/root",
                 check=True,
             )
@@ -89,7 +92,7 @@ def main(
     mode: str = "kernels",
     tokens_per_rank: int = 8,
 ) -> None:
-    result = probe.with_options(gpu="B300:2" if mode == "mega-moe" else "B300").remote(
+    result = probe.with_options(gpu="B300" if mode == "kernels" else "B300:2").remote(
         mode, tokens_per_rank
     )
     path = Path(output)

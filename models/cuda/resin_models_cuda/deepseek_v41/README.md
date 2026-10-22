@@ -55,13 +55,15 @@ this MLA model has one KV head, so `attn_tp>1` is rejected. Attention DP, CP,
 EP, and expert TP have implementation paths. CP partitions query attention
 while retaining replicated KV, compressor, and FFN work, as in V4.
 
-The initial deployment target is `Parallelism(world_size=8, attn_dp=8, ep=8)`
-on eight B300s, with attention TP1 and expert TP1. Engram tables are currently
+The full checkpoint passes the small validation workload on
+`Parallelism(world_size=8, attn_dp=8, ep=8)` on eight B300s, with attention TP1
+and expert TP1, using the DeepGEMM backend. Engram tables are currently
 replicated across attention-DP replicas; sharded table lookup is not implemented.
 A metadata-only estimate puts weights at 237.24 GiB per GPU on this layout,
 before caches, workspaces, and graph buffers. Four B300s with ADP4/EP4 require
 271.70 GiB of weights per GPU and cannot fit those additional allocations.
-These estimates establish neither runtime memory headroom nor qualification.
+These weight estimates do not measure remaining cache or graph-buffer headroom
+at larger batch sizes and context lengths.
 
 CED currently reproduces candidate selection and causal masking using dense
 index scores; it does not yet avoid scoring keys outside candidate blocks.
@@ -89,8 +91,22 @@ cover checkpoint geometry, physical source sharing, n-gram history and rollback,
 source ownership, and the shifted residual/draft contracts. GPU and numerical
 qualification results belong in the deployment reports, including any failures.
 
-Full-checkpoint target, natural DSpark, and throughput qualification on the
-eight-GPU ADP8/EP8 layout remain pending. Earlier four-GPU TP4 debug runs sliced
+The recorded full-checkpoint target-only K0 and natural DSpark K4 reports pass
+on all eight attention-DP drivers. They are saved locally under
+`artifacts/benchmarks/deepseek-v41-adp8ep8-deepgemm-{target,dspark}-validation.json`;
+generated reports are ignored by Git. Each driver runs the same 26-token
+counting prompt with an eight-token prefill chunk, producing four prefill steps.
+Within each width, eager and captured execution have exactly equal output IDs,
+selected and top-three logprobs, and all 25 scored prompt positions. Captured
+execution replays seven full decode graphs for K0 and three for K4; both replay
+160 FFN and 480 attention-projection prefill regions per driver. Eager execution
+replays none. K0's eight generated IDs match K4's first eight IDs. Each K4 driver
+naturally accepts 12 of 12 draft tokens across three blocks and emits 16 output
+tokens, with ordinary expert routing and no forced acceptance. This single
+prompt validates the recorded execution and graph paths; throughput sweeps and
+broader quality and acceptance measurements remain unqualified.
+
+Earlier four-GPU TP4 debug runs sliced
 query heads while replicating KV. That layout violates the current attention-TP
 contract, so those reports and charts are historical debugging artifacts,
 not supported-layout validation. The legacy TP-only `modal_deepseek_v4.py`

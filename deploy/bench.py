@@ -157,7 +157,18 @@ def _checkpoint_validation(raw, engine, checkpoint, metadata, groups):
     ]
 
 
-def _rank(rank, port, report_path, model, checkpoint, case_values, topology, options):
+def _rank(
+    rank,
+    port,
+    report_path,
+    model,
+    checkpoint,
+    case_values,
+    topology,
+    options,
+    *,
+    runner_factory=None,
+):
     from resin.bench import (
         BenchCase,
         BenchmarkRunner,
@@ -194,7 +205,7 @@ def _rank(rank, port, report_path, model, checkpoint, case_values, topology, opt
     if rank == 0:
         print(f"[bench] loading {model} over {topology.world_size} GPUs", flush=True)
     started = time.perf_counter()
-    raw = _runner(
+    raw = (runner_factory or _runner)(
         model,
         checkpoint,
         device=f"cuda:{rank}",
