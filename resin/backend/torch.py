@@ -19,20 +19,23 @@ def use_default_dtype(dtype: torch.dtype) -> Generator[None, None, None]:
 
 
 def benchmark_expert_indices(
-    scores: torch.Tensor, top_k: int, replica: int = 0
+    scores: torch.Tensor, top_k: int, replica: int = 0, expert_parallel_size: int = 1
 ) -> torch.Tensor:
     """Synthetic round-robin routes for explicitly labeled throughput benchmarks.
 
-    Consecutive assignments cover experts evenly and each token uses distinct
-    experts. Keep this shape-only operation capturable with ordinary routing.
+    Assign consecutive routes across contiguous expert owners first, then across
+    their experts, so small batches also balance communication. This permutation
+    retains distinct token routes and evenly covers individual experts.
     """
 
+    experts_per_owner = scores.shape[-1] // expert_parallel_size
+    ordinal = (
+        torch.arange(scores.shape[0] * top_k, device=scores.device)
+        + replica * scores.shape[0] * top_k
+    )
     return (
-        (
-            torch.arange(scores.shape[0] * top_k, device=scores.device)
-            + replica * scores.shape[0] * top_k
-        )
-        % scores.shape[-1]
+        (ordinal % expert_parallel_size) * experts_per_owner
+        + (ordinal // expert_parallel_size) % experts_per_owner
     ).reshape(-1, top_k)
 
 

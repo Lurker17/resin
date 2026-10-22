@@ -844,6 +844,42 @@ class TestGptOssCudaTinyOracle:
         assert len(fused_calls) == 1
         assert fused_calls[0] is large_logits
 
+    def test_synthetic_routes_balance_ep_owners_in_both_router_paths(self):
+        from resin.bench import BenchmarkRunner
+        from resin.models.gpt_oss.config import GptOssConfig
+
+        router = TopKRouter(
+            cast(
+                GptOssConfig,
+                SimpleNamespace(
+                    num_experts_per_tok=4,
+                    num_local_experts=32,
+                    hidden_size=8,
+                ),
+            )
+        )
+        with torch.no_grad():
+            router.weight.zero_()
+            router.bias.copy_(torch.arange(32))
+        hidden = torch.zeros(1, 8)
+        assert (router(hidden)[2] // 16 == 1).all()
+        BenchmarkRunner(
+            SimpleNamespace(
+                _model=torch.nn.Sequential(router),
+                parallel_groups=SimpleNamespace(
+                    ep=SimpleNamespace(size=2),
+                    attn_dp=SimpleNamespace(local_rank=1),
+                ),
+            ),
+            balanced_experts=True,
+        )
+        logits, weights, indices = router(hidden)
+        assert indices.tolist() == [[2, 18, 3, 19]]
+        cuda_indices, cuda_weights = _route(router, logits)
+        torch.testing.assert_close(cuda_indices, indices)
+        torch.testing.assert_close(cuda_weights, weights)
+        torch.testing.assert_close(weights, logits.gather(1, indices).softmax(-1))
+
     def test_static_decode_step_restores_rust_sequence_order_before_sampling(
         self,
     ) -> None:

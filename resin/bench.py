@@ -76,12 +76,14 @@ class BenchmarkRunner:
                 raise ValueError(
                     "balanced experts are unsupported by this model runner"
                 )
+            groups = getattr(runner, "parallel_groups", None)
             for router in routers:
                 router.benchmark_balanced_experts = True
-                groups = getattr(runner, "parallel_groups", None)
                 router.benchmark_replica = (
                     0 if groups is None else groups.attn_dp.local_rank
                 )
+                if groups is not None:
+                    router.benchmark_expert_parallel_size = groups.ep.size
         self._plan: BatchPlan | None = None
 
     def __getattr__(self, name):

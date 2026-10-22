@@ -145,6 +145,7 @@ class TopKRouter(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.benchmark_balanced_experts = False
         self.benchmark_replica = 0
+        self.benchmark_expert_parallel_size = 1
         self.weight = nn.Parameter(
             torch.empty(config.num_local_experts, config.hidden_size)
         )
@@ -154,7 +155,10 @@ class TopKRouter(nn.Module):
         logits = F.linear(hidden, self.weight, self.bias)
         if self.benchmark_balanced_experts:
             indices = benchmark_expert_indices(
-                logits, self.top_k, self.benchmark_replica
+                logits,
+                self.top_k,
+                self.benchmark_replica,
+                self.benchmark_expert_parallel_size,
             )
             values = logits.gather(1, indices)
         else:

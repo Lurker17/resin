@@ -121,12 +121,40 @@ def test_balanced_routes_are_distinct_per_token_and_globally_even():
     counts = indices.flatten().bincount(minlength=8)
     assert int(counts.max() - counts.min()) <= 1
     assert benchmark_expert_indices(scores[:0], 3).shape == (0, 3)
-    # Replicas with one token must continue the global assignment sequence.
     routes = torch.cat(
         [benchmark_expert_indices(scores[:1], 3, rank) for rank in range(3)]
     )
     counts = routes.flatten().bincount(minlength=8)
     assert int(counts.max() - counts.min()) <= 1
+
+
+@pytest.mark.parametrize(
+    "experts,ep,top_k,batch,replicas",
+    [
+        (384, 4, 6, 1, 1),
+        (32, 2, 4, 1, 1),
+        (384, 4, 6, 1, 4),
+        (32, 2, 4, 5, 3),
+        (32, 2, 32, 1, 2),
+    ],
+)
+def test_balanced_routes_cover_contiguous_owners_before_their_experts(
+    experts, ep, top_k, batch, replicas
+):
+    scores = torch.zeros(batch, experts)
+    routes = torch.cat(
+        [
+            benchmark_expert_indices(scores, top_k, replica, ep)
+            for replica in range(replicas)
+        ]
+    )
+    assert all(len(set(row)) == top_k for row in routes.tolist())
+    for indices, count in ((routes, experts), (routes // (experts // ep), ep)):
+        loads = indices.flatten().bincount(minlength=count)
+        assert int(loads.max() - loads.min()) <= 1
+    assert routes[0, : min(ep, top_k)].tolist() == [
+        owner * (experts // ep) for owner in range(min(ep, top_k))
+    ]
 
 
 def test_graph_counters_exclude_prefill_and_decode_warmup():

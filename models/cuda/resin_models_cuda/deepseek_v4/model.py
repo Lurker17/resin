@@ -1457,6 +1457,7 @@ class Gate(nn.Module):
         self.topk = args.n_activated_experts
         self.benchmark_balanced_experts = False
         self.benchmark_replica = 0
+        self.benchmark_expert_parallel_size = 1
         self.score_func = args.score_func
         self.route_scale = args.route_scale
         self.hash = layer_id < args.n_hash_layers
@@ -1512,7 +1513,10 @@ class Gate(nn.Module):
             scores = scores + self.bias
         if self.benchmark_balanced_experts:
             indices = benchmark_expert_indices(
-                scores, self.topk, self.benchmark_replica
+                scores,
+                self.topk,
+                self.benchmark_replica,
+                self.benchmark_expert_parallel_size,
             )
         elif self.hash:
             indices = self.tid2eid[input_ids]
@@ -1662,6 +1666,7 @@ class MoEWeights(nn.Module):
         self.experts_start_idx = owned.start
         self.experts_end_idx = owned.stop
         self.gate = Gate(layer_id, args)
+        self.gate.benchmark_expert_parallel_size = expert_parallel.size
         expert_dtype = torch.float4_e2m1fn_x2 if args.expert_dtype == "fp4" else None
         self._fused_fp4 = expert_dtype == torch.float4_e2m1fn_x2
         if self._fused_fp4:
