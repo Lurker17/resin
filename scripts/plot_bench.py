@@ -252,8 +252,7 @@ def plot(records, phase, output_dir, *, draft_tokens=4, accept_rate=0.75):
         axis.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
         axis.grid(alpha=0.25)
         axis.spines[["top", "right"]].set_visible(False)
-        if len(curves) > 1:
-            axis.legend(fontsize=9)
+        axis.legend(fontsize=9)
         if decode:
             measured = [
                 r["measured_accept_rate"]

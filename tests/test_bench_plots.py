@@ -217,12 +217,12 @@ def test_plotting_import_does_not_load_matplotlib_or_torch():
     )
 
 
-def test_cli_renders_two_pngs_and_two_svgs(tmp_path, capsys):
+@pytest.mark.parametrize("contexts", [(4096,), (4096, 8192)])
+def test_cli_renders_two_pngs_and_two_svgs(tmp_path, capsys, contexts):
     rows = [
-        record(),
-        record("prefill"),
-        record(context_length=8192),
-        record("prefill", context_length=8192),
+        record(phase, context_length=context)
+        for context in contexts
+        for phase in ("decode", "prefill")
     ]
     path = write(tmp_path / "synthetic.jsonl", *rows)
     output = tmp_path / "plots"
@@ -237,5 +237,6 @@ def test_cli_renders_two_pngs_and_two_svgs(tmp_path, capsys):
     svg = (output / "decode.svg").read_text()
     assert "Projected acceptance 75%" in svg
     assert "measured acceptance 25.0%" in svg
-    assert "Context 8,192" in svg
+    for context in contexts:
+        assert f"Context {context:,}" in svg
     assert "decode.png" in capsys.readouterr().out
