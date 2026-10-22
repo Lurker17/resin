@@ -425,3 +425,59 @@ def test_driver_reduction_uses_slowest_time_and_unique_replica_totals():
         "context_end_min": 4,
         "context_end_max": 5,
     }
+
+
+def test_completed_case_is_saved_before_later_failure_and_requests_are_cleaned(
+    tmp_path, capsys
+):
+    import json
+
+    from deploy.bench import _result_callback
+
+    runner = BenchmarkRunner(Runner())
+
+    class FailingAdmission:
+        def __init__(self):
+            self.local = Engine(runner, max_running_requests=2, context_length=64)
+            self.calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self.local, name)
+
+        def submit(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 3:
+                raise ValueError("second case admission failed")
+            return self.local.submit(*args, **kwargs)
+
+    engine = FailingAdmission()
+    output = tmp_path / "results.json"
+    save = _result_callback(output)
+    completed = []
+
+    def on_result(record):
+        # Decode leases have been canceled before user I/O begins.
+        assert not engine.local.has_work()
+        save(record)
+        completed.append(record)
+
+    with pytest.raises(ValueError, match="second case admission failed"):
+        run_sweep(
+            engine,
+            [
+                BenchCase(phase="decode", context_length=4, batch_size=1),
+                BenchCase(phase="prefill", context_length=8, batch_size=2),
+            ],
+            runner=runner,
+            prompt_tokens=[1],
+            warmup_steps=0,
+            measure_steps=2,
+            on_result=on_result,
+        )
+    assert len(completed) == 1
+    assert json.loads(output.read_text()) == completed
+    assert not output.with_suffix(".json.tmp").exists()
+    assert not engine.local.has_work()
+    prefix, point = capsys.readouterr().out.strip().split(" ", 1)
+    assert prefix == "[bench-result]"
+    assert json.loads(point) == completed[0]

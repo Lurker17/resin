@@ -4,6 +4,9 @@ The sweep loads one model per GPU, keeps it resident across cases, and measures
 synchronous engine steps after warmup. It writes raw measurements to JSONL;
 plotting runs locally without importing PyTorch. Startup, weight loading, and
 graph capture are outside the measured windows and recorded separately.
+The requested result file is written after normal sweep completion. Each completed
+point is also flushed as a `[bench-result] {json}` log line, so earlier points can
+be recovered from captured logs if a later case fails.
 The chart axes and speculative projection follow
 [DeepInfer's sweep plotter](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/examples/sweep/plot_pareto.py).
 

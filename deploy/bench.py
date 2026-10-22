@@ -80,6 +80,21 @@ def _runner(model, checkpoint, *, device, groups, cases, options, context_capaci
     )
 
 
+def _result_callback(report_path):
+    """Keep a valid snapshot of completed cases and print untimed progress."""
+    records = []
+    path = Path(report_path)
+
+    def save(record):
+        records.append(record)
+        pending = path.with_suffix(path.suffix + ".tmp")
+        pending.write_text(json.dumps(records))
+        pending.replace(path)
+        print("[bench-result] " + json.dumps(record), flush=True)
+
+    return save
+
+
 def _checkpoint_validation(raw, engine, checkpoint, metadata, groups):
     from tokenizers import Tokenizer
 
@@ -292,6 +307,7 @@ def _rank(
                 synchronize=torch.cuda.synchronize,
                 reduce_step=None if groups is None else distributed_reducer(groups),
                 metadata=metadata,
+                on_result=_result_callback(report_path) if rank == 0 else None,
             )
         if rank == 0:
             Path(report_path).write_text(json.dumps(records))

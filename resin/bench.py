@@ -177,6 +177,7 @@ def run_sweep(
     synchronize: Callable[[], None] = lambda: None,
     reduce_step: Callable[[dict], dict] | None = None,
     metadata: dict | None = None,
+    on_result: Callable[[dict], None] | None = None,
 ) -> list[dict]:
     """Measure prefill cohorts or a steady decode window on an existing Engine.
 
@@ -186,6 +187,7 @@ def run_sweep(
     its context grows naturally during warmup and measurement. All DP drivers
     call together with distributed_reducer; records contain global token counts
     and the slowest driver's step duration. The caller retains engine ownership.
+    on_result receives each completed record after request cleanup, outside timing.
     """
 
     for name, value, minimum in (
@@ -368,4 +370,6 @@ def run_sweep(
                     if not lease.done:
                         engine.cancel(lease)
                 local.clear_prefix_cache()
+        if on_result is not None:
+            on_result(records[-1])
     return records
