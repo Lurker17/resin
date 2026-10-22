@@ -49,8 +49,6 @@ from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
 from resin_models_cuda.deepseek_v4.cache import (
-    GRAPH_SCRATCH_PARENTS,
-    CacheArena,
     CacheGeometry,
     plan_cache_capacity,
 )
@@ -168,8 +166,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             ):
                 raise ValueError("the default process group does not match TP layout")
 
-        self.model_path = resolve_model_path(model)
-        self.config = load_config(self.model_path)
+        self.model_path, self.config = self._checkpoint(model)
         self.config.validate_tensor_parallel(self.tensor_parallel_size)
         if speculative_tokens > self.config.dspark_block_size:
             raise ValueError(
@@ -219,10 +216,6 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 )
             }
         )
-        # Import only after CUDA validation: importing this module initializes
-        # cuTile and is intentionally not part of Resin's CPU package path.
-        import resin_models_cuda.deepseek_v4.model as native_model
-
         inference_config_path = self.model_path / "inference/config.json"
         try:
             inference_values = json.loads(inference_config_path.read_text())
@@ -243,20 +236,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 raise ValueError("DSpark checkpoint has no speculative stages")
         else:
             inference_values["n_mtp_layers"] = 0
-        model_fields = native_model.ModelArgs.__dataclass_fields__
-        args = native_model.ModelArgs(
-            **{
-                name: value
-                for name, value in inference_values.items()
-                if name in model_fields
-            }
-        )
-        with use_default_dtype(torch.bfloat16), torch.device(self.device):
-            self._model = native_model.Transformer(
-                args,
-                tensor_parallel=self.tensor_parallel,
-                parallel_groups=parallel_groups,
-            )
+        args, self._model = self._build_model(inference_values)
         self._allreduce = FlashInferAllReduce(
             self.tensor_parallel,
             max_token_num=max_batch_size * max(1, speculative_tokens + 1),
@@ -299,24 +279,12 @@ class DeepSeekV4CudaRunner(CudaRunner):
             self._allreduce.sum,
             indexer_reducer=reduce_index_scores,
         )
-        self.weight_load = load_deepseek_v4_weights(
-            self.model_path,
-            self._model,
-            rank=self.tensor_parallel_rank,
-            tensor_parallel_size=self.tensor_parallel_size,
-            device=self.device,
-        )
+        self.weight_load = self._load_weights()
         self._model.prepare_weights(self._allreduce.sum)
         self._configure_expert_parallel_graphs(self._model, parallel_groups)
 
-        self.cache_geometry = CacheGeometry.build(
-            args.compress_ratios,
-            target_layers=args.n_layers,
-            dspark_layers=args.n_mtp_layers,
-            window_size=args.window_size,
-            decode_input_tokens=max(1, speculative_tokens + 1),
-            prefill_chunk_size=self.prefill_chunk_size,
-        )
+        cache_backend = self._cache_backend()
+        self.cache_geometry = self._build_cache_geometry(args)
         torch.cuda.synchronize(self.device)
         free_memory, total_memory = torch.cuda.mem_get_info(self.device)
         capacity_plan = plan_cache_capacity(
@@ -324,7 +292,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             free_memory,
             gpu_memory_utilization,
             self.cache_geometry,
-            reserved_parent_count=1 + GRAPH_SCRATCH_PARENTS,
+            reserved_parent_count=1 + self.cache_geometry.graph_scratch_parents,
         )
         local_capacity = capacity_plan.parent_capacity
         if cache_parent_capacity is not None:
@@ -356,7 +324,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             * capacity_plan.bytes_per_parent,
         )
         self.cache_layout = self.cache_geometry.layout(local_capacity)
-        self._cache = CacheArena(
+        self._cache = cache_backend.CacheArena(
             self.device,
             self.cache_layout,
             self.cache_geometry,
@@ -382,6 +350,56 @@ class DeepSeekV4CudaRunner(CudaRunner):
         for layer, callback in zip(self._model.layers, prefill_ffns, strict=True):
             layer.prefill_ffn = callback
         self._configure_prefill_attention_graphs()
+
+    @staticmethod
+    def _checkpoint(model):
+        path = resolve_model_path(model)
+        return path, load_config(path)
+
+    @staticmethod
+    def _cache_backend():
+        from resin_models_cuda.deepseek_v4 import cache
+
+        return cache
+
+    def _build_cache_geometry(self, args):
+        return CacheGeometry.build(
+            args.compress_ratios,
+            target_layers=args.n_layers,
+            dspark_layers=args.n_mtp_layers,
+            window_size=args.window_size,
+            decode_input_tokens=max(1, self.speculative_tokens + 1),
+            prefill_chunk_size=self.prefill_chunk_size,
+            max_batch_size=self.max_batch_size,
+        )
+
+    def _build_model(self, values):
+        # Imported after device validation; cuTile initialization is GPU-only.
+        from resin_models_cuda.deepseek_v4 import model as implementation
+
+        args = implementation.ModelArgs(
+            **{
+                key: value
+                for key, value in values.items()
+                if key in implementation.ModelArgs.__dataclass_fields__
+            }
+        )
+        with use_default_dtype(torch.bfloat16), torch.device(self.device):
+            model = implementation.Transformer(
+                args,
+                tensor_parallel=self.tensor_parallel,
+                parallel_groups=self.parallel_groups,
+            )
+        return args, model
+
+    def _load_weights(self):
+        return load_deepseek_v4_weights(
+            self.model_path,
+            self._model,
+            rank=self.tensor_parallel_rank,
+            tensor_parallel_size=self.tensor_parallel_size,
+            device=self.device,
+        )
 
     def _configure_prefill_attention_graphs(self) -> None:
         """Capture dense projections around the ordinary eager sparse attention."""

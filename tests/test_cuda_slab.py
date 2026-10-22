@@ -21,8 +21,12 @@ def test_graph_replay_pads_unused_rows_with_the_capture_scratch_parents(
         def _make_graph_cache(self, groups):
             return SimpleNamespace(groups=groups)
 
-        def _graph_padding_id(self, _index: int) -> int:
-            return self.layout.parent_capacity + _index + 1 if private_scratch else 0
+        def _graph_padding_address(self, index: int, row: int) -> tuple[int, int]:
+            return (
+                (self.layout.parent_capacity + index + 1, 0)
+                if private_scratch
+                else (0, 0)
+            )
 
     arena = Arena()
     cache = arena.graph_cache(2, 256)
@@ -43,7 +47,7 @@ def test_graph_replay_pads_unused_rows_with_the_capture_scratch_parents(
 
     for group in range(2):
         prefix = f"cache.{group}"
-        parent = arena._graph_padding_id(group)
+        parent, slot = arena._graph_padding_address(group, 1)
         np.testing.assert_array_equal(
             replay[f"{prefix}.slabs"], [[7, 0], [parent, parent]]
         )

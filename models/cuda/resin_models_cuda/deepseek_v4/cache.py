@@ -14,6 +14,8 @@ from resin.backend.capacity import plan_cache_capacity as plan_capacity
 from resin.backend.cuda.slab import (
     PARENT_PAGE_NAMES,
     GraphPageTableArena,
+    graph_scratch_address,
+    graph_scratch_parent_count,
     slice_page_groups,
     stage_page_groups,
 )
@@ -34,7 +36,6 @@ C128_KV_GROUP = 3
 C128_STATE_GROUP = 4
 INDEX_STATE_GROUP = 5
 GROUP_COUNT = 6
-GRAPH_SCRATCH_PARENTS = GROUP_COUNT
 _GROUP_BLOCK_TOKENS = (128, 128, 4, 128, 8, 4)
 
 
@@ -77,6 +78,11 @@ class CacheGeometry:
     state_widths: tuple[int, ...]
     packings: tuple[int, ...]
     parent_rows: int
+    max_batch_size: int = 1
+
+    @property
+    def graph_scratch_parents(self) -> int:
+        return graph_scratch_parent_count(self.packings, self.max_batch_size)
 
     @classmethod
     def build(
@@ -88,6 +94,7 @@ class CacheGeometry:
         window_size: int,
         decode_input_tokens: int = 1,
         prefill_chunk_size: int = 1,
+        max_batch_size: int = 1,
     ) -> CacheGeometry:
         ratios = _ints("compress_ratios", compress_ratios)
         if (
@@ -215,6 +222,7 @@ class CacheGeometry:
             + (0,) * dspark_layers,
             packings,
             parent_rows,
+            max_batch_size,
         )
 
     def layout(self, parent_capacity: int) -> CacheLayout:
@@ -517,7 +525,7 @@ class CacheArena(GraphPageTableArena):
         self.geometry = geometry
         self.storage = torch.empty(
             (
-                layout.parent_capacity + 1 + GRAPH_SCRATCH_PARENTS,
+                layout.parent_capacity + 1 + geometry.graph_scratch_parents,
                 geometry.parent_rows,
                 512,
             ),
@@ -530,7 +538,7 @@ class CacheArena(GraphPageTableArena):
 
     def reset_scratch(self) -> None:
         self.storage[0].zero_()
-        self.storage[-GRAPH_SCRATCH_PARENTS:].zero_()
+        self.storage[-self.geometry.graph_scratch_parents :].zero_()
 
     def state_tensors(
         self, layer: int, *, indexer: bool = False
@@ -601,8 +609,14 @@ class CacheArena(GraphPageTableArena):
             self.index_keys,
         )
 
-    def _graph_padding_id(self, _index: int) -> int:
-        return self.layout.parent_capacity + _index + 1
+    def _graph_padding_address(self, index: int, row: int) -> tuple[int, int]:
+        return graph_scratch_address(
+            self.layout.parent_capacity,
+            self.geometry.packings,
+            self.geometry.max_batch_size,
+            index,
+            row,
+        )
 
 
 __all__ = [

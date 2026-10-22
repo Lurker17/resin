@@ -149,6 +149,19 @@ def empty_page_groups(device, batch_size: int, widths):
     )
 
 
+def graph_scratch_parent_count(packings, batch_size: int) -> int:
+    return sum(math.ceil(batch_size / packing) for packing in packings)
+
+
+def graph_scratch_address(parent_capacity, packings, batch_size, group, row):
+    """Give each graph-padding row its own writable child in each cache group."""
+    if not 0 <= row < batch_size:
+        raise ValueError("graph batch exceeds reserved scratch capacity")
+    preceding = graph_scratch_parent_count(packings[:group], batch_size)
+    parent, slot = divmod(row, packings[group])
+    return parent_capacity + preceding + parent + 1, slot
+
+
 def page_group_device_inputs(groups, *, names=_SLAB_NAMES) -> dict[str, object]:
     return {
         f"cache.{index}.{name}": value
@@ -164,14 +177,18 @@ def page_group_capture_inputs(
     batch_size: int,
     *,
     names=_SLAB_NAMES,
-    padding_ids: Callable[[int], int] = lambda _index: 0,
+    padding_address: Callable[[int, int], tuple[int, int]] = lambda _index, _row: (
+        0,
+        0,
+    ),
 ) -> dict[str, object]:
     inputs = {}
     for index, width in enumerate(widths):
-        inputs[f"cache.{index}.{names[0]}"] = (padding_ids(index),) * (
-            batch_size * width
-        )
-        inputs[f"cache.{index}.{names[1]}"] = (0,) * (batch_size * width)
+        addresses = [padding_address(index, row) for row in range(batch_size)]
+        for field in (0, 1):
+            inputs[f"cache.{index}.{names[field]}"] = tuple(
+                address[field] for address in addresses for _ in range(width)
+            )
         inputs[f"cache.{index}.{names[2]}"] = (0,) * batch_size
     return inputs
 
@@ -182,7 +199,10 @@ def page_group_plan_inputs(
     *,
     label: str,
     names=_SLAB_NAMES,
-    padding_ids: Callable[[int], int] = lambda _index: 0,
+    padding_address: Callable[[int, int], tuple[int, int]] = lambda _index, _row: (
+        0,
+        0,
+    ),
 ) -> dict[str, object]:
     inputs = {}
     for index, (target, source) in enumerate(zip(groups, plan.groups, strict=True)):
@@ -192,7 +212,8 @@ def page_group_plan_inputs(
         ids, slots = np.zeros(shape, dtype=np.uint32), np.zeros(shape, dtype=np.uint32)
         # Padded requests may still write dummy tokens during graph replay.
         # Use capture's scratch storage without making absent live history valid.
-        ids[plan.rows :] = padding_ids(index)
+        for row in range(plan.rows, shape[0]):
+            ids[row], slots[row] = padding_address(index, row)
         for row in range(plan.rows):
             row_ids, row_slots = source.block_slabs(row), source.block_slots(row)
             if len(row_ids) > shape[1]:
@@ -219,8 +240,8 @@ class GraphPageTableArena:
     def _make_graph_cache(self, groups):
         raise NotImplementedError
 
-    def _graph_padding_id(self, _index: int) -> int:
-        return 0
+    def _graph_padding_address(self, index: int, row: int) -> tuple[int, int]:
+        return 0, 0
 
     def _graph_widths(self, sequence_capacity: int) -> tuple[int, ...]:
         return graph_page_widths(self.layout, sequence_capacity)
@@ -243,7 +264,7 @@ class GraphPageTableArena:
             self._graph_widths(sequence_capacity),
             batch_size,
             names=self.graph_input_names,
-            padding_ids=self._graph_padding_id,
+            padding_address=self._graph_padding_address,
         )
 
     def graph_plan_inputs(self, cache, plan) -> dict[str, object]:
@@ -252,7 +273,7 @@ class GraphPageTableArena:
             plan,
             label=self.graph_label,
             names=self.graph_input_names,
-            padding_ids=self._graph_padding_id,
+            padding_address=self._graph_padding_address,
         )
 
 
@@ -263,6 +284,8 @@ __all__ = [
     "SlabDeviceCache",
     "empty_page_groups",
     "graph_page_widths",
+    "graph_scratch_address",
+    "graph_scratch_parent_count",
     "page_group_capture_inputs",
     "page_group_device_inputs",
     "page_group_plan_inputs",

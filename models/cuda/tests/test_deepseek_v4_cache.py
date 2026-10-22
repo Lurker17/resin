@@ -17,13 +17,16 @@ from resin_models_cuda.deepseek_v4.cache import (
 )
 
 
-def _geometry(*, decode_input_tokens: int = 6, dspark_layers: int = 3) -> CacheGeometry:
+def _geometry(
+    *, decode_input_tokens: int = 6, dspark_layers: int = 3, max_batch_size: int = 1
+) -> CacheGeometry:
     return CacheGeometry.build(
         [0, 0, *([4, 128] * 20), 4, 0, 0, 0],
         target_layers=43,
         dspark_layers=dspark_layers,
         window_size=128,
         decode_input_tokens=decode_input_tokens,
+        max_batch_size=max_batch_size,
     )
 
 
@@ -131,20 +134,28 @@ def test_post_load_vram_budget_includes_null_parent() -> None:
 
 
 def test_graph_capture_uses_group_private_scratch_parents() -> None:
-    geometry = _geometry()
+    geometry = _geometry(max_batch_size=4)
     layout = geometry.layout(3)
     arena = CacheArena("cpu", layout, geometry, dtype=torch.bfloat16)
 
-    inputs = arena.graph_shape_capture_inputs(2, 256)
+    inputs = arena.graph_shape_capture_inputs(4, 256)
 
-    assert arena.storage.shape[0] == layout.parent_capacity + 7
+    assert (
+        arena.storage.shape[0]
+        == layout.parent_capacity + 1 + geometry.graph_scratch_parents
+    )
+    seen_parents = set()
     for group in range(len(geometry.packings)):
-        expected_parent = layout.parent_capacity + group + 1
-        parent_ids = inputs[f"cache.{group}.parent_ids"]
-        child_slots = inputs[f"cache.{group}.child_slots"]
-        assert isinstance(parent_ids, tuple) and isinstance(child_slots, tuple)
-        assert set(parent_ids) == {expected_parent}
-        assert set(child_slots) == {0}
+        parent_ids = np.asarray(inputs[f"cache.{group}.parent_ids"]).reshape(4, -1)
+        child_slots = np.asarray(inputs[f"cache.{group}.child_slots"]).reshape(4, -1)
+        addresses = [arena._graph_padding_address(group, row) for row in range(4)]
+        assert len(set(addresses)) == 4
+        assert seen_parents.isdisjoint(parent for parent, _ in addresses)
+        seen_parents.update(parent for parent, _ in addresses)
+        for row, (parent, slot) in enumerate(addresses):
+            assert (parent_ids[row] == parent).all()
+            assert (child_slots[row] == slot).all()
+    assert len(seen_parents) == geometry.graph_scratch_parents
 
 
 def test_plan_preserves_structured_parent_and_child_addresses() -> None:
