@@ -39,6 +39,7 @@ uv run modal run deploy/modal_bench.py \
   --model deepseek-v41 --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 \
   --expert-backend deepgemm --context-lengths 131072 \
   --shared-prefix-tokens 126976 --batch-sizes 1,4,16,64,256 \
+  --phases decode --prefill-chunk-size 1024 --gpu-memory-utilization 0.5 \
   --output bench/deepseek-v41-shared.jsonl
 ```
 
@@ -48,6 +49,10 @@ requested prefix. Unsupported cache/checkpoint reuse fails explicitly. Records
 include shared/private token counts and actual cached-length bounds; prefill
 throughput counts newly processed inputs. Independent and shared-prefix points
 must use separate chart files. The default is zero shared tokens.
+The lower cache budget in this long-context example leaves workspace for the
+captured decode graphs and uncaptured prefill operations. Cache preflight still
+requires the entire requested cohort to fit; unused arena capacity does not
+improve throughput.
 
 The default DeepSeek workload uses four draft tokens, forces three accepted
 drafts per verification step, and balances expert routing. These are controlled
@@ -149,10 +154,15 @@ and has no draft model:
 
 ```bash
 uv run modal run deploy/modal_bench.py \
-  --model gpt-oss-20b --gpu H100 --world-size 1 --attn-dp 1 --attn-tp 1 --ep 1 \
+  --model gpt-oss-20b --gpu 'H100!' --world-size 1 --attn-dp 1 --attn-tp 1 --ep 1 \
   --draft-tokens 0 --prefill-chunk-size 1024 --output bench/gpt-oss-20b.jsonl
 uv run scripts/plot_bench.py bench/gpt-oss-20b.jsonl --draft-tokens 0
 ```
+
+Use `--gpu 'H100!'` for an H100 comparison. Modal can automatically upgrade
+plain `H100` requests to H200; the exclamation mark
+[disables that upgrade](https://modal.com/docs/guide/gpu#automatic-upgrades-to-h200s).
+Records always retain the actual device name.
 
 Use `--phases decode` or `--phases prefill` for one phase and the matching
 `--mode decode` or `--mode prefill` when plotting. Parallelism is configured with

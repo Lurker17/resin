@@ -255,6 +255,50 @@ def axes(records, phase, *, draft_tokens=4, accept_rate=0.75, compare_topologies
     return result
 
 
+def _annotate_points(axis, points):
+    """Keep batch labels inside the plot and separate crowded curve endpoints."""
+    axis.figure.canvas.draw()
+    renderer = axis.figure.canvas.get_renderer()
+    bounds = axis.get_window_extent(renderer)
+    placed = []
+    if legend := axis.get_legend():
+        placed.append(legend.get_window_extent(renderer))
+    offsets = (
+        (0, 9),
+        (0, -16),
+        (12, 9),
+        (-12, 9),
+        (12, -16),
+        (-12, -16),
+        (24, 18),
+        (-24, 18),
+        (24, -24),
+        (-24, -24),
+        (0, 27),
+        (0, -34),
+    )
+    for x, y, label, color in sorted(points, key=lambda point: -point[1]):
+        annotation = axis.annotate(
+            label,
+            (x, y),
+            xytext=offsets[0],
+            textcoords="offset points",
+            ha="center",
+            fontsize=9,
+            color=color,
+        )
+        for offset in offsets:
+            annotation.set_position(offset)
+            box = annotation.get_window_extent(renderer).padded(2)
+            if (
+                bounds.contains(box.x0, box.y0)
+                and bounds.contains(box.x1, box.y1)
+                and not any(box.overlaps(other) for other in placed)
+            ):
+                break
+        placed.append(box)
+
+
 def plot(
     records,
     phase,
@@ -297,7 +341,8 @@ def plot(
         subtitle += f" | shared prefix={shared:,}, private suffix={private:,} tokens"
     figure, axis = plt.subplots(figsize=(9, 6.4))
     try:
-        for curve_index, (context, points) in enumerate(sorted(curves.items())):
+        annotations = []
+        for context, points in sorted(curves.items()):
             xs, ys, labels = zip(*points, strict=True)
             label = (
                 f"{context[1]}; context {context[0]:,}"
@@ -306,15 +351,7 @@ def plot(
             )
             (line,) = axis.plot(xs, ys, "o-", linewidth=2, label=label)
             for x, y, label in points:
-                axis.annotate(
-                    label,
-                    (x, y),
-                    xytext=(0, 9 if curve_index % 2 == 0 else -16),
-                    textcoords="offset points",
-                    ha="center",
-                    fontsize=9,
-                    color=line.get_color(),
-                )
+                annotations.append((x, y, label, line.get_color()))
         decode = phase == "decode"
         figure.suptitle(
             "Decode: output throughput vs. interactivity"
@@ -387,6 +424,7 @@ def plot(
             note += "\nMeshes reserve different prefill capacities; decode timing excludes prefill."
         figure.text(0.5, 0.025, note, ha="center", fontsize=9, color="#555555")
         figure.tight_layout(rect=(0, 0.05 + 0.025 * (note.count("\n") + 1), 1, 0.94))
+        _annotate_points(axis, annotations)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         paths = tuple(output_dir / f"{phase}.{suffix}" for suffix in ("png", "svg"))

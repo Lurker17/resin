@@ -384,3 +384,32 @@ def test_shared_prefix_plot_labels_both_shared_and_private_context(tmp_path):
     svg = (output / "decode.svg").read_text()
     captions = " ".join(re.findall(r"<!-- (.*?) -->", svg))
     assert "shared prefix=4,096, private suffix=4,096 tokens" in captions
+
+
+def test_batch_labels_stay_inside_axes_and_avoid_crowded_endpoints():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    from scripts.plot_bench import _annotate_points
+
+    figure, axis = plt.subplots(figsize=(9, 6.4))
+    canvas = FigureCanvasAgg(figure)
+    try:
+        axis.set(xlim=(0, 10), ylim=(0, 10))
+        points = [
+            (5 + i * 0.01, 0.1, label, "blue")
+            for i, label in enumerate(("1", "4", "16", "32", "64"))
+        ]
+        _annotate_points(axis, points)
+        renderer = canvas.get_renderer()
+        bounds = axis.get_window_extent(renderer)
+        boxes = [text.get_window_extent(renderer).padded(2) for text in axis.texts]
+        assert len(boxes) == 5
+        for index, box in enumerate(boxes):
+            assert bounds.contains(box.x0, box.y0) and bounds.contains(box.x1, box.y1)
+            assert not any(box.overlaps(other) for other in boxes[:index])
+    finally:
+        plt.close(figure)
