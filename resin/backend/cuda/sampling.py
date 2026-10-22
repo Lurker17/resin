@@ -29,10 +29,15 @@ class FlashInferSampler:
     """
 
     def __init__(self) -> None:
-        from flashinfer.sampling import softmax, top_k_top_p_sampling_from_probs
+        from flashinfer.sampling import (
+            softmax,
+            top_k_mask_logits,
+            top_p_sampling_from_probs,
+        )
 
+        self._mask_logits = top_k_mask_logits
         self._softmax = softmax
-        self._sample = top_k_top_p_sampling_from_probs
+        self._sample = top_p_sampling_from_probs
 
     @staticmethod
     def host_inputs(
@@ -83,12 +88,14 @@ class FlashInferSampler:
 
     def sample_tensors(self, logits, tensors: SamplingTensors, *, out=None):
         greedy = logits.argmax(dim=-1)
-        probabilities = self._softmax(logits, temperature=tensors.temperatures)
+        # Mask before softmax to normalize the top-k conditional distribution.
+        # FlashInfer's probabilities-first renormalizer uses unordered FP32
+        # atomics across CTAs, even when the later sampler is deterministic.
+        masked_logits = self._mask_logits(logits, tensors.top_ks)
+        probabilities = self._softmax(masked_logits, temperature=tensors.temperatures)
         sampled, valid = self._sample(
             probabilities,
-            tensors.top_ks,
             tensors.top_ps,
-            filter_apply_order="top_k_first",
             deterministic=True,
             seed=tensors.seeds,
             offset=tensors.offsets,

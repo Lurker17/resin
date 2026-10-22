@@ -184,21 +184,30 @@ class TestSharedSampler:
         calls = {}
         sampler = FlashInferSampler.__new__(FlashInferSampler)
 
+        def mask_logits(logits, top_k):
+            calls["top_k"] = top_k.clone()
+            threshold = logits.sort(descending=True).values.gather(
+                1, top_k.long()[:, None] - 1
+            )
+            return logits.masked_fill(logits < threshold, -torch.inf)
+
         def softmax(logits, *, temperature):
             calls["temperatures"] = temperature.clone()
             return torch.softmax(logits / temperature[:, None], dim=-1)
 
-        def sample(probabilities, top_k, top_p, **kwargs):
-            calls["top_k"] = top_k.clone()
+        def sample(probabilities, top_p, **kwargs):
+            calls["probabilities"] = probabilities.clone()
             calls["top_p"] = top_p.clone()
             calls["seed"] = kwargs["seed"].clone()
             calls["offset"] = kwargs["offset"].clone()
             calls["return_valid"] = kwargs["return_valid"]
+            assert kwargs["deterministic"] is True
             return (
                 torch.tensor([2, 0], dtype=torch.int32),
                 torch.tensor([True, True]),
             )
 
+        monkeypatch.setattr(sampler, "_mask_logits", mask_logits, raising=False)
         monkeypatch.setattr(sampler, "_softmax", softmax, raising=False)
         monkeypatch.setattr(sampler, "_sample", sample, raising=False)
         plan = BatchPlan(
@@ -217,6 +226,10 @@ class TestSharedSampler:
         assert sampler(logits, plan).tolist()[1] == 1
         torch.testing.assert_close(calls["temperatures"], torch.tensor([0.5, 1.0]))
         assert calls["top_k"].tolist() == [2, 3]
+        torch.testing.assert_close(
+            calls["probabilities"][0],
+            torch.cat((torch.zeros(1), torch.tensor([2.0, 4.0]).softmax(-1))),
+        )
         torch.testing.assert_close(calls["top_p"], torch.tensor([0.8, 1.0]))
         assert calls["seed"].tolist() == [31, 32]
         assert calls["offset"].tolist() == [64, 96]
@@ -229,6 +242,9 @@ class TestSharedSampler:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         sampler = FlashInferSampler.__new__(FlashInferSampler)
+        monkeypatch.setattr(
+            sampler, "_mask_logits", lambda logits, top_k: logits, raising=False
+        )
         monkeypatch.setattr(
             sampler,
             "_softmax",
