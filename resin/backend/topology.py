@@ -14,7 +14,8 @@ class ParallelismCapabilities:
     """Supported parallelisms for a model implementation."""
 
     attn_dp: bool = False
-    # Partitions every layer's KV heads; replicated KV or query-only TP is unsupported.
+    # Shards KV heads within each copy. Remaining ranks replicate attention and KV
+    # when attn_dp * attn_tp * cp < world_size.
     attn_tp: bool = False
     cp: bool = False
     ep: bool = False
