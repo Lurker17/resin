@@ -414,6 +414,7 @@ def test_driver_reduction_uses_slowest_time_and_unique_replica_totals():
     )
     assert reduced == {
         "seconds": 0.2,
+        "replica_sequences": [2, 2],
         "input_tokens": 8,
         "committed_tokens": 4,
         "drafts": 8,
@@ -478,6 +479,34 @@ def test_completed_case_is_saved_before_later_failure_and_requests_are_cleaned(
     assert json.loads(output.read_text()) == completed
     assert not output.with_suffix(".json.tmp").exists()
     assert not engine.local.has_work()
-    prefix, point = capsys.readouterr().out.strip().split(" ", 1)
-    assert prefix == "[bench-result]"
-    assert json.loads(point) == completed[0]
+    point, error = capsys.readouterr().out.strip().splitlines()
+    assert point.startswith("[bench-result] ")
+    assert json.loads(point.split(" ", 1)[1]) == completed[0]
+    assert error.startswith("[bench-error] ")
+    assert "second case admission failed" in json.loads(error.split(" ", 1)[1])["error"]
+
+
+def test_decode_reports_when_cache_admission_only_fits_part_of_the_cohort(capsys):
+    import json
+
+    raw = Runner()
+    raw.runner_config = RunnerConfig(cache_layout=CacheLayout(4, [CacheGroupLayout(4)]))
+    runner = BenchmarkRunner(raw)
+    engine = Engine(runner, max_running_requests=4, context_length=64)
+    with pytest.raises(RuntimeError, match="scheduled_global=2, expected_global=4"):
+        run_sweep(
+            engine,
+            [BenchCase(phase="decode", context_length=4, batch_size=4)],
+            runner=runner,
+            prompt_tokens=[1],
+            warmup_steps=0,
+            measure_steps=1,
+        )
+    line = capsys.readouterr().out.strip()
+    assert line.startswith("[bench-error] ")
+    diagnostic = json.loads(line.split(" ", 1)[1])
+    assert diagnostic["observation"]["sequences"] == 2
+    assert diagnostic["cache"]["cache_parent_capacity"] == 4
+    assert diagnostic["cache"]["ready_request_count"] == 4
+    assert diagnostic["cache"]["active_request_count"] == 4
+    assert not engine.has_work()

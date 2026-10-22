@@ -7,6 +7,7 @@ import os
 import socket
 import tempfile
 import time
+from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,59 @@ def _result_callback(report_path):
         print("[bench-result] " + json.dumps(record), flush=True)
 
     return save
+
+
+def _cache_preflight(raw, cases, options, groups=None):
+    """Reject a partial decode cohort before spending time on capture or prefill."""
+    plan = getattr(raw, "cache_capacity_plan", None)
+    if plan is None:
+        return
+    layout = raw.cache_layout
+    requirements = []
+    for case in cases:
+        context = case.context_length
+        if case.phase == "decode":
+            context += (options["warmup_steps"] + options["measure_steps"] + 1) * (
+                options["draft_tokens"] + 1
+            ) + options["draft_tokens"]
+        parents = layout.estimated_parent_count([context] * case.batch_size)
+        requirements.append(
+            dict(
+                phase=case.phase,
+                context_length=case.context_length,
+                batch_size=case.batch_size,
+                peak_context=context,
+                required_parents=parents,
+            )
+        )
+    rank = 0 if groups is None else groups.rank
+    print(
+        "[bench-cache] "
+        + json.dumps(
+            dict(
+                rank=rank,
+                capacity=asdict(plan),
+                cases=requirements,
+            )
+        ),
+        flush=True,
+    )
+    failures = [
+        f"rank {rank} {row['phase']} ctx={row['context_length']} "
+        f"batch={row['batch_size']} needs {row['required_parents']} cache parents, "
+        f"capacity={layout.parent_capacity} (peak context {row['peak_context']})"
+        for row in requirements
+        if row["required_parents"] > layout.parent_capacity
+    ]
+    errors = [failures]
+    if groups is not None and groups.domain.size > 1:
+        errors = [None] * groups.domain.size
+        groups.distributed.all_gather_object(
+            errors, failures, group=groups.domain.handle
+        )
+    failures = [failure for values in errors if values for failure in values]
+    if failures:
+        raise ValueError("benchmark cache preflight failed: " + "; ".join(failures))
 
 
 def _checkpoint_validation(raw, engine, checkpoint, metadata, groups):
@@ -229,6 +283,7 @@ def _rank(
         options=options,
         context_capacity=capacity,
     )
+    _cache_preflight(raw, cases, options, groups)
     observed = BenchmarkRunner(
         raw,
         accepted_drafts=options["accepted_drafts"],

@@ -7,10 +7,11 @@ metrics reduction are outside the timed Engine.step calls.
 
 from __future__ import annotations
 
+import json
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 from resin import BatchPhase, BatchPlan, SamplingParams
@@ -141,6 +142,7 @@ def distributed_reducer(groups):
             groups.distributed.all_gather_object(values, local, group=drivers.handle)
         return {
             "seconds": max(v["seconds"] for v in values),
+            "replica_sequences": [v["sequences"] for v in values],
             **{
                 key: sum(v[key] for v in values)
                 for key in (
@@ -239,6 +241,7 @@ def run_sweep(
                 "seconds": elapsed,
                 "input_tokens": runner.observation["input_tokens"],
                 "sequences": runner.observation["sequences"],
+                "replica_sequences": [runner.observation["sequences"]],
                 "committed_tokens": len(events),
                 "drafts": drafts - before_drafts,
                 "accepted": accepted - before_accepted,
@@ -266,6 +269,7 @@ def run_sweep(
         leases = []
         samples = []
         warmed = 0
+        result = None
 
         def admit(max_new_tokens):
             local.clear_prefix_cache()
@@ -309,7 +313,14 @@ def run_sweep(
                     if runner.observation["phase"] != "decode":
                         raise RuntimeError("decode benchmark did not execute decode")
                     if result["sequences"] != case.batch_size * attn_dp:
-                        raise RuntimeError("decode batch was not fully scheduled")
+                        raise RuntimeError(
+                            "decode batch was not fully scheduled: "
+                            f"scheduled_global={result['sequences']}, "
+                            f"expected_global={case.batch_size * attn_dp}, "
+                            f"scheduled_local={runner.observation['sequences']}, "
+                            f"expected_per_replica={case.batch_size}, "
+                            f"context_length={case.context_length}, phase={case.phase}"
+                        )
                     if any(lease.done for lease in leases):
                         raise RuntimeError("decode cohort retired during measurement")
                     if index >= warmup_steps:
@@ -364,6 +375,29 @@ def run_sweep(
                     "metadata": dict(metadata or {}),
                 }
             )
+        except Exception as error:
+            diagnostic = dict(
+                **asdict(case),
+                error=f"{type(error).__name__}: {error}",
+                attn_dp=attn_dp,
+                actual_global=(result or {}).get("sequences"),
+                expected_global=case.batch_size * attn_dp,
+                observation=runner.observation,
+                per_replica=(result or {}).get("replica_sequences"),
+                cache={
+                    name: getattr(local, name, None)
+                    for name in (
+                        "ready_request_count",
+                        "active_request_count",
+                        "new_token_ratio",
+                        "cache_parent_capacity",
+                        "cache_free_parent_count",
+                        "cache_occupied_block_count",
+                    )
+                },
+            )
+            print("[bench-error] " + json.dumps(diagnostic), flush=True)
+            raise
         finally:
             if not local.poisoned:
                 for lease in leases:

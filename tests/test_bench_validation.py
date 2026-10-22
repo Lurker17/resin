@@ -190,3 +190,62 @@ def test_validation_cli_saves_all_driver_failures_before_raising(tmp_path, monke
     with pytest.raises(RuntimeError, match="reports saved"):
         modal_bench.main(model="deepseek-v41", validate_model=True, output=str(output))
     assert json.loads(output.read_text()) == report
+
+
+def test_cache_preflight_rejects_decode_growth_before_prefill_or_capture(capsys):
+    from resin import CacheGroupLayout, CacheLayout
+    from resin.backend.capacity import plan_cache_capacity
+    from resin.bench import BenchCase
+
+    layout = CacheLayout(4, [CacheGroupLayout(4)])
+    raw = SimpleNamespace(
+        cache_layout=layout,
+        cache_capacity_plan=plan_cache_capacity(100, 100, 0.5, 10),
+    )
+    options = dict(warmup_steps=0, measure_steps=1, draft_tokens=0)
+    bench._cache_preflight(
+        raw, [BenchCase(phase="prefill", context_length=4, batch_size=4)], options
+    )
+    with pytest.raises(
+        ValueError, match="decode ctx=4 batch=4 needs 8 cache parents, capacity=4"
+    ):
+        bench._cache_preflight(
+            raw, [BenchCase(phase="decode", context_length=4, batch_size=4)], options
+        )
+    rows = [
+        json.loads(line.split(" ", 1)[1])
+        for line in capsys.readouterr().out.splitlines()
+    ]
+    assert rows[0]["cases"][0]["required_parents"] == 4
+    assert rows[1]["cases"][0]["peak_context"] == 6
+    assert rows[1]["capacity"]["bytes_per_parent"] == 10
+    assert rows[1]["capacity"]["reserved_parent_count"] == 1
+
+
+def test_cache_preflight_propagates_a_peers_capacity_failure():
+    from resin import CacheGroupLayout, CacheLayout
+    from resin.backend.capacity import plan_cache_capacity
+    from resin.bench import BenchCase
+
+    class Distributed:
+        @staticmethod
+        def all_gather_object(values, local, *, group):
+            assert not local  # This rank fits; a peer does not.
+            values[:] = [[], ["rank 1 requires more cache parents"]]
+
+    groups = SimpleNamespace(
+        rank=0,
+        domain=SimpleNamespace(size=2, handle=object()),
+        distributed=Distributed(),
+    )
+    raw = SimpleNamespace(
+        cache_layout=CacheLayout(4, [CacheGroupLayout(4)]),
+        cache_capacity_plan=plan_cache_capacity(100, 100, 0.5, 10),
+    )
+    with pytest.raises(ValueError, match="rank 1 requires more cache parents"):
+        bench._cache_preflight(
+            raw,
+            [BenchCase(phase="prefill", context_length=4, batch_size=4)],
+            dict(warmup_steps=0, measure_steps=1, draft_tokens=0),
+            groups,
+        )
