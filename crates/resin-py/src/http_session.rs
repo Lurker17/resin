@@ -11,7 +11,8 @@ use pyo3::{
 };
 use pythonize::{depythonize, pythonize};
 use resin_http::{
-    ConversationRequest, EVENT_QUEUE_CAPACITY, FinishReason, GenerationEvent, GenerationJob,
+    ConversationRequest, EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob,
+    GenerationEvent, GenerationJob,
 };
 use resin_recipe::{AttributedEvent, Event as ParsedEvent, FinishReason as ParserFinishReason};
 use serde::Deserialize;
@@ -108,6 +109,53 @@ fn optional_method(py: Python<'_>, object: &Py<PyAny>, name: &str) -> PyResult<O
     }
 }
 
+/// Coalesce protocol-neutral output across steps, without delaying parsing or stops.
+#[derive(Default)]
+struct StreamOutput {
+    events: Vec<GenerationEvent>,
+    scores: Vec<GeneratedTokenLogprob>,
+    tokens: u32,
+    sent_output: bool,
+}
+
+impl StreamOutput {
+    fn has_output(&self) -> bool {
+        self.events.iter().any(|event| match event {
+            GenerationEvent::TextDelta { delta, .. }
+            | GenerationEvent::ReasoningDelta(delta)
+            | GenerationEvent::ToolCallArgumentsDelta { delta, .. } => !delta.is_empty(),
+            GenerationEvent::ToolCallStart { .. } => true,
+            _ => false,
+        })
+    }
+
+    fn ready(&self, interval: u32, finished: bool) -> bool {
+        finished
+            || self.tokens >= interval
+            || (!self.sent_output && self.has_output())
+            // Bound noncoalescible lanes even with a large configured interval.
+            || self.events.len() >= EVENT_QUEUE_CAPACITY / 2
+    }
+
+    fn flush(&mut self, sender: &mpsc::Sender<GenerationEvent>) -> bool {
+        if self.events.is_empty() && self.scores.is_empty() {
+            return true;
+        }
+        let has_output = self.has_output();
+        let delivered = self
+            .events
+            .drain(..)
+            .all(|event| sender.try_send(event).is_ok())
+            && (self.scores.is_empty()
+                || sender
+                    .try_send(GenerationEvent::Logprobs(std::mem::take(&mut self.scores)))
+                    .is_ok());
+        self.sent_output |= has_output && delivered;
+        self.tokens = 0;
+        delivered
+    }
+}
+
 struct ActiveRequest {
     http_id: String,
     lease: Py<RequestLease>,
@@ -123,6 +171,7 @@ struct ActiveRequest {
     cached_tokens: usize,
     output_tokens: usize,
     last_source: u32,
+    stream: StreamOutput,
 }
 
 impl ActiveRequest {
@@ -172,9 +221,20 @@ pub(crate) struct Session {
     codec: Py<PyAny>,
     vocabulary: Vocabulary,
     active: HashMap<u64, ActiveRequest>,
+    stream_interval: u32,
 }
 impl Session {
-    pub fn new(py: Python<'_>, engine: Py<Engine>, codec: Py<PyAny>) -> PyResult<Self> {
+    pub fn new(
+        py: Python<'_>,
+        engine: Py<Engine>,
+        codec: Py<PyAny>,
+        stream_interval: u32,
+    ) -> PyResult<Self> {
+        if stream_interval == 0 {
+            return Err(PyValueError::new_err(
+                "stream_interval must be a positive integer",
+            ));
+        }
         let state = engine.bind(py).borrow();
         if state.closed() || state.poisoned() {
             return Err(PyRuntimeError::new_err(
@@ -188,6 +248,7 @@ impl Session {
             codec,
             vocabulary,
             active: HashMap::new(),
+            stream_interval,
         })
     }
     pub fn active_count(&self) -> usize {
@@ -200,7 +261,13 @@ impl Session {
         cancel_disconnected(&self.engine, &mut self.active)
     }
     pub fn process(&mut self, tokens: Vec<TokenEvent>) -> Result<(), String> {
-        process(&self.engine, &self.vocabulary, &mut self.active, tokens)
+        process(
+            &self.engine,
+            &self.vocabulary,
+            &mut self.active,
+            self.stream_interval,
+            tokens,
+        )
     }
     pub fn cancel(&mut self, ids: &[String]) -> PyResult<()> {
         let remove = self
@@ -232,6 +299,7 @@ fn process(
     engine: &Py<Engine>,
     vocabulary: &Vocabulary,
     active: &mut HashMap<u64, ActiveRequest>,
+    stream_interval: u32,
     token_events: Vec<TokenEvent>,
 ) -> Result<(), String> {
     let mut grouped = HashMap::<u64, Vec<crate::TokenEvent>>::new();
@@ -256,9 +324,9 @@ fn process(
             request.first_token_at.get_or_insert_with(Instant::now);
         }
         let mut finished = tokens.is_empty().then_some(CompletionReason::Length);
-        let mut scores = Vec::new();
+        let mut scores = std::mem::take(&mut request.stream.scores);
         let parsed = (|| -> PyResult<Vec<GenerationEvent>> {
-            let mut output = Vec::new();
+            let mut output = std::mem::take(&mut request.stream.events);
             if tokens.is_empty() {
                 for event in request.parser.finish(ParserFinishReason::Length)? {
                     request.parsed(event, &mut output)?;
@@ -267,6 +335,7 @@ fn process(
             }
             for token in tokens {
                 request.output_tokens += 1;
+                request.stream.tokens = request.stream.tokens.saturating_add(1);
                 let channel = if token.logprobs.is_none() {
                     None
                 } else {
@@ -326,15 +395,10 @@ fn process(
         })();
         let delivered = match parsed {
             Ok(events) => {
-                let delivered = events
-                    .into_iter()
-                    .all(|event| request.events.try_send(event).is_ok());
-                delivered
-                    && (scores.is_empty()
-                        || request
-                            .events
-                            .try_send(GenerationEvent::Logprobs(scores))
-                            .is_ok())
+                request.stream.events = events;
+                request.stream.scores = scores;
+                !request.stream.ready(stream_interval, finished.is_some())
+                    || request.stream.flush(&request.events)
             }
             Err(error) => {
                 let _ = request.events.try_send(GenerationEvent::Error {
@@ -493,6 +557,7 @@ fn admit(
                     cached_tokens,
                     output_tokens: 0,
                     last_source: 0,
+                    stream: StreamOutput::default(),
                 },
             );
         }
@@ -535,9 +600,18 @@ pub(crate) struct NativeHttpSession {
 #[pymethods]
 impl NativeHttpSession {
     #[new]
-    fn new(py: Python<'_>, engine: Py<Engine>, codec: Py<PyAny>) -> PyResult<Self> {
+    #[pyo3(signature = (engine, codec, *, stream_interval = 1))]
+    fn new(
+        py: Python<'_>,
+        engine: Py<Engine>,
+        codec: Py<PyAny>,
+        stream_interval: u32,
+    ) -> PyResult<Self> {
         Ok(Self {
-            inner: Mutex::new((Session::new(py, engine, codec)?, HashMap::new())),
+            inner: Mutex::new((
+                Session::new(py, engine, codec, stream_interval)?,
+                HashMap::new(),
+            )),
         })
     }
     fn admit(&self, requests_json: &str) -> PyResult<()> {

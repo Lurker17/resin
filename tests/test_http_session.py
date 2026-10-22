@@ -2,11 +2,16 @@
 
 import json
 
+import pytest
+
 from resin import BatchPhase, Engine
 from resin._resin import _HttpSession
 
 
-def test_session_overflow_terminates_client_and_keeps_other_requests_usable():
+@pytest.mark.parametrize("stream_interval", [1, 4])
+def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
+    stream_interval,
+):
     class Runner:
         def forward(self, plan):
             return [1] if plan.phase == BatchPhase.PREFILL else [[2] * 40]
@@ -50,7 +55,7 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable():
         )
 
     engine = Engine(Runner())
-    session = _HttpSession(engine, Codec())
+    session = _HttpSession(engine, Codec(), stream_interval=stream_interval)
     session.admit(admission("overflow", 100))
     first = json.loads(session.process(engine.step()))
     assert [event["type"] for _, event in first] == [

@@ -226,7 +226,7 @@ For a custom model-format adapter, pass any protocol-compatible `codec=`:
 ```python
 from resin.server import HttpServer
 
-HttpServer(engine, codec=my_codec, model="my-model").serve()
+HttpServer(engine, codec=my_codec, model="my-model", stream_interval=4).serve()
 ```
 
 `ConversationCodec.render()` returns prompt and stop token IDs;
@@ -234,6 +234,14 @@ HttpServer(engine, codec=my_codec, model="my-model").serve()
 reasoning, and tool-call deltas. An optional `finish("stop" | "length")` flushes
 buffered output before the server sends the final response. Custom codecs do
 not need to inherit a Resin class or use the native tokenizer/parser.
+
+`stream_interval` is an integer from 1 through `2**32 - 1`, set once per server,
+and defaults to 1.
+The first semantic output is sent immediately. Later output flushes at a step
+boundary once N generated model tokens have accumulated; verified blocks can
+produce larger chunks, while completion or a bounded buffer can flush earlier.
+Text and its logprobs stay aligned. Inference, stop matching, and cancellation
+still run on every step. The setting applies to all requests and HTTP APIs.
 
 `resin.server.media` provides optional image decoding and OpenAI-style message
 normalization helpers for model bring-up, demos, and tests. Codecs do not have

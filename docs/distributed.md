@@ -337,6 +337,14 @@ codec, media preprocessing, incremental parser, scheduler, and cache. Client
 disconnects and stalled response channels cancel the request on its owner.
 Generated and prompt logprobs travel through the same response bridge.
 
+Set `HttpServer(..., stream_interval=N)` to batch later streaming output until N
+generated model tokens accumulate, checked at step boundaries after the first
+semantic output. Completion flushes the remainder. It defaults to 1 and must be
+the same positive integer on every driver, along with the model and route
+configuration. Every driver's native
+session uses that interval; coordinated inference, stop matching, and
+cancellation continue on every step. Text and score records stay aligned.
+
 `DistributedHttpCoordinator` exchanges ingress before each coordinated step,
 including steps where a replica is idle. Native `_HttpSession` instances reuse
 the ordinary HTTP lifecycle on each driver; the frontend retains client

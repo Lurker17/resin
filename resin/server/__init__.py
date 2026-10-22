@@ -28,6 +28,11 @@ class HttpServer:
     calls serve. The first driver listens; the others participate in coordinated
     inference. Requests select a replica with routed_dp_rank or the
     resin-routed-dp-rank header; unassigned requests use round robin.
+
+    stream_interval batches later output until N generated model tokens have
+    accumulated, checked at step boundaries. The first semantic output is sent
+    immediately, and completion flushes the remainder. Stop matching and
+    cancellation still run on every step.
     """
 
     def __init__(
@@ -36,6 +41,7 @@ class HttpServer:
         *,
         codec: ConversationCodec,
         model: str | None = None,
+        stream_interval: int = 1,
         enable_openai: bool = True,
         enable_anthropic: bool = True,
         enable_demo: bool = True,
@@ -47,6 +53,13 @@ class HttpServer:
 
         error = None
         try:
+            if (
+                type(stream_interval) is not int
+                or not 1 <= stream_interval <= 2**32 - 1
+            ):
+                raise ValueError(
+                    "stream_interval must be a positive integer fitting u32"
+                )
             if model is None:
                 model = getattr(getattr(codec, "tokenizer", None), "name_or_path", None)
             if not isinstance(model, str) or not model.strip():
@@ -68,7 +81,13 @@ class HttpServer:
             config = (
                 None
                 if error is not None
-                else (model, enable_openai, enable_anthropic, enable_demo)
+                else (
+                    model,
+                    enable_openai,
+                    enable_anthropic,
+                    enable_demo,
+                    stream_interval,
+                )
             )
             states = engine.worker._drivers(
                 "http configuration", (config, None if error is None else str(error))
@@ -83,7 +102,7 @@ class HttpServer:
                 None,
             )
             if failure is None and any(config != states[0][0] for config, _ in states):
-                failure = "HTTP model and route configuration must agree across replica drivers"
+                failure = "HTTP server configuration must agree across replica drivers"
             if failure:
                 try:
                     engine.close()
@@ -97,7 +116,9 @@ class HttpServer:
         if isinstance(engine, DistributedEngine):
             from resin.server.distributed import DistributedHttpCoordinator
 
-            self._coordinator = DistributedHttpCoordinator(engine, codec)
+            self._coordinator = DistributedHttpCoordinator(
+                engine, codec, stream_interval=stream_interval
+            )
         self._native = None
         error = None
         try:
@@ -106,6 +127,7 @@ class HttpServer:
                     engine.local if isinstance(engine, DistributedEngine) else engine,
                     codec,
                     model=model,
+                    stream_interval=stream_interval,
                     enable_openai=enable_openai,
                     enable_anthropic=enable_anthropic,
                     enable_demo=enable_demo,

@@ -23,6 +23,14 @@ class IncrementingRunner:
         ]
 
 
+class _Codec:
+    def render(self, request):
+        return {"token_ids": [1], "stop_token_ids": []}
+
+    def create_parser(self, request, prompt_ids):
+        return SimpleNamespace(feed=lambda ids: [])
+
+
 class RecordingDistributed:
     def __init__(self, incoming=None) -> None:
         self.commands = [] if incoming is None else list(incoming)
@@ -134,18 +142,48 @@ def test_tensor_parallel_plan_round_trip_preserves_native_contract() -> None:
 
 
 def test_http_server_validates_route_configuration() -> None:
-    class Codec:
-        def render(self, request):
-            return {"token_ids": [1], "stop_token_ids": []}
-
-        def create_parser(self, request, prompt_ids):
-            return SimpleNamespace(feed=lambda ids: [])
-
     with pytest.raises(ValueError, match="requires enable_openai"):
         HttpServer(
             Engine(IncrementingRunner()),
-            codec=Codec(),
+            codec=_Codec(),
             model="test",
             enable_openai=False,
             enable_demo=True,
         )
+
+
+@pytest.mark.parametrize("interval", [0, -1, 2**32, True, False, 1.5, "2", None])
+def test_http_server_requires_a_positive_integer_stream_interval(interval) -> None:
+    engine = Engine(IncrementingRunner())
+    with pytest.raises(ValueError, match="stream_interval.*positive integer"):
+        HttpServer(engine, codec=_Codec(), model="test", stream_interval=interval)
+    assert not engine.closed
+    engine.close()
+
+
+@pytest.mark.parametrize("interval", [None, 4, 2**32 - 1])
+def test_http_server_forwards_default_and_custom_stream_interval(interval, monkeypatch):
+    import resin.server as serving
+
+    created = []
+
+    def native(*args, **kwargs):
+        created.append(kwargs)
+        return SimpleNamespace(running=False)
+
+    monkeypatch.setattr(serving, "_HttpServer", native)
+    engine = Engine(IncrementingRunner())
+    options = {} if interval is None else {"stream_interval": interval}
+    server = HttpServer(engine, codec=_Codec(), model="test", **options)
+    assert server.model == "test"
+    assert created[0]["stream_interval"] == (1 if interval is None else interval)
+    engine.close()
+
+
+def test_native_http_server_rejects_zero_stream_interval():
+    from resin._resin import _HttpServer
+
+    engine = Engine(IncrementingRunner())
+    with pytest.raises(ValueError, match="stream_interval.*positive"):
+        _HttpServer(engine, _Codec(), model="test", stream_interval=0)
+    engine.close()

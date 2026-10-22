@@ -153,6 +153,16 @@ def _serve_rank(rank, world_size, directory, port, case):
                 codec=codec,
                 model=model,
                 enable_openai=not (case == "flags" and groups.drivers.local_rank == 0),
+                stream_interval=(
+                    3
+                    if case == "normal"
+                    else 2
+                    if case == "stream_interval" and groups.drivers.local_rank == 1
+                    else 0
+                    if case == "invalid_stream_interval"
+                    and groups.drivers.local_rank == 1
+                    else 1
+                ),
             )
             if groups.drivers.local_rank == 0:
 
@@ -228,6 +238,8 @@ def _wait_ready(base, directory):
         ("flags", 2),
         ("infer", 2),
         ("frontend", 2),
+        ("stream_interval", 2),
+        ("invalid_stream_interval", 2),
     ],
 )
 def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size):
@@ -266,6 +278,23 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
             # scores still cross replicas, while content-only scores stay empty.
             assert output["choices"][0]["logprobs"]["content"] == []
             assert len(output["resin"]["generation_logprobs"]) == 2
+            with _post(base, 1, stream=True, max_tokens=5, logprobs=True) as response:
+                chunks = [
+                    json.loads(line[6:])
+                    for line in response.read().decode().splitlines()
+                    if line.startswith("data: ") and line != "data: [DONE]"
+                ]
+            assert [
+                content
+                for chunk in chunks
+                for choice in chunk["choices"]
+                if (content := choice["delta"].get("content"))
+            ] == ["1", "111", "1"]
+            assert [
+                score["token_index"]
+                for chunk in chunks
+                for score in chunk.get("resin", {}).get("generation_logprobs", [])
+            ] == list(range(5))
             with _post(base, headers={"resin-routed-dp-rank": "1"}) as response:
                 assert json.load(response)["choices"][0]["message"]["content"] == "11"
             with _post(base, 999, headers={"resin-routed-dp-rank": "1"}) as response:
@@ -322,9 +351,21 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
     elif case == "bind":
         assert "bind" in records[0]["error"]
         assert records[1]["error"] is None
-    elif case in ("whitespace", "flags", "infer", "frontend", "initialize"):
+    elif case in (
+        "whitespace",
+        "flags",
+        "infer",
+        "frontend",
+        "initialize",
+        "stream_interval",
+        "invalid_stream_interval",
+    ):
         assert len({record["error"] for record in records}) == 1
         assert records[0]["error"] is not None
         assert all(record["engine_closed"] for record in records)
+        if case == "stream_interval":
+            assert "configuration must agree" in records[0]["error"]
+        elif case == "invalid_stream_interval":
+            assert "stream_interval must be a positive integer" in records[0]["error"]
     else:
         assert all("injected" in record["error"] for record in records)

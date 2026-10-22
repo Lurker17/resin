@@ -27,6 +27,7 @@ pub(crate) struct NativeHttpServer {
     distributed: Option<Py<PyAny>>,
     codec: Py<PyAny>,
     model: String,
+    stream_interval: u32,
     routes: RouteConfig,
     running: AtomicBool,
     shutdown: Mutex<Option<watch::Sender<bool>>>,
@@ -40,20 +41,26 @@ impl NativeHttpServer {
         codec,
         *,
         model,
+        stream_interval = 1,
         enable_openai = true,
         enable_anthropic = true,
         enable_demo = true,
         distributed = None
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         engine: Py<Engine>,
         codec: Py<PyAny>,
         model: String,
+        stream_interval: u32,
         enable_openai: bool,
         enable_anthropic: bool,
         enable_demo: bool,
         distributed: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
+        if stream_interval == 0 {
+            return Err(PyValueError::new_err("stream_interval must be positive"));
+        }
         let routed_dp_size = distributed
             .as_ref()
             .map(|coordinator| {
@@ -77,6 +84,7 @@ impl NativeHttpServer {
             distributed,
             codec,
             model,
+            stream_interval,
             routes: RouteConfig {
                 enable_openai,
                 enable_anthropic,
@@ -109,6 +117,7 @@ impl NativeHttpServer {
         let codec = self.codec.clone_ref(py);
         let model = self.model.clone();
         let routes = self.routes;
+        let stream_interval = self.stream_interval;
         let result = py.detach(move || {
             run_server(
                 engine,
@@ -116,6 +125,7 @@ impl NativeHttpServer {
                 codec,
                 model,
                 routes,
+                stream_interval,
                 SocketAddr::new(host, port),
                 shutdown,
             )
@@ -155,8 +165,9 @@ impl NativeHttpServer {
 
     fn __repr__(&self) -> String {
         format!(
-            "_HttpServer(model={:?}, enable_openai={}, enable_anthropic={}, enable_demo={}, running={})",
+            "_HttpServer(model={:?}, stream_interval={}, enable_openai={}, enable_anthropic={}, enable_demo={}, running={})",
             self.model,
+            self.stream_interval,
             self.routes.enable_openai,
             self.routes.enable_anthropic,
             self.routes.enable_demo,
@@ -165,12 +176,14 @@ impl NativeHttpServer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_server(
     engine: Py<Engine>,
     distributed: Option<Py<PyAny>>,
     codec: Py<PyAny>,
     model: String,
     routes: RouteConfig,
+    stream_interval: u32,
     address: SocketAddr,
     shutdown: watch::Sender<bool>,
 ) -> Result<(), String> {
@@ -195,7 +208,7 @@ fn run_server(
                     routes.routed_dp_size,
                 )
             } else {
-                engine_actor(engine, codec, receiver, actor_shutdown)
+                engine_actor(engine, codec, receiver, actor_shutdown, stream_interval)
             };
             if let Err(error) = &result {
                 eprintln!("[resin-http] inference actor failed: {error}");
@@ -236,9 +249,11 @@ fn engine_actor(
     codec: Py<PyAny>,
     mut jobs: mpsc::Receiver<GenerationJob>,
     shutdown: watch::Receiver<bool>,
+    stream_interval: u32,
 ) -> Result<(), String> {
-    let mut session = Python::attach(|py| Session::new(py, engine.clone_ref(py), codec))
-        .map_err(|error| format_python_error("HTTP session preparation failed", error))?;
+    let mut session =
+        Python::attach(|py| Session::new(py, engine.clone_ref(py), codec, stream_interval))
+            .map_err(|error| format_python_error("HTTP session preparation failed", error))?;
     let mut disconnected = false;
     loop {
         for _ in 0..ADMISSIONS_PER_STEP {

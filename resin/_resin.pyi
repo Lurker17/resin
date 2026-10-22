@@ -797,6 +797,7 @@ class _HttpServer:
         codec: ConversationCodec,
         *,
         model: str,
+        stream_interval: int = 1,
         enable_openai: bool = True,
         enable_anthropic: bool = True,
         enable_demo: bool = True,
@@ -819,7 +820,9 @@ class _HttpSession:
     """
     The same native lifecycle used by the ordinary actor, attached to one DP driver.
     """
-    def __new__(cls, /, engine: Engine, codec: Any) -> _HttpSession: ...
+    def __new__(
+        cls, /, engine: Engine, codec: Any, *, stream_interval: int = 1
+    ) -> _HttpSession: ...
     @property
     def active_count(self, /) -> int: ...
     def admit(self, /, requests_json: str) -> None: ...

@@ -21,7 +21,13 @@ class DistributedHttpCoordinator:
     and parsers remain local to the selected replica.
     """
 
-    def __init__(self, engine: DistributedEngine, codec: ConversationCodec):
+    def __init__(
+        self,
+        engine: DistributedEngine,
+        codec: ConversationCodec,
+        *,
+        stream_interval: int = 1,
+    ):
         self.engine = engine
         self.group = engine.worker._driver_group
         self.distributed = engine.worker.groups.distributed
@@ -38,7 +44,9 @@ class DistributedHttpCoordinator:
         try:
             from resin._resin import _HttpSession
 
-            self.session = _HttpSession(engine.local, codec)
+            self.session = _HttpSession(
+                engine.local, codec, stream_interval=stream_interval
+            )
         except BaseException as exc:
             error = str(exc)
         failure = self._vote("initialize", error)
