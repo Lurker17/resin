@@ -67,7 +67,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
     """Dynamically batched runner over Resin's DeepSeek-V4 implementation."""
 
     parallelism_capabilities = ParallelismCapabilities(
-        attn_tp=True,
+        attn_tp=False,
         attn_dp=True,
         cp=True,
         ep=True,
@@ -141,6 +141,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
             )
         elif tensor_parallel is None:
             tensor_parallel = TensorParallelContext()
+        if tensor_parallel.size != 1:
+            raise ValueError("DeepSeek MLA has one KV head and requires attn_tp=1")
         self.parallel_groups = parallel_groups
         self.tensor_parallel = tensor_parallel
         self.tensor_parallel_rank = tensor_parallel.rank

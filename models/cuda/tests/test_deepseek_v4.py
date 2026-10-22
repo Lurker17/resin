@@ -46,16 +46,18 @@ def _release_config() -> dict[str, object]:
 
 
 class TestDeepSeekV4Config:
-    def test_release_geometry_supports_tp4(self) -> None:
+    def test_release_geometry_keeps_its_single_kv_head_whole(self) -> None:
         config = DeepSeekV4Config.from_hugging_face(_release_config())
 
-        config.validate_tensor_parallel(4)
+        config.validate_tensor_parallel(1)
+        with pytest.raises(ValueError, match="one KV head"):
+            config.validate_tensor_parallel(4)
         assert config.num_hidden_layers == 43
         assert config.compress_ratios[:6] == (0, 0, 4, 128, 4, 128)
-        assert config.num_routed_experts // 4 == 64
-        assert config.num_attention_heads // 4 == 16
+        assert config.num_routed_experts == 256
+        assert config.num_attention_heads == 64
 
-    def test_pro_geometry_supports_tp4(self) -> None:
+    def test_pro_geometry_also_keeps_its_single_kv_head_whole(self) -> None:
         values = _release_config()
         values.update(
             {
@@ -77,10 +79,12 @@ class TestDeepSeekV4Config:
 
         config = DeepSeekV4Config.from_hugging_face(values)
 
-        config.validate_tensor_parallel(4)
+        config.validate_tensor_parallel(1)
+        with pytest.raises(ValueError, match="one KV head"):
+            config.validate_tensor_parallel(4)
         assert config.num_hidden_layers == 61
-        assert config.num_routed_experts // 4 == 96
-        assert config.num_attention_heads // 4 == 32
+        assert config.num_routed_experts == 384
+        assert config.num_attention_heads == 128
         assert config.dspark_markov_rank == 512
 
     def test_rejects_mismatched_layer_compression(self) -> None:
@@ -93,7 +97,7 @@ class TestDeepSeekV4Config:
     def test_rejects_incompatible_tensor_parallel_size(self) -> None:
         config = DeepSeekV4Config.from_hugging_face(_release_config())
 
-        with pytest.raises(ValueError, match="TP=3"):
+        with pytest.raises(ValueError, match="attn_tp=1"):
             config.validate_tensor_parallel(3)
 
     def test_dspark_geometry_is_checkpoint_data(self) -> None:

@@ -123,6 +123,42 @@ def test_local_model_heads_and_expert_channels_use_different_tp_sizes():
     assert full_attention.intermediate_size == 64
 
 
+@pytest.mark.parametrize("queries,kv_heads,tp", [(4, 1, 2), (4, 2, 4), (6, 3, 2)])
+def test_attention_tp_rejects_query_shards_that_would_replicate_kv(
+    queries, kv_heads, tp
+):
+    args = replace(_config(), num_attention_heads=queries, num_key_value_heads=kv_heads)
+    layout = TensorParallelLayout(size=tp)
+    with pytest.raises(ValueError, match="num_key_value_heads=.*must be divisible"):
+        shard_model_config(args, layout)
+    for projection in ("k_proj", "v_proj"):
+        with pytest.raises(ValueError, match="num_key_value_heads=.*must be divisible"):
+            shard_checkpoint_tensor(
+                f"model.layers.0.self_attn.{projection}.weight",
+                torch.empty(kv_heads * args.head_dim, args.hidden_size),
+                args=args,
+                tensor_parallel=layout,
+            )
+
+
+@pytest.mark.parametrize("projection", ["k_proj", "v_proj"])
+def test_attention_tp_partitions_complete_kv_heads_without_replication(projection):
+    args = _config()
+    weight = torch.arange(args.num_key_value_heads * args.head_dim * args.hidden_size)
+    weight = weight.reshape(args.num_key_value_heads * args.head_dim, args.hidden_size)
+    shards = [
+        shard_checkpoint_tensor(
+            f"model.layers.0.self_attn.{projection}.weight",
+            weight,
+            args=args,
+            tensor_parallel=TensorParallelLayout(rank=rank, size=2),
+        )
+        for rank in range(2)
+    ]
+    assert all(shard.shape[0] == args.head_dim for shard in shards)
+    torch.testing.assert_close(torch.cat(shards), weight)
+
+
 @pytest.mark.parametrize("name", EXPERT_CHECKPOINT_NAMES)
 def test_composed_ep_and_expert_tp_reconstruct_all_checkpoint_weights(name):
     args = _config()

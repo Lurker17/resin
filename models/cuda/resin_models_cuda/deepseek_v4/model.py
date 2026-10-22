@@ -965,6 +965,8 @@ class Attention(nn.Module):
     ):
         super().__init__()
         self.tensor_parallel = tensor_parallel or _default_tensor_parallel()
+        if self.tensor_parallel.size != 1:
+            raise ValueError("DeepSeek-V4 MLA has one KV head and requires attn_tp=1")
         self.layer_id = layer_id
         self.dim = args.dim
         self.n_heads = args.n_heads
@@ -2189,6 +2191,8 @@ class Transformer(nn.Module):
                 group.handle if group.size > 1 else None,
             )
         tensor_parallel = tensor_parallel or _default_tensor_parallel()
+        if tensor_parallel.size != 1:
+            raise ValueError("DeepSeek-V4 MLA has one KV head and requires attn_tp=1")
         expert_parallel = (
             TensorParallelLayout(
                 rank=parallel_groups.ep.local_rank, size=parallel_groups.ep.size

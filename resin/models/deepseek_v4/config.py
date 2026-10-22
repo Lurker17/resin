@@ -97,6 +97,8 @@ class DeepSeekV4Config:
             raise ValueError("head_dim must exceed rope_head_dim")
         if self.num_attention_heads % self.o_groups:
             raise ValueError("attention heads must be divisible by output groups")
+        if self.num_key_value_heads != 1:
+            raise ValueError("DeepSeek-V4 MLA requires one KV head")
         if self.expert_dtype != "fp4":
             raise ValueError("the DeepSeek-V4 runner requires FP4 experts")
         if self.dspark_block_size < 0 or self.dspark_markov_rank < 0:
@@ -115,20 +117,12 @@ class DeepSeekV4Config:
                 raise ValueError("DSpark target layer is outside the target model")
 
     def validate_tensor_parallel(self, size: int) -> None:
-        """Validate every checkpoint axis sharded by Resin's TP layout."""
+        """Attention TP partitions KV heads; MLA's single KV head stays whole."""
 
         if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
             raise ValueError("tensor parallel size must be a positive integer")
-        sharded = {
-            "vocab_size": self.vocab_size,
-            "num_attention_heads": self.num_attention_heads,
-            "o_groups": self.o_groups,
-            "num_routed_experts": self.num_routed_experts,
-        }
-        if invalid := [name for name, value in sharded.items() if value % size]:
-            raise ValueError(
-                f"DeepSeek-V4 fields are not divisible by TP={size}: {invalid}"
-            )
+        if size != 1:
+            raise ValueError("DeepSeek-V4 has one KV head and requires attn_tp=1")
 
 
 __all__ = ["DeepSeekV4Config"]

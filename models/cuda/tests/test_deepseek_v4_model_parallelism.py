@@ -117,16 +117,16 @@ def test_attention_and_expert_weight_meshes_are_independent(monkeypatch):
         expert_parallel=TensorParallelLayout(rank=2, size=4),
         expert_tensor_parallel=TensorParallelLayout(rank=1, size=2),
     )
-    sharded_attention = native.Attention(
-        0,
-        args,
-        # The opaque group is never used: this test only checks shard geometry.
-        tensor_parallel=TensorParallelContext(TensorParallelLayout(size=2), object()),  # ty: ignore[invalid-argument-type]
-    )
+    with pytest.raises(ValueError, match="one KV head"):
+        native.Attention(
+            0,
+            args,
+            tensor_parallel=TensorParallelContext(
+                TensorParallelLayout(size=2), Mock(spec=torch.distributed.ProcessGroup)
+            ),
+        )
     assert attention.n_local_heads == 4
     assert attention.n_local_groups == 4
-    assert sharded_attention.n_local_heads == 2
-    assert sharded_attention.n_local_groups == 2
     assert experts.experts_start_idx == 4
     assert experts.experts_end_idx == 6
     assert [i for i, expert in enumerate(experts.experts) if expert is not None] == [
@@ -326,15 +326,19 @@ def test_empty_model_round_only_calls_prepared_routed_experts(monkeypatch):
         assert indices.dtype == torch.int32 and weights.dtype == torch.bfloat16
         calls.append(True)
 
+    def layer():
+        ffn = SimpleNamespace(
+            dim=4,
+            gate=SimpleNamespace(topk=3, weight=torch.empty(1, dtype=torch.bfloat16)),
+            routed=routed,
+        )
+        ffn.forward_empty = lambda: native.MoE.forward_empty(ffn)
+        return SimpleNamespace(ffn=ffn)
+
     model = SimpleNamespace(
         parallel_groups=object(),
         embed=SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16), dim=4),
-        layers=[
-            SimpleNamespace(
-                ffn=SimpleNamespace(gate=SimpleNamespace(topk=3), routed=routed)
-            )
-            for _ in range(2)
-        ],
+        layers=[layer(), layer()],
     )
     native.Transformer.forward_experts_empty(model)
     assert len(calls) == 2
@@ -345,17 +349,10 @@ def test_empty_speculative_stages_visit_their_own_expert_layers(monkeypatch):
     calls = []
 
     def layer(name):
-        def routed(hidden, indices, weights):
-            assert hidden.shape == (0, 4)
-            assert hidden.dtype == weights.dtype == torch.bfloat16
-            assert indices.shape == weights.shape == (0, 3)
+        def forward_empty():
             calls.append(name)
-            # Prepared distributed expert callbacks retain FP32 partials.
-            return hidden.float()
 
-        return SimpleNamespace(
-            ffn=SimpleNamespace(gate=SimpleNamespace(topk=3), routed=routed)
-        )
+        return SimpleNamespace(ffn=SimpleNamespace(forward_empty=forward_empty))
 
     model = SimpleNamespace(
         parallel_groups=object(),

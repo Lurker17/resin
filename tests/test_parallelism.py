@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pickle
+from importlib import import_module
 
 import pytest
 
@@ -180,3 +181,20 @@ def test_capabilities_declare_axes_and_reject_unsupported_combinations():
         ep_dp.validate(Parallelism(world_size=4, ep=2, attn_dp=4), model="EP/DP")
     with pytest.raises(ValueError, match="cp=2"):
         ep_dp.validate(Parallelism(world_size=4, ep=4, cp=2), model="EP/DP")
+
+
+@pytest.mark.parametrize(
+    "module,runner",
+    [
+        ("resin_models_cuda.gemma4.cuda", "Gemma4CudaRunner"),
+        ("resin_models_cuda.qwen3_5.cuda", "Qwen3_5CudaRunner"),
+        ("resin_models_cuda.inkling.cuda", "InklingCudaRunner"),
+        ("resin_models_torch.lfm2.reference", "Lfm2TorchRunner"),
+    ],
+)
+def test_unsharded_model_implementations_reject_attention_tp(module, runner):
+    implementation = getattr(import_module(module), runner)
+    with pytest.raises(ValueError, match="does not support attn_tp=2"):
+        implementation.parallelism_capabilities.validate(
+            Parallelism(world_size=2, attn_tp=2), model=runner
+        )

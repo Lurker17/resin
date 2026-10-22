@@ -496,6 +496,11 @@ def test_managed_cache_addresses_are_validated_before_expert_rounds(
             {"tensor_parallel": TensorParallelContext()},
             "either",
         ),
+        (
+            Parallelism(world_size=4, ep=4, attn_tp=2),
+            {},
+            "attn_tp=2",
+        ),
     ],
 )
 def test_unsupported_distributed_preparation_fails_before_cuda(
@@ -521,9 +526,9 @@ def test_unsupported_distributed_preparation_fails_before_cuda(
     [
         Parallelism(world_size=4, ep=4, attn_dp=4),
         Parallelism(world_size=4, ep=2),
-        Parallelism(world_size=4, ep=4, attn_tp=2),
+        Parallelism(world_size=4, ep=4, attn_dp=2),
         Parallelism(world_size=4, ep=2, cp=2),
-        Parallelism(world_size=8, attn_dp=2, attn_tp=2, cp=2, ep=2),
+        Parallelism(world_size=8, attn_dp=2, cp=2, ep=2),
     ],
 )
 def test_distributed_graph_policies_and_composed_meshes_pass_preparation(
