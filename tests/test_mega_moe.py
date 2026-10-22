@@ -366,3 +366,39 @@ def test_mega_hc_transition_preserves_shifted_pre_and_full_residual(deepgemm):
         * block.ffn_norm.weight.float()
     ).bfloat16()
     assert torch.equal(normalized, expected_norm)
+
+
+def test_probe_reports_near_tie_routes_separately_and_rejects_wrong_routing():
+    from deploy.mega_moe_validation import _routing_comparison
+
+    gate = SimpleNamespace(
+        weight=torch.zeros(5, 2),
+        bias=torch.tensor([0.4, 0.3, 0.2, 0.2000005, 0]),
+        route_scale=1.5,
+        topk=3,
+        benchmark_balanced_experts=False,
+    )
+    inputs = torch.zeros(3, 2)
+    expected = torch.tensor([[0, 1, 3]] * 3)
+    indices = torch.tensor([[0, 1, 3], [0, 1, 2], [-1, -1, -1]])
+    weights = torch.tensor([[0.5] * 3, [0.5] * 3, [0.0] * 3])
+    result = _routing_comparison(gate, inputs, expected, (weights, indices), 2)
+    assert result["token_set_mismatches"] == result["ordered_slot_mismatches"] == 1
+    assert result["mismatch_examples"][0]["token"] == 1
+    assert 0 < result["mismatch_examples"][0]["reference_boundary_gap"] < 2e-5
+    assert result["rounded_weight_max_abs"] == 0
+    indices[1, 2] = 4
+    with pytest.raises(AssertionError, match="outside numerical ties"):
+        _routing_comparison(gate, inputs, expected, (weights, indices), 2)
+
+
+def test_probe_does_not_dilute_one_ffn_outlier_across_large_batches():
+    from deploy.mega_moe_validation import _output_comparison
+
+    expected = torch.ones(1280, 4)
+    actual = expected.clone()
+    actual[3] += 0.05
+    summary = _output_comparison(actual, expected, limit=0.002)
+    assert summary["relative_l2"] < 0.002
+    with pytest.raises(AssertionError, match="max_token_relative_l2"):
+        _output_comparison(actual, expected, limit=0.002, max_token_limit=0.02)

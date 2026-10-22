@@ -34,9 +34,7 @@ def model():
     result = nn.Module()
     layer = nn.Module()
     engram, embedding = nn.Module(), nn.Module()
-    embedding.register_buffer(
-        "weight", torch.full((9, 4), -1, dtype=torch.bfloat16)
-    )
+    embedding.register_buffer("weight", torch.full((9, 4), -1, dtype=torch.bfloat16))
     engram.add_module("embed", embedding)
     layer.add_module("engram", engram)
     result.layers = nn.ModuleList([layer])

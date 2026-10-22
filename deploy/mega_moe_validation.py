@@ -9,8 +9,10 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.nn import functional as F
 
 from deploy.deepinfer_kernel_probe import (
+    _compare,
     quantize_fp4_raw,
     quantize_fp8,
     reference_ffn,
@@ -33,6 +35,92 @@ def _block_fp8(shape):
     full = scale.float().repeat_interleave(32, 0).repeat_interleave(32, 1)
     weight = (source / full).to(torch.float8_e4m3fn)
     return weight, scale, weight.float() * full
+
+
+def _routing_comparison(gate, inputs, expected_indices, routes, count):
+    """Separate near-tie selection changes from incorrect routing or FFN math."""
+    weights, indices = routes
+    if not indices[count:].eq(-1).all() or not weights[count:].eq(0).all():
+        raise AssertionError("fused gate emitted routes for masked rows")
+    result = dict(live_tokens=count, masked_tokens=len(inputs) - count)
+    if not count:
+        return result
+    selected, expected = indices[:count], expected_indices[:count].long()
+    if not ((selected >= 0) & (selected < len(gate.weight))).all():
+        raise AssertionError("fused gate emitted an invalid expert ID")
+    sorted_ids = selected.sort(-1).values
+    if (sorted_ids[:, 1:] == sorted_ids[:, :-1]).any():
+        raise AssertionError("fused gate emitted duplicate expert IDs")
+    scores = F.softplus(inputs[:count].float() @ gate.weight.float().T).sqrt()
+    ranking = scores + gate.bias
+    selected_scores = scores.gather(1, selected)
+    expected_weights = (
+        selected_scores
+        / (selected_scores.sum(-1, keepdim=True) + 1e-20)
+        * gate.route_scale
+    )
+    # Selected weights are intentionally rounded to BF16 at the model boundary.
+    result["weights_on_actual_ids"] = _compare(
+        weights[:count], expected_weights, atol=2e-5, rtol=4e-3
+    )
+    result["rounded_weight_max_abs"] = (
+        (weights[:count] - expected_weights.bfloat16().float()).abs().max().item()
+    )
+    mismatched = (sorted_ids != expected.sort(-1).values).any(-1)
+    result.update(
+        token_set_mismatches=int(mismatched.sum()),
+        ordered_slot_mismatches=int((selected != expected).sum()),
+        balanced=gate.benchmark_balanced_experts,
+    )
+    if gate.benchmark_balanced_experts:
+        if not torch.equal(selected, expected):
+            raise AssertionError("fused gate changed exact balanced benchmark routes")
+        return result
+    top = ranking.topk(gate.topk + 1, dim=-1).values
+    gap = top[:, -2] - top[:, -1]
+    crossing = (
+        ranking.scatter(1, selected, -torch.inf).max(-1).values
+        - ranking.gather(1, selected).min(-1).values
+    )
+    result.update(
+        max_selection_crossing=crossing.max().item(),
+        selection_crossing_limit=2e-5,
+        min_reference_boundary_gap=gap.min().item(),
+        mismatch_examples=[
+            dict(
+                token=token,
+                reference_ids=expected[token].tolist(),
+                actual_ids=selected[token].tolist(),
+                reference_boundary_gap=gap[token].item(),
+                selection_crossing=crossing[token].item(),
+            )
+            for token in mismatched.nonzero().flatten()[:8].tolist()
+        ],
+    )
+    if (crossing > 2e-5).any():
+        raise AssertionError(f"fused gate selected outside numerical ties: {result}")
+    return result
+
+
+def _output_comparison(actual, expected, *, limit, max_token_limit=None):
+    if not len(expected):
+        return {"empty_output": list(expected.shape)}
+    delta = actual[: len(expected)].float() - expected.float()
+    error = delta.norm() / expected.float().norm().clamp_min(1e-20)
+    token_error = delta.norm(dim=-1) / expected.float().norm(dim=-1).clamp_min(1e-20)
+    result = dict(
+        relative_l2=error.item(),
+        limit=limit,
+        max_abs=delta.abs().max().item(),
+        max_token_relative_l2=token_error.max().item(),
+    )
+    if max_token_limit is not None:
+        result["max_token_relative_l2_limit"] = max_token_limit
+    if error >= limit or (
+        max_token_limit is not None and token_error.max() >= max_token_limit
+    ):
+        raise AssertionError(f"adapter quantized FFN reference failed: {result}")
+    return result
 
 
 @torch.inference_mode()
@@ -126,19 +214,22 @@ def _block_hc():
 
 
 @torch.inference_mode()
-def run_probe(group):
+def run_probe(group, *, rows: int = 8, max_tokens: int | None = None):
     """Join an already initialized EP2 process group, leaving it alive on return."""
     from resin_models_cuda.deepseek_v41.experts import prepare_mega_moe
     from resin_models_cuda.deepseek_v41.linear import SharedExpert
     from resin_models_cuda.deepseek_v41.model import Gate, ModelArgs, MoEWeights
 
+    capacity = max(16, rows) if max_tokens is None else max_tokens
+    if rows < 1 or capacity < rows:
+        raise ValueError("probe rows must be positive and fit max_tokens")
     rank, world = dist.get_rank(group), dist.get_world_size(group)
     if world != 2:
         raise ValueError("the prepared mega-MoE probe requires EP2")
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(1731 + rank)
     torch.backends.cuda.matmul.allow_tf32 = False
-    rows, hidden, intermediate, experts, topk = 8, 5120, 2304, 16, 6
+    hidden, intermediate, experts, topk = 5120, 2304, 16, 6
     args = ModelArgs(
         dim=hidden,
         moe_inter_dim=intermediate,
@@ -204,7 +295,9 @@ def run_probe(group):
     raw_weight = weakref.ref(source._fused_w13_weight)
     model = nn.Sequential(source)
     del source
-    collective = MegaMoeCollective(RankGroup(tuple(range(world)), group, rank), 16)
+    collective = MegaMoeCollective(
+        RankGroup(tuple(range(world)), group, rank), capacity
+    )
     prepare_model(
         model,
         lambda module: (
@@ -227,9 +320,10 @@ def run_probe(group):
         with collective.fixed_capacity(rows, valid_rows=valid):
             output.copy_(layer(inputs, ids))
 
-    def reference(count):
+    def reference(count, routes=None):
         _, _, restored = quantize_fp8(inputs)
-        weights, indices = gate(inputs, ids)
+        weights, indices = gate(inputs, ids) if routes is None else routes
+        weights, indices = weights.clone(), indices.clone()
         indices[count:] = -1
         weights[count:] = 0
         gathered = []
@@ -273,8 +367,16 @@ def run_probe(group):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             call()
-        for name in ("regular", "changed_routing", "idle_rank", "balanced"):
+        for name in (
+            "regular",
+            "changed_routing",
+            "partial_rows",
+            "idle_rank",
+            "balanced",
+        ):
             count = 0 if name == "idle_rank" and rank == 1 else rows
+            if name == "partial_rows":
+                count = max(1, rows - 3) if rank == 0 else max(1, rows // 2)
             with torch.cuda.stream(stream):
                 valid.fill_(count)
                 inputs.copy_(original if name == "regular" else original.roll(17, -1))
@@ -282,15 +384,14 @@ def run_probe(group):
                     torch.linspace(-0.5, 0.5, experts, device=device)
                     * (name != "regular")
                 )
-                expected = reference(count)
+                if name == "balanced":
+                    gate.benchmark_balanced_experts = True
+                original_routes = gate(inputs, ids)
+                expected = reference(count, original_routes)
                 call()
                 eager = output.clone()
                 # The balanced benchmark switch is a capture-time choice.
                 if name == "balanced":
-                    gate.benchmark_balanced_experts = True
-                    expected = reference(count)
-                    call()
-                    eager = output.clone()
                     graph.reset()
                     with torch.cuda.graph(graph, stream=stream):
                         call()
@@ -301,25 +402,23 @@ def run_probe(group):
                     raise AssertionError(
                         f"adapter {name} graph differs from identical eager inputs"
                     )
-                if count:
-                    delta = output[:count].float() - expected.float()
-                    error = delta.norm() / expected.float().norm().clamp_min(1e-20)
-                    if error >= 0.02:
-                        raise AssertionError(
-                            f"adapter {name} quantized oracle relative L2={error.item()}"
-                        )
-                    comparison = {
-                        "relative_l2": error.item(),
-                        "limit": 0.02,
-                        "max_abs": delta.abs().max().item(),
-                    }
-                else:
-                    comparison = {"empty_output": [0, hidden]}
+                actual_routes = (
+                    layer.workspace.topk_weights[:rows].clone(),
+                    layer.workspace.topk_idx[:rows].clone(),
+                )
+                routing = _routing_comparison(
+                    gate, inputs, original_routes[1], actual_routes, count
+                )
+                actual_expected = reference(count, actual_routes)
                 results.append(
                     {
                         "case": name,
                         "tokens": count,
-                        "reference": comparison,
+                        "reference": _output_comparison(output, expected, limit=0.02),
+                        "actual_route_reference": _output_comparison(
+                            output, actual_expected, limit=0.002, max_token_limit=0.02
+                        ),
+                        "router": routing,
                         "graph_bitwise_equal": True,
                         "replays": 3,
                     }
@@ -332,6 +431,9 @@ def run_probe(group):
         torch.cuda.synchronize()
         return {
             "rank": rank,
+            "tokens_per_rank": rows,
+            "max_tokens": capacity,
+            "shared_block_m": layer._shared_block_m(rows),
             "cases": results,
             "source_storage_released": True,
             "workspace_count": len(collective.buffers),

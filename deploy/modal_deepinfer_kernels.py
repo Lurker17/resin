@@ -52,9 +52,11 @@ app = modal.App("resin-deepinfer-kernels", image=image)
     volumes={"/kernel-cache": CACHE},
     single_use_containers=True,
 )
-def probe(mode: str = "kernels") -> dict:
+def probe(mode: str = "kernels", tokens_per_rank: int = 8) -> dict:
     if mode not in {"kernels", "mega-moe"}:
         raise ValueError("mode must be kernels or mega-moe")
+    if tokens_per_rank < 1:
+        raise ValueError("tokens_per_rank must be positive")
     try:
         # Run the same locked environment as the model deployment.
         with tempfile.TemporaryDirectory(prefix="deepinfer-kernels-") as directory:
@@ -66,6 +68,8 @@ def probe(mode: str = "kernels") -> dict:
                     "deploy.deepinfer_kernel_probe",
                     str(output),
                     mode,
+                    "--tokens-per-rank",
+                    str(tokens_per_rank),
                 ],
                 cwd="/root",
                 check=True,
@@ -81,10 +85,12 @@ def probe(mode: str = "kernels") -> dict:
 
 @app.local_entrypoint()
 def main(
-    output: str = "/tmp/resin-deepinfer-kernels.json", mode: str = "kernels"
+    output: str = "/tmp/resin-deepinfer-kernels.json",
+    mode: str = "kernels",
+    tokens_per_rank: int = 8,
 ) -> None:
     result = probe.with_options(gpu="B300:2" if mode == "mega-moe" else "B300").remote(
-        mode
+        mode, tokens_per_rank
     )
     path = Path(output)
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import subprocess
-import sys
 import tempfile
 import time
 from datetime import timedelta
@@ -332,7 +331,7 @@ def reference_ffn(value, w1, w2, route_weight=None):
     return (quantized @ w2.T).bfloat16().float()
 
 
-def _mega_moe_rank(rank, rendezvous, directory):
+def _mega_moe_rank(rank, rendezvous, directory, tokens_per_rank):
     import importlib
 
     deep_gemm: Any = importlib.import_module("deep_gemm")
@@ -495,7 +494,7 @@ def _mega_moe_rank(rank, rendezvous, directory):
         buffer.destroy()
         from deploy.mega_moe_validation import run_probe as adapter_probe
 
-        adapter = adapter_probe(dist.group.WORLD)
+        adapter = adapter_probe(dist.group.WORLD, rows=tokens_per_rank)
         import json
 
         Path(directory, f"rank{rank}.json").write_text(
@@ -507,21 +506,27 @@ def _mega_moe_rank(rank, rendezvous, directory):
         dist.destroy_process_group()
 
 
-def run_mega_moe():
+def run_mega_moe(tokens_per_rank: int = 8):
     import json
     import socket
 
     if torch.cuda.device_count() != 2:
         raise ValueError("the MegaMoE probe requires exactly two visible NVLink GPUs")
+    if tokens_per_rank < 1:
+        raise ValueError("tokens_per_rank must be positive")
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         rendezvous = f"tcp://127.0.0.1:{listener.getsockname()[1]}"
     with tempfile.TemporaryDirectory(prefix="mega-moe-") as directory:
         torch.multiprocessing.spawn(
-            _mega_moe_rank, args=(rendezvous, directory), nprocs=2, join=True
+            _mega_moe_rank,
+            args=(rendezvous, directory, tokens_per_rank),
+            nprocs=2,
+            join=True,
         )
         return {
             "world_size": 2,
+            "tokens_per_rank": tokens_per_rank,
             "hidden": 5120,
             "intermediate": 2304,
             "experts": 16,
@@ -535,11 +540,19 @@ def run_mega_moe():
 
 
 if __name__ == "__main__":
+    import argparse
     import json
 
-    result = (
-        run_mega_moe()
-        if len(sys.argv) > 2 and sys.argv[2] == "mega-moe"
-        else run_probe()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "mode", choices=("kernels", "mega-moe"), nargs="?", default="kernels"
     )
-    Path(sys.argv[1]).write_text(json.dumps(result, indent=2))
+    parser.add_argument("--tokens-per-rank", type=int, default=8)
+    args = parser.parse_args()
+    if args.tokens_per_rank < 1:
+        parser.error("--tokens-per-rank must be positive")
+    result = (
+        run_mega_moe(args.tokens_per_rank) if args.mode == "mega-moe" else run_probe()
+    )
+    args.output.write_text(json.dumps(result, indent=2))
