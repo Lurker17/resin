@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TypedDict
 
 import numpy as np
@@ -13,25 +14,157 @@ from resin import SamplingParams
 SAMPLING_OFFSET_STRIDE = 32
 
 
+def _offsets(counts):
+    return np.concatenate((np.zeros(1, np.uint32), counts.cumsum(dtype=np.uint32)))
+
+
+@dataclass(frozen=True)
+class _ScoreColumns:
+    counts: npt.NDArray[np.uint32]
+    token_ids: torch.Tensor
+    logprobs: torch.Tensor
+
+    def output(self, prefix):
+        return {
+            f"{prefix}_indptr": _offsets(self.counts),
+            f"{prefix}_token_ids": self.token_ids.detach()
+            .to(device="cpu", dtype=torch.uint32)
+            .numpy(),
+            f"{prefix}_logprobs": self.logprobs.detach().cpu().numpy(),
+        }
+
+    @classmethod
+    def concat(cls, parts, lengths):
+        present = [part for part in parts if part is not None]
+        if not present:
+            return None
+        return cls(
+            np.concatenate(
+                [
+                    np.zeros(length, np.uint32) if part is None else part.counts
+                    for part, length in zip(parts, lengths, strict=True)
+                ]
+            ),
+            torch.cat([part.token_ids for part in present]),
+            torch.cat([part.logprobs for part in present]),
+        )
+
+
+@dataclass(frozen=True)
+class PromptScores:
+    """Packed selected, top, and target scores from the same raw distributions."""
+
+    logprobs: torch.Tensor
+    top: _ScoreColumns | None = None
+    targets: _ScoreColumns | None = None
+
+    @classmethod
+    def concat(cls, parts):
+        if not parts:
+            return None
+        if len(parts) == 1:
+            return parts[0]
+        lengths = [len(part.logprobs) for part in parts]
+        return cls(
+            torch.cat([part.logprobs for part in parts]),
+            _ScoreColumns.concat([part.top for part in parts], lengths),
+            _ScoreColumns.concat([part.targets for part in parts], lengths),
+        )
+
+    def output(self, plan):
+        columns = {
+            "prompt_logprobs": self.logprobs.detach().cpu().numpy(),
+            "prompt_logprob_indptr": np.asarray(
+                plan.prompt_score_indptr, dtype=np.uint32
+            ),
+        }
+        if self.top is not None:
+            columns.update(self.top.output("prompt_top"))
+        if self.targets is not None:
+            columns.update(self.targets.output("prompt_target"))
+        return columns
+
+
+def _score_distribution(
+    logits, selected, top_counts, target_counts=None, target_ids=None
+):
+    """Normalize once, then gather all requested views of each distribution."""
+    vocab = logits.shape[-1]
+    # Check on CPU before gather: an invalid CUDA index poisons the device.
+    if target_ids is not None and np.any(target_ids >= vocab):
+        raise ValueError(
+            f"prompt target token IDs must be less than vocabulary size {vocab}"
+        )
+    values = logits.float().log_softmax(dim=-1)
+    chosen = values.gather(1, selected[:, None]).squeeze(1)
+    top_counts = np.minimum(top_counts, vocab).astype(np.uint32)
+    max_k = int(top_counts.max()) if top_counts.size else 0
+    top = None
+    if max_k:
+        top_values, top_ids = values.topk(max_k, dim=-1)
+        keep = (
+            torch.arange(max_k, device=values.device)[None, :]
+            < torch.as_tensor(top_counts.astype(np.int64), device=values.device)[
+                :, None
+            ]
+        )
+        top = _ScoreColumns(top_counts, top_ids[keep], top_values[keep])
+    targets = None
+    if target_ids is not None and target_counts is not None and len(target_ids):
+        rows = torch.as_tensor(
+            np.repeat(np.arange(len(chosen)), target_counts), device=values.device
+        )
+        ids = torch.as_tensor(target_ids.astype(np.int64), device=values.device)
+        targets = _ScoreColumns(target_counts, ids, values[rows, ids])
+    return PromptScores(chosen, top, targets)
+
+
 def prompt_scores(plan, hidden, project=None, *, token_start=0):
-    """Score prompt predecessors from this forward, projecting bounded chunks."""
+    """Score this forward's prompt predecessors, projecting at most 128 rows."""
     if not plan.needs_prompt_logprobs:
         return None
     indices = plan.prompt_score_indices
     keep = (indices >= token_start) & (indices < token_start + hidden.shape[0])
+    rows = np.flatnonzero(keep)
     selected = torch.as_tensor(
         indices[keep].astype(np.int64) - token_start, device=hidden.device
     )
     targets = torch.as_tensor(
         plan.prompt_score_token_ids[keep].astype(np.int64), device=hidden.device
     )
-    scores = []
+    top_counts = plan.prompt_score_top_counts[keep]
+    target_indptr = plan.prompt_target_indptr
+    target_counts = np.diff(target_indptr)[keep]
+    target_ids = plan.prompt_target_token_ids
+    parts = []
     for start in range(0, len(selected), 128):
-        values = hidden.index_select(0, selected[start : start + 128])
-        values = (project(values) if project is not None else values).float()
-        chosen = values.gather(1, targets[start : start + 128, None]).squeeze(1)
-        scores.append(chosen - values.logsumexp(dim=-1))
-    return torch.cat(scores) if scores else hidden.new_empty(0, dtype=torch.float32)
+        end = start + 128
+        values = hidden.index_select(0, selected[start:end])
+        values = project(values) if project is not None else values
+        ids = (
+            np.concatenate(
+                [
+                    target_ids[target_indptr[row] : target_indptr[row + 1]]
+                    for row in rows[start:end]
+                ]
+            )
+            if np.any(target_counts[start:end])
+            else None
+        )
+        parts.append(
+            _score_distribution(
+                values,
+                targets[start:end],
+                top_counts[start:end],
+                target_counts[start:end],
+                ids,
+            )
+        )
+    return (
+        PromptScores.concat(parts)
+        if parts
+        else PromptScores(hidden.new_empty(0, dtype=torch.float32))
+    )
 
 
 def format_output(logits, token_ids, plan, *, prompt_logprobs=None):
@@ -69,14 +202,17 @@ def format_output(logits, token_ids, plan, *, prompt_logprobs=None):
     if plan.needs_prompt_logprobs:
         if prompt_logprobs is None:
             raise ValueError("prefill did not provide requested prompt scores")
-        prompt_columns = {
-            "prompt_logprobs": prompt_logprobs.detach()
-            .to(device="cpu", dtype=torch.float32)
-            .numpy(),
-            "prompt_logprob_indptr": np.asarray(
-                plan.prompt_score_indptr, dtype=np.uint32
-            ),
-        }
+        if isinstance(prompt_logprobs, PromptScores):
+            prompt_columns = prompt_logprobs.output(plan)
+        else:
+            prompt_columns = {
+                "prompt_logprobs": prompt_logprobs.detach()
+                .to(device="cpu", dtype=torch.float32)
+                .numpy(),
+                "prompt_logprob_indptr": np.asarray(
+                    plan.prompt_score_indptr, dtype=np.uint32
+                ),
+            }
     if not plan.needs_logprobs:
         return ForwardOutput(ids, offsets, **prompt_columns)
     if logits.ndim == 2:
@@ -111,34 +247,16 @@ def format_output(logits, token_ids, plan, *, prompt_logprobs=None):
     selected = torch.as_tensor(
         ids[offsets[row_ids] + positions].astype(np.int64), device=device
     )
-    values = values.log_softmax(dim=-1)
-    chosen = values.gather(1, selected[:, None]).squeeze(1)
-
-    # Array storage crosses into Rust without scalar boxing or a second host copy.
-    # The .numpy() views retain the CPU tensors that own their buffers.
-    columns = {}
     counts = np.fromiter(
         (min(params.top_logprobs, values.shape[-1]) for params in policies),
         dtype=np.uint32,
     )[row_ids]
-    max_k = int(np.max(counts)) if counts.size else 0
-    if max_k:
-        top_values, top_ids = values.topk(max_k, dim=-1)
-        keep = (
-            torch.arange(max_k, device=device)[None, :]
-            < torch.as_tensor(counts.astype(np.int64), device=device)[:, None]
-        )
-        columns = {
-            "top_indptr": np.concatenate(
-                (np.zeros(1, np.uint32), counts.cumsum(dtype=np.uint32))
-            ),
-            "top_token_ids": top_ids[keep].to(device="cpu", dtype=torch.uint32).numpy(),
-            "top_logprobs": top_values[keep].cpu().numpy(),
-        }
+    scores = _score_distribution(values, selected, counts)
+    columns = {} if scores.top is None else scores.top.output("top")
     return ForwardOutput(
         ids,
         offsets,
-        logprobs=chosen.cpu().numpy(),
+        logprobs=scores.logprobs.detach().cpu().numpy(),
         logprob_indptr=score_offsets,
         **columns,
         **prompt_columns,
@@ -251,6 +369,7 @@ class TorchSampler:
 
 __all__ = [
     "SAMPLING_OFFSET_STRIDE",
+    "PromptScores",
     "TorchSampler",
     "batch_sampling_inputs",
     "format_output",

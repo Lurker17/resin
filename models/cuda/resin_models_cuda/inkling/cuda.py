@@ -30,7 +30,7 @@ from resin.backend.cuda.sampling import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
-from resin.backend.sampling import format_output, prompt_scores
+from resin.backend.sampling import PromptScores, format_output, prompt_scores
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
 from resin.models.inkling.media import InklingMedia
@@ -429,7 +429,7 @@ class InklingCudaRunner(CudaRunner):
                 row_logits = project(row_logits[:, -1:])
             logits.append(row_logits[:, -1])
         values = torch.cat(logits)
-        scores = torch.cat(prompt_rows) if prompt_rows else None
+        scores = PromptScores.concat(prompt_rows)
         return format_output(
             values, self._sample(values, plan), plan, prompt_logprobs=scores
         )

@@ -490,6 +490,7 @@ fn admit(
                 job.request.logprobs,
                 job.request.top_logprobs,
                 job.request.prompt_logprobs,
+                0,
                 Some(extra),
             )?,
         )?;
@@ -503,6 +504,7 @@ fn admit(
             Some(sampling_params),
             Some(rendered.stop_token_ids),
             media,
+            None,
         )?;
         let lease_ref = lease.bind(py).borrow();
         let request_id = lease_ref.request_id();

@@ -19,6 +19,18 @@ use crate::core_error;
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 pub struct ForwardOutput {
     #[pyo3(get)]
+    prompt_top_indptr: Option<Py<PyArray1<u32>>>,
+    #[pyo3(get)]
+    prompt_top_token_ids: Option<Py<PyArray1<u32>>>,
+    #[pyo3(get)]
+    prompt_top_logprobs: Option<Py<PyArray1<f32>>>,
+    #[pyo3(get)]
+    prompt_target_indptr: Option<Py<PyArray1<u32>>>,
+    #[pyo3(get)]
+    prompt_target_token_ids: Option<Py<PyArray1<u32>>>,
+    #[pyo3(get)]
+    prompt_target_logprobs: Option<Py<PyArray1<f32>>>,
+    #[pyo3(get)]
     prompt_logprobs: Option<Py<PyArray1<f32>>>,
     #[pyo3(get)]
     prompt_logprob_indptr: Option<Py<PyArray1<u32>>>,
@@ -41,7 +53,7 @@ pub struct ForwardOutput {
 #[pymethods]
 impl ForwardOutput {
     #[new]
-    #[pyo3(signature = (token_ids, token_indptr, *, logprobs = None, logprob_indptr = None, top_indptr = None, top_token_ids = None, top_logprobs = None, prompt_logprobs = None, prompt_logprob_indptr = None))]
+    #[pyo3(signature = (token_ids, token_indptr, *, logprobs = None, logprob_indptr = None, top_indptr = None, top_token_ids = None, top_logprobs = None, prompt_logprobs = None, prompt_logprob_indptr = None, prompt_top_indptr = None, prompt_top_token_ids = None, prompt_top_logprobs = None, prompt_target_indptr = None, prompt_target_token_ids = None, prompt_target_logprobs = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -54,11 +66,42 @@ impl ForwardOutput {
         top_logprobs: Option<Py<PyArray1<f32>>>,
         prompt_logprobs: Option<Py<PyArray1<f32>>>,
         prompt_logprob_indptr: Option<Py<PyArray1<u32>>>,
+        prompt_top_indptr: Option<Py<PyArray1<u32>>>,
+        prompt_top_token_ids: Option<Py<PyArray1<u32>>>,
+        prompt_top_logprobs: Option<Py<PyArray1<f32>>>,
+        prompt_target_indptr: Option<Py<PyArray1<u32>>>,
+        prompt_target_token_ids: Option<Py<PyArray1<u32>>>,
+        prompt_target_logprobs: Option<Py<PyArray1<f32>>>,
     ) -> PyResult<Self> {
         if prompt_logprobs.is_some() != prompt_logprob_indptr.is_some() {
             return Err(PyValueError::new_err(
                 "prompt scores require both prompt_logprobs and prompt_logprob_indptr",
             ));
+        }
+        for (name, columns) in [
+            (
+                "prompt_top",
+                [
+                    prompt_top_indptr.is_some(),
+                    prompt_top_token_ids.is_some(),
+                    prompt_top_logprobs.is_some(),
+                ],
+            ),
+            (
+                "prompt_target",
+                [
+                    prompt_target_indptr.is_some(),
+                    prompt_target_token_ids.is_some(),
+                    prompt_target_logprobs.is_some(),
+                ],
+            ),
+        ] {
+            let count = columns.into_iter().filter(|present| *present).count();
+            if count != 0 && (count != 3 || prompt_logprobs.is_none()) {
+                return Err(PyValueError::new_err(format!(
+                    "{name} scores require all three arrays and prompt_logprobs"
+                )));
+            }
         }
         let top_count = usize::from(top_indptr.is_some())
             + usize::from(top_token_ids.is_some())
@@ -77,6 +120,12 @@ impl ForwardOutput {
             .as_ref()
             .map(|_| logprob_indptr.unwrap_or_else(|| token_indptr.clone_ref(py)));
         Ok(Self {
+            prompt_top_indptr,
+            prompt_top_token_ids,
+            prompt_top_logprobs,
+            prompt_target_indptr,
+            prompt_target_token_ids,
+            prompt_target_logprobs,
             prompt_logprobs,
             prompt_logprob_indptr,
             token_ids,
@@ -112,10 +161,39 @@ struct BorrowedTop<'py> {
     values: PyReadonlyArray1<'py, f32>,
 }
 
+impl<'py> BorrowedTop<'py> {
+    fn borrow(
+        py: Python<'py>,
+        indptr: &Option<Py<PyArray1<u32>>>,
+        ids: &Option<Py<PyArray1<u32>>>,
+        values: &Option<Py<PyArray1<f32>>>,
+    ) -> PyResult<Option<Self>> {
+        indptr
+            .as_ref()
+            .map(|indptr| {
+                Ok(Self {
+                    indptr: borrow(indptr, py)?,
+                    token_ids: borrow(ids.as_ref().unwrap(), py)?,
+                    values: borrow(values.as_ref().unwrap(), py)?,
+                })
+            })
+            .transpose()
+    }
+
+    fn view(&self) -> TopLogprobView<'_> {
+        TopLogprobView {
+            indptr: self.indptr.as_slice().unwrap(),
+            token_ids: self.token_ids.as_slice().unwrap(),
+            values: self.values.as_slice().unwrap(),
+        }
+    }
+}
+
 pub struct BorrowedLogprobs<'py> {
     indptr: PyReadonlyArray1<'py, u32>,
     values: PyReadonlyArray1<'py, f32>,
     top: Option<BorrowedTop<'py>>,
+    targets: Option<BorrowedTop<'py>>,
 }
 
 pub struct BorrowedOutput<'py> {
@@ -131,11 +209,8 @@ impl BorrowedLogprobs<'_> {
         LogprobView {
             indptr: self.indptr.as_slice().unwrap(),
             values: self.values.as_slice().unwrap(),
-            top: self.top.as_ref().map(|top| TopLogprobView {
-                indptr: top.indptr.as_slice().unwrap(),
-                token_ids: top.token_ids.as_slice().unwrap(),
-                values: top.values.as_slice().unwrap(),
-            }),
+            top: self.top.as_ref().map(BorrowedTop::view),
+            targets: self.targets.as_ref().map(BorrowedTop::view),
         }
     }
 }
@@ -161,21 +236,16 @@ impl ForwardOutput {
             .logprobs
             .as_ref()
             .map(|values| {
-                let top = self
-                    .top_indptr
-                    .as_ref()
-                    .map(|indptr| {
-                        Ok::<_, PyErr>(BorrowedTop {
-                            indptr: borrow(indptr, py)?,
-                            token_ids: borrow(self.top_token_ids.as_ref().unwrap(), py)?,
-                            values: borrow(self.top_logprobs.as_ref().unwrap(), py)?,
-                        })
-                    })
-                    .transpose()?;
                 Ok::<_, PyErr>(BorrowedLogprobs {
                     indptr: borrow(self.logprob_indptr.as_ref().unwrap(), py)?,
                     values: borrow(values, py)?,
-                    top,
+                    top: BorrowedTop::borrow(
+                        py,
+                        &self.top_indptr,
+                        &self.top_token_ids,
+                        &self.top_logprobs,
+                    )?,
+                    targets: None,
                 })
             })
             .transpose()?;
@@ -186,7 +256,18 @@ impl ForwardOutput {
                 Ok::<_, PyErr>(BorrowedLogprobs {
                     indptr: borrow(self.prompt_logprob_indptr.as_ref().unwrap(), py)?,
                     values: borrow(values, py)?,
-                    top: None,
+                    top: BorrowedTop::borrow(
+                        py,
+                        &self.prompt_top_indptr,
+                        &self.prompt_top_token_ids,
+                        &self.prompt_top_logprobs,
+                    )?,
+                    targets: BorrowedTop::borrow(
+                        py,
+                        &self.prompt_target_indptr,
+                        &self.prompt_target_token_ids,
+                        &self.prompt_target_logprobs,
+                    )?,
                 })
             })
             .transpose()?;

@@ -251,6 +251,8 @@ fn complete_request_lease(
 #[derive(Clone, Debug)]
 pub struct Submission<P> {
     pub prompt_logprobs: bool,
+    pub prompt_top_logprobs: u32,
+    pub prompt_target_logprobs: Option<Vec<Vec<u32>>>,
     pub token_ids: Vec<u32>,
     pub max_new_tokens: Option<usize>,
     pub priority: i32,
@@ -265,6 +267,8 @@ impl<P> Submission<P> {
     pub fn new(token_ids: Vec<u32>, payload: P) -> Self {
         Self {
             prompt_logprobs: false,
+            prompt_top_logprobs: 0,
+            prompt_target_logprobs: None,
             token_ids,
             payload,
             max_new_tokens: None,
@@ -285,6 +289,9 @@ pub struct ExecutionPlan<P> {
     pub prompt_score_indices: Vec<u32>,
     pub prompt_score_token_ids: Vec<u32>,
     pub prompt_score_indptr: Vec<u32>,
+    pub prompt_score_top_counts: Vec<u32>,
+    pub prompt_target_indptr: Vec<u32>,
+    pub prompt_target_token_ids: Vec<u32>,
     pub batch_id: u64,
     pub batch_key: Option<u64>,
     pub phase: Phase,
@@ -319,6 +326,8 @@ pub trait Runner<P> {
 #[derive(Debug)]
 struct Request<P> {
     prompt_logprobs: bool,
+    prompt_top_logprobs: u32,
+    prompt_target_logprobs: Option<Vec<Vec<u32>>>,
     id: u64,
     lease: Arc<Mutex<RequestLeaseState>>,
     priority: i32,
@@ -338,6 +347,20 @@ struct Request<P> {
 }
 
 impl<P> Request<P> {
+    fn prompt_score_range(&self, row: SequenceStep) -> std::ops::Range<usize> {
+        if !self.prompt_logprobs || row.phase != Phase::Prefill {
+            return 0..0;
+        }
+        let start = row.token_start() as usize;
+        start..(row.token_end().unwrap() as usize).min(self.prompt.len().saturating_sub(1))
+    }
+
+    fn prompt_targets(&self, predecessor: usize) -> &[u32] {
+        self.prompt_target_logprobs
+            .as_ref()
+            .map_or(&[], |rows| &rows[predecessor + 1])
+    }
+
     fn prompt_length(&self) -> u32 {
         u32::try_from(self.prompt.len()).expect("submit bounds prompt length to u32")
     }
@@ -643,6 +666,8 @@ impl<P: Clone> EngineCore<P> {
         self.raise_if_open()?;
         let Submission {
             prompt_logprobs,
+            prompt_top_logprobs,
+            prompt_target_logprobs,
             token_ids,
             max_new_tokens,
             priority,
@@ -656,6 +681,27 @@ impl<P: Clone> EngineCore<P> {
         if token_ids.is_empty() {
             return Err(Error::invalid("token_ids must be non-empty"));
         }
+        if prompt_top_logprobs > 1000 {
+            return Err(Error::invalid(
+                "prompt_top_logprobs must be between 0 and 1000",
+            ));
+        }
+        if let Some(targets) = &prompt_target_logprobs {
+            if targets.len() != token_ids.len() || !targets[0].is_empty() {
+                return Err(Error::invalid(
+                    "prompt_target_logprobs must match prompt length and begin with an empty row",
+                ));
+            }
+            targets.iter().try_fold(0_u32, |total, row| {
+                total
+                    .checked_add(u32::try_from(row.len()).map_err(|_| {
+                        Error::invalid("prompt target count exceeds u32 metadata range")
+                    })?)
+                    .ok_or_else(|| Error::invalid("prompt target count exceeds u32 metadata range"))
+            })?;
+        }
+        let prompt_logprobs =
+            prompt_logprobs || prompt_top_logprobs > 0 || prompt_target_logprobs.is_some();
         if cache_prompt
             .as_ref()
             .is_some_and(|key| key.len() != token_ids.len())
@@ -757,6 +803,8 @@ impl<P: Clone> EngineCore<P> {
         self.next_request_id = next_request_id;
         self.scheduler.enqueue(Request {
             prompt_logprobs,
+            prompt_top_logprobs,
+            prompt_target_logprobs,
             id: request_id,
             lease: lease_state,
             priority,
@@ -1037,18 +1085,28 @@ impl<P: Clone> EngineCore<P> {
         let prompt_counts = batch
             .rows
             .iter()
-            .map(|row| {
-                if row.request.prompt_logprobs && row.scheduled.phase == Phase::Prefill {
-                    (row.scheduled.token_end().unwrap() as usize)
-                        .min(row.request.prompt.len().saturating_sub(1))
-                        .saturating_sub(row.scheduled.token_start() as usize)
-                } else {
-                    0
-                }
-            })
+            .map(|row| row.request.prompt_score_range(row.scheduled).len())
             .collect::<Vec<_>>();
+        let mut prompt_top_counts = Vec::new();
+        let mut prompt_target_indptr = Vec::new();
+        let mut prompt_target_ids = Vec::new();
+        for row in &batch.rows {
+            for position in row.request.prompt_score_range(row.scheduled) {
+                if prompt_target_indptr.is_empty() {
+                    prompt_target_indptr.push(0);
+                }
+                prompt_top_counts.push(row.request.prompt_top_logprobs);
+                prompt_target_ids.extend_from_slice(row.request.prompt_targets(position));
+                prompt_target_indptr.push(prompt_target_ids.len() as u32);
+            }
+        }
         if let Err(error) = match prompt_logprobs {
-            Some(scores) => scores.validate_required_lengths(&prompt_counts),
+            Some(scores) => scores.validate_prompt(
+                &prompt_counts,
+                &prompt_top_counts,
+                &prompt_target_indptr,
+                &prompt_target_ids,
+            ),
             None if prompt_counts.iter().any(|&count| count > 0) => Err(Error::execution(
                 "runner did not return requested prompt logprobs",
             )),
@@ -1699,19 +1757,27 @@ fn build_plan<P: Clone>(
     let mut prompt_score_indices = Vec::new();
     let mut prompt_score_token_ids = Vec::new();
     let mut prompt_score_indptr = vec![0];
+    let mut prompt_score_top_counts = Vec::new();
+    let mut prompt_target_indptr = Vec::new();
+    let mut prompt_target_token_ids = Vec::new();
     token_indptr.push(0);
 
     for (request, scheduled) in requests.iter().zip(scheduled_rows) {
         sequence_ids.push(request.id);
         payloads.push(request.payload.clone());
         let token_end = request.validate_step(*scheduled)?;
-        if request.prompt_logprobs && scheduled.phase == Phase::Prefill {
-            let start = scheduled.token_start() as usize;
-            for position in start..(token_end as usize).min(request.prompt.len().saturating_sub(1))
-            {
-                prompt_score_indices.push((token_ids.len() + position - start) as u32);
-                prompt_score_token_ids.push(request.prompt[position + 1]);
+        for position in request.prompt_score_range(*scheduled) {
+            if prompt_target_indptr.is_empty() {
+                prompt_target_indptr.push(0);
             }
+            prompt_score_indices
+                .push((token_ids.len() + position - scheduled.token_start() as usize) as u32);
+            prompt_score_token_ids.push(request.prompt[position + 1]);
+            prompt_score_top_counts.push(request.prompt_top_logprobs);
+            prompt_target_token_ids.extend_from_slice(request.prompt_targets(position));
+            prompt_target_indptr.push(u32::try_from(prompt_target_token_ids.len()).map_err(
+                |_| Error::invalid("batch prompt target count exceeds u32 metadata range"),
+            )?);
         }
         prompt_score_indptr.push(prompt_score_indices.len() as u32);
         match scheduled.phase {
@@ -1749,6 +1815,9 @@ fn build_plan<P: Clone>(
         prompt_score_indices,
         prompt_score_token_ids,
         prompt_score_indptr,
+        prompt_score_top_counts,
+        prompt_target_indptr,
+        prompt_target_token_ids,
         sequence_ids,
         context_lengths,
         token_ids,
@@ -1794,6 +1863,8 @@ mod tests {
     ) -> Request<()> {
         Request {
             prompt_logprobs: false,
+            prompt_top_logprobs: 0,
+            prompt_target_logprobs: None,
             id,
             lease: Arc::new(Mutex::new(RequestLeaseState::default())),
             priority: 0,

@@ -16,7 +16,12 @@ from resin.backend.loading import (
     resolve_model,
 )
 from resin.backend.plans import plan_rows
-from resin.backend.sampling import TorchSampler, format_output, prompt_scores
+from resin.backend.sampling import (
+    PromptScores,
+    TorchSampler,
+    format_output,
+    prompt_scores,
+)
 from resin.backend.topology import ParallelismCapabilities
 from resin.protocols import Runner
 from resin_models_torch.lfm2.config import Lfm2Config
@@ -123,7 +128,7 @@ class Lfm2TorchRunner(Runner):
         if sampler is None:
             sampler = self._sampler = TorchSampler()
         logits = torch.cat(logits_rows)
-        scores = torch.cat(prompt_rows) if prompt_rows else None
+        scores = PromptScores.concat(prompt_rows)
         return format_output(
             logits, sampler(logits, plan), plan, prompt_logprobs=scores
         )

@@ -44,7 +44,7 @@ from resin.backend.cuda.sampling import (
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
 from resin.backend.plans import BatchView, PagedCachePlan
-from resin.backend.sampling import format_output, prompt_scores
+from resin.backend.sampling import PromptScores, format_output, prompt_scores
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
@@ -766,7 +766,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         cache,
         token_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, PromptScores | None]:
         """Prefill fresh prompts eagerly and replay only a restored suffix."""
 
         logits = []
@@ -802,7 +802,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
                         cache=row_cache,
                     )
             logits.append(row_logits)
-        return torch.cat(logits, dim=0), torch.cat(prompt_rows) if prompt_rows else None
+        return torch.cat(logits, dim=0), PromptScores.concat(prompt_rows)
 
     def _broadcast_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
         groups = self.parallel_groups

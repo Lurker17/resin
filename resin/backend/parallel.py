@@ -53,6 +53,7 @@ def batch_plan_payload(plan: BatchPlan) -> dict[str, Any]:
                 "logprobs": params.logprobs,
                 "top_logprobs": params.top_logprobs,
                 "prompt_logprobs": params.prompt_logprobs,
+                "prompt_top_logprobs": params.prompt_top_logprobs,
                 "extra": params.extra,
             }
             for params in plan.sampling_params
@@ -61,6 +62,9 @@ def batch_plan_payload(plan: BatchPlan) -> dict[str, Any]:
         "prompt_score_indices": plan.prompt_score_indices,
         "prompt_score_token_ids": plan.prompt_score_token_ids,
         "prompt_score_indptr": plan.prompt_score_indptr,
+        "prompt_score_top_counts": plan.prompt_score_top_counts,
+        "prompt_target_indptr": plan.prompt_target_indptr,
+        "prompt_target_token_ids": plan.prompt_target_token_ids,
         "media": plan.media,
         "cache_groups": [
             {
@@ -102,6 +106,9 @@ def batch_plan_from_payload(payload: dict[str, Any]) -> BatchPlan:
         prompt_score_indices=payload.get("prompt_score_indices"),
         prompt_score_token_ids=payload.get("prompt_score_token_ids"),
         prompt_score_indptr=payload.get("prompt_score_indptr"),
+        prompt_score_top_counts=payload.get("prompt_score_top_counts"),
+        prompt_target_indptr=payload.get("prompt_target_indptr"),
+        prompt_target_token_ids=payload.get("prompt_target_token_ids"),
     )
 
 

@@ -14,7 +14,7 @@ from resin import (
     SchedulerConfig,
 )
 from resin.backend.parallel import batch_plan_from_payload, batch_plan_payload
-from resin.backend.sampling import format_output, prompt_scores
+from resin.backend.sampling import PromptScores, format_output, prompt_scores
 
 
 class TransitionRunner:
@@ -153,16 +153,23 @@ def test_prompt_metadata_survives_follower_transport():
         [0],
         [1, 2],
         [0, 2],
-        sampling_params=[SamplingParams(prompt_logprobs=True)],
+        sampling_params=[SamplingParams(prompt_logprobs=True, prompt_top_logprobs=3)],
         prompt_score_indices=[0, 1],
         prompt_score_token_ids=[2, 3],
         prompt_score_indptr=[0, 2],
+        prompt_score_top_counts=[1, 3],
+        prompt_target_indptr=[0, 2, 3],
+        prompt_target_token_ids=[7, 2, 4],
     )
     restored = batch_plan_from_payload(batch_plan_payload(plan))
     assert restored.sampling_params[0].prompt_logprobs
+    assert restored.sampling_params[0].prompt_top_logprobs == 3
     assert restored.needs_prompt_logprobs
     np.testing.assert_array_equal(restored.prompt_score_token_ids, [2, 3])
     np.testing.assert_array_equal(restored.prompt_score_indices, [0, 1])
+    np.testing.assert_array_equal(restored.prompt_score_top_counts, [1, 3])
+    np.testing.assert_array_equal(restored.prompt_target_indptr, [0, 2, 3])
+    np.testing.assert_array_equal(restored.prompt_target_token_ids, [7, 2, 4])
 
 
 def test_mixed_rows_keep_input_and_output_scores_separate():
@@ -217,7 +224,7 @@ def test_invalid_prompt_columns_leave_scores_unpublished(bad_scores, monkeypatch
     assert request.prompt_logprobs == [None, None]
 
 
-def test_projection_memory_is_bounded_by_chunk_size():
+def test_projection_and_normalization_are_shared_and_bounded(monkeypatch):
     count = 513
     plan = BatchPlan(
         [1],
@@ -227,15 +234,182 @@ def test_projection_memory_is_bounded_by_chunk_size():
         prompt_score_indices=list(range(count)),
         prompt_score_token_ids=[1] * count,
         prompt_score_indptr=[0, count],
+        prompt_score_top_counts=[9] * count,
+        prompt_target_indptr=list(range(0, 3 * count + 1, 3)),
+        prompt_target_token_ids=[6, 0, 6] * count,
     )
     rows = []
     hidden = torch.randn(count, 4)
     weight = torch.randn(4, 7)
+    expected = (hidden @ weight).log_softmax(-1)
+    normalizations = []
+    original = torch.Tensor.log_softmax
+
+    def normalize(values, *args, **kwargs):
+        normalizations.append(len(values))
+        return original(values, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "log_softmax", normalize)
 
     def project(values):
         rows.append(len(values))
         return values @ weight
 
     actual = prompt_scores(plan, hidden, project)
-    assert max(rows) == 128 and sum(rows) == count
-    torch.testing.assert_close(actual, (hidden @ weight).log_softmax(-1)[:, 1])
+    assert isinstance(actual, PromptScores)
+    assert rows == normalizations == [128, 128, 128, 128, 1]
+    torch.testing.assert_close(actual.logprobs, expected[:, 1])
+    assert actual.top is not None and actual.targets is not None
+    np.testing.assert_array_equal(actual.top.counts, np.full(count, 7, np.uint32))
+    torch.testing.assert_close(actual.top.logprobs, expected.topk(7).values.flatten())
+    torch.testing.assert_close(
+        actual.targets.logprobs, expected[:, [6, 0, 6]].flatten()
+    )
+    assert actual.targets.token_ids.tolist() == [6, 0, 6] * count
+
+
+def test_shared_columns_join_per_sequence_rows_without_losing_empty_score_groups():
+    plan = BatchPlan(
+        [1, 2],
+        [0, 0],
+        [1, 2, 3, 4],
+        [0, 2, 4],
+        sampling_params=[
+            SamplingParams(prompt_logprobs=True),
+            SamplingParams(prompt_top_logprobs=2),
+        ],
+        prompt_score_indices=[0, 1, 2, 3],
+        prompt_score_token_ids=[2, 5, 4, 6],
+        prompt_score_indptr=[0, 2, 4],
+        prompt_score_top_counts=[0, 0, 2, 2],
+        prompt_target_indptr=[0, 1, 3, 3, 3],
+        prompt_target_token_ids=[7, 0, 7],
+    )
+    hidden = TransitionRunner().table[[1, 2, 3, 4]]
+    whole = prompt_scores(plan, hidden)
+    parts = PromptScores.concat(
+        [
+            prompt_scores(plan, hidden[:2]),
+            prompt_scores(plan, hidden[2:], token_start=2),
+        ]
+    )
+    assert whole is not None and parts is not None
+    expected, actual = whole.output(plan), parts.output(plan)
+    assert expected.keys() == actual.keys()
+    for name in expected:
+        np.testing.assert_array_equal(actual[name], expected[name])
+    np.testing.assert_array_equal(actual["prompt_top_indptr"], [0, 0, 0, 2, 4])
+    np.testing.assert_array_equal(actual["prompt_target_indptr"], [0, 1, 3, 3, 3])
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 8])
+@pytest.mark.parametrize("mode", ["top", "targets", "both"])
+def test_prompt_top_and_per_position_targets_enable_raw_score_only_requests(
+    chunk, mode
+):
+    runner = TransitionRunner()
+    engine = Engine(runner, scheduler_config=SchedulerConfig(prefill_chunk_size=chunk))
+    tokens = [1, 3, 5, 2, 6]
+    targets = [[], [7, 3, 7], [], [0], [2, 1]]
+    top = 3 if mode in ("top", "both") else 0
+    requested_targets = targets if mode in ("targets", "both") else None
+    request = engine.submit(
+        tokens,
+        max_new_tokens=0,
+        sampling_params=SamplingParams(
+            prompt_top_logprobs=top, temperature=0.13, top_k=1, top_p=0.2
+        ),
+        prompt_target_logprobs=requested_targets,
+    )
+    while engine.has_work():
+        assert engine.step() == []
+    scores = request.prompt_logprobs
+    assert scores is not None and scores[0] is None
+    expected = runner.table[tokens[:-1]].log_softmax(-1)
+    for position, score in enumerate(scores[1:], 1):
+        assert score is not None
+        distribution = expected[position - 1]
+        assert score.logprob == pytest.approx(
+            distribution[tokens[position]].item(), abs=1e-6
+        )
+        assert [token for token, _ in score.top_logprobs] == distribution.topk(
+            top
+        ).indices.tolist()
+        assert [value for _, value in score.top_logprobs] == pytest.approx(
+            distribution.topk(top).values.tolist(), abs=1e-6
+        )
+        ids = [] if requested_targets is None else targets[position]
+        assert [token for token, _ in score.target_logprobs] == ids
+        assert [value for _, value in score.target_logprobs] == pytest.approx(
+            distribution[ids].tolist(), abs=1e-6
+        )
+    assert request.done and request.take_result() == []
+    assert len(runner.calls) == (len(tokens) + chunk - 1) // chunk
+    assert sum(len(plan.prompt_target_token_ids) for plan in runner.calls) == (
+        sum(map(len, targets)) if requested_targets is not None else 0
+    )
+
+
+def test_mixed_prompt_views_preserve_row_ownership_and_target_request_storage():
+    runner = TransitionRunner()
+    engine = Engine(runner, scheduler_config=SchedulerConfig(prefill_chunk_size=2))
+    top = engine.submit(
+        [1, 3, 2],
+        max_new_tokens=1,
+        sampling_params=SamplingParams(prompt_top_logprobs=20),
+    )
+    targets = [[], [7, 2], [1], [3, 3]]
+    target = engine.submit(
+        [2, 4, 1, 5], max_new_tokens=1, prompt_target_logprobs=targets
+    )
+    ordinary = engine.submit([6, 3], max_new_tokens=1)
+    targets[1].clear()
+    while engine.has_work():
+        engine.step()
+    assert top.prompt_logprobs is not None and target.prompt_logprobs is not None
+    top_score, target_score = top.prompt_logprobs[1], target.prompt_logprobs[1]
+    assert top_score is not None and target_score is not None
+    assert len(top_score.top_logprobs) == 8
+    assert top_score.target_logprobs == []
+    assert [token for token, _ in target_score.target_logprobs] == [7, 2]
+    assert target_score.top_logprobs == []
+    assert ordinary.prompt_logprobs is None
+    assert any(plan.num_sequences > 1 for plan in runner.calls)
+
+
+def test_empty_target_rows_still_enable_input_scoring():
+    runner = TransitionRunner()
+    engine = Engine(runner)
+    request = engine.submit([1, 2], max_new_tokens=0, prompt_target_logprobs=[[], []])
+    assert engine.step() == []
+    assert request.done and request.prompt_logprobs is not None
+    score = request.prompt_logprobs[1]
+    assert score is not None and score.target_logprobs == []
+
+
+@pytest.mark.parametrize(
+    "targets", [[[]], [[], [], []], [[1], []], [[], [-1]], [[], [2**32]]]
+)
+def test_prompt_target_request_shape_and_ids_are_validated_before_admission(targets):
+    engine = Engine(TransitionRunner())
+    with pytest.raises((ValueError, TypeError, OverflowError)):
+        engine.submit([1, 2], max_new_tokens=0, prompt_target_logprobs=targets)
+    assert not engine.has_work()
+
+
+def test_out_of_vocabulary_targets_are_rejected_before_any_gather(monkeypatch):
+    engine = Engine(TransitionRunner())
+    request = engine.submit([1, 2], max_new_tokens=0, prompt_target_logprobs=[[], [8]])
+    gathers = []
+    original = torch.Tensor.gather
+
+    def gather(values, *args, **kwargs):
+        gathers.append(True)
+        return original(values, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "gather", gather)
+    with pytest.raises(ValueError, match="target token IDs.*vocabulary size"):
+        engine.step()
+    assert gathers == []
+    assert not request.done
+    assert request.prompt_logprobs == [None, None]

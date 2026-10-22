@@ -165,14 +165,16 @@ class TestLfm2Torch:
         tokens = [1, 2, 3, 4, 5]
         with torch.inference_mode():
             logits = self.model(torch.tensor([tokens]), self.model.make_cache())[0]
-            expected = logits[:-1].log_softmax(-1)[range(len(tokens) - 1), tokens[1:]]
+            distributions = logits[:-1].log_softmax(-1)
+            expected = distributions[range(len(tokens) - 1), tokens[1:]]
         engine = Engine(
             runner, scheduler_config=SchedulerConfig(prefill_chunk_size=chunk)
         )
         request = engine.submit(
             tokens,
             max_new_tokens=0,
-            sampling_params=SamplingParams(prompt_logprobs=True),
+            sampling_params=SamplingParams(prompt_top_logprobs=3),
+            prompt_target_logprobs=[[], [7, 2, 7], [], [63], [4, 4]],
         )
         while engine.has_work():
             assert engine.step() == []
@@ -181,6 +183,20 @@ class TestLfm2Torch:
         assert [
             score.logprob for score in scores[1:] if score is not None
         ] == pytest.approx(expected.tolist(), abs=1e-5)
+        for position, target_ids in [(1, [7, 2, 7]), (2, []), (3, [63]), (4, [4, 4])]:
+            score = scores[position]
+            assert score is not None
+            distribution = distributions[position - 1]
+            assert [token for token, _ in score.top_logprobs] == distribution.topk(
+                3
+            ).indices.tolist()
+            assert [value for _, value in score.top_logprobs] == pytest.approx(
+                distribution.topk(3).values.tolist(), abs=1e-5
+            )
+            assert [token for token, _ in score.target_logprobs] == target_ids
+            assert [value for _, value in score.target_logprobs] == pytest.approx(
+                distribution[target_ids].tolist(), abs=1e-5
+            )
         assert runner.forward_calls == (len(tokens) + chunk - 1) // chunk
         assert runner.live_cache_count == 0
 

@@ -15,6 +15,15 @@ OUTPUT_COLUMNS = {
     "top_logprobs": "npt.NDArray[np.float32] | None",
     "prompt_logprobs": "npt.NDArray[np.float32] | None",
     "prompt_logprob_indptr": "npt.NDArray[np.uint32] | None",
+    **{
+        f"prompt_{kind}_{name}": f"npt.NDArray[np.{dtype}] | None"
+        for kind in ("top", "target")
+        for name, dtype in (
+            ("indptr", "uint32"),
+            ("token_ids", "uint32"),
+            ("logprobs", "float32"),
+        )
+    },
 }
 
 PARAMETERS = {
@@ -37,6 +46,9 @@ PARAMETERS = {
         "prompt_score_indices": f"{U32_INPUT} | None",
         "prompt_score_token_ids": f"{U32_INPUT} | None",
         "prompt_score_indptr": f"{U32_INPUT} | None",
+        "prompt_score_top_counts": f"{U32_INPUT} | None",
+        "prompt_target_indptr": f"{U32_INPUT} | None",
+        "prompt_target_token_ids": f"{U32_INPUT} | None",
         "media": "Sequence[MediaInput | None] | None",
     },
     ("CacheGroupPlan", "__new__"): {
@@ -91,6 +103,9 @@ RETURNS = {
                     "prompt_score_indices",
                     "prompt_score_token_ids",
                     "prompt_score_indptr",
+                    "prompt_score_top_counts",
+                    "prompt_target_indptr",
+                    "prompt_target_token_ids",
                 ),
             ),
             (

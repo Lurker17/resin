@@ -30,7 +30,7 @@ from resin.backend.cuda.sampling import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
-from resin.backend.sampling import format_output, prompt_scores
+from resin.backend.sampling import PromptScores, format_output, prompt_scores
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
 from resin.models.qwen3_5.media import Qwen35Media
@@ -882,7 +882,7 @@ class Qwen3_5CudaRunner(CudaRunner):
                 hidden[:, -1],
             )
             outputs.append(int(sampled[row]))
-        scores = torch.cat(prompt_rows) if prompt_rows else None
+        scores = PromptScores.concat(prompt_rows)
         return format_output(logits, outputs, plan, prompt_logprobs=scores)
 
     def _ordinary_decode(

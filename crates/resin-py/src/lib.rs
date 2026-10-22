@@ -161,6 +161,7 @@ struct SamplingParams {
     logprobs: bool,
     top_logprobs: usize,
     prompt_logprobs: bool,
+    prompt_top_logprobs: usize,
     extra: Option<Arc<Py<PyAny>>>,
 }
 
@@ -174,6 +175,7 @@ impl Default for SamplingParams {
             logprobs: false,
             top_logprobs: 0,
             prompt_logprobs: false,
+            prompt_top_logprobs: 0,
             extra: None,
         }
     }
@@ -182,7 +184,7 @@ impl Default for SamplingParams {
 #[pymethods]
 impl SamplingParams {
     #[new]
-    #[pyo3(signature = (*, temperature = 1.0, top_p = 1.0, top_k = None, seed = None, logprobs = false, top_logprobs = 0, prompt_logprobs = false, extra = None))]
+    #[pyo3(signature = (*, temperature = 1.0, top_p = 1.0, top_k = None, seed = None, logprobs = false, top_logprobs = 0, prompt_logprobs = false, prompt_top_logprobs = 0, extra = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         temperature: f64,
@@ -192,6 +194,7 @@ impl SamplingParams {
         logprobs: bool,
         top_logprobs: usize,
         prompt_logprobs: bool,
+        prompt_top_logprobs: usize,
         extra: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         if !temperature.is_finite() || temperature < 0.0 {
@@ -219,6 +222,11 @@ impl SamplingParams {
                 "top_logprobs must be between 0 and 1000",
             ));
         }
+        if prompt_top_logprobs > 1000 {
+            return Err(PyValueError::new_err(
+                "prompt_top_logprobs must be between 0 and 1000",
+            ));
+        }
         Ok(Self {
             temperature,
             top_p,
@@ -226,7 +234,8 @@ impl SamplingParams {
             seed,
             logprobs: logprobs || top_logprobs > 0,
             top_logprobs,
-            prompt_logprobs,
+            prompt_logprobs: prompt_logprobs || prompt_top_logprobs > 0,
+            prompt_top_logprobs,
             extra: extra.map(Arc::new),
         })
     }
@@ -258,6 +267,10 @@ impl SamplingParams {
     #[getter]
     fn prompt_logprobs(&self) -> bool {
         self.prompt_logprobs
+    }
+    #[getter]
+    fn prompt_top_logprobs(&self) -> usize {
+        self.prompt_top_logprobs
     }
 
     #[getter]
@@ -307,6 +320,9 @@ struct BatchPlan {
     prompt_score_indices: Vec<u32>,
     prompt_score_token_ids: Vec<u32>,
     prompt_score_indptr: Vec<u32>,
+    prompt_score_top_counts: Vec<u32>,
+    prompt_target_indptr: Vec<u32>,
+    prompt_target_token_ids: Vec<u32>,
     sequence_ids: Vec<u64>,
     context_lengths: Vec<u32>,
     token_ids: Vec<u32>,
@@ -415,7 +431,23 @@ impl BatchPlan {
             plan.prompt_score_indices.len(),
         )
         .map_err(core_error)?;
+        if !plan.prompt_score_indices.is_empty()
+            || !plan.prompt_target_indptr.is_empty()
+            || !plan.prompt_target_token_ids.is_empty()
+        {
+            resin_core::logprobs::validate_indptr(
+                &plan.prompt_target_indptr,
+                plan.prompt_score_indices.len(),
+                plan.prompt_target_token_ids.len(),
+            )
+            .map_err(core_error)?;
+        }
         if plan.prompt_score_token_ids.len() != plan.prompt_score_indices.len()
+            || plan.prompt_score_top_counts.len() != plan.prompt_score_indices.len()
+            || plan
+                .prompt_score_top_counts
+                .iter()
+                .any(|&count| count > 1000)
             || plan
                 .prompt_score_indptr
                 .windows(2)
@@ -504,7 +536,10 @@ impl BatchPlan {
         media = None,
         prompt_score_indices = None,
         prompt_score_token_ids = None,
-        prompt_score_indptr = None
+        prompt_score_indptr = None,
+        prompt_score_top_counts = None,
+        prompt_target_indptr = None,
+        prompt_target_token_ids = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -523,6 +558,9 @@ impl BatchPlan {
         prompt_score_indices: Option<PyArrayLike1<'_, u32>>,
         prompt_score_token_ids: Option<PyArrayLike1<'_, u32>>,
         prompt_score_indptr: Option<PyArrayLike1<'_, u32>>,
+        prompt_score_top_counts: Option<PyArrayLike1<'_, u32>>,
+        prompt_target_indptr: Option<PyArrayLike1<'_, u32>>,
+        prompt_target_token_ids: Option<PyArrayLike1<'_, u32>>,
     ) -> PyResult<Self> {
         let sequence_ids = arrays::owned_vec(sequence_ids);
         let context_lengths = arrays::owned_vec(context_lengths);
@@ -555,8 +593,25 @@ impl BatchPlan {
             .into_iter()
             .map(|payload| payload.map(Arc::new))
             .collect();
+        let prompt_score_indices = prompt_score_indices
+            .map(arrays::owned_vec)
+            .unwrap_or_default();
+        let predecessor_count = prompt_score_indices.len();
         Self::checked(Self {
-            prompt_score_indices: prompt_score_indices
+            prompt_score_indices,
+            prompt_score_top_counts: prompt_score_top_counts
+                .map(arrays::owned_vec)
+                .unwrap_or_else(|| vec![0; predecessor_count]),
+            prompt_target_indptr: prompt_target_indptr.map(arrays::owned_vec).unwrap_or_else(
+                || {
+                    if predecessor_count == 0 {
+                        Vec::new()
+                    } else {
+                        vec![0; predecessor_count + 1]
+                    }
+                },
+            ),
+            prompt_target_token_ids: prompt_target_token_ids
                 .map(arrays::owned_vec)
                 .unwrap_or_default(),
             prompt_score_token_ids: prompt_score_token_ids
@@ -685,6 +740,18 @@ impl BatchPlan {
     fn prompt_score_indptr<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
         arrays::readonly_view(this.clone().into_any(), &this.get().prompt_score_indptr)
     }
+    #[getter]
+    fn prompt_score_top_counts<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        arrays::readonly_view(this.clone().into_any(), &this.get().prompt_score_top_counts)
+    }
+    #[getter]
+    fn prompt_target_indptr<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        arrays::readonly_view(this.clone().into_any(), &this.get().prompt_target_indptr)
+    }
+    #[getter]
+    fn prompt_target_token_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        arrays::readonly_view(this.clone().into_any(), &this.get().prompt_target_token_ids)
+    }
 
     /// Effective sampling parameters, one per sequence.
     #[getter]
@@ -811,12 +878,13 @@ struct TokenLogprobs {
 #[pymethods]
 impl TokenLogprobs {
     #[new]
-    #[pyo3(signature = (logprob, top_logprobs = Vec::new()))]
-    fn new(logprob: f32, top_logprobs: Vec<(u32, f32)>) -> Self {
+    #[pyo3(signature = (logprob, top_logprobs = Vec::new(), target_logprobs = Vec::new()))]
+    fn new(logprob: f32, top_logprobs: Vec<(u32, f32)>, target_logprobs: Vec<(u32, f32)>) -> Self {
         Self {
             inner: core::TokenLogprobs {
                 logprob,
                 top_logprobs,
+                target_logprobs,
             },
         }
     }
@@ -827,6 +895,10 @@ impl TokenLogprobs {
     #[getter]
     fn top_logprobs(&self) -> Vec<(u32, f32)> {
         self.inner.top_logprobs.clone()
+    }
+    #[getter]
+    fn target_logprobs(&self) -> Vec<(u32, f32)> {
+        self.inner.target_logprobs.clone()
     }
 }
 
@@ -1042,7 +1114,8 @@ impl Engine {
         batch_key = None,
         sampling_params = None,
         stop_token_ids = None,
-        media = None
+        media = None,
+        prompt_target_logprobs = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn submit(
@@ -1055,6 +1128,7 @@ impl Engine {
         sampling_params: Option<Py<SamplingParams>>,
         stop_token_ids: Option<Vec<u32>>,
         media: Option<Py<PyAny>>,
+        prompt_target_logprobs: Option<Vec<Vec<u32>>>,
     ) -> PyResult<Py<RequestLease>> {
         self.core.raise_if_open().map_err(core_error)?;
         let token_ids = match token_ids {
@@ -1121,6 +1195,8 @@ impl Engine {
         let cacheable = media.is_none() || cache_prompt.is_some();
         let input = core::Submission {
             prompt_logprobs: sampling_params.prompt_logprobs,
+            prompt_top_logprobs: sampling_params.prompt_top_logprobs as u32,
+            prompt_target_logprobs,
             token_ids,
             max_new_tokens,
             priority,
@@ -1467,7 +1543,12 @@ fn extract_runner_output<'py>(
             .map(|pair| (pair[1] - pair[0]) as usize)
             .collect::<Vec<_>>();
         scores
-            .validate_required_lengths(&lengths)
+            .validate_prompt(
+                &lengths,
+                &plan.prompt_score_top_counts,
+                &plan.prompt_target_indptr,
+                &plan.prompt_target_token_ids,
+            )
             .map_err(core_error)?;
     } else if plan.needs_prompt_logprobs() {
         return Err(PyRuntimeError::new_err(
@@ -1521,6 +1602,9 @@ mod tests {
             prompt_score_indices: Vec::new(),
             prompt_score_token_ids: Vec::new(),
             prompt_score_indptr: vec![0, 0],
+            prompt_score_top_counts: Vec::new(),
+            prompt_target_indptr: vec![0],
+            prompt_target_token_ids: Vec::new(),
             sequence_ids: vec![1],
             context_lengths: vec![0],
             token_ids: vec![1, 2],
