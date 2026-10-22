@@ -1,6 +1,7 @@
 """Blackwell primitive probes and real-checkpoint eager/captured validation."""
 
 from contextlib import contextmanager
+from dataclasses import replace
 
 import torch
 
@@ -202,14 +203,16 @@ def _attention():
         candidate_topk_blocks=2,
     )
     geometry = CacheGeometry.build(args, prefill_chunk_size=32)
+    # Exercise released physical strides with only the tiny model's payload.
+    geometry = replace(geometry, parent_rows=5504, packings=(1, 8, 2, 64))
     arena = CacheArena("cuda", geometry.layout(8), geometry, dtype=torch.bfloat16)
     groups = tuple(
         DevicePageGroup(
             torch.tensor([[i + 1, i + 5]], device="cuda", dtype=torch.int32),
-            torch.zeros(1, 2, device="cuda", dtype=torch.int32),
+            torch.tensor([[packing - 1, 0]], device="cuda", dtype=torch.int32),
             torch.zeros(1, device="cuda", dtype=torch.int32),
         )
-        for i in range(4)
+        for i, packing in enumerate(geometry.packings)
     )
     cache = arena._make_graph_cache(groups)
     positions = torch.tensor(
@@ -293,6 +296,11 @@ def _attention():
     graph.replay()
     torch.cuda.synchronize()
     result = {
+        "physical_layout": {
+            "parent_rows": geometry.parent_rows,
+            "packings": list(geometry.packings),
+            "child_slots": [[packing - 1, 0] for packing in geometry.packings],
+        },
         "source_and_consumer_sparse": comparisons,
         "captured": _check(captured, eager),
     }

@@ -49,6 +49,14 @@ compressed token IDs for Engram lookback. KV consumers map to their declared
 source's storage. Index-result ownership is independent of KV ownership. Future
 verification rows stay causally invisible and are overwritten before corrected
 execution consumes them. No Python request-to-cache map is introduced.
+Parent slabs fit the largest group; smaller groups use power-of-two child
+packings with even row strides. The released geometry uses 5.375 MiB parents,
+avoiding the earlier 8 MiB padding caused by token-history packing. At batch
+256 and 4K context, K4 decode needs about 13.19 GiB for cache and graph scratch;
+the native estimator checks scheduler-usable parents separately from scratch.
+The small B300 attention oracle also passes with these physical strides and
+nonzero child slots, comparing source/consumer attention with Torch and checking
+exact graph replay.
 
 The runner declares its supported parallelisms. Attention TP shards KV heads;
 this MLA model has one KV head, so `attn_tp>1` is rejected. Attention DP, CP,

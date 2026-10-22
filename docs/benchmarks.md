@@ -7,6 +7,11 @@ graph capture are outside the measured windows and recorded separately.
 The requested result file is written after normal sweep completion. Each completed
 point is also flushed as a `[bench-result] {json}` log line, so earlier points can
 be recovered from captured logs if a later case fails.
+Before capture, the launcher logs each rank's cache budget and checks every
+cohort's peak context against the native `CacheLayout.estimated_parent_count`
+estimator. Decode includes warmup, measured generation, and draft write
+lookahead. A case that cannot remain fully resident fails before prefill rather
+than measuring a smaller admitted batch.
 The chart axes and speculative projection follow
 [DeepInfer's sweep plotter](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/examples/sweep/plot_pareto.py).
 
