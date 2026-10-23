@@ -720,6 +720,10 @@ class Transformer(nn.Module):
                 prepare_attention(source)
             if isinstance(source, Block) and collective is not None:
                 source.lazy_hc = True
+            if isinstance(source, ParallelHead):
+                from resin_models_cuda.deepseek_v41.linear import PreparedVocabHead
+
+                return PreparedVocabHead(source)
             if isinstance(source, Linear):
                 from resin_models_cuda.deepseek_v41.linear import prepare_linear
 

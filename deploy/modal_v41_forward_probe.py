@@ -21,6 +21,7 @@ image = build_modal_image(
 for helper in (
     "v41_indexer_probe",
     "deepinfer_projection_probe",
+    "deepinfer_head_probe",
     "deepinfer_compressor_probe",
     "flashmla_validation",
     "deepseek_v41_validation",
@@ -46,6 +47,7 @@ def probe() -> dict:
         for name, module in (
             ("indexer", "v41_indexer_probe"),
             ("projections", "deepinfer_projection_probe"),
+            ("heads", "deepinfer_head_probe"),
             ("compressor", "deepinfer_compressor_probe"),
             ("attention", "flashmla_validation"),
             ("transforms", "v41_transform_probe"),

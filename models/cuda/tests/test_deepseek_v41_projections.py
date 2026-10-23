@@ -5,11 +5,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_deepseek_v41_model import implementation as implementation
+from torch import nn
 from torch.nn import functional as F
 
+from resin.backend.cuda.parallel import TensorParallelContext
 from resin_models_cuda.deepseek_v41.linear import (
     Linear,
     PreparedLinear,
+    PreparedVocabHead,
     prepare_linear,
 )
 
@@ -182,3 +186,43 @@ def test_parent_fusion_accepts_already_prepared_child_scales(deepgemm):
     torch.testing.assert_close(
         merged.scale, torch.cat((torch.ones(32, 1), torch.full((32, 1), 8)))
     )
+
+
+def test_prepared_vocab_head_preserves_last_row_full_logits_and_fp32_output(deepgemm):
+    weight = torch.randn(19, 32).bfloat16().float()
+    source = SimpleNamespace(weight=weight, tensor_parallel=SimpleNamespace(size=1))
+    head = PreparedVocabHead(source)
+    hidden = torch.randn(2, 3, 32).bfloat16()
+    expected = F.linear(hidden.float(), weight)
+    assert head.weight.dtype == torch.bfloat16
+    assert head(hidden).dtype == torch.float32
+    torch.testing.assert_close(head.weight.float(), weight, rtol=0, atol=0)
+    torch.testing.assert_close(head(hidden), expected[:, -1], rtol=0, atol=0)
+    torch.testing.assert_close(head(hidden, full_logits=True), expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        head(hidden[:, 0], full_logits=True), expected[:, 0], rtol=0, atol=0
+    )
+    torch.testing.assert_close(source.weight, weight, rtol=0, atol=0)
+
+
+def test_prepared_vocab_head_rejects_attention_tp_before_preparation():
+    source = SimpleNamespace(tensor_parallel=SimpleNamespace(size=2))
+    with pytest.raises(ValueError, match="attention TP1"):
+        PreparedVocabHead(source)
+
+
+def test_weight_preparation_lowers_main_and_markov_vocabulary_heads(
+    deepgemm, implementation
+):
+    model = implementation.Transformer.__new__(implementation.Transformer)
+    nn.Module.__init__(model)
+    model.head = implementation.ParallelHead(
+        32, 32, tensor_parallel=TensorParallelContext()
+    )
+    model.markov = nn.Module()
+    model.markov.head = implementation.ParallelHead(
+        32, 16, tensor_parallel=TensorParallelContext()
+    )
+    model.prepare_weights(lambda value: value)
+    assert isinstance(model.head, PreparedVocabHead)
+    assert isinstance(model.markov.head, PreparedVocabHead)

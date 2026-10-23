@@ -4,6 +4,8 @@ Runtime quantization and GEMM recipes follow DeepInfer's ReplicatedLinear at
 774ce244b87cc0eb8d4b94ab9f5de2ab22049f01 (Apache-2.0).
 """
 
+from types import SimpleNamespace
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -177,6 +179,24 @@ def prepare_linear(source):
         and source.weight.dtype in (torch.bfloat16, torch.float8_e4m3fn)
         else source
     )
+
+
+class PreparedVocabHead(PreparedLinear):
+    """BF16 vocabulary weights with FP32 logits, as in DeepInfer's get_logits."""
+
+    def __init__(self, source):
+        if source.tensor_parallel.size != 1:
+            raise ValueError("DeepSeek-V4.1 vocabulary heads require attention TP1")
+        super().__init__(
+            SimpleNamespace(weight=source.weight.detach().bfloat16(), scale=None),
+            use_fp32_output=True,
+        )
+        self.tensor_parallel = source.tensor_parallel
+
+    def forward(self, value, *, full_logits=False):
+        if not full_logits:
+            value = value[:, -1]
+        return super().forward(value.bfloat16())
 
 
 class SharedExpert(nn.Module):
