@@ -43,12 +43,12 @@ def _control_worker(rank, rendezvous, output):
     )
 
     class Transport:
-        reductions = 0
+        gathers = 0
         objects = 0
 
-        def all_reduce(self, *args, **kwargs):
-            self.reductions += 1
-            dist.all_reduce(*args, **kwargs)
+        def all_gather_single(self, *args, **kwargs):
+            self.gathers += 1
+            dist.all_gather_single(*args, **kwargs)
 
         def all_gather_object(self, *args, **kwargs):
             self.objects += 1
@@ -80,9 +80,7 @@ def _control_worker(rank, rendezvous, output):
     # Different logical operations still use identical collective type/shape.
     # Both ranks detect the mismatch, rather than one entering model execution.
     with pytest.raises(ControlPlaneError, match="different orders"):
-        control.gather(
-            group, ControlOperation.PHASE if rank else ControlOperation.PREPARE
-        )
+        control.gather(group, "http output" if rank else ControlOperation.PREPARE)
     assert control.gather(group, ControlOperation.COMMIT) == (
         [(), ()],
         [None, None],
@@ -90,7 +88,7 @@ def _control_worker(rank, rendezvous, output):
     assert saved == [(0, -1, 2**40), (3, -2, 2**40 + 1)]
     assert len(control._buffers) == 1
     (output / f"rank{rank}.json").write_text(
-        json.dumps({"reductions": transport.reductions, "objects": transport.objects})
+        json.dumps({"gathers": transport.gathers, "objects": transport.objects})
     )
     dist.destroy_process_group()
 
@@ -103,4 +101,4 @@ def test_control_votes_preserve_rank_records_failure_diagnostics_and_order(tmp_p
         join=True,
     )
     records = [json.loads(path.read_text()) for path in tmp_path.glob("rank*.json")]
-    assert records == [{"reductions": 9, "objects": 1}] * 2
+    assert records == [{"gathers": 9, "objects": 1}] * 2
