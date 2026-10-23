@@ -15,6 +15,7 @@ from deploy.v41_yoco_probe import (
     _check_continuations,
     _compare,
     _public,
+    _qualify_restore_observations,
     _restore_observations,
     _sample_positions,
     _scheduling_cohorts,
@@ -152,6 +153,39 @@ def test_restore_shape_differences_are_diagnostic_and_cross_mode_checks_stay_str
     changed["snapshots"][(129, 129)]["state"]["main.20"][0] += 1
     with pytest.raises(AssertionError, match="main.20"):
         _compare(restored, changed)
+
+
+@pytest.mark.parametrize("field", [None, "token", "top_ids", "score", "state"])
+def test_invariant_restore_gate_requires_exact_outputs_and_sampled_state(field):
+    fresh, restored = _result(), _result()
+    if field == "token":
+        restored["requests"][129]["tokens"][0] += 1
+    elif field == "top_ids":
+        restored["requests"][129]["top_ids"][0][0] += 1
+    elif field == "score":
+        restored["requests"][129]["scores"][0] += 0.001
+    elif field == "state":
+        restored["snapshots"][(129, 129)]["state"]["main.20"][0] += 1
+    observations = _restore_observations(fresh, restored)
+    configuration = dict(
+        batch_invariant_requested=False,
+        deep_gemm_deterministic_algorithms=False,
+        tile_kernels_deterministic_control_available=False,
+        tile_kernels_deterministic_algorithms=None,
+    )
+    assert _qualify_restore_observations(observations, configuration) is observations
+    assert observations["129"]["qualifies_equivalence"] is False
+    configuration.update(batch_invariant_requested=True)
+    with pytest.raises(AssertionError, match="without deterministic DeepGEMM"):
+        _qualify_restore_observations(observations, configuration)
+    configuration.update(deep_gemm_deterministic_algorithms=True)
+    if field is not None:
+        with pytest.raises(AssertionError, match="restored prompt 129"):
+            _qualify_restore_observations(observations, configuration)
+    else:
+        qualified = _qualify_restore_observations(observations, configuration)
+        assert qualified["129"]["qualifies_equivalence"] is True
+        assert observations["129"]["qualifies_equivalence"] is False
 
 
 def test_cross_mode_equivalence_requires_identical_prefill_chunk_trajectory():

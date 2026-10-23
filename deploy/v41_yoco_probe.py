@@ -277,6 +277,32 @@ def _restore_observations(fresh, restored):
     return observations
 
 
+def _qualify_restore_observations(observations, kernel_configuration):
+    """Gate exact outputs and sampled final state under explicit probe controls."""
+    if not kernel_configuration["batch_invariant_requested"]:
+        return observations
+    assert kernel_configuration["deep_gemm_deterministic_algorithms"] is True, (
+        "restore invariance requested without deterministic DeepGEMM"
+    )
+    if kernel_configuration["tile_kernels_deterministic_control_available"]:
+        assert kernel_configuration["tile_kernels_deterministic_algorithms"] is True
+    for prompt, row in observations.items():
+        for field in (
+            "first_token_difference",
+            "first_top_ids_difference",
+            "first_flat_score_difference",
+        ):
+            assert row[field] is None, f"restored prompt {prompt}: {field}={row[field]}"
+        assert row["final_state_fields_compared"] > 0
+        assert not row["final_state_differences"], (
+            f"restored prompt {prompt}: {row['final_state_differences']}"
+        )
+    return {
+        prompt: {**row, "qualifies_equivalence": True}
+        for prompt, row in observations.items()
+    }
+
+
 def _public(result):
     return {
         **{key: value for key, value in result.items() if key != "snapshots"},
@@ -321,7 +347,8 @@ def run_probe(
     """Qualify fresh, restored, scored, unequal-active, and idle decode cohorts.
 
     Paired mask/compact comparisons are exact within each cache trajectory.
-    Fresh/restored observations use different chunk shapes and are diagnostic.
+    Fresh/restored use different chunk shapes. Explicit invariant controls gate
+    their equality; fast-mode observations remain diagnostic.
     Wall time is qualification time, including small state-sample copies.
     """
     local = getattr(engine, "local", engine)
@@ -516,6 +543,9 @@ def run_probe(
             record(mode, "restored", restored)
             with _validation_stage(mode + " restore observations", coordinate):
                 restore_observations[mode] = _restore_observations(fresh, restored)
+                restore_observations[mode] = _qualify_restore_observations(
+                    restore_observations[mode], runner._yoco_kernel_configuration
+                )
                 local.clear_prefix_cache()
             scored = cohort(mode + " scored fallback", (lengths[1],), scored=True)
             record(mode, "scored", scored)
