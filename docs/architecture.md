@@ -1,7 +1,7 @@
 # Architecture
 
 Resin separates request and resource ownership from model-specific execution.
-The dependency-free `resin-core` crate contains the complete synchronous
+The dependency-free `resin-core` crate contains the complete transactional
 `EngineCore<P>` lifecycle. `P` is opaque frontend metadata: native code schedules
 tokens without knowing about Python sampling objects or model media. Payloads
 are cloned once per dispatched row; native applications should use `Arc` for
@@ -45,14 +45,15 @@ execute straightforwardly.
    and cache capacity.
 5. The cache coordinator grows each request, creates ordered group page tables,
    and acquires one batch lease.
-6. The Engine emits a `BatchPlan` and calls `forward()` synchronously.
+6. The Engine emits a `BatchPlan` and either calls `forward()` or enqueues an
+   owned device completion while retaining the exact requests and page lease.
 7. The Engine validates the complete raw result against the leased write span
    before applying stop tokens or generation limits. It prepares events, releases
    terminal model state, publishes aligned prefixes, retires cache leases, and
    commits progress before requeuing survivors.
 
 Internally, preparation owns the selected requests and cache capabilities until
-completion or rollback. `step()` remains the synchronous driver; there is no
+completion or rollback. `step()` drives submission and completion; there is no
 public API that commits arbitrary page IDs. Rust runners implement
 `engine::Runner<P>` and receive an owned `ExecutionPlan<P>`. The native
 [conformance tests](../crates/resin-core/tests/engine.rs) demonstrate this API
@@ -61,8 +62,30 @@ cache pool and use the same logical runner throughout its lifetime. They call
 `close(&mut runner)` for orderly shutdown; the core does not own the device
 runtime or call back into a runner when it is dropped.
 
-One batch is selected per `step()`. Multiple requests within that batch execute
-together and may decode concurrently.
+Multiple requests within a batch execute together. With device overlap, an
+initial `step()` can return no events while its batch runs; subsequent steps
+submit a continuation before harvesting the previous batch.
+
+### Engine overlap
+
+`Engine(overlap=True)` is the default. An optional runner `enqueue()` returns an
+owned completion with `result()` and device `feedback`; the synchronous runner
+contract remains sufficient. The shared DeepSeek CUDA runner implements this
+boundary. Model forward methods receive ordinary device inputs and cache views;
+they do not track pending batches or schedule continuations.
+
+The Engine keeps one batch in flight. Exact accepted tokens, positions and
+sampling offsets feed the next graph on the GPU; CPU progress and events commit
+from the completed output. A single writer lease transfers between safe decode
+continuations. Arrivals, cancellation, close and page boundaries drain before
+changing ownership. Failures after enqueue retain owners in quarantine.
+
+The initial fast path requires a stable decode cohort, no token stops or
+generated-token logprobs, sufficient remaining budget, and both write spans
+inside the same owned blocks in every cache group. Other steps use the
+synchronous path. EOS-based HTTP generation therefore currently takes that
+fallback. `overlap=False` or `step(allow_overlap=False)` selects the reference
+path. Distributed replicas vote together before enqueue or drain.
 
 ## Cache geometry
 
@@ -137,7 +160,7 @@ borrowed NumPy columns.
 
 ## Current limits
 
-- one synchronous batch per Engine step;
+- overlapped decode currently excludes token stops and generated-token logprobs;
 - no prefill/decode disaggregation;
 - sparse graph-safe expert dispatch requires a shared NVLink domain and retains
   static receive storage; RDMA graph transport and communication overlap are pending;

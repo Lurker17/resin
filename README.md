@@ -162,6 +162,12 @@ Managed history and recurrent state are cache groups declared through a frozen
 `RunnerConfig`. The Engine binds their one physical arena during construction.
 Pass `prefix_cache=True` to reuse aligned prefixes across requests.
 
+`Engine(overlap=True)` enables device submission/completion overlap when the
+runner provides it. The initial DeepSeek CUDA path covers stable decode cohorts;
+token stops, generated-token logprobs and ownership changes take a synchronous
+fallback. Use `overlap=False` for reference execution. See
+[Engine overlap](docs/architecture.md#engine-overlap).
+
 ## Local HTTP server
 
 The built-in native server exposes one Engine through OpenAI Chat Completions and
@@ -300,16 +306,16 @@ V4.1 owns shifted hyper-connections, block32 quantization, Engram, shared source
 KV, CED selection, and its changed DSpark stages. Four cache groups hold sliding
 KV, shared compressed KV/index keys, compressor state, and Engram token history.
 Its initial deployment target is eight B300s with attention DP8, EP8, and
-attention TP1. Engram tables are currently replicated; sharded table lookup is
-not implemented. Full-checkpoint validation and performance qualification on
-this layout remain pending. Earlier TP4 debug runs used replicated KV and do
+attention TP1. Engram tables are sharded over the GPU domain, and packed FP8/FP4
+KV shares Engine-owned slabs. Prepared DeepInfer operators and metadata pass
+full-checkpoint eager/graph checks on four B300s; traced eight-B300 throughput
+baselines are recorded in the family README. Earlier TP4 debug runs used replicated KV and do
 not qualify the supported attention-TP contract. Vision inputs are rejected.
 See the family README for memory and optimization limits.
 
-Current limits include synchronous runner steps and no prefill/decode
-disaggregation. A
+Current limits include no prefill/decode disaggregation. A
 [distributed coordinator prototype](docs/distributed.md) covers explicit TP, CP,
-attention DP, and EP groups with synchronous steps.
+attention DP, and EP groups with coordinated submission and completion.
 [DeepSeek-V4 Flash](docs/deepseek-v4-parallelism.md) and
 [GPT-OSS](docs/gpt-oss-parallelism.md) describe their composed attention TP/DP,
 CP, EP, and expert-TP execution paths and validation. Production multi-node

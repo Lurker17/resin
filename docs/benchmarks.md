@@ -1,9 +1,17 @@
 # Benchmark sweeps
 
 The sweep loads one model per GPU, keeps it resident across cases, and measures
-synchronous engine steps after warmup. It writes raw measurements to JSONL;
+engine completions after warmup. It writes raw measurements to JSONL;
 plotting runs locally without importing PyTorch. Startup, weight loading, and
 graph capture are outside the measured windows and recorded separately.
+Overlap is enabled by default for capable runners; pass `--no-overlap` to time
+the synchronized reference path. Overlapped decode measures continuous completion
+intervals, including CPU work between completions, without per-step CUDA
+synchronization or metric reductions. Warmup reductions are deferred too, so
+the first measured completion cannot advance in an untimed reduction. Each point
+records actual enqueue/continuation counts; static graph phase events are omitted
+when a following replay could overwrite them. Perfetto traces contain two live
+completions after timing, with no benchmark metric collectives between them.
 The requested result file is written after normal sweep completion. Each completed
 point is also flushed as a `[bench-result] {json}` log line, so earlier points can
 be recovered from captured logs if a later case fails.
