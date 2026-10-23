@@ -97,9 +97,10 @@ Validate the full checkpoint with natural expert routing and acceptance:
 uv run modal run deploy/modal_bench.py \
   --model deepseek-v41 --gpu B300 --world-size 4 --attn-dp 4 --ep 4 \
   --expert-backend deepgemm --draft-tokens 3 --natural-acceptance \
-  --no-balanced-experts --validate-model --prefill-chunk-size 8 \
-  --context-lengths 64 --batch-sizes 1 \
-  --output artifacts/benchmarks/deepinfer-v41-forward-ep4-k3-validation.json
+  --no-balanced-experts --validate-model --prefill-chunk-size 1024 \
+  --phases decode --context-lengths 512 --batch-sizes 1,2,4 \
+  --gpu-memory-utilization 0.75 \
+  --output artifacts/benchmarks/2026-10-22-deepseek-v41-prepared/final-validation.json
 ```
 
 The [B300 forward probes](https://modal.com/apps/ekzhang/main/ap-AMkTFWk8QDJEM5Dg1cRdQd)
@@ -119,22 +120,24 @@ and selected indices. Table widths 1, 3 and 1,025 also match the equations while
 reusing identical compiled metadata and conversion kernels. Its report is
 `artifacts/benchmarks/deepinfer-v41-dynamic-metadata-probe.json`.
 
-At clean commit `cd5ecfd`, the [full-checkpoint EP4/ADP4 B300 check](https://modal.com/apps/ekzhang/main/ap-G0MLxyy7133CqWY3HJwRjo)
+At clean commit `40a44fd`, the [full-checkpoint EP4/ADP4 B300 check](https://modal.com/apps/ekzhang/main/ap-LJDJ9gxQ1FTvfB51xQOh9U)
 passes on all four drivers with the released 384 experts and natural routing.
-Each driver runs four prefill and three decode steps, replays three full decode
-graphs, 160 prefill compute regions and 480 attention-projection regions. Eager
-and captured execution produce identical greedy IDs, prompt logprobs,
-generated-token logprobs and top-3 logprobs (maximum absolute difference zero).
-This includes the shared metadata and prepared forward operators. Natural K3
-verification accepts 9/9 drafts on this short counting prompt; this does not
-establish model quality or representative acceptance. The report is
-`artifacts/benchmarks/2026-10-22-deepseek-v41-prepared/overlap-validation.json`.
+Each driver runs one prefill and three decode steps, replaying 40 prefill compute
+regions and three full decode graphs. Eager and captured execution produce
+identical greedy IDs, prompt logprobs, generated-token logprobs and top-3 logprobs
+(maximum absolute difference zero). This includes prepared metadata, compact
+graph-control votes and event-guarded host staging. Natural K3 verification accepts
+9/9 drafts on this short counting prompt; this does not establish model quality
+or representative acceptance.
 
 The same run checks Engine-owned GPU feedback with greedy sampling, scores and
 token stops disabled. All four drivers emit 160 tokens identical to synchronous
-captured execution, with 57 enqueues and 55 GPU continuations per driver. Generated
+captured execution, with 54 enqueues and 52 GPU continuations per driver. Generated
 positions 26 through 185 cross a 128-token cache-page boundary, exercising the
-transition back through page planning as well as continued graph replay.
+transition back through page planning as well as continued graph replay. The raw
+report, audited summary and completed-run log are
+`artifacts/benchmarks/2026-10-22-deepseek-v41-prepared/final-validation.json`,
+`final-validation-summary.json` and `final-validation.log` in the same directory.
 
 The [native FP32 route EP2 probe](https://modal.com/apps/ekzhang/main/ap-72WXKqszkwgN9zSWQIn3gv)
 at `14af36b` covers synthetic 16-expert, top-6 routing with widths 5,120/2,304 and
