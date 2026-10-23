@@ -251,7 +251,7 @@ def test_overlap_benchmark_defers_reduction_and_observes_harvested_positions():
         # GPU work must not progress in untimed per-step synchronization or
         # reduction calls. All measured reductions happen after all harvests.
         assert synchronizations == []
-        assert reductions[-3:] == [4, 4, 4]
+        assert reductions == [0, 4, 4, 4]  # Prefill, then the measured window.
         assert engine.overlap_stats[1] >= 3
         assert not engine.has_work()
     finally:

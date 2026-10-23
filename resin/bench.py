@@ -449,14 +449,12 @@ def run_sweep(
                     step()
                 for index in range(warmup_steps + measure_steps):
                     measuring = index >= warmup_steps
-                    if measuring and index == warmup_steps:
+                    if overlap and measuring and warmup_steps == 0 and index == 0:
                         previous_completion = None
-                    result = step(defer_reduce=overlap and measuring)
+                    result = step(defer_reduce=overlap)
                     if runner.observation["phase"] != "decode":
                         raise RuntimeError("decode benchmark did not execute decode")
-                    expected = case.batch_size * (
-                        1 if overlap and measuring else attn_dp
-                    )
+                    expected = case.batch_size * (1 if overlap else attn_dp)
                     if result["sequences"] != expected:
                         raise RuntimeError(
                             "decode batch was not fully scheduled: "
