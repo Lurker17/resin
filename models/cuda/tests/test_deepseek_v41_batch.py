@@ -114,7 +114,7 @@ def test_prepared_metadata_matches_scalar_paged_addresses(draft, masked):
                 table.parent_ids[row] * cache.geometry.packings[1]
                 + table.child_slots[row]
             )
-            assert torch.equal(frame.block_tables[query * 3 + row], expected)
+            assert torch.equal(frame.block_tables[row * 5 + query], expected)
 
 
 def test_compressed_mapping_reuses_identity_and_refreshes_new_source_selection():
@@ -158,6 +158,88 @@ def test_preparation_refreshes_engine_tables_and_cross_page_positions():
         next_frame.slot_mapping_store_swa[1, -1] != first.slot_mapping_store_swa[1, -1]
     )
     assert next_frame.state_block_idx[1, -1] == physical(cache, 2, 1, 256) // 128
+
+
+def crossing_page_batch(device="cpu"):
+    cache, _ = cache_and_positions(device=device)
+    parents = torch.tensor([[1, 0], [2, 0], [3, 0], [4, 5]], device=device).int()
+    group = DevicePageGroup(
+        parents, torch.zeros_like(parents), torch.zeros(4, device=device).int()
+    )
+    cache = DeviceCache(cache.geometry, (group,) * 4, cache.storage)
+    positions = torch.tensor([70, 74, 80, 125], device=device)[:, None] + torch.arange(
+        4, device=device
+    )
+    return cache, cache.prepare_metadata(positions)
+
+
+def test_indexer_request_runs_use_their_own_first_query_page_table():
+    cache, frame = crossing_page_batch()
+    # DeepGEMM groups equal adjacent IDs and indexes tables by the run's first
+    # query offset, not by the value of that ID. Only request 3 crosses page 128.
+    ids = frame.query_indices.tolist()
+    for start in range(len(ids)):
+        if start and ids[start] == ids[start - 1]:
+            continue
+        row = ids[start]
+        length = int(frame.klen[1][row, -1])
+        for position in range(length):
+            page = int(frame.block_tables[start, position // 128])
+            assert page * 128 + position % 128 == physical(cache, 1, row, position)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="requires Blackwell",
+)
+def test_deepgemm_index_logits_with_unequal_request_pages():
+    """Run the actual varlen kernel across the 128-token boundary with B=Q=4."""
+    import deep_gemm
+    from deep_gemm.utils import per_token_cast_to_fp4
+
+    cache, frame = crossing_page_batch("cuda")
+    heads, dim, page_tokens = 8, 128, 128
+    pages = int(frame.block_tables.max()) + 1
+    page_values = (2.0 ** (torch.arange(pages, device="cuda") % 3)).bfloat16()
+    keys = page_values[:, None, None].expand(pages, page_tokens, dim).contiguous()
+    packed, scales = per_token_cast_to_fp4(
+        keys.flatten(0, 1), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    kv = torch.empty(pages, page_tokens * 68, device="cuda", dtype=torch.uint8)
+    kv[:, : page_tokens * 64] = packed.view(pages, -1).view(torch.uint8)
+    kv[:, page_tokens * 64 :] = scales.reshape(pages, -1).view(torch.uint8)
+    kv = kv.view(pages, page_tokens, 1, 68)
+    q, sf = per_token_cast_to_fp4(
+        torch.ones(16 * heads, dim, device="cuda", dtype=torch.bfloat16),
+        use_ue8m0=True,
+        gran_k=32,
+        use_packed_ue8m0=True,
+    )
+    lengths = frame.klen[1].reshape(-1, 1)
+    schedule = deep_gemm.get_paged_mqa_logits_metadata(
+        lengths, page_tokens, deep_gemm.get_num_sms(), indices=frame.query_indices
+    )
+    actual = deep_gemm.fp8_fp4_paged_mqa_logits(
+        (q.view(16, 1, heads, dim // 2), sf.view(16, 1, heads)),
+        kv,
+        torch.ones(16, heads, device="cuda", dtype=torch.bfloat16),
+        lengths,
+        frame.block_tables,
+        schedule,
+        256,
+        indices=frame.query_indices,
+    ).cpu()
+    for row in range(4):
+        for query in range(4):
+            length = int(frame.klen[1][row, query])
+            expected = torch.tensor(
+                [
+                    heads * dim * 2 ** ((physical(cache, 1, row, p) // 128) % 3)
+                    for p in range(length)
+                ],
+                dtype=torch.bfloat16,
+            )
+            torch.testing.assert_close(actual[row * 4 + query, :length], expected)
 
 
 def test_private_draft_keys_mask_invalid_columns_and_target_storage_stays_linear():

@@ -28,7 +28,7 @@ def convert_kv_index_tl(
     def _convert_kv_index(
         selected: T.Tensor([b, s, k], T.int32),  # ty: ignore[invalid-type-form]
         context_lens: T.Tensor([b, s], T.int32),  # ty: ignore[invalid-type-form]
-        block_tables: T.Tensor([b, n], T.int32),  # ty: ignore[invalid-type-form]
+        block_tables: T.Tensor([b * s, n], T.int32),  # ty: ignore[invalid-type-form]
         output: T.Tensor([b, s, k], T.int32),  # ty: ignore[invalid-type-form]
     ):
         with T.Kernel(s, b, threads=128) as (sid, bid):
@@ -38,7 +38,7 @@ def convert_kv_index_tl(
             for k_i in T.Parallel(k):
                 x = topk_idxs_fragment[k_i]
                 if 0 <= x < context_lens[bid, sid] and x // block_size < n:
-                    page = block_tables[bid, x // block_size]
+                    page = block_tables[bid * s + sid, x // block_size]
                     topk_idxs_fragment[k_i] = T.if_then_else(
                         page >= 0, page * block_size + x % block_size, -1
                     )

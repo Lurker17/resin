@@ -255,15 +255,14 @@ class DeviceCache:
     def index_block_table(self, query_tokens):
         """Adapt Engine parent/child IDs without materializing historical keys.
 
-        DeepGEMM's varlen API reserves one table row per query. Request IDs
-        still refer to the first batch-size rows, so repeating the table only
-        supplies the required backing extent; queries share their original row.
+        DeepGEMM's varlen API indexes the table by flattened query offset.
+        Each request's queries must therefore repeat that request's own table.
         """
         group = self.groups[COMPRESSED]
         pages = (
             group.parent_ids * self.geometry.packings[COMPRESSED] + group.child_slots
         )
-        return pages.repeat(query_tokens, 1).int()
+        return pages.repeat_interleave(query_tokens, dim=0).int()
 
     def compressor_rows(self, layer, positions):
         base, offsets = self._bytes(COMPRESSOR, positions)

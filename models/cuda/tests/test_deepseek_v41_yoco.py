@@ -25,6 +25,10 @@ def test_compact_metadata_preserves_page_ownership_masks_and_placeholder_history
     assert torch.equal(original.slot_mapping_store_swa, original_stores)
     for row in range(3):
         for query, source in enumerate((2, 3, 4, 0)):
+            torch.testing.assert_close(
+                compact.block_tables[row * 4 + query],
+                original.block_tables[row * 5 + source],
+            )
             pos = int(positions[row, source])
             valid = query != 3
             writable = valid and pos >= 128

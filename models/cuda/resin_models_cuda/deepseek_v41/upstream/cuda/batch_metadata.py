@@ -196,7 +196,7 @@ def prepare_engine_metadata_tl(
                                 + ca_slots[bid, column]
                             )
                             for sid in T.serial(queries):
-                                block_tables[sid * batch + bid, column] = (
+                                block_tables[bid * queries + sid, column] = (
                                     T.if_then_else(
                                         ca_parents[bid, column] > 0, page, -1
                                     )
@@ -258,8 +258,8 @@ def copy_engine_tables_tl(packings: tuple[int, int]) -> Any:
             queries = rows // batch
             bid, sid = row // queries, row % queries
             T.pdl_sync()
-            # Preserve DG's sequence-major first B CA rows, while SWA lookup
-            # uses the flattened [batch, queries] row order.
+            # DeepGEMM selects a request's table by its first flattened query
+            # offset; the IDs only identify runs of queries belonging together.
             for tile in T.serial(T.ceildiv(width_ca, 128)):
                 for lane in T.Parallel(128):
                     column = tile * 128 + lane
@@ -268,7 +268,7 @@ def copy_engine_tables_tl(packings: tuple[int, int]) -> Any:
                             ca_parents[bid, column] * packings[1]
                             + ca_slots[bid, column]
                         )
-                        block_tables[sid * batch + bid, column] = T.if_then_else(
+                        block_tables[row, column] = T.if_then_else(
                             ca_parents[bid, column] > 0, page, -1
                         )
             for tile in T.serial(T.ceildiv(width_swa, 128)):

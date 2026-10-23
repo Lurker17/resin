@@ -45,9 +45,7 @@ def compact_metadata(
         + torch.arange(window, device=positions.device)
     )
     indices = torch.where(valid[..., None] & (logical >= swa_start), indices, -1)
-    # Engine tables are repeated in query-major order; request IDs and all
-    # ordinary per-token fields use batch-major order.
-    tables = frame.block_tables.reshape(queries, batch, -1).index_select(0, safe)
+    tables = frame.block_tables.reshape(batch, queries, -1).index_select(1, safe)
     return ForwardMetadata(
         positions=positions,
         context_lens=select(frame.context_lens),

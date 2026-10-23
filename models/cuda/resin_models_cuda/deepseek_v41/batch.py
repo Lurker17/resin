@@ -20,7 +20,7 @@ class ForwardMetadata:
     klen: dict[int, Tensor]
     state_block_idx: Tensor
     query_indices: Tensor
-    block_tables: Tensor
+    block_tables: Tensor  # [batch * queries, pages], in flattened query order.
     draft_slots: Tensor
     draft_indices: Tensor
     _selected: dict[tuple[int, int], tuple[Tensor, Tensor]] = field(
@@ -42,20 +42,21 @@ class ForwardMetadata:
 
             output = torch.empty_like(selected, dtype=torch.int32)
             batch, queries, topk = selected.shape
-            table = self.block_tables[:batch]
             convert_kv_index_tl(topk, 128 // ratio)(
                 selected,
                 self.klen[ratio],
-                table,
+                self.block_tables,
                 output,
             )
         else:
             # The CPU branch is the address equation, independent of TileLang.
             batch, queries, topk = selected.shape
-            table = self.block_tables[:batch]
+            table = self.block_tables
             block_size = 128 // ratio
             columns = selected.clamp_min(0).long() // block_size
-            pages = table.gather(1, columns.clamp_max(table.shape[1] - 1).flatten(1))
+            pages = table.gather(
+                1, columns.clamp_max(table.shape[1] - 1).reshape(batch * queries, topk)
+            )
             pages = pages.reshape(batch, queries, topk)
             output = torch.where(
                 (selected >= 0)
@@ -247,7 +248,7 @@ def _reference(cache, positions, ratios, draft, valid_tokens):
         query_indices=torch.arange(batch, device=positions.device)
         .repeat_interleave(queries)
         .int(),
-        block_tables=pages.repeat(queries, 1),
+        block_tables=pages.repeat_interleave(queries, dim=0),
         draft_slots=draft_slots,
         draft_indices=private,
     )
