@@ -172,9 +172,13 @@ def _selection_worker(rank, rendezvous):
             fixed = 0
             objects = 0
 
-            def all_gather_single(self, *args, **kwargs):
+            def gather(self, *args, **kwargs):
                 self.fixed += 1
-                return dist.all_gather_single(*args, **kwargs)
+                return dist.gather(*args, **kwargs)
+
+            def broadcast(self, *args, **kwargs):
+                self.fixed += 1
+                return dist.broadcast(*args, **kwargs)
 
             def all_gather_object(self, *args, **kwargs):
                 self.objects += 1
@@ -195,13 +199,13 @@ def _selection_worker(rank, rendezvous):
             "decode", context, required_shape=required
         )
         assert shape == (4, 8)
-        assert (transport.fixed, transport.objects) == (1, 1)
+        assert (transport.fixed, transport.objects) == (2, 1)
         for _ in range(3):
             before = transport.fixed, transport.objects
             assert runner._select_distributed_cuda_graph(
                 "decode", context, required_shape=required
             ) == (4, 8)
-            assert (transport.fixed, transport.objects) == (before[0] + 1, before[1])
+            assert (transport.fixed, transport.objects) == (before[0] + 2, before[1])
 
         # An identical live catalog update is revalidated once on every rank.
         # A later one-rank mutation must invalidate warm trust on all peers.
@@ -215,7 +219,7 @@ def _selection_worker(rank, rendezvous):
         assert mutable._select_distributed_cuda_graph(
             "decode", context, required_shape=(1, 1)
         ) == (1, 4)
-        assert (transport.fixed, transport.objects) == (before[0] + 1, before[1] + 1)
+        assert (transport.fixed, transport.objects) == (before[0] + 2, before[1] + 1)
         if rank == 0:
             cache.shapes = ((1, 4),)
         with pytest.raises(ValueError, match="catalogs must agree"):

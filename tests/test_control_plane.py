@@ -46,11 +46,16 @@ def _control_worker(rank, rendezvous, output):
 
     class Transport:
         gathers = 0
+        broadcasts = 0
         objects = 0
 
-        def all_gather_single(self, *args, **kwargs):
+        def gather(self, *args, **kwargs):
             self.gathers += 1
-            dist.all_gather_single(*args, **kwargs)
+            dist.gather(*args, **kwargs)
+
+        def broadcast(self, *args, **kwargs):
+            self.broadcasts += 1
+            dist.broadcast(*args, **kwargs)
 
         def all_gather_object(self, *args, **kwargs):
             self.objects += 1
@@ -91,7 +96,7 @@ def _control_worker(rank, rendezvous, output):
     assert len(control._buffers) == 1
 
     # Exercise actual driver codecs and their opaque HTTP fallback on the same
-    # group. Every successful step vote remains one tensor collective.
+    # group. Every successful step vote uses only fixed tensor collectives.
     worker = object.__new__(DistributedWorker)
     worker.groups = SimpleNamespace(drivers=group, distributed=transport)
     worker._control, worker.failure = control, None
@@ -122,7 +127,13 @@ def _control_worker(rank, rendezvous, output):
             worker._drivers("http output", {"rank": rank})
     assert transport.objects == 3  # No opaque payload exchange after mismatch.
     (output / f"rank{rank}.json").write_text(
-        json.dumps({"gathers": transport.gathers, "objects": transport.objects})
+        json.dumps(
+            {
+                "gathers": transport.gathers,
+                "broadcasts": transport.broadcasts,
+                "objects": transport.objects,
+            }
+        )
     )
     dist.destroy_process_group()
 
@@ -135,7 +146,7 @@ def test_control_votes_preserve_rank_records_failure_diagnostics_and_order(tmp_p
         join=True,
     )
     records = [json.loads(path.read_text()) for path in tmp_path.glob("rank*.json")]
-    assert records == [{"gathers": 15, "objects": 3}] * 2
+    assert records == [{"gathers": 15, "broadcasts": 15, "objects": 3}] * 2
 
 
 def _inference_mode_worker(rank, rendezvous):
@@ -167,7 +178,8 @@ def _inference_mode_worker(rank, rendezvous):
                 ]
                 assert errors == [None, None]
                 assert len(control._buffers) == 1
-                buffers = next(iter(control._buffers.values()))
+                cached = next(iter(control._buffers.values()))
+                buffers = (cached.send, cached.receive, *cached.rows)
                 assert all(not torch.is_inference(tensor) for tensor in buffers)
                 if saved is None:
                     saved = buffers
@@ -190,4 +202,62 @@ def test_control_buffers_cross_inference_mode_boundaries(tmp_path):
         args=(tmp_path / "inference-rendezvous",),
         nprocs=2,
         join=True,
+    )
+
+
+def _subgroup_worker(rank, rendezvous):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=30),
+    )
+    ranks = (1, 2, 3)
+    handle = dist.new_group(list(ranks), backend="gloo")
+    try:
+        if rank in ranks:
+            group = RankGroup(ranks, handle, ranks.index(rank))
+            control = ControlPlane(dist)
+            for operation in (ControlOperation.PREPARE, "HTTP configuration"):
+                records, errors = control.gather(
+                    group,
+                    operation,
+                    (rank, -(1 << 63) + rank, (1 << 63) - 1 - rank),
+                )
+                assert records == [
+                    (member, -(1 << 63) + member, (1 << 63) - 1 - member)
+                    for member in ranks
+                ]
+                assert errors == [None] * len(ranks)
+            records, errors = control.gather(
+                group,
+                ControlOperation.FORWARD,
+                (rank,),
+                error="middle rank failed" if rank == 2 else None,
+            )
+            assert records == [(1,), (2,), (3,)]
+            assert errors == [None, "middle rank failed", None]
+            with pytest.raises(ControlPlaneError, match="different orders"):
+                control.gather(
+                    group,
+                    ControlOperation.PREPARE if rank == group.source else "HTTP output",
+                )
+            assert control.gather(group, ControlOperation.COMMIT) == (
+                [(), (), ()],
+                [None, None, None],
+            )
+        dist.barrier()
+    finally:
+        if rank in ranks:
+            dist.destroy_process_group(handle)
+        dist.destroy_process_group()
+
+
+def test_control_subgroup_preserves_records_and_errors_with_nonzero_global_root(
+    tmp_path,
+):
+    mp.spawn(
+        _subgroup_worker, args=(tmp_path / "subgroup-rendezvous",), nprocs=4, join=True
     )

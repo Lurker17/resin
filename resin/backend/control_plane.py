@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import IntEnum
 from hashlib import blake2b
 
@@ -23,10 +24,17 @@ class ControlPlaneError(RuntimeError):
     pass
 
 
-class ControlPlane:
-    """Gather fixed-size integer records with one CPU collective per vote.
+@dataclass(frozen=True, slots=True)
+class _VoteBuffers:
+    send: torch.Tensor
+    receive: torch.Tensor
+    rows: list[torch.Tensor]
 
-    Every operation uses the same shape and collective, including the operation
+
+class ControlPlane:
+    """Gather fixed-size integer records, then broadcast the complete table.
+
+    Every operation uses the same shapes and collectives, including the operation
     tag check; ranks calling different step operations therefore fail together.
     Error text takes a separate object gather only when a rank reports failure.
     """
@@ -36,9 +44,7 @@ class ControlPlane:
 
     def __init__(self, distributed):
         self.distributed = distributed
-        self._buffers: dict[
-            tuple[int, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]
-        ] = {}
+        self._buffers: dict[tuple[int, tuple[int, ...]], _VoteBuffers] = {}
         self._tags: dict[str, int] = {}
 
     def gather(
@@ -73,17 +79,25 @@ class ControlPlane:
             with torch.inference_mode(False):
                 send = torch.empty(self._width, dtype=torch.int64, device="cpu")
                 receive = torch.empty(
-                    group.size * self._width, dtype=torch.int64, device="cpu"
+                    (group.size, self._width), dtype=torch.int64, device="cpu"
                 )
-            self._buffers[key] = send, receive
-        else:
-            send, receive = buffers
+                buffers = _VoteBuffers(send, receive, list(receive.unbind(0)))
+            self._buffers[key] = buffers
+        send, receive = buffers.send, buffers.receive
         send.zero_()
         send[0], send[1] = tag, int(error is not None)
         for column, value in enumerate(values, 2):
             send[column] = value
-        self.distributed.all_gather_single(receive, send, group=group.handle)
-        records = receive.view(group.size, self._width).tolist()
+        # Gathering to the source and broadcasting the table preserves every
+        # rank's exact record with lower Gloo latency for small, wide votes.
+        self.distributed.gather(
+            send,
+            gather_list=buffers.rows if group.local_rank == 0 else None,
+            dst=group.source,
+            group=group.handle,
+        )
+        self.distributed.broadcast(receive, src=group.source, group=group.handle)
+        records = receive.tolist()
         if any(record[0] != tag for record in records):
             raise ControlPlaneError(
                 "ranks called collective engine operations in different orders"
