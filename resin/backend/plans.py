@@ -49,17 +49,12 @@ class BatchView:
             or len(positions) != tokens
         ):
             raise ValueError("BatchPlan does not describe nonempty token rows")
-        for row in range(rows):
-            start, end = map(int, token_indptr[row : row + 2])
-            expected = np.arange(
-                context_lengths[row],
-                int(context_lengths[row]) + end - start,
-                dtype=np.uint32,
-            )
-            if not np.array_equal(positions[start:end], expected):
-                raise ValueError(
-                    "BatchPlan positions are not contiguous within each row"
-                )
+        query_lengths = np.diff(token_indptr)
+        expected = np.arange(tokens, dtype=np.int64) + np.repeat(
+            context_lengths.astype(np.int64) - token_indptr[:-1], query_lengths
+        )
+        if not np.array_equal(positions, expected):
+            raise ValueError("BatchPlan positions are not contiguous within each row")
         try:
             cache_groups = tuple(plan.cache_groups)
         except (AttributeError, TypeError) as error:
@@ -258,6 +253,21 @@ class PagedCachePlan:
         if len(batch.cache_groups) != len(layout.groups):
             raise ValueError("BatchPlan cache groups do not match CacheLayout")
 
+        query_lengths = batch.query_lengths.astype(np.int64)
+        row_ids = np.repeat(np.arange(batch.num_sequences), query_lengths)
+        positions = batch.positions.astype(np.int64)
+        lookahead = decode_lookahead if batch.phase == BatchPhase.DECODE else 0
+        # Native fields are u32, but a leased decode span can extend beyond u32.
+        # Keep even oversized caller-supplied lookahead from wrapping arithmetic.
+        post_lengths = batch.context_lengths.astype(np.int64) + query_lengths
+        arithmetic = (
+            object
+            if lookahead > np.iinfo(np.int64).max - int(post_lengths.max())
+            else np.int64
+        )
+        write_tokens = query_lengths.astype(arithmetic) + lookahead
+        leased = batch.context_lengths.astype(arithmetic) + write_tokens
+
         groups = []
         for index, (native, descriptor) in enumerate(
             zip(batch.cache_groups, layout.groups, strict=True)
@@ -272,60 +282,61 @@ class PagedCachePlan:
                 block_tokens=block_tokens,
             )
             window_blocks = descriptor.window_resident_block_count
-            for row in range(batch.num_sequences):
-                token_slice = batch.token_slice(row)
-                query_length = token_slice.stop - token_slice.start
-                write_tokens = query_length + (
-                    decode_lookahead if batch.phase == BatchPhase.DECODE else 0
-                )
-                if window_blocks is not None:
-                    assert descriptor.window_tokens is not None
-                    assert descriptor.read_window_tokens is not None
-                    maximum = (
-                        descriptor.window_tokens - descriptor.read_window_tokens + 1
+            invalid_span = np.zeros(batch.num_sequences, dtype=np.bool_)
+            maximum = 0
+            if window_blocks is not None:
+                assert descriptor.window_tokens is not None
+                assert descriptor.read_window_tokens is not None
+                maximum = descriptor.window_tokens - descriptor.read_window_tokens + 1
+                invalid_span = write_tokens > maximum
+            last_blocks = (leased - 1) // block_tokens
+            if descriptor.family == CacheGroupFamily.STATE:
+                expected_first = np.maximum(0, last_blocks - 1)
+            elif window_blocks is not None:
+                expected_first = np.maximum(0, last_blocks + 1 - window_blocks)
+            else:
+                expected_first = np.zeros(batch.num_sequences, dtype=np.int64)
+            invalid_range = (group.block_table_start_indices != expected_first) | (
+                np.diff(group.block_indptr) != last_blocks - expected_first + 1
+            )
+
+            logical_blocks = positions // block_tokens
+            # Malformed extents, including empty rows, cannot be indexed safely.
+            retained = (logical_blocks >= expected_first[row_ids]) & ~invalid_range[
+                row_ids
+            ]
+            retained_rows = row_ids[retained]
+            columns = (logical_blocks[retained] - expected_first[retained_rows]).astype(
+                np.intp
+            )
+            addresses = group.block_indptr[:-1][retained_rows] + columns
+            invalid_append = (
+                group.append_slab_ids[retained] != group.block_slab_ids[addresses]
+            ) | (group.append_slotnums[retained] != group.block_slotnums[addresses])
+            invalid_append |= (
+                group.append_block_offsets[retained]
+                != positions[retained] % block_tokens
+            )
+            invalid_append_rows = np.zeros(batch.num_sequences, dtype=np.bool_)
+            invalid_append_rows[retained_rows[invalid_append]] = True
+            # Keep the original row-first failure order across all three checks.
+            invalid_rows = np.flatnonzero(
+                invalid_span | invalid_range | invalid_append_rows
+            )
+            if len(invalid_rows):
+                row = int(invalid_rows[0])
+                if invalid_span[row]:
+                    raise ValueError(
+                        f"cache group {index} row {row} write span {write_tokens[row]} "
+                        f"exceeds {maximum}-token Window read/write capacity"
                     )
-                    if write_tokens > maximum:
-                        raise ValueError(
-                            f"cache group {index} row {row} write span {write_tokens} "
-                            f"exceeds {maximum}-token Window read/write capacity"
-                        )
-                leased = int(batch.context_lengths[row]) + write_tokens
-                last_block = (leased - 1) // block_tokens
-                if descriptor.family == CacheGroupFamily.STATE:
-                    expected_first = max(0, last_block - 1)
-                elif window_blocks is not None:
-                    expected_first = max(0, last_block + 1 - window_blocks)
-                else:
-                    expected_first = 0
-                slabs = group.block_slabs(row)
-                slots = group.block_slots(row)
-                if (
-                    int(group.block_table_start_indices[row]) != expected_first
-                    or len(slabs) != last_block - expected_first + 1
-                ):
+                if invalid_range[row]:
                     raise ValueError(
                         f"cache group {index} row {row} is not its exact active range"
                     )
-
-                positions = batch.positions[token_slice]
-                logical_blocks = positions // block_tokens
-                retained = logical_blocks >= expected_first
-                columns = logical_blocks[retained] - expected_first
-                if (
-                    not np.array_equal(
-                        group.append_slab_ids[token_slice][retained], slabs[columns]
-                    )
-                    or not np.array_equal(
-                        group.append_slotnums[token_slice][retained], slots[columns]
-                    )
-                    or not np.array_equal(
-                        group.append_block_offsets[token_slice][retained],
-                        positions[retained] % block_tokens,
-                    )
-                ):
-                    raise ValueError(
-                        f"cache group {index} row {row} append target is not row-owned"
-                    )
+                raise ValueError(
+                    f"cache group {index} row {row} append target is not row-owned"
+                )
             groups.append(group)
         return cls(batch, layout, tuple(groups))
 
