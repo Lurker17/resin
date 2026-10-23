@@ -16,6 +16,10 @@ import torch.distributed as dist
 
 from resin import BatchPhase, CacheGroupLayout, CacheLayout, Parallelism, RunnerConfig
 from resin.backend.cuda.graphs import CudaGraphMode
+from resin.backend.cuda.parallel import (
+    TensorParallelContext,
+    replicated_cache_capacity,
+)
 from resin.backend.cuda.runner import CudaRunner
 from resin.backend.distributed import StepContext
 from resin.backend.expert_parallel import ExpertParallelDispatch
@@ -44,7 +48,7 @@ class _CpuRunner(CudaRunner):
         self._cuda_graph_executor = None
         self._model = torch.nn.Module()
         self.runner_config = RunnerConfig()
-        self._configure_expert_parallel_graphs(self._model, groups)
+        self._configure_parallel_graphs(self._model, groups)
         self._configure_cuda_graphs(
             {"decode": CudaGraphMode(shapes, lambda _: _unreachable(), lambda _: {})}
         )
@@ -164,6 +168,17 @@ def _selection_worker(rank, rendezvous):
     dist.barrier()
     groups = None
     try:
+        world = RankGroup((0, 1), dist.group.WORLD, rank)
+        context = TensorParallelContext.from_group(world)
+        assert (context.rank, context.size) == (rank, 2)
+        torch.testing.assert_close(
+            context.sum(torch.tensor([rank + 1])), torch.tensor([3])
+        )
+        with torch.inference_mode():
+            assert replicated_cache_capacity(100 - rank * 7, world) == 93
+        assert not TensorParallelContext.from_group(None).enabled
+        assert not TensorParallelContext.from_group(RankGroup((rank,), None, 0)).enabled
+        assert replicated_cache_capacity(17, None) == 17
         groups = ParallelGroups.create(
             Parallelism(world_size=2, ep=2, attn_dp=2), device_backend="gloo"
         )
@@ -226,7 +241,7 @@ def _selection_worker(rank, rendezvous):
             mutable._select_distributed_cuda_graph(
                 "decode", context, required_shape=(1, 1)
             )
-        assert mutable._expert_graph_catalogs["decode"] == ((1, 4), (4, 8))
+        assert mutable._parallel_graph_catalogs["decode"] == ((1, 4), (4, 8))
 
         with pytest.raises(ValueError, match="dimensions must agree"):
             runner._select_distributed_cuda_graph(
@@ -389,9 +404,13 @@ def test_driver_policy_disables_every_peer_without_hiding_catalogs(
         assert bool(value[0]) == (rank == 1)
         return [(0, *value[1:]), (1, *value[1:])], [None, None]
 
-    runner._expert_graph_catalogs[mode] = catalog
-    runner._expert_graph_groups = SimpleNamespace(domain=RankGroup((0, 1), None, rank))
-    monkeypatch.setattr(runner, "_expert_graph_control", SimpleNamespace(gather=gather))
+    runner._parallel_graph_catalogs[mode] = catalog
+    runner._parallel_graph_groups = SimpleNamespace(
+        domain=RankGroup((0, 1), None, rank)
+    )
+    monkeypatch.setattr(
+        runner, "_parallel_graph_control", SimpleNamespace(gather=gather)
+    )
     context = SimpleNamespace(max_num_tokens=2)
     assert (
         runner._select_distributed_cuda_graph(mode, context, required_shape=catalog[0])

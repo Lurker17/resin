@@ -99,31 +99,31 @@ class CudaRunner(Runner):
         self._sampler = FlashInferSampler()
         self._cache_binding: CachePoolBinding | None = None
         self._cuda_graph_executor: CudaGraphExecutor | None = None
-        self._expert_graph_model = None
-        self._expert_graph_groups = None
-        self._expert_graph_catalogs = {}
-        self._expert_graph_control = None
+        self._parallel_graph_model = None
+        self._parallel_graph_groups = None
+        self._parallel_graph_catalogs = {}
+        self._parallel_graph_control = None
         self._distributed_prefill_bucket = None
         self._distributed_prefill_scope = False
 
-    def _configure_expert_parallel_graphs(self, model, groups) -> None:
-        """Attach explicit expert collectives to the ordinary graph machinery."""
+    def _configure_parallel_graphs(self, model, groups) -> None:
+        """Coordinate capture catalogs and collectives across the execution mesh."""
 
-        self._expert_graph_model, self._expert_graph_groups = model, groups
-        self._expert_graph_catalogs = {}
-        self._expert_graph_control = (
+        self._parallel_graph_model, self._parallel_graph_groups = model, groups
+        self._parallel_graph_catalogs = {}
+        self._parallel_graph_control = (
             None if groups is None else ControlPlane(groups.distributed)
         )
 
-    def _expert_graph_capacity(self, capacity: int, *, valid_rows=None):
-        if getattr(self, "_expert_graph_groups", None) is None:
+    def _parallel_graph_capacity(self, capacity: int, *, valid_rows=None):
+        if getattr(self, "_parallel_graph_groups", None) is None:
             return nullcontext()
-        model = self._expert_graph_model
+        model = self._parallel_graph_model
         assert model is not None
         return fixed_layer_capacity(model, capacity, valid_rows=valid_rows)
 
     def _graph_domain_values(self, value):
-        groups = getattr(self, "_expert_graph_groups", None)
+        groups = getattr(self, "_parallel_graph_groups", None)
         if groups is None or groups.domain.size == 1:
             return [value]
         values = [None] * groups.domain.size
@@ -131,7 +131,7 @@ class CudaRunner(Runner):
         return values
 
     def _validate_distributed_graph_catalogs(self, request=None) -> None:
-        if getattr(self, "_expert_graph_groups", None) is None:
+        if getattr(self, "_parallel_graph_groups", None) is None:
             return
         catalog = tuple(
             (mode, stats["configured_shapes"], stats["captured_shapes"])
@@ -150,7 +150,7 @@ class CudaRunner(Runner):
             raise ValueError(
                 "distributed CUDA graph catalogs and capture order must agree"
             )
-        self._expert_graph_catalogs = {
+        self._parallel_graph_catalogs = {
             mode: tuple(
                 tuple(shape)
                 for shape in self._require_cuda_graph_executor().mode(mode).shapes
@@ -179,7 +179,7 @@ class CudaRunner(Runner):
         cache = self._require_cuda_graph_executor().mode(mode)
         required_shape = tuple(required_shape)
         catalog = tuple(tuple(shape) for shape in cache.shapes)
-        trusted = self._expert_graph_catalogs
+        trusted = self._parallel_graph_catalogs
         changed = trusted.get(mode) != catalog
         # Ordinary graph demands fit the fixed control record. Wider generic
         # GraphShapes retain the full object path rather than losing dimensions.
@@ -190,11 +190,11 @@ class CudaRunner(Runner):
             *required_shape[:3],
             *(0 for _ in range(max(0, 3 - len(required_shape)))),
         )
-        groups = getattr(self, "_expert_graph_groups", None)
+        groups = getattr(self, "_parallel_graph_groups", None)
         if groups is None:
             records = [record]
         else:
-            control = self._expert_graph_control
+            control = self._parallel_graph_control
             assert control is not None
             records, _ = control.gather(
                 groups.domain, f"cuda_graph_select:{mode}", record
@@ -370,7 +370,11 @@ class CudaRunner(Runner):
                 device=self.device,
             )
             inputs = {"hidden": hidden}
-            if getattr(self, "_expert_graph_groups", None) is not None:
+            if (
+                getattr(self, "_parallel_graph_groups", None) is not None
+                and self._parallel_graph_model is not None
+                and any(layer_collectives(self._parallel_graph_model))
+            ):
                 inputs["ep_valid_rows"] = torch.tensor(
                     tokens, dtype=torch.int32, device=self.device
                 )
@@ -399,7 +403,7 @@ class CudaRunner(Runner):
 
         def launch():
             with (
-                self._expert_graph_capacity(
+                self._parallel_graph_capacity(
                     tokens, valid_rows=inputs.get("ep_valid_rows")
                 ),
                 self._prefill_capture_context(),
@@ -516,19 +520,20 @@ class CudaRunner(Runner):
         for graphs in getattr(self, "_prefill_tensor_graphs", {}).values():
             graphs.buffers.clear()
         if (
-            self._expert_graph_model is not None
-            and self._expert_graph_groups is not None
+            self._parallel_graph_model is not None
+            and self._parallel_graph_groups is not None
             and any(
-                value.allocated for value in layer_collectives(self._expert_graph_model)
+                value.allocated
+                for value in layer_collectives(self._parallel_graph_model)
             )
         ):
             # Every peer must finish reading shared layer buffers before any
             # rank unmaps them, including when a model is reloaded in-process.
             torch.cuda.synchronize(self.device)
-            self._expert_graph_groups.distributed.barrier(
-                group=self._expert_graph_groups.domain.handle
+            self._parallel_graph_groups.distributed.barrier(
+                group=self._parallel_graph_groups.domain.handle
             )
-            close_layer_collectives(self._expert_graph_model)
+            close_layer_collectives(self._parallel_graph_model)
 
     def capture_cuda_graph(self, mode: str, shape: GraphShape) -> CudaGraphStats:
         """Capture one mode shape while honoring model-state hooks."""

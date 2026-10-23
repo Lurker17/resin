@@ -292,7 +292,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         )
         self.weight_load = self._load_weights()
         self._prepare_model_weights()
-        self._configure_expert_parallel_graphs(self._model, parallel_groups)
+        self._configure_parallel_graphs(self._model, parallel_groups)
 
         cache_backend = self._cache_backend()
         self.cache_geometry = self._build_cache_geometry(args)
@@ -562,7 +562,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
 
         def launch() -> None:
             with (
-                self._expert_graph_capacity(batch_size, valid_rows=valid_rows),
+                self._parallel_graph_capacity(batch_size, valid_rows=valid_rows),
                 use_default_dtype(torch.bfloat16),
                 torch.device(self.device),
             ):
@@ -661,7 +661,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 # Expert dispatch counts flattened token rows. Draft and
                 # verification have different block widths, while the live
                 # replica batch is a replay input that may also be zero.
-                with self._expert_graph_capacity(
+                with self._parallel_graph_capacity(
                     batch_size * block_size,
                     valid_rows=None if valid_rows is None else valid_rows * block_size,
                 ):
@@ -671,7 +671,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 if phase_events is not None:
                     phase_events[1].record()
                 verify_ids = torch.cat((token_ids, drafts), dim=1)
-                with self._expert_graph_capacity(
+                with self._parallel_graph_capacity(
                     batch_size * (block_size + 1),
                     valid_rows=None
                     if valid_rows is None

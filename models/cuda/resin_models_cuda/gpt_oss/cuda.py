@@ -271,7 +271,7 @@ class GptOssCudaRunner(CudaRunner):
             tensor_parallel=self.tensor_parallel.layout,
             parallel_groups=parallel_groups,
         )
-        self._configure_expert_parallel_graphs(self._model, parallel_groups)
+        self._configure_parallel_graphs(self._model, parallel_groups)
         self._graph_logits = {}
         self._last_graph_logits = None
         args = self._model.args
@@ -858,7 +858,7 @@ class GptOssCudaRunner(CudaRunner):
         )
 
         def launch() -> None:
-            with self._expert_graph_capacity(batch_size, valid_rows=valid_rows):
+            with self._parallel_graph_capacity(batch_size, valid_rows=valid_rows):
                 hidden = self._forward_batch(token_ids, positions, batch)
                 final_hidden.index_copy_(0, batch.sequence_indices, hidden)
                 logits = self._model.lm_head(final_hidden)

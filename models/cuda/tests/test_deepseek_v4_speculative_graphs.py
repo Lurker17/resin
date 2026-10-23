@@ -90,7 +90,7 @@ def test_speculative_graph_has_distinct_expert_capacities_and_replay_masks(block
             assert current_scope is None
             calls.append("commit")
 
-    runner._expert_graph_capacity = capacity
+    runner._parallel_graph_capacity = capacity
     runner._model = Model()
     step = runner._new_dspark_graph_step((3, 128))
     step.inputs["token_ids"].copy_(torch.tensor([[1], [3], [5]]))
