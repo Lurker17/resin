@@ -93,6 +93,74 @@ def test_legacy_deepseek_tp_keeps_its_prepared_expert_owner_count(implementation
     assert weights.gate.benchmark_replica == 0
 
 
+def test_router_retains_official_fp32_probabilities(implementation):
+    args = implementation.ModelArgs(
+        dim=4,
+        n_routed_experts=8,
+        n_activated_experts=3,
+        score_func="sqrtsoftplus",
+        route_scale=1.5,
+    )
+    gate = implementation.Gate(args)
+    with torch.no_grad():
+        gate.weight.copy_(torch.arange(32).reshape(8, 4) / 37)
+        gate.bias.copy_(torch.linspace(0.2, -0.2, 8))
+    hidden = torch.tensor([[0.125, -0.25, 0.5, 0.75]]).bfloat16()
+    scores = F.softplus(F.linear(hidden.float(), gate.weight.float())).sqrt()
+    expected_ids = (scores + gate.bias).topk(3, dim=-1).indices
+    selected = scores.gather(1, expected_ids)
+    expected_weights = selected / selected.sum(-1, keepdim=True) * 1.5
+
+    weights, indices = gate(hidden, torch.tensor([0]))
+
+    assert weights.dtype == torch.float32
+    assert torch.equal(indices, expected_ids.int())
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+    assert not torch.equal(weights, weights.bfloat16().float())
+
+
+def test_flashinfer_rounds_routes_only_at_local_kernel_boundary(
+    implementation, monkeypatch
+):
+    layer = implementation.RoutedExperts.__new__(implementation.RoutedExperts)
+    nn.Module.__init__(layer)
+    layer.dispatch, layer.num_experts, layer.start = None, 8, 0
+    for name in (
+        "w13_weight",
+        "w13_scale",
+        "w2_weight",
+        "w2_scale",
+        "output_scales",
+        "clamp_limits",
+    ):
+        setattr(layer, name, torch.empty(0))
+    hidden = torch.ones(1, 32, dtype=torch.bfloat16)
+    weights = torch.tensor([[0.123456, 0.543219]])
+    original = weights.clone()
+    indices = torch.tensor([[1, 2]], dtype=torch.int32)
+    observed = []
+
+    def fused(quantized, scales, ids, routes, *_args, **_kwargs):
+        assert ids is indices
+        assert routes.dtype == torch.bfloat16
+        observed.append(routes.clone())
+        return hidden
+
+    monkeypatch.setattr(
+        implementation,
+        "act_quant",
+        lambda *_: (
+            hidden.to(torch.float8_e4m3fn),
+            torch.ones(1, 1).to(torch.float8_e8m0fnu),
+        ),
+    )
+    monkeypatch.setattr(implementation, "fp4_fused_moe", fused)
+
+    assert layer.local(hidden, indices, weights) is hidden
+    assert torch.equal(observed[0], original.bfloat16())
+    assert torch.equal(weights, original)
+
+
 def _args():
     return SimpleNamespace(
         n_layers=7,

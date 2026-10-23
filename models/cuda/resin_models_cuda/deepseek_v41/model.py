@@ -79,7 +79,9 @@ class RoutedExperts(V4RoutedExperts):
             quantized,
             scales.view(torch.float8_e4m3fn),
             indices,
-            weights,
+            # FlashInfer's routed-MoE ABI requires BF16 routing weights;
+            # keep the model/transport contract in FP32 until this boundary.
+            weights.bfloat16(),
             self.w13_weight,
             self.w13_scale,
             self.w2_weight,
@@ -128,7 +130,7 @@ class Gate(nn.Module):
         weights = scores.gather(-1, indices)
         if self.normalized and self.topk > 1:
             weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
-        return (weights * self.route_scale).bfloat16(), indices.int()
+        return weights * self.route_scale, indices.int()
 
 
 class Compressor(nn.Module):

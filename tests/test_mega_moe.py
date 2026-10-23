@@ -296,7 +296,7 @@ def test_v41_factory_preserves_gate_up_order_values_and_adopts_down_storage(
 
 
 @pytest.mark.parametrize("balanced", [False, True])
-def test_mega_gate_writes_workspace_masks_rows_and_preserves_bf16_weights(
+def test_mega_gate_writes_workspace_masks_rows_and_preserves_fp32_weights(
     deepgemm, monkeypatch, balanced
 ):
     from resin.backend.torch import benchmark_expert_indices
@@ -319,7 +319,7 @@ def test_mega_gate_writes_workspace_masks_rows_and_preserves_bf16_weights(
     expected_weights = scores.gather(1, expected_indices)
     expected_weights = (
         expected_weights / expected_weights.sum(-1, keepdim=True) * gate.route_scale
-    ).bfloat16()
+    )
 
     def no_unfused(*_):
         raise AssertionError("unfused gate called")
@@ -332,8 +332,8 @@ def test_mega_gate_writes_workspace_masks_rows_and_preserves_bf16_weights(
     assert deepgemm.gates[-1]["rank"] == 1
     assert deepgemm.gates[-1]["out"][0].data_ptr() == indices.data_ptr()
     assert torch.equal(indices[:2], expected_indices[:2].long())
-    assert torch.equal(weights[:2], expected_weights[:2].float())
-    assert torch.equal(weights, weights.bfloat16().float())
+    assert torch.equal(weights[:2], expected_weights[:2])
+    assert not torch.equal(weights[:2], weights[:2].bfloat16().float())
     assert indices[2:].eq(-1).all() and weights[2:].eq(0).all()
     active[:] = torch.tensor([False, True, True, True])
     mega_gate(gate, hidden, active, (indices, weights), ep_rank=1)
@@ -477,10 +477,33 @@ def test_probe_reports_near_tie_routes_separately_and_rejects_wrong_routing():
     assert result["token_set_mismatches"] == result["ordered_slot_mismatches"] == 1
     assert result["mismatch_examples"][0]["token"] == 1
     assert 0 < result["mismatch_examples"][0]["reference_boundary_gap"] < 2e-5
-    assert result["rounded_weight_max_abs"] == 0
+    assert result["fp32_weight_max_abs"] < 1e-7
     indices[1, 2] = 4
     with pytest.raises(AssertionError, match="outside numerical ties"):
         _routing_comparison(gate, inputs, expected, (weights, indices), 2)
+
+
+def test_probe_rejects_bf16_rounded_routing_weights():
+    from deploy.mega_moe_validation import _routing_comparison
+
+    gate = SimpleNamespace(
+        weight=torch.tensor([[0.1, 0.3], [0.4, 0.7], [-0.2, 0.6]]),
+        bias=torch.zeros(3),
+        route_scale=1.5,
+        topk=2,
+        benchmark_balanced_experts=False,
+    )
+    inputs = torch.tensor([[0.75, -0.125]])
+    scores = torch.nn.functional.softplus(inputs @ gate.weight.T).sqrt()
+    indices = scores.topk(2, dim=-1).indices
+    selected = scores.gather(1, indices)
+    weights = selected / selected.sum(-1, keepdim=True) * 1.5
+    result = _routing_comparison(gate, inputs, indices, (weights, indices), 1)
+    assert result["fp32_weight_max_abs"] == 0
+    with pytest.raises(AssertionError):
+        _routing_comparison(
+            gate, inputs, indices, (weights.bfloat16().float(), indices), 1
+        )
 
 
 def test_probe_does_not_dilute_one_ffn_outlier_across_large_batches():

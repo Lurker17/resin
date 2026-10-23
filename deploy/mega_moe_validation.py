@@ -60,12 +60,12 @@ def _routing_comparison(gate, inputs, expected_indices, routes, count):
         / (selected_scores.sum(-1, keepdim=True) + 1e-20)
         * gate.route_scale
     )
-    # Selected weights are intentionally rounded to BF16 at the model boundary.
+    # Official V4.1 and DeepInfer retain normalized routing weights in FP32.
     result["weights_on_actual_ids"] = _compare(
-        weights[:count], expected_weights, atol=2e-5, rtol=4e-3
+        weights[:count], expected_weights, atol=2e-5, rtol=5e-5
     )
-    result["rounded_weight_max_abs"] = (
-        (weights[:count] - expected_weights.bfloat16().float()).abs().max().item()
+    result["fp32_weight_max_abs"] = (
+        (weights[:count] - expected_weights).abs().max().item()
     )
     mismatched = (sorted_ids != expected.sort(-1).values).any(-1)
     result.update(

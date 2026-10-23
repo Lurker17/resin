@@ -44,8 +44,6 @@ def mega_gate(gate, hidden, active, out, *, ep_rank):
         ),
         out=out,
     )
-    # The model's gate contract rounds selected weights before expert dispatch.
-    out[1].copy_(out[1].bfloat16())
 
 
 @torch.no_grad()
