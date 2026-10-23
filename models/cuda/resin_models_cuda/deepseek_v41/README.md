@@ -97,6 +97,16 @@ state across chunk boundaries, packed attention, stores, FP32 logits and exact
 graph replay. Full-checkpoint parity and throughput qualification remain in progress.
 Short-prompt parity does not establish model quality or representative acceptance.
 
+A B300 EP2 composition test with 384 experts and hidden/intermediate widths
+5,120/2,304 reproduces the NCCL/persistent-grid conflict after all ranks finish
+serial warmup: asynchronous Engram fetches cause a DeepGEMM grid-sync timeout
+at four tokens. Joining both fetches first passes
+eager execution, capture and 30 graph replays at four and 1,280 tokens, with exact
+MoE and Engram outputs. [Joined results](https://modal.com/apps/ekzhang/main/ap-rZUgGEwWmUWHh5XBuCBcxC),
+[overlap failure](https://modal.com/apps/ekzhang/main/ap-XVDWkUOmoD41DVkMtwSvL2), traces
+and reproduction sources are archived under
+`artifacts/benchmarks/2026-10-22-v41-forward-port-microprobes/`.
+
 ## Benchmark status and remaining work
 
 The [historical 128K EP8 sweep](https://modal.com/apps/ekzhang/main/ap-zYfGn4MBfzHHNDRSsHqnXO)
