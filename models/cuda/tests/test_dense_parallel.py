@@ -10,9 +10,17 @@ from torch import nn
 from torch.distributed import ProcessGroup
 from torch.nn import functional as F
 
-from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
+from resin.backend.cuda.parallel import (
+    TensorParallelContext,
+    TensorParallelLayout,
+    TensorShard,
+)
 from resin.backend.loading import prepare_model
-from resin_models_cuda.dense_parallel import TensorParallelSum, shard_dense_mlp
+from resin_models_cuda.dense_parallel import (
+    TensorParallelSum,
+    shard_dense_mlp,
+    shard_linear,
+)
 from resin_models_cuda.nvfp4 import Nvfp4LinearWeights
 
 
@@ -150,6 +158,36 @@ def test_nvfp4_slices_packed_columns_and_scales_before_lowering(monkeypatch):
 def test_disabled_dense_tp_preserves_module_identity():
     mlp = _MLP()
     assert shard_dense_mlp(mlp, TensorParallelContext()) is mlp
+
+
+@pytest.mark.parametrize("output", [False, True])
+@pytest.mark.parametrize("start,stop", [(-16, 0), (0, 0), (8, 4), (0, 33)])
+def test_projection_shard_rejects_empty_reversed_or_out_of_bounds_ranges(
+    output, start, stop
+):
+    with pytest.raises(ValueError, match="within the projection axis"):
+        shard_linear(nn.Linear(32, 32), TensorShard(start, stop), output=output, rank=0)
+
+
+@pytest.mark.parametrize("start", [1, 2, 8])
+def test_nvfp4_input_shard_rejects_offset_inside_a_quantization_group(start):
+    # Width alone is valid; truncating these offsets when dividing packed byte
+    # and scale coordinates would silently select the wrong checkpoint values.
+    source = Nvfp4LinearWeights(128, 64)
+    with pytest.raises(ValueError, match="align to quantization groups"):
+        shard_linear(source, TensorShard(start, start + 64), output=False, rank=0)
+
+
+def test_nvfp4_input_shard_at_nonzero_group_boundary_preserves_values():
+    torch.manual_seed(92)
+    source = Nvfp4LinearWeights(128, 64)
+    source.weight.copy_(torch.randint(0, 256, source.weight.shape, dtype=torch.uint8))
+    source.weight_scale.copy_(torch.rand(source.weight_scale.shape))
+    source.weight_scale_2.fill_(0.125)
+    local = shard_linear(source, TensorShard(16, 80), output=False, rank=0)
+    torch.testing.assert_close(
+        _decode(local), _decode(source)[:, 16:80], atol=0, rtol=0
+    )
 
 
 @pytest.mark.parametrize(

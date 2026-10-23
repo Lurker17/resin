@@ -37,6 +37,17 @@ def shard_linear(
 ) -> nn.Module:
     """Slice a checkpoint projection; assign an input-sharded bias only to rank zero."""
     axis = 0 if output else 1
+    extent = source.out_features if output else source.in_features
+    if not 0 <= shard.start < shard.stop <= extent:
+        raise ValueError("linear shard must be nonempty and within the projection axis")
+    if (
+        isinstance(source, Nvfp4LinearWeights)
+        and not output
+        and (shard.start % source.group_size or shard.stop % source.group_size)
+    ):
+        raise ValueError(
+            "NVFP4 input shard boundaries must align to quantization groups"
+        )
     in_features = source.in_features if output else shard.size
     out_features = shard.size if output else source.out_features
     if isinstance(source, nn.Linear):
