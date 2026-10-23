@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import cache
 from typing import Any
@@ -18,10 +18,11 @@ from resin_models_cuda.paged_kv import append_slab_kv
 class PagedAttentionBatch:
     """Per-forward attention metadata shared by every layer in each cache group."""
 
-    page_tables: tuple[Tensor, ...]
-    used_lengths: tuple[Tensor, ...]
-    max_lengths: tuple[int, ...]
+    page_tables: dict[int, Tensor]
+    used_lengths: dict[int, Tensor]
+    max_lengths: dict[int, int]
     cu_query_lengths: Tensor
+    log_tau: Tensor | None = None
 
 
 def prepare_paged_attention_batch(
@@ -31,21 +32,24 @@ def prepare_paged_attention_batch(
     *,
     batch: int,
     tokens: int,
-    layer_counts: tuple[int, ...],
+    layer_counts: Mapping[int, int],
+    log_tau: Tensor | None = None,
 ) -> PagedAttentionBatch:
     """Build graph-stable page tables once for all attention layers."""
 
     if sequence_lengths.shape != (batch,):
         raise ValueError("Inkling sequence lengths do not match the attention batch")
-    if len(layer_counts) > len(cache.groups) or any(
-        count <= 0 for count in layer_counts
+    if not layer_counts or any(
+        not 0 <= index < len(cache.groups) or count <= 0
+        for index, count in layer_counts.items()
     ):
         raise ValueError("Inkling attention cache-group geometry is invalid")
 
-    page_tables = []
-    used_lengths = []
-    max_lengths = []
-    for group, layer_count in zip(cache.groups, layer_counts):
+    page_tables = {}
+    used_lengths = {}
+    max_lengths = {}
+    for index, layer_count in layer_counts.items():
+        group = cache.groups[index]
         base_pages = group.slab_ids * cache.slab_units + group.slotnums * layer_count
         layer_offsets = torch.arange(
             layer_count,
@@ -53,21 +57,22 @@ def prepare_paged_attention_batch(
             device=base_pages.device,
         ).view(layer_count, 1, 1)
         tables = (base_pages.unsqueeze(0) + layer_offsets).to(torch.int32)
-        page_tables.append(tables)
+        page_tables[index] = tables
         retained_starts = group.first_blocks * cache.page_tokens
-        used_lengths.append((sequence_lengths - retained_starts).to(torch.int32))
-        max_lengths.append(
-            min(max_sequence_length, tables.shape[-1] * cache.page_tokens)
+        used_lengths[index] = (sequence_lengths - retained_starts).to(torch.int32)
+        max_lengths[index] = min(
+            max_sequence_length, tables.shape[-1] * cache.page_tokens
         )
     cu_query_lengths = (
         torch.arange(batch + 1, dtype=torch.int32, device=sequence_lengths.device)
         * tokens
     )
     return PagedAttentionBatch(
-        tuple(page_tables),
-        tuple(used_lengths),
-        tuple(max_lengths),
+        page_tables,
+        used_lengths,
+        max_lengths,
         cu_query_lengths,
+        log_tau,
     )
 
 
@@ -149,7 +154,7 @@ def paged_attention(
         )
     else:
         if (
-            not 0 <= group_index < len(prepared_batch.page_tables)
+            group_index not in prepared_batch.page_tables
             or prepared_batch.page_tables[group_index].shape[0] != layer_count
             or not 0 <= layer < layer_count
         ):

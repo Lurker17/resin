@@ -75,6 +75,99 @@ def _program_count(
 
 
 @ct.kernel(occupancy=8)
+def _short_convolution_kernel(
+    inputs: _StaticLastDim,
+    state: _StaticLastDim,
+    weight: _StaticLastTwoDims,
+    output: _StaticLastDim,
+    state_length: _ConstantInt,
+    program_count: _ConstantInt,
+):
+    """Parallelize prefill tokens while keeping their count a runtime extent."""
+
+    work = ct.bid(0)
+    tiles = inputs.shape[2] // _VALUE_TILE
+    tokens = inputs.shape[1]
+    work_count = inputs.shape[0] * tokens * tiles
+    while work < work_count:
+        tile = work % tiles
+        sequence = (work // tiles) % tokens
+        batch = work // (tiles * tokens)
+        accumulator = ct.zeros((_VALUE_TILE,), dtype=ct.float32)
+        for tap in ct.static_iter(range(state_length + 1)):
+            source = sequence + tap
+            if source < state_length:
+                values = ct.load(
+                    state, (batch, source, tile), shape=(1, 1, _VALUE_TILE)
+                ).reshape((_VALUE_TILE,))
+            else:
+                values = ct.load(
+                    inputs,
+                    (batch, source - state_length, tile),
+                    shape=(1, 1, _VALUE_TILE),
+                ).reshape((_VALUE_TILE,))
+            coefficient = ct.load(
+                weight, (tile, 0, tap), shape=(_VALUE_TILE, 1, 1)
+            ).reshape((_VALUE_TILE,))
+            accumulator += values.astype(ct.float32) * coefficient
+        current = ct.load(
+            inputs, (batch, sequence, tile), shape=(1, 1, _VALUE_TILE)
+        ).reshape((_VALUE_TILE,))
+        ct.store(
+            output,
+            (batch, sequence, tile),
+            (accumulator + current.astype(ct.float32))
+            .astype(ct.bfloat16)
+            .reshape((1, 1, _VALUE_TILE)),
+        )
+        work += program_count
+
+
+def short_convolution(
+    inputs: Tensor,
+    state: Tensor,
+    weight: Tensor,
+    *,
+    program_count: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Fuse prefill convolution and its residual without materializing history."""
+
+    if inputs.ndim != 3:
+        raise ValueError("persistent Inkling convolution input must be rank three")
+    batch, tokens, width = inputs.shape
+    state_length = weight.shape[-1] - 1
+    if (
+        inputs.dtype != torch.bfloat16
+        or state.dtype != inputs.dtype
+        or weight.dtype != torch.float32
+        or state.shape != (batch, state_length, width)
+        or weight.shape != (width, 1, state_length + 1)
+        or width % _VALUE_TILE
+        or tokens <= 0
+        or state_length <= 0
+    ):
+        raise ValueError("persistent Inkling convolution inputs have invalid geometry")
+    output = torch.empty_like(inputs)
+    programs = _program_count(
+        inputs, program_count, programs_per_sm=_SCONV_PROGRAMS_PER_SM
+    )
+    ct.launch(
+        torch.cuda.current_stream(inputs.device),
+        (programs,),
+        _short_convolution_kernel,
+        (inputs, state, weight, output, state_length, programs),
+    )
+    # A normal prefill chunk already contains the entire next recurrent state.
+    # Only one- or two-token tails need a small join with the incoming state.
+    next_state = (
+        inputs[:, -state_length:]
+        if tokens >= state_length
+        else torch.cat((state[:, tokens:], inputs), dim=1)
+    )
+    return output, next_state
+
+
+@ct.kernel(occupancy=8)
 def _kv_sconv_norm_store_kernel(
     key_input: _StaticLastDim,
     value_input: _StaticLastDim,
@@ -976,5 +1069,6 @@ __all__ = [
     "select_convolution_state",
     "shared_reduce_add",
     "shared_swiglu",
+    "short_convolution",
     "sconv_residual",
 ]
