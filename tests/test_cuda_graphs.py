@@ -199,7 +199,7 @@ class _Torch:
         self.cuda = _Cuda()
         self.host_allocations = 0
 
-    def inference_mode(self):
+    def inference_mode(self, enabled=True):
         return _Context()
 
     def tensor(self, values, *, dtype, device, pin_memory=False):

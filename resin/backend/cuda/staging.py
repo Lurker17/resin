@@ -27,20 +27,26 @@ class TensorStager:
     def host(self, name: str, values, dtype):
         if not isinstance(values, torch.Tensor):
             values = np.asarray(values)
-        tensor = self.host_tensors.get(name)
-        if tensor is None or tensor.shape != values.shape or tensor.dtype != dtype:
-            tensor = torch.empty(
-                values.shape,
-                dtype=dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-            self.host_tensors[name] = tensor
+        tensor = self._host_buffer(name, values.shape, dtype)
         if isinstance(values, torch.Tensor):
             # CPU-to-CPU copying also supports dtypes NumPy cannot represent.
             tensor.copy_(values)
         else:
             np.copyto(tensor.numpy(), values, casting="unsafe")
+        return tensor
+
+    def _host_buffer(self, name: str, shape, dtype):
+        tensor = self.host_tensors.get(name)
+        if tensor is None or tensor.shape != shape or tensor.dtype != dtype:
+            # These mutable buffers outlive the caller's inference-mode scope.
+            with torch.inference_mode(False):
+                tensor = torch.empty(
+                    shape,
+                    dtype=dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            self.host_tensors[name] = tensor
         return tensor
 
     def device(self, name: str, values, dtype):
@@ -49,19 +55,7 @@ class TensorStager:
         )
 
     def output(self, name: str, source):
-        tensor = self.host_tensors.get(name)
-        if (
-            tensor is None
-            or tensor.shape != source.shape
-            or tensor.dtype != source.dtype
-        ):
-            tensor = torch.empty(
-                source.shape,
-                dtype=source.dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-            self.host_tensors[name] = tensor
+        tensor = self._host_buffer(name, source.shape, source.dtype)
         tensor.copy_(source, non_blocking=True)
         return tensor
 

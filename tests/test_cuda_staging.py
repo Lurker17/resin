@@ -2,6 +2,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -73,7 +74,7 @@ class _Runtime:
         self.host_allocations += 1
         return _Tensor(np.empty(shape), self, dtype=dtype)
 
-    def inference_mode(self):
+    def inference_mode(self, enabled=True):
         return nullcontext()
 
     def drain(self, count=None):
@@ -208,3 +209,75 @@ def test_graph_cache_queued_replays_preserve_each_host_input(runtime, monkeypatc
     runtime.drain()
     assert observed == [[value] for value in range(1, 9)]
     assert cache.stats["replay_count"] == 8
+
+
+@pytest.fixture
+def cpu_torch(monkeypatch):
+    import torch
+
+    runtime = _Runtime()
+
+    def empty(shape, *, dtype, device, pin_memory):
+        # Exercise actual inference tensor rules without requiring CUDA pinning.
+        assert device == "cpu" and pin_memory
+        return torch.empty(shape, dtype=dtype, device="cpu")
+
+    monkeypatch.setattr(
+        staging,
+        "torch",
+        SimpleNamespace(
+            Tensor=torch.Tensor,
+            empty=empty,
+            inference_mode=torch.inference_mode,
+            cuda=runtime.cuda,
+        ),
+    )
+    return torch, runtime
+
+
+@pytest.mark.parametrize("field", ["array", "cpu_tensor", "output"])
+def test_stager_buffers_remain_mutable_after_first_inference_scope(cpu_torch, field):
+    torch, _runtime = cpu_torch
+    stager = staging.TensorStager("cuda")
+
+    def stage(value):
+        source = torch.tensor([value]) if field != "array" else [value]
+        if field == "output":
+            return stager.output("value", source)
+        return stager.host("value", source, torch.int64)
+
+    with torch.inference_mode():
+        first = stage(1)
+    assert not first.is_inference()
+    assert stage(2) is first
+    assert first.tolist() == [2]
+
+
+@pytest.mark.parametrize("tensor_input", [False, True])
+def test_pool_reuses_buffers_across_caller_inference_scopes(cpu_torch, tensor_input):
+    torch, runtime = cpu_torch
+    observed = []
+
+    class Target:
+        shape = (1,)
+        dtype = torch.int64
+        device = SimpleNamespace(type="cuda")
+
+        def copy_(self, source, *, non_blocking):
+            assert non_blocking
+            runtime.queue.append(lambda: observed.append(source.tolist()))
+
+    pool = staging.TensorStagerPool("cuda")
+    targets: dict[str, Any] = {"tokens": Target()}
+
+    def enqueue(value):
+        source = torch.tensor([value]) if tensor_input else [value]
+        pool.copy_into(targets, {"tokens": source})
+
+    with torch.inference_mode():
+        enqueue(1)
+    runtime.drain()
+    enqueue(2)  # Reuses the first generation outside inference mode.
+    runtime.drain()
+    assert observed == [[1], [2]]
+    assert not pool._pending[0].staging.host_tensors["tokens"].is_inference()
