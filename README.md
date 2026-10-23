@@ -209,7 +209,7 @@ uv run modal run deploy/modal_gpt_oss.py --mode download --model 120b
 uv run modal deploy deploy/modal_gpt_oss.py
 
 # DeepSeek V4.1 Flash uses four B300s with EP4 and attention DP4.
-uv run modal run deploy/modal_bench.py --mode download --model deepseek-v41
+uv run modal run deploy/modal_bench.py --download-only --model deepseek-v41
 uv run modal deploy deploy/modal_deepseek_v41.py
 ```
 
