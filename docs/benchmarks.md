@@ -291,6 +291,62 @@ digitization, protocol details and six merged Perfetto traces are under
 `d6074ac` attempt is preserved there separately: it produced no timing point and
 exposed reusable inference-tensor buffers, corrected before `40a44fd`.
 
+The subsequent [EP8 control-path sweep](https://modal.com/apps/ekzhang/main/ap-sSIr6M6gIVKDIHJSURJzMn)
+at clean `43b9333` retains the same six rank agreements, but transports each fixed
+record with gather-to-source followed by broadcast. It also reads aggregate
+graph counters instead of rebuilding all per-shape diagnostics twice per timed
+step. The latter removes benchmark instrumentation overhead; the full diagnostics
+API remains available. Neither change alters model kernels or native completion,
+cache ownership, and failure agreement.
+
+| Batch/GPU | Engine ms | Projected tokens/s/user | Projected tokens/s/GPU |
+| ---: | ---: | ---: | ---: |
+| 8 | 15.897 | 204.44 | 1,635.55 |
+| 16 | 16.835 | 193.05 | 3,088.88 |
+| 32 | 17.900 | 181.56 | 5,809.95 |
+| 64 | 20.667 | 157.25 | 10,064.17 |
+| 128 | 27.246 | 119.28 | 15,268.43 |
+| 256 | 41.626 | 78.08 | 19,987.31 |
+
+All cases use eight B300s, K3, forced two-draft acceptance, balanced routes,
+50 warmup and 60 measured completions, with the same 128K shared/private prompt
+split and all page-boundary drains included. Every case retains 480 decode
+replays, zero eager fallback, and 464 enqueues / 456 continuations across drivers.
+Charts still project 75% acceptance with tau 3.25; actual B256 throughput is
+18,449.82 tokens/s/GPU at three committed tokens per step. Raw records, the
+updated interactivity/throughput plot, and rank traces are in
+`artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-control/frontier/`.
+
+A separate B8-only qualification on the same source measured 16.474 ms versus
+25.683 ms in the previous sweep. Its extra traces reduce the mean gap between
+graph bodies across eight ranks from 10.895 to 0.170 ms, with no Gloo activity
+remaining inside that gap. All ranks retain the same graph kernel names and
+launch dimensions, and 1,436 kernels per forward. These are separate profiler
+captures and allocations; profiled graph-body durations are not subtracted from
+unprofiled completion timing. That focused run, CPU transport/counter probes,
+and gap analysis are retained in the parent `ep8-control/` directory.
+
+The same source's warmed, uncached prefill probe uses one prompt per GPU at
+EP8/ADP8 and 1,024-token chunks. It measures 0.300 seconds for 4,096 tokens and
+9.774 seconds for 131,072 tokens (about 13,410 input tokens/s/GPU). These are sums
+of timed Engine steps after one complete warmup prompt at each length, excluding
+weight loading, graph capture and benchmark metric reductions; they are not HTTP
+TTFT measurements. Raw prefill records are in `ep8-control/prefill.jsonl`.
+
+This prefill result executes all 40 backbone layers over every input token.
+DeepInfer's published prefill curve instead uses EP4/ADP4, CP1, 4K–64K packed
+tokens per rank, and 140-token bounded replay. Its layers 0–19 process the full
+prompt; layer 20 prepares full compressed main/index KV, while layers 20–39
+process retained queries only. The upstream
+[deployment notes](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/doc/inference_deployment_qa.md#kv-cache-hits-and-recomputation)
+describe this as approximate consumer SWA reconstruction, nearly halving prefill
+computation; exact reconstruction would require a 2,560-token tail. The
+approximate consumer state is used for decode and excluded from prefix caching.
+Matching that protocol in Resin also requires a consumer-sized distributed
+graph bucket, full KV writes at the boundary, absolute DSpark positions, and
+full execution when prompt scores are requested. Increasing chunk size alone
+does not implement bounded replay or establish parity with that curve.
+
 The implementation uses fixed-width greedy proposals, loads the confidence head
 without applying its length policy, and supports up to the released five-token
 block. Benchmark defaults remain four drafts. Wider meshes and longer contexts
