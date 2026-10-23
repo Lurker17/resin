@@ -21,10 +21,12 @@ T: Any = _language
     },
 )
 def candidate_block_max_tl(
-    max_model_len: int,
     block_size: int,
 ) -> Any:
     num_rows = T.dynamic("num_rows")
+    # Engine prefill tables grow with live context. Keep their score width out
+    # of the compiled key; only the fixed 16K reduction tile is specialized.
+    max_model_len = T.dynamic("max_model_len")
     logits_stride = T.dynamic("logits_stride")
     score_stride = T.dynamic("score_stride")
     valid_blocks_size = T.dynamic("valid_blocks_size")

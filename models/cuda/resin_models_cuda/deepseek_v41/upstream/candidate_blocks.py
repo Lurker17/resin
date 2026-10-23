@@ -50,7 +50,7 @@ def candidate_block_max(
     valid_blocks = torch.empty(
         (valid_blocks_size,), dtype=valid_lens.dtype, device=valid_lens.device
     )
-    ops.candidate_block_max_tl(max_model_len, block_size)(
+    ops.candidate_block_max_tl(block_size)(
         logits, valid_lens, block_scores, valid_blocks
     )
     return score_storage, valid_blocks[:num_rows]
