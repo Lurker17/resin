@@ -175,6 +175,45 @@ def _worker(rank, rendezvous):
             worker.serve()
         dist.barrier()
 
+    # A single chat must overlap even while its EP peers have no attention work.
+    # A later admission on an idle replica drains before mixed-phase execution;
+    # EOS then retires that replica while its peer continues decoding.
+    runner = ParallelRunner(groups)
+    worker = DistributedWorker(runner, groups)
+    if groups.is_driver:
+        engine = DistributedEngine(worker)
+        dp = groups.attn_dp.local_rank
+        request = (
+            engine.submit([1], max_new_tokens=60, stop_token_ids=[48])
+            if dp == 0
+            else None
+        )
+        for _ in range(8):
+            engine.step()
+        if dp == 0:
+            assert engine.local.overlap_stats[1] > 0
+        else:
+            assert any(async_ and idle for _, async_, idle in runner.calls)
+            request = engine.submit([20] * 5, max_new_tokens=30, stop_token_ids=[29])
+        steps = 0
+        events = []
+        while engine.has_work():
+            events.extend(engine.step())
+            steps += 1
+            assert steps < 80
+        assert request is not None
+        expected = list(range(2, 49)) if dp == 0 else list(range(21, 30))
+        assert request.take_result() == expected
+        assert engine.local.overlap_stats[1] > 0
+        if dp == 1:
+            assert [event.token_id for event in events] == expected
+        engine.close()
+        assert worker._completion is None
+        assert engine.local.cache_free_parent_count == 32
+    else:
+        worker.serve()
+    dist.barrier()
+
     groups.close()
     dist.destroy_process_group()
 

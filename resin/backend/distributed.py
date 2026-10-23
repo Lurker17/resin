@@ -566,7 +566,7 @@ class DistributedEngine:
                 proposal,
                 error,
                 self.local.overlap_pending,
-                bool(allow_overlap and self.local.overlap_ready),
+                bool(allow_overlap and self.local.overlap and self.local.overlap_ready),
             ),
         )
         failure = _first_error(
@@ -575,9 +575,10 @@ class DistributedEngine:
         if failure:
             self._finish(failure)
         available = {item[0] for item in proposals} - {None}
+        active = [item for item in proposals if item[0] is not None]
         allow_overlap = (
-            all(item[0] == "decode" and item[3] for item in proposals)
-            and len({item[2] for item in proposals}) == 1
+            all(item[0] in (None, "decode") and item[3] for item in proposals)
+            and len({item[2] for item in active}) == 1
         )
         if not available:
             return []
@@ -605,7 +606,10 @@ class DistributedEngine:
         if not self.worker._entered:
             # Empty, mismatched, or rejected preparation still joins the vote.
             try:
-                self.worker._coordinate(None, error)
+                # Idle attention replicas still enqueue every expert collective.
+                # Their zero-row completion belongs to the worker, with no local
+                # scheduler/cache continuation and no token feedback to consume.
+                self.worker._coordinate(None, error, enqueue=allow_overlap)
             except BaseException as exc:
                 error = error or _message(exc)
         errors = self.worker._drivers("commit", error)
@@ -620,6 +624,9 @@ class DistributedEngine:
         try:
             if not self.local.poisoned:
                 self.local.close()
+                if self.worker._completion is not None:
+                    self.worker._completion.result()
+                    self.worker._completion = None
         except BaseException as exc:
             error = error or _message(exc)
         errors = self.worker._drivers("close", error)
