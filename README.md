@@ -208,13 +208,17 @@ uv run modal run deploy/modal_gpt_oss.py --mode download --model 20b
 uv run modal run deploy/modal_gpt_oss.py --mode download --model 120b
 uv run modal deploy deploy/modal_gpt_oss.py
 
+# DeepSeek V4.1 Flash uses four B300s with EP4 and attention DP4.
+uv run modal run deploy/modal_bench.py --mode download --model deepseek-v41
+uv run modal deploy deploy/modal_deepseek_v41.py
 ```
 
-The legacy DeepSeek TP-only HTTP deployment needs migration to the attention-DP
-coordinator. Both MLA families have one KV head and require `attn_tp=1`;
-query-head slicing with replicated KV is not supported attention TP.
-Use the [benchmark launcher](docs/benchmarks.md) for explicit attention-DP/EP
-execution and checkpoint downloads.
+DeepSeek uses the shared distributed HTTP coordinator, with a 32K context limit,
+32 running requests per attention-DP replica, CUDA graphs, and three speculative
+draft tokens with natural acceptance. Requests are routed round-robin unless
+`routed_dp_rank` in the JSON body or `resin-routed-dp-rank` in the header selects
+a replica (0–3). Both MLA families have one KV head and require `attn_tp=1`.
+The older `modal_deepseek_v4.py` retains TP-only diagnostics, not this endpoint.
 
 Each deployed URL serves `/`, `/health`, `/v1/models`,
 `/v1/chat/completions`, `/v1/responses`, and `/v1/messages`. The functions
