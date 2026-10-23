@@ -18,7 +18,7 @@ def _case(batch, queries, context, *, ca_width=None):
         width = (
             (int(positions.max()) // 128 + 3 if ca_width is None else ca_width)
             if index == 1
-            else max(5, (queries + 127) // 128 + 2)
+            else max(5, (queries + 127) // 128 + 3)
         )
         ordinal = torch.arange(batch * width).reshape(batch, width) * 3 + 17
         first = torch.zeros(batch, dtype=torch.int32)
@@ -69,6 +69,19 @@ def _case(batch, queries, context, *, ca_width=None):
 
 def _group(group):
     return group.parent_ids, group.child_slots, group.first_blocks
+
+
+def _assert_owned(cache, positions, draft):
+    # Match Engine admission: every proposed write/state row and visible SWA
+    # history remains owned even when a replay moves across a page boundary.
+    for index in (0, 2):
+        group = cache.groups[index]
+        columns = positions // 128 - group.first_blocks[:, None]
+        assert ((columns >= 0) & (columns < group.parent_ids.shape[1])).all()
+    end = positions[:, :1] if draft else positions + 1
+    start = (end - cache.geometry.window_size).clamp_min(0)
+    first = start // 128 - cache.groups[0].first_blocks[:, None]
+    assert (first >= 0).all()
 
 
 def _tensors(frame):
@@ -156,6 +169,7 @@ def _growing_table_probe():
             return _prepare(gpu, device_positions, device_mask, device_selected, False)
 
         expected = _prepare(cpu, positions, mask, selected, False)
+        _assert_owned(cpu, positions, False)
         _equal(call(), expected)
         graph, output = _capture(call)
         graph.replay()
@@ -192,6 +206,7 @@ def run_probe():
         def call():
             return _prepare(gpu, gpu_positions, gpu_mask, gpu_selected, draft)
 
+        _assert_owned(cpu, positions, draft)
         expected = _prepare(cpu, positions, mask, selected, draft)
         _equal(call(), expected)
         graph, output = _capture(call)
@@ -219,6 +234,7 @@ def run_probe():
             gpu_positions.copy_(positions)
             if gpu_mask is not None:
                 gpu_mask.copy_(mask)
+            _assert_owned(cpu, positions, draft)
             eager = call()
             graph.replay()
             torch.cuda.synchronize()
@@ -245,6 +261,7 @@ def run_probe():
                 "torch_shared_metadata_ms": _latency(reference_graph),
             }
         )
+        print(f"[metadata-probe] {results[-1]}", flush=True)
     return {
         "gpu": torch.cuda.get_device_name(),
         "cases": results,
