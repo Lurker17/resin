@@ -192,7 +192,8 @@ def run_probe():
     assert cache.compressed_cache(1).data_ptr() == compressed.data_ptr()
     query_source, output_source = _weight(64 * 512, 128), _weight(8 * 128, 4096)
     query_projection = QueryProjection(query_source, 64, 512)
-    output_projection = OutputProjection(output_source, 8, 128)
+    # This oracle isolates the grouped projection before its optional FP8 cast.
+    output_projection = OutputProjection(output_source, 8, 128, fp8_output=False)
     frequencies = (
         torch.arange(256, device="cuda")[:, None]
         * torch.arange(32, device="cuda")[None]

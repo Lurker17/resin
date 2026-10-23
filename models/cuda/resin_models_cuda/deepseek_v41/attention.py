@@ -70,13 +70,19 @@ class QueryProjection(PreparedLinear):
 
 
 class OutputProjection(nn.Module):
+    """Grouped O-A projection with a fused block32 FP8 epilogue for O-B."""
+
     weight: torch.Tensor
     scale: torch.Tensor
 
-    def __init__(self, source, groups, rank):
+    def __init__(self, source, groups, rank, *, fp8_output=True):
         super().__init__()
         from flash_mla import fused_norm_rope_attn_rope_cast as fused
 
+        if fp8_output and groups * rank % 128:
+            raise ValueError(
+                "packed output scales require groups * rank divisible by 128"
+            )
         width = source.weight.shape[-1]
         weight = source.weight.reshape(groups, rank, width)
         scales = weight_scale_rows(source).reshape(groups, rank, width // 32)
@@ -84,6 +90,7 @@ class OutputProjection(nn.Module):
         weight, scales = fused.permute_wv_proj((weight, scales), width // 512, 512)
         self.register_buffer("weight", weight.detach())
         self.register_buffer("scale", scales.detach())
+        self.fp8_output = fp8_output
 
     def forward(self, values, scales):
         import deep_gemm
@@ -96,12 +103,23 @@ class OutputProjection(nn.Module):
             .view(torch.int32)
             .transpose(0, 1)
         )
+        rows, groups, rank = values.shape[0], *self.weight.shape[:2]
         output = values.new_empty(
-            values.shape[0],
-            self.weight.shape[0],
-            self.weight.shape[1],
-            dtype=torch.bfloat16,
+            rows,
+            groups,
+            rank,
+            dtype=torch.float8_e4m3fn if self.fp8_output else torch.bfloat16,
         )
+        if self.fp8_output:
+            # Scales describe the flattened groups, not separate padded groups.
+            # This is DeepInfer's fp8_einsum -> ReplicatedLinear tuple boundary.
+            output_scales = torch.empty_strided(
+                (rows, groups * rank // 128),
+                (1, deep_gemm.get_tma_aligned_size(rows, 4)),
+                dtype=torch.int32,
+                device=values.device,
+            )
+            output = (output, output_scales)
         deep_gemm.fp8_einsum(
             "bhr,hdr->bhd",
             (values, scales),
@@ -110,6 +128,17 @@ class OutputProjection(nn.Module):
             recipe=(1, 1, 32),
         )
         return output
+
+
+def finish_output(attention, context):
+    """Keep grouped values and packed scales paired until the final GEMM."""
+    output = attention.wo_a(*context)
+    value = (
+        (output[0].flatten(1), output[1])
+        if isinstance(output, tuple)
+        else output.flatten(1)
+    )
+    return attention.wo_b(value)
 
 
 @lru_cache(2)

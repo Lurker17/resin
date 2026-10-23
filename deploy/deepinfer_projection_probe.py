@@ -1,5 +1,7 @@
 """Dense projection numerical, capture and timing checks on a Blackwell GPU."""
 
+from types import SimpleNamespace
+
 import torch
 from torch.nn import functional as F
 
@@ -54,6 +56,122 @@ def _graph(call):
         "bitwise_equal": True,
         "graph_ms": start.elapsed_time(stop) / 20,
     }
+
+
+def _metrics(actual, expected):
+    delta = actual.float() - expected.float()
+    return {
+        "relative_l2": (delta.norm() / expected.float().norm().clamp_min(1e-20)).item(),
+        "max_abs": delta.abs().max().item(),
+    }
+
+
+def _output_boundary_probe():
+    from resin_models_cuda.deepseek_v41.attention import OutputProjection, finish_output
+
+    # Exact released geometry: H64 x D512, eight O-A groups of rank1024,
+    # then O-B projects the flattened 8192 channels back to hidden5120.
+    groups, heads_per_group, rank, width = 8, 8, 1024, 4096
+    source_a, weight_a = _source(width, groups * rank)
+    source_b, weight_b = _source(groups * rank, 5120)
+    projected = PreparedLinear(source_b)
+    fused = SimpleNamespace(
+        wo_a=OutputProjection(source_a, groups, rank), wo_b=projected
+    )
+    fallback = SimpleNamespace(
+        wo_a=OutputProjection(source_a, groups, rank, fp8_output=False), wo_b=projected
+    )
+    results = []
+    for rows in (1, 5, 1024, 1280):
+        context = torch.randn(
+            rows, groups * heads_per_group, 512, device="cuda", dtype=torch.bfloat16
+        )
+        # Vary every head's scale so group boundaries and packed-SF addressing
+        # cannot accidentally pass by using uniform exponents.
+        context.mul_(
+            torch.logspace(-1, 1, groups * heads_per_group, device="cuda")[
+                None, :, None
+            ]
+        )
+        values, scales = _fp8_reference(context.flatten(1))
+        restored = (values.float() * scales.repeat_interleave(32, -1)).reshape(
+            rows, groups, width
+        )
+        lane_values = (
+            values.reshape(rows, groups, heads_per_group, 16, 32)
+            .transpose(2, 3)
+            .reshape(rows, groups, width)
+        )
+        lane_scales = (
+            scales.to(torch.float8_e8m0fnu)
+            .reshape(rows, groups, heads_per_group, 16)
+            .transpose(2, 3)
+            .contiguous()
+            .view(torch.int32)
+            .reshape(rows, groups, width // 128)
+        )
+        packed_context = lane_values, lane_scales
+        bf16_a = fallback.wo_a(*packed_context)
+        expected_a = torch.einsum(
+            "mgr,gdr->mgd", restored, weight_a.reshape(groups, rank, width)
+        ).bfloat16()
+        grouped_error = _metrics(bf16_a, expected_a)
+        if grouped_error["relative_l2"] > 0.003:
+            raise AssertionError(f"output projection rows={rows}: {grouped_error}")
+
+        direct_values, direct_sf = fused.wo_a(*packed_context)
+        # Pinned DeepGEMM epilogue/operators.cuh rounds its accumulators to
+        # BF16 before amax/FP8 casting, matching this standalone cast exactly.
+        expected_values, expected_sf = quantize_fp8(bf16_a.flatten(1))
+        if not torch.equal(
+            direct_values.flatten(1).view(torch.uint8),
+            expected_values.view(torch.uint8),
+        ):
+            raise AssertionError(
+                f"direct FP8 epilogue differs from BF16 + cast, rows={rows}"
+            )
+        if not torch.equal(direct_sf, expected_sf):
+            raise AssertionError(f"direct FP8 output scales differ, rows={rows}")
+        actual = finish_output(fused, packed_context)
+        previous = finish_output(fallback, packed_context)
+        if not torch.equal(actual, previous):
+            raise AssertionError(
+                f"output boundary differs from prior path, rows={rows}"
+            )
+
+        reference_values, reference_scales = _fp8_reference(expected_a.flatten(1))
+        reference = F.linear(
+            (
+                reference_values.float() * reference_scales.repeat_interleave(32, -1)
+            ).bfloat16(),
+            weight_b.bfloat16(),
+        )
+        dense_error = _metrics(actual, reference)
+        if dense_error["relative_l2"] > 0.02:
+            raise AssertionError(
+                f"complete output projection rows={rows}: {dense_error}"
+            )
+        results.append(
+            {
+                "rows": rows,
+                "groups": groups,
+                "rank": rank,
+                "group_input": width,
+                "output_shape": list(actual.shape),
+                "packed_scale_shape": list(direct_sf.shape),
+                "packed_scale_stride": list(direct_sf.stride()),
+                "grouped_projection_oracle": grouped_error,
+                "complete_projection_oracle": dense_error,
+                "fp8_epilogue_bitwise_equal": True,
+                "packed_scales_bitwise_equal": True,
+                "previous_path_bitwise_equal": True,
+                "direct_fp8": _graph(lambda: finish_output(fused, packed_context)),
+                "bf16_then_cast": _graph(
+                    lambda: finish_output(fallback, packed_context)
+                ),
+            }
+        )
+    return results
 
 
 @torch.inference_mode()
@@ -159,4 +277,8 @@ def run_probe():
                         **errors,
                         "capture": _graph(captured_query),
                     }
-    return {"gpu": torch.cuda.get_device_name(), "projections": result}
+    return {
+        "gpu": torch.cuda.get_device_name(),
+        "projections": result,
+        "output_boundary": _output_boundary_probe(),
+    }

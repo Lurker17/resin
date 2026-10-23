@@ -286,8 +286,9 @@ class Attention(nn.Module):
         return self.q_norm(self.wq_a(hidden)), self.wkv(hidden)
 
     def _finish(self, output, positions):
-        output = self.wo_a(*output)
-        return self.wo_b(output.reshape(*positions.shape, -1))
+        from resin_models_cuda.deepseek_v41.attention import finish_output
+
+        return finish_output(self, output).reshape(*positions.shape, -1)
 
     def store(self, hidden, positions, cache):
         if hasattr(self, "cos_sin"):

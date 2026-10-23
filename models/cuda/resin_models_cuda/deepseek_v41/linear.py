@@ -93,6 +93,8 @@ class PreparedLinear(Linear):
     Concatenating projections with the same input shares one cast and GEMM.
     Checkpoint scales are expanded before concatenation so a partial final
     block cannot accidentally rescale the next projection's first rows.
+    Prequantized inputs pair [..., K] FP8 values with [flattened_rows, K/128]
+    packed UE8M0 scales; only the values are reshaped for the GEMM.
     """
 
     def __init__(self, source, *additional, use_fp32_output=False):
@@ -142,8 +144,14 @@ class PreparedLinear(Linear):
     def forward(self, value):
         import deep_gemm
 
-        shape = value[0].shape[:-1] if isinstance(value, tuple) else value.shape[:-1]
-        device = value[0].device if isinstance(value, tuple) else value.device
+        values = value[0] if isinstance(value, tuple) else value
+        if values.shape[-1] != self.in_features:
+            raise ValueError(
+                "projection input width does not match its prepared weights"
+            )
+        if isinstance(value, tuple) and self.scale is None:
+            raise TypeError("prequantized inputs require FP8 projection weights")
+        shape, device = values.shape[:-1], values.device
         # DeepGEMM requires a 32-byte aligned row stride even when N is small.
         alignment = 32 // self.output_dtype.itemsize
         physical_width = (self.out_features + alignment - 1) // alignment * alignment
@@ -164,9 +172,13 @@ class PreparedLinear(Linear):
                 value.reshape(-1, self.in_features), self.weight, flat
             )
         else:
-            values = value if isinstance(value, tuple) else quantize_fp8(value)
+            quantized = (
+                (values.reshape(-1, self.in_features), value[1])
+                if isinstance(value, tuple)
+                else quantize_fp8(value)
+            )
             deep_gemm.fp8_fp4_gemm_nt(
-                values, (self.weight, self.scale), flat, recipe=(1, 1, 32)
+                quantized, (self.weight, self.scale), flat, recipe=(1, 1, 32)
             )
         return self.allreduce(output) if self.axis == 1 else output
 

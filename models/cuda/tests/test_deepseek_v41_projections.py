@@ -132,6 +132,55 @@ def test_bf16_projection_preserves_reduction_and_fp32_stays_unmodified(deepgemm)
     assert prepare_linear(fp32) is fp32
 
 
+def test_prequantized_projection_preserves_scales_and_restores_leading_shape(
+    deepgemm, monkeypatch
+):
+    calls, quantize = deepgemm
+    prepared = PreparedLinear(projection(17))
+    hidden = torch.randn(2, 3, 32).bfloat16()
+    values, scales = quantize(
+        hidden.flatten(0, 1),
+        fmt="e4m3",
+        num_per_channels=32,
+        round_sf=True,
+        use_packed_ue8m0=True,
+        use_tma_aligned_col_major_sf=True,
+    )
+
+    def no_cast(_value):
+        raise AssertionError("prequantized projection must not cast a second time")
+
+    monkeypatch.setattr("resin_models_cuda.deepseek_v41.linear.quantize_fp8", no_cast)
+    result = prepared((values.reshape(2, 3, 32), scales))
+    assert result.shape == (2, 3, 17)
+    assert calls[0][0][0].shape == (6, 32)
+    assert calls[0][0][1] is scales
+    expected = F.linear(
+        values.float() * scales.repeat_interleave(32, -1),
+        prepared.weight.float() * prepared.scale.repeat_interleave(32, -1),
+    ).bfloat16()
+    torch.testing.assert_close(result.flatten(0, 1), expected, rtol=0, atol=0)
+    bf16 = PreparedLinear(projection(17, dtype=torch.bfloat16))
+    with pytest.raises(TypeError, match="prequantized inputs require FP8"):
+        bf16((values, scales))
+    with pytest.raises(ValueError, match="input width"):
+        prepared((values[:, :16], scales))
+
+
+def test_attention_finish_restores_batch_sequence_shape(implementation):
+    from resin_models_cuda.deepseek_v41.attention import finish_output
+
+    values = torch.ones(6, 2, 128, dtype=torch.float8_e4m3fn)
+    scales = torch.empty_strided((6, 2), (1, 8), dtype=torch.int32)
+    attention = SimpleNamespace(
+        wo_a=lambda *_: (values, scales), wo_b=lambda value: value[0].bfloat16()[:, :32]
+    )
+    context = (values, scales)
+    actual = implementation.Attention._finish(attention, context, torch.empty(2, 3))
+    assert actual.shape == (2, 3, 32)
+    torch.testing.assert_close(actual.flatten(0, 1), finish_output(attention, context))
+
+
 @pytest.mark.parametrize("merged", [False, True])
 def test_query_permutation_preserves_source_and_index_rows(
     deepgemm, monkeypatch, merged

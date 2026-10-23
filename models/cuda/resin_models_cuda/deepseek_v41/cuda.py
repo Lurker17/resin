@@ -112,7 +112,9 @@ class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
                 )
 
             def finish(values, scales, attention=attention):
-                return attention.wo_b(attention.wo_a(values, scales).flatten(1))
+                from resin_models_cuda.deepseek_v41.attention import finish_output
+
+                return finish_output(attention, (values, scales))
 
             query_outputs = (
                 TensorSpec((attention.n_local_heads * attention.head_dim,)),
