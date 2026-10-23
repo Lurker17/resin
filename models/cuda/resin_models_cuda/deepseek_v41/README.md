@@ -19,6 +19,7 @@ DeepSelect `bfa4507d`, and TileKernels 1.0.0; full revisions live in
 | `linear.py`, `attention.py`, `compressor.py`, `experts.py` | Lower loaded checkpoint tensors into fused projections, packed scales and prepared operators. |
 | `indexer.py`, `upstream/` | Paged FP4 MQA, candidate selection and fused cache transforms. |
 | `batch.py` | Prepare shared store slots, attention indices, compression lengths and state-page mappings once per forward. |
+| `yoco.py` | Select retained consumer queries and bound their SWA visibility over complete producer KV. |
 | `cache.py` | Typed zero-copy views over Engine-owned byte slabs and live page tables. |
 | `cuda.py` | Adapt the shared V4 serving runtime and prepare graph regions. |
 | Shared Resin runtime | Scheduling, cache admission, graph lifecycle, sampling, scores and distributed steps. |
@@ -70,6 +71,28 @@ attention, indexing, cache updates and Engram hashing execute between regions.
 CP partitions query attention while retaining replicated KV, compressor and FFN
 work. There is no pipeline or sequence parallelism.
 
+## Bounded prefill replay
+
+The runner defaults to `swa_replay_tokens=140`. Layers 0–19 process every input;
+layer 20 writes complete shared C1 main/index KV before layers 20–39 keep only
+the final replay suffix. The bound refers to the request's final prefill endpoint,
+including reconstructed generated inputs, rather than each chunk's endpoint.
+Earlier chunks use one placeholder consumer row with no SWA reads or writes.
+DSpark commits retained rows at their absolute positions.
+
+This follows DeepInfer's approximate SWA reconstruction: it preserves complete
+producer KV but truncates consumer SWA dependencies. It does not reproduce a full
+40-layer prefill exactly. Prompt-scoring requests execute every row. Set
+`swa_replay_mode="off"` for ordinary full execution; `"mask"` retains every query
+with the same bounded SWA visibility as `"compact"` for implementation comparisons.
+
+Shared machinery knows only the final prefill lengths, a cache-layout replay
+suffix, and graph region row demands. V4.1 chooses its layer boundary and masks.
+Prefix hits stop before the required suffix; restored consumer bytes are ignored
+until their tail is rebuilt. Producer and consumer FFNs agree separate graph
+capacities across the expert domain, including idle attention replicas. CP
+repartitions retained attention queries and keeps its existing output gather.
+
 ## Validation
 
 CPU tests cover geometry, physical aliases, child slots, rollback, shifted HC,
@@ -79,6 +102,15 @@ Run the family tests with:
 ```bash
 uv run pytest models/cuda/tests/test_deepseek_v41*.py -q
 ```
+
+The [bounded-replay CP2 probe](https://modal.com/apps/ekzhang/main/ap-3CqOIEsvN90Xzj60QQAnw2)
+at `2973faf` passes on two B300s. Seven cases retain 1, 11 or 140 rows at page
+boundaries and contexts beyond 128K, including an empty CP peer and an early
+placeholder with no consumer SWA access. All 16 metadata fields and physical
+compressed-KV indices match CPU equations. Each rank replays 28 collective graph
+regions at distinct producer/consumer capacities without eager fallback. This
+operator check uses synthetic tensors, not checkpoint logits; its report is
+`artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-control/bounded-replay/cp-probe.json`.
 
 Independent B300 operator checks cover paged indexing/CED, projections, compressor
 pooling, packed attention, fused stores, vocabulary heads, HC/Engram residuals and
@@ -185,5 +217,5 @@ timing scope and the distinction between measured and projected acceptance.
 
 The runner accepts text token IDs and rejects image tokens. DSpark uses fixed-width
 greedy proposals up to the released five-token block; its confidence head is loaded
-but does not choose proposal length. Decoder bounded prefill replay, adaptive draft
-length, host RDMA Engram, wider EP and broader quality workloads remain separate work.
+but does not choose proposal length. Adaptive draft length, host RDMA Engram,
+wider EP and broader quality workloads remain separate work.

@@ -363,6 +363,25 @@ graph bucket, full KV writes at the boundary, absolute DSpark positions, and
 full execution when prompt scores are requested. Increasing chunk size alone
 does not implement bounded replay or establish parity with that curve.
 
+At `5d716e6`, [bounded consumer prefill on eight B300s](https://modal.com/apps/ekzhang/main/ap-yobactmL98aPFxktZM3kYU)
+uses the same EP8/ADP8, 8K chunks, balanced routing and warmed whole-prompt timing
+as the preceding full-model measurement:
+
+| Prompt tokens per GPU | Full prefill (s) | Bounded prefill (s) | Bounded input tokens/s/GPU |
+| ---: | ---: | ---: | ---: |
+| 4,096 | 0.1166 | 0.0947 | 43,257.50 |
+| 131,072 | 3.6910 | 2.0449 | 64,096.72 |
+
+The 128K result is 1.805× faster. It includes all 16 sequential chunks, full
+producer/C1 writes, retained consumer queries and DSpark state commits. It uses
+ordinary fast kernel arithmetic, with no deterministic validation overrides.
+Every FFN region replays its agreed graph; the final 140-row consumer projection
+regions use their intentional eager `padding` fallback. The model's bounded
+SWA reconstruction is approximate; these timings do not establish numerical
+equivalence or a controlled match to DeepInfer's EP4 curve. Raw records and
+provenance are in `ep8-control/bounded-replay/prefill.jsonl` and
+`prefill-summary.json`.
+
 The implementation uses fixed-width greedy proposals, loads the confidence head
 without applying its length policy, and supports up to the released five-token
 block. Benchmark defaults remain four drafts. Wider meshes and longer contexts

@@ -387,8 +387,9 @@ class CudaRunner(Runner):
         Operations accept flattened BF16 hidden states and optional token IDs.
         Only these stateless regions are padded; attention, recurrent updates,
         and sampling keep their actual request lengths and execute eagerly.
-        Large partial chunks stay eager so padding cannot double their FFN work.
-        Set ``pad_up_to=0`` when a model requires exact token buckets.
+        Local bucket selection leaves large partial chunks eager; ``pad_up_to=0``
+        requires an exact local bucket. Explicit distributed capacities override
+        this padding policy so every participant executes the same graph shape.
         """
 
         if self._prefill_operations:
