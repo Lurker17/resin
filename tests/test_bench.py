@@ -47,6 +47,19 @@ class Runner:
         return [0] * plan.num_sequences
 
 
+def test_distributed_benchmark_forwards_preparation_without_rebuilding_it():
+    prepared, context = object(), object()
+
+    class PreparedRunner(Runner):
+        def forward_distributed(self, plan, step_context, *, prepared):
+            assert step_context is context
+            return prepared
+
+    runner = BenchmarkRunner(PreparedRunner())
+    assert runner.forward_distributed(None, context, prepared=prepared) is prepared
+    assert runner._plan is None
+
+
 def test_prefill_measures_actual_chunked_inputs_and_keeps_engine_resident():
     raw = Runner(chunked=True)
     runner = BenchmarkRunner(raw)
@@ -395,7 +408,17 @@ def test_driver_reduction_uses_slowest_time_and_unique_replica_totals():
     class Distributed:
         @staticmethod
         def all_gather_object(values, local, *, group):
-            values[:] = [local, {**local, "seconds": 2 * local["seconds"]}]
+            values[:] = [
+                local,
+                {
+                    **local,
+                    "seconds": 2 * local["seconds"],
+                    "device_phase_ms": {
+                        key: 2 * value
+                        for key, value in local["device_phase_ms"].items()
+                    },
+                },
+            ]
 
     groups = SimpleNamespace(
         drivers=SimpleNamespace(size=2, handle=object()), distributed=Distributed()
@@ -403,6 +426,11 @@ def test_driver_reduction_uses_slowest_time_and_unique_replica_totals():
     reduced = distributed_reducer(groups)(
         {
             "seconds": 0.1,
+            "device_phase_ms": {
+                "draft": 5.0,
+                "target_verify": 15.0,
+                "device_total": 20.0,
+            },
             "input_tokens": 4,
             "committed_tokens": 2,
             "drafts": 4,
@@ -416,6 +444,7 @@ def test_driver_reduction_uses_slowest_time_and_unique_replica_totals():
     )
     assert reduced == {
         "seconds": 0.2,
+        "device_phase_ms": {"draft": 10.0, "target_verify": 30.0, "device_total": 40.0},
         "replica_sequences": [2, 2],
         "input_tokens": 8,
         "committed_tokens": 4,

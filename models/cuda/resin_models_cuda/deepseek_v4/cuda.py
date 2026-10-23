@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager, nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -61,6 +61,14 @@ from resin_models_cuda.deepseek_v4.weights import load_deepseek_v4_weights
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
     from resin.backend.distributed import StepContext
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedBatch:
+    """Rank-local host metadata accepted by distributed readiness validation."""
+
+    rows: tuple[tuple[int, int], ...]
+    cache_plan: PagedCachePlan | None
 
 
 class DeepSeekV4CudaRunner(CudaRunner):
@@ -953,33 +961,39 @@ class DeepSeekV4CudaRunner(CudaRunner):
 
     def validate_distributed(
         self, plan: BatchPlan | None, context: StepContext
-    ) -> None:
+    ) -> PreparedBatch:
         """Reject incompatible batches before the coordinator's readiness vote."""
 
         if self.parallel_groups is None or context.groups is not self.parallel_groups:
             raise ValueError("distributed step groups do not match this runner")
         if context.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
             raise ValueError("DeepSeek-V4 plan phase must be prefill or decode")
+        rows, cache_plan = (), None
         if plan is None:
             if context.num_sequences or context.num_tokens:
                 raise ValueError("a nonempty replica requires a batch plan")
         else:
-            self._validate_plan(plan)
+            rows = self._validate_plan(plan)
             if (
                 plan.phase != context.phase
                 or plan.num_sequences != context.num_sequences
                 or plan.num_tokens != context.num_tokens
             ):
                 raise ValueError("distributed step metadata does not match the plan")
-            self._cache_plan(plan)
+            cache_plan = self._cache_plan(plan)
         # Worker readiness votes on validation errors before any rank enters
         # a graph-selection collective or launches captured expert exchanges.
         self._check_cuda_graphs(context.phase)
         if context.phase == BatchPhase.DECODE and self.cuda_graph_decode != "disabled":
             self._require_cuda_graph_executor().mode("decode").check_ready()
+        return PreparedBatch(rows, cache_plan)
 
     def forward_distributed(
-        self, plan: BatchPlan | None, context: StepContext
+        self,
+        plan: BatchPlan | None,
+        context: StepContext,
+        *,
+        prepared: PreparedBatch | None = None,
     ) -> list[int] | list[list[int]] | ForwardOutput | None:
         """Join every EP layer even when this attention replica has no work.
 
@@ -990,16 +1004,20 @@ class DeepSeekV4CudaRunner(CudaRunner):
         round, including replicas that have no local requests.
         """
 
-        self.validate_distributed(plan, context)
-        rows = () if plan is None else self._validate_plan(plan)
+        prepared = (
+            self.validate_distributed(plan, context) if prepared is None else prepared
+        )
+        rows, cache_plan = prepared.rows, prepared.cache_plan
         with self._cuda_failure:
             if context.phase == BatchPhase.DECODE:
-                used_graph, graph_output = self._distributed_decode_graph(plan, context)
+                used_graph, graph_output = self._distributed_decode_graph(
+                    plan, context, cache_plan
+                )
                 if used_graph:
                     return graph_output
             staging = TensorStager(self.device)
             if plan is not None:
-                cache = self._cache.tensorize(self._cache_plan(plan), staging)
+                cache = self._cache.tensorize(cache_plan, staging)
                 token_ids = staging.device("token_ids", plan.token_ids, torch.long)
                 positions = staging.device("positions", plan.positions, torch.long)
             with (
@@ -1052,7 +1070,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             return format_output(output_logits, output, plan, prompt_logprobs=scores)
 
     def _distributed_decode_graph(
-        self, plan: BatchPlan | None, context: StepContext
+        self, plan: BatchPlan | None, context: StepContext, cache_plan
     ) -> tuple[bool, list[int] | list[list[int]] | ForwardOutput | None]:
         """Replay one common graph bucket across independent attention replicas."""
 
@@ -1069,7 +1087,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         if shape is None:
             return False, None
         if plan is not None:
-            return True, self._graph_forward(plan, self._cache_plan(plan), shape=shape)
+            return True, self._graph_forward(plan, cache_plan, shape=shape)
 
         # Idle replicas use only reserved scratch parents and send zero-weight
         # expert rows. Their local experts still execute work for active peers.

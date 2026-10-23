@@ -13,6 +13,30 @@ from deploy import deepseek_v4_parallel_validation as validation
 from resin import BatchPhase, ForwardOutput
 
 
+def test_observer_preserves_validated_preparation_through_execution():
+    prepared = object()
+    runner = SimpleNamespace(
+        validate_distributed=Mock(return_value=prepared),
+        forward_distributed=Mock(return_value=[3]),
+        cuda_graph_stats={"decode": {"replay_count": 0}},
+        speculative_tokens=0,
+    )
+    plan = SimpleNamespace(sequence_ids=(7,), context_lengths=(128,))
+    context = SimpleNamespace(
+        step_id=1,
+        phase=BatchPhase.DECODE,
+        placeholder=False,
+        num_sequences=1,
+        num_tokens=1,
+        replica_sizes=((1, 1),),
+    )
+    observed = validation._ObservedRunner(runner)
+    assert observed.validate_distributed(plan, context) is prepared
+    assert observed.forward_distributed(plan, context, prepared=prepared) == [3]
+    runner.validate_distributed.assert_called_once_with(plan, context)
+    runner.forward_distributed.assert_called_once_with(plan, context, prepared=prepared)
+
+
 def test_failed_case_persists_logits_and_reuses_baseline_for_retry(
     monkeypatch, tmp_path
 ):

@@ -247,6 +247,7 @@ def main(
     probe_only: bool = False,
     validate_model: bool = False,
     expert_backend: str = "flashinfer",
+    profile_graph_phases: bool = False,
 ):
     from deploy.bench import write_results
     from resin import Parallelism
@@ -319,6 +320,7 @@ def main(
         gpu_memory_utilization=gpu_memory_utilization,
         validate_model=validate_model,
         expert_backend=expert_backend,
+        profile_graph_phases=profile_graph_phases,
         metadata={
             "git_commit": git_revision,
             "dirty": dirty,

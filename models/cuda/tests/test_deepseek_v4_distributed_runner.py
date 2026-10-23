@@ -477,8 +477,9 @@ def test_managed_cache_addresses_are_validated_before_expert_rounds(
     )
 
     if error is None:
-        assert runner.validate_distributed(plan, context) is None
-        assert runner.forward_distributed(plan, context) == [2]
+        prepared = runner.validate_distributed(plan, context)
+        assert prepared.cache_plan is not None and prepared.rows == ((0, 1),)
+        assert runner.forward_distributed(plan, context, prepared=prepared) == [2]
         assert runner._model.calls == [("prefill", [[2]], 0, "row-0")]
     else:
         with pytest.raises(ValueError, match=error):
@@ -486,6 +487,33 @@ def test_managed_cache_addresses_are_validated_before_expert_rounds(
         assert runner._model.calls == []
         assert runner._cache.plans == []
         assert runner._cuda_failure.synchronizations == 0
+
+
+@pytest.mark.parametrize("idle", [False, True])
+def test_prepared_distributed_batch_is_reused_without_revalidating(monkeypatch, idle):
+    groups = _groups(Parallelism(world_size=4, ep=4, attn_dp=4))
+    runner = _runner(monkeypatch, groups)
+    plan = None if idle else BatchPlan([7], [0], [2], [0, 1], phase=BatchPhase.PREFILL)
+    context = _context(
+        groups,
+        BatchPhase.PREFILL,
+        ((0, 0) if idle else (1, 1), (1, 1), (0, 0), (0, 0)),
+        plan,
+    )
+    prepared = runner.validate_distributed(plan, context)
+
+    def revalidated(*_):
+        raise AssertionError(
+            "accepted execution must reuse its validated host metadata"
+        )
+
+    monkeypatch.setattr(runner, "validate_distributed", revalidated)
+    monkeypatch.setattr(runner, "_validate_plan", revalidated)
+    monkeypatch.setattr(runner, "_cache_plan", revalidated)
+    assert runner.forward_distributed(plan, context, prepared=prepared) == (
+        None if idle else [2]
+    )
+    assert runner._cache.plans == ([] if idle else [prepared.cache_plan])
 
 
 @pytest.mark.parametrize(

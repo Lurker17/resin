@@ -68,14 +68,14 @@ class _ObservedRunner:
     def validate_distributed(self, plan, context):
         validate = getattr(self.runner, "validate_distributed", None)
         if validate is not None:
-            validate(plan, context)
+            return validate(plan, context)
 
     def forward(self, plan):
         if self.decode_trace is not None:
             return self.decode_trace.step(plan, lambda: self.runner.forward(plan))
         return self.runner.forward(plan)
 
-    def forward_distributed(self, plan, context):
+    def forward_distributed(self, plan, context, *, prepared=None):
         before = {
             mode: stats["replay_count"]
             for mode, stats in self.runner.cuda_graph_stats.items()
@@ -101,12 +101,19 @@ class _ObservedRunner:
                 ),
             }
         )
-        if self.decode_trace is not None:
-            output = self.decode_trace.step(
-                plan, lambda: self.runner.forward_distributed(plan, context)
+
+        def execute():
+            return (
+                self.runner.forward_distributed(plan, context)
+                if prepared is None
+                else self.runner.forward_distributed(plan, context, prepared=prepared)
             )
-        else:
-            output = self.runner.forward_distributed(plan, context)
+
+        output = (
+            self.decode_trace.step(plan, execute)
+            if self.decode_trace is not None
+            else execute()
+        )
         self.calls[-1]["graph_replays"] = {
             mode: stats["replay_count"] - before.get(mode, 0)
             for mode, stats in self.runner.cuda_graph_stats.items()

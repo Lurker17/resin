@@ -127,9 +127,13 @@ class BenchmarkRunner:
         self._observe(plan)
         return self.runner.forward(plan)
 
-    def forward_distributed(self, plan, context):
+    def forward_distributed(self, plan, context, *, prepared=None):
         self._observe(plan)
-        return self.runner.forward_distributed(plan, context)
+        return (
+            self.runner.forward_distributed(plan, context)
+            if prepared is None
+            else self.runner.forward_distributed(plan, context, prepared=prepared)
+        )
 
     def speculation(self):
         stats = getattr(self.runner, "_speculation", None)
@@ -169,6 +173,12 @@ def distributed_reducer(groups):
             "context_start_max": max(v["context_start_max"] for v in values),
             "context_end_min": min(v["context_end_min"] for v in values),
             "context_end_max": max(v["context_end_max"] for v in values),
+            "device_phase_ms": {
+                phase: max(v.get("device_phase_ms", {}).get(phase, 0) for v in values)
+                for phase in {
+                    key for v in values for key in v.get("device_phase_ms", {})
+                }
+            },
         }
 
     return reduce_step
@@ -257,6 +267,11 @@ def run_sweep(
                 "context_start_max": max(starts),
                 "context_end_min": min(ends),
                 "context_end_max": max(ends),
+                "device_phase_ms": (
+                    getattr(runner, "last_dspark_phase_ms", None) or {}
+                    if plan.phase == BatchPhase.DECODE
+                    else {}
+                ),
                 "graph_counts": {
                     key: value - before_graphs.get(key, 0)
                     for key, value in graph_counts.items()
@@ -409,6 +424,15 @@ def run_sweep(
                     "warmup_steps": warmed,
                     "measure_steps": len(samples),
                     "step_seconds": seconds,
+                    **(
+                        {
+                            "device_phase_ms": [
+                                sample["device_phase_ms"] for sample in samples
+                            ]
+                        }
+                        if any(sample.get("device_phase_ms") for sample in samples)
+                        else {}
+                    ),
                     "window_seconds": sum(seconds),
                     "committed_tokens": sum(s["committed_tokens"] for s in samples),
                     "measured_context_start_min": samples[0]["context_start_min"],

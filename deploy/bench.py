@@ -72,6 +72,7 @@ def _runner(model, checkpoint, *, device, groups, cases, options, context_capaci
         max_batch_size=max(batches),
         speculative_tokens=options["draft_tokens"],
         prefill_chunk_size=options["prefill_chunk_size"],
+        profile_graph_phases=options.get("profile_graph_phases", False),
         cuda_graph_decode_shapes=(
             tuple((batch, context_capacity) for batch in batches)
             if options["decode_graph"] != "disabled"
@@ -392,6 +393,7 @@ def run_benchmark(
     metadata: dict | None = None,
     validate_model: bool = False,
     expert_backend: str = "flashinfer",
+    profile_graph_phases: bool = False,
 ) -> list[dict]:
     """One load and graph catalog for all compatible points in this sweep."""
     from resin.bench import BenchCase
@@ -454,6 +456,7 @@ def run_benchmark(
         metadata=metadata or {},
         validate_model=validate_model,
         expert_backend=expert_backend,
+        profile_graph_phases=profile_graph_phases,
     )
     with tempfile.TemporaryDirectory(prefix="resin-bench-") as directory:
         output = Path(directory) / "results.json"

@@ -70,8 +70,15 @@ class CollectiveRunner:
             assert plan.phase == context.phase
             assert plan.num_sequences <= context.max_num_sequences
             assert len(plan.token_ids) <= context.max_num_tokens
+        if self.case == "normal":
+            return context.step_id, plan
 
-    def forward_distributed(self, plan, context):
+    def forward_distributed(self, plan, context, *, prepared=None):
+        if self.case == "normal":
+            assert prepared is not None
+            assert prepared[0] == context.step_id and prepared[1] is plan
+        else:
+            assert prepared is None
         groups = self.groups
         _, cp, _, tp = groups.topology.coordinates(groups.rank)
         prefill = context.phase == BatchPhase.PREFILL
@@ -543,11 +550,11 @@ def test_external_failure_preserves_native_resources_and_disables_cleanup():
     assert releases == []
 
 
-def test_control_failure_after_model_work_keeps_the_accepted_batch(monkeypatch):
+def _single_rank_groups():
     from resin.backend.topology import RankGroup
 
     singleton = RankGroup((0,), None, 0)
-    groups = ParallelGroups(
+    return ParallelGroups(
         Parallelism(),
         0,
         singleton,
@@ -564,6 +571,47 @@ def test_control_failure_after_model_work_keeps_the_accepted_batch(monkeypatch):
         None,
         [],
     )
+
+
+def test_single_rank_replica_keeps_preparation_local_and_skips_serialization(
+    monkeypatch,
+):
+    import resin.backend.distributed as implementation
+
+    def unexpected_serialization(*args, **kwargs):
+        raise AssertionError("a single-rank replica has no plan consumer")
+
+    monkeypatch.setattr(implementation.pickle, "dumps", unexpected_serialization)
+
+    class PreparedRunner:
+        runner_config = RunnerConfig()
+        calls = 0
+        validations = 0
+
+        def validate_distributed(self, plan, context):
+            self.validations += 1
+            return context.step_id, plan
+
+        def forward_distributed(self, plan, context, *, prepared=None):
+            assert prepared is not None
+            assert prepared[0] == context.step_id and prepared[1] is plan
+            assert plan.media[0].callback() == 19
+            self.calls += 1
+            return [3]
+
+    runner = PreparedRunner()
+    engine = DistributedEngine(DistributedWorker(runner, _single_rank_groups()))
+    request = engine.submit(
+        [1], max_new_tokens=1, media=SimpleNamespace(callback=lambda: 19)
+    )
+    engine.step()
+    assert request.take_result() == [3]
+    assert runner.calls == runner.validations == 1
+    engine.close()
+
+
+def test_control_failure_after_model_work_keeps_the_accepted_batch(monkeypatch):
+    groups = _single_rank_groups()
     releases = []
     calls = []
     runner = LocalRunner(

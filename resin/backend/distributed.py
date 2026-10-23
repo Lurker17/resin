@@ -106,8 +106,11 @@ class DistributedWorker:
 
     CP/EP/attention-DP runtimes implement forward_distributed(plan_or_none, context),
     including empty participation. Optional validate_distributed performs host
-    checks before a domain-wide readiness vote. The forward callback must finish
-    device work before returning. Bind/release may communicate within a replica;
+    checks before a domain-wide readiness vote. A non-None validation result is
+    passed to forward_distributed as the keyword-only ``prepared`` argument;
+    runners can reuse validated host metadata without retaining pending state.
+    The forward callback must finish device work before returning.
+    Bind/release may communicate within a replica;
     collectives across replicas belong only in the forward callback.
     """
 
@@ -253,9 +256,10 @@ class DistributedWorker:
             if plan is not None:
                 if plan.phase != self._phase:
                     raise ValueError("local plan disagrees with the coordinated phase")
-                payload = pickle.dumps(
-                    batch_plan_payload(plan), protocol=pickle.HIGHEST_PROTOCOL
-                )
+                if self.groups.replica.size > 1:
+                    payload = pickle.dumps(
+                        batch_plan_payload(plan), protocol=pickle.HIGHEST_PROTOCOL
+                    )
         except BaseException as exc:
             error = _message(exc)
         descriptors = self._drivers(
@@ -283,7 +287,7 @@ class DistributedWorker:
         return self._execute(command, plan)
 
     def _execute(self, command, plan=None):
-        error, context = None, None
+        error, context, prepared = None, None, None
         try:
             if plan is None and command["payload"] is not None:
                 plan = batch_plan_from_payload(pickle.loads(command["payload"]))
@@ -298,14 +302,18 @@ class DistributedWorker:
                 0 if plan is None else len(plan.token_ids),
             )
             if self._validate is not None:
-                self._validate(plan, context)
+                prepared = self._validate(plan, context)
         except BaseException as exc:
             error = _message(exc)
         self._consensus(self.groups.domain, error)
         result, error = None, None
         try:
             if self._forward is not None:
-                result = self._forward(plan, context)
+                result = (
+                    self._forward(plan, context)
+                    if prepared is None
+                    else self._forward(plan, context, prepared=prepared)
+                )
             elif plan is not None:
                 result = getattr(self.runner, "forward")(plan)
         except BaseException as exc:
