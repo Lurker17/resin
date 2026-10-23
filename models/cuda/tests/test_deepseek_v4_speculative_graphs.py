@@ -145,7 +145,6 @@ def test_distributed_speculative_graph_selection_includes_verification_lookahead
         return (4, 128)
 
     runner._select_distributed_cuda_graph = select
-    runner._cache_plan = lambda plan: "cache-plan"
     runner._graph_forward = lambda *args, **kwargs: (
         replayed.append((args, kwargs))
         or [
@@ -154,7 +153,7 @@ def test_distributed_speculative_graph_selection_includes_verification_lookahead
         ]
     )
 
-    used_graph, output = runner._distributed_decode_graph(plan, "context")
+    used_graph, output = runner._distributed_decode_graph(plan, "context", "cache-plan")
 
     assert selected == [
         (
@@ -166,6 +165,7 @@ def test_distributed_speculative_graph_selection_includes_verification_lookahead
     assert used_graph
     assert output == [[1], [2, 3]]
     assert len(replayed) == 1
+    assert replayed[0][0] == (plan, "cache-plan")
 
 
 def test_idle_speculative_replica_votes_before_replaying_scratch_graph():
@@ -183,7 +183,7 @@ def test_idle_speculative_replica_votes_before_replaying_scratch_graph():
 
     runner._select_distributed_cuda_graph = select
 
-    assert runner._distributed_decode_graph(None, "context") == (True, None)
+    assert runner._distributed_decode_graph(None, "context", None) == (True, None)
     assert replayed == [
         ("decode", (4, 128), {"scratch_shape": (4, 128), "ep_valid_rows": 0})
     ]
