@@ -132,15 +132,21 @@ def _latency(graph):
 @torch.inference_mode()
 def run_probe():
     results = []
-    for batch, queries, context, draft in (
-        (2, 1, 0, False),
-        (3, 5, 126, False),
-        (3, 3, 126, True),
-        (256, 4, 131070, False),
-        (256, 3, 131070, True),
+    for batch, queries, context, draft, masked, int32 in (
+        (2, 1, 0, False, False, True),
+        (3, 5, 126, False, True, False),
+        (3, 3, 126, True, True, True),
+        (256, 4, 131070, False, False, False),
+        (256, 4, 131070, False, True, False),
+        (256, 3, 131070, True, True, False),
     ):
         cpu, gpu, positions, mask, selected = _case(batch, queries, context)
-        gpu_positions, gpu_mask = positions.cuda(), mask.cuda()
+        if int32:
+            positions = positions.int()
+        if not masked:
+            mask = None
+        gpu_positions = positions.cuda()
+        gpu_mask = None if mask is None else mask.cuda()
         gpu_selected = {ratio: values.cuda() for ratio, values in selected.items()}
 
         def call():
@@ -153,7 +159,10 @@ def run_probe():
         original_first = [group.first_blocks.clone() for group in cpu.groups]
         for iteration in range(5):
             positions.copy_(initial_positions + iteration)
-            mask.copy_((torch.arange(batch * queries) + iteration).remainder(11) != 0)
+            if mask is not None:
+                mask.copy_(
+                    (torch.arange(batch * queries) + iteration).remainder(11) != 0
+                )
             for index, (source, target) in enumerate(zip(cpu.groups, gpu.groups)):
                 source.parent_ids.add_(3)
                 source.child_slots.add_(1).remainder_(cpu.geometry.packings[index])
@@ -168,7 +177,8 @@ def run_probe():
                 values[..., 3] = (positions + 1) // ratio
                 gpu_selected[ratio].copy_(values)
             gpu_positions.copy_(positions)
-            gpu_mask.copy_(mask)
+            if gpu_mask is not None:
+                gpu_mask.copy_(mask)
             eager = call()
             graph.replay()
             torch.cuda.synchronize()
@@ -187,6 +197,8 @@ def run_probe():
                 "queries": queries,
                 "context": context,
                 "draft": draft,
+                "masked": masked,
+                "position_dtype": str(positions.dtype),
                 "exact_fields": len(output),
                 "dynamic_graph_replays": 5,
                 "native_ms": _latency(graph),
