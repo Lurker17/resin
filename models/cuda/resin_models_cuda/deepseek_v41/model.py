@@ -38,7 +38,12 @@ from resin_models_cuda.deepseek_v41.attention import (
     store_attention_kv,
     store_kv,
 )
-from resin_models_cuda.deepseek_v41.hc import HCLazyPost, materialize, mega_transition
+from resin_models_cuda.deepseek_v41.hc import (
+    HCLazyPost,
+    materialize,
+    mega_transition,
+    prenorm,
+)
 from resin_models_cuda.deepseek_v41.kernels import (
     act_quant,
     hc_split_sinkhorn,
@@ -519,10 +524,7 @@ class Block(nn.Module):
             )
 
     def mixes(self, hidden, name):
-        flat = hidden.flatten(2).float()
-        mixed = F.linear(flat, getattr(self, f"hc_{name}_fn")) * torch.rsqrt(
-            flat.square().mean(-1, keepdim=True) + self.args.norm_eps
-        )
+        mixed = prenorm(hidden, getattr(self, f"hc_{name}_fn"), self.args.norm_eps)
         return hc_split_sinkhorn(
             mixed,
             getattr(self, f"hc_{name}_scale"),

@@ -1,10 +1,50 @@
 """Native residual operator layouts, checked without a GPU dependency."""
 
+import sys
 from types import SimpleNamespace
 
 import torch
 
+from resin.backend.torch import use_default_dtype
 from resin_models_cuda.deepseek_v41 import engram, hc
+
+
+def test_prenorm_uses_bf16_inputs_fixed_splits_and_fp32_workspaces(monkeypatch):
+    hidden = torch.randn(2, 3, 4, 8, dtype=torch.bfloat16)
+    fn = torch.randn(24, 32)
+    eps = 1e-6
+
+    def gemm(x, weight, out, squares, splits):
+        assert x.shape == (6, 32) and x.dtype == torch.bfloat16
+        assert weight is fn and splits == 16
+        assert out.shape == (16, 6, 24) and out.dtype == torch.float32
+        assert squares.shape == (16, 6) and squares.dtype == torch.float32
+        for split in range(splits):
+            part = slice(2 * split, 2 * split + 2)
+            out[split] = x[:, part].float() @ fn[:, part].T
+            squares[split] = x[:, part].float().square().sum(-1)
+
+    def kernel(mixes, groups, width, epsilon, splits):
+        assert (mixes, groups, width, epsilon, splits) == (24, 1, 32, eps, 16)
+
+        def reduce(partials, squares, sums, sum_squares, output):
+            assert partials.shape == (16, 6, 1, 24)
+            assert squares.shape == (16, 6, 1)
+            sums.copy_(partials.sum(0))
+            sum_squares.copy_(squares.sum(0))
+            output.copy_(sums[:, 0] * torch.rsqrt(sum_squares / width + eps))
+
+        return reduce
+
+    monkeypatch.setitem(
+        sys.modules, "deep_gemm", SimpleNamespace(tf32_hc_prenorm_gemm=gemm)
+    )
+    monkeypatch.setattr(hc, "_prenorm_kernel", lambda: kernel)
+    expected = hc.prenorm(hidden, fn, eps)
+    with use_default_dtype(torch.bfloat16):
+        actual = hc._prenorm_native(hidden, fn, eps)
+    assert actual.shape == (2, 3, 24) and actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_native_post_keeps_source_destination_order_and_lazy_state(monkeypatch):

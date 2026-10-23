@@ -1,6 +1,7 @@
 """DeepInfer's lazy shifted-HC transitions using the pinned DeepGEMM ABI.
 
-Adapted from DeepInfer's v4_modules/hc.py::_mega_mhc and hc_lazy.py (Apache-2.0).
+Adapted from DeepInfer's v4_modules/hc.py::_mega_mhc, hc_lazy.py, and
+mhc_ops.py::mhc_pre_norm_fn (Apache-2.0).
 Revision: 774ce244b87cc0eb8d4b94ab9f5de2ab22049f01.
 Engram and DSpark taps materialize the residual before observing its streams.
 """
@@ -49,6 +50,49 @@ def materialize(output: Tensor, state: HCLazyPost) -> Tensor:
         state.post[..., None] * output[..., None, :]
         + (state.comb[..., None] * state.residual.unsqueeze(-2)).sum(-3)
     ).to(output.dtype)
+
+
+@cache
+def _prenorm_kernel():
+    import_module("resin_models_cuda.deepseek_v4.tilelang_kernels")
+    # TileKernels 1.0 exposes the reducer builder; newer releases wrap this as
+    # mhc_reduce_partials_and_rmsnorm_fwd. Keep the pinned ABI in this adapter.
+    return import_module("tile_kernels.mhc.norm_fn_kernel")._mhc_pre_norm_fn_fwd_norm
+
+
+def _prenorm_native(hidden: Tensor, fn: Tensor, eps: float) -> Tensor:
+    """DeepInfer's fixed 16-way HC prenorm reduction, independent of row count."""
+    import deep_gemm
+
+    mixes, width = fn.shape
+    flat = hidden.reshape(-1, width)
+    rows, splits = flat.shape[0], 16
+    partials = torch.empty(
+        (splits, rows, 1, mixes), device=hidden.device, dtype=torch.float32
+    )
+    squares = torch.empty((splits, rows, 1), device=hidden.device, dtype=torch.float32)
+    deep_gemm.tf32_hc_prenorm_gemm(
+        flat, fn, partials.view(splits, rows, mixes), squares.view(splits, rows), splits
+    )
+    output = torch.empty_like(partials[0, :, 0])
+    _prenorm_kernel()(mixes, 1, width, eps, splits)(
+        partials,
+        squares,
+        torch.empty_like(partials[0]),
+        torch.empty_like(squares[0]),
+        output,
+    )
+    return output.view(*hidden.shape[:-2], mixes)
+
+
+def prenorm(hidden: Tensor, fn: Tensor, eps: float) -> Tensor:
+    """Compute HC mixes at materialized boundaries (embedding, Engram, taps)."""
+    if hidden.is_cuda:
+        return _prenorm_native(hidden, fn, eps)
+    flat = hidden.flatten(-2).float()
+    return torch.nn.functional.linear(flat, fn) * torch.rsqrt(
+        flat.square().mean(-1, keepdim=True) + eps
+    )
 
 
 def mega_transition(
