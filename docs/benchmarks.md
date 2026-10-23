@@ -218,6 +218,79 @@ These archived `cd5ecfd` results precede the compact graph-selection vote added
 afterward. That change retains exact catalog revalidation on mutation; it needs
 its own GPU measurement and does not change the recorded plots above.
 
+The [compact-vote EP8 sweep](https://modal.com/apps/ekzhang/main/ap-a7qZSjXVMRlWgDgyLccAtF)
+at clean `40a44fd` qualifies that change with 50 warmup and 60 measured
+completions per case, using memory utilization 0.5. All six cases pass the token,
+context and graph-count audit. Timing includes the safe overlap drains at a cache
+page boundary.
+
+| Batch/GPU | Engine ms | Projected tokens/s/GPU | Actual tokens/s/GPU | Published DI EP8 ms, approximate |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 25.683 | 1,012.33 | 934.46 | ~13.6 |
+| 16 | 24.722 | 2,103.39 | 1,941.59 | ~14.1 |
+| 32 | 26.781 | 3,883.32 | 3,584.60 | ~14.8 |
+| 64 | 28.241 | 7,365.06 | 6,798.51 | ~16.4 |
+| 128 | 28.526 | 14,583.18 | 13,461.40 | ~21.7 |
+| 256 | 42.507 | 19,573.12 | 18,067.50 | ~33.3 |
+
+Each case records 480 graph replays, 464 enqueues and 456 continuations across
+eight drivers, with no eager fallback. Each sequence commits 180 tokens while its
+context grows from 131,222 to 131,402. At B256, the three intervals around the
+page crossing take 89.96, 97.68 and 87.20 ms; the median interval is 39.95 ms.
+The reported 42.507 ms mean includes them. The earlier `cd5ecfd` window stayed
+within one page, so its 39.794 ms B256 mean covers a different drain pattern.
+Extending prepared write leases across this boundary is the first large-batch
+lifecycle target, while preserving writer ownership, page retirement and failure
+quarantine.
+
+All 48 new rank traces contain two complete forwards. The graph vote now uses one
+fixed record, and every rank records six fixed control gathers per forward with
+no object gathers. CUDA kernel counts remain 1,436 at B8 and 1,428 at B256.
+The extra traces measure GPU-active union durations of 15.63 and 38.74 ms,
+respectively; these separate profiler captures cannot isolate CPU time by
+subtraction from Engine timing. B8 still points to CPU coordination as the first
+latency target. Coordinated decode intervals, as in DeepInfer's periodic phase
+checks, could reduce phase arbitration. Completion and commit failure agreement
+must preserve the Engine's page leases, prefix publication and request results.
+
+The DeepInfer column is read from its
+[published EP8 image](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/doc/images/wide_ep_decode_pareto.png),
+not raw measurements. Both sources really prefill the same 126,976 shared and
+4,096 private tokens, and both charts use K3 and τ=3.25. The comparison is
+indicative: DeepInfer specifies SM100 rather than an exact B300 model, uses
+384+32 experts with random physical routing, natural acceptance, temperature 0.3,
+top-p 0.95, forced sampler top-k 1024 and five logprobs. Resin uses 384 experts,
+balanced routes, greedy sampling without scores and forced two-draft acceptance.
+DeepInfer reports rank0's mean after 50 warmup, 60 logged and 60 silent intervals,
+excluding periodic load-balance-stat flush intervals; Resin includes drains and
+takes the DP maximum for each measured completion interval.
+
+The remaining device opportunities below use frozen `cd5ecfd` profiler work,
+averaged across eight ranks. These are bundle footprints and upper bounds on
+removable work, not promised wall-time savings; some bundles overlap.
+
+| Candidate | Kernels/forward | B8 work ms | B256 work ms | Concrete boundary |
+| --- | ---: | ---: | ---: | --- |
+| Sampling | 47 / 43 | 1.501 | 5.405 | Fuse runtime greedy and filtering branches; four stochastic paths currently run even for greedy rows. |
+| Seven materialized HC boundaries | 98 | 0.350 | 2.331 | Use DeepInfer's shifted prenorm and pre-mix operators instead of cast/SGEMM/reduction chains. |
+| Route setup | 430 | 0.661 | 0.839 | Prepare balanced layouts before capture and share the live-token mask; 344 kernels are synthetic balanced-route setup. |
+| Verification-logit slice copies | 4 | 0.018 | 0.347 | Let sampling read the existing row strides. |
+| Markov vocabulary additions | 3 | 0.015 | 0.304 | Accumulate the projection into logits through DeepGEMM's `out_acc` contract. |
+| FP8 casts, total footprint | 92 | 0.161 | 0.287 | Emit attention normalization's FP8 values/scales directly where the consumer permits it. |
+
+Sampling changes must retain Resin's top-k-before-top-p distribution and per-request
+Philox seed/offset stream. DeepInfer's sampler uses different filtering and RNG
+contracts, so copying it requires an explicit adapter and independent validation.
+Shifted HC must apply the previous pre-mix; the unshifted fused operator is not a
+drop-in replacement. Route tensors must be prepared outside capture and retained
+through graph teardown.
+
+Raw records, exact token/counter audits, source provenance, plots, image
+digitization, protocol details and six merged Perfetto traces are under
+`artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-compact/`. The full failed
+`d6074ac` attempt is preserved there separately: it produced no timing point and
+exposed reusable inference-tensor buffers, corrected before `40a44fd`.
+
 The implementation uses fixed-width greedy proposals, loads the confidence head
 without applying its length policy, and supports up to the released five-token
 block. Benchmark defaults remain four drafts. Wider meshes and longer contexts
