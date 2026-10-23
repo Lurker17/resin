@@ -41,8 +41,8 @@ The MIT notice is retained in that model directory's LICENSE.
 
 The prepared DeepSeek-V4.1 forward pass in
 models/cuda/resin_models_cuda/deepseek_v41 (attention, linear, HC, compressor,
-indexer, Engram prefetch and the upstream CUDA operators) contains portions
-adapted from DeepInfer:
+indexer, Engram prefetch, shared batch metadata and the upstream CUDA operators)
+contains portions adapted from DeepInfer:
 
   https://github.com/deepseek-ai/DeepInfer
   revision 774ce244b87cc0eb8d4b94ab9f5de2ab22049f01
@@ -50,6 +50,9 @@ adapted from DeepInfer:
 DeepInfer is licensed under the Apache License, Version 2.0. Its license is
 retained in deepseek_v41/upstream/LICENSE. Copied operators identify their
 source files and revision; adaptations bind them to Resin's paged storage.
+The native batch metadata, paged index expansion and selected-index conversion
+kernels adapt prepare_decode_metadata.py, get_kv_index.py and flash_mla_utils.py
+from deepinfer/model_executor/layers/tilelang_ops/cuda at that revision.
 The DeepSelect dependency is pinned to the matching DeepInfer submodule
 revision bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18.
 

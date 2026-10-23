@@ -18,6 +18,7 @@ DeepSelect `bfa4507d`, and TileKernels 1.0.0; full revisions live in
 | `model.py` | Shifted HC, shared KV/index ownership, Engram, and DSpark architecture. |
 | `linear.py`, `attention.py`, `compressor.py`, `experts.py` | Lower loaded checkpoint tensors into fused projections, packed scales and prepared operators. |
 | `indexer.py`, `upstream/` | Paged FP4 MQA, candidate selection and fused cache transforms. |
+| `batch.py` | Prepare shared store slots, attention indices, compression lengths and state-page mappings once per forward. |
 | `cache.py` | Typed zero-copy views over Engine-owned byte slabs and live page tables. |
 | `cuda.py` | Adapt the shared V4 serving runtime and prepare graph regions. |
 | Shared Resin runtime | Scheduling, cache admission, graph lifecycle, sampling, scores and distributed steps. |
@@ -27,6 +28,13 @@ logits; FP8 projections use per-token block32 casts and packed UE8M0 TMA scales.
 C2 combines BF16 gate/value projections with FP32 accumulation and pools on the
 Engine's paged FP32 state. Only completed compression windows update packed KV
 or index keys; rejected speculative rows cannot overwrite accepted earlier state.
+
+Each target or draft forward prepares one batch metadata object from live positions
+and Engine parent/child page tables. Native kernels expand SWA windows, prepare
+compression/state mappings and adapt selected compressed indices once per KV
+source; consuming layers reuse those tensors. Graph replay reads updated inputs,
+including page tables and masks. Prefill also shares address geometry and unpacked
+compressed KV across consumers of the same owner.
 
 FlashMLA fuses query RoPE, sparse attention, inverse output RoPE and FP8 output
 casting. KV stores fuse RMS normalization, RoPE and quantization. Sliding KV uses
@@ -63,14 +71,16 @@ work. There is no pipeline or sequence parallelism.
 ## Validation
 
 CPU tests cover geometry, physical aliases, child slots, rollback, shifted HC,
-prepared weight layouts and projection fusion. Run the family tests with:
+prepared weight layouts, projection fusion and independent paged-address equations.
+Run the family tests with:
 
 ```bash
 uv run pytest models/cuda/tests/test_deepseek_v41*.py -q
 ```
 
 Independent B300 operator checks cover paged indexing/CED, projections, compressor
-pooling, packed attention, fused stores and vocabulary heads, including graph replay:
+pooling, packed attention, fused stores, vocabulary heads, HC/Engram residuals and
+shared batch metadata, including graph replay:
 
 ```bash
 uv run modal run deploy/modal_v41_forward_probe.py \
@@ -98,14 +108,23 @@ The [direct FP8 output probe](https://modal.com/apps/ekzhang/main/ap-AeDmb4KbJfj
 checks H64/G8/R1024 at 1/5/1,024/1,280 rows: O-A values, packed scales and O-B
 outputs match BF16-plus-cast bitwise, including five graph replays.
 
-At clean commit `7087a31`, the [full-checkpoint EP4/ADP4 B300 check](https://modal.com/apps/ekzhang/main/ap-RGV18BLKlCCRqSzjNVwMBm)
+The [shared metadata B300 probe](https://modal.com/apps/ekzhang/main/ap-gWvo1SQ61ukvMlqmp00bN7)
+at `299d75d` checks six shapes, including batch256 with four target queries or
+three draft queries at 128K context. All 18 output fields match the CPU equations,
+including irregular masks and both position dtypes. Five graph replays per case
+update positions, parent/child tables, masks and selected indices. Its report is
+`artifacts/benchmarks/deepinfer-v41-batch-metadata-probe.json`.
+
+At clean commit `4ca8eb2`, the [full-checkpoint EP4/ADP4 B300 check](https://modal.com/apps/ekzhang/main/ap-agflU32LUNXLq0VuVaehmh)
 passes on all four drivers with the released 384 experts and natural routing.
 Each driver runs four prefill and three decode steps, replays three full decode
-graphs, and matches eager greedy IDs, prompt logprobs and generated-token logprobs
-exactly (maximum absolute difference zero). Natural K3 verification accepts 9/9
-drafts on this short counting prompt; this does not establish model quality or
-representative acceptance. The report is
-`artifacts/benchmarks/deepinfer-v41-forward-ep4-k3-validation.json`.
+graphs, 160 prefill compute regions and 480 attention-projection regions. Eager
+and captured execution produce identical greedy IDs, prompt logprobs,
+generated-token logprobs and top-3 logprobs (maximum absolute difference zero).
+This includes the shared metadata and prepared forward operators. Natural K3
+verification accepts 9/9 drafts on this short counting prompt; this does not
+establish model quality or representative acceptance. The report is
+`artifacts/benchmarks/2026-10-22-deepseek-v41-prepared/validation.json`.
 
 The [native FP32 route EP2 probe](https://modal.com/apps/ekzhang/main/ap-72WXKqszkwgN9zSWQIn3gv)
 at `14af36b` covers synthetic 16-expert, top-6 routing with widths 5,120/2,304 and
@@ -140,8 +159,9 @@ host coordination and planning overhead. Raw records, PNG/SVG plots and all-rank
 Perfetto traces live under
 `artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-deepinfer/`.
 These historical records precede the current scheduling, overlap and prepared
-metadata changes; current source needs fresh full-checkpoint qualification and
-throughput measurement. See [the benchmark protocol](../../../../docs/benchmarks.md).
+metadata changes. The checkpoint qualification above does not measure their
+throughput; performance results must identify the same source revision.
+See [the benchmark protocol](../../../../docs/benchmarks.md).
 
 The runner accepts text token IDs and rejects image tokens. DSpark uses fixed-width
 greedy proposals up to the released five-token block; its confidence head is loaded
