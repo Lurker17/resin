@@ -8,6 +8,7 @@ import os
 import subprocess
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import modal
 
@@ -20,6 +21,9 @@ from deploy.jit_cache import (
 from deploy.modal_image import build_modal_image
 
 ROOT = Path(__file__).resolve().parents[1]
+TRACE_VOLUME = modal.Volume.from_name(
+    "resin-benchmark-traces-v1", create_if_missing=True
+)
 # Share the existing checkpoint volumes, while keeping model identity explicit
 # in every result. Repository Python files are never downloaded or executed.
 CHECKPOINTS = {
@@ -83,6 +87,9 @@ image = (
     )
     .add_local_file(ROOT / "deploy/bench.py", "/root/deploy/bench.py", copy=True)
     .add_local_file(
+        ROOT / "deploy/bench_trace.py", "/root/deploy/bench_trace.py", copy=True
+    )
+    .add_local_file(
         ROOT / "deploy/deepseek_v41_validation.py",
         "/root/deploy/deepseek_v41_validation.py",
         copy=True,
@@ -100,6 +107,7 @@ app = modal.App(
         **MODEL_VOLUMES,
         "/kernel-cache/.cache": KERNEL_VOLUME,
         KERNEL_CACHE_MOUNT: HOPPER_KERNEL_VOLUME,
+        "/bench-traces": TRACE_VOLUME,
     },
 )
 
@@ -199,6 +207,35 @@ def sweep(model: str, cases: list[dict], topology: dict, options: dict) -> list[
     finally:
         KERNEL_VOLUME.commit()
         HOPPER_KERNEL_VOLUME.commit()
+        if options.get("trace_dir"):
+            TRACE_VOLUME.commit()
+
+
+def download_traces(remote_directory: str, output: str | Path) -> list[str]:
+    """Download this run's rank traces and combine each case for Perfetto."""
+    from scripts.merge_bench_traces import merge_traces
+
+    prefix = Path(remote_directory).relative_to("/bench-traces").as_posix()
+    destination = Path(output)
+    destination.mkdir(parents=True, exist_ok=True)
+    cases: dict[str, list[Path]] = {}
+    for entry in TRACE_VOLUME.iterdir(prefix):
+        if not entry.path.endswith(".json.gz"):
+            continue
+        target = destination / Path(entry.path).name
+        with target.open("wb") as stream:
+            for chunk in TRACE_VOLUME.read_file(entry.path):
+                stream.write(chunk)
+        case = target.name.rsplit("-rank", 1)[0]
+        cases.setdefault(case, []).append(target)
+    merged = []
+    for case, sources in sorted(cases.items()):
+        target = destination / f"{case}-all-ranks.json.gz"
+        merge_traces(sources, target)
+        merged.append(str(target))
+    if not merged:
+        raise RuntimeError(f"no decode traces found in {remote_directory}")
+    return merged
 
 
 @app.function(cpu=16, memory=32768, timeout=30 * 60, single_use_containers=True)
@@ -248,6 +285,7 @@ def main(
     validate_model: bool = False,
     expert_backend: str = "flashinfer",
     profile_graph_phases: bool = False,
+    trace_dir: str = "",
 ):
     from deploy.bench import write_results
     from resin import Parallelism
@@ -283,6 +321,10 @@ def main(
     ]
     for case in cases:
         BenchCase(**case)
+    if trace_dir and (validate_model or "decode" not in phases.split(",")):
+        raise ValueError(
+            "traces require a decode benchmark, outside checkpoint validation"
+        )
     if model.startswith("gpt-oss") and draft_tokens:
         raise ValueError("GPT-OSS has no draft model; pass --draft-tokens 0")
     git_revision = subprocess.check_output(
@@ -302,6 +344,7 @@ def main(
         if path.suffix in {".py", ".rs", ".toml", ".lock", ".cu", ".cuh"}:
             source.update(name.encode())
             source.update(path.read_bytes())
+    remote_trace_dir = f"/bench-traces/{uuid4().hex}" if trace_dir else ""
     options = dict(
         draft_tokens=draft_tokens,
         accepted_drafts=(
@@ -321,6 +364,7 @@ def main(
         validate_model=validate_model,
         expert_backend=expert_backend,
         profile_graph_phases=profile_graph_phases,
+        trace_dir=remote_trace_dir or None,
         metadata={
             "git_commit": git_revision,
             "dirty": dirty,
@@ -342,3 +386,6 @@ def main(
         return
     write_results(output, records)
     print(f"Appended {len(records)} raw points to {output}")
+    if trace_dir:
+        for path in download_traces(remote_trace_dir, trace_dir):
+            print(f"Perfetto trace: {path}")

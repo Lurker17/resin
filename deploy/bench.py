@@ -15,6 +15,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from deploy.bench_trace import decode_trace
 from resin import Engine, Parallelism, SchedulerConfig
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.topology import ParallelGroups
@@ -366,6 +367,11 @@ def _rank(
                 reduce_step=None if groups is None else distributed_reducer(groups),
                 metadata=metadata,
                 on_result=_result_callback(report_path) if rank == 0 else None,
+                trace_step=(
+                    None
+                    if options.get("trace_dir") is None
+                    else decode_trace(options["trace_dir"], rank, metadata)
+                ),
             )
         if rank == 0:
             Path(report_path).write_text(json.dumps(records))
@@ -395,6 +401,7 @@ def run_benchmark(
     validate_model: bool = False,
     expert_backend: str = "flashinfer",
     profile_graph_phases: bool = False,
+    trace_dir: str | None = None,
 ) -> list[dict]:
     """One load and graph catalog for all compatible points in this sweep."""
     from resin.bench import BenchCase
@@ -424,6 +431,10 @@ def run_benchmark(
         raise ValueError("the benchmark needs at least one case")
     for values in cases:
         BenchCase(**values)
+    if trace_dir and (validate_model or not any(c["phase"] == "decode" for c in cases)):
+        raise ValueError(
+            "traces require a decode benchmark, outside checkpoint validation"
+        )
     if (
         draft_tokens < 0
         or accepted_drafts is not None
@@ -458,6 +469,7 @@ def run_benchmark(
         validate_model=validate_model,
         expert_backend=expert_backend,
         profile_graph_phases=profile_graph_phases,
+        trace_dir=trace_dir,
     )
     with tempfile.TemporaryDirectory(prefix="resin-bench-") as directory:
         output = Path(directory) / "results.json"
