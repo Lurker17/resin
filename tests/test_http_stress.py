@@ -6,7 +6,14 @@ import json
 import httpx
 import pytest
 
-from scripts.stress_http import Case, Completion, chat_case, robustness_cases, run_case
+from scripts.stress_http import (
+    Case,
+    Completion,
+    chat_case,
+    robustness_cases,
+    run_case,
+    run_stage,
+)
 
 
 def payload(*, stream=False, score_index=0, finish="length"):
@@ -252,3 +259,63 @@ def test_modal_result_redirect_preserves_completion_validation():
     result = asyncio.run(run())
     assert result["ok"]
     assert methods == ["POST", "GET"]
+
+
+def test_incremental_journal_survives_interrupted_stage(tmp_path):
+    journal = tmp_path / "requests.jsonl"
+
+    async def run():
+        async def handle(_request):
+            await asyncio.sleep(60)
+            return httpx.Response(200, json=payload())
+
+        async with httpx.AsyncClient(
+            base_url="http://test/v1/", transport=httpx.MockTransport(handle)
+        ) as client:
+            task = asyncio.create_task(
+                run_stage(
+                    client,
+                    "pending",
+                    [Case(name="pending", body={"max_tokens": 1})],
+                    1,
+                    60,
+                    event_path=journal,
+                )
+            )
+            while not journal.exists():
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(run())
+    rows = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["event"] == "start" and rows[0]["case"] == "pending"
+    assert rows[0]["body"] == {"max_tokens": 1}
+
+
+def test_incremental_journal_records_failures_before_stage_finishes(tmp_path):
+    journal = tmp_path / "requests.jsonl"
+
+    async def run():
+        async with httpx.AsyncClient(
+            base_url="http://test/v1/",
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(500, text="worker failed")
+            ),
+        ) as client:
+            return await run_stage(
+                client,
+                "failure",
+                [Case(name="failed", body={"max_tokens": 1})],
+                1,
+                1,
+                event_path=journal,
+            )
+
+    result = asyncio.run(run())
+    assert result["passed"] == 0
+    rows = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert [row["event"] for row in rows] == ["start", "finish"]
+    assert rows[-1]["status"] == 500 and not rows[-1]["ok"]

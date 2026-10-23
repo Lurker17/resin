@@ -214,12 +214,50 @@ def percentile(values: list[float], quantile: float) -> float | None:
     return ordered[min(len(ordered) - 1, math.ceil(len(ordered) * quantile) - 1)]
 
 
-async def run_stage(client, name, cases, concurrency, timeout):
+async def run_stage(
+    client, name, cases, concurrency, timeout, *, event_path: Path | None = None
+):
     semaphore = asyncio.Semaphore(concurrency)
+    finished = 0
+
+    def record(event):
+        if event_path is not None:
+            with event_path.open("a") as journal:
+                journal.write(
+                    json.dumps(
+                        {
+                            "at": datetime.now(timezone.utc).isoformat(),
+                            "stage": name,
+                            **event,
+                        }
+                    )
+                    + "\n"
+                )
 
     async def limited(case):
+        nonlocal finished
         async with semaphore:
-            return await run_case(client, case, timeout)
+            record(
+                {
+                    "event": "start",
+                    "case": case.name,
+                    "body": case.body,
+                    "routed_rank_header": case.headers.get("resin-routed-dp-rank"),
+                }
+            )
+            result = await run_case(client, case, timeout)
+            record({"event": "finish", **result})
+            finished += 1
+            if not result["ok"]:
+                print(json.dumps({"stage": name, **result}), flush=True)
+            elif finished % 16 == 0:
+                print(
+                    json.dumps(
+                        {"stage": name, "finished": finished, "requests": len(cases)}
+                    ),
+                    flush=True,
+                )
+            return result
 
     started = time.perf_counter()
     results = await asyncio.gather(*(limited(case) for case in cases))
@@ -354,6 +392,8 @@ async def main(args):
         "stages": [],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    event_path = args.output.with_suffix(".requests.jsonl")
+    event_path.write_text("")
 
     async with httpx.AsyncClient(
         base_url=base_url + "/",
@@ -414,13 +454,20 @@ async def main(args):
         )
         for name, cases, concurrency in stages:
             report["stages"].append(
-                await run_stage(client, name, cases, concurrency, args.timeout)
+                await run_stage(
+                    client,
+                    name,
+                    cases,
+                    concurrency,
+                    args.timeout,
+                    event_path=event_path,
+                )
             )
             report["ok"] = all(
                 stage["passed"] == stage["requests"] for stage in report["stages"]
             )
             args.output.write_text(json.dumps(report, indent=2) + "\n")
-            if name == "warmup" and not report["ok"]:
+            if not report["ok"]:
                 break
     return report["ok"]
 
