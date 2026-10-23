@@ -103,6 +103,30 @@ Run the family tests with:
 uv run pytest models/cuda/tests/test_deepseek_v41*.py -q
 ```
 
+The [bounded-replay checkpoint qualification](https://modal.com/apps/ekzhang/main/ap-uGTh6NFXHkXqPg0FN0LDNo)
+at `43c3db4` passes on four B300s with EP4/ADP4, 1K chunks, K=3 and natural
+routing/acceptance. Masked and compact execution match exactly for sampled
+producer/consumer cache state, generated tokens, selected/top scores and prompt
+scores on 1,281- and 2,177-token prompts with 160 generated tokens per request.
+Fresh, restored, scored, unequal-active and idle-rank cohorts all pass; active
+drivers each execute 44 real continuations per mode. Fresh/restored observations
+also match exactly despite different chunk boundaries. These checks enable
+DeepGEMM deterministic arithmetic; the locked TileKernels has no global
+deterministic switch. Production timings use ordinary fast arithmetic.
+
+The layer-36–38 diagnostic also matches every retained hidden state and HC mix.
+Materialized HC boundaries use DeepInfer's fixed 16-way prenorm reduction, avoiding
+the row-count-dependent arithmetic of the previous general FP32 matmul. This is
+DeepInfer's TF32 path: a separate B300 operator check verifies exact row slicing
+and nine graph replays, with relative L2 error `2.07e-4` against an FP64 reference.
+Reports and exact source manifests are in `validation-prenorm-ep4.*`
+and `hc-prenorm-probe.*` under
+`artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-control/bounded-replay/`.
+The later `63cba9e` restore gate is independently certified against the unchanged
+GPU report in `validation-prenorm-ep4-restore-certification.json`. This is
+implementation parity for bounded replay, not equivalence to full-history SWA
+or a long-context model-quality evaluation.
+
 The [bounded-replay CP2 probe](https://modal.com/apps/ekzhang/main/ap-3CqOIEsvN90Xzj60QQAnw2)
 at `2973faf` passes on two B300s. Seven cases retain 1, 11 or 140 rows at page
 boundaries and contexts beyond 128K, including an empty CP peer and an early
