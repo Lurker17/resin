@@ -116,7 +116,7 @@ def prepare_forward(cache, positions: Tensor, *, draft=False, valid_tokens=None)
     swa_pivots = empty(batch * queries, 2)
     swa_tables = empty(batch * queries, width_swa)
     block_tables = empty(batch * queries, width_ca)
-    draft_indices = empty(batch, queries, (queries + 7) // 8 * 8)
+    draft_indices = empty(batch, queries, (queries + 7) // 8 * 8 if draft else 1)
     prepare_engine_metadata_tl(
         queries,
         width_swa,
@@ -207,15 +207,20 @@ def _reference(cache, positions, ratios, draft, valid_tokens):
         + slots
     )
     draft_slots = torch.where(valid & draft, draft_slots, -1).int()
-    draft_columns = torch.arange((queries + 7) // 8 * 8, device=positions.device)
+    draft_columns = torch.arange(
+        (queries + 7) // 8 * 8 if draft else 1, device=positions.device
+    )
     private = (
         torch.arange(batch, device=positions.device)[:, None, None]
         * cache.geometry.draft_tokens
         + draft_columns
     )
     private = private.expand(batch, queries, -1)
+    valid_keys = valid[:, draft_columns.clamp_max(queries - 1)]
     private = torch.where(
-        valid[..., None] & draft & (draft_columns < queries), private, -1
+        valid[..., None] & valid_keys[:, None, :] & draft & (draft_columns < queries),
+        private,
+        -1,
     ).int()
     pages = (
         cache.groups[1].parent_ids * cache.geometry.packings[1]

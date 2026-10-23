@@ -105,7 +105,7 @@ def test_prepared_metadata_matches_scalar_paged_addresses(draft, masked):
             )
             assert frame.draft_indices[row, query].tolist() == [
                 row * 8 + column if active and draft and column < 5 else -1
-                for column in range(8)
+                for column in range(8 if draft else 1)
             ]
     for query in range(5):
         for row in range(3):
@@ -158,6 +158,20 @@ def test_preparation_refreshes_engine_tables_and_cross_page_positions():
         next_frame.slot_mapping_store_swa[1, -1] != first.slot_mapping_store_swa[1, -1]
     )
     assert next_frame.state_block_idx[1, -1] == physical(cache, 2, 1, 256) // 128
+
+
+def test_private_draft_keys_mask_invalid_columns_and_target_storage_stays_linear():
+    cache, positions = cache_and_positions()
+    mask = torch.ones(15, dtype=torch.bool)
+    mask[2] = False
+    frame = cache.prepare_metadata(positions, draft=True, valid_tokens=mask)
+    assert (frame.draft_indices[0, :, 2] == -1).all()
+    assert (frame.draft_indices[0, 2] == -1).all()
+    assert frame.draft_indices[0, 0, 1] == 1
+    long_positions = torch.arange(256).expand(3, -1).clone()
+    target = cache.prepare_metadata(long_positions)
+    assert target.draft_indices.shape == (3, 256, 1)
+    assert (target.draft_indices == -1).all()
 
 
 @pytest.mark.parametrize(

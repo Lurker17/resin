@@ -34,7 +34,7 @@ def prepare_engine_metadata_tl(
 ) -> Any:
     batch = T.dynamic("batch")
     num_ratios = max(len(ca_ratios), 1)
-    padded_draft = (queries + 7) // 8 * 8
+    padded_draft = (queries + 7) // 8 * 8 if draft else 1
     ratio_items = tuple(enumerate(ca_ratios))
 
     @T.macro
@@ -186,10 +186,15 @@ def prepare_engine_metadata_tl(
                 )
             for sid, column in T.Parallel(queries, padded_draft):
                 valid = T.bool(True)
+                key_valid = column < queries
                 if has_valid_mask:
                     valid = valid_in[bid * queries + sid]
+                    key_valid = (
+                        column < queries
+                        and valid_in[bid * queries + T.min(column, queries - 1)]
+                    )
                 draft_indices[bid, sid, column] = T.if_then_else(
-                    draft and valid and column < queries,
+                    draft and valid and key_valid,
                     bid * draft_capacity + column,
                     -1,
                 )
