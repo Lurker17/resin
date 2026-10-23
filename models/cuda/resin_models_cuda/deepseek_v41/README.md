@@ -33,8 +33,10 @@ Each target or draft forward prepares one batch metadata object from live positi
 and Engine parent/child page tables. Native kernels expand SWA windows, prepare
 compression/state mappings and adapt selected compressed indices once per KV
 source; consuming layers reuse those tensors. Graph replay reads updated inputs,
-including page tables and masks. Prefill also shares address geometry and unpacked
-compressed KV across consumers of the same owner.
+including page tables and masks. Full-history table width is a runtime dimension,
+so growing context reuses the same compiled metadata and index-conversion kernels.
+Prefill also shares address geometry and unpacked compressed KV across consumers
+of the same owner.
 
 FlashMLA fuses query RoPE, sparse attention, inverse output RoPE and FP8 output
 casting. KV stores fuse RMS normalization, RoPE and quantization. Sliding KV uses
@@ -108,12 +110,14 @@ The [direct FP8 output probe](https://modal.com/apps/ekzhang/main/ap-AeDmb4KbJfj
 checks H64/G8/R1024 at 1/5/1,024/1,280 rows: O-A values, packed scales and O-B
 outputs match BF16-plus-cast bitwise, including five graph replays.
 
-The [shared metadata B300 probe](https://modal.com/apps/ekzhang/main/ap-gWvo1SQ61ukvMlqmp00bN7)
-at `299d75d` checks six shapes, including batch256 with four target queries or
-three draft queries at 128K context. All 18 output fields match the CPU equations,
-including irregular masks and both position dtypes. Five graph replays per case
-update positions, parent/child tables, masks and selected indices. Its report is
-`artifacts/benchmarks/deepinfer-v41-batch-metadata-probe.json`.
+The [shared metadata B300 probe](https://modal.com/apps/ekzhang/main/ap-m1vDGbDRZUwEdde9ROc8Fd)
+at `a4e62a1` checks seven shapes, including batch256 with four target queries or
+three draft queries at 128K context and a 1,024-query masked prefill. All 18 output
+fields match the CPU equations, including irregular masks and both position
+dtypes. Five graph replays per case update positions, parent/child tables, masks
+and selected indices. Table widths 1, 3 and 1,025 also match the equations while
+reusing identical compiled metadata and conversion kernels. Its report is
+`artifacts/benchmarks/deepinfer-v41-dynamic-metadata-probe.json`.
 
 At clean commit `cd5ecfd`, the [full-checkpoint EP4/ADP4 B300 check](https://modal.com/apps/ekzhang/main/ap-G0MLxyy7133CqWY3HJwRjo)
 passes on all four drivers with the released 384 experts and natural routing.
