@@ -208,6 +208,71 @@ def _validation_stage(stage, coordinate):
             coordinate(stage, None)
 
 
+def validate_overlap(runner, engine, prompt, *, coordinate=None, generated=160):
+    """Check natural GPU feedback against synchronous captured execution.
+
+    Token stops and scores deliberately remain disabled so the Engine can keep
+    a decode in flight. The fixed output span crosses a 128-token page boundary.
+    """
+    from resin import SamplingParams
+
+    local = getattr(engine, "local", engine)
+    if len(prompt) + generated + runner.speculative_tokens > local.context_length:
+        raise ValueError("overlap validation needs space for 160 generated tokens")
+
+    def generate(overlap):
+        name = "overlapped" if overlap else "synchronous captured"
+        with _validation_stage(name + " admission", coordinate):
+            local.clear_prefix_cache()
+            before = local.overlap_stats
+            request = engine.submit(
+                prompt,
+                max_new_tokens=generated,
+                stop_token_ids=[],
+                sampling_params=SamplingParams(temperature=0, seed=41),
+            )
+        tokens, steps = [], 0
+        try:
+            while engine.has_work():
+                events = engine.step(allow_overlap=overlap)
+                steps += 1
+                with _validation_stage(name + " events", coordinate):
+                    for event in events:
+                        if event.request_id != request.id or event.index != len(tokens):
+                            raise AssertionError("overlap returned misordered events")
+                        tokens.append(event.token_id)
+            with _validation_stage(name + " result", coordinate):
+                if len(tokens) != generated or request.take_result() != tokens:
+                    raise AssertionError("overlap lost committed tokens")
+                after = local.overlap_stats
+                continuations = after[1] - before[1]
+                if overlap and not continuations:
+                    raise AssertionError("overlap validation never continued on GPU")
+                return {
+                    "token_ids": tokens,
+                    "steps": steps,
+                    "enqueues": after[0] - before[0],
+                    "continuations": continuations,
+                }
+        finally:
+            with _validation_stage(name + " cleanup", coordinate):
+                if not request.done:
+                    engine.cancel(request)
+
+    reference, overlapped = generate(False), generate(True)
+    with _validation_stage("overlap parity", coordinate):
+        if reference["token_ids"] != overlapped["token_ids"]:
+            index = next(
+                i
+                for i, pair in enumerate(
+                    zip(reference["token_ids"], overlapped["token_ids"], strict=True)
+                )
+                if pair[0] != pair[1]
+            )
+            raise AssertionError(f"synchronous/overlapped tokens differ at {index}")
+    return {"ok": True, "reference": reference, "overlapped": overlapped}
+
+
 def validate_model(
     runner,
     engine,
@@ -437,6 +502,11 @@ def validate_model(
         atol=0.05,
         rtol=0.01,
     )
+    overlap = (
+        validate_overlap(runner, engine, prompt, coordinate=coordinate)
+        if getattr(local, "overlap", False)
+        else None
+    )
     return {
         "ok": True,
         "prompt_tokens": len(prompt),
@@ -449,4 +519,5 @@ def validate_model(
         "selected_comparison": selected,
         "prompt_comparison": prompt_scores,
         "tolerance": {"atol": 0.05, "rtol": 0.01},
+        **({"overlap": overlap} if overlap is not None else {}),
     }

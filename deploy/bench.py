@@ -269,7 +269,7 @@ def _rank(
     )
     # Reserve real generated positions, including draft write lookahead. Context
     # lengths on the charts remain the prompt lengths recorded by the harness.
-    headroom = (options["warmup_steps"] + options["measure_steps"] + 2) * (
+    headroom = (options["warmup_steps"] + options["measure_steps"] + 4) * (
         options["draft_tokens"] + 1
     )
     capacity = max(case.context_length for case in cases) + headroom
@@ -322,6 +322,10 @@ def _rank(
         "load_seconds": loaded_seconds,
         "capture_seconds": capture_seconds,
         "profile_graph_phases": options.get("profile_graph_phases", False),
+        "overlap": options.get("overlap", True),
+        "timing": "continuous_completions"
+        if options.get("overlap", True)
+        else "synchronized_steps",
         "prefill_chunk_size": options["prefill_chunk_size"],
         "max_batch_tokens": prefill_budget,
     }
@@ -330,6 +334,7 @@ def _rank(
         context_length=capacity,
         prefix_cache=any(case.shared_prefix_tokens for case in cases),
         eos_token_id=None,
+        overlap=options.get("overlap", True),
         scheduler_config=SchedulerConfig(
             max_batch_tokens=prefill_budget,
             prefill_chunk_size=options["prefill_chunk_size"],
@@ -401,6 +406,7 @@ def run_benchmark(
     validate_model: bool = False,
     expert_backend: str = "flashinfer",
     profile_graph_phases: bool = False,
+    overlap: bool = True,
     trace_dir: str | None = None,
 ) -> list[dict]:
     """One load and graph catalog for all compatible points in this sweep."""
@@ -469,6 +475,7 @@ def run_benchmark(
         validate_model=validate_model,
         expert_backend=expert_backend,
         profile_graph_phases=profile_graph_phases,
+        overlap=overlap,
         trace_dir=trace_dir,
     )
     with tempfile.TemporaryDirectory(prefix="resin-bench-") as directory:

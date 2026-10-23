@@ -199,6 +199,66 @@ def test_decode_counts_real_steps_and_disables_eos_without_retiring_cohort():
     assert not engine.has_work()
 
 
+def test_overlap_benchmark_defers_reduction_and_observes_harvested_positions():
+    from test_engine_overlap import AsyncRunner
+
+    class PipelinedRunner(AsyncRunner):
+        vocab_size = 1024
+        speculative_tokens = 2
+
+        def __init__(self):
+            super().__init__()
+            self.harvested = 0
+
+        def enqueue(self, plan, *, feedback=None):
+            completion = super().enqueue(plan, feedback=feedback)
+            completion.positions = torch.tensor(
+                plan.positions.tolist() if feedback is None else feedback.positions
+            )
+            result = completion.result
+
+            def harvest():
+                rows = result()
+                self.harvested += 1
+                return rows
+
+            completion.result = harvest
+            return completion
+
+    raw = PipelinedRunner()
+    runner = BenchmarkRunner(raw)
+    engine = Engine(runner, max_running_requests=2, context_length=512)
+    reductions, synchronizations = [], []
+
+    def reduce_step(value):
+        reductions.append(raw.harvested)
+        return value
+
+    try:
+        record = run_sweep(
+            engine,
+            [BenchCase(phase="decode", context_length=4, batch_size=2)],
+            runner=runner,
+            prompt_tokens=[1],
+            warmup_steps=1,
+            measure_steps=3,
+            synchronize=lambda: synchronizations.append(raw.harvested),
+            reduce_step=reduce_step,
+        )[0]
+        assert record["committed_tokens"] == 12
+        assert record["measured_context_start_min"] == 6
+        assert record["measured_context_end_max"] == 12
+        # GPU work must not progress in untimed per-step synchronization or
+        # reduction calls. All measured reductions happen after all harvests.
+        assert synchronizations == []
+        assert reductions[-3:] == [4, 4, 4]
+        assert engine.overlap_stats[1] >= 3
+        assert not engine.has_work()
+    finally:
+        engine.close()
+        raw.shutdown()
+
+
 @pytest.mark.parametrize("batch_size", [1, 3])
 def test_decode_trace_uses_live_full_cohort_without_changing_measurements(
     monkeypatch, batch_size

@@ -1,8 +1,9 @@
 """Resident-engine benchmarks with explicit synthetic routing/verification modes.
 
 Install BenchmarkRunner before constructing the Engine and capturing graphs.
-Each point owns an uncached request cohort; loading, capture, admission, and
-metrics reduction are outside the timed Engine.step calls.
+Each point owns an uncached request cohort; loading, capture, and admission
+are untimed. Pipelined decode measures continuous completion intervals, with
+metrics reduced only after the window so in-flight GPU work stays timed.
 """
 
 from __future__ import annotations
@@ -39,6 +40,23 @@ class BenchCase:
             raise ValueError(
                 "shared_prefix_tokens must be an integer in [0, context_length)"
             )
+
+
+class _ObservedCompletion:
+    """Attribute a pipelined sample to its harvested plan, not the next launch."""
+
+    def __init__(self, runner, plan, completion):
+        self._runner, self._plan, self._completion = runner, plan, completion
+
+    @property
+    def feedback(self):
+        return self._completion.feedback
+
+    def result(self):
+        output = self._completion.result()
+        self._runner._observe(self._plan)
+        self._runner._completed_positions = getattr(self._completion, "positions", None)
+        return output
 
 
 class BenchmarkRunner:
@@ -94,12 +112,24 @@ class BenchmarkRunner:
                 if groups is not None:
                     router.benchmark_expert_parallel_size = groups.ep.size
         self._plan: BatchPlan | None = None
+        self._completed_positions = None
 
     def __getattr__(self, name):
         return getattr(self.runner, name)
 
     def _observe(self, plan: BatchPlan | None):
         self._plan = plan
+        self._completed_positions = None
+
+    @property
+    def completed_context_lengths(self):
+        if self._plan is None:
+            raise RuntimeError("no benchmark result has been harvested")
+        return (
+            self._completed_positions
+            if self._completed_positions is not None
+            else self._plan.context_lengths
+        )
 
     @property
     def observation(self) -> dict[str, Any]:
@@ -134,6 +164,29 @@ class BenchmarkRunner:
             if prepared is None
             else self.runner.forward_distributed(plan, context, prepared=prepared)
         )
+
+    def enqueue(self, plan, *, feedback=None):
+        enqueue = getattr(self.runner, "enqueue", None)
+        if enqueue is None:
+            return self.forward(plan)
+        output = enqueue(plan, feedback=feedback)
+        if hasattr(output, "result"):
+            return _ObservedCompletion(self, plan, output)
+        self._observe(plan)
+        return output
+
+    def enqueue_distributed(self, plan, context, *, prepared=None, feedback=None):
+        enqueue = getattr(self.runner, "enqueue_distributed", None)
+        if enqueue is None:
+            return self.forward_distributed(plan, context, prepared=prepared)
+        kwargs = {"feedback": feedback}
+        if prepared is not None:
+            kwargs["prepared"] = prepared
+        output = enqueue(plan, context, **kwargs)
+        if hasattr(output, "result"):
+            return _ObservedCompletion(self, plan, output)
+        self._observe(plan)
+        return output
 
     def speculation(self):
         stats = getattr(self.runner, "_speculation", None)
@@ -207,7 +260,9 @@ def run_sweep(
     scheduling chunks. Decode records exactly the requested number of steps;
     its context grows naturally during warmup and measurement. All DP drivers
     call together with distributed_reducer; records contain global token counts
-    and the slowest driver's step duration. The caller retains engine ownership.
+    and the slowest driver's completion interval. Overlapped decode defers these
+    reductions until the continuous measurement window ends. The caller retains
+    engine ownership.
     on_result receives each completed record after request cleanup, outside timing.
     trace_step may run one extra decode step on the live cohort after recording
     measurements. Its outputs are excluded from records; all distributed drivers
@@ -229,26 +284,48 @@ def run_sweep(
     if not len(prompt_tokens):
         raise ValueError("prompt_tokens must not be empty")
     local = getattr(engine, "local", engine)
+    overlap = bool(getattr(local, "overlap", False)) and callable(
+        getattr(runner.runner, "enqueue", None)
+    )
     if local.has_work():
         raise ValueError("benchmark engine must not have active requests")
     reduce = reduce_step or (lambda value: value)
     records = []
+    previous_completion = None
 
-    def step():
+    def step(*, defer_reduce=False):
+        nonlocal previous_completion
         before_drafts, before_accepted = runner.speculation()
         before_graphs = runner.graph_counts()
         runner._plan = None
-        synchronize()
-        started = time.perf_counter()
-        events = engine.step()
-        synchronize()
-        elapsed = time.perf_counter() - started
+        if not overlap:
+            synchronize()
+        started = (
+            previous_completion
+            if defer_reduce and previous_completion is not None
+            else time.perf_counter()
+        )
+        # Filling an empty pipeline produces no host result. Include any such
+        # submission in the next completion interval, including boundary bubbles.
+        while True:
+            events = engine.step()
+            if runner._plan is not None:
+                break
+            if not getattr(local, "overlap_pending", False):
+                raise RuntimeError("Engine must use the supplied BenchmarkRunner")
+        if not overlap:
+            synchronize()
+        finished = time.perf_counter()
+        elapsed = finished - started
+        previous_completion = finished
         plan = runner._plan
         if plan is None:
             raise RuntimeError("Engine must use the supplied BenchmarkRunner")
         drafts, accepted = runner.speculation()
         graph_counts = runner.graph_counts()
-        starts = plan.context_lengths.tolist()
+        starts = getattr(
+            runner, "completed_context_lengths", plan.context_lengths
+        ).tolist()
         if plan.phase == BatchPhase.PREFILL:
             offsets = plan.token_indptr.tolist()
             ends = [start + b - a for start, a, b in zip(starts, offsets, offsets[1:])]
@@ -258,31 +335,29 @@ def run_sweep(
                 start + counts[int(sequence)]
                 for start, sequence in zip(starts, plan.sequence_ids)
             ]
-        measured = reduce(
-            {
-                "seconds": elapsed,
-                "input_tokens": runner.observation["input_tokens"],
-                "sequences": runner.observation["sequences"],
-                "replica_sequences": [runner.observation["sequences"]],
-                "committed_tokens": len(events),
-                "drafts": drafts - before_drafts,
-                "accepted": accepted - before_accepted,
-                "context_start_min": min(starts),
-                "context_start_max": max(starts),
-                "context_end_min": min(ends),
-                "context_end_max": max(ends),
-                "device_phase_ms": (
-                    getattr(runner, "last_dspark_phase_ms", None) or {}
-                    if plan.phase == BatchPhase.DECODE
-                    else {}
-                ),
-                "graph_counts": {
-                    key: value - before_graphs.get(key, 0)
-                    for key, value in graph_counts.items()
-                },
-            }
-        )
-        return measured
+        measured = {
+            "seconds": elapsed,
+            "input_tokens": runner.observation["input_tokens"],
+            "sequences": runner.observation["sequences"],
+            "replica_sequences": [runner.observation["sequences"]],
+            "committed_tokens": len(events),
+            "drafts": drafts - before_drafts,
+            "accepted": accepted - before_accepted,
+            "context_start_min": min(starts),
+            "context_start_max": max(starts),
+            "context_end_min": min(ends),
+            "context_end_max": max(ends),
+            "device_phase_ms": (
+                getattr(runner, "last_dspark_phase_ms", None) or {}
+                if plan.phase == BatchPhase.DECODE
+                else {}
+            ),
+            "graph_counts": {
+                key: value - before_graphs.get(key, 0)
+                for key, value in graph_counts.items()
+            },
+        }
+        return measured if defer_reduce else reduce(measured)
 
     for case in cases:
         if case.batch_size > local.max_running_requests:
@@ -364,7 +439,7 @@ def run_sweep(
             else:
                 # Reserve a complete extra step for optional tracing, including
                 # maximum speculative acceptance and the initial prefill token.
-                maximum = 1 + (warmup_steps + measure_steps + 1) * (
+                maximum = 1 + (warmup_steps + measure_steps + (3 if overlap else 1)) * (
                     runner.draft_tokens + 1
                 )
                 if case.context_length + maximum > local.context_length:
@@ -373,10 +448,16 @@ def run_sweep(
                 while local.next_phase() == BatchPhase.PREFILL:
                     step()
                 for index in range(warmup_steps + measure_steps):
-                    result = step()
+                    measuring = index >= warmup_steps
+                    if measuring and index == warmup_steps:
+                        previous_completion = None
+                    result = step(defer_reduce=overlap and measuring)
                     if runner.observation["phase"] != "decode":
                         raise RuntimeError("decode benchmark did not execute decode")
-                    if result["sequences"] != case.batch_size * attn_dp:
+                    expected = case.batch_size * (
+                        1 if overlap and measuring else attn_dp
+                    )
+                    if result["sequences"] != expected:
                         raise RuntimeError(
                             "decode batch was not fully scheduled: "
                             f"scheduled_global={result['sequences']}, "
@@ -387,8 +468,13 @@ def run_sweep(
                         )
                     if any(lease.done for lease in leases):
                         raise RuntimeError("decode cohort retired during measurement")
-                    if index >= warmup_steps:
+                    if measuring:
                         samples.append(result)
+                if overlap:
+                    # A per-step reduction or CUDA synchronization lets future
+                    # GPU work run outside the timer. Reduce only after the
+                    # continuous completion window has finished.
+                    samples = [reduce(sample) for sample in samples]
                 warmed = warmup_steps
             seconds = [sample["seconds"] for sample in samples]
             inputs = (
@@ -453,6 +539,7 @@ def run_sweep(
                 }
             )
             if case.phase == "decode" and trace_step is not None:
+                synchronize()
                 trace_step(case, step)
         except Exception as error:
             diagnostic = dict(
