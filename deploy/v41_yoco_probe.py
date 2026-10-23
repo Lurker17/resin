@@ -120,7 +120,20 @@ class ProbeRunner(DeepSeekV41CudaRunner):
 
     def _prefill_row(self, plan, slot, input_ids, positions, cache):
         before = len(getattr(self, "_yoco_rows", ()))
-        output = super()._prefill_row(plan, slot, input_ids, positions, cache)
+        diagnostic = getattr(self, "_yoco_diagnostic", None)
+        if diagnostic is not None:
+            diagnostic.begin_row(
+                self._swa_replay_mode,
+                int(plan.prefill_lengths[slot]),
+                int(plan.context_lengths[slot]),
+                input_ids.shape[1],
+                self._swa_replay_tokens,
+            )
+        try:
+            output = super()._prefill_row(plan, slot, input_ids, positions, cache)
+        finally:
+            if diagnostic is not None:
+                diagnostic.end_row()
         if getattr(self, "_yoco_observe", False):
             endpoint = int(plan.context_lengths[slot]) + input_ids.shape[1]
             prompt = int(plan.prefill_lengths[slot])
@@ -301,6 +314,7 @@ def run_probe(
     coordinate=None,
     modes=None,
     generated=160,
+    prefill_only=False,
     atol=0,
     rtol=0,
 ):
@@ -496,6 +510,8 @@ def run_probe(
             results[mode] = {}
             fresh = cohort(mode + " fresh", lengths)
             record(mode, "fresh", fresh)
+            if prefill_only:
+                continue
             restored = cohort(mode + " restored", lengths, restored=True)
             record(mode, "restored", restored)
             with _validation_stage(mode + " restore observations", coordinate):
@@ -505,7 +521,7 @@ def run_probe(
             record(mode, "scored", scored)
         # Complete the same-trajectory numerical checks before the independent
         # scheduling coverage, so an overlap contract cannot hide their result.
-        for mode in modes:
+        for mode in () if prefill_only else modes:
             for name, chosen, continuation_expected in _scheduling_cohorts(
                 lengths, driver, drivers
             ):
@@ -525,6 +541,7 @@ def run_probe(
             modes=modes,
             retained_tokens=140,
             generated=generated,
+            prefill_only=prefill_only,
             kernel_configuration=dict(runner._yoco_kernel_configuration),
             comparisons=comparisons,
             restore_observations=restore_observations,
@@ -567,7 +584,16 @@ class ValidationFailure(RuntimeError):
         self.validation_records = records
 
 
-def run_validation(raw, engine, checkpoint, metadata, groups):
+def run_validation(
+    raw,
+    engine,
+    checkpoint,
+    metadata,
+    groups,
+    *,
+    probe=run_probe,
+    validation_name="bounded_swa_replay",
+):
     """deploy.bench._rank callback; each attention-DP driver joins each stage."""
     from tokenizers import Tokenizer
 
@@ -609,7 +635,7 @@ def run_validation(raw, engine, checkpoint, metadata, groups):
         )
         result = dict(
             rank=rank,
-            **run_probe(raw, engine, prompt, coordinate=coordinate, modes=modes),
+            **probe(raw, engine, prompt, coordinate=coordinate, modes=modes),
         )
     except Exception as error:
         result = dict(
@@ -619,13 +645,14 @@ def run_validation(raw, engine, checkpoint, metadata, groups):
             error=f"{type(error).__name__}: {error}",
             partial_results=getattr(error, "partial_results", {}),
             restore_observations=getattr(error, "restore_observations", {}),
+            activation_diagnostics=getattr(error, "activation_diagnostics", {}),
         )
     reports = gather("reports", result)
     records = [
         dict(
             schema_version=1,
             phase="validation",
-            validation="bounded_swa_replay",
+            validation=validation_name,
             metadata=metadata,
             ranks=reports,
         )
