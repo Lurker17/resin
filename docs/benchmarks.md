@@ -183,6 +183,24 @@ policies. Defaults are a 4,096-token prefill chunk, breakable prefill graphs,
 full decode graphs, five warmup steps, and twenty measured steps. Prefill may
 measure additional steps to finish its request cohort.
 
+## Decode traces
+
+Add `--trace-dir bench/traces` to save Perfetto-compatible Chrome JSON traces.
+After each decode timing window, every attention-DP driver profiles one extra
+full-cohort step with CPU and CUDA activities, including individual CUDA graph
+nodes. This step is excluded from measured durations, acceptance, counters and
+context bounds. Prefill and checkpoint-validation runs are not traced.
+
+The launcher downloads compressed raw rank traces and a merged
+`decode-ctx<length>-b<batch>-all-ranks.json.gz` for each case. The merger aligns
+PyTorch timestamp bases and separates rank process/flow IDs. Open the merged
+file in [Perfetto](https://ui.perfetto.dev/). Source and workload metadata stay
+in the trace. Raw files can also be merged again locally:
+
+```bash
+uv run scripts/merge_bench_traces.py bench/traces
+```
+
 ## Reading the charts
 
 The plotter saves `decode.png`, `decode.svg`, `prefill.png`, and `prefill.svg`
