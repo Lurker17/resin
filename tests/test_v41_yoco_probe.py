@@ -12,10 +12,12 @@ from deploy.v41_yoco_probe import (
     ProbeRunner,
     ValidationFailure,
     _cache_snapshot,
+    _check_continuations,
     _compare,
     _public,
     _restore_observations,
     _sample_positions,
+    _scheduling_cohorts,
     _tensor_report,
     compare_fixed_mode_reports,
     run_probe,
@@ -156,6 +158,33 @@ def test_cross_mode_equivalence_requires_identical_prefill_chunk_trajectory():
     left, right = _result(), _result()
     right["snapshots"][(129, 129)]["input_rows"] = 1
     with pytest.raises(AssertionError, match="cache trajectory"):
+        _compare(left, right)
+
+
+@pytest.mark.parametrize("drivers", [2, 4, 8])
+def test_continuation_coverage_separates_active_and_idle_replicas(drivers):
+    cases = [
+        _scheduling_cohorts((2177, 1281), rank, drivers) for rank in range(drivers)
+    ]
+    active = [rows[0] for rows in cases]
+    idle = [rows[1] for rows in cases]
+    assert [len(chosen) for _, chosen, _ in active] == [2, *([1] * (drivers - 1))]
+    assert all(expected for _, _, expected in active)
+    assert [len(chosen) for _, chosen, _ in idle] == [2, *([0] * (drivers - 1))]
+    assert not any(expected for _, _, expected in idle)
+    _check_continuations(1, expected=True)
+    _check_continuations(0, expected=False)
+    with pytest.raises(AssertionError, match="all drivers active"):
+        _check_continuations(0, expected=True)
+    with pytest.raises(AssertionError, match="synchronous fallback"):
+        _check_continuations(1, expected=False)
+
+
+def test_state_failure_precedes_generated_token_difference():
+    left, right = _result(), _result()
+    right["requests"][129]["tokens"][0] += 1
+    right["snapshots"][(129, 129)]["state"]["main.20"][0] += 1
+    with pytest.raises(AssertionError, match="snapshot.*main.20"):
         _compare(left, right)
 
 

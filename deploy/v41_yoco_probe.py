@@ -172,19 +172,8 @@ def _state_hashes(snapshot):
 
 def _compare(left, right, *, atol=0, rtol=0, label="case"):
     assert left["requests"].keys() == right["requests"].keys()
-    scores = {}
-    for key, a in left["requests"].items():
-        b = right["requests"][key]
-        assert a["tokens"] == b["tokens"], f"{label} token mismatch for {key}"
-        assert a["top_ids"] == b["top_ids"], f"{label} top token mismatch for {key}"
-        assert a["cached_tokens"] == b["cached_tokens"]
-        scores[str(key)] = _tensor_report(
-            torch.tensor(a["scores"], dtype=torch.float64),
-            torch.tensor(b["scores"], dtype=torch.float64),
-            atol=atol,
-            rtol=rtol,
-            label=f"{label} request {key} scores",
-        )
+    # Inspect prefill state before any autoregressive token divergence obscures
+    # whether producer/C1 or consumer-window contents changed first.
     assert left["snapshots"].keys() == right["snapshots"].keys()
     state = {}
     for key, a in left["snapshots"].items():
@@ -201,6 +190,19 @@ def _compare(left, right, *, atol=0, rtol=0, label="case"):
             )
             for name, value in a["state"].items()
         }
+    scores = {}
+    for key, a in left["requests"].items():
+        b = right["requests"][key]
+        assert a["tokens"] == b["tokens"], f"{label} token mismatch for {key}"
+        assert a["top_ids"] == b["top_ids"], f"{label} top token mismatch for {key}"
+        assert a["cached_tokens"] == b["cached_tokens"]
+        scores[str(key)] = _tensor_report(
+            torch.tensor(a["scores"], dtype=torch.float64),
+            torch.tensor(b["scores"], dtype=torch.float64),
+            atol=atol,
+            rtol=rtol,
+            label=f"{label} request {key} scores",
+        )
     return dict(scores=scores, state=state)
 
 
@@ -275,6 +277,22 @@ def _public(result):
     }
 
 
+def _scheduling_cohorts(lengths, driver, drivers):
+    # An idle driver correctly vetoes async continuation for the whole domain.
+    # Exercise unequal but active replicas separately from that fallback.
+    return (
+        ("unequal_active", lengths[: 2 if driver == 0 else 1], True),
+        ("idle", lengths[: 2 if driver == 0 else 0], drivers == 1),
+    )
+
+
+def _check_continuations(delta, *, expected):
+    if expected:
+        assert delta > 0, "no real GPU continuation occurred with all drivers active"
+    else:
+        assert delta == 0, "idle drivers must force synchronous fallback"
+
+
 def run_probe(
     runner,
     engine,
@@ -286,7 +304,7 @@ def run_probe(
     atol=0,
     rtol=0,
 ):
-    """Qualify fresh, restored, scored, unequal/idle, and natural decode cohorts.
+    """Qualify fresh, restored, scored, unequal-active, and idle decode cohorts.
 
     Paired mask/compact comparisons are exact within each cache trajectory.
     Fresh/restored observations use different chunk shapes and are diagnostic.
@@ -296,6 +314,7 @@ def run_probe(
     groups = runner.parallel_groups
     world = 1 if groups is None else groups.topology.world_size
     driver = 0 if groups is None else groups.drivers.local_rank
+    drivers = 1 if groups is None else groups.drivers.size
     modes = tuple(modes or ("mask", "compact"))
     if len(modes) > 1 and groups is not None and groups.drivers.size != world:
         raise ValueError("CP/TP qualification needs constructor-fixed mode runs")
@@ -343,7 +362,15 @@ def run_probe(
     )
     original_mode = runner._swa_replay_mode
 
-    def cohort(name, chosen, *, restored=False, scored=False, overlap=False):
+    def cohort(
+        name,
+        chosen,
+        *,
+        restored=False,
+        scored=False,
+        overlap=False,
+        continuation_expected=False,
+    ):
         runner._yoco_rows.clear()
         runner._yoco_snapshots.clear()
         runner._yoco_observe = True
@@ -422,14 +449,18 @@ def run_probe(
                     assert snapshot["consumer_rows"] == [expected]
                 after = local.overlap_stats
                 speculation_after = runner._speculation.snapshot()
-                if overlap and chosen:
-                    assert after[1] > before[1], "no real GPU continuation occurred"
+                if overlap:
+                    _check_continuations(
+                        after[1] - before[1], expected=continuation_expected
+                    )
                 return dict(
                     requests=records,
                     steps=steps,
                     qualification_seconds=time.perf_counter() - started,
                     enqueues=after[0] - before[0],
                     continuations=after[1] - before[1],
+                    overlap_requested=overlap,
+                    continuation_expected=continuation_expected,
                     speculation={
                         key: speculation_after[key] - speculation_before[key]
                         for key in ("blocks", "drafts", "accepted", "emitted")
@@ -472,13 +503,23 @@ def run_probe(
                 local.clear_prefix_cache()
             scored = cohort(mode + " scored fallback", (lengths[1],), scored=True)
             record(mode, "scored", scored)
-            with _validation_stage(mode + " unequal setup", coordinate):
-                local.clear_prefix_cache()
-            count = 2 if driver == 0 else 1 if driver == 1 else 0
-            unequal = cohort(
-                mode + " unequal idle overlap", lengths[:count], overlap=True
-            )
-            record(mode, "unequal", unequal)
+        # Complete the same-trajectory numerical checks before the independent
+        # scheduling coverage, so an overlap contract cannot hide their result.
+        for mode in modes:
+            for name, chosen, continuation_expected in _scheduling_cohorts(
+                lengths, driver, drivers
+            ):
+                with _validation_stage(mode + " " + name + " setup", coordinate):
+                    assert not local.has_work()
+                    runner._swa_replay_mode = mode
+                    local.clear_prefix_cache()
+                observed = cohort(
+                    mode + " " + name,
+                    chosen,
+                    overlap=True,
+                    continuation_expected=continuation_expected,
+                )
+                record(mode, name, observed)
         return dict(
             ok=True,
             modes=modes,
