@@ -333,6 +333,22 @@ of timed Engine steps after one complete warmup prompt at each length, excluding
 weight loading, graph capture and benchmark metric reductions; they are not HTTP
 TTFT measurements. Raw prefill records are in `ep8-control/prefill.jsonl`.
 
+At clean `a77b14a`, the same full-model probe with larger chunks measures:
+
+| Chunk tokens | 4K prompt seconds | 128K prompt seconds | 128K input tokens/s/GPU |
+| ---: | ---: | ---: | ---: |
+| 1,024 (baseline) | 0.300 | 9.774 | 13,409.65 |
+| 4,096 | 0.119 | 4.009 | 32,696.57 |
+| 8,192 | 0.117 | 3.691 | 35,511.46 |
+
+The larger-chunk source removes history/table widths from metadata and candidate
+kernel specialization, and parallelizes prefill table expansion across queries.
+A separate B300 qualification checks exact outputs and mutable graph replay
+while context grows to 128K, with unchanged compiled-kernel counts. Chunk/query
+sizes remain legitimate specializations. All prefill points still execute the
+full backbone; records and qualification are in `ep8-control/prefill-chunks/`
+and `ep8-control/runtime-width/` respectively.
+
 This prefill result executes all 40 backbone layers over every input token.
 DeepInfer's published prefill curve instead uses EP4/ADP4, CP1, 4K–64K packed
 tokens per rank, and 140-token bounded replay. Its layers 0–19 process the full
