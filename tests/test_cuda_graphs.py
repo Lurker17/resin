@@ -46,6 +46,7 @@ class _Context:
 class _Tensor:
     def __init__(self, values, *, dtype="int"):
         self.values = np.array(values, copy=True)
+        self.device = SimpleNamespace(type="cuda")
         self.dtype = dtype
         self.shape = self.values.shape
         self.copy_error = None
@@ -113,6 +114,14 @@ class _Stream:
         pass
 
 
+class _Event:
+    def record(self, _stream):
+        pass
+
+    def query(self):
+        return True
+
+
 class _Graph:
     def __init__(self):
         self.error = None
@@ -129,6 +138,8 @@ class _Graph:
 
 
 class _Cuda:
+    Event = _Event
+
     def __init__(self):
         self.graphs = []
         self.pools = []

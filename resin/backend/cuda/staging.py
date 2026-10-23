@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -13,14 +14,19 @@ class StagingError(ValueError):
 
 
 class TensorStager:
-    """Own host tensors until their asynchronous copies are complete."""
+    """Own one mutable generation of pinned host tensors.
+
+    Reusing a field requires its previous asynchronous copy to have finished.
+    Use :class:`TensorStagerPool` when enqueuing successive device batches.
+    """
 
     def __init__(self, device) -> None:
         self.target_device = device
         self.host_tensors: dict[str, torch.Tensor] = {}
 
     def host(self, name: str, values, dtype):
-        values = np.asarray(values)
+        if not isinstance(values, torch.Tensor):
+            values = np.asarray(values)
         tensor = self.host_tensors.get(name)
         if tensor is None or tensor.shape != values.shape or tensor.dtype != dtype:
             tensor = torch.empty(
@@ -30,7 +36,11 @@ class TensorStager:
                 pin_memory=True,
             )
             self.host_tensors[name] = tensor
-        np.copyto(tensor.numpy(), values, casting="unsafe")
+        if isinstance(values, torch.Tensor):
+            # CPU-to-CPU copying also supports dtypes NumPy cannot represent.
+            tensor.copy_(values)
+        else:
+            np.copyto(tensor.numpy(), values, casting="unsafe")
         return tensor
 
     def device(self, name: str, values, dtype):
@@ -85,7 +95,11 @@ class TensorStager:
                             f"device input {name!r} has shape {tuple(value.shape)} and dtype {value.dtype}; "
                             f"expected shape {tuple(target.shape)} and dtype {target.dtype}"
                         )
-                    source = value
+                    source = (
+                        self.host(name, value, target.dtype)
+                        if value.device.type == "cpu" and target.device.type != "cpu"
+                        else value
+                    )
                 else:
                     source = self.host(name, value, target.dtype).view(target.shape)
                 staged.append((name, target, source))
@@ -98,3 +112,59 @@ class TensorStager:
             ) from error
         for name, target, source in staged:
             target.copy_(source, non_blocking=True)
+
+
+@dataclass(slots=True)
+class _PendingStaging:
+    staging: TensorStager
+    # None quarantines a generation if recording its completion event failed.
+    event: torch.cuda.Event | None = None
+
+
+class TensorStagerPool:
+    """Reuse pinned inputs only after the GPU has consumed their generation.
+
+    Each copy batch records one event after its H2D copies. Outstanding batches
+    retain separate buffers at arbitrary queue depth; completed batches reuse
+    their allocations without blocking the submitting CPU thread.
+    """
+
+    def __init__(self, device) -> None:
+        self.target_device = device
+        self._available: list[TensorStager] = []
+        self._pending: list[_PendingStaging] = []
+
+    def copy_into(
+        self,
+        targets: Mapping[str, torch.Tensor],
+        values: Mapping[str, object],
+    ) -> None:
+        if targets is values:
+            return
+        completed = []
+        outstanding = []
+        for item in self._pending:
+            if item.event is not None and item.event.query():
+                completed.append(item.staging)
+            else:
+                outstanding.append(item)
+        self._pending = outstanding
+        self._available.extend(completed)
+        staging = (
+            self._available.pop()
+            if self._available
+            else TensorStager(self.target_device)
+        )
+        try:
+            staging.copy_into(targets, values)
+        finally:
+            if staging.host_tensors:
+                # Retain the source even when a later copy or event record fails:
+                # an earlier H2D operation may already be reading this generation.
+                pending = _PendingStaging(staging)
+                self._pending.append(pending)
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(self.target_device))
+                pending.event = event
+            else:
+                self._available.append(staging)

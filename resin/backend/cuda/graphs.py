@@ -11,7 +11,7 @@ from typing import Any, NoReturn, NotRequired, TypedDict
 import torch
 
 from resin.backend.cuda.failures import GraphInputError, PostAcceptCudaError
-from resin.backend.cuda.staging import StagingError, TensorStager
+from resin.backend.cuda.staging import StagingError, TensorStagerPool
 
 GraphShape = tuple[int, ...]
 DEFAULT_MAX_NUM_SEQS = 128
@@ -304,7 +304,7 @@ class CudaGraphMode:
 class _GraphEntry:
     shape: GraphShape
     program: CudaGraphProgram | None = None
-    staging: TensorStager | None = None
+    staging: TensorStagerPool | None = None
     graphs: tuple[Any | None, ...] = ()
     captured: bool = False
     captures: int = 0
@@ -461,7 +461,7 @@ class CudaGraphCache:
         before = torch.cuda.memory_allocated(self.device)
         entry.program = _as_program(self._build(shape))
         try:
-            entry.staging = TensorStager(self.device)
+            entry.staging = TensorStagerPool(self.device)
             entry.staging.copy_into(entry.program.inputs, inputs)
         except StagingError as error:
             entry.program = None
