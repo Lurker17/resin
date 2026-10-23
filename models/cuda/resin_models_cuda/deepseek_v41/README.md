@@ -83,19 +83,35 @@ Validate the full checkpoint with natural expert routing and acceptance:
 
 ```bash
 uv run modal run deploy/modal_bench.py \
-  --model deepseek-v41 --gpu B300 --world-size 8 --attn-dp 8 --ep 8 \
+  --model deepseek-v41 --gpu B300 --world-size 4 --attn-dp 4 --ep 4 \
   --expert-backend deepgemm --draft-tokens 3 --natural-acceptance \
   --no-balanced-experts --validate-model --prefill-chunk-size 8 \
   --context-lengths 64 --batch-sizes 1 \
-  --output artifacts/benchmarks/deepinfer-v41-ep8-k3-validation.json
+  --output artifacts/benchmarks/deepinfer-v41-forward-ep4-k3-validation.json
 ```
 
 The [B300 forward probes](https://modal.com/apps/ekzhang/main/ap-AMkTFWk8QDJEM5Dg1cRdQd)
 and [head probes](https://modal.com/apps/ekzhang/main/ap-CRERPEvWiUcxDXtsYWV0Wn) pass
 all six families, including merged/unmerged Q layouts, C1/C2 paged indexing, C2
-state across chunk boundaries, packed attention, stores, FP32 logits and exact
-graph replay. Full-checkpoint parity and throughput qualification remain in progress.
-Short-prompt parity does not establish model quality or representative acceptance.
+state across chunk boundaries, packed attention, stores, FP32 logits and exact replay.
+The [direct FP8 output probe](https://modal.com/apps/ekzhang/main/ap-AeDmb4KbJfjlNfVVL0wA0M)
+checks H64/G8/R1024 at 1/5/1,024/1,280 rows: O-A values, packed scales and O-B
+outputs match BF16-plus-cast bitwise, including five graph replays.
+
+At clean commit `7087a31`, the [full-checkpoint EP4/ADP4 B300 check](https://modal.com/apps/ekzhang/main/ap-RGV18BLKlCCRqSzjNVwMBm)
+passes on all four drivers with the released 384 experts and natural routing.
+Each driver runs four prefill and three decode steps, replays three full decode
+graphs, and matches eager greedy IDs, prompt logprobs and generated-token logprobs
+exactly (maximum absolute difference zero). Natural K3 verification accepts 9/9
+drafts on this short counting prompt; this does not establish model quality or
+representative acceptance. The report is
+`artifacts/benchmarks/deepinfer-v41-forward-ep4-k3-validation.json`.
+
+The [native FP32 route EP2 probe](https://modal.com/apps/ekzhang/main/ap-72WXKqszkwgN9zSWQIn3gv)
+at `14af36b` covers synthetic 16-expert, top-6 routing with widths 5,120/2,304 and
+1,280 rows/rank, rather than the full 384-expert checkpoint. It checks route
+precision, FFN numerical error and exact graph replay; its reports live beside
+the joined-Engram probes below.
 
 A B300 EP2 composition test with 384 experts and hidden/intermediate widths
 5,120/2,304 reproduces the NCCL/persistent-grid conflict after all ranks finish
@@ -115,7 +131,9 @@ It reached 1,430.90 output tokens/s/GPU at batch256/GPU. Those measurements pred
 the paged FP4 indexer, fused dense projections, cross-block lazy HC and Engram
 prefetch; they do not measure the new forward pass. Raw records and PNG/SVG plots
 remain under `artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-128k/`.
-New throughput measurements are pending; see [the benchmark protocol](../../../../docs/benchmarks.md).
+New throughput measurements for `7087a31` are queued; see
+[the benchmark protocol](../../../../docs/benchmarks.md). Subsequent TileKernels
+HC materialization and Engram gate ports need fresh full-checkpoint qualification.
 
 The runner accepts text token IDs and rejects image tokens. DSpark uses fixed-width
 greedy proposals up to the released five-token block; its confidence head is loaded

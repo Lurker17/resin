@@ -109,44 +109,52 @@ replicating KV; their results do not qualify this contract. The initial V4.1
 target used eight B300s with attention DP8/EP8 and replicated Engram tables.
 The current runner shards Engram rows across the device domain and stores packed
 FP8 sliding KV and FP4 compressed KV. On eight ranks, Engram table storage drops
-from 188.83 to 23.60 GiB per GPU. The full checkpoint passes eager/captured K0
-checks on both ADP2/EP2 and ADP8/EP8, and K4 on ADP8/EP8. See the
+from 188.83 to 23.60 GiB per GPU. Earlier full-checkpoint reports passed
+eager/captured K0 on ADP2/EP2 and ADP8/EP8, and K4 on ADP8/EP8; those reports
+predate the prepared DeepInfer forward operators. See the
 [family memory and qualification details](../models/cuda/resin_models_cuda/deepseek_v41/README.md)
 for exact allocations and the distinction between the current path and older
 replicated-table/BF16-cache measurements.
 
-Run the target comparison with normal routing and no speculation:
+Run the current prepared forward comparison with natural routing and K3:
 
 ```bash
 uv run modal run deploy/modal_bench.py \
-  --model deepseek-v41 --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 \
+  --model deepseek-v41 --gpu B300 --world-size 4 --attn-dp 4 --attn-tp 1 --ep 4 \
   --expert-backend deepgemm \
-  --draft-tokens 0 --natural-acceptance --no-balanced-experts --validate-model \
+  --draft-tokens 3 --natural-acceptance --no-balanced-experts --validate-model \
   --prefill-chunk-size 8 --context-lengths 64 --batch-sizes 1 \
-  --output artifacts/benchmarks/deepseek-v41-adp8ep8-target-validation.json
+  --output artifacts/benchmarks/deepinfer-v41-forward-ep4-k3-validation.json
 ```
 
-Run a separate natural four-draft DSpark comparison with:
+Validation writes a JSON report rather than chart measurements. At clean commit
+`7087a31`, this [four-B300 run](https://modal.com/apps/ekzhang/main/ap-RGV18BLKlCCRqSzjNVwMBm)
+passes with the released 384 experts on all four drivers. Each driver runs four
+prefill and three decode steps, including three full decode graph replays. Eager
+and captured greedy IDs, prompt logprobs and generated-token logprobs match
+exactly (maximum absolute difference zero). K3 naturally accepts all nine drafts
+on this short counting prompt. The report is
+`artifacts/benchmarks/deepinfer-v41-forward-ep4-k3-validation.json`; this focused
+execution check does not establish model quality or representative acceptance.
 
-```bash
-uv run modal run deploy/modal_bench.py \
-  --model deepseek-v41 --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 \
-  --expert-backend deepgemm \
-  --draft-tokens 4 --natural-acceptance --no-balanced-experts --validate-model \
-  --prefill-chunk-size 8 --context-lengths 64 --batch-sizes 1 \
-  --output artifacts/benchmarks/deepseek-v41-adp8ep8-dspark-validation.json
-```
+The [FP8 output-boundary probe](https://modal.com/apps/ekzhang/main/ap-AeDmb4KbJfjlNfVVL0wA0M)
+uses the released H64/G8/R1024 geometry at 1/5/1,024/1,280 rows. Its direct FP8
+O-A values, packed scales and final O-B outputs equal BF16-plus-cast bitwise,
+with five exact graph replays. The separate
+[FP32 route EP2 probe](https://modal.com/apps/ekzhang/main/ap-72WXKqszkwgN9zSWQIn3gv)
+at `14af36b` uses synthetic 16-expert top-6 routing, widths 5,120/2,304 and
+1,280 rows/rank; it qualifies route precision and captured FFN execution, rather
+than the full 384-expert checkpoint. Artifacts live under
+`artifacts/benchmarks/2026-10-22-v41-forward-port-microprobes/`, alongside
+`artifacts/benchmarks/deepinfer-v41-output-probe.json`.
 
-Validation writes a JSON report rather than chart measurements. The implementation uses fixed-width greedy
-proposals, loads the confidence head without applying its length policy, and
-supports up to the released five-token block. Benchmark defaults remain four
-drafts. On 2026-10-22, both commands passed on all eight B300 drivers: K0 replayed
-seven full decode graphs, while natural K4 replayed three and accepted all 12
-proposed drafts on the short counting prompt. Eager/captured generated IDs,
-selected-token scores, and prompt scores matched exactly; the first eight
-K4 IDs also matched K0. These are focused execution checks, not a model-quality
-evaluation or a natural-acceptance estimate. Wider meshes, longer contexts, and throughput tuning need separate qualification;
-see the [family limits](../models/cuda/resin_models_cuda/deepseek_v41/README.md).
+New throughput measurements are queued from `7087a31`. Subsequent TileKernels HC
+materialization and Engram gate ports require fresh full-checkpoint validation.
+The implementation uses fixed-width greedy proposals, loads the confidence head
+without applying its length policy, and supports up to the released five-token
+block. Benchmark defaults remain four drafts. Wider meshes and longer contexts
+need separate qualification; see the
+[family limits](../models/cuda/resin_models_cuda/deepseek_v41/README.md).
 
 Available model names are `deepseek-v4`, `deepseek-v41`, `gpt-oss-20b`, and
 `gpt-oss-120b`. The GPT-OSS benchmark path currently uses the Hopper expert kernel
