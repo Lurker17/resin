@@ -136,3 +136,58 @@ def test_control_votes_preserve_rank_records_failure_diagnostics_and_order(tmp_p
     )
     records = [json.loads(path.read_text()) for path in tmp_path.glob("rank*.json")]
     assert records == [{"gathers": 15, "objects": 3}] * 2
+
+
+def _inference_mode_worker(rank, rendezvous):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        group = RankGroup((0, 1), dist.group.WORLD, rank)
+        for first_inference in (True, False):
+            control = ControlPlane(dist)
+            saved = None
+            for generation, enabled in enumerate(
+                (first_inference, not first_inference, first_inference)
+            ):
+                with torch.inference_mode(enabled):
+                    records, errors = control.gather(
+                        group,
+                        f"inference boundary {first_inference}:{generation}",
+                        (rank, generation, int(enabled)),
+                    )
+                assert records == [
+                    (0, generation, int(enabled)),
+                    (1, generation, int(enabled)),
+                ]
+                assert errors == [None, None]
+                assert len(control._buffers) == 1
+                buffers = next(iter(control._buffers.values()))
+                assert all(not torch.is_inference(tensor) for tensor in buffers)
+                if saved is None:
+                    saved = buffers
+                else:
+                    assert all(
+                        tensor is previous
+                        for tensor, previous in zip(buffers, saved, strict=True)
+                    )
+                # Both send and receive remain writable after leaving the
+                # creating scope, and the next real gather replaces these.
+                for tensor in buffers:
+                    tensor.fill_(-1)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_control_buffers_cross_inference_mode_boundaries(tmp_path):
+    mp.spawn(
+        _inference_mode_worker,
+        args=(tmp_path / "inference-rendezvous",),
+        nprocs=2,
+        join=True,
+    )

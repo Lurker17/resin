@@ -67,10 +67,14 @@ class ControlPlane:
         key = id(group.handle), group.ranks
         buffers = self._buffers.get(key)
         if buffers is None:
-            send = torch.empty(self._width, dtype=torch.int64, device="cpu")
-            receive = torch.empty(
-                group.size * self._width, dtype=torch.int64, device="cpu"
-            )
+            # Votes can first run inside a model's inference scope, then be
+            # reused outside it. Gloo also writes receive on its worker thread.
+            # Both buffers must therefore remain ordinary mutable tensors.
+            with torch.inference_mode(False):
+                send = torch.empty(self._width, dtype=torch.int64, device="cpu")
+                receive = torch.empty(
+                    group.size * self._width, dtype=torch.int64, device="cpu"
+                )
             self._buffers[key] = send, receive
         else:
             send, receive = buffers
