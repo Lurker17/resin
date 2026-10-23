@@ -1,4 +1,4 @@
-"""The EP/ADP endpoint warms every driver before entering shared HTTP serving."""
+"""The EP/ADP endpoint verifies single-replica overlap before shared HTTP serving."""
 
 from inspect import signature
 from types import SimpleNamespace
@@ -77,6 +77,7 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
 
     class RequestEngine:
         closed = False
+        local = SimpleNamespace(overlap_stats=(8, 6))
 
         def __init__(self, worker, **options):
             signature(Engine).bind(worker, **options)
@@ -94,6 +95,7 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
             signature(Engine.submit).bind(self, prompt, **options)
             assert prompt == [4, 5] and options["stop_token_ids"] == [7, 8]
             assert options["sampling_params"].temperature == 0
+            assert options["max_new_tokens"] == 64 and rank == 0
             calls.append("submit")
             return SimpleNamespace(take_result=lambda: calls.append("warmup_done"))
 
@@ -154,6 +156,11 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
         deployment._serve_rank(rank, 12345)
     assert calls[:5] == [("device", rank), "initialize", "groups", "runner", "capture"]
     assert calls.count("step") == 2 and calls.count("close") == 1
-    assert calls.index("warmup_done") < calls.index("http") < calls.index("serve")
-    assert calls.index("capture") < calls.index("engine") < calls.index("submit")
+    assert calls.index("capture") < calls.index("engine") < calls.index("http")
+    if rank == 0:
+        assert calls.index("engine") < calls.index("submit")
+        assert calls.index("warmup_done") < calls.index("http")
+    else:
+        assert "submit" not in calls and "warmup_done" not in calls
+    assert calls.index("http") < calls.index("serve")
     assert calls.count("commit") == (1 if rank == 0 else 0)

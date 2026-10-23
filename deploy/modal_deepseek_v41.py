@@ -119,15 +119,24 @@ def _serve_rank(rank: int, port: int) -> None:
         ),
     )
     try:
-        warmup = engine.submit(
-            codec.render_ids([{"role": "user", "content": "Count from 1 to 10."}]),
-            max_new_tokens=8,
-            stop_token_ids=codec.get_stop_token_ids(),
-            sampling_params=SamplingParams(temperature=0.0),
+        # Exercise the web-chat path: one active replica, idle EP peers, and
+        # ordinary EOS handling while device-feedback decode overlaps.
+        warmup = (
+            engine.submit(
+                codec.render_ids([{"role": "user", "content": "Count from 1 to 100."}]),
+                max_new_tokens=64,
+                stop_token_ids=codec.get_stop_token_ids(),
+                sampling_params=SamplingParams(temperature=0.0),
+            )
+            if rank == 0
+            else None
         )
         while engine.has_work():
             engine.step()
-        warmup.take_result()
+        if warmup is not None:
+            warmup.take_result()
+            if engine.local.overlap_stats[1] == 0:
+                raise RuntimeError("single-replica warmup did not overlap decode")
         torch.cuda.synchronize()
         captures = {
             mode: stats["capture_count"]
@@ -136,7 +145,7 @@ def _serve_rank(rank: int, port: int) -> None:
         print(
             f"[deepseek-http rank={rank}] ready after "
             f"{time.perf_counter() - started:.1f}s; "
-            f"captured graphs={captures}",
+            f"captured graphs={captures}; overlap={engine.local.overlap_stats}",
             flush=True,
         )
         if rank == 0:
