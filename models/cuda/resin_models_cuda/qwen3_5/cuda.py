@@ -265,15 +265,17 @@ class Qwen3_5CudaRunner(CudaRunner):
             raise TypeError("Qwen3_5CudaRunner media must be Qwen35Media")
         return media
 
-    def _rope_deltas(self, plan: BatchPlan) -> torch.Tensor:
-        return torch.tensor(
+    def _host_rope_deltas(self, plan: BatchPlan) -> np.ndarray:
+        return np.asarray(
             [
                 media.rope_delta if (media := self._media_at(plan, row)) else 0
                 for row in range(plan.num_sequences)
             ],
-            dtype=torch.long,
-            device=self.device,
+            dtype=np.int64,
         )
+
+    def _rope_deltas(self, plan: BatchPlan) -> torch.Tensor:
+        return torch.as_tensor(self._host_rope_deltas(plan), device=self.device)
 
     def _decode_rotary_positions(
         self, plan: BatchPlan, positions: torch.Tensor
@@ -369,8 +371,8 @@ class Qwen3_5CudaRunner(CudaRunner):
         inputs = self._capture_inputs(shape, self.vocab_size)
         inputs.update(self._cache.graph_shape_capture_inputs(*shape))
         for index, call in enumerate(self._graph_attention_for(shape).calls):
-            inputs[f"attention.{index}.logical_pages"] = (0,) * len(
-                call.prepared.logical_pages
+            inputs[f"attention.{index}.base_pages"] = (0,) * len(
+                call.prepared.base_pages
             )
         return inputs
 
@@ -609,7 +611,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         inputs: dict[str, object] = {
             "token_ids": np.pad(plan.token_ids, (0, padding)),
             "positions": np.pad(plan.positions, (0, padding), constant_values=1),
-            "rope_deltas": np.pad(self._rope_deltas(plan).cpu().numpy(), (0, padding)),
+            "rope_deltas": np.pad(self._host_rope_deltas(plan), (0, padding)),
         }
         inputs.update(
             self._cache.graph_plan_inputs(self._graph_device_caches[shape], cache_plan)

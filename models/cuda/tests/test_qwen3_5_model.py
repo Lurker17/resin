@@ -5,6 +5,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 import torch
 from test_qwen3_5_config import _qwen38
 
@@ -52,9 +53,12 @@ def test_qwen_offset_rms_norm_uses_one_plus_checkpoint_weight() -> None:
     torch.testing.assert_close(norm(hidden), expected * 1.5)
 
 
-def test_delta_net_chunk_matches_recurrent_steps() -> None:
+@pytest.mark.parametrize("value_heads", [2, 4])
+def test_delta_net_chunk_matches_recurrent_steps(value_heads: int) -> None:
     torch.manual_seed(8)
-    module = Qwen35GatedDeltaNet(_tiny_config())
+    module = Qwen35GatedDeltaNet(
+        replace(_tiny_config(), linear_num_value_heads=value_heads)
+    )
     hidden = torch.randn(2, 6, 32)
 
     expected, expected_recurrent, expected_convolution = module(hidden, None, None)
