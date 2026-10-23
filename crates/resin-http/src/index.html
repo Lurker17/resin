@@ -177,10 +177,10 @@ settingsToggle.addEventListener('click',()=>{settings.hidden=!settings.hidden;se
 attach.addEventListener('click',()=>imageInput.click());
 imageInput.addEventListener('change',async()=>{const files=[...imageInput.files];imageInput.value='';let error='';for(const file of files){if(pendingImages.length>=maxImages){error=`Attach at most ${maxImages} images`;break}if(!supportedImageTypes.has(file.type)){error=`Unsupported image type: ${file.type||file.name}`;continue}if(file.size>maxImageBytes){error=`${file.name} is larger than 8 MiB`;continue}if(pendingImages.reduce((total,image)=>total+image.size,0)+file.size>maxImageBytes){error='Attached images total more than 8 MiB';break}try{pendingImages.push({name:file.name,size:file.size,url:await readDataUrl(file)})}catch(err){error=err.message}}renderAttachments();stats.textContent=error});
 form.addEventListener('submit',async e=>{
-  e.preventDefault();const text=prompt.value.trim(),images=pendingImages;if(!text&&!images.length)return;
+  e.preventDefault();if(send.disabled)return;const text=prompt.value.trim(),images=pendingImages;if(!text&&!images.length)return;
   pendingImages=[];renderAttachments();prompt.value='';resizePrompt();send.disabled=true;attach.disabled=true;stats.textContent='';userTurn(text,images);
   const content=images.length?[...images.map(image=>({type:'image_url',image_url:{url:image.url}})),...(text?[{type:'text',text}]:[])]:text;
-  history.push({role:'user',content});
+  const historyLength=history.length;history.push({role:'user',content});
   const box=turn('assistant'),thinking=document.createElement('details'),summary=document.createElement('summary'),reasonBox=document.createElement('div');
   reasonBox.className='markdown';thinking.className='pending';thinking.open=true;thinking.append(summary,reasonBox);box.before(thinking);
   const requestStartedAt=performance.now();let pendingLabel='Starting model';
@@ -193,18 +193,19 @@ form.addEventListener('submit',async e=>{
     const response=await fetch('/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(request)});
     if(!response.ok)throw new Error((await response.json()).error?.message||response.statusText);
     pendingLabel='Preparing prompt';updatePending();
-    const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';
-    while(true){const {value,done}=await reader.read();buffer+=decoder.decode(value||new Uint8Array(),{stream:!done});buffer=parseSse(buffer,data=>{
-      if(data==='[DONE]')return;const event=JSON.parse(data),delta=event.choices?.[0]?.delta||{};
+    const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='',completed=false;
+    while(!completed){const {value,done}=await reader.read();buffer+=decoder.decode(value||new Uint8Array(),{stream:!done});buffer=parseSse(buffer,data=>{
+      if(data==='[DONE]'){completed=true;return}const event=JSON.parse(data);if(event.error)throw new Error(event.error.message||'The inference request failed');const delta=event.choices?.[0]?.delta||{};
       finishReason=event.choices?.[0]?.finish_reason||finishReason;
       if(delta.reasoning_content||delta.content)generationStartedAt??=performance.now();
       if(delta.reasoning_content){reason+=delta.reasoning_content;summary.textContent='Reasoning';thinking.classList.remove('pending');renderRich(reasonBox,reason);thinking.open=true}
       if(delta.content){if(!reason)thinking.remove();answer+=delta.content;renderRich(box,answer)}
       if(event.resin){const r=event.resin,now=performance.now();if(!reason&&!answer)thinking.remove();const generationMs=r.generation_elapsed_ms>0?r.generation_elapsed_ms:(generationStartedAt===null?r.elapsed_ms:now-generationStartedAt);const observedTtftMs=generationStartedAt===null?r.time_to_first_token_ms:generationStartedAt-requestStartedAt;const rate=generationMs>0?r.completion_tokens*1000/generationMs:0;const stopNote=finishReason==='length'?' · max output reached':'';stats.textContent=`${r.prompt_tokens} prompt + ${r.completion_tokens} generated tokens · ${rate.toFixed(1)} tok/s · ${(generationMs/1000).toFixed(2)} s generation · ${(observedTtftMs/1000).toFixed(2)} s TTFT${stopNote}`}
     });if(done)break}
+    if(!completed)throw new Error('The inference stream ended before completion');
     history.push({role:'assistant',content:answer,...(reason?{reasoning_content:reason}:{})});
-  } catch(err) {if(!reason)thinking.remove();box.textContent='Error: '+err.message}
-  finally {clearInterval(statusTimer);send.disabled=false;attach.disabled=false;prompt.focus()}
+  } catch(err) {history.length=historyLength;if(!reason)thinking.remove();box.textContent='Error: '+err.message}
+  finally {clearInterval(statusTimer);if(thinking.classList.contains('pending'))thinking.remove();send.disabled=false;attach.disabled=false;prompt.focus()}
 });
 prompt.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit()}});
 </script>
