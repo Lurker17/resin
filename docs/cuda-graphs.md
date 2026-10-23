@@ -81,6 +81,14 @@ tokens to 32 failed its numerical comparison. Model integrations can restrict
 padding through the private region configuration without changing the public
 policy or creating another execution path.
 
+Models that change row counts between regions can pass `region_tokens` to the
+distributed prefill scope: a mapping from callback index ranges to local row
+demands. The coordinator agrees a bucket for each range before the forward
+pass, including idle replicas, and each region uses its agreed bucket. Model
+code owns the selection policy; the graph runner only handles ranges and sizes.
+V4.1 uses this to give its full producer and compact consumer regions separate
+capacities.
+
 Prefill regions share input/output buffers per token bucket and tensor layout,
 and a private capture memory pool per mode, separate from decode. Larger buckets
 are captured first.

@@ -240,6 +240,7 @@ def _rank(
     options,
     *,
     runner_factory=None,
+    validation=None,
 ):
     from resin.bench import (
         BenchCase,
@@ -357,7 +358,15 @@ def _rank(
             1000, min(30_000, raw.vocab_size), (capacity,), generator=generator
         ).tolist()
         if options["validate_model"]:
-            records = _checkpoint_validation(raw, engine, checkpoint, metadata, groups)
+            try:
+                records = (validation or _checkpoint_validation)(
+                    raw, engine, checkpoint, metadata, groups
+                )
+            except Exception as error:
+                diagnostics = getattr(error, "validation_records", None)
+                if rank == 0 and diagnostics is not None:
+                    Path(report_path).write_text(json.dumps(diagnostics))
+                raise
         else:
             records = run_sweep(
                 engine,

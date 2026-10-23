@@ -59,6 +59,14 @@ entries. Prefixes are published only at an alignment shared by every cache
 group. A hit attaches immutable references to the cached pages and schedules
 only the unmatched suffix.
 
+A model can declare `CacheLayout(replay_suffix_tokens=N)` when a restored
+history needs its final `N` inputs recomputed. Prefix lookup caps the hit at
+`prefill_length - N` before applying cache alignment. The scheduler does not
+interpret those inputs or choose model layers. `BatchPlan.prefill_lengths`
+provides each request's final prefill endpoint across chunks, including
+generated inputs when reconstructing a retracted request. Scored prompts still
+take the full prefill path.
+
 Live requests have priority over cached entries. When allocation needs more
 slabs, the least-recently-used prefix is evicted. Advancing a shared Window or
 State ring uses copy-on-write so one request cannot overwrite another request's
