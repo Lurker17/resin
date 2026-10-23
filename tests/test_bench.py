@@ -253,6 +253,7 @@ def test_overlap_benchmark_defers_reduction_and_observes_harvested_positions():
         assert synchronizations == []
         assert reductions == [0, 4, 4, 4]  # Prefill, then the measured window.
         assert engine.overlap_stats[1] >= 3
+        assert record["overlap_counts"] == {"enqueues": 3, "continuations": 3}
         assert not engine.has_work()
     finally:
         engine.close()
@@ -605,6 +606,7 @@ def test_driver_reduction_uses_slowest_time_and_unique_replica_totals():
             },
             "input_tokens": 4,
             "committed_tokens": 2,
+            "overlap_counts": {"enqueues": 3, "continuations": 2},
             "drafts": 4,
             "accepted": 3,
             "sequences": 2,
@@ -624,6 +626,7 @@ def test_driver_reduction_uses_slowest_time_and_unique_replica_totals():
         "accepted": 6,
         "sequences": 4,
         "graph_counts": {},
+        "overlap_counts": {"enqueues": 6, "continuations": 4},
         "context_start_min": 3,
         "context_start_max": 4,
         "context_end_min": 4,

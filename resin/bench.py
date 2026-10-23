@@ -222,6 +222,10 @@ def distributed_reducer(groups):
                 key: sum(v.get("graph_counts", {}).get(key, 0) for v in values)
                 for key in {key for v in values for key in v.get("graph_counts", {})}
             },
+            "overlap_counts": {
+                key: sum(v.get("overlap_counts", {}).get(key, 0) for v in values)
+                for key in ("enqueues", "continuations")
+            },
             "context_start_min": min(v["context_start_min"] for v in values),
             "context_start_max": max(v["context_start_max"] for v in values),
             "context_end_min": min(v["context_end_min"] for v in values),
@@ -297,6 +301,7 @@ def run_sweep(
         nonlocal previous_completion
         before_drafts, before_accepted = runner.speculation()
         before_graphs = runner.graph_counts()
+        before_overlap = getattr(local, "overlap_stats", (0, 0))
         runner._plan = None
         if not overlap:
             synchronize()
@@ -323,6 +328,7 @@ def run_sweep(
             raise RuntimeError("Engine must use the supplied BenchmarkRunner")
         drafts, accepted = runner.speculation()
         graph_counts = runner.graph_counts()
+        after_overlap = getattr(local, "overlap_stats", (0, 0))
         starts = getattr(
             runner, "completed_context_lengths", plan.context_lengths
         ).tolist()
@@ -356,6 +362,16 @@ def run_sweep(
                 key: value - before_graphs.get(key, 0)
                 for key, value in graph_counts.items()
             },
+            "overlap_counts": dict(
+                zip(
+                    ("enqueues", "continuations"),
+                    (
+                        after - before
+                        for before, after in zip(before_overlap, after_overlap)
+                    ),
+                    strict=True,
+                )
+            ),
         }
         return measured if defer_reduce else reduce(measured)
 
@@ -533,12 +549,18 @@ def run_sweep(
                         key: sum(s["graph_counts"].get(key, 0) for s in samples)
                         for key in {key for s in samples for key in s["graph_counts"]}
                     },
+                    "overlap_counts": {
+                        key: sum(
+                            s.get("overlap_counts", {}).get(key, 0) for s in samples
+                        )
+                        for key in ("enqueues", "continuations")
+                    },
                     "metadata": dict(metadata or {}),
                 }
             )
             if case.phase == "decode" and trace_step is not None:
                 synchronize()
-                trace_step(case, step)
+                trace_step(case, lambda: step(defer_reduce=overlap))
         except Exception as error:
             diagnostic = dict(
                 **asdict(case),
