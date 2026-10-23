@@ -401,3 +401,155 @@ fn a_panicking_payload_clone_restores_the_cohort_and_releases_its_cache_access()
     assert_eq!(handles[1].take_result().unwrap(), [21]);
     assert_eq!(engine.cache_free_parent_count(), Some(8));
 }
+
+#[test]
+fn enqueued_transaction_retains_requests_and_pages_until_harvest() {
+    let mut engine = engine(0, 128);
+    let mut model = Model::default();
+    let request = engine.submit(input(vec![10], 2)).unwrap();
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert!(model.plans.is_empty());
+    assert!(engine.has_in_flight_step());
+    assert!(engine.has_work());
+    assert_eq!(engine.ready_request_count(), 0);
+    assert_eq!(engine.cache_free_parent_count(), Some(15));
+    assert_eq!(
+        engine.next_phase().unwrap(),
+        Some(resin_core::Phase::Prefill)
+    );
+    assert!(!request.done());
+    assert!(engine.prepare_step(&mut model, None).is_err());
+    assert!(engine.cancel(&mut model, &request).is_err());
+    assert!(engine.close(&mut model).is_err());
+    assert!(!engine.poisoned());
+
+    let output = model.forward(plan);
+    let events = engine.complete_step_with(&mut model, output, Ok).unwrap();
+    assert_eq!(events[0].token_id, 11);
+    assert!(!engine.has_in_flight_step());
+    assert_eq!(engine.ready_request_count(), 1);
+    assert!(engine.cancel(&mut model, &request).unwrap());
+    assert_eq!(engine.cache_free_parent_count(), Some(16));
+}
+
+#[test]
+fn rejected_enqueued_transaction_restores_exact_cohort_but_failure_quarantines() {
+    let mut engine = engine(0, 128);
+    let mut model = Model::default();
+    let request = engine.submit(input(vec![10], 2)).unwrap();
+    engine.prepare_step(&mut model, None).unwrap().unwrap();
+    let rejected = engine.complete_step_with(&mut model, Err(Error::rejected("not launched")), Ok);
+    assert_eq!(rejected.unwrap_err().kind, ErrorKind::Rejected);
+    assert!(!engine.poisoned());
+    assert!(!engine.has_in_flight_step());
+    assert_eq!(engine.ready_request_count(), 1);
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert_eq!(plan.sequence_ids, [request.id()]);
+    let failed = engine.complete_step_with(&mut model, Err(Error::execution("device failed")), Ok);
+    assert_eq!(failed.unwrap_err().kind, ErrorKind::Execution);
+    assert!(engine.poisoned());
+    assert_eq!(engine.cache_free_parent_count(), Some(15));
+    assert!(model.released.is_empty());
+    assert!(!request.done());
+}
+
+#[test]
+fn decode_continuation_transfers_writer_lease_and_commits_exact_feedback_depth() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    4,
+                    vec![KvGroupLayout::new(128, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            cache_write_lookahead_tokens: 3,
+            ..Default::default()
+        },
+        4,
+        512,
+        SchedulerConfig::default(),
+        None,
+        true,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    let request = engine.submit(input(vec![1], 40)).unwrap();
+    engine.step(&mut model).unwrap();
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert_eq!(plan.context_lengths, [1]);
+    assert!(engine.retain_continuation(&plan));
+    let next = engine.continuation_plan().unwrap().unwrap();
+    assert_eq!(next.context_lengths, [5]); // GPU corrects conservative host length.
+    assert_eq!(next.cache_groups[0].append_block_offsets, [5]);
+    let leased = engine.cache_free_parent_count();
+    let events = engine
+        .complete_continuing_step_with(&mut model, Ok(vec![vec![3, 4]]), Ok)
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.token_id)
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
+    assert!(engine.has_in_flight_step());
+    assert_eq!(engine.cache_free_parent_count(), leased);
+    let following = engine.continuation_plan().unwrap().unwrap();
+    assert_eq!(following.context_lengths, [7]); // Actual 1 + 2, then maximum 4.
+    assert_eq!(following.token_ids, [4]);
+    engine
+        .complete_step_with(&mut model, Ok(vec![vec![5]]), Ok)
+        .unwrap();
+    assert!(!engine.has_in_flight_step());
+    let next = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert_eq!(next.context_lengths, [4]);
+    assert_eq!(next.token_ids, [5]);
+    engine
+        .complete_step_with(&mut model, Err(Error::rejected("not launched")), Ok)
+        .unwrap_err();
+    engine.close(&mut model).unwrap();
+    assert_eq!(request.take_result().unwrap(), [2, 3, 4, 5]);
+    assert_eq!(engine.cache_free_parent_count(), Some(4));
+}
+
+#[test]
+fn unsafe_decode_boundaries_fall_back_before_enqueuing_a_continuation() {
+    for (prompt, stop, limit) in [
+        (vec![1; 127], None, 40),
+        (vec![1], Some(vec![9]), 40),
+        (vec![1], None, 4),
+    ] {
+        let mut engine = EngineCore::new(
+            RunnerConfig {
+                cache_layout: Some(
+                    KvLayout::new(
+                        8,
+                        vec![KvGroupLayout::new(128, 1, KvRetention::FullContext).unwrap()],
+                    )
+                    .unwrap(),
+                ),
+                cache_write_lookahead_tokens: 3,
+                ..Default::default()
+            },
+            4,
+            512,
+            SchedulerConfig::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        let mut model = Model::default();
+        let mut submission = input(prompt, limit);
+        submission.stop_token_ids = stop;
+        engine.submit(submission).unwrap();
+        engine.step(&mut model).unwrap();
+        let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+        assert!(!engine.retain_continuation(&plan));
+        assert!(engine.continuation_plan().unwrap().is_none());
+        let output = model.forward(plan);
+        engine.complete_step_with(&mut model, output, Ok).unwrap();
+        engine.close(&mut model).unwrap();
+    }
+}

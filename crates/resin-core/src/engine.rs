@@ -1,4 +1,4 @@
-//! Synchronous inference lifecycle, independent of Python and device runtimes.
+//! Inference transactions, independent of Python and device runtimes.
 //!
 //! The engine owns requests and cache leases; a runner only executes a frozen
 //! plan and releases model-local state. Opaque payloads carry frontend metadata.
@@ -10,7 +10,7 @@ use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
 use crate::resources::paged_kv::{PagedKvBatchView, PagedKvError, PagedKvResources};
 use crate::{
     Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable, Scheduler,
-    Selection, SequenceStep, schedule_ready_prefix,
+    Selection, SequenceStep, TokenRange, schedule_ready_prefix,
 };
 use std::cmp::Reverse;
 use std::fmt;
@@ -484,6 +484,8 @@ struct Batch<P> {
 }
 
 pub struct EngineCore<P> {
+    in_flight: Option<Batch<P>>,
+    continuation: Option<ExecutionPlan<P>>,
     quarantined: Option<Batch<P>>,
     runner_config: RunnerConfig,
     scheduler: Scheduler<Request<P>>,
@@ -551,6 +553,8 @@ impl<P: Clone> EngineCore<P> {
         let new_token_ratio_decay =
             (new_token_ratio - minimum_new_token_ratio) / NEW_TOKEN_RATIO_DECAY_STEPS;
         Ok(Self {
+            in_flight: None,
+            continuation: None,
             quarantined: None,
             runner_config,
             scheduler: Scheduler::new(max_running_requests),
@@ -585,7 +589,7 @@ impl<P: Clone> EngineCore<P> {
         self.context_length.get()
     }
     pub fn has_work(&self) -> bool {
-        !self.scheduler.is_empty()
+        self.in_flight.is_some() || !self.scheduler.is_empty()
     }
     pub fn ready_request_count(&self) -> usize {
         self.scheduler.len()
@@ -844,12 +848,51 @@ impl<P: Clone> EngineCore<P> {
         phase: Option<Phase>,
         make_event: impl FnMut(TokenEvent) -> Result<E>,
     ) -> Result<Vec<E>> {
-        let Some((mut batch, plan)) = self.prepare_batch(runner, phase)? else {
+        let Some(plan) = self.prepare_step(runner, phase)? else {
             return Ok(Vec::new());
+        };
+        let output = execution_call("forward", || runner.forward(plan));
+        self.complete_step_with(runner, output, make_event)
+    }
+
+    /// Freeze a plan and retain its requests and writer lease until completion.
+    ///
+    /// A device runtime may enqueue work and return immediately. Neither a
+    /// second preparation nor retirement may reuse its pages before the exact
+    /// accepted transaction is completed or rejected.
+    pub fn prepare_step(
+        &mut self,
+        runner: &mut impl Runner<P>,
+        phase: Option<Phase>,
+    ) -> Result<Option<ExecutionPlan<P>>> {
+        self.raise_if_open()?;
+        self.require_completed_step()?;
+        let Some((batch, plan)) = self.prepare_batch(runner, phase)? else {
+            return Ok(None);
+        };
+        self.in_flight = Some(batch);
+        Ok(Some(plan))
+    }
+
+    pub fn has_in_flight_step(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    /// Harvest an enqueued result using the same atomic commit as synchronous execution.
+    pub fn complete_step_with<E>(
+        &mut self,
+        runner: &mut impl Runner<P>,
+        output: Result<Vec<Vec<u32>>>,
+        make_event: impl FnMut(TokenEvent) -> Result<E>,
+    ) -> Result<Vec<E>> {
+        self.raise_if_open()?;
+        self.continuation = None;
+        let Some(mut batch) = self.in_flight.take() else {
+            return Err(Error::internal("Engine has no in-flight step to complete"));
         };
         // A rejection promises that persistent state is unchanged. Every other
         // execution failure keeps the exact requests and writer lease quarantined.
-        let output = match execution_call("forward", || runner.forward(plan)) {
+        let output = match output {
             Err(error) if error.kind == ErrorKind::Rejected => {
                 self.release_kv_access(batch.resources.take());
                 self.scheduler
@@ -862,6 +905,161 @@ impl<P: Clone> EngineCore<P> {
             Ok(output) => output,
         };
         self.complete_batch(runner, batch, output, make_event)
+    }
+
+    /// Retain a decode view only when another maximum-sized step cannot
+    /// allocate, rotate, replace, retire, or publish any of its leased pages.
+    /// The caller separately checks that its device runtime supports feedback.
+    pub fn retain_continuation(&mut self, plan: &ExecutionPlan<P>) -> bool {
+        let maximum = u64::from(self.runner_config.cache_write_lookahead_tokens) + 1;
+        let Some(batch) = &self.in_flight else {
+            return false;
+        };
+        let allowed = plan.phase == Phase::Decode
+            && batch.rows.len() == plan.sequence_ids.len()
+            && batch.rows.iter().all(|row| {
+                row.request.stop_token_ids.is_empty()
+                    && row
+                        .request
+                        .max_new_tokens
+                        .saturating_sub(row.request.generated.len()) as u64
+                        > 2 * maximum
+                    && u64::from(row.scheduled.token_start()) + 2 * maximum
+                        <= u64::from(self.context_length.get())
+            })
+            && self
+                .runner_config
+                .cache_layout
+                .as_ref()
+                .is_some_and(|layout| {
+                    layout.groups().iter().all(|group| {
+                        plan.context_lengths.iter().all(|&start| {
+                            let block = u64::from(group.block_tokens().get());
+                            u64::from(start) / block == (u64::from(start) + 2 * maximum - 1) / block
+                        })
+                    })
+                });
+        self.continuation = allowed.then(|| plan.clone());
+        allowed
+    }
+
+    /// A conservative host plan reserves the longest possible previous output;
+    /// the runtime substitutes exact GPU token/position feedback before launch.
+    pub fn continuation_plan(&mut self) -> Result<Option<ExecutionPlan<P>>> {
+        self.raise_if_open()?;
+        let Some(template) = &self.continuation else {
+            return Ok(None);
+        };
+        let mut plan = template.clone();
+        plan.batch_id = self.next_batch_id;
+        self.next_batch_id = self
+            .next_batch_id
+            .checked_add(1)
+            .ok_or_else(|| Error::internal("batch id space is exhausted"))?;
+        let maximum = self.runner_config.cache_write_lookahead_tokens + 1;
+        for context in &mut plan.context_lengths {
+            *context += maximum;
+        }
+        for (group, layout) in plan.cache_groups.iter_mut().zip(
+            self.runner_config
+                .cache_layout
+                .as_ref()
+                .expect("continuation keeps resources")
+                .groups(),
+        ) {
+            for (offset, &position) in group
+                .append_block_offsets
+                .iter_mut()
+                .zip(&plan.context_lengths)
+            {
+                *offset = position % layout.block_tokens().get();
+            }
+        }
+        Ok(Some(plan))
+    }
+
+    /// Commit the previous output while the next device step uses the same
+    /// page lease. Eligibility excludes retirement and page-boundary changes.
+    pub fn complete_continuing_step_with<E>(
+        &mut self,
+        runner: &mut impl Runner<P>,
+        output: Result<Vec<Vec<u32>>>,
+        make_event: impl FnMut(TokenEvent) -> Result<E>,
+    ) -> Result<Vec<E>> {
+        let Some(mut template) = self.continuation.take() else {
+            return Err(Error::internal("Engine has no safe decode continuation"));
+        };
+        let mut resources = self
+            .in_flight
+            .as_mut()
+            .ok_or_else(|| Error::internal("Engine has no in-flight step to continue"))?
+            .resources
+            .take();
+        let events = match self.complete_step_with(runner, output, make_event) {
+            Ok(events) => events,
+            Err(error) => {
+                // A next forward was already accepted: even a previous-step
+                // rejection cannot justify returning this writer lease.
+                if let Some(batch) = self.quarantined.as_mut() {
+                    batch.resources = resources.take();
+                } else {
+                    let rows = template
+                        .sequence_ids
+                        .iter()
+                        .filter_map(|id| {
+                            self.scheduler
+                                .position(|request| request.id == *id)
+                                .map(|index| self.scheduler.remove(index))
+                        })
+                        .map(|request| BatchRow {
+                            scheduled: SequenceStep {
+                                phase: Phase::Decode,
+                                tokens: TokenRange {
+                                    start: request.resident_tokens,
+                                    count: NonZeroU32::MIN,
+                                },
+                                sample: true,
+                            },
+                            request,
+                        })
+                        .collect();
+                    self.quarantined = Some(Batch {
+                        rows,
+                        resources: resources.take(),
+                    });
+                }
+                self.poison("overlapped execution failed after enqueue", &error);
+                return Err(error);
+            }
+        };
+        let mut rows = Vec::with_capacity(template.sequence_ids.len());
+        for (slot, id) in template.sequence_ids.iter().enumerate() {
+            let index = self
+                .scheduler
+                .position(|request| request.id == *id)
+                .expect("safe continuation cannot retire a request");
+            let request = self.scheduler.remove(index);
+            let position = request.resident_tokens;
+            template.context_lengths[slot] = position;
+            template.token_ids[slot] = *request
+                .generated
+                .last()
+                .expect("decode continuation has generated tokens");
+            rows.push(BatchRow {
+                request,
+                scheduled: SequenceStep {
+                    phase: Phase::Decode,
+                    tokens: TokenRange {
+                        start: position,
+                        count: NonZeroU32::MIN,
+                    },
+                    sample: true,
+                },
+            });
+        }
+        self.in_flight = Some(Batch { rows, resources });
+        self.retain_continuation(&template);
+        Ok(events)
     }
 
     fn selected_cohort(&self) -> Result<(Vec<&Request<P>>, Selection)> {
@@ -879,6 +1077,9 @@ impl<P: Clone> EngineCore<P> {
     /// Read-only proposal using the same admission fallback as actual dispatch.
     pub fn next_phase(&self) -> Result<Option<Phase>> {
         self.raise_if_open()?;
+        if let Some(batch) = &self.in_flight {
+            return Ok(batch.rows.first().map(|row| row.scheduled.phase));
+        }
         Ok(self
             .selected_cohort()?
             .0
@@ -1273,6 +1474,7 @@ impl<P: Clone> EngineCore<P> {
 
     pub fn cancel(&mut self, runner: &mut impl Runner<P>, request: &RequestHandle) -> Result<bool> {
         self.raise_if_open()?;
+        self.require_completed_step()?;
         if request.engine_id != self.engine_id {
             return Err(Error::invalid("RequestLease belongs to a different Engine"));
         }
@@ -1310,6 +1512,7 @@ impl<P: Clone> EngineCore<P> {
             return Ok(());
         }
         self.raise_if_poisoned()?;
+        self.require_completed_step()?;
         self.close_healthy(runner)
     }
 }
@@ -1514,6 +1717,15 @@ impl<P: Clone> EngineCore<P> {
             return Err(Error::internal("Engine is closed"));
         }
         self.raise_if_poisoned()
+    }
+
+    fn require_completed_step(&self) -> Result<()> {
+        if self.in_flight.is_some() {
+            return Err(Error::internal(
+                "Engine must drain its in-flight step first",
+            ));
+        }
+        Ok(())
     }
 
     fn raise_if_poisoned(&self) -> Result<()> {
