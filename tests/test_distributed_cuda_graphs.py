@@ -55,7 +55,7 @@ def _context(groups, *, phase=BatchPhase.DECODE, sizes=((1, 2), (3, 6))):
     return StepContext(groups, 0, phase, sizes, rows, tokens)
 
 
-def _prefill_rounds(groups):
+def _prefill_fixture(groups, *, regions=2):
     """Use real exchanges with CPU launches of the persistent graph closures."""
 
     runner = _CpuRunner(groups, shapes=())
@@ -77,7 +77,7 @@ def _prefill_rounds(groups):
         return dispatch(hidden, indices, weights)
 
     runner._configure_prefill_graphs(
-        (operation, operation), hidden_size=2, max_tokens=4
+        (operation,) * regions, hidden_size=2, max_tokens=4
     )
     steps = {
         shape: runner._new_prefill_graph_step(shape)
@@ -94,6 +94,11 @@ def _prefill_rounds(groups):
         return step.output
 
     setattr(runner, "_run_cuda_graph", replay)
+    return runner, replays, received
+
+
+def _prefill_rounds(groups):
+    runner, replays, received = _prefill_fixture(groups)
     for sizes, capacity in (
         (((1, 1), (1, 3)), 4),
         (((0, 0), (1, 2)), 2),
@@ -148,6 +153,76 @@ def _prefill_rounds(groups):
         assert runner._distributed_prefill_bucket == 4
         assert runner._prefill_graph_active
     assert runner._distributed_prefill_bucket is None
+
+
+def _compact_prefill_rounds(groups):
+    runner, replays, received = _prefill_fixture(groups, regions=4)
+    for sizes, retained, capacities in (
+        (((1, 4), (1, 3)), (1, 2), (4, 2)),
+        (((0, 0), (1, 4)), (0, 1), (4, 1)),
+        # A peer needing full prompt outputs keeps every consumer at full size.
+        (((1, 4), (1, 3)), (4, 1), (4, 4)),
+    ):
+        context = _context(groups, phase=BatchPhase.PREFILL, sizes=sizes)
+        count = retained[groups.rank]
+        hidden = torch.arange(context.num_tokens * 2, dtype=torch.bfloat16).reshape(
+            -1, 2
+        )
+        with runner._distributed_prefill_graphs(
+            context, region_tokens={range(2, 4): count}
+        ):
+            assert runner._distributed_prefill_bucket == capacities[0]
+            assert runner._distributed_prefill_region_buckets == {
+                2: capacities[1],
+                3: capacities[1],
+            }
+            if context.placeholder:
+                runner._empty_prefill_regions()
+            else:
+                expected = hidden
+                output = hidden
+                for region in range(4):
+                    if region == 2:
+                        expected, output = expected[-count:], output[-count:]
+                    output = runner._run_prefill_region(region, output)
+                    expected = ((expected.float() + 1) * 1.75).bfloat16()
+                torch.testing.assert_close(output, expected)
+        assert replays[-4:] == [
+            ((capacity, region + 1), context.num_tokens if region < 2 else count)
+            for region, capacity in enumerate(
+                (capacities[0],) * 2 + (capacities[1],) * 2
+            )
+        ]
+        assert received[-4:] == [
+            (2 * capacity, sum(n for _, n in sizes) if region < 2 else sum(retained))
+            for region, capacity in enumerate(
+                (capacities[0],) * 2 + (capacities[1],) * 2
+            )
+        ]
+        assert not runner._prefill_graph_active
+        assert not runner._distributed_prefill_scope
+        assert runner._distributed_prefill_bucket is None
+        assert runner._distributed_prefill_region_buckets == {}
+
+    # Layout disagreements fail before layers, rather than sending an idle
+    # peer into a different number of graph-selection or expert collectives.
+    context = _context(groups, phase=BatchPhase.PREFILL, sizes=((1, 4), (1, 4)))
+    before = len(replays)
+    for regions in (
+        {range(2, 4): 1} if groups.rank else {},
+        {range(1 if groups.rank else 2, 4): 1},
+    ):
+        with pytest.raises(RuntimeError, match="different orders"):
+            with runner._distributed_prefill_graphs(context, region_tokens=regions):
+                raise AssertionError("a mismatched region schedule entered forward")
+    with pytest.raises(ValueError, match="nonnegative integers"):
+        with runner._distributed_prefill_graphs(
+            context, region_tokens={range(2, 4): -1 if groups.rank else 1}
+        ):
+            raise AssertionError("an invalid token demand entered forward")
+    assert len(replays) == before
+    with runner._distributed_prefill_graphs(context, region_tokens={range(2, 4): 1}):
+        assert runner._distributed_prefill_region_buckets == {2: 1, 3: 1}
 
 
 def _selection_worker(rank, rendezvous):
@@ -340,6 +415,7 @@ def _selection_worker(rank, rendezvous):
             "decode", context, required_shape=(1, 1)
         ) == (1, 4)
         _prefill_rounds(groups)
+        _compact_prefill_rounds(groups)
     finally:
         if groups is not None:
             groups.close()
@@ -385,7 +461,8 @@ def test_driver_policy_disables_every_peer_without_hiding_catalogs(
     cache = runner._require_cuda_graph_executor().mode(mode)
     catalog = cache.shapes
 
-    def gather(group, operation, value):
+    def gather(group, operation, value, *, error=None):
+        assert error is None
         assert bool(value[0]) == (rank == 1)
         return [(0, *value[1:]), (1, *value[1:])], [None, None]
 
@@ -421,3 +498,101 @@ def test_wide_graph_demands_keep_every_dimension():
         assert runner._select_distributed_cuda_graph(
             "decode", None, required_shape=(2, 2, 2, 2)
         ) == (2, 3, 4, 5)
+
+
+@pytest.mark.parametrize(
+    "regions",
+    [
+        {range(2, 2): 1},
+        {range(0, 4, 2): 1},
+        {range(0, 5): 1},
+        {range(0, 3): 1, range(2, 4): 1},
+        {range(2, 4): -1},
+        {range(2, 4): True},
+    ],
+)
+def test_prefill_region_demands_are_validated_before_forward(regions):
+    runner = _CpuRunner(None)
+    runner._configure_prefill_graphs(
+        (lambda hidden, ids: hidden,) * 4, hidden_size=2, max_tokens=4
+    )
+    with pytest.raises(ValueError, match="prefill graph region"):
+        with runner._distributed_prefill_graphs(
+            SimpleNamespace(max_num_tokens=4), region_tokens=regions
+        ):
+            raise AssertionError("invalid region demands entered forward")
+    assert not runner._prefill_graph_active
+    assert not getattr(runner, "_distributed_prefill_scope", False)
+
+
+def test_nested_prefill_region_buckets_restore_after_failure():
+    runner = _CpuRunner(None)
+    runner._configure_prefill_graphs(
+        (lambda hidden, ids: hidden,) * 4, hidden_size=2, max_tokens=4
+    )
+    with runner._distributed_prefill_graphs(
+        SimpleNamespace(max_num_tokens=4), region_tokens={range(2, 4): 1}
+    ):
+        with pytest.raises(RuntimeError, match="operation failed"):
+            with runner._distributed_prefill_graphs(
+                SimpleNamespace(max_num_tokens=2), region_tokens={range(1, 3): 2}
+            ):
+                assert runner._distributed_prefill_bucket == 2
+                assert runner._distributed_prefill_region_buckets == {1: 2, 2: 2}
+                raise RuntimeError("operation failed")
+        assert runner._prefill_graph_active
+        assert runner._distributed_prefill_scope
+        assert runner._distributed_prefill_bucket == 4
+        assert runner._distributed_prefill_region_buckets == {2: 1, 3: 1}
+    assert not runner._prefill_graph_active
+    assert not runner._distributed_prefill_scope
+    assert runner._distributed_prefill_bucket is None
+    assert runner._distributed_prefill_region_buckets == {}
+
+
+def test_prefill_region_fallback_keeps_the_other_agreed_bucket(monkeypatch):
+    runner = _CpuRunner(None)
+    runner._configure_prefill_graphs(
+        (lambda hidden, ids: hidden + 1,) * 2, hidden_size=2, max_tokens=4
+    )
+    replays = []
+
+    def replay(mode, shape, inputs):
+        replays.append(shape)
+        step = runner._new_prefill_graph_step(shape)
+        assert step.inputs is inputs
+        step.launch()
+        return step.output
+
+    monkeypatch.setattr(runner, "_run_cuda_graph", replay)
+    for full_count, compact_count in ((5, 1), (4, 5)):
+        hidden = torch.zeros((full_count, 2), dtype=torch.bfloat16)
+        with runner._distributed_prefill_graphs(
+            SimpleNamespace(max_num_tokens=full_count),
+            region_tokens={range(1, 2): compact_count},
+        ):
+            assert runner._prefill_graph_active
+            with runner._prefill_graphs():
+                output = runner._run_prefill_region(0, hidden)
+                torch.testing.assert_close(output, hidden + 1)
+                compact = torch.ones((compact_count, 2), dtype=torch.bfloat16)
+                output = runner._run_prefill_region(1, compact)
+                torch.testing.assert_close(output, compact + 1)
+    assert replays == [(1, 2), (4, 1)]
+
+
+def test_prefill_region_cannot_silently_exceed_its_agreed_capacity():
+    runner = _CpuRunner(None)
+    invoked = []
+
+    def operation(hidden, _ids):
+        invoked.append(True)
+        return hidden
+
+    runner._configure_prefill_graphs((operation,) * 2, hidden_size=2, max_tokens=4)
+    with runner._distributed_prefill_graphs(
+        SimpleNamespace(max_num_tokens=4), region_tokens={range(1, 2): 1}
+    ):
+        with pytest.raises(ValueError, match="exceeds its agreed"):
+            runner._run_prefill_region(1, torch.ones(2, 2, dtype=torch.bfloat16))
+    assert invoked == []

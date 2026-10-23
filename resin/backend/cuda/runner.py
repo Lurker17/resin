@@ -104,6 +104,7 @@ class CudaRunner(Runner):
         self._expert_graph_catalogs = {}
         self._expert_graph_control = None
         self._distributed_prefill_bucket = None
+        self._distributed_prefill_region_buckets = {}
         self._distributed_prefill_scope = False
 
     def _configure_expert_parallel_graphs(self, model, groups) -> None:
@@ -159,7 +160,15 @@ class CudaRunner(Runner):
         }
 
     def _select_distributed_cuda_graph(
-        self, mode, context, *, required_shape, eligible=True, fallback="shape"
+        self,
+        mode,
+        context,
+        *,
+        required_shape,
+        eligible=True,
+        fallback="shape",
+        agreement=None,
+        validation_error=None,
     ):
         """Vote before GPU work so every attention replica chooses the same path.
 
@@ -167,6 +176,8 @@ class CudaRunner(Runner):
         Any changed or untrusted catalog makes every rank join an exact object
         comparison before selection; only successful agreement updates trust.
         Wider demands also keep their complete shape through that cold path.
+        An optional schedule tag rejects incompatible region sequences in
+        their first vote, while validation errors fail every peer together.
         """
 
         eligible = eligible and (
@@ -193,12 +204,18 @@ class CudaRunner(Runner):
         groups = getattr(self, "_expert_graph_groups", None)
         if groups is None:
             records = [record]
+            errors = [validation_error]
         else:
             control = self._expert_graph_control
             assert control is not None
-            records, _ = control.gather(
-                groups.domain, f"cuda_graph_select:{mode}", record
+            operation = f"cuda_graph_select:{mode}"
+            if agreement is not None:
+                operation += f":{agreement!r}"
+            records, errors = control.gather(
+                groups.domain, operation, record, error=validation_error
             )
+        if any(error is not None for error in errors):
+            raise ValueError("; ".join(error for error in errors if error is not None))
         if any(row[2] != len(required_shape) for row in records):
             raise ValueError("distributed CUDA graph demand dimensions must agree")
         if any(row[1] for row in records) or len(required_shape) > 3:
@@ -220,27 +237,80 @@ class CudaRunner(Runner):
         )
 
     @contextmanager
-    def _distributed_prefill_graphs(self, context, *, per_sequence=False):
-        """Align FFN buckets across unequal and empty attention-DP replicas."""
+    def _distributed_prefill_graphs(
+        self,
+        context,
+        *,
+        per_sequence=False,
+        region_tokens: Mapping[range, int] | None = None,
+    ):
+        """Agree FFN capacities before unequal or empty replicas enter forward.
+
+        A model can give consecutive regions a smaller token demand after a
+        row-reducing operation. Each range keeps its own common bucket across
+        the communication domain, including replicas with no local rows. No
+        votes are needed between regions.
+        """
 
         tokens = context.max_num_tokens
         if per_sequence:
             tokens = min(tokens, self.prefill_chunk_size)
+        demands = []
+        validation_error = None
+        try:
+            for regions, count in (region_tokens or {}).items():
+                if (
+                    not isinstance(regions, range)
+                    or regions.step != 1
+                    or not 0
+                    <= regions.start
+                    < regions.stop
+                    <= len(self._prefill_operations)
+                ):
+                    raise ValueError(
+                        "prefill graph regions must be nonempty contiguous ranges within the configured operations"
+                    )
+                demands.append((regions.start, regions.stop, count))
+                if type(count) is not int or count < 0:
+                    raise ValueError(
+                        "prefill graph region token demands must be nonnegative integers"
+                    )
+            demands.sort()
+            if any(left[1] > right[0] for left, right in zip(demands, demands[1:])):
+                raise ValueError("prefill graph region ranges must not overlap")
+        except ValueError as error:
+            validation_error = str(error)
+        layout = tuple((start, stop) for start, stop, _ in demands)
+        agreement = None if not layout else ("prefill_regions", layout)
         shape = self._select_distributed_cuda_graph(
             "prefill",
             context,
             required_shape=(tokens, 1),
+            agreement=agreement,
+            validation_error=validation_error,
         )
+        region_buckets = {}
+        for start, stop, count in demands:
+            region_shape = self._select_distributed_cuda_graph(
+                "prefill",
+                context,
+                required_shape=(count, 1),
+                agreement=("prefill_regions", layout, start, stop),
+            )
+            bucket = None if region_shape is None else region_shape[0]
+            region_buckets.update((region, bucket) for region in range(start, stop))
         previous = getattr(self, "_distributed_prefill_bucket", None)
+        previous_regions = getattr(self, "_distributed_prefill_region_buckets", {})
         previous_scope = getattr(self, "_distributed_prefill_scope", False)
         self._distributed_prefill_bucket = None if shape is None else shape[0]
+        self._distributed_prefill_region_buckets = region_buckets
         self._distributed_prefill_scope = True
         try:
             with self._prefill_graphs():
-                self._prefill_graph_active = shape is not None
                 yield
         finally:
             self._distributed_prefill_bucket = previous
+            self._distributed_prefill_region_buckets = previous_regions
             self._distributed_prefill_scope = previous_scope
 
     def _empty_prefill_regions(self) -> None:
@@ -419,6 +489,12 @@ class CudaRunner(Runner):
         self._prefill_graph_active = self.cuda_graph_prefill == "breakable" and (
             not getattr(self, "_distributed_prefill_scope", False)
             or self._distributed_prefill_bucket is not None
+            or any(
+                bucket is not None
+                for bucket in getattr(
+                    self, "_distributed_prefill_region_buckets", {}
+                ).values()
+            )
         )
         try:
             yield
@@ -438,18 +514,21 @@ class CudaRunner(Runner):
             output = operation(flattened, ids)
             return output if flat_input else output.view_as(hidden)
         tokens = flattened.shape[0]
-        common_bucket = getattr(self, "_distributed_prefill_bucket", None)
-        bucket = common_bucket or next(
-            (size for size in self._prefill_buckets if size >= tokens), None
+        common_bucket = getattr(self, "_distributed_prefill_region_buckets", {}).get(
+            region, getattr(self, "_distributed_prefill_bucket", None)
         )
+        distributed = getattr(self, "_distributed_prefill_scope", False)
+        bucket = (
+            common_bucket
+            if distributed
+            else next((size for size in self._prefill_buckets if size >= tokens), None)
+        )
+        if distributed and bucket is not None and tokens > bucket:
+            raise ValueError("prefill region exceeds its agreed graph token capacity")
         fallback = None
         if bucket is None or flattened.dtype != torch.bfloat16:
             fallback = "tokens_or_dtype"
-        elif (
-            common_bucket is None
-            and tokens > self._prefill_pad_up_to
-            and tokens != bucket
-        ):
+        elif not distributed and tokens > self._prefill_pad_up_to and tokens != bucket:
             fallback = "padding"
         if fallback is not None:
             self._cuda_graph_fallback("prefill", fallback)
