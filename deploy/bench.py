@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 import tempfile
 import time
 from dataclasses import asdict
@@ -380,7 +381,14 @@ def _rank(
         if rank == 0:
             Path(report_path).write_text(json.dumps(records))
     finally:
-        engine.close()
+        # Closing a poisoned domain still tells followers to stop. Preserve the
+        # original failure/report if close repeats that same domain error.
+        failed = engine.poisoned or sys.exc_info()[0] is not None
+        try:
+            engine.close()
+        except Exception:
+            if not failed:
+                raise
     # Spawned process exit releases graph-owned NCCL communicators together.
     if groups is not None:
         os._exit(0)

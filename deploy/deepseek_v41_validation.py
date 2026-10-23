@@ -256,7 +256,7 @@ def validate_overlap(runner, engine, prompt, *, coordinate=None, generated=160):
                 }
         finally:
             with _validation_stage(name + " cleanup", coordinate):
-                if not request.done:
+                if not request.done and not local.poisoned:
                     engine.cancel(request)
 
     reference, overlapped = generate(False), generate(True)
@@ -424,7 +424,7 @@ def validate_model(
                     )
         finally:
             with _validation_stage(stage + " cleanup", coordinate):
-                if not request.done:
+                if not request.done and not local.poisoned:
                     engine.cancel(request)
         with _validation_stage(stage + " graphs", coordinate):
             after = counts()
