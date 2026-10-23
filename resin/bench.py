@@ -198,6 +198,7 @@ def run_sweep(
     reduce_step: Callable[[dict], dict] | None = None,
     metadata: dict | None = None,
     on_result: Callable[[dict], None] | None = None,
+    trace_step: Callable[[BenchCase, Callable[[], dict]], None] | None = None,
 ) -> list[dict]:
     """Measure prefill cohorts or a steady decode window on an existing Engine.
 
@@ -208,6 +209,9 @@ def run_sweep(
     call together with distributed_reducer; records contain global token counts
     and the slowest driver's step duration. The caller retains engine ownership.
     on_result receives each completed record after request cleanup, outside timing.
+    trace_step may run one extra decode step on the live cohort after recording
+    measurements. Its outputs are excluded from records; all distributed drivers
+    must participate in that step.
     """
 
     for name, value, minimum in (
@@ -358,6 +362,8 @@ def run_sweep(
                         if not measured:
                             warmed = count
             else:
+                # Reserve a complete extra step for optional tracing, including
+                # maximum speculative acceptance and the initial prefill token.
                 maximum = 1 + (warmup_steps + measure_steps + 1) * (
                     runner.draft_tokens + 1
                 )
@@ -446,6 +452,8 @@ def run_sweep(
                     "metadata": dict(metadata or {}),
                 }
             )
+            if case.phase == "decode" and trace_step is not None:
+                trace_step(case, step)
         except Exception as error:
             diagnostic = dict(
                 **asdict(case),

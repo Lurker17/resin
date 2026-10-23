@@ -199,6 +199,118 @@ def test_decode_counts_real_steps_and_disables_eos_without_retiring_cohort():
     assert not engine.has_work()
 
 
+@pytest.mark.parametrize("batch_size", [1, 3])
+def test_decode_trace_uses_live_full_cohort_without_changing_measurements(
+    monkeypatch, batch_size
+):
+    clock = iter(range(1000))
+    monkeypatch.setattr("resin.bench.time.perf_counter", lambda: next(clock))
+    case = BenchCase(phase="decode", context_length=4, batch_size=batch_size)
+    traces = []
+
+    class GraphRunner(Runner):
+        @property
+        def cuda_graph_stats(self):
+            count = sum(plan.phase == BatchPhase.DECODE for plan in self.plans)
+            return {
+                "decode": {
+                    "replay_count": count,
+                    "eager_fallback_count": 0,
+                    "fallback_counts": {},
+                }
+            }
+
+    def run(traced):
+        raw = GraphRunner(drafts=4)
+        runner = BenchmarkRunner(raw, accepted_drafts=4)
+        # Exactly the existing reservation: prompt + prefill sample + four
+        # maximum-acceptance steps (warmup, two measured, one traced).
+        engine = Engine(runner, max_running_requests=batch_size, context_length=25)
+
+        def trace(actual_case, step):
+            assert actual_case is case
+            assert engine.has_work() and engine.next_phase() == BatchPhase.DECODE
+            assert engine.active_request_count == batch_size
+            assert len(raw.plans) == 4  # Prefill, warmup, then two measured steps.
+            traced_step = step()
+            assert list(raw.plans[-1].context_lengths) == [19] * batch_size
+            assert traced_step["sequences"] == batch_size
+            assert traced_step["committed_tokens"] == 5 * batch_size
+            traces.append(traced_step)
+
+        completed = []
+
+        def on_result(record):
+            assert not engine.has_work()
+            completed.append(record)
+
+        records = run_sweep(
+            engine,
+            [case],
+            runner=runner,
+            prompt_tokens=[1],
+            warmup_steps=1,
+            measure_steps=2,
+            trace_step=trace if traced else None,
+            on_result=on_result,
+        )
+        assert not engine.has_work()
+        assert completed == records
+        assert len(raw.plans) == (5 if traced else 4)
+        return records
+
+    baseline, profiled = run(False), run(True)
+    assert baseline == profiled
+    record = profiled[0]
+    assert record["step_seconds"] == [1, 1]
+    assert record["graph_counts"]["decode.replay_count"] == 2
+    assert record["committed_tokens"] == 10 * batch_size
+    assert record["measured_accept_rate"] == 1.0
+    assert record["measured_context_start_min"] == 9
+    assert record["measured_context_end_max"] == 19
+    assert len(traces) == 1
+
+
+def test_trace_skips_prefill_and_cleans_up_if_decode_callback_fails():
+    runner = BenchmarkRunner(Runner(drafts=4), accepted_drafts=0)
+    engine = Engine(runner, max_running_requests=2, context_length=64)
+
+    def unexpected_trace(*_):
+        raise AssertionError("prefill must not invoke the decode trace hook")
+
+    run_sweep(
+        engine,
+        [BenchCase(phase="prefill", context_length=4, batch_size=2)],
+        runner=runner,
+        prompt_tokens=[1],
+        warmup_steps=0,
+        measure_steps=1,
+        trace_step=unexpected_trace,
+    )
+    completed = []
+
+    def failing_trace(case, step):
+        assert case.phase == "decode" and engine.active_request_count == 2
+        step()
+        assert engine.has_work()  # Cleanup must cancel this still-live cohort.
+        raise RuntimeError("trace export failed")
+
+    with pytest.raises(RuntimeError, match="trace export failed"):
+        run_sweep(
+            engine,
+            [BenchCase(phase="decode", context_length=4, batch_size=2)],
+            runner=runner,
+            prompt_tokens=[1],
+            warmup_steps=0,
+            measure_steps=1,
+            trace_step=failing_trace,
+            on_result=completed.append,
+        )
+    assert not completed
+    assert not engine.has_work()
+    assert engine.active_request_count == 0
+
+
 @pytest.mark.parametrize("accepted", [0, 3, 4])
 def test_fixed_acceptance_changes_engine_commit_and_model_rollback_depth(accepted):
     raw = Runner(drafts=4)
