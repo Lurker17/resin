@@ -9,13 +9,17 @@ from resin_models_cuda.deepseek_v41.batch import ForwardMetadata, _reference
 from resin_models_cuda.deepseek_v41.cache import CacheGeometry, DeviceCache
 
 
-def _case(batch, queries, context):
+def _case(batch, queries, context, *, ca_width=None):
     anchors = torch.arange(batch) % 7 + context
     positions = anchors[:, None] + torch.arange(queries)
     packings = (4, 8, 2, 16)
     groups = []
     for index, packing in enumerate(packings):
-        width = int(positions.max()) // 128 + 3 if index == 1 else 5
+        width = (
+            (int(positions.max()) // 128 + 3 if ca_width is None else ca_width)
+            if index == 1
+            else max(5, (queries + 127) // 128 + 2)
+        )
         ordinal = torch.arange(batch * width).reshape(batch, width) * 3 + 17
         first = torch.zeros(batch, dtype=torch.int32)
         if index != 1:
@@ -129,6 +133,41 @@ def _latency(graph):
     return start.elapsed_time(end) / 100
 
 
+def _growing_table_probe():
+    from resin_models_cuda.deepseek_v41.upstream.cuda.batch_metadata import (
+        prepare_engine_metadata_tl,
+    )
+    from resin_models_cuda.deepseek_v41.upstream.cuda.flash_mla_utils import (
+        convert_kv_index_tl,
+    )
+
+    # Only runtime table tensors change. These handles must stay identical even
+    # when the last table grows to a 128K history; no new specialization is needed.
+    static = (4, 5, 5, (4, 8, 2), 128, 8, (1, 2), "int64", False, True)
+    kernel = prepare_engine_metadata_tl(*static)
+    converters = {ratio: convert_kv_index_tl(4, 512, 128 // ratio) for ratio in (1, 2)}
+    results = []
+    for width, context in ((1, 0), (3, 126), (1025, 131070)):
+        cpu, gpu, positions, mask, selected = _case(3, 4, context, ca_width=width)
+        device_positions, device_mask = positions.cuda(), mask.cuda()
+        device_selected = {ratio: value.cuda() for ratio, value in selected.items()}
+
+        def call():
+            return _prepare(gpu, device_positions, device_mask, device_selected, False)
+
+        expected = _prepare(cpu, positions, mask, selected, False)
+        _equal(call(), expected)
+        graph, output = _capture(call)
+        graph.replay()
+        torch.cuda.synchronize()
+        _equal(output, expected)
+        assert prepare_engine_metadata_tl(*static) is kernel
+        for ratio in (1, 2):
+            assert convert_kv_index_tl(4, 512, 128 // ratio) is converters[ratio]
+        results.append({"width_ca": width, "exact_fields": len(output)})
+    return {"same_compiled_factories": True, "cases": results}
+
+
 @torch.inference_mode()
 def run_probe():
     results = []
@@ -139,6 +178,7 @@ def run_probe():
         (256, 4, 131070, False, False, False),
         (256, 4, 131070, False, True, False),
         (256, 3, 131070, True, True, False),
+        (1, 1024, 130048, False, True, True),
     ):
         cpu, gpu, positions, mask, selected = _case(batch, queries, context)
         if int32:
@@ -205,4 +245,8 @@ def run_probe():
                 "torch_shared_metadata_ms": _latency(reference_graph),
             }
         )
-    return {"gpu": torch.cuda.get_device_name(), "cases": results}
+    return {
+        "gpu": torch.cuda.get_device_name(),
+        "cases": results,
+        "growing_tables": _growing_table_probe(),
+    }

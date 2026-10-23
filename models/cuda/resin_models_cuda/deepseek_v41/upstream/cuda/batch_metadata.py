@@ -22,7 +22,6 @@ T: Any = _language
 def prepare_engine_metadata_tl(
     queries: int,
     width_swa: int,
-    width_ca: int,
     width_state: int,
     packings: tuple[int, ...],
     window_size: int,
@@ -33,6 +32,7 @@ def prepare_engine_metadata_tl(
     has_valid_mask: bool,
 ) -> Any:
     batch = T.dynamic("batch")
+    width_ca = T.dynamic("width_ca")
     num_ratios = max(len(ca_ratios), 1)
     padded_draft = (queries + 7) // 8 * 8 if draft else 1
     ratio_items = tuple(enumerate(ca_ratios))
@@ -174,11 +174,20 @@ def prepare_engine_metadata_tl(
 
             # DG's varlen paged API reserves one table row per query, while its
             # query_indices point at the first B request rows. Preserve that ABI.
-            for sid, column in T.Parallel(queries, width_ca):
-                page = ca_parents[bid, column] * packings[1] + ca_slots[bid, column]
-                block_tables[sid * batch + bid, column] = T.if_then_else(
-                    ca_parents[bid, column] > 0, page, -1
-                )
+            # Full-history tables grow on each prefill chunk. Keep their width
+            # runtime-valued, with bounded tiles rather than one JIT per page.
+            for tile in T.serial(T.ceildiv(width_ca, 128)):
+                for lane in T.Parallel(128):
+                    column = tile * 128 + lane
+                    if column < width_ca:
+                        page = (
+                            ca_parents[bid, column] * packings[1]
+                            + ca_slots[bid, column]
+                        )
+                        for sid in T.serial(queries):
+                            block_tables[sid * batch + bid, column] = T.if_then_else(
+                                ca_parents[bid, column] > 0, page, -1
+                            )
             for sid, column in T.Parallel(queries, width_swa):
                 page = swa_parents[bid, column] * packings[0] + swa_slots[bid, column]
                 swa_tables[bid * queries + sid, column] = T.if_then_else(

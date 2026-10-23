@@ -174,6 +174,47 @@ def test_private_draft_keys_mask_invalid_columns_and_target_storage_stays_linear
     assert (target.draft_indices == -1).all()
 
 
+@pytest.mark.parametrize("width,context", [(1, 0), (3, 126), (1025, 131070)])
+def test_growing_compressed_tables_preserve_physical_address_equations(width, context):
+    cache, _ = cache_and_positions()
+    positions = context + torch.arange(3)[:, None] + torch.arange(4)
+    ordinal = torch.arange(3 * width).reshape(3, width) * 7 + 19
+    compressed = DevicePageGroup(
+        (ordinal // 8 + 1).int(),
+        (ordinal % 8).int(),
+        torch.zeros(3, dtype=torch.int32),
+    )
+    cache = DeviceCache(
+        cache.geometry,
+        cache.groups[:1] + (compressed,) + cache.groups[2:],
+        cache.storage,
+    )
+    for group in (cache.groups[0], cache.groups[2]):
+        group.first_blocks.copy_((positions[:, 0] // 128 - 1).clamp_min(0))
+    frame = cache.prepare_metadata(positions)
+    assert frame.block_tables.shape == (12, width)
+    for ratio in (1, 2):
+        selected = torch.stack(
+            (
+                torch.zeros_like(positions),
+                (positions + 1) // ratio - 1,
+                (positions + 1) // ratio,
+                torch.full_like(positions, -1),
+            ),
+            -1,
+        ).int()
+        mapped = frame.compressed_indices(3, ratio, selected)
+        for row in range(3):
+            for query in range(4):
+                expected = [
+                    physical(cache, 1, row, int(value) * ratio, ratio)
+                    if 0 <= int(value) < int(frame.klen[ratio][row, query])
+                    else -1
+                    for value in selected[row, query]
+                ]
+                assert mapped[row, query].tolist() == expected
+
+
 @pytest.mark.parametrize(
     "positions,mask",
     [

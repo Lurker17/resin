@@ -43,7 +43,7 @@ class ForwardMetadata:
             output = torch.empty_like(selected, dtype=torch.int32)
             batch, queries, topk = selected.shape
             table = self.block_tables[:batch]
-            convert_kv_index_tl(queries, topk, table.shape[1], 128 // ratio)(
+            convert_kv_index_tl(queries, topk, 128 // ratio)(
                 selected,
                 self.klen[ratio],
                 table,
@@ -120,7 +120,6 @@ def prepare_forward(cache, positions: Tensor, *, draft=False, valid_tokens=None)
     prepare_engine_metadata_tl(
         queries,
         width_swa,
-        width_ca,
         width_state,
         tuple(cache.geometry.packings[:3]),
         cache.geometry.window_size,
