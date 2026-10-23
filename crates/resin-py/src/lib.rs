@@ -1069,6 +1069,165 @@ struct PendingExecution {
 }
 
 impl Engine {
+    fn step_once(
+        &mut self,
+        py: Python<'_>,
+        phase: Option<BatchPhase>,
+        allow_overlap: bool,
+    ) -> PyResult<Vec<Py<TokenEvent>>> {
+        self.core.raise_if_open().map_err(core_error)?;
+        let mut events = Vec::new();
+        if self.pending.is_some() {
+            let next = if self.overlap
+                && allow_overlap
+                && phase.is_none_or(|phase| matches!(phase, BatchPhase::Decode))
+            {
+                self.core.continuation_plan().map_err(core_error)?
+            } else {
+                None
+            };
+            if let Some(next) = next {
+                let next_plan = Py::new(py, planning::from_core(next))?;
+                let previous = self.pending.as_ref().expect("pending execution");
+                let feedback = match previous.completion.bind(py).getattr("feedback") {
+                    Ok(feedback) => feedback,
+                    Err(error) => {
+                        self.core.poison_message(format!(
+                            "accepted completion feedback failed: {error}"
+                        ));
+                        return Err(error);
+                    }
+                };
+                let kwargs = pyo3::types::PyDict::new(py);
+                kwargs.set_item("feedback", feedback)?;
+                let enqueue = self
+                    .runner_enqueue
+                    .as_ref()
+                    .expect("pending runner can enqueue");
+                let result = match enqueue.bind(py).call((&next_plan,), Some(&kwargs)) {
+                    Ok(result) => result.unbind(),
+                    Err(error) => {
+                        self.core
+                            .poison_message(format!("overlapped enqueue failed: {error}"));
+                        return Err(error);
+                    }
+                };
+                let asynchronous = match result.bind(py).hasattr("result") {
+                    Ok(asynchronous) => asynchronous,
+                    Err(error) => {
+                        self.failed_executions.push(result);
+                        self.core.poison_message(format!(
+                            "accepted completion inspection failed: {error}"
+                        ));
+                        return Err(error);
+                    }
+                };
+                if !asynchronous {
+                    // Distributed peers may collectively choose a synchronous
+                    // fallback. It still executed the future step, so harvest
+                    // and commit both results without releasing pages between.
+                    let previous_events = match self.harvest(py, true) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            self.failed_executions.push(result);
+                            return Err(error);
+                        }
+                    };
+                    events.extend(previous_events);
+                    events.extend(self.consume_output(py, &next_plan, result.bind(py), false)?);
+                    return Ok(events);
+                }
+                let previous_events = match self.harvest(py, true) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        self.failed_executions.push(result);
+                        return Err(error);
+                    }
+                };
+                self.pending = Some(PendingExecution {
+                    plan: next_plan,
+                    completion: result,
+                });
+                self.overlap_enqueues += 1;
+                self.overlap_continuations += 1;
+                events.extend(previous_events);
+            } else {
+                events.extend(self.harvest(py, false)?);
+            }
+            return Ok(events);
+        }
+
+        let forward = self.runner_forward.clone_ref(py);
+        let release = self
+            .runner_release
+            .as_ref()
+            .map(|value| value.clone_ref(py));
+        let mut runner = PythonRunner {
+            py,
+            forward: &forward,
+            release: release.as_ref(),
+            error: None,
+            logprobs: None,
+            prompt_logprobs: None,
+        };
+        let Some(plan) = self
+            .core
+            .prepare_step(&mut runner, phase.map(BatchPhase::core))
+            .map_err(|error| runner.error.take().unwrap_or_else(|| core_error(error)))?
+        else {
+            return Ok(events);
+        };
+        let can_enqueue = self.overlap
+            && allow_overlap
+            && self.runner_enqueue.is_some()
+            && plan.phase == resin_core::Phase::Decode
+            && plan
+                .payloads
+                .iter()
+                .all(|payload| !payload.sampling_params.logprobs)
+            && self.core.retain_continuation(&plan);
+        let plan = match Py::new(py, planning::from_core(plan)) {
+            Ok(plan) => plan,
+            Err(error) => return Err(self.fail_output(py, error, false)),
+        };
+        if can_enqueue {
+            let enqueue = self.runner_enqueue.as_ref().expect("checked enqueue");
+            match enqueue.bind(py).call1((&plan,)) {
+                Ok(output) => {
+                    let asynchronous = match output.hasattr("result") {
+                        Ok(asynchronous) => asynchronous,
+                        Err(error) => {
+                            self.failed_executions.push(output.unbind());
+                            return Err(self.fail_output(py, error, true));
+                        }
+                    };
+                    if asynchronous {
+                        self.pending = Some(PendingExecution {
+                            plan,
+                            completion: output.unbind(),
+                        });
+                        self.overlap_enqueues += 1;
+                        return Ok(events);
+                    }
+                    match self.consume_output(py, &plan, &output, false) {
+                        Ok(completed) => events.extend(completed),
+                        Err(error) => {
+                            self.failed_executions.push(output.unbind());
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(error) => return Err(self.fail_output(py, error, false)),
+            }
+        } else {
+            match self.runner_forward.bind(py).call1((&plan,)) {
+                Ok(output) => events.extend(self.consume_output(py, &plan, &output, false)?),
+                Err(error) => return Err(self.fail_output(py, error, false)),
+            }
+        }
+        Ok(events)
+    }
+
     fn consume_output(
         &mut self,
         py: Python<'_>,
@@ -1350,156 +1509,12 @@ impl Engine {
         phase: Option<BatchPhase>,
         allow_overlap: bool,
     ) -> PyResult<Vec<Py<TokenEvent>>> {
-        self.core.raise_if_open().map_err(core_error)?;
+        let mut current = self.step_once(py, phase, allow_overlap)?;
+        if self.deferred_events.is_empty() {
+            return Ok(current);
+        }
         let mut events = std::mem::take(&mut self.deferred_events);
-        if self.pending.is_some() {
-            let next = if self.overlap
-                && allow_overlap
-                && phase.is_none_or(|phase| matches!(phase, BatchPhase::Decode))
-            {
-                self.core.continuation_plan().map_err(core_error)?
-            } else {
-                None
-            };
-            if let Some(next) = next {
-                let next_plan = Py::new(py, planning::from_core(next))?;
-                let previous = self.pending.as_ref().expect("pending execution");
-                let feedback = match previous.completion.bind(py).getattr("feedback") {
-                    Ok(feedback) => feedback,
-                    Err(error) => {
-                        self.core.poison_message(format!(
-                            "accepted completion feedback failed: {error}"
-                        ));
-                        return Err(error);
-                    }
-                };
-                let kwargs = pyo3::types::PyDict::new(py);
-                kwargs.set_item("feedback", feedback)?;
-                let enqueue = self
-                    .runner_enqueue
-                    .as_ref()
-                    .expect("pending runner can enqueue");
-                let result = match enqueue.bind(py).call((&next_plan,), Some(&kwargs)) {
-                    Ok(result) => result.unbind(),
-                    Err(error) => {
-                        self.core
-                            .poison_message(format!("overlapped enqueue failed: {error}"));
-                        return Err(error);
-                    }
-                };
-                let asynchronous = match result.bind(py).hasattr("result") {
-                    Ok(asynchronous) => asynchronous,
-                    Err(error) => {
-                        self.failed_executions.push(result);
-                        self.core.poison_message(format!(
-                            "accepted completion inspection failed: {error}"
-                        ));
-                        return Err(error);
-                    }
-                };
-                if !asynchronous {
-                    // Distributed peers may collectively choose a synchronous
-                    // fallback. It still executed the future step, so harvest
-                    // and commit both results without releasing pages between.
-                    let previous_events = match self.harvest(py, true) {
-                        Ok(events) => events,
-                        Err(error) => {
-                            self.failed_executions.push(result);
-                            return Err(error);
-                        }
-                    };
-                    events.extend(previous_events);
-                    events.extend(self.consume_output(py, &next_plan, result.bind(py), false)?);
-                    return Ok(events);
-                }
-                let previous_events = match self.harvest(py, true) {
-                    Ok(events) => events,
-                    Err(error) => {
-                        self.failed_executions.push(result);
-                        return Err(error);
-                    }
-                };
-                self.pending = Some(PendingExecution {
-                    plan: next_plan,
-                    completion: result,
-                });
-                self.overlap_enqueues += 1;
-                self.overlap_continuations += 1;
-                events.extend(previous_events);
-            } else {
-                events.extend(self.harvest(py, false)?);
-            }
-            return Ok(events);
-        }
-
-        let forward = self.runner_forward.clone_ref(py);
-        let release = self
-            .runner_release
-            .as_ref()
-            .map(|value| value.clone_ref(py));
-        let mut runner = PythonRunner {
-            py,
-            forward: &forward,
-            release: release.as_ref(),
-            error: None,
-            logprobs: None,
-            prompt_logprobs: None,
-        };
-        let Some(plan) = self
-            .core
-            .prepare_step(&mut runner, phase.map(BatchPhase::core))
-            .map_err(|error| runner.error.take().unwrap_or_else(|| core_error(error)))?
-        else {
-            return Ok(events);
-        };
-        let can_enqueue = self.overlap
-            && allow_overlap
-            && self.runner_enqueue.is_some()
-            && plan.phase == resin_core::Phase::Decode
-            && plan
-                .payloads
-                .iter()
-                .all(|payload| !payload.sampling_params.logprobs)
-            && self.core.retain_continuation(&plan);
-        let plan = match Py::new(py, planning::from_core(plan)) {
-            Ok(plan) => plan,
-            Err(error) => return Err(self.fail_output(py, error, false)),
-        };
-        if can_enqueue {
-            let enqueue = self.runner_enqueue.as_ref().expect("checked enqueue");
-            match enqueue.bind(py).call1((&plan,)) {
-                Ok(output) => {
-                    let asynchronous = match output.hasattr("result") {
-                        Ok(asynchronous) => asynchronous,
-                        Err(error) => {
-                            self.failed_executions.push(output.unbind());
-                            return Err(self.fail_output(py, error, true));
-                        }
-                    };
-                    if asynchronous {
-                        self.pending = Some(PendingExecution {
-                            plan,
-                            completion: output.unbind(),
-                        });
-                        self.overlap_enqueues += 1;
-                        return Ok(events);
-                    }
-                    match self.consume_output(py, &plan, &output, false) {
-                        Ok(completed) => events.extend(completed),
-                        Err(error) => {
-                            self.failed_executions.push(output.unbind());
-                            return Err(error);
-                        }
-                    }
-                }
-                Err(error) => return Err(self.fail_output(py, error, false)),
-            }
-        } else {
-            match self.runner_forward.bind(py).call1((&plan,)) {
-                Ok(output) => events.extend(self.consume_output(py, &plan, &output, false)?),
-                Err(error) => return Err(self.fail_output(py, error, false)),
-            }
-        }
+        events.append(&mut current);
         Ok(events)
     }
 
@@ -1607,7 +1622,7 @@ impl Engine {
 
     #[getter]
     fn active_request_count(&self) -> usize {
-        self.core.ready_request_count()
+        self.core.active_request_count()
     }
 
     #[getter]

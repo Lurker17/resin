@@ -52,6 +52,7 @@ class AsyncRunner:
         self.prior_harvest = Event()
         self.require_overlap = False
         self.fail = False
+        self.reject_enqueue = False
 
     def bind_resources(self, binding):
         self.binding = binding
@@ -63,6 +64,9 @@ class AsyncRunner:
         ]
 
     def enqueue(self, plan, *, feedback=None):
+        if self.reject_enqueue:
+            self.reject_enqueue = False
+            raise RuntimeError("enqueue rejected before launch")
         self.plans.append(plan)
         tokens = plan.token_ids.tolist() if feedback is None else feedback.tokens
         positions = plan.positions.tolist() if feedback is None else feedback.positions
@@ -109,6 +113,7 @@ def test_next_device_submission_precedes_previous_cpu_harvest():
     assert [event.token_id for event in engine.step()] == [2]
     assert engine.step() == []
     assert engine.overlap_pending
+    assert engine.active_request_count == 1 and engine.ready_request_count == 0
     assert [event.token_id for event in engine.step()] == [3, 4]
     assert runner.next_submitted.is_set() and runner.prior_harvest.is_set()
     assert engine.overlap_stats == (2, 1)
@@ -266,4 +271,47 @@ def test_feedback_descriptor_failure_cannot_leave_a_healthy_pending_engine(monke
     assert engine.poisoned and not request.done
     assert engine.cache_occupied_block_count == 1
     assert runner.released == []
+    runner.shutdown()
+
+
+def test_retryable_rejection_keeps_unrelated_already_committed_stream_events():
+    runner = AsyncRunner()
+    engine = Engine(runner)
+    first = engine.submit([1], max_new_tokens=24)
+    second = engine.submit([10], max_new_tokens=24)
+    engine.step()
+    assert engine.step() == []
+    assert engine.cancel(first)
+    runner.reject_enqueue = True
+    with pytest.raises(RuntimeError, match="enqueue rejected before launch"):
+        engine.step()
+    assert not engine.poisoned
+    events = engine.step()
+    assert [(event.request_id, event.token_id) for event in events] == [
+        (second.id, 12),
+        (second.id, 13),
+    ]
+    engine.close()
+    runner.shutdown()
+
+
+def test_arriving_work_drains_the_pending_cohort_before_scheduler_admission():
+    runner = AsyncRunner()
+    engine = Engine(runner, max_running_requests=2)
+    first = engine.submit([1], max_new_tokens=40)
+    engine.step()
+    assert engine.step() == []
+    enqueued = len(runner.pending)
+    added = engine.submit([20], max_new_tokens=1, priority=100)
+    assert not engine.overlap_ready
+    assert [event.token_id for event in engine.step()] == [3, 4]
+    assert not engine.overlap_pending
+    assert len(runner.pending) == enqueued
+    for _ in range(4):
+        if added.done:
+            break
+        engine.step()
+    assert added.take_result() == [21]
+    engine.cancel(first)
+    engine.close()
     runner.shutdown()

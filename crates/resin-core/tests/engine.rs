@@ -412,6 +412,7 @@ fn enqueued_transaction_retains_requests_and_pages_until_harvest() {
     assert!(engine.has_in_flight_step());
     assert!(engine.has_work());
     assert_eq!(engine.ready_request_count(), 0);
+    assert_eq!(engine.active_request_count(), 1);
     assert_eq!(engine.cache_free_parent_count(), Some(15));
     assert_eq!(
         engine.next_phase().unwrap(),

@@ -591,6 +591,10 @@ impl<P: Clone> EngineCore<P> {
     pub fn has_work(&self) -> bool {
         self.in_flight.is_some() || !self.scheduler.is_empty()
     }
+    pub fn active_request_count(&self) -> usize {
+        self.scheduler.len() + self.in_flight.as_ref().map_or(0, |batch| batch.rows.len())
+    }
+
     pub fn ready_request_count(&self) -> usize {
         self.scheduler.len()
     }
