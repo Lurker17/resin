@@ -342,7 +342,7 @@ def test_indexer_metadata_preserves_causal_lengths_and_request_grouping():
     assert tables.shape[0] == positions.numel()
     physical = cache.groups[1].parent_ids * cache.geometry.packings[1]
     physical += cache.groups[1].child_slots
-    assert torch.equal(tables[:2], physical)
+    assert torch.equal(tables, physical.repeat_interleave(positions.shape[1], dim=0))
     # Later query-source layers share exactly the same causal/page metadata.
     assert index_metadata(cache, positions, 2, runtime) is metadata
     assert schedules == {}
