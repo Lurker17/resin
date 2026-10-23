@@ -29,7 +29,7 @@ def implementation(monkeypatch):
 
 @pytest.mark.parametrize("fused", [False, True])
 def test_shifted_hc_consumes_previous_pre_mix_and_returns_ffn_pre_mix(
-    implementation, fused
+    implementation, fused, monkeypatch
 ):
     block = implementation.Block.__new__(implementation.Block)
     nn.Module.__init__(block)
@@ -40,7 +40,9 @@ def test_shifted_hc_consumes_previous_pre_mix_and_returns_ffn_pre_mix(
         def forward(self, hidden, _ids):
             return hidden
 
-    block.ffn, block.prefill_ffn, block.ffn_transition = FFN(), None, None
+        forward_prepared = forward
+
+    block.ffn, block.prefill_ffn, block.lazy_hc = FFN(), None, fused
     pre_values = {
         "attn": torch.tensor([[[2.0, 3.0]]]),
         "ffn": torch.tensor([[[5.0, 7.0]]]),
@@ -53,44 +55,42 @@ def test_shifted_hc_consumes_previous_pre_mix_and_returns_ffn_pre_mix(
     transitions = []
     if fused:
 
-        def transition(layer, output, residual, previous_pre, post, comb):
-            transitions.append(previous_pre)
-            residual = layer.expand(output, residual, post, comb)
-            next_pre, post, comb = layer.mixes(residual, "ffn")
+        def transition(layer, output, state, name, **kwargs):
+            assert name == "ffn" and kwargs == {"prepare_ffn": True}
+            transitions.append(state.pre)
+            residual = implementation.materialize(output, state)
+            next_pre, post, comb = layer.mixes(residual, name)
             return (
-                layer.ffn_norm(layer.collapse(residual, previous_pre)),
-                residual,
-                next_pre,
-                post,
-                comb,
+                layer.ffn_norm(layer.collapse(residual, state.pre)),
+                implementation.HCLazyPost(residual, next_pre, post, comb),
             )
 
-        block.ffn_transition = transition
+        monkeypatch.setattr(implementation, "mega_transition", transition)
     hidden = torch.tensor([[[[10.0, 20.0], [100.0, 200.0]]]])
     result, next_pre = block(
         hidden, torch.tensor([[[1.0, 0.0]]]), torch.tensor([[0]]), lambda value: value
     )
+    if fused:
+        result, next_pre = implementation.materialize(result, next_pre), next_pre.pre
     torch.testing.assert_close(result, torch.tensor([[[[50.0, 100.0], [50.0, 100.0]]]]))
     torch.testing.assert_close(next_pre, pre_values["ffn"])
     if fused:
         assert transitions == [pre_values["attn"]]
 
 
-def test_deepgemm_preparation_installs_only_the_within_block_hc_transition(
+def test_deepgemm_preparation_enables_lazy_hc_across_both_sublayers(
     implementation,
 ):
-    from resin_models_cuda.deepseek_v41.hc import mega_ffn_transition
-
     model = implementation.Transformer.__new__(implementation.Transformer)
     nn.Module.__init__(model)
     model.args = SimpleNamespace(dim=5120, hc_mult=4)
     model.parallel_groups = SimpleNamespace(ep=object())
     block = implementation.Block.__new__(implementation.Block)
     nn.Module.__init__(block)
-    block.ffn_transition = None
+    block.lazy_hc = False
     model.layers = nn.ModuleList([block])
     model.prepare_weights(lambda value: value, expert_backend="deepgemm")
-    assert block.ffn_transition is mega_ffn_transition
+    assert block.lazy_hc
 
 
 def test_hc_residual_combination_uses_official_source_destination_matrix_order(
@@ -107,23 +107,6 @@ def test_hc_residual_combination_uses_official_source_destination_matrix_order(
     )
 
 
-def test_ced_pins_newest_partial_block_and_excludes_unreachable_positions(
-    implementation,
-):
-    scores = torch.tensor(
-        [[[20.0, 19.0, 8.0, 7.0, 0.0, -torch.inf, -torch.inf, -torch.inf]]]
-    )
-    keep = implementation.select_candidate_blocks(
-        scores, torch.tensor([[[5]]]), topk_blocks=2, block_size=2
-    )
-    assert keep.tolist() == [[[True, True, False, False, True, True, False, False]]]
-    # Its final position is causally hidden by the indexer's independent mask.
-    causal = torch.arange(8) < 5
-    assert (keep & causal).tolist() == [
-        [[True, True, False, False, True, False, False, False]]
-    ]
-
-
 def test_dspark_collects_target_hidden_before_target_layer(implementation):
     model = implementation.Transformer.__new__(implementation.Transformer)
     nn.Module.__init__(model)
@@ -137,7 +120,7 @@ def test_dspark_collects_target_hidden_before_target_layer(implementation):
             super().__init__()
             self.layer_id, self.engram = layer, None
 
-        def forward(self, hidden, pre, ids, attention):
+        def forward(self, hidden, pre, ids, attention, *, prefill=False):
             return hidden + 10 * (self.layer_id + 1), pre
 
     model.layers = nn.ModuleList([Layer(0), Layer(1), Layer(2)])

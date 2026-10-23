@@ -5,7 +5,7 @@ storage are shared with V4. Version-specific attention and residual semantics
 are explicit here; checkpoint repository Python is never imported.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
@@ -35,11 +35,12 @@ from resin_models_cuda.deepseek_v41.attention import (
     fused_attention,
     gather_kv,
     pack_kv,
+    store_attention_kv,
     store_kv,
 )
+from resin_models_cuda.deepseek_v41.hc import HCLazyPost, materialize, mega_transition
 from resin_models_cuda.deepseek_v41.kernels import (
     act_quant,
-    fp4_act_quant,
     hc_split_sinkhorn,
 )
 from resin_models_cuda.deepseek_v41.linear import Linear, SharedExpert
@@ -130,26 +131,9 @@ class Gate(nn.Module):
         return (weights * self.route_scale).bfloat16(), indices.int()
 
 
-def select_candidate_blocks(scores, lengths, topk_blocks, block_size):
-    """CED retains each block's maximum and pins the newest partial block."""
-    width = scores.shape[-1]
-    blocks = (
-        F.pad(scores, (0, -width % block_size), value=-torch.inf)
-        .unflatten(-1, (-1, block_size))
-        .amax(-1)
-    )
-    newest = (lengths - 1) // block_size
-    blocks = blocks.masked_fill(
-        torch.arange(blocks.shape[-1], device=scores.device) == newest, torch.inf
-    )
-    chosen = blocks.topk(min(topk_blocks, blocks.shape[-1]), dim=-1)
-    keep = torch.zeros_like(blocks, dtype=torch.bool).scatter_(
-        -1, chosen.indices, chosen.values > -torch.inf
-    )
-    return keep.repeat_interleave(block_size, -1)[..., :width]
-
-
 class Compressor(nn.Module):
+    """Checkpoint layout and reference pooling; lowered to PreparedCompressor."""
+
     def __init__(self, args, layer):
         super().__init__()
         self.layer, self.ratio = layer, args.compress_ratios[layer]
@@ -214,60 +198,31 @@ class Indexer(nn.Module):
             self.k_norm = RMSNorm(args.index_head_dim, args.norm_eps)
         self.allreduce = tp.sum
 
-    def forward(self, hidden, qr, latent, positions, capacity, cache, freqs, runtime):
-        if self.owns_k:
-            keys = self.k_norm(self.wk(latent))
-            source_positions = positions - positions.remainder(self.ratio)
-            apply_rotary_emb(keys[..., -self.rope_dim :], freqs[source_positions])
-            fp4_act_quant(keys, 32, True)
-            rows = cache.index_rows(self.layer, positions)
-            cache.index_keys.view(-1, self.head_dim).index_copy_(
-                0, rows.flatten().long(), keys.reshape(-1, self.head_dim)
-            )
-        width = capacity // self.ratio
-        if width == 0:
-            return torch.empty(
-                *positions.shape, 0, dtype=torch.long, device=hidden.device
-            )
-        logical = (
-            torch.arange(width, device=hidden.device).expand(hidden.shape[0], width)
-            * self.ratio
+    def forward(
+        self,
+        hidden,
+        qr,
+        latent,
+        positions,
+        capacity,
+        cache,
+        freqs,
+        runtime,
+        *,
+        query=None,
+    ):
+        from resin_models_cuda.deepseek_v41.indexer import paged_index
+
+        query = self.wq_b(qr) if query is None else query
+        return paged_index(
+            self, hidden, query, latent, positions, capacity, cache, freqs, runtime
         )
-        rows = cache.index_rows(self.layer, logical)
-        keys = cache.index_keys.view(-1, self.head_dim)[rows.long()]
-        query = self.wq_b(qr).unflatten(-1, (self.local_heads, self.head_dim))
-        apply_rotary_emb(query[..., -self.rope_dim :], freqs[positions])
-        fp4_act_quant(query, 32, True)
-        weights = self.weights_proj(hidden) * (self.head_dim**-0.5 * self.n_heads**-0.5)
-        # Bound the temporary [query, heads, history] matrix during prefill.
-        scores = torch.cat(
-            [
-                (torch.einsum("bshd,btd->bsht", q, keys).relu_() * w[..., None]).sum(-2)
-                for q, w in zip(query.split(128, 1), weights.split(128, 1), strict=True)
-            ],
-            1,
-        )
-        scores = self.allreduce(scores)
-        lengths = ((positions + 1) // self.ratio)[..., None]
-        scores = scores.masked_fill(
-            torch.arange(width, device=hidden.device) >= lengths, -torch.inf
-        )
-        if self.layer == self.candidate_source:
-            runtime["candidates"] = select_candidate_blocks(
-                scores, lengths, self.candidate_topk, self.block_size
-            )
-        elif self.candidate_source >= 0 and self.layer > self.candidate_source:
-            scores = scores.masked_fill(~runtime["candidates"], -torch.inf)
-        selected = (
-            scores.topk(min(self.topk, width), dim=-1, sorted=False)
-            .indices.sort(-1)
-            .values
-        )
-        return torch.where(selected < lengths, selected, -1)
 
 
 class Attention(nn.Module):
     freqs_cis: torch.Tensor
+    project_input: Callable
+    project_query: Callable
 
     def __init__(self, layer, args, tp):
         super().__init__()
@@ -324,6 +279,8 @@ class Attention(nn.Module):
         self.prefill_project = self.prefill_query = self.prefill_finish = None
 
     def _project(self, hidden):
+        if hasattr(self, "project_input"):
+            return self.project_input(hidden)
         return self.q_norm(self.wq_a(hidden)), self.wkv(hidden)
 
     def _finish(self, output, positions):
@@ -331,6 +288,15 @@ class Attention(nn.Module):
         return self.wo_b(output.reshape(*positions.shape, -1))
 
     def store(self, hidden, positions, cache):
+        if hasattr(self, "cos_sin"):
+            store_attention_kv(
+                self,
+                self.wkv(hidden),
+                positions,
+                cache.window_cache(self.layer_id),
+                cache.window_rows(self.layer_id, positions),
+            )
+            return
         kv = self.kv_norm(self.wkv(hidden))
         apply_rotary_emb(kv[..., -self.rope_head_dim :], self.freqs_cis[positions])
         store_kv(
@@ -355,12 +321,30 @@ class Attention(nn.Module):
         qr, kv = (
             self.prefill_project if prefill and self.prefill_project else self._project
         )(hidden)
-        kv = self.kv_norm(kv)
-        apply_rotary_emb(kv[..., -self.rope_head_dim :], self.freqs_cis[positions])
-        store_kv(
-            cache.window_cache(self.layer_id),
-            cache.window_rows(self.layer_id, positions),
-            pack_kv(kv),
+        if hasattr(self, "cos_sin"):
+            store_attention_kv(
+                self,
+                kv,
+                positions,
+                cache.window_cache(self.layer_id),
+                cache.window_rows(self.layer_id, positions),
+            )
+        else:
+            kv = self.kv_norm(kv)
+            apply_rotary_emb(kv[..., -self.rope_head_dim :], self.freqs_cis[positions])
+            store_kv(
+                cache.window_cache(self.layer_id),
+                cache.window_rows(self.layer_id, positions),
+                pack_kv(kv),
+            )
+        project_query = (
+            self.prefill_query
+            if prefill and self.prefill_query
+            else getattr(self, "project_query", None)
+        )
+        projected = project_query(qr) if project_query else self.wq_b(qr)
+        query, index_query = (
+            projected if isinstance(projected, tuple) else (projected, None)
         )
         latent = (
             self.compressor(hidden, positions, cache)
@@ -369,28 +353,49 @@ class Attention(nn.Module):
         )
         if hasattr(self, "indexer"):
             runtime["indices"] = self.indexer(
-                hidden, qr, latent, positions, capacity, cache, self.freqs_cis, runtime
+                hidden,
+                qr,
+                latent,
+                positions,
+                capacity,
+                cache,
+                self.freqs_cis,
+                runtime,
+                query=index_query,
             )
         if latent is not None:
-            apply_rotary_emb(
-                latent[..., -self.rope_head_dim :],
-                self.freqs_cis[positions - positions.remainder(self.ratio)],
-            )
-            store_kv(
-                cache.compressed_cache(self.layer_id),
-                cache.compressed_rows(self.layer_id, self.ratio, positions),
-                pack_kv(latent, fp4=True),
-            )
+            compressed_positions = positions - positions.remainder(self.ratio)
+            if hasattr(self, "cos_sin"):
+                store_attention_kv(
+                    self,
+                    latent,
+                    compressed_positions,
+                    cache.compressed_cache(self.layer_id),
+                    torch.where(
+                        (positions + 1).remainder(self.ratio) == 0,
+                        cache.compressed_rows(self.layer_id, self.ratio, positions),
+                        -1,
+                    ),
+                    compressed=True,
+                )
+            else:
+                apply_rotary_emb(
+                    latent[..., -self.rope_head_dim :],
+                    self.freqs_cis[compressed_positions],
+                )
+                store_kv(
+                    cache.compressed_cache(self.layer_id),
+                    cache.compressed_rows(self.layer_id, self.ratio, positions),
+                    pack_kv(latent, fp4=True),
+                )
         if context_parallel is not None:
-            qr, positions = (
-                qr.index_select(1, context_parallel.token_indices),
+            query, positions = (
+                query.index_select(1, context_parallel.token_indices),
                 positions.index_select(1, context_parallel.token_indices),
             )
             if not positions.shape[1]:
                 return context_parallel.gather(hidden.new_empty(0, self.dim))[None]
-        query = (self.prefill_query if prefill and self.prefill_query else self.wq_b)(
-            qr
-        ).unflatten(-1, (self.n_local_heads, self.head_dim))
+        query = query.unflatten(-1, (self.n_local_heads, self.head_dim))
         columns = torch.arange(self.window_size, device=hidden.device)
         counts = (positions + 1).clamp_max(self.window_size)
         windows = positions[..., None] + 1 - counts[..., None] + columns
@@ -492,7 +497,7 @@ class Block(nn.Module):
             RMSNorm(args.dim, args.norm_eps),
         )
         self.prefill_ffn = None
-        self.ffn_transition = None
+        self.lazy_hc = False
         for name in ("attn", "ffn"):
             setattr(
                 self,
@@ -543,18 +548,31 @@ class Block(nn.Module):
             + (comb[..., None] * residual.unsqueeze(-2)).sum(-3)
         ).to(output.dtype)
 
-    def forward(self, hidden, pre, ids, attention):
+    def forward(self, hidden, pre, ids, attention, *, prefill=False):
+        if self.lazy_hc:
+            if isinstance(pre, HCLazyPost):
+                value, state = mega_transition(self, hidden, pre, "attn")
+            else:
+                current_pre, post, comb = self.mixes(hidden, "attn")
+                value = self.attn_norm(self.collapse(hidden, pre))
+                state = HCLazyPost(hidden, current_pre, post, comb)
+            output = attention(value)
+            prepared = not prefill
+            value, state = mega_transition(
+                self, output, state, "ffn", prepare_ffn=prepared
+            )
+            output = (
+                self.ffn.forward_prepared(value, ids)
+                if prepared
+                else (self.prefill_ffn or self.ffn)(value, ids)
+            )
+            return output, state
         residual = hidden
         attn_pre, post, comb = self.mixes(hidden, "attn")
         output = attention(self.attn_norm(self.collapse(hidden, pre)))
-        if self.ffn_transition is not None:
-            hidden, residual, ffn_pre, post, comb = self.ffn_transition(
-                self, output, residual, attn_pre, post, comb
-            )
-        else:
-            residual = self.expand(output, residual, post, comb)
-            ffn_pre, post, comb = self.mixes(residual, "ffn")
-            hidden = self.ffn_norm(self.collapse(residual, attn_pre))
+        residual = self.expand(output, residual, post, comb)
+        ffn_pre, post, comb = self.mixes(residual, "ffn")
+        hidden = self.ffn_norm(self.collapse(residual, attn_pre))
         output = (self.prefill_ffn or self.ffn)(hidden, ids)
         return self.expand(output, residual, post, comb), ffn_pre
 
@@ -643,7 +661,11 @@ class Transformer(nn.Module):
         )
         if args.engram_layer_ids:
             from resin.backend.embedding import ShardedEmbeddingLookup
-            from resin_models_cuda.deepseek_v41.engram import Engram, NgramHash
+            from resin_models_cuda.deepseek_v41.engram import (
+                Engram,
+                EngramRuntime,
+                NgramHash,
+            )
 
             self.engram_hash = NgramHash(args, tokenizer)
             lookup = (
@@ -657,6 +679,13 @@ class Transformer(nn.Module):
             for layer in self.layers:
                 if layer.layer_id in args.engram_layer_ids:
                     layer.engram = Engram(args, layer.layer_id, lookup=lookup)
+            self.engram_runtime = EngramRuntime(
+                {
+                    layer.layer_id: layer.engram
+                    for layer in self.layers
+                    if layer.engram is not None
+                }
+            )
         else:
             self.engram_hash = None
         if self.mtp:
@@ -690,9 +719,11 @@ class Transformer(nn.Module):
 
                 prepare_attention(source)
             if isinstance(source, Block) and collective is not None:
-                from resin_models_cuda.deepseek_v41.hc import mega_ffn_transition
+                source.lazy_hc = True
+            if isinstance(source, Linear):
+                from resin_models_cuda.deepseek_v41.linear import prepare_linear
 
-                source.ffn_transition = mega_ffn_transition
+                return prepare_linear(source)
             if not isinstance(source, MoEWeights):
                 return source
             if collective is not None:
@@ -731,9 +762,14 @@ class Transformer(nn.Module):
         pass  # Every state access receives the current immutable page tables.
 
     def forward_experts_empty(self, *, stage="target", prefill=False):
+        hooks = (
+            self.engram_runtime.fetch(None)
+            if stage == "target" and self.engram_hash is not None
+            else {}
+        )
         for layer in self.layers if stage == "target" else self.mtp:
             if layer.engram is not None:
-                layer.engram.embed.forward_empty(layer.engram.hash_columns)
+                hooks[layer.layer_id]()
             if prefill:
                 weight = self.embed.weight
                 operation = layer.prefill_ffn
@@ -752,16 +788,21 @@ class Transformer(nn.Module):
             if self.engram_hash is not None
             else None
         )
+        hooks = self.engram_runtime.fetch(hashes) if hashes is not None else {}
         hidden = self.embed(ids).unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         pre = hidden.new_zeros(*ids.shape, self.hc_mult, dtype=torch.float32)
         pre[..., 0] = 1
         runtime, collected = {}, []
         for layer in self.layers:
+            # Engram and feature taps observe all residual streams. Everywhere
+            # else, keep the previous post-mix lazy so the next HC can fuse it.
+            if isinstance(pre, HCLazyPost) and (
+                layer.engram is not None or layer.layer_id in self.target_layer_ids
+            ):
+                hidden, pre = materialize(hidden, pre), pre.pre
             if layer.engram is not None:
                 assert hashes is not None
-                hidden = layer.engram(
-                    hidden, hashes[..., layer.engram.layer_hash_index, :]
-                )
+                hidden = layer.engram(hidden, embed_hook=hooks[layer.layer_id])
             if layer.layer_id in self.target_layer_ids:
                 collected.append(hidden.mean(-2))
             hidden, pre = layer(
@@ -771,7 +812,10 @@ class Transformer(nn.Module):
                 lambda value, layer=layer: layer.attn(
                     value, positions, capacity, cache, runtime, cp, prefill=prefill
                 ),
+                prefill=prefill,
             )
+        if isinstance(pre, HCLazyPost):
+            hidden, pre = materialize(hidden, pre), pre.pre
         return self.norm(Block.collapse(hidden, pre)), torch.cat(
             collected, -1
         ) if collected else None
@@ -846,16 +890,19 @@ class Transformer(nn.Module):
         query = attention.wq_b(qr).unflatten(
             -1, (attention.n_local_heads, attention.head_dim)
         )
-        kv = attention.kv_norm(kv)
-        apply_rotary_emb(
-            kv[..., -attention.rope_head_dim :], attention.freqs_cis[positions]
-        )
         drafts = torch.arange(batch, device=hidden.device)[
             :, None
         ] * cache.geometry.draft_tokens + torch.arange(block, device=hidden.device)
         # Draft keys are transient and bidirectional within this block. They
         # must never overwrite the committed main-hidden history at the anchor.
-        store_kv(cache.draft_cache, drafts, pack_kv(kv))
+        if hasattr(attention, "cos_sin"):
+            store_attention_kv(attention, kv, positions, cache.draft_cache, drafts)
+        else:
+            kv = attention.kv_norm(kv)
+            apply_rotary_emb(
+                kv[..., -attention.rope_head_dim :], attention.freqs_cis[positions]
+            )
+            store_kv(cache.draft_cache, drafts, pack_kv(kv))
         columns = torch.arange(attention.window_size, device=hidden.device)
         counts = position.clamp_max(attention.window_size)
         history = position[:, None] - counts[:, None] + columns
@@ -895,6 +942,8 @@ class Transformer(nn.Module):
                 ),
             )
         last = self.mtp[-1]
+        if isinstance(pre, HCLazyPost):
+            hidden, pre = materialize(hidden, pre), pre.pre
         hidden = Block.collapse(hidden, pre)
         logits = self.head(last.norm(hidden), full_logits=True)
         previous, outputs = anchor_ids.flatten(), []

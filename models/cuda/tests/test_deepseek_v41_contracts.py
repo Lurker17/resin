@@ -228,7 +228,10 @@ def test_fp32_compressor_sources_and_packed_index_keys_never_alias():
         keys = cache.index_rows(source, positions).long()
         packed = cache.compressed_cache(source)
         packed[rows // packed.shape[1], rows % packed.shape[1], 0] = source + 30
-        cache.index_keys.view(-1, 128)[keys] = source + 40
+        values, scales = cache.index_parts(source)
+        pages, offsets = keys // packed.shape[1], keys % packed.shape[1]
+        values[pages, offsets] = source + 40
+        scales[pages, offsets] = source + 50
     for source in (1, 3, 5):
         rows = cache.compressed_rows(
             source, cache.geometry.ratios[source], positions
@@ -238,7 +241,10 @@ def test_fp32_compressor_sources_and_packed_index_keys_never_alias():
         assert (
             packed[rows // packed.shape[1], rows % packed.shape[1], 0] == source + 30
         ).all()
-        assert (cache.index_keys.view(-1, 128)[keys] == source + 40).all()
+        values, scales = cache.index_parts(source)
+        pages, offsets = keys // packed.shape[1], keys % packed.shape[1]
+        assert (values[pages, offsets] == source + 40).all()
+        assert (scales[pages, offsets] == source + 50).all()
     for rows, value in saved:
         assert (cache.compressor_values[rows] == value).all()
 
@@ -255,43 +261,49 @@ def test_published_index_query_sources_share_keys_from_latest_kv_owner():
     assert all(geometry.compressed_offsets[layer] is None for layer in (40, 41, 42))
 
 
-def test_indexer_masks_future_and_incomplete_compressed_keys(
-    implementation, monkeypatch
-):
+def test_indexer_metadata_preserves_causal_lengths_and_request_grouping():
+    from resin_models_cuda.deepseek_v41.indexer import index_metadata
+
+    cache = _cache()
+    positions = torch.arange(6).expand(2, -1)
+    runtime = {}
+    metadata = index_metadata(cache, positions, 2, runtime)
+    lengths, requests, tables, schedules = metadata
+    assert lengths.tolist() == [0, 1, 1, 2, 2, 3] * 2
+    assert requests.tolist() == [0] * 6 + [1] * 6
+    assert tables.shape[0] == positions.numel()
+    physical = cache.groups[1].parent_ids * cache.geometry.packings[1]
+    physical += cache.groups[1].child_slots
+    assert torch.equal(tables[:2], physical)
+    # Later query-source layers share exactly the same causal/page metadata.
+    assert index_metadata(cache, positions, 2, runtime) is metadata
+    assert schedules == {}
+    c1 = index_metadata(cache, positions, 1, runtime)
+    assert c1[0].tolist() == list(range(1, 7)) * 2
+    assert c1 is not metadata
+
+
+def test_indexer_accepts_the_shared_query_projection(implementation, monkeypatch):
+    from resin_models_cuda.deepseek_v41 import indexer as kernels
+
     indexer = implementation.Indexer.__new__(implementation.Indexer)
     nn.Module.__init__(indexer)
-    indexer.layer, indexer.ratio, indexer.owns_k = 1, 2, False
-    indexer.local_heads = indexer.n_heads = 1
-    indexer.head_dim, indexer.rope_dim, indexer.topk = 128, 2, 2
-    indexer.candidate_source = -1
-    indexer.wq_b, indexer.allreduce = nn.Identity(), lambda value: value
 
-    class Weights(nn.Module):
-        def forward(self, hidden):
-            return hidden.new_ones(*hidden.shape[:2], 1)
+    def duplicate_projection(_hidden):
+        raise AssertionError("fused index Q was projected a second time")
 
-    indexer.weights_proj = Weights()
-    monkeypatch.setattr(implementation, "fp4_act_quant", lambda value, *args: value)
-    cache = _cache()
-    rows = cache.index_rows(1, torch.arange(0, 8, 2).expand(2, -1)).long()
-    # Rejected/future keys can remain stored and even dominate the raw score.
-    cache.index_keys.view(-1, 128)[rows] = torch.tensor(
-        [1, 10, 100, 1000], dtype=torch.bfloat16
-    )[None, :, None]
-    positions = torch.arange(6).expand(2, -1)
-    selected = indexer(
-        torch.zeros(2, 6, 8, dtype=torch.bfloat16),
-        torch.ones(2, 6, 128, dtype=torch.bfloat16),
-        None,
-        positions,
-        8,
-        cache,
-        torch.ones(8, 1, dtype=torch.complex64),
-        {},
-    )
-    expected = [[], [0], [0], [0, 1], [0, 1], [1, 2]]
-    for batch in selected.tolist():
-        assert [[value for value in row if value >= 0] for row in batch] == expected
+    indexer.wq_b = duplicate_projection
+    query = torch.ones(2, 5, 32 * 128)
+    observed = []
+
+    def execute(module, hidden, projected, *args):
+        observed.append((module, projected))
+        return projected[..., :1]
+
+    monkeypatch.setattr(kernels, "paged_index", execute)
+    result = indexer(None, None, None, None, None, None, None, None, query=query)
+    assert observed == [(indexer, query)]
+    assert result.shape == (2, 5, 1)
 
 
 def test_final_hidden_collapses_with_last_ffn_pre_mix_instead_of_mean(implementation):
@@ -304,7 +316,7 @@ def test_final_hidden_collapses_with_last_ffn_pre_mix_instead_of_mean(implementa
     class Layer(nn.Module):
         layer_id, engram = 0, None
 
-        def forward(self, hidden, pre, ids, attention):
+        def forward(self, hidden, pre, ids, attention, *, prefill=False):
             return hidden + torch.tensor([1.0, 10.0])[
                 None, None, :, None
             ], torch.tensor([[[2.0, 3.0]]])

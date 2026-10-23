@@ -64,12 +64,15 @@ def run_probe(group):
     )
     with torch.device(device):
         table = ParallelEngramEmbedding(rows, dimension, lookup)
+        second = ParallelEngramEmbedding(rows, dimension, lookup)
     values, scales, reference = table_values(rows, dimension, device)
     count = min(table.stop, rows) - table.start
     table.weight.zero_()
     table.scale.fill_(1)
     table.weight[:count].copy_(values[table.start : table.start + count])
     table.scale[:count].copy_(scales[table.start : table.start + count])
+    second.weight.copy_(table.weight)
+    second.scale.copy_((table.scale.float() * 2).to(torch.float8_e8m0fnu))
     indices = (
         torch.arange(capacity * columns, device=device).reshape(capacity, columns) * 13
         + rank * 91
@@ -79,10 +82,16 @@ def run_probe(group):
     output = torch.empty(
         capacity, columns, dimension, dtype=torch.bfloat16, device=device
     )
+    second_output = torch.empty_like(output)
 
     def call():
         with lookup.fixed_capacity(capacity, valid_rows=valid):
-            output.copy_(table(indices))
+            hooks = lookup.prefetch(
+                [(indices, table.local), (indices.flip(-1), second.local)]
+            )
+            # Hooks retain independent storage even when consumed out of order.
+            second_output.copy_(hooks[1]())
+            output.copy_(hooks[0]())
 
     stream, graph = torch.cuda.Stream(device), torch.cuda.CUDAGraph()
     stream.wait_stream(torch.cuda.current_stream())
@@ -107,12 +116,20 @@ def run_probe(group):
                 indices.copy_(original if name == "full" else original.flip(-1))
                 expected = reference[indices]
                 expected[live:] = 0
+                expected_second = (reference[indices.flip(-1)].float() * 2).bfloat16()
+                expected_second[live:] = 0
                 call()
                 eager = output.clone()
+                eager_second = second_output.clone()
                 for _ in range(3):
                     graph.replay()
                 stream.synchronize()
-                if not torch.equal(output, expected) or not torch.equal(output, eager):
+                if (
+                    not torch.equal(output, expected)
+                    or not torch.equal(output, eager)
+                    or not torch.equal(second_output, expected_second)
+                    or not torch.equal(second_output, eager_second)
+                ):
                     raise AssertionError(
                         f"Engram {name} differs from full-table oracle or identical eager inputs"
                     )
@@ -139,6 +156,7 @@ def run_probe(group):
             dimension=dimension,
             hash_columns=columns,
             capacity=capacity,
+            prefetched_layers=2,
             cases=results,
             unequal_and_empty_eager=True,
             rdma_inventory=rdma_inventory(),

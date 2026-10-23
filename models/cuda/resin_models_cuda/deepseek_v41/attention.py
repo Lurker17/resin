@@ -1,6 +1,6 @@
 """Pinned FlashMLA packed KV and prepared fused attention projections."""
 
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import torch
 from torch import nn
@@ -8,6 +8,7 @@ from torch.nn import functional as F
 
 from resin.backend.cuda.mega_moe import prepare_weights
 from resin_models_cuda.deepseek_v41.kernels import act_quant, fp4_act_quant, unpack_kv
+from resin_models_cuda.deepseek_v41.linear import PreparedLinear, weight_scale_rows
 
 
 def pack_kv(value, *, fp4=False):
@@ -36,36 +37,31 @@ def padded_indices(indices):
     return F.pad(indices.int(), (0, -indices.shape[-1] % 8), value=-1).contiguous()
 
 
-class QueryProjection(nn.Module):
-    weight: torch.Tensor
-    scale: torch.Tensor
-
-    def __init__(self, source, heads, dim):
-        super().__init__()
+class QueryProjection(PreparedLinear):
+    def __init__(self, source, heads, dim, index_source=None):
+        super().__init__(source, *((index_source,) if index_source is not None else ()))
         from flash_mla import fused_norm_rope_attn_rope_cast as fused
 
-        weight, scales = prepare_weights(source.weight, source.scale, block_rows=32)
-        weight, scales = fused.permute_q_b_proj((weight, scales), heads, dim)
-        self.register_buffer("weight", weight.detach())
-        self.register_buffer("scale", scales.detach())
-
-    def forward(self, hidden):
-        import deep_gemm
-
-        values, scales = act_quant(hidden, 32, "ue8m0", torch.float8_e8m0fnu)
-        output = hidden.new_empty(
-            hidden.numel() // hidden.shape[-1], self.weight.shape[0]
+        self.query_width = heads * dim
+        weight, scales = fused.permute_q_b_proj(
+            (self.weight[: self.query_width], self.scale[: self.query_width]),
+            heads,
+            dim,
         )
-        deep_gemm.fp8_gemm_nt(
-            (
-                values.reshape(-1, values.shape[-1]),
-                scales.reshape(-1, scales.shape[-1]).float(),
-            ),
-            (self.weight, self.scale),
-            output,
-            recipe=(1, 1, 32),
+        # Only attention Q is permuted; the appended index Q keeps its ordinary
+        # head layout. Preserve the packed scale tensor's TMA-aligned stride.
+        self.weight[: self.query_width].copy_(weight)
+        self.scale[: self.query_width].copy_(scales)
+
+    def forward(self, value):
+        return self.project(value)[0]
+
+    def project(self, hidden):
+        output = super().forward(hidden)
+        return (
+            output[..., : self.query_width],
+            output[..., self.query_width :] if len(self.widths) > 1 else None,
         )
-        return output.reshape(*hidden.shape[:-1], -1)
 
 
 class OutputProjection(nn.Module):
@@ -78,11 +74,7 @@ class OutputProjection(nn.Module):
 
         width = source.weight.shape[-1]
         weight = source.weight.reshape(groups, rank, width)
-        scales = (
-            source.scale.float()
-            .repeat_interleave(32, 0)
-            .reshape(groups, rank, width // 32)
-        )
+        scales = weight_scale_rows(source).reshape(groups, rank, width // 32)
         weight, scales = prepare_weights(weight, scales)
         weight, scales = fused.permute_wv_proj((weight, scales), width // 512, 512)
         self.register_buffer("weight", weight.detach())
@@ -121,9 +113,22 @@ def _cos_sin(freqs):
 
 
 def prepare_attention(attention):
+    from resin_models_cuda.deepseek_v41.compressor import PreparedCompressor
+
+    # DeepInfer merges these projections before lowering so their input cast
+    # and GEMM are shared. The separate KV projection is retained for DFlash's
+    # store-only pass, which must not compute Q.
+    attention.qkv_projection = PreparedLinear(attention.wq_a, attention.wkv)
+    attention.project_input = partial(project_input, attention)
     attention.wq_b = QueryProjection(
-        attention.wq_b, attention.n_local_heads, attention.head_dim
+        attention.wq_b,
+        attention.n_local_heads,
+        attention.head_dim,
+        attention.indexer.wq_b if hasattr(attention, "indexer") else None,
     )
+    attention.project_query = attention.wq_b.project
+    if hasattr(attention, "compressor"):
+        attention.compressor = PreparedCompressor(attention.compressor)
     attention.wo_a = OutputProjection(
         attention.wo_a, attention.n_local_groups, attention.o_lora_rank
     )
@@ -131,6 +136,44 @@ def prepare_attention(attention):
         "cos_sin",
         _cos_sin(attention.freqs_cis),
         persistent=False,
+    )
+
+
+def project_input(attention, hidden):
+    query, kv = attention.qkv_projection(hidden).split(
+        (attention.q_lora_rank, attention.head_dim), dim=-1
+    )
+    return attention.q_norm(query), kv
+
+
+def store_attention_kv(attention, value, positions, cache, slots, *, compressed=False):
+    """DeepInfer's one-pass RMSNorm/RoPE/quantization/paged store."""
+    from resin_models_cuda.deepseek_v41.upstream.fused_transform import (
+        CastArgs,
+        KVCacheOutArgs,
+        NormArgs,
+        RopeArgs,
+        fused_norm_rope_hadamard_cast_store_kvcache,
+    )
+
+    fused_norm_rope_hadamard_cast_store_kvcache(
+        value.reshape(-1, attention.head_dim),
+        norm_args=None
+        if compressed
+        else NormArgs(attention.kv_norm.weight, attention.kv_norm.eps),
+        rope_args=RopeArgs(
+            positions.flatten().int(),
+            attention.cos_sin,
+            attention.rope_head_dim,
+            is_neox=False,
+        ),
+        cast_args=CastArgs(
+            "e2m1" if compressed else "e4m3",
+            16 if compressed else 32,
+            round_sf=not compressed,
+            sf_format="e4m3" if compressed else "ue8m0",
+        ),
+        out_args=KVCacheOutArgs(cache, slots.flatten().int()),
     )
 
 

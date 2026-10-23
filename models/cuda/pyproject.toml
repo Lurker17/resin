@@ -29,6 +29,7 @@ dependencies = [
   "cuda-tile==1.5.0; sys_platform == 'linux'",
   "quack-kernels==0.6.4; sys_platform == 'linux'",
   "deep-gemm==2.8.2; sys_platform == 'linux'",
+  "deep-select==1.0.0; sys_platform == 'linux'",
   "flash-mla==1.0.0; sys_platform == 'linux'",
   "tile-kernels==1.0.0; sys_platform == 'linux'",
 ]
@@ -37,6 +38,7 @@ dependencies = [
 resin = { workspace = true }
 resin-models-torch = { workspace = true }
 deep-gemm = { git = "https://github.com/deepseek-ai/DeepGEMM", rev = "1fc9c66975ee322d628b3288534ca0e9ce12a64d" }
+deep-select = { git = "https://github.com/deepseek-ai/DeepSelect", rev = "bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18" }
 flash-mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "2e5429fc5653bab6e081f09477126f731882a6a9" }
 
 [tool.uv.build-backend]

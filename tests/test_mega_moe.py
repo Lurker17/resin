@@ -33,8 +33,8 @@ def deepgemm(monkeypatch):
             assert not self.destroyed
             self.destroyed = True
 
-    def scales(value, n, k, recipe, groups):
-        assert recipe == (1, 32)
+    def scales(value, n, k, recipe, groups=None, **_):
+        assert recipe in ((1, 32), (1, 1, 32))
         assert value.shape[-2:] == (n, k // 32)
         return value.to(torch.float8_e8m0fnu).view(torch.int32).clone()
 
@@ -185,20 +185,63 @@ def test_layers_share_workspace_and_close_releases_it_once(deepgemm):
     assert deepgemm.workspaces[0].destroyed
 
 
+def test_fused_normalization_owns_inputs_until_prepared_ffn_consumes_them(deepgemm):
+    layer, collective, quantized = prepared(deepgemm)
+    kwargs = layer.fused_norm_cast_kwargs(4)
+    assert kwargs["y_fp8"].data_ptr() == layer.workspace.x.data_ptr()
+    assert kwargs["y_routed_sf"].data_ptr() == layer.workspace.x_sf.data_ptr()
+    assert (
+        kwargs["y_shared_sf"].data_ptr() == layer.workspace.shared_l1_acts_sf.data_ptr()
+    )
+    assert kwargs["shared_sf_block_m"] == 64
+    kwargs["y_fp8"].fill_(0.5)
+    kwargs["y_routed_sf"].fill_(17)
+    kwargs["y_shared_sf"].fill_(23)
+    expected = {
+        name: value.clone()
+        for name, value in kwargs.items()
+        if name != "shared_sf_block_m"
+    }
+    with collective.fixed_capacity(4, valid_rows=torch.tensor(2)):
+        layer.forward_prepared(torch.ones(2, 2, 128).bfloat16(), torch.zeros(2, 2))
+    assert not quantized
+    for name, value in expected.items():
+        assert torch.equal(kwargs[name].view(torch.uint8), value.view(torch.uint8))
+    assert deepgemm.calls[-1]["indices"].tolist() == [[0], [0], [-1], [-1]]
+    with collective.fixed_capacity(3):
+        with pytest.raises(ValueError, match="current graph capacity"):
+            layer.fused_norm_cast_kwargs(4)
+    with pytest.raises(ValueError, match="prepared workspace capacity"):
+        layer.fused_norm_cast_kwargs(17)
+
+
+@pytest.mark.parametrize("prepare_children", [False, True])
 def test_v41_factory_preserves_gate_up_order_values_and_adopts_down_storage(
     deepgemm,
+    prepare_children,
 ):
+    from resin.backend.loading import prepare_model
     from resin_models_cuda.deepseek_v41.experts import prepare_mega_moe
+    from resin_models_cuda.deepseek_v41.linear import (
+        Linear,
+        PreparedLinear,
+        prepare_linear,
+    )
+
+    def container(**fields):
+        module = nn.Module()
+        for key, value in fields.items():
+            setattr(module, key, value)
+        return module
 
     def linear(value):
-        return SimpleNamespace(
-            weight=nn.Parameter(
-                torch.full((128, 128), value, dtype=torch.float8_e4m3fn)
-            ),
-            scale=nn.Parameter(torch.full((4, 4), value, dtype=torch.float8_e8m0fnu)),
-        )
+        module = Linear(128, 128)
+        with torch.no_grad():
+            module.weight.fill_(value)
+            module.scale.fill_(value)
+        return module
 
-    source = SimpleNamespace(
+    source = container(
         routed_intermediate_size=128,
         dim=128,
         n_routed_experts=2,
@@ -215,11 +258,22 @@ def test_v41_factory_preserves_gate_up_order_values_and_adopts_down_storage(
         _fused_w13_scale=torch.ones(2, 256, 4, dtype=torch.float8_e8m0fnu),
         _fused_w2_weight=torch.full((2, 128, 64), 7, dtype=torch.uint8),
         _fused_w2_scale=torch.ones(2, 128, 4, dtype=torch.float8_e8m0fnu),
-        shared_experts=SimpleNamespace(w1=linear(1), w2=linear(2), w3=linear(4)),
+        shared_experts=container(w1=linear(1), w2=linear(2), w3=linear(4)),
     )
     gate_pointer = source.gate.weight.data_ptr()
     collective = MegaMoeCollective(RankGroup((0,), object(), 0), 16)
-    layer = prepare_mega_moe(source, collective)
+    if prepare_children:
+
+        def lower(module):
+            if isinstance(module, Linear):
+                return prepare_linear(module)
+            return prepare_mega_moe(module, collective) if module is source else module
+
+        layer = prepare_model(source, lower)
+        assert isinstance(source.shared_experts.w1, PreparedLinear)
+    else:
+        layer = prepare_mega_moe(source, collective)
+    assert isinstance(layer, MegaMoe)
     routed, shared = deepgemm.transforms
     assert (routed[0][0][:, :128] == 5).all()  # Gate precedes up.
     assert (routed[0][0][:, 128:] == 3).all()
@@ -304,9 +358,18 @@ def test_mega_factory_rejects_unsupported_gate_before_weight_transforms(
     assert deepgemm.transforms == []
 
 
-def test_mega_hc_transition_preserves_shifted_pre_and_full_residual(deepgemm):
+@pytest.mark.parametrize(
+    "name,prepare_ffn", [("attn", False), ("ffn", False), ("ffn", True)]
+)
+def test_mega_hc_transition_preserves_shifted_pre_and_full_residual(
+    deepgemm, name, prepare_ffn
+):
     from deploy.deepinfer_kernel_probe import _mhc_reference
-    from resin_models_cuda.deepseek_v41.hc import mega_ffn_transition
+    from resin_models_cuda.deepseek_v41.hc import (
+        HCLazyPost,
+        materialize,
+        mega_transition,
+    )
 
     captured = {}
 
@@ -324,6 +387,11 @@ def test_mega_hc_transition_preserves_shifted_pre_and_full_residual(deepgemm):
             },
         )
         captured.update(inputs)
+        captured["cast_out"] = {
+            key: value
+            for key, value in kwargs.items()
+            if key in ("y_fp8", "y_routed_sf", "y_shared_sf", "shared_sf_block_m")
+        }
         for name, value in _mhc_reference(inputs).items():
             kwargs[name].copy_(value)
 
@@ -334,21 +402,27 @@ def test_mega_hc_transition_preserves_shifted_pre_and_full_residual(deepgemm):
         args=SimpleNamespace(
             dim=dim, hc_mult=4, norm_eps=1e-20, hc_eps=1e-6, hc_sinkhorn_iters=20
         ),
-        hc_ffn_fn=torch.randn(24, 4 * dim) * 0.01,
-        hc_ffn_scale=torch.randn(3) * 0.1,
-        hc_ffn_base=torch.randn(24) * 0.1,
-        ffn_norm=SimpleNamespace(weight=torch.randn(dim).bfloat16()),
     )
+    for prefix in ("attn", "ffn"):
+        setattr(block, f"hc_{prefix}_fn", torch.randn(24, 4 * dim) * 0.01)
+        setattr(block, f"hc_{prefix}_scale", torch.randn(3) * 0.1)
+        setattr(block, f"hc_{prefix}_base", torch.randn(24) * 0.1)
+        setattr(
+            block, f"{prefix}_norm", SimpleNamespace(weight=torch.randn(dim).bfloat16())
+        )
+    block.ffn, _, _ = prepared(deepgemm)
     output = torch.randn(2, 3, dim).bfloat16()
     residual = torch.randn(2, 3, 4, dim).bfloat16()
     pre, post = torch.rand(2, 3, 4), torch.rand(2, 3, 4)
     comb = torch.rand(2, 3, 4, 4)
-    normalized, updated, next_pre, next_post, next_comb = mega_ffn_transition(
-        block, output, residual, pre, post, comb
+    state = HCLazyPost(residual, pre, post, comb)
+    normalized, updated = mega_transition(
+        block, output, state, name, prepare_ffn=prepare_ffn
     )
-    assert normalized.shape == output.shape and updated.shape == residual.shape
+    assert normalized.shape == output.shape and updated.residual.shape == residual.shape
     assert (
-        next_pre.shape == next_post.shape == pre.shape and next_comb.shape == comb.shape
+        updated.pre.shape == updated.post.shape == pre.shape
+        and updated.comb.shape == comb.shape
     )
     assert captured["shifted_prev_mix"].data_ptr() == pre.data_ptr()
     assert captured["comb_res_mix"].data_ptr() == comb.data_ptr()
@@ -358,14 +432,31 @@ def test_mega_hc_transition_preserves_shifted_pre_and_full_residual(deepgemm):
         output.float()[..., None, :] * post[..., None]
         + torch.einsum("...ij,...id->...jd", comb, residual.float())
     ).bfloat16()
-    assert torch.equal(updated, expected)
-    collapsed = (updated.float() * pre[..., None]).sum(-2).bfloat16().float()
+    assert torch.equal(updated.residual, expected)
+    assert torch.equal(materialize(output, state), expected)
+    collapsed = (updated.residual.float() * pre[..., None]).sum(-2).bfloat16().float()
     expected_norm = (
         collapsed
         * torch.rsqrt(collapsed.square().mean(-1, keepdim=True) + 1e-20)
-        * block.ffn_norm.weight.float()
+        * getattr(block, f"{name}_norm").weight.float()
     ).bfloat16()
     assert torch.equal(normalized, expected_norm)
+    assert captured["fn"].data_ptr() == getattr(block, f"hc_{name}_fn").data_ptr()
+    if prepare_ffn:
+        assert captured["cast_out"]["y_fp8"].shape == (6, dim)
+        assert (
+            captured["cast_out"]["y_fp8"].data_ptr() == block.ffn.workspace.x.data_ptr()
+        )
+        assert (
+            captured["cast_out"]["y_routed_sf"].data_ptr()
+            == block.ffn.workspace.x_sf.data_ptr()
+        )
+        assert (
+            captured["cast_out"]["y_shared_sf"].data_ptr()
+            == block.ffn.workspace.shared_l1_acts_sf.data_ptr()
+        )
+    else:
+        assert not captured["cast_out"]
 
 
 def test_probe_reports_near_tie_routes_separately_and_rejects_wrong_routing():

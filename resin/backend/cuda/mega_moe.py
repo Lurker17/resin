@@ -79,6 +79,15 @@ class MegaMoeCollective(LayerCollective):
 class MegaMoe(nn.Module):
     """Gate, sparse EP exchange, routed/shared GEMMs and combine in DeepGEMM."""
 
+    gate_up_weight: Tensor
+    gate_up_scale: Tensor
+    down_weight: Tensor
+    down_scale: Tensor
+    shared_gate_up_weight: Tensor
+    shared_gate_up_scale: Tensor
+    shared_down_weight: Tensor
+    shared_down_scale: Tensor
+
     def __init__(
         self,
         gate: nn.Module,
@@ -132,20 +141,43 @@ class MegaMoe(nn.Module):
     def workspace(self):
         return self.collective.buffers[self._workspace_key]
 
+    def fused_norm_cast_kwargs(self, rows: int) -> dict:
+        """Let mHC write the routed and shared FP8 inputs in their final layout.
+
+        Matches DeepInfer's v4_modules/mlp.py::fused_norm_cast_kwargs contract.
+        The BF16 normalization output remains the routing gate's input.
+        """
+        self._validate_rows(rows)
+        workspace = self.workspace
+        return {
+            "y_fp8": workspace.x[:rows],
+            "y_routed_sf": workspace.x_sf[:rows],
+            "y_shared_sf": workspace.shared_l1_acts_sf[:rows],
+            "shared_sf_block_m": self._shared_block_m(rows),
+        }
+
+    def _validate_rows(self, rows: int) -> None:
+        if rows > self.collective.max_tokens:
+            raise ValueError("mega-MoE rows exceed its prepared workspace capacity")
+        if self.collective._capacity is not None and rows > self.collective._capacity:
+            raise ValueError("mega-MoE rows exceed the current graph capacity")
+
     def forward(self, hidden: Tensor, input_ids: Tensor):
         with torch.cuda.device(hidden.device):
-            return self._forward(hidden, input_ids)
+            return self._forward(hidden, input_ids, prepared=False)
 
-    def _forward(self, hidden: Tensor, input_ids: Tensor):
+    def forward_prepared(self, hidden: Tensor, input_ids: Tensor):
+        """Consume the symmetric inputs just written by fused mHC normalization."""
+        with torch.cuda.device(hidden.device):
+            return self._forward(hidden, input_ids, prepared=True)
+
+    def _forward(self, hidden: Tensor, input_ids: Tensor, *, prepared: bool):
         import deep_gemm
 
         shape = hidden.shape
         hidden = hidden.reshape(-1, self.dim)
         rows, workspace = hidden.shape[0], self.workspace
-        if rows > self.collective.max_tokens:
-            raise ValueError("mega-MoE rows exceed its prepared workspace capacity")
-        if self.collective._capacity is not None and rows > self.collective._capacity:
-            raise ValueError("mega-MoE rows exceed the current graph capacity")
+        self._validate_rows(rows)
         valid = self.collective._valid_rows
         active = (
             None if valid is None else torch.arange(rows, device=hidden.device) < valid
@@ -153,7 +185,7 @@ class MegaMoe(nn.Module):
         self.route(
             hidden, active, (workspace.topk_idx[:rows], workspace.topk_weights[:rows])
         )
-        if rows:
+        if rows and not prepared:
             values, scales = self.quantize(hidden)
             packed = scales.contiguous().view(torch.int32)
             workspace.x[:rows].copy_(values)

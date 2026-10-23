@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import weakref
+from types import SimpleNamespace
 from typing import Any, cast
 
 import torch
@@ -124,90 +125,178 @@ def _output_comparison(actual, expected, *, limit, max_token_limit=None):
 
 
 @torch.inference_mode()
-def _block_hc():
-    """Real Block wiring against its explicit checkpoint equations, including B>1."""
-    from resin_models_cuda.deepseek_v41.hc import mega_ffn_transition
-    from resin_models_cuda.deepseek_v41.model import Block, ModelArgs, RMSNorm
+def _block_hc(layer):
+    """Both lazy HC transitions, direct FP8 writes and the actual EP FFN."""
+    from deploy.deepinfer_kernel_probe import _mhc_reference
+    from resin.backend.cuda.mega_moe import shared_scale_rows
+    from resin_models_cuda.deepseek_v41.hc import (
+        HCLazyPost,
+        materialize,
+        mega_transition,
+    )
+    from resin_models_cuda.deepseek_v41.kernels import act_quant
 
-    class FFN(nn.Module):
-        def forward(self, hidden, _ids):
-            return (hidden.float() * 0.75).bfloat16()
-
-    args = ModelArgs(dim=5120, norm_eps=1e-20, hc_mult=4, hc_sinkhorn_iters=20)
-    block = Block.__new__(Block)
-    nn.Module.__init__(block)
-    block.args, block.prefill_ffn, block.ffn_transition = args, None, None
-    block.ffn = FFN()
+    dim, tokens = layer.dim, min(1280, layer.collective.max_tokens)
+    shape = (2, tokens // 2) if tokens % 2 == 0 else (1, tokens)
+    block = SimpleNamespace(
+        args=SimpleNamespace(
+            dim=dim, norm_eps=1e-20, hc_mult=4, hc_eps=1e-6, hc_sinkhorn_iters=20
+        ),
+        ffn=layer,
+    )
     with torch.device("cuda"):
-        block.attn_norm, block.ffn_norm = (
-            RMSNorm(args.dim, args.norm_eps),
-            RMSNorm(args.dim, args.norm_eps),
-        )
         for name in ("attn", "ffn"):
-            for suffix, value in (
-                ("fn", torch.randn(24, 4 * args.dim) * 0.01),
-                ("scale", torch.randn(3) * 0.1),
-                ("base", torch.randn(24) * 0.1),
-            ):
-                setattr(block, f"hc_{name}_{suffix}", nn.Parameter(value))
-        trunk = torch.randn(4, 5, 4, args.dim).bfloat16()
-        previous_pre = torch.rand(4, 5, 4)
-        ids = torch.zeros(4, 5, dtype=torch.long)
-    block.attn_norm.weight.fill_(1)
-    block.ffn_norm.weight.fill_(1)
-    output, next_pre = torch.empty_like(trunk), torch.empty_like(previous_pre)
+            setattr(block, f"hc_{name}_fn", torch.randn(24, 4 * dim) * 0.01)
+            setattr(block, f"hc_{name}_scale", torch.randn(3) * 0.1)
+            setattr(block, f"hc_{name}_base", torch.randn(24) * 0.1)
+            setattr(
+                block,
+                f"{name}_norm",
+                SimpleNamespace(weight=torch.ones(dim).bfloat16()),
+            )
+        source = torch.randn(*shape, dim).bfloat16()
+        initial = HCLazyPost(
+            torch.randn(*shape, 4, dim).bfloat16(),
+            torch.rand(*shape, 4),
+            torch.rand(*shape, 4),
+            torch.rand(*shape, 4, 4),
+        )
+        ids = torch.zeros(*shape, dtype=torch.long)
+        valid = torch.tensor(tokens, dtype=torch.int32)
+        output = torch.empty(*shape, 4, dim, dtype=torch.bfloat16)
+        norm = torch.empty_like(source)
+        pre = torch.empty_like(initial.pre)
 
     def call():
-        values = block(
-            trunk, previous_pre, ids, lambda value: (value.float() * 0.25).bfloat16()
+        with layer.collective.fixed_capacity(tokens, valid_rows=valid):
+            attention, state = mega_transition(block, source, initial, "attn")
+            attention = (attention.float() * 0.25).bfloat16()
+            normalized, state = mega_transition(
+                block, attention, state, "ffn", prepare_ffn=True
+            )
+            output.copy_(materialize(layer.forward_prepared(normalized, ids), state))
+            norm.copy_(normalized)
+            pre.copy_(state.pre)
+
+    def reference_transition(value, state, name):
+        reference = _mhc_reference(
+            dict(
+                x=value.reshape(-1, dim),
+                residual=state.residual.reshape(-1, 4, dim),
+                shifted_prev_mix=state.pre.reshape(-1, 4, 1),
+                post_mix=state.post.reshape(-1, 4, 1),
+                comb_res_mix=state.comb.reshape(-1, 4, 4),
+                fn=getattr(block, f"hc_{name}_fn"),
+                mix_scales=getattr(block, f"hc_{name}_scale"),
+                mix_bases=getattr(block, f"hc_{name}_base"),
+                rmsnorm_weight=getattr(block, f"{name}_norm").weight,
+                hc_norm_eps=1e-20,
+                hc_pre_eps=1e-6,
+                hc_post_scale=2,
+                sinkhorn_eps=1e-6,
+                num_sinkhorn_iters=20,
+                rmsnorm_eps=1e-20,
+                rmsnorm_scale=1,
+            )
         )
-        output.copy_(values[0])
-        next_pre.copy_(values[1])
+        return reference["y_bf16"].reshape(*shape, dim), HCLazyPost(
+            reference["new_residual"].reshape(*shape, 4, dim),
+            reference["new_prev_mix"].reshape(*shape, 4),
+            reference["new_post_mix"].reshape(*shape, 4),
+            reference["new_comb_res_mix"].reshape(*shape, 4, 4),
+        )
 
     graph, results = torch.cuda.CUDAGraph(), []
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     try:
         with torch.cuda.stream(stream):
-            call()
-            expected = output.clone(), next_pre.clone()
-            block.ffn_transition = mega_ffn_transition
+            attention, state = reference_transition(source, initial, "attn")
+            reference_norm, reference_state = reference_transition(
+                (attention.float() * 0.25).bfloat16(), state, "ffn"
+            )
             for _ in range(3):
                 call()
-            eager = output.clone(), next_pre.clone()
-            for name, actual, reference in zip(
-                ("full_residual", "shifted_ffn_pre"), eager, expected, strict=True
+            eager = output.clone(), norm.clone(), pre.clone()
+            for name, actual, expected in (
+                ("shifted_ffn_pre", pre, reference_state.pre),
+                ("ffn_normalization", norm, reference_norm),
             ):
-                delta = actual.float() - reference.float()
-                normalized = delta.square().sum() / (
-                    actual.float().square().sum() + reference.float().square().sum()
+                delta = actual.float() - expected.float()
+                error = delta.square().sum() / (
+                    actual.float().square().sum() + expected.float().square().sum()
                 ).clamp_min(1e-20)
-                if normalized >= 5e-5:
+                if error >= 5e-5:
                     raise AssertionError(
-                        f"Block mHC {name} normalized error={normalized.item()}"
+                        f"lazy HC {name} normalized error={error.item()}"
                     )
                 results.append(
-                    dict(
-                        output=name,
-                        max_abs=delta.abs().max().item(),
-                        normalized_squared_error=normalized.item(),
-                        limit=5e-5,
-                    )
+                    dict(output=name, normalized_squared_error=error.item(), limit=5e-5)
+                )
+            values, scales = act_quant(
+                norm.reshape(-1, dim), 32, "ue8m0", torch.float8_e8m0fnu
+            )
+            packed = scales.contiguous().view(torch.int32)
+            if not torch.equal(
+                values.view(torch.uint8), layer.workspace.x[:tokens].view(torch.uint8)
+            ):
+                raise AssertionError(
+                    "fused HC FP8 differs from quantizing its BF16 normalization"
+                )
+            if not torch.equal(packed, layer.workspace.x_sf[:tokens]):
+                raise AssertionError("fused HC routed scales differ")
+            shared_rows = shared_scale_rows(
+                tokens, layer._shared_block_m(tokens), device=norm.device
+            )
+            if not torch.equal(packed, layer.workspace.shared_l1_acts_sf[shared_rows]):
+                raise AssertionError("fused HC shared scales differ")
+            # Ordinary FFN preparation must consume exactly the same FP8 values.
+            with layer.collective.fixed_capacity(tokens):
+                ordinary = layer(norm, ids)
+            attention, actual_state = mega_transition(block, source, initial, "attn")
+            _, actual_state = mega_transition(
+                block, (attention.float() * 0.25).bfloat16(), actual_state, "ffn"
+            )
+            if not torch.equal(materialize(ordinary, actual_state), eager[0]):
+                raise AssertionError(
+                    "prepared FFN changed the complete residual output"
                 )
         stream.synchronize()
         with torch.cuda.graph(graph, stream=stream):
             call()
-        for _ in range(3):
-            graph.replay()
-        stream.synchronize()
-        if not torch.equal(output, eager[0]) or not torch.equal(next_pre, eager[1]):
-            raise AssertionError("Block mHC graph differs from identical eager inputs")
+        captures = []
+        for name, count in (
+            ("regular", tokens),
+            ("changed_input", tokens),
+            ("partial_rows", max(1, tokens // 2)),
+            ("idle_rank", 0 if layer.collective.group.local_rank == 1 else tokens),
+        ):
+            with torch.cuda.stream(stream):
+                if name == "changed_input":
+                    source.copy_(source.roll(17, -1))
+                    initial.pre.copy_(initial.pre.roll(1, -1))
+                valid.fill_(count)
+                call()
+                eager = output.clone(), norm.clone(), pre.clone()
+                for _ in range(3):
+                    graph.replay()
+            stream.synchronize()
+            if any(
+                not torch.equal(value, expected)
+                for value, expected in zip((output, norm, pre), eager, strict=True)
+            ):
+                raise AssertionError(f"lazy HC {name} graph differs from eager inputs")
+            if not layer.workspace.topk_idx[count:tokens].eq(-1).all():
+                raise AssertionError("fused normalization routed masked graph rows")
+            captures.append(dict(case=name, valid_tokens=count, replays=3))
         return dict(
-            shape=list(trunk.shape),
+            shape=list(initial.residual.shape),
             reference="unfused_checkpoint_equations",
             outputs=results,
+            direct_fp8_and_scales_exact=True,
+            prepared_ffn_bitwise_equal=True,
             graph_bitwise_equal=True,
-            replays=3,
+            capture_cases=captures,
         )
     finally:
         graph.reset()
@@ -217,7 +306,11 @@ def _block_hc():
 def run_probe(group, *, rows: int = 8, max_tokens: int | None = None):
     """Join an already initialized EP2 process group, leaving it alive on return."""
     from resin_models_cuda.deepseek_v41.experts import prepare_mega_moe
-    from resin_models_cuda.deepseek_v41.linear import SharedExpert
+    from resin_models_cuda.deepseek_v41.linear import (
+        Linear,
+        SharedExpert,
+        prepare_linear,
+    )
     from resin_models_cuda.deepseek_v41.model import Gate, ModelArgs, MoEWeights
 
     capacity = max(16, rows) if max_tokens is None else max_tokens
@@ -298,14 +391,24 @@ def run_probe(group, *, rows: int = 8, max_tokens: int | None = None):
     collective = MegaMoeCollective(
         RankGroup(tuple(range(world)), group, rank), capacity
     )
-    prepare_model(
-        model,
-        lambda module: (
+    prepared_projections = []
+
+    def lower(module):
+        if isinstance(module, Linear):
+            prepared_projections.append(module)
+            return prepare_linear(module)
+        return (
             prepare_mega_moe(module, collective)
             if isinstance(module, MoEWeights)
             else module
-        ),
-    )
+        )
+
+    prepare_model(model, lower)
+    if len(prepared_projections) != 3:
+        raise AssertionError(
+            "shared projections were not prepared before their parent FFN"
+        )
+    prepared_projections.clear()
     gc.collect()
     if raw_weight() is not None:
         raise AssertionError("prepared traversal retained consumed checkpoint W13")
@@ -436,9 +539,10 @@ def run_probe(group, *, rows: int = 8, max_tokens: int | None = None):
             "shared_block_m": layer._shared_block_m(rows),
             "cases": results,
             "source_storage_released": True,
+            "prepared_shared_projections": 3,
             "workspace_count": len(collective.buffers),
             "empty_collective": True,
-            "block_hc": _block_hc(),
+            "block_hc": _block_hc(layer),
         }
     finally:
         if graph is not None:

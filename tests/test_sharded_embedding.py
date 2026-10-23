@@ -67,6 +67,24 @@ def _worker(rank, rendezvous):
                 current = tuple(t.data_ptr() for t in lookup._buffers[4, 3, ids.device])
                 assert pointers is None or current == pointers
                 pointers = current
+                with lookup.fixed_capacity(4, valid_rows=valid):
+                    hooks = lookup.prefetch(
+                        [(ids, shards[0].local), (ids.flip(-1), shards[1].local)]
+                    )
+                    second, first = hooks[1](), hooks[0]()
+                    assert first.data_ptr() != second.data_ptr()
+                    for actual, tokens in ((first, ids), (second, ids.flip(-1))):
+                        expected = reference[tokens].clone()
+                        expected[count:] = 0
+                        assert torch.equal(actual, expected)
+            hooks = lookup.prefetch(
+                [
+                    (ids[:count], shards[0].local),
+                    (ids[:count].flip(-1), shards[1].local),
+                ]
+            )
+            assert torch.equal(hooks[0](), reference[ids[:count]])
+            assert torch.equal(hooks[1](), reference[ids[:count].flip(-1)])
             close_layer_collectives(tables)
             close_layer_collectives(tables)
             assert not lookup.allocated

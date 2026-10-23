@@ -95,6 +95,11 @@ name = "flash-mla"
 version = "1.0.0"
 requires-dist = []
 
+[[tool.uv.dependency-metadata]]
+name = "deep-select"
+version = "1.0.0"
+requires-dist = []
+
 [tool.uv.extra-build-dependencies]
 deep-gemm = [
   { requirement = "torch", match-runtime = true },
@@ -113,9 +118,18 @@ flash-mla = [
   "ninja>=1.11",
   "packaging>=24",
 ]
+deep-select = [
+  { requirement = "torch", match-runtime = true },
+  "triton==3.7.1",
+  "setuptools==80.9.0",
+  "wheel==0.45.1",
+  "ninja>=1.11",
+  "packaging>=24",
+]
 
 [tool.uv.extra-build-variables]
 deep-gemm = { DG_USE_LOCAL_VERSION = "0", DG_FORCE_BUILD = "1" }
+deep-select = { DEEP_SELECT_BUILD_TARGET_PLATFORM = "CUDA", MAX_JOBS = "4", NVCC_THREADS = "4" }
 # Check the artifact separately: CUDA 13.3 spills in an unused legacy split-KV
 # kernel; all fused attention and projection kernels must remain spill-free.
 flash-mla = { FLASH_MLA_BUILD_TARGET_PLATFORM = "CUDA", FLASH_MLA_SKIP_REG_SPILL_CHECK = "1", MAX_JOBS = "4", NVCC_THREADS = "4" }

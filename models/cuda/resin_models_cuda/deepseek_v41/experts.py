@@ -9,6 +9,7 @@ from torch import Tensor
 from resin.backend.cuda.mega_moe import MegaMoe, prepare_weights
 from resin.backend.torch import benchmark_expert_indices
 from resin_models_cuda.deepseek_v41.kernels import act_quant
+from resin_models_cuda.deepseek_v41.linear import weight_scale_rows
 
 
 def mega_gate(gate, hidden, active, out, *, ep_rank):
@@ -89,12 +90,14 @@ def prepare_mega_moe(source, collective):
     )
     shared = source.shared_experts
     shared_weight = torch.cat((shared.w1.weight, shared.w3.weight))
-    shared_scale = torch.cat((shared.w1.scale.float(), shared.w3.scale.float()))
+    shared_scale = torch.cat(
+        (weight_scale_rows(shared.w1), weight_scale_rows(shared.w3))
+    )
     shared_weights = cast(
         tuple[tuple[Tensor, Tensor], tuple[Tensor, Tensor]],
         deep_gemm.transform_weights_for_mega_moe(
-            prepare_weights(shared_weight, shared_scale, block_rows=32),
-            prepare_weights(shared.w2.weight, shared.w2.scale, block_rows=32),
+            prepare_weights(shared_weight, shared_scale),
+            prepare_weights(shared.w2.weight, weight_scale_rows(shared.w2)),
         ),
     )
     return MegaMoe(

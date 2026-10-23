@@ -12,6 +12,7 @@ from torch import nn
 from resin_models_cuda.deepseek_v41.engram import (
     Engram,
     EngramLayout,
+    EngramRuntime,
     NgramHash,
     ParallelEngramEmbedding,
     build_compressed_token_map,
@@ -240,6 +241,28 @@ def test_row_shards_keep_fp8_storage_and_mask_other_ranks():
     )
 
 
+def test_engram_runtime_keeps_layer_hash_selection_and_empty_fetches():
+    layers = {}
+    for layer, hash_index in ((14, 1), (1, 0)):
+        embed = ParallelEngramEmbedding(17, 32)
+        with torch.no_grad():
+            embed.weight.copy_(torch.arange(17).reshape(-1, 1).expand(-1, 32))
+            embed.scale.fill_(2 if layer == 14 else 1)
+        layers[layer] = SimpleNamespace(
+            embed=embed, layer_hash_index=hash_index, hash_columns=2
+        )
+    runtime = EngramRuntime(layers)
+    hashes = torch.arange(12).reshape(1, 3, 2, 2)
+    hooks = runtime.fetch(hashes)
+    for layer, module in layers.items():
+        expected = (
+            hashes[..., module.layer_hash_index, :].unsqueeze(-1).expand(-1, -1, -1, 32)
+        )
+        assert torch.equal(hooks[layer](), expected * (2 if layer == 14 else 1))
+        assert runtime.fetch(None)[layer]().shape == (0, 2, 32)
+    assert EngramRuntime({}).fetch(hashes) == {}
+
+
 def test_engram_gate_normalizes_each_hc_copy_and_preserves_mask(monkeypatch):
     import resin_models_cuda.deepseek_v41.linear as linear
 
@@ -256,6 +279,13 @@ def test_engram_gate_normalizes_each_hc_copy_and_preserves_mask(monkeypatch):
             parameter.copy_(torch.randn(parameter.shape, generator=generator))
     hidden = torch.randn(2, 3, 2, 4, generator=generator)
     hashes = torch.randint(0, 600, (2, 3, 6), generator=generator)
+    embedding = module.embed(hashes)
+    torch.testing.assert_close(
+        module(hidden, hashes),
+        module(hidden, embed_hook=lambda: embedding),
+        rtol=0,
+        atol=0,
+    )
     mask = torch.tensor([[True, False, True], [False, True, True]])
     key, value = module.wkv(module.embed(hashes).flatten(-2)).split([8, 4], -1)
     key = key.reshape(2, 3, 2, 4)
@@ -280,7 +310,7 @@ def test_engram_gate_normalizes_each_hc_copy_and_preserves_mask(monkeypatch):
 
 
 @pytest.mark.parametrize("prefill", [False, True])
-def test_idle_rank_joins_engram_before_each_layer_collective(
+def test_idle_rank_prefetches_all_engram_and_waits_before_each_layer_collective(
     implementation, prefill, monkeypatch
 ):
     Transformer = implementation.Transformer
@@ -289,18 +319,8 @@ def test_idle_rank_joins_engram_before_each_layer_collective(
     class Layer(nn.Module):
         def __init__(self, index, *, engram=False):
             super().__init__()
-            self.engram = (
-                SimpleNamespace(
-                    hash_columns=24,
-                    embed=SimpleNamespace(
-                        forward_empty=lambda columns: calls.append(
-                            ("engram", index, columns)
-                        )
-                    ),
-                )
-                if engram
-                else None
-            )
+            self.layer_id = index
+            self.engram = object() if engram else None
             self.ffn = SimpleNamespace(
                 forward_empty=lambda: calls.append(("ffn", index))
             )
@@ -323,15 +343,28 @@ def test_idle_rank_joins_engram_before_each_layer_collective(
     )
     monkeypatch.setattr(model, "mtp", nn.ModuleList([Layer(3)]), raising=False)
     monkeypatch.setattr(model, "args", SimpleNamespace(dim=8), raising=False)
+    monkeypatch.setattr(model, "engram_hash", object(), raising=False)
+
+    def fetch(hashes):
+        assert hashes is None
+        calls.append(("prefetch", 1, 2))
+        return {
+            layer: lambda layer=layer: calls.append(("wait", layer)) for layer in (1, 2)
+        }
+
+    monkeypatch.setattr(
+        model, "engram_runtime", SimpleNamespace(fetch=fetch), raising=False
+    )
     monkeypatch.setattr(
         model, "embed", nn.Embedding(4, 8, dtype=torch.bfloat16), raising=False
     )
     Transformer.forward_experts_empty(model, prefill=prefill)
     assert calls == [
+        ("prefetch", 1, 2),
         ("ffn", 0),
-        ("engram", 1, 24),
+        ("wait", 1),
         ("ffn", 1),
-        ("engram", 2, 24),
+        ("wait", 2),
         ("ffn", 2),
     ]
     calls.clear()

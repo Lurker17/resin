@@ -162,11 +162,15 @@ def test_shared_kv_and_index_pages_alias_only_their_declared_source():
         main % packed.shape[1],
     )
     packed[pages, offsets, 0] = 2
-    cache.index_keys.view(-1, 128)[index] = 3
+    index_values, index_scales = cache.index_parts(1)
+    index_pages, index_offsets = index // packed.shape[1], index % packed.shape[1]
+    index_values[index_pages, index_offsets] = 3
+    index_scales[index_pages, index_offsets] = 4
     assert (packed[pages, offsets, 0] == 2).all()
     assert packed.storage_offset() == cache.compressed_cache(2).storage_offset()
     assert packed.storage_offset() != cache.compressed_cache(3).storage_offset()
-    assert (cache.index_keys.view(-1, 128)[index] == 3).all()
+    assert (index_values[index_pages, index_offsets] == 3).all()
+    assert (index_scales[index_pages, index_offsets] == 4).all()
     assert arena.geometry.bytes_per_parent < 2 << 20
 
 
@@ -256,8 +260,8 @@ def test_pinned_packed_children_hold_every_physical_view_without_overlap(group):
                 cache.compressed_cache(layer),
                 cache.compressed_rows(layer, geometry.ratios[layer], positions),
             )
-            record(cache.index_rows(layer, positions), 256)
-        payload_bytes = (3 * 64 + 128) * (288 + 256)
+            record_packed(cache.index_cache(layer), cache.index_rows(layer, positions))
+        payload_bytes = (3 * 64 + 128) * (288 + 68)
     elif group == 2:
         for layer in geometry.compressor_sources:
             for rows in cache.compressor_rows(layer, positions):

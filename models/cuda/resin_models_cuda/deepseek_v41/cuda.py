@@ -114,6 +114,20 @@ class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
             def finish(values, scales, attention=attention):
                 return attention.wo_b(attention.wo_a(values, scales).flatten(1))
 
+            query_outputs = (
+                TensorSpec((attention.n_local_heads * attention.head_dim,)),
+            )
+            if hasattr(attention, "indexer"):
+                query_outputs += (
+                    TensorSpec(
+                        (attention.indexer.local_heads * attention.indexer.head_dim,)
+                    ),
+                )
+
+            def query(qr, attention=attention):
+                main, index = attention.project_query(qr)
+                return (main,) if index is None else (main, index)
+
             regions.extend(
                 (
                     CudaGraphTensorRegion(
@@ -127,9 +141,9 @@ class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
                     ),
                     CudaGraphTensorRegion(
                         f"layer.{layer.layer_id}.query",
-                        attention.wq_b,
+                        query,
                         (TensorSpec((attention.q_lora_rank,)),),
-                        TensorSpec((attention.n_local_heads * attention.head_dim,)),
+                        query_outputs,
                     ),
                     CudaGraphTensorRegion(
                         f"layer.{layer.layer_id}.finish",
@@ -157,9 +171,12 @@ class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
             layer.attn.prefill_project = lambda hidden, invoke=project: tuple(
                 value[None] for value in invoke(hidden.squeeze(0))
             )
-            layer.attn.prefill_query = lambda qr, invoke=query: invoke(qr.squeeze(0))[
-                None
-            ]
+
+            def prefill_query(qr, invoke=query):
+                values = invoke(qr.squeeze(0))
+                return values[0][None], values[1][None] if len(values) > 1 else None
+
+            layer.attn.prefill_query = prefill_query
             layer.attn.prefill_finish = lambda output, positions, invoke=finish: invoke(
                 *output
             )[None]

@@ -20,6 +20,7 @@ from resin.backend.resources import CachePoolBinding
 PAGE_TOKENS = 128
 WINDOW, COMPRESSED, COMPRESSOR, TOKENS = range(4)
 FP8_BYTES, FP4_BYTES = 528, 288
+INDEX_BYTES = 68  # 128 FP4 values plus four UE8M0 scales, block-wide sections.
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +48,7 @@ class CacheGeometry:
             cursor += PAGE_TOKENS // ratios[layer] * FP4_BYTES
         for layer in args.kv_source_layers:
             indices[layer] = cursor
-            cursor += PAGE_TOKENS // ratios[layer] * 128 * 2
+            cursor += PAGE_TOKENS // ratios[layer] * INDEX_BYTES
         for layer in range(args.n_layers):
             if ratios[layer]:
                 owner = next(x for x in reversed(args.kv_source_layers) if x <= layer)
@@ -208,21 +209,67 @@ class DeviceCache:
         )
 
     def index_rows(self, layer, positions):
-        base, offsets = self._bytes(COMPRESSED, positions)
+        if self.geometry.index_offsets[layer] is None:
+            raise ValueError("layer does not consume shared index keys")
+        return self._rows(COMPRESSED, positions, self.geometry.ratios[layer])
+
+    def index_cache(self, layer):
+        """DeepGEMM's FP4 index ABI: page-wide values followed by scales."""
         offset = self.geometry.index_offsets[layer]
         if offset is None:
             raise ValueError("layer does not consume shared index keys")
-        return ((base + offset) // 256 + offsets // self.geometry.ratios[layer]).long()
+        return self._view(
+            COMPRESSED, offset, PAGE_TOKENS // self.geometry.ratios[layer], INDEX_BYTES
+        )
 
-    @property
-    def index_keys(self):
-        return self.storage.view(torch.bfloat16).reshape(-1, 128)
+    def index_parts(self, layer):
+        """Typed zero-copy views used by the upstream fused cache-store kernel."""
+        cache = self.index_cache(layer)
+        pages, tokens = cache.shape[:2]
+        values = self.storage.view(torch.int8).as_strided(
+            (pages, tokens, 64), (cache.stride(0), 64, 1), cache.storage_offset()
+        )
+        scales = self.storage.view(torch.int32).as_strided(
+            (pages, tokens),
+            (cache.stride(0) // 4, 1),
+            (cache.storage_offset() + tokens * 64) // 4,
+        )
+        return values, scales
+
+    def index_block_table(self, query_tokens):
+        """Adapt Engine parent/child IDs without materializing historical keys.
+
+        DeepGEMM's varlen API reserves one table row per query. Request IDs
+        still refer to the first batch-size rows, so repeating the table only
+        supplies the required backing extent; queries share their original row.
+        """
+        group = self.groups[COMPRESSED]
+        pages = (
+            group.parent_ids * self.geometry.packings[COMPRESSED] + group.child_slots
+        )
+        return pages.repeat(query_tokens, 1).int()
 
     def compressor_rows(self, layer, positions):
         base, offsets = self._bytes(COMPRESSOR, positions)
         owner = self.geometry.compressor_sources.index(layer)
         values = base // 2048 + owner * PAGE_TOKENS * 2 + offsets.long() * 2
         return values, values + 1
+
+    def compressor_state(self, layer):
+        """Zero-copy paged compressor state, preserving [latent, score] slots."""
+        packing = self.geometry.packings[COMPRESSOR]
+        pages = (self.storage.shape[0] - self.geometry.guard_parents) * packing
+        owner = self.geometry.compressor_sources.index(layer)
+        return self.storage.view(torch.float32).as_strided(
+            (pages, PAGE_TOKENS, 2, 512),
+            (self.geometry.parent_bytes // packing // 4, 1024, 512, 1),
+            owner * PAGE_TOKENS * 1024,
+        )
+
+    def compressor_pages(self, positions):
+        return self._rows(COMPRESSOR, positions, 1).div(
+            PAGE_TOKENS, rounding_mode="floor"
+        )
 
     @property
     def compressor_values(self):

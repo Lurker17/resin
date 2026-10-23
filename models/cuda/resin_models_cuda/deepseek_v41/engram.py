@@ -240,8 +240,9 @@ class Engram(nn.Module):
         self.q_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))
         self.k_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))
 
-    def forward(self, hidden, hash_ids, token_mask=None):
-        key, value = self.wkv(self.embed(hash_ids).flatten(-2)).split(
+    def forward(self, hidden, hash_ids=None, token_mask=None, *, embed_hook=None):
+        embedding = self.embed(hash_ids) if embed_hook is None else embed_hook()
+        key, value = self.wkv(embedding.flatten(-2)).split(
             [self.hc_mult * self.dim, self.dim], dim=-1
         )
         key = key.float().unflatten(-1, (self.hc_mult, self.dim))
@@ -258,3 +259,41 @@ class Engram(nn.Module):
         return (stream + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(
             hidden.dtype
         )
+
+
+class EngramRuntime:
+    """Prefetch every layer's table rows and defer its wait until consumption.
+
+    The fetch/hook boundary follows DeepInfer v4_modules/engram.py at
+    774ce244b87cc0eb8d4b94ab9f5de2ab22049f01 (Apache-2.0). This transport
+    uses NCCL owner lookups and does not require DeepEP's RDMA devices.
+    """
+
+    def __init__(self, layers):
+        self.layers = tuple(layers.items())
+        self.lookup = self.layers[0][1].embed.lookup if self.layers else None
+        if any(layer.embed.lookup is not self.lookup for _, layer in self.layers):
+            raise ValueError("Engram layers must share one lookup transport")
+
+    def fetch(self, hashes):
+        """All ranks issue the same table order, including empty participants."""
+        requests = [
+            (
+                layer.embed.weight.new_empty((0, layer.hash_columns), dtype=torch.int64)
+                if hashes is None
+                else hashes[..., layer.layer_hash_index, :],
+                layer.embed.local,
+            )
+            for _, layer in self.layers
+        ]
+        hooks = (
+            self.lookup.prefetch(requests)
+            if self.lookup is not None
+            else [
+                lambda indices=indices, local=local: local(indices)
+                for indices, local in requests
+            ]
+        )
+        return {
+            layer: hook for (layer, _), hook in zip(self.layers, hooks, strict=True)
+        }
