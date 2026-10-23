@@ -1058,6 +1058,7 @@ struct Engine {
     overlap: bool,
     pending: Option<PendingExecution>,
     deferred_events: Vec<Py<TokenEvent>>,
+    failed_executions: Vec<Py<PyAny>>,
     overlap_enqueues: u64,
     overlap_continuations: u64,
 }
@@ -1153,8 +1154,17 @@ impl Engine {
     fn harvest(&mut self, py: Python<'_>, continuing: bool) -> PyResult<Vec<Py<TokenEvent>>> {
         let pending = self.pending.take().expect("harvest pending execution");
         match pending.completion.bind(py).call_method0("result") {
-            Ok(output) => self.consume_output(py, &pending.plan, &output, continuing),
-            Err(error) => Err(self.fail_output(py, error, true)),
+            Ok(output) => match self.consume_output(py, &pending.plan, &output, continuing) {
+                Ok(events) => Ok(events),
+                Err(error) => {
+                    self.failed_executions.push(pending.completion);
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                self.failed_executions.push(pending.completion);
+                Err(self.fail_output(py, error, true))
+            }
         }
     }
 }
@@ -1213,6 +1223,7 @@ impl Engine {
             overlap,
             pending: None,
             deferred_events: Vec::new(),
+            failed_executions: Vec::new(),
             overlap_enqueues: 0,
             overlap_continuations: 0,
         })
@@ -1353,7 +1364,15 @@ impl Engine {
             if let Some(next) = next {
                 let next_plan = Py::new(py, planning::from_core(next))?;
                 let previous = self.pending.as_ref().expect("pending execution");
-                let feedback = previous.completion.bind(py).getattr("feedback")?;
+                let feedback = match previous.completion.bind(py).getattr("feedback") {
+                    Ok(feedback) => feedback,
+                    Err(error) => {
+                        self.core.poison_message(format!(
+                            "accepted completion feedback failed: {error}"
+                        ));
+                        return Err(error);
+                    }
+                };
                 let kwargs = pyo3::types::PyDict::new(py);
                 kwargs.set_item("feedback", feedback)?;
                 let enqueue = self
@@ -1368,16 +1387,38 @@ impl Engine {
                         return Err(error);
                     }
                 };
-                if !result.bind(py).hasattr("result")? {
+                let asynchronous = match result.bind(py).hasattr("result") {
+                    Ok(asynchronous) => asynchronous,
+                    Err(error) => {
+                        self.failed_executions.push(result);
+                        self.core.poison_message(format!(
+                            "accepted completion inspection failed: {error}"
+                        ));
+                        return Err(error);
+                    }
+                };
+                if !asynchronous {
                     // Distributed peers may collectively choose a synchronous
                     // fallback. It still executed the future step, so harvest
                     // and commit both results without releasing pages between.
-                    let previous_events = self.harvest(py, true)?;
+                    let previous_events = match self.harvest(py, true) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            self.failed_executions.push(result);
+                            return Err(error);
+                        }
+                    };
                     events.extend(previous_events);
                     events.extend(self.consume_output(py, &next_plan, result.bind(py), false)?);
                     return Ok(events);
                 }
-                let previous_events = self.harvest(py, true)?;
+                let previous_events = match self.harvest(py, true) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        self.failed_executions.push(result);
+                        return Err(error);
+                    }
+                };
                 self.pending = Some(PendingExecution {
                     plan: next_plan,
                     completion: result,
@@ -1427,15 +1468,30 @@ impl Engine {
         if can_enqueue {
             let enqueue = self.runner_enqueue.as_ref().expect("checked enqueue");
             match enqueue.bind(py).call1((&plan,)) {
-                Ok(output) if output.hasattr("result")? => {
-                    self.pending = Some(PendingExecution {
-                        plan,
-                        completion: output.unbind(),
-                    });
-                    self.overlap_enqueues += 1;
-                    return Ok(events);
+                Ok(output) => {
+                    let asynchronous = match output.hasattr("result") {
+                        Ok(asynchronous) => asynchronous,
+                        Err(error) => {
+                            self.failed_executions.push(output.unbind());
+                            return Err(self.fail_output(py, error, true));
+                        }
+                    };
+                    if asynchronous {
+                        self.pending = Some(PendingExecution {
+                            plan,
+                            completion: output.unbind(),
+                        });
+                        self.overlap_enqueues += 1;
+                        return Ok(events);
+                    }
+                    match self.consume_output(py, &plan, &output, false) {
+                        Ok(completed) => events.extend(completed),
+                        Err(error) => {
+                            self.failed_executions.push(output.unbind());
+                            return Err(error);
+                        }
+                    }
                 }
-                Ok(output) => events.extend(self.consume_output(py, &plan, &output, false)?),
                 Err(error) => return Err(self.fail_output(py, error, false)),
             }
         } else {

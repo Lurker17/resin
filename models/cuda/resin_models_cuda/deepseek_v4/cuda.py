@@ -1005,6 +1005,10 @@ class DeepSeekV4CudaRunner(CudaRunner):
             result = self._graph_forward(
                 plan, cache_plan, enqueue=True, feedback=feedback
             )
+        if result is None and feedback is not None:
+            raise RuntimeError(
+                "a device continuation requires its captured decode graph"
+            )
         return self.forward(plan) if result is None else result
 
     def enqueue_distributed(self, plan, context, *, prepared=None, feedback=None):
@@ -1058,6 +1062,10 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 return DeviceCompletion(
                     tokens, counts, next_inputs, rows=0, device=self.device
                 )
+        if feedback is not None:
+            raise RuntimeError(
+                "a device continuation requires its captured decode graph"
+            )
         return self.forward_distributed(plan, context, prepared=prepared)
 
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]] | ForwardOutput:

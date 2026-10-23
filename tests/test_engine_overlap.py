@@ -202,3 +202,68 @@ def test_gpu_feedback_matches_reference_across_page_and_budget_drains():
         engine.close()
         runner.shutdown()
     assert outputs[0] == outputs[1] == list(range(2, 272))
+
+
+@pytest.mark.parametrize("second_enqueue", [False, True])
+def test_completion_inspection_failure_quarantines_accepted_work(
+    monkeypatch, second_enqueue
+):
+    import gc
+    import weakref
+
+    class InvalidCompletion:
+        @property
+        def result(self):
+            raise RuntimeError("completion descriptor failed")
+
+    runner = AsyncRunner()
+    original = runner.enqueue
+    references = []
+    calls = 0
+
+    def enqueue(plan, *, feedback=None):
+        nonlocal calls
+        calls += 1
+        if calls == (2 if second_enqueue else 1):
+            result = InvalidCompletion()
+            references.append(weakref.ref(result))
+            return result
+        return original(plan, feedback=feedback)
+
+    monkeypatch.setattr(runner, "enqueue", enqueue)
+    engine = Engine(runner)
+    request = engine.submit([1], max_new_tokens=24)
+    engine.step()
+    if second_enqueue:
+        assert engine.step() == []
+    with pytest.raises(RuntimeError, match="completion descriptor failed"):
+        engine.step()
+    gc.collect()
+    assert references[0]() is not None  # Its GPU buffer owner stays quarantined.
+    assert engine.poisoned and not request.done
+    assert engine.cache_occupied_block_count == 1
+    assert runner.released == []
+    runner.shutdown()
+
+
+def test_feedback_descriptor_failure_cannot_leave_a_healthy_pending_engine(monkeypatch):
+    class InvalidFeedback:
+        @property
+        def feedback(self):
+            raise RuntimeError("feedback descriptor failed")
+
+        def result(self):
+            return [[3, 4]]
+
+    runner = AsyncRunner()
+    monkeypatch.setattr(runner, "enqueue", lambda plan: InvalidFeedback())
+    engine = Engine(runner)
+    request = engine.submit([1], max_new_tokens=24)
+    engine.step()
+    assert engine.step() == []
+    with pytest.raises(RuntimeError, match="feedback descriptor failed"):
+        engine.step()
+    assert engine.poisoned and not request.done
+    assert engine.cache_occupied_block_count == 1
+    assert runner.released == []
+    runner.shutdown()
