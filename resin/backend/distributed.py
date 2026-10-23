@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any, Protocol
 
 from resin import BatchPhase, BatchPlan, Engine, ForwardOutput, Runner, RunnerConfig
+from resin.backend.control_plane import ControlOperation, ControlPlane
 from resin.backend.parallel import batch_plan_from_payload, batch_plan_payload
 from resin.backend.topology import ParallelGroups, RankGroup
 
@@ -124,6 +125,7 @@ class DistributedWorker:
         self._step_id, self._phase = 0, None
         self._forward, self._validate, self._enqueue = None, None, None
         self._completion = None
+        self._control = ControlPlane(groups.distributed)
         lookahead = None
         error = None
         try:
@@ -178,8 +180,16 @@ class DistributedWorker:
             raise DistributedExecutionError(self.failure) from exc
         return results
 
+    def _vote(self, group, operation, values=(), *, error=None):
+        try:
+            return self._control.gather(group, operation, values, error=error)
+        except BaseException as exc:
+            self.failure = _message(exc)
+            raise DistributedExecutionError(self.failure) from exc
+
     def _consensus(self, group: RankGroup, error: str | None):
-        failure = _first_error(group, self._gather(group, error))
+        _, errors = self._vote(group, ControlOperation.VALIDATE, error=error)
+        failure = _first_error(group, errors)
         if failure:
             raise DistributedExecutionError(failure)
 
@@ -192,6 +202,41 @@ class DistributedWorker:
 
     def _drivers(self, operation, value):
         group = self._driver_group
+        if operation in {"initialize", "commit", "close"}:
+            _, errors = self._vote(group, operation, error=value)
+            return errors
+        if operation == "work":
+            records, errors = self._vote(
+                group, operation, (int(value[0]),), error=value[1]
+            )
+            return [(bool(row[0]), error) for row, error in zip(records, errors)]
+        if operation == "phase":
+            phases = (None, "prefill", "decode")
+            records, errors = self._vote(
+                group,
+                operation,
+                (phases.index(value[0]), int(value[2]), int(value[3])),
+                error=value[1],
+            )
+            return [
+                (phases[row[0]], error, bool(row[1]), bool(row[2]))
+                for row, error in zip(records, errors)
+            ]
+        if operation == "prepare":
+            records, errors = self._vote(
+                group,
+                operation,
+                (value[0], value[1], int(value[3]), int(value[4])),
+                error=value[2],
+            )
+            return [
+                (row[0], row[1], error, bool(row[2]), bool(row[3]))
+                for row, error in zip(records, errors)
+            ]
+        # HTTP and other infrequent operations can carry arbitrary objects.
+        # Their fixed header must still match hot step votes before any rank
+        # enters a different collective or model callback.
+        self._vote(group, operation)
         results = self._gather(group, (operation, value))
         if any(kind != operation for kind, _ in results):
             raise DistributedExecutionError(
@@ -529,7 +574,10 @@ class DistributedEngine:
         if failure:
             self._finish(failure)
         available = {item[0] for item in proposals} - {None}
-        allow_overlap = available == {"decode"} and all(item[3] for item in proposals)
+        allow_overlap = (
+            all(item[0] == "decode" and item[3] for item in proposals)
+            and len({item[2] for item in proposals}) == 1
+        )
         if not available:
             return []
         # A mixed domain alternates phases, bounding starvation of either cohort.
