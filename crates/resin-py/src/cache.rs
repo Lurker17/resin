@@ -233,6 +233,9 @@ impl CacheGroupLayout {
 ///
 /// `parent_capacity` is the number of fungible physical slabs shared by every
 /// group. Group order is stable and identifies each group in BatchPlan.
+/// `replay_suffix_tokens` caps prefix hits so every request rebuilds that many
+/// final prompt tokens. Models using this policy must not consume omitted
+/// consumer prefix state: cached opaque bytes are not valid until rebuilt.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CacheLayout {
@@ -271,8 +274,12 @@ impl CacheLayout {
             .map(group_repr)
             .collect::<Vec<_>>()
             .join(", ");
+        let replay = match self.inner.replay_suffix_tokens() {
+            0 => String::new(),
+            tokens => format!(", replay_suffix_tokens={tokens}"),
+        };
         format!(
-            "CacheLayout(parent_capacity={}, groups=[{groups}])",
+            "CacheLayout(parent_capacity={}, groups=[{groups}]{replay})",
             self.inner.parent_capacity()
         )
     }
@@ -281,13 +288,23 @@ impl CacheLayout {
 #[pymethods]
 impl CacheLayout {
     #[new]
+    #[pyo3(signature = (parent_capacity, groups, *, replay_suffix_tokens=0))]
     fn new(
         py: Python<'_>,
         parent_capacity: u32,
         groups: Vec<Py<CacheGroupLayout>>,
+        replay_suffix_tokens: u32,
     ) -> PyResult<Self> {
         let groups = groups.into_iter().map(|group| *group.borrow(py)).collect();
-        Self::from_groups(parent_capacity, groups)
+        let mut layout = Self::from_groups(parent_capacity, groups)?;
+        layout.inner = layout.inner.with_replay_suffix_tokens(replay_suffix_tokens);
+        Ok(layout)
+    }
+
+    /// Minimum final prompt suffix rebuilt after every prefix-cache hit.
+    #[getter]
+    fn replay_suffix_tokens(&self) -> u32 {
+        self.inner.replay_suffix_tokens()
     }
 
     /// Number of fungible physical slabs in the pool.
@@ -573,7 +590,7 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             let group = Py::new(py, history(16, 2)).unwrap();
-            let layout = CacheLayout::new(py, 4, vec![group]).unwrap();
+            let layout = CacheLayout::new(py, 4, vec![group], 0).unwrap();
             assert_eq!(layout.groups_native(), &[history(16, 2).inner()]);
             assert_eq!(layout.groups(py).unwrap().bind(py).len(), 1);
             assert_eq!(layout.group_kernel_page_capacity(0).unwrap(), 8);

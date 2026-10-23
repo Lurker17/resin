@@ -314,6 +314,10 @@ impl SamplingParams {
 /// so that sequence's new tokens occupy consecutive absolute positions
 /// beginning there. `cache_groups` contains one placement plan per declared
 /// `CacheLayout` group, and every group plan covers every sequence.
+/// `prefill_lengths` records the final endpoint of each prefill history,
+/// including generated inputs being reconstructed after retraction. It stays
+/// fixed across those prefill chunks and is only meaningful during prefill.
+/// Public constructors that omit it infer each endpoint from its scheduled end.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug)]
 struct BatchPlan {
@@ -325,6 +329,7 @@ struct BatchPlan {
     prompt_target_token_ids: Vec<u32>,
     sequence_ids: Vec<u64>,
     context_lengths: Vec<u32>,
+    prefill_lengths: Vec<u32>,
     token_ids: Vec<u32>,
     token_indptr: Vec<u32>,
     phase: BatchPhase,
@@ -344,6 +349,7 @@ impl BatchPlan {
             sequence_ids,
             token_indptr,
             context_lengths,
+            prefill_lengths,
             sampling_params,
             sampling_mask,
             media,
@@ -372,6 +378,11 @@ impl BatchPlan {
         if context_lengths.len() != sequence_ids.len() {
             return Err(PyValueError::new_err(
                 "context_lengths must contain one item per sequence",
+            ));
+        }
+        if prefill_lengths.len() != sequence_ids.len() {
+            return Err(PyValueError::new_err(
+                "prefill_lengths must contain one item per sequence",
             ));
         }
         if sampling_params.len() != sequence_ids.len() {
@@ -414,6 +425,17 @@ impl BatchPlan {
         {
             return Err(PyValueError::new_err(
                 "scheduled positions exceed the u32 metadata range",
+            ));
+        }
+        if plan.phase == BatchPhase::Prefill
+            && context_lengths
+                .iter()
+                .zip(token_indptr.windows(2))
+                .zip(prefill_lengths)
+                .any(|((context, range), length)| *context + (range[1] - range[0]) > *length)
+        {
+            return Err(PyValueError::new_err(
+                "prefill_lengths must cover every scheduled prefill row",
             ));
         }
         let mut sorted_ids = sequence_ids.clone();
@@ -527,6 +549,7 @@ impl BatchPlan {
         token_ids,
         token_indptr,
         *,
+        prefill_lengths = None,
         phase = BatchPhase::Prefill,
         batch_id = 0,
         batch_key = None,
@@ -548,6 +571,7 @@ impl BatchPlan {
         context_lengths: PyArrayLike1<'_, u32>,
         token_ids: PyArrayLike1<'_, u32>,
         token_indptr: PyArrayLike1<'_, u32>,
+        prefill_lengths: Option<PyArrayLike1<'_, u32>>,
         phase: BatchPhase,
         batch_id: u64,
         batch_key: Option<u64>,
@@ -566,6 +590,15 @@ impl BatchPlan {
         let context_lengths = arrays::owned_vec(context_lengths);
         let token_ids = arrays::owned_vec(token_ids);
         let token_indptr = arrays::owned_vec(token_indptr);
+        // Malformed CSR inputs are rejected by checked() below; deriving the
+        // compatibility default must not underflow before that validation.
+        let prefill_lengths = prefill_lengths.map(arrays::owned_vec).unwrap_or_else(|| {
+            context_lengths
+                .iter()
+                .zip(token_indptr.windows(2))
+                .map(|(context, range)| context.saturating_add(range[1].saturating_sub(range[0])))
+                .collect()
+        });
         let sequence_count = sequence_ids.len();
         let cache_groups = cache_groups
             .unwrap_or_default()
@@ -622,6 +655,7 @@ impl BatchPlan {
                 .unwrap_or_else(|| vec![0; sequence_count + 1]),
             sequence_ids,
             context_lengths,
+            prefill_lengths,
             token_ids,
             token_indptr,
             phase,
@@ -645,6 +679,13 @@ impl BatchPlan {
     #[getter]
     fn context_lengths<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
         arrays::readonly_view(this.clone().into_any(), &this.get().context_lengths)
+    }
+
+    /// Final history endpoint for each prefill, including retracted generated inputs.
+    /// Only meaningful during prefill; constant across that history's chunks.
+    #[getter]
+    fn prefill_lengths<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        arrays::readonly_view(this.clone().into_any(), &this.get().prefill_lengths)
     }
 
     /// Flattened scheduled token IDs, grouped by sequence.
@@ -1906,6 +1947,7 @@ mod tests {
             prompt_target_token_ids: Vec::new(),
             sequence_ids: vec![1],
             context_lengths: vec![0],
+            prefill_lengths: vec![2],
             token_ids: vec![1, 2],
             token_indptr: vec![0, 2],
             phase: BatchPhase::Prefill,

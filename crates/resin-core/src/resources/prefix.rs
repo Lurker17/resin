@@ -63,13 +63,14 @@ impl<T> PrefixCache<T> {
         self.alignment
     }
 
-    pub(crate) fn find(&mut self, tokens: &[u32]) -> Option<(u32, &T)> {
+    pub(crate) fn find(&mut self, tokens: &[u32], max_prefix_tokens: usize) -> Option<(u32, &T)> {
         let alignment = self.alignment as usize;
         let usable = if tokens.len().is_multiple_of(alignment) {
             tokens.len().saturating_sub(alignment)
         } else {
             tokens.len() / alignment * alignment
-        };
+        }
+        .min(max_prefix_tokens / alignment * alignment);
         let mut node = 0usize;
         let mut matched = None;
         for (block_index, block) in tokens[..usable].chunks_exact(alignment).enumerate() {
@@ -240,7 +241,7 @@ mod tests {
         cache.insert(&[1], "one");
         cache.insert(&[2], "two");
         cache.insert(&[3], "three");
-        assert_eq!(cache.find(&[1, 99]), Some((1, &"one")));
+        assert_eq!(cache.find(&[1, 99], usize::MAX), Some((1, &"one")));
         assert_eq!(cache.insert(&[2], "new two"), Some("two"));
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.evict_lru(), Some("three"));
@@ -252,13 +253,25 @@ mod tests {
     }
 
     #[test]
+    fn replay_limit_is_aligned_without_excluding_the_boundary_again() {
+        let mut cache = PrefixCache::new(4);
+        let tokens = (0..16).collect::<Vec<_>>();
+        for end in [4, 8, 12] {
+            cache.insert(&tokens[..end], end);
+        }
+        assert_eq!(cache.find(&tokens, 8), Some((8, &8)));
+        assert_eq!(cache.find(&tokens, 7), Some((4, &4)));
+        assert_eq!(cache.find(&tokens, 0), None);
+    }
+
+    #[test]
     fn evicting_ancestors_preserves_descendants_and_reuses_pruned_nodes() {
         let mut cache = PrefixCache::new(1);
         cache.insert(&[1], 1);
         cache.insert(&[1, 2], 2);
         cache.insert(&[1, 2, 3], 3);
         assert_eq!(cache.evict_lru(), Some(1));
-        assert_eq!(cache.find(&[1, 2, 99]), Some((2, &2)));
+        assert_eq!(cache.find(&[1, 2, 99], usize::MAX), Some((2, &2)));
         assert_eq!(cache.evict_lru(), Some(3));
         assert_eq!(cache.evict_lru(), Some(2));
         assert!(cache.nodes[0].children.is_empty());
@@ -266,7 +279,7 @@ mod tests {
 
         cache.insert(&[4, 5], 4);
         assert_eq!(cache.nodes.len(), 4);
-        assert_eq!(cache.find(&[4, 5, 99]), Some((2, &4)));
+        assert_eq!(cache.find(&[4, 5, 99], usize::MAX), Some((2, &4)));
         assert_eq!(cache.evict_lru(), Some(4));
         assert_eq!(cache.oldest, None);
         assert_eq!(cache.newest, None);

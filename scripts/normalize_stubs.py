@@ -36,6 +36,7 @@ PARAMETERS = {
     ("BatchPlan", "__new__"): {
         "sequence_ids": "Sequence[int] | npt.NDArray[np.uint64]",
         "context_lengths": U32_INPUT,
+        "prefill_lengths": f"{U32_INPUT} | None",
         "token_ids": U32_INPUT,
         "token_indptr": U32_INPUT,
         "sampling_mask": "Sequence[bool] | npt.NDArray[np.bool_] | None",
@@ -85,6 +86,7 @@ RETURNS = {
                 "BatchPlan",
                 (
                     "context_lengths",
+                    "prefill_lengths",
                     "token_ids",
                     "token_indptr",
                     "positions",

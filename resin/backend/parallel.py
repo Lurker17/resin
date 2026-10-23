@@ -44,6 +44,7 @@ def batch_plan_payload(plan: BatchPlan) -> dict[str, Any]:
         "sequence_ids": plan.sequence_ids,
         "token_indptr": plan.token_indptr,
         "context_lengths": plan.context_lengths,
+        "prefill_lengths": plan.prefill_lengths,
         "sampling_params": [
             {
                 "temperature": params.temperature,
@@ -96,6 +97,7 @@ def batch_plan_from_payload(payload: dict[str, Any]) -> BatchPlan:
         payload["context_lengths"],
         payload["token_ids"],
         payload["token_indptr"],
+        prefill_lengths=payload.get("prefill_lengths"),
         phase=phase,
         batch_id=payload["batch_id"],
         batch_key=payload["batch_key"],

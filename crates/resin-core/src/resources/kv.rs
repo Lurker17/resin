@@ -173,6 +173,7 @@ impl KvGroupLayout {
 pub struct KvLayout {
     parent_capacity: NonZeroU32,
     groups: Box<[KvGroupLayout]>,
+    replay_suffix_tokens: u32,
 }
 
 impl KvLayout {
@@ -219,7 +220,20 @@ impl KvLayout {
         Ok(Self {
             parent_capacity,
             groups: groups.into_boxed_slice(),
+            replay_suffix_tokens: 0,
         })
+    }
+
+    /// Require rebuilding this many final prompt tokens after a prefix hit.
+    /// Models must not read omitted prefix state before rebuilding this suffix;
+    /// snapshots may retain those opaque bytes without making them valid inputs.
+    pub fn with_replay_suffix_tokens(mut self, tokens: u32) -> Self {
+        self.replay_suffix_tokens = tokens;
+        self
+    }
+
+    pub const fn replay_suffix_tokens(&self) -> u32 {
+        self.replay_suffix_tokens
     }
 
     pub const fn parent_capacity(&self) -> NonZeroU32 {
@@ -459,6 +473,16 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn replay_suffix_is_frozen_into_layout_identity() {
+        let layout = KvLayout::new(4, vec![full(128, 1)]).unwrap();
+        let replay = layout.clone().with_replay_suffix_tokens(140);
+        assert_eq!(layout.replay_suffix_tokens(), 0);
+        assert_eq!(replay.replay_suffix_tokens(), 140);
+        assert_eq!(replay.clone(), replay);
+        assert_ne!(layout, replay);
     }
 
     #[test]

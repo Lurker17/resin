@@ -297,6 +297,9 @@ pub struct ExecutionPlan<P> {
     pub phase: Phase,
     pub sequence_ids: Vec<u64>,
     pub context_lengths: Vec<u32>,
+    /// Final prefill-history endpoints, including generated inputs on retraction.
+    /// Only meaningful for prefill; constant across that history's chunks.
+    pub prefill_lengths: Vec<u32>,
     pub token_ids: Vec<u32>,
     pub token_indptr: Vec<u32>,
     pub sampling_mask: Vec<bool>,
@@ -1977,6 +1980,7 @@ fn build_plan<P: Clone>(
     let mut sequence_ids = Vec::with_capacity(requests.len());
     let mut token_indptr = Vec::with_capacity(requests.len() + 1);
     let mut context_lengths = Vec::with_capacity(requests.len());
+    let mut prefill_lengths = Vec::with_capacity(requests.len());
     let mut payloads = Vec::with_capacity(requests.len());
     let mut sampling_mask = Vec::with_capacity(requests.len());
     let mut prompt_score_indices = Vec::new();
@@ -2026,6 +2030,7 @@ fn build_plan<P: Clone>(
             }
         }
         context_lengths.push(scheduled.token_start());
+        prefill_lengths.push(request.prefill_length()?);
         sampling_mask.push(scheduled.sample);
         token_indptr.push(
             u32::try_from(token_ids.len())
@@ -2045,6 +2050,7 @@ fn build_plan<P: Clone>(
         prompt_target_token_ids,
         sequence_ids,
         context_lengths,
+        prefill_lengths,
         token_ids,
         token_indptr,
         phase,
@@ -2164,6 +2170,24 @@ mod tests {
     }
 
     #[test]
+    fn retracted_history_endpoint_is_known_before_the_first_replay_chunk() {
+        let mut replay = request(1, &[10, 11, 12], &[20, 21, 22, 23], None);
+        replay.resident_tokens = 0;
+        let mut config = planning(SchedulerConfig::default());
+        config.prefill_chunk_size = NonZeroU32::new(2).unwrap();
+        for (start, expected_tokens) in [(0, vec![10, 11]), (2, vec![12, 20]), (4, vec![21, 22])] {
+            let rows = schedule_requests(&[&replay], config).unwrap();
+            let plan = build_plan(1, std::slice::from_ref(&replay), &rows, None).unwrap();
+            assert_eq!(plan.context_lengths, vec![start]);
+            assert_eq!(plan.prefill_lengths, vec![6]);
+            assert_eq!(plan.token_ids, expected_tokens);
+            assert_eq!(plan.sampling_mask, vec![false]);
+            replay.resident_tokens += 2;
+        }
+        assert_eq!(replay.phase(), Phase::Decode);
+    }
+
+    #[test]
     fn malformed_rows_are_rejected_before_execution_and_progress_commit() {
         for (decode, phase, start, count, sample) in [
             (false, Phase::Prefill, 1, 2, true),
@@ -2218,6 +2242,7 @@ mod tests {
 
         assert_eq!(plan.token_ids, vec![5, 6]);
         assert_eq!(plan.context_lengths, vec![4]);
+        assert_eq!(plan.prefill_lengths, vec![6]);
         assert_eq!(plan.cache_groups.len(), 2);
         let full = &plan.cache_groups[0];
         assert_eq!(full.block_indptr, [0, 2]);

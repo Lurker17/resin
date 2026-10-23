@@ -21,6 +21,7 @@ pub(super) fn from_core(plan: ExecutionPlan<RequestPayload>) -> BatchPlan {
         prompt_target_token_ids: plan.prompt_target_token_ids,
         sequence_ids: plan.sequence_ids,
         context_lengths: plan.context_lengths,
+        prefill_lengths: plan.prefill_lengths,
         token_ids: plan.token_ids,
         token_indptr: plan.token_indptr,
         phase: match plan.phase {

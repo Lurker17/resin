@@ -46,6 +46,7 @@ def _runner_signature(config: RunnerConfig):
         if layout is None
         else (
             layout.parent_capacity,
+            layout.replay_suffix_tokens,
             tuple(
                 (
                     group.block_tokens,

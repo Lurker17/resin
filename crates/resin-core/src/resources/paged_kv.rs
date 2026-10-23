@@ -169,8 +169,12 @@ impl PagedKvResources {
         state: &mut RequestPages,
         tokens: &[u32],
     ) -> Result<u32, CachePoolError> {
+        let maximum = tokens
+            .len()
+            .saturating_sub(self.layout.replay_suffix_tokens() as usize);
         let (pool, cache) = (&mut self.pool, &mut self.prefix_cache);
-        let Some((length, snapshot)) = cache.as_mut().and_then(|cache| cache.find(tokens)) else {
+        let Some((length, snapshot)) = cache.as_mut().and_then(|cache| cache.find(tokens, maximum))
+        else {
             return Ok(0);
         };
         pool.attach_shared_prefix(state, snapshot)?;

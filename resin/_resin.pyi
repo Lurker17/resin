@@ -32,6 +32,10 @@ class BatchPlan:
     so that sequence's new tokens occupy consecutive absolute positions
     beginning there. `cache_groups` contains one placement plan per declared
     `CacheLayout` group, and every group plan covers every sequence.
+    `prefill_lengths` records the final endpoint of each prefill history,
+    including generated inputs being reconstructed after retraction. It stays
+    fixed across those prefill chunks and is only meaningful during prefill.
+    Public constructors that omit it infer each endpoint from its scheduled end.
     """
     def __new__(
         cls,
@@ -41,6 +45,7 @@ class BatchPlan:
         token_ids: Sequence[int] | npt.NDArray[np.uint32],
         token_indptr: Sequence[int] | npt.NDArray[np.uint32],
         *,
+        prefill_lengths: Sequence[int] | npt.NDArray[np.uint32] | None = None,
         phase: BatchPhase = ...,
         batch_id: int = 0,
         batch_key: int | None = None,
@@ -109,6 +114,12 @@ class BatchPlan:
     def positions(self, /) -> npt.NDArray[np.uint32]:
         """
         Absolute position of every flattened scheduled token.
+        """
+    @property
+    def prefill_lengths(self, /) -> npt.NDArray[np.uint32]:
+        """
+        Final history endpoint for each prefill, including retracted generated inputs.
+        Only meaningful during prefill; constant across that history's chunks.
         """
     @property
     def prompt_score_indices(self, /) -> npt.NDArray[np.uint32]: ...
@@ -331,9 +342,17 @@ class CacheLayout:
 
     `parent_capacity` is the number of fungible physical slabs shared by every
     group. Group order is stable and identifies each group in BatchPlan.
+    `replay_suffix_tokens` caps prefix hits so every request rebuilds that many
+    final prompt tokens. Models using this policy must not consume omitted
+    consumer prefix state: cached opaque bytes are not valid until rebuilt.
     """
     def __new__(
-        cls, /, parent_capacity: int, groups: Sequence[CacheGroupLayout]
+        cls,
+        /,
+        parent_capacity: int,
+        groups: Sequence[CacheGroupLayout],
+        *,
+        replay_suffix_tokens: int = 0,
     ) -> CacheLayout: ...
     def __repr__(self, /) -> str: ...
     def estimated_parent_count(
@@ -360,6 +379,11 @@ class CacheLayout:
     def parent_capacity(self, /) -> int:
         """
         Number of fungible physical slabs in the pool.
+        """
+    @property
+    def replay_suffix_tokens(self, /) -> int:
+        """
+        Minimum final prompt suffix rebuilt after every prefix-cache hit.
         """
 
 @final
