@@ -6,7 +6,7 @@
 //! page-table policy, prefix identity, and device byte layout deliberately live
 //! outside this module.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -726,7 +726,7 @@ pub struct CachePool {
     /// Reused for linear ownership validation. Capacity grows before request
     /// tables grow, so validation and retirement never allocate. The mutex
     /// preserves read-only validation through a shared pool reference.
-    validation_handles: Mutex<HashSet<PageHandle>>,
+    validation_handles: Mutex<Vec<PageHandle>>,
 }
 
 impl CachePool {
@@ -782,7 +782,7 @@ impl CachePool {
             free_parents,
             partial_parents,
             occupied_blocks: 0,
-            validation_handles: Mutex::new(HashSet::new()),
+            validation_handles: Mutex::new(Vec::new()),
         })
     }
 
@@ -1570,12 +1570,21 @@ impl CachePool {
 
     /// Preflight a request retirement without changing ownership or placement.
     pub fn validate_request(&self, request: &RequestPages) -> Result<(), CachePoolError> {
+        self.validate_request_access(request, false)
+    }
+
+    fn validate_request_access(
+        &self,
+        request: &RequestPages,
+        require_idle: bool,
+    ) -> Result<(), CachePoolError> {
         if request.pool_id != self.id {
             return Err(CachePoolError::ForeignPool);
         }
         if self.has_duplicate_request_handle(request)? {
             return Err(CachePoolError::DuplicateHandle);
         }
+        let mut active = false;
         for group in &request.groups {
             for page in &group.pages {
                 if group.group != page.handle.group {
@@ -1594,20 +1603,20 @@ impl CachePool {
                     (Some(PageMode::Shared), false) if slot.request_refs != 0 => {}
                     _ => return Err(CachePoolError::StaleHandle),
                 }
+                active |= require_idle && (slot.writer_lease || slot.reader_leases != 0);
             }
         }
-        Ok(())
+        // Preserve ownership-error precedence even when an earlier page is
+        // busy, without looking up every historical handle for a second pass.
+        if active {
+            Err(CachePoolError::AccessConflict)
+        } else {
+            Ok(())
+        }
     }
 
     fn validate_request_idle(&self, request: &RequestPages) -> Result<(), CachePoolError> {
-        self.validate_request(request)?;
-        for page in request.groups.iter().flat_map(|group| &group.pages) {
-            let slot = self.validate_live_handle(page.handle)?;
-            if slot.writer_lease || slot.reader_leases != 0 {
-                return Err(CachePoolError::AccessConflict);
-            }
-        }
-        Ok(())
+        self.validate_request_access(request, true)
     }
 
     fn prepare_validation_capacity(&mut self, count: usize) -> Result<(), CachePoolError> {
@@ -1631,17 +1640,23 @@ impl CachePool {
             // An allocator-issued request always fits the preallocated table.
             // Reject internally forged excess owners without allocating here.
             if handles.len() == handles.capacity() {
-                return if handles.contains(&page.handle) {
+                handles.sort_unstable();
+                return if handles.windows(2).any(|pair| pair[0] == pair[1])
+                    || handles.binary_search(&page.handle).is_ok()
+                {
                     Ok(true)
                 } else {
                     Err(CachePoolError::StaleHandle)
                 };
             }
-            if !handles.insert(page.handle) {
-                return Ok(true);
-            }
+            handles.push(page.handle);
         }
-        Ok(false)
+        // Tables emitted by the allocator are already ordered except for a
+        // small cyclic suffix. Sorting reusable scratch avoids hashing every
+        // shared historical handle on each decode, without trusting callers
+        // or allocating on a retirement/error path.
+        handles.sort_unstable();
+        Ok(handles.windows(2).any(|pair| pair[0] == pair[1]))
     }
 
     fn validate_writer_claim(&self, claim: PageAccessClaim) -> Result<(), CachePoolError> {
@@ -1803,6 +1818,7 @@ impl CachePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn nz(value: u32) -> NonZeroU32 {
         NonZeroU32::new(value).unwrap()
@@ -2345,6 +2361,63 @@ mod tests {
         );
         failure.request.groups[0].pages.pop();
         pool.retire_request(failure.request).unwrap();
+    }
+
+    #[test]
+    fn idle_validation_keeps_ownership_errors_ahead_of_active_leases() {
+        let mut pool = CachePool::new(3, &[nz(1)]).unwrap();
+        let first = pool
+            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 2)])
+            .unwrap();
+        let mut first = pool.promote_request(first);
+        let second = pool
+            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)])
+            .unwrap();
+        let second = pool.promote_request(second);
+        let claims = vec![first.access_claim(&first.groups[0].pages[0])];
+        let prepared = pool.prepare_writer_access(claims).unwrap();
+        let lease = pool.acquire_writer_access(prepared).unwrap();
+        let original = first.groups[0].pages[1].handle;
+        first.groups[0].pages[1].handle = second.groups[0].pages[0].handle;
+        let demands = [GroupDemand::new(GroupId::new(0), 2)];
+        assert_eq!(
+            pool.grow_request(&mut first, &demands),
+            Err(CachePoolError::WrongWriter)
+        );
+        first.groups[0].pages[1].handle = original;
+        assert_eq!(
+            pool.grow_request(&mut first, &demands),
+            Err(CachePoolError::AccessConflict)
+        );
+        pool.release_writer_access(lease);
+        pool.grow_request(&mut first, &demands).unwrap();
+        pool.retire_request(first).unwrap();
+        pool.retire_request(second).unwrap();
+        assert_eq!(pool.free_parent_count(), 3);
+    }
+
+    #[test]
+    fn duplicate_validation_uses_preallocated_scratch_for_forged_excess_pages() {
+        let mut pool = CachePool::new(1, &[nz(1)]).unwrap();
+        let request = pool
+            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+            .unwrap();
+        let mut request = pool.promote_request(request);
+        let capacity = pool.validation_handles.lock().unwrap().capacity();
+        let handle = request.groups[0].pages[0].handle;
+        for _ in 0..=capacity {
+            request.groups[0].pages.push(PageRef {
+                handle,
+                writable: true,
+            });
+        }
+        assert_eq!(
+            pool.validate_request(&request),
+            Err(CachePoolError::DuplicateHandle)
+        );
+        assert_eq!(pool.validation_handles.lock().unwrap().capacity(), capacity);
+        request.groups[0].pages.truncate(1);
+        pool.retire_request(request).unwrap();
     }
 
     #[test]

@@ -144,6 +144,11 @@ impl PagedKvResources {
             replacements[group_index].sort_unstable();
             replacements[group_index].dedup();
         }
+        // grow_request already authenticated the whole idle owner above. An
+        // unchanged ring needs no second full-history validation or mutation.
+        if replacements.iter().all(Vec::is_empty) {
+            return Ok(());
+        }
         loop {
             match self.pool.replace_shared_pages(state, &replacements) {
                 Ok(()) => return Ok(()),
@@ -336,6 +341,7 @@ impl PagedKvResources {
             .sum();
         let mut groups = Vec::with_capacity(self.layout.groups().len());
         let mut claims = Vec::<PageAccessClaim>::new();
+        let mut shared_reads = HashSet::new();
         for (group_index, group) in self.layout.groups().iter().copied().enumerate() {
             let mut indptr = Vec::with_capacity(requests.len() + 1);
             let mut block_slab_ids = Vec::new();
@@ -379,7 +385,14 @@ impl PagedKvResources {
                     let (slab_id, slotnum) = self.pool.physical_address(page.handle())?;
                     block_slab_ids.push(slab_id);
                     block_slotnums.push(slotnum);
-                    claims.push(request.state.access_claim(page));
+                    // Every request was authenticated above. A shared prefix
+                    // needs one read pin for the batch, even when hundreds of
+                    // rows expose that same history in their device tables.
+                    // Keep every write claim so conflicting writers still fail
+                    // prepare_writer_access's transactional duplicate check.
+                    if page.is_writable() || shared_reads.insert((slab_id, slotnum)) {
+                        claims.push(request.state.access_claim(page));
+                    }
                 }
                 indptr.push(
                     u32::try_from(block_slab_ids.len()).map_err(|_| {
@@ -846,6 +859,103 @@ mod tests {
         assert_eq!(resources.prefix_cache_metrics(), Some((1, 1, 0, 0)));
         resources.retire(second).unwrap();
         resources.retire(first).unwrap();
+    }
+
+    #[test]
+    fn shared_batch_read_claims_keep_all_tables_and_pin_retired_owners() {
+        let layout = KvLayout::new(
+            4,
+            vec![KvGroupLayout::new(2, 1, KvRetention::FullContext).unwrap()],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::with_prefix_cache(layout).unwrap();
+        let seed_id = RequestId::new(NonZeroU64::new(1).unwrap());
+        let mut seed = resources.attach(seed_id, 0).unwrap();
+        resources.ensure_context(&mut seed, 0, 4).unwrap();
+        resources
+            .publish_prefix(&mut seed, &[10, 11, 12, 13], 4)
+            .unwrap();
+        resources.retire(seed).unwrap();
+
+        let mut owners = Vec::new();
+        for value in 2..=3 {
+            let id = RequestId::new(NonZeroU64::new(value).unwrap());
+            let mut state = resources.attach(id, 0).unwrap();
+            assert_eq!(
+                resources
+                    .restore_prefix(&mut state, &[10, 11, 12, 13, 20])
+                    .unwrap(),
+                4
+            );
+            resources.ensure_context(&mut state, 4, 5).unwrap();
+            owners.push((id, state));
+        }
+        let steps = [SequenceStep {
+            phase: Phase::Decode,
+            tokens: TokenRange {
+                start: 4,
+                count: NonZeroU32::new(1).unwrap(),
+            },
+            sample: true,
+        }; 2];
+        let requests = owners
+            .iter()
+            .map(|(id, state)| RequestResourceRef {
+                request_id: *id,
+                state,
+            })
+            .collect::<Vec<_>>();
+        let access = resources.acquire(&requests, &steps, 0).unwrap();
+        assert_eq!(access.view.groups[0].block_indptr, [0, 3, 6]);
+        let addresses = &access.view.groups[0].block_slab_ids;
+        assert_eq!(&addresses[..2], &addresses[3..5]);
+        assert_ne!(addresses[2], addresses[5]);
+        assert_eq!(access.lease.len(), 4); // Two shared reads, two distinct writers.
+        drop(requests);
+        for (_, state) in owners {
+            resources.retire(state).unwrap();
+        }
+        resources.clear_prefix_cache().unwrap();
+        assert_eq!(resources.pool().occupied_block_count(), 4);
+        resources.release(access.lease);
+        assert_eq!(resources.pool().free_parent_count(), 4);
+    }
+
+    #[test]
+    fn batch_shared_read_deduplication_never_hides_duplicate_writers() {
+        let layout = KvLayout::new(
+            1,
+            vec![KvGroupLayout::new(2, 1, KvRetention::FullContext).unwrap()],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::new(layout).unwrap();
+        let id = RequestId::new(NonZeroU64::new(1).unwrap());
+        let state = resources.attach(id, 2).unwrap();
+        let requests = [
+            RequestResourceRef {
+                request_id: id,
+                state: &state,
+            },
+            RequestResourceRef {
+                request_id: id,
+                state: &state,
+            },
+        ];
+        let steps = [SequenceStep {
+            phase: Phase::Decode,
+            tokens: TokenRange {
+                start: 0,
+                count: NonZeroU32::new(1).unwrap(),
+            },
+            sample: true,
+        }; 2];
+        assert!(matches!(
+            resources.acquire(&requests, &steps, 0),
+            Err(PagedKvError::Cache(CachePoolError::DuplicateAccessClaim))
+        ));
+        assert!(!resources.batch_active);
+        resources.retire(state).unwrap();
+        assert_eq!(resources.pool().free_parent_count(), 1);
     }
 
     #[test]
