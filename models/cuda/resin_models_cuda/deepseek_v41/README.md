@@ -115,7 +115,7 @@ including irregular masks and both position dtypes. Five graph replays per case
 update positions, parent/child tables, masks and selected indices. Its report is
 `artifacts/benchmarks/deepinfer-v41-batch-metadata-probe.json`.
 
-At clean commit `4ca8eb2`, the [full-checkpoint EP4/ADP4 B300 check](https://modal.com/apps/ekzhang/main/ap-agflU32LUNXLq0VuVaehmh)
+At clean commit `cd5ecfd`, the [full-checkpoint EP4/ADP4 B300 check](https://modal.com/apps/ekzhang/main/ap-G0MLxyy7133CqWY3HJwRjo)
 passes on all four drivers with the released 384 experts and natural routing.
 Each driver runs four prefill and three decode steps, replays three full decode
 graphs, 160 prefill compute regions and 480 attention-projection regions. Eager
@@ -124,7 +124,13 @@ generated-token logprobs and top-3 logprobs (maximum absolute difference zero).
 This includes the shared metadata and prepared forward operators. Natural K3
 verification accepts 9/9 drafts on this short counting prompt; this does not
 establish model quality or representative acceptance. The report is
-`artifacts/benchmarks/2026-10-22-deepseek-v41-prepared/validation.json`.
+`artifacts/benchmarks/2026-10-22-deepseek-v41-prepared/overlap-validation.json`.
+
+The same run checks Engine-owned GPU feedback with greedy sampling, scores and
+token stops disabled. All four drivers emit 160 tokens identical to synchronous
+captured execution, with 57 enqueues and 55 GPU continuations per driver. Generated
+positions 26 through 185 cross a 128-token cache-page boundary, exercising the
+transition back through page planning as well as continued graph replay.
 
 The [native FP32 route EP2 probe](https://modal.com/apps/ekzhang/main/ap-72WXKqszkwgN9zSWQIn3gv)
 at `14af36b` covers synthetic 16-expert, top-6 routing with widths 5,120/2,304 and
