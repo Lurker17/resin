@@ -274,7 +274,7 @@ def _table_grid_probe():
             graph.replay()
             torch.cuda.synchronize()
             assert torch.equal(output[0], (swa * 4).repeat_interleave(queries, 0))
-            assert torch.equal(output[1], (ca * 8).repeat(queries, 1))
+            assert torch.equal(output[1], (ca * 8).repeat_interleave(queries, dim=0))
         results.append({"batch": batch, "queries": queries, "exact_replays": 3})
     return results
 
