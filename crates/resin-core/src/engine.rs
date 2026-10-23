@@ -474,6 +474,9 @@ type ScheduledRow = SequenceStep;
 struct BatchRow<P> {
     request: Request<P>,
     scheduled: ScheduledRow,
+    // Logical completion may precede the already-enqueued step's retirement.
+    // Keep its physical row and cache ownership until that step is harvested.
+    terminal: bool,
 }
 
 struct PreparedProgress {
@@ -595,7 +598,10 @@ impl<P: Clone> EngineCore<P> {
         self.in_flight.is_some() || !self.scheduler.is_empty()
     }
     pub fn active_request_count(&self) -> usize {
-        self.scheduler.len() + self.in_flight.as_ref().map_or(0, |batch| batch.rows.len())
+        self.scheduler.len()
+            + self.in_flight.as_ref().map_or(0, |batch| {
+                batch.rows.iter().filter(|row| !row.terminal).count()
+            })
     }
 
     pub fn ready_request_count(&self) -> usize {
@@ -904,7 +910,10 @@ impl<P: Clone> EngineCore<P> {
         // A rejection promises that persistent state is unchanged. Every other
         // execution failure keeps the exact requests and writer lease quarantined.
         let output = match output {
-            Err(error) if error.kind == ErrorKind::Rejected => {
+            Err(error)
+                if error.kind == ErrorKind::Rejected
+                    && !batch.rows.iter().any(|row| row.terminal) =>
+            {
                 self.release_kv_access(batch.resources.take());
                 self.scheduler
                     .restore_rejected(batch.rows.into_iter().map(|row| row.request).collect());
@@ -915,11 +924,12 @@ impl<P: Clone> EngineCore<P> {
             }
             Ok(output) => output,
         };
-        self.complete_batch(runner, batch, output, make_event)
+        self.complete_batch(runner, batch, output, make_event, None)
     }
 
     /// Retain a decode view only when another maximum-sized step cannot
-    /// allocate, rotate, replace, retire, or publish any of its leased pages.
+    /// allocate, rotate, replace, or publish any of its leased pages. Stops
+    /// complete logically while physical retirement waits for the next step.
     /// The caller separately checks that its device runtime supports feedback.
     pub fn retain_continuation(&mut self, plan: &ExecutionPlan<P>) -> bool {
         let maximum = u64::from(self.runner_config.cache_write_lookahead_tokens) + 1;
@@ -930,7 +940,7 @@ impl<P: Clone> EngineCore<P> {
             && plan.phase == Phase::Decode
             && batch.rows.len() == plan.sequence_ids.len()
             && batch.rows.iter().all(|row| {
-                row.request.stop_token_ids.is_empty()
+                !row.terminal
                     && row
                         .request
                         .max_new_tokens
@@ -994,87 +1004,31 @@ impl<P: Clone> EngineCore<P> {
     }
 
     /// Commit the previous output while the next device step uses the same
-    /// page lease. Eligibility excludes retirement and page-boundary changes.
+    /// page lease. Terminal rows keep their original physical slots and cache
+    /// ownership until that next step completes; its outputs are discarded.
     pub fn complete_continuing_step_with<E>(
         &mut self,
         runner: &mut impl Runner<P>,
         output: Result<Vec<Vec<u32>>>,
         make_event: impl FnMut(TokenEvent) -> Result<E>,
     ) -> Result<Vec<E>> {
-        let Some(mut template) = self.continuation.take() else {
+        self.raise_if_open()?;
+        let Some(template) = self.continuation.take() else {
             return Err(Error::internal("Engine has no safe decode continuation"));
         };
-        let mut resources = self
+        let batch = self
             .in_flight
-            .as_mut()
-            .ok_or_else(|| Error::internal("Engine has no in-flight step to continue"))?
-            .resources
-            .take();
-        let events = match self.complete_step_with(runner, output, make_event) {
-            Ok(events) => events,
+            .take()
+            .ok_or_else(|| Error::internal("Engine has no in-flight step to continue"))?;
+        let output = match output {
+            // A next forward was already accepted: even a previous-step
+            // rejection cannot justify returning its shared writer lease.
             Err(error) => {
-                // A next forward was already accepted: even a previous-step
-                // rejection cannot justify returning this writer lease.
-                if let Some(batch) = self.quarantined.as_mut() {
-                    batch.resources = resources.take();
-                } else {
-                    let rows = template
-                        .sequence_ids
-                        .iter()
-                        .filter_map(|id| {
-                            self.scheduler
-                                .position(|request| request.id == *id)
-                                .map(|index| self.scheduler.remove(index))
-                        })
-                        .map(|request| BatchRow {
-                            scheduled: SequenceStep {
-                                phase: Phase::Decode,
-                                tokens: TokenRange {
-                                    start: request.resident_tokens,
-                                    count: NonZeroU32::MIN,
-                                },
-                                sample: true,
-                            },
-                            request,
-                        })
-                        .collect();
-                    self.quarantined = Some(Batch {
-                        rows,
-                        resources: resources.take(),
-                    });
-                }
-                self.poison("overlapped execution failed after enqueue", &error);
-                return Err(error);
+                return self.quarantine(batch, "overlapped execution failed after enqueue", error);
             }
+            Ok(output) => output,
         };
-        let mut rows = Vec::with_capacity(template.sequence_ids.len());
-        for (slot, id) in template.sequence_ids.iter().enumerate() {
-            let index = self
-                .scheduler
-                .position(|request| request.id == *id)
-                .expect("safe continuation cannot retire a request");
-            let request = self.scheduler.remove(index);
-            let position = request.resident_tokens;
-            template.context_lengths[slot] = position;
-            template.token_ids[slot] = *request
-                .generated
-                .last()
-                .expect("decode continuation has generated tokens");
-            rows.push(BatchRow {
-                request,
-                scheduled: SequenceStep {
-                    phase: Phase::Decode,
-                    tokens: TokenRange {
-                        start: position,
-                        count: NonZeroU32::MIN,
-                    },
-                    sample: true,
-                },
-            });
-        }
-        self.in_flight = Some(Batch { rows, resources });
-        self.retain_continuation(&template);
-        Ok(events)
+        self.complete_batch(runner, batch, output, make_event, Some(template))
     }
 
     fn selected_cohort(&self) -> Result<(Vec<&Request<P>>, Selection)> {
@@ -1259,7 +1213,11 @@ impl<P: Clone> EngineCore<P> {
             rows: scheduled
                 .into_iter()
                 .zip(scheduled_rows)
-                .map(|(request, scheduled)| BatchRow { request, scheduled })
+                .map(|(request, scheduled)| BatchRow {
+                    request,
+                    scheduled,
+                    terminal: false,
+                })
                 .collect(),
             resources: acquired_kv.map(|access| access.lease),
         };
@@ -1273,6 +1231,7 @@ impl<P: Clone> EngineCore<P> {
         mut batch: Batch<P>,
         output_token_ids: Vec<Vec<u32>>,
         mut make_event: impl FnMut(TokenEvent) -> Result<E>,
+        continuation: Option<ExecutionPlan<P>>,
     ) -> Result<Vec<E>> {
         // Validate the complete execution result before terminal output limits
         // can hide writes beyond the leased capacity or extra prefill tokens.
@@ -1348,6 +1307,14 @@ impl<P: Clone> EngineCore<P> {
         let mut committed_token_ids = Vec::with_capacity(batch.rows.len());
         for (row_index, (row, token_ids)) in batch.rows.iter().zip(&output_token_ids).enumerate() {
             let request = &row.request;
+            if row.terminal {
+                // This physical row ran after its previous result reached a
+                // stop token. Validate its execution above, then ignore it.
+                retired.push(true);
+                retired_ids.push(request.id);
+                committed_token_ids.push(Vec::new());
+                continue;
+            }
             if !row.scheduled.sample {
                 let finished = request.max_new_tokens == 0
                     && row.scheduled.token_end() == Some(request.prompt_length());
@@ -1411,7 +1378,7 @@ impl<P: Clone> EngineCore<P> {
         // Validate every physical retirement and reserve all destination
         // storage before asking the runner or any allocator to release state.
         for (row, retire) in batch.rows.iter().zip(&retired) {
-            if !*retire {
+            if !*retire || continuation.is_some() {
                 continue;
             }
             if let Err(error) = self.validate_request_cache(&row.request) {
@@ -1419,29 +1386,32 @@ impl<P: Clone> EngineCore<P> {
             }
         }
         let mut survivors = Vec::new();
-        if survivors
-            .try_reserve_exact(batch.rows.len().saturating_sub(retired_ids.len()))
-            .is_err()
+        if continuation.is_none()
+            && survivors
+                .try_reserve_exact(batch.rows.len().saturating_sub(retired_ids.len()))
+                .is_err()
         {
             let error = Error::memory("could not reserve surviving request storage");
             return self.quarantine(batch, "native survivor storage failed", error);
         }
 
-        if !retired_ids.is_empty()
+        if continuation.is_none()
+            && !retired_ids.is_empty()
             && let Err(error) = execution_call("release", || runner.release(&retired_ids))
         {
             return self.quarantine(batch, "runner release failed", error);
         }
-        // Runner cleanup proves physical execution is terminal. Only now may
-        // the cache writer lease return.
-        self.release_kv_access(batch.resources.take());
-
-        if let Err(error) = self.publish_batch_prefixes(&mut batch, &prepared_progress) {
-            return self.quarantine(batch, "native prefix publication failed", error);
+        if continuation.is_none() {
+            // Runner cleanup proves physical execution is terminal. Only now
+            // may its writer lease return and cache pages become reusable.
+            self.release_kv_access(batch.resources.take());
+            if let Err(error) = self.publish_batch_prefixes(&mut batch, &prepared_progress) {
+                return self.quarantine(batch, "native prefix publication failed", error);
+            }
         }
 
         for (row, retire) in batch.rows.iter_mut().zip(&retired) {
-            if !*retire {
+            if !*retire || continuation.is_some() {
                 continue;
             }
             if let Err(error) = self.retire_request_cache(&mut row.request) {
@@ -1472,15 +1442,44 @@ impl<P: Clone> EngineCore<P> {
             let start = row.scheduled.token_start() as usize + 1;
             scores[start..start + updates.len()].clone_from_slice(&updates);
         }
-        for (row, retire) in batch.rows.drain(..).zip(retired) {
-            let request = row.request;
-            if retire {
-                complete_request_lease(&request.lease, request.generated, false);
-            } else {
-                survivors.push(request);
+        if let Some(mut template) = continuation {
+            for (slot, (row, retire)) in batch.rows.iter_mut().zip(retired).enumerate() {
+                if retire {
+                    complete_request_lease(
+                        &row.request.lease,
+                        std::mem::take(&mut row.request.generated),
+                        false,
+                    );
+                    row.terminal = true;
+                } else {
+                    let position = row.request.resident_tokens;
+                    row.scheduled.tokens = TokenRange {
+                        start: position,
+                        count: NonZeroU32::MIN,
+                    };
+                    template.context_lengths[slot] = position;
+                    template.token_ids[slot] = *row
+                        .request
+                        .generated
+                        .last()
+                        .expect("decode continuation has generated tokens");
+                }
             }
+            self.in_flight = Some(batch);
+            self.retain_continuation(&template);
+        } else {
+            for (row, retire) in batch.rows.drain(..).zip(retired) {
+                let request = row.request;
+                if retire {
+                    if !row.terminal {
+                        complete_request_lease(&request.lease, request.generated, false);
+                    }
+                } else {
+                    survivors.push(request);
+                }
+            }
+            self.scheduler.requeue_survivors(survivors);
         }
-        self.scheduler.requeue_survivors(survivors);
         if decoded_batch {
             self.decay_new_token_ratio();
         }
@@ -1548,7 +1547,8 @@ impl<P: Clone> EngineCore<P> {
             return Ok(());
         };
         for (row, progress) in batch.rows.iter_mut().zip(progress) {
-            if !row.request.cacheable
+            if row.terminal
+                || !row.request.cacheable
                 || progress.resident_tokens == 0
                 || progress.resident_tokens % alignment != 0
             {
@@ -1859,6 +1859,13 @@ impl<P: Clone> EngineCore<P> {
         let mut prepared = Vec::with_capacity(rows.len());
         for (row, token_ids) in rows.iter_mut().zip(output_token_ids) {
             let request = &mut row.request;
+            if row.terminal {
+                prepared.push(PreparedProgress {
+                    resident_tokens: request.resident_tokens,
+                    sampled_tokens: Vec::new(),
+                });
+                continue;
+            }
             let scheduled = row.scheduled;
             let token_end = request.validate_step(scheduled)?;
             if token_ids.is_empty() {
@@ -2207,7 +2214,11 @@ mod tests {
                 sample,
             };
             assert!(build_plan(1, std::slice::from_ref(&request), &[scheduled], None).is_err());
-            let mut rows = [BatchRow { request, scheduled }];
+            let mut rows = [BatchRow {
+                request,
+                scheduled,
+                terminal: false,
+            }];
             assert!(EngineCore::<()>::prepare_scheduled_progress(&mut rows, &[vec![9]]).is_err());
         }
     }

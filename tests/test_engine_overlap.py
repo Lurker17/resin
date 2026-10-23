@@ -176,17 +176,94 @@ def test_async_failure_quarantines_the_original_writer_lease():
     runner.shutdown()
 
 
-def test_stop_conditions_and_short_budgets_use_synchronous_reference():
-    for stop, limit in (([999], 24), (None, 4)):
-        runner = AsyncRunner()
-        engine = Engine(runner)
-        request = engine.submit([1], max_new_tokens=limit, stop_token_ids=stop)
-        engine.step()
-        assert engine.step()
-        assert not runner.pending and not engine.overlap_pending
-        engine.close()
-        assert request.done
-        runner.shutdown()
+def test_short_budgets_use_synchronous_reference():
+    runner = AsyncRunner()
+    engine = Engine(runner)
+    request = engine.submit([1], max_new_tokens=4)
+    engine.step()
+    assert engine.step()
+    assert not runner.pending and not engine.overlap_pending
+    engine.close()
+    assert request.done
+    runner.shutdown()
+
+
+@pytest.mark.parametrize("stop,engine_eos", [(3, None), (4, None), (3, 3)])
+def test_stop_result_precedes_successor_completion_but_release_waits(
+    monkeypatch, stop, engine_eos
+):
+    runner = AsyncRunner()
+    original = runner.enqueue
+
+    def enqueue(plan, *, feedback=None):
+        completion = original(plan, feedback=feedback)
+        if feedback is not None:
+            completion.future = Future()
+        return completion
+
+    monkeypatch.setattr(runner, "enqueue", enqueue)
+    engine = Engine(runner, eos_token_id=engine_eos)
+    request = engine.submit(
+        [1],
+        max_new_tokens=24,
+        stop_token_ids=None if engine_eos is not None else [stop],
+    )
+    assert [event.token_id for event in engine.step()] == [2]
+    assert engine.step() == []
+    events = engine.step()
+    assert [event.token_id for event in events] == list(range(3, stop + 1))
+    assert events[-1].finished and events[-1].finish_reason == "stop"
+    assert request.done and not request.cancelled
+    assert request.take_result() == list(range(2, stop + 1))
+    assert engine.overlap_stats == (2, 1)
+    assert engine.overlap_pending and not engine.overlap_ready
+    assert engine.active_request_count == 0 and engine.has_work()
+    assert engine.cache_free_parent_count == 15
+    assert runner.released == []
+    successor = runner.pending[-1]
+    assert not successor.future.done()
+
+    successor.future.set_result(successor.rows)
+    assert engine.step() == []
+    assert not engine.overlap_pending and not engine.has_work()
+    assert engine.cache_free_parent_count == 16
+    assert runner.released == [request.id]
+    assert all(runner.completed_before_release)
+    assert not engine.cancel(request)
+    with pytest.raises(RuntimeError, match="already been consumed"):
+        request.take_result()
+    engine.close()
+    assert runner.released == [request.id]
+    runner.shutdown()
+
+
+def test_cancel_survivor_drains_terminal_peer_without_losing_other_events():
+    runner = AsyncRunner()
+    engine = Engine(runner)
+    stopped = engine.submit([1], max_new_tokens=24, stop_token_ids=[3])
+    canceled = engine.submit([10], max_new_tokens=24, stop_token_ids=[999])
+    survivor = engine.submit([20], max_new_tokens=24, stop_token_ids=[999])
+    engine.step()
+    assert engine.step() == []
+    events = engine.step()
+    assert [event.token_id for event in events if event.request_id == stopped.id] == [3]
+    assert stopped.take_result() == [2, 3]
+    assert engine.overlap_pending and not engine.overlap_ready
+    assert runner.released == []
+
+    assert engine.cancel(canceled)
+    assert canceled.cancelled and canceled.take_result() == [11, 12, 13, 14, 15]
+    assert runner.released == [stopped.id, canceled.id]
+    events = engine.step()
+    assert [(event.request_id, event.token_id) for event in events] == [
+        (survivor.id, 24),
+        (survivor.id, 25),
+    ]
+    engine.close()
+    assert survivor.take_result() == [21, 22, 23, 24, 25, 26, 27]
+    assert all(runner.completed_before_release)
+    assert engine.cache_free_parent_count == 16
+    runner.shutdown()
 
 
 def test_gpu_feedback_matches_reference_across_page_and_budget_drains():

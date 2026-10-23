@@ -517,11 +517,7 @@ fn decode_continuation_transfers_writer_lease_and_commits_exact_feedback_depth()
 
 #[test]
 fn unsafe_decode_boundaries_fall_back_before_enqueuing_a_continuation() {
-    for (prompt, stop, limit) in [
-        (vec![1; 127], None, 40),
-        (vec![1], Some(vec![9]), 40),
-        (vec![1], None, 4),
-    ] {
+    for (prompt, limit) in [(vec![1; 127], 40), (vec![1], 4)] {
         let mut engine = EngineCore::new(
             RunnerConfig {
                 cache_layout: Some(
@@ -542,9 +538,7 @@ fn unsafe_decode_boundaries_fall_back_before_enqueuing_a_continuation() {
         )
         .unwrap();
         let mut model = Model::default();
-        let mut submission = input(prompt, limit);
-        submission.stop_token_ids = stop;
-        engine.submit(submission).unwrap();
+        engine.submit(input(prompt, limit)).unwrap();
         engine.step(&mut model).unwrap();
         let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
         assert!(!engine.retain_continuation(&plan));
@@ -552,6 +546,190 @@ fn unsafe_decode_boundaries_fall_back_before_enqueuing_a_continuation() {
         let output = model.forward(plan);
         engine.complete_step_with(&mut model, output, Ok).unwrap();
         engine.close(&mut model).unwrap();
+    }
+}
+
+fn stop_overlap_engine() -> EngineCore<&'static str> {
+    EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    8,
+                    vec![KvGroupLayout::new(128, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            cache_write_lookahead_tokens: 3,
+            ..Default::default()
+        },
+        4,
+        512,
+        SchedulerConfig::default(),
+        None,
+        true,
+    )
+    .unwrap()
+}
+
+#[test]
+fn stopped_continuation_publishes_result_but_keeps_pages_until_successor_finishes() {
+    for stop in [3, 4, 5] {
+        let mut engine = stop_overlap_engine();
+        let mut model = Model::default();
+        let mut submission = input(vec![1], 40);
+        submission.stop_token_ids = Some(vec![stop]);
+        let request = engine.submit(submission).unwrap();
+        engine.step(&mut model).unwrap();
+        let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+        assert!(engine.retain_continuation(&plan));
+        engine.continuation_plan().unwrap().unwrap(); // Successor accepted on device.
+        let leased = engine.cache_free_parent_count();
+
+        let events = engine
+            .complete_continuing_step_with(&mut model, Ok(vec![vec![3, 4, 5]]), Ok)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.token_id)
+                .collect::<Vec<_>>(),
+            (3..=stop).collect::<Vec<_>>()
+        );
+        assert!(events.last().unwrap().finished);
+        assert_eq!(
+            events.last().unwrap().finish_reason,
+            Some(resin_core::engine::CompletionReason::Stop)
+        );
+        assert!(request.done());
+        assert_eq!(
+            request.take_result().unwrap(),
+            (2..=stop).collect::<Vec<_>>()
+        );
+        assert_eq!(engine.active_request_count(), 0);
+        assert_eq!(engine.ready_request_count(), 0);
+        assert!(engine.has_work() && engine.has_in_flight_step());
+        assert!(engine.continuation_plan().unwrap().is_none());
+        assert_eq!(engine.cache_free_parent_count(), leased);
+        assert!(model.released.is_empty());
+        assert!(engine.cancel(&mut model, &request).is_err());
+
+        // The device used the untruncated accepted block for feedback. Neither
+        // its extra positions nor its sampled output belong to this request.
+        let discarded = engine
+            .complete_step_with(&mut model, Ok(vec![vec![100, 101, 102, 103]]), Ok)
+            .unwrap();
+        assert!(discarded.is_empty());
+        assert_eq!(model.released, [request.id()]);
+        assert_eq!(engine.cache_free_parent_count(), Some(8));
+        assert!(!engine.has_work());
+        assert!(!engine.cancel(&mut model, &request).unwrap());
+        assert!(request.take_result().is_err()); // Never refill a consumed result.
+        engine.close(&mut model).unwrap();
+        assert_eq!(model.released, [request.id()]);
+    }
+}
+
+#[test]
+fn stopped_middle_row_retains_dense_successor_slots_and_variable_acceptance() {
+    let mut engine = stop_overlap_engine();
+    let mut model = Model::default();
+    let requests: Vec<_> = [1, 10, 20]
+        .into_iter()
+        .map(|token| {
+            let mut submission = input(vec![token], 40);
+            submission.stop_token_ids = Some(vec![99]);
+            engine.submit(submission).unwrap()
+        })
+        .collect();
+    engine.step(&mut model).unwrap();
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert!(engine.retain_continuation(&plan));
+    engine.continuation_plan().unwrap().unwrap();
+    let events = engine
+        .complete_continuing_step_with(
+            &mut model,
+            Ok(vec![vec![3, 4], vec![99, 100, 101], vec![22]]),
+            Ok,
+        )
+        .unwrap();
+    assert_eq!(events.len(), 4);
+    assert_eq!(requests[1].take_result().unwrap(), [11, 99]);
+    assert_eq!(engine.active_request_count(), 2);
+    assert_eq!(engine.cache_free_parent_count(), Some(5));
+    assert!(model.released.is_empty());
+    assert!(!engine.has_continuation());
+
+    let events = engine
+        .complete_step_with(
+            &mut model,
+            Ok(vec![vec![5], vec![900, 901], vec![23, 24, 25, 26]]),
+            Ok,
+        )
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| (event.request_id, event.token_id))
+            .collect::<Vec<_>>(),
+        [
+            (requests[0].id(), 5),
+            (requests[2].id(), 23),
+            (requests[2].id(), 24),
+            (requests[2].id(), 25),
+            (requests[2].id(), 26),
+        ]
+    );
+    assert_eq!(model.released, [requests[1].id()]);
+    assert_eq!(engine.cache_free_parent_count(), Some(6));
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert_eq!(plan.sequence_ids, [requests[0].id(), requests[2].id()]);
+    assert_eq!(plan.context_lengths, [4, 6]);
+    assert_eq!(plan.token_ids, [5, 26]);
+    engine
+        .complete_step_with(&mut model, Err(Error::rejected("not launched")), Ok)
+        .unwrap_err();
+    assert!(engine.cancel(&mut model, &requests[0]).unwrap());
+    assert!(requests[0].cancelled());
+    engine.close(&mut model).unwrap();
+    assert_eq!(engine.cache_free_parent_count(), Some(8));
+    assert_eq!(requests[0].take_result().unwrap(), [2, 3, 4, 5]);
+    assert_eq!(requests[2].take_result().unwrap(), [21, 22, 23, 24, 25, 26]);
+}
+
+#[test]
+fn failed_successor_quarantines_terminal_rows_without_resurrection() {
+    for failure in 0..3 {
+        let mut engine = stop_overlap_engine();
+        let mut model = Model::default();
+        let mut submission = input(vec![1], 40);
+        submission.stop_token_ids = Some(vec![3]);
+        let request = engine.submit(submission).unwrap();
+        engine.step(&mut model).unwrap();
+        let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+        assert!(engine.retain_continuation(&plan));
+        engine.continuation_plan().unwrap().unwrap();
+        engine
+            .complete_continuing_step_with(&mut model, Ok(vec![vec![3, 4]]), Ok)
+            .unwrap();
+        assert_eq!(request.take_result().unwrap(), [2, 3]);
+        let output = match failure {
+            0 => Err(Error::rejected("accepted successor unavailable")),
+            1 => Ok(vec![vec![]]),
+            _ => {
+                model.release_fails = true;
+                Ok(vec![vec![5]])
+            }
+        };
+        engine
+            .complete_step_with(&mut model, output, Ok)
+            .unwrap_err();
+        assert!(engine.poisoned());
+        assert!(request.done() && !request.cancelled());
+        assert!(request.take_result().is_err());
+        assert_eq!(engine.ready_request_count(), 0);
+        assert_eq!(engine.cache_free_parent_count(), Some(7));
+        assert!(model.released.is_empty());
+        assert!(engine.close(&mut model).is_err());
     }
 }
 
