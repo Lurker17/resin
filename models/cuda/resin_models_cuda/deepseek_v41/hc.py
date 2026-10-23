@@ -6,6 +6,8 @@ Engram and DSpark taps materialize the residual before observing its streams.
 """
 
 from dataclasses import dataclass
+from functools import cache
+from importlib import import_module
 
 import torch
 from torch import Tensor
@@ -21,8 +23,28 @@ class HCLazyPost:
     comb: Tensor
 
 
+@cache
+def _post_kernel():
+    # Load the shared TileLang compatibility adapter before TileKernels 1.0.
+    import_module("resin_models_cuda.deepseek_v4.tilelang_kernels")
+    return import_module("tile_kernels.mhc.post_kernel").mhc_post_fwd
+
+
+def _materialize_native(output: Tensor, state: HCLazyPost) -> Tensor:
+    """Use DeepInfer's [1, tokens, ...] post ABI, with comb[input, output]."""
+    hc, dim = state.residual.shape[-2:]
+    return _post_kernel()(
+        output.reshape(1, -1, dim),
+        state.residual.reshape(1, -1, hc, dim),
+        state.post.reshape(1, -1, hc, 1),
+        state.comb.reshape(1, -1, hc, hc),
+    ).view_as(state.residual)
+
+
 def materialize(output: Tensor, state: HCLazyPost) -> Tensor:
     """Apply the pending post-mix at an Engram, feature tap, or model boundary."""
+    if output.is_cuda:
+        return _materialize_native(output, state)
     return (
         state.post[..., None] * output[..., None, :]
         + (state.comb[..., None] * state.residual.unsqueeze(-2)).sum(-3)

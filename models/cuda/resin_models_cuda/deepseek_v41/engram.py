@@ -4,6 +4,8 @@
 """Checkpoint-exact n-gram hashing and row-sharded Engram residuals."""
 
 from dataclasses import dataclass
+from functools import cache
+from importlib import import_module
 from math import isqrt
 
 import numpy as np
@@ -239,12 +241,29 @@ class Engram(nn.Module):
         )
         self.q_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))
         self.k_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))
+        self.register_buffer("_gate_weight", None, persistent=False)
+
+    def prepare_gate(self):
+        """Fuse loaded RMS weights once, as in DeepInfer's Engram preparation."""
+        self._gate_weight = (
+            _gate_kernels().fused_weight(self.q_weight, self.k_weight)
+            if self.q_weight.is_cuda
+            else self.q_weight.float() * self.k_weight.float()
+        )
 
     def forward(self, hidden, hash_ids=None, token_mask=None, *, embed_hook=None):
         embedding = self.embed(hash_ids) if embed_hook is None else embed_hook()
-        key, value = self.wkv(embedding.flatten(-2)).split(
-            [self.hc_mult * self.dim, self.dim], dim=-1
-        )
+        projection = self.wkv(embedding.flatten(-2))
+        if hidden.is_cuda:
+            if self._gate_weight is None:
+                raise RuntimeError("prepare Engram gate weights before execution")
+            output = _gate_native(hidden, projection, self._gate_weight, self.eps)
+            return (
+                output
+                if token_mask is None
+                else torch.where(token_mask[..., None, None], output, hidden)
+            )
+        key, value = projection.split([self.hc_mult * self.dim, self.dim], dim=-1)
         key = key.float().unflatten(-1, (self.hc_mult, self.dim))
         stream = hidden.float()
         rstd = torch.rsqrt(stream.square().mean(-1) + self.eps) * torch.rsqrt(
@@ -259,6 +278,34 @@ class Engram(nn.Module):
         return (stream + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(
             hidden.dtype
         )
+
+
+@cache
+def _gate_kernels():
+    # Load the shared TileLang compatibility adapter before TileKernels 1.0.
+    import_module("resin_models_cuda.deepseek_v4.tilelang_kernels")
+    return import_module("tile_kernels.engram")
+
+
+def _gate_native(hidden, projection, weight, eps):
+    """Adapt DeepInfer's fused gate to TileKernels 1.0's separate K/V ABI.
+
+    DeepInfer 774ce244's v4_modules/engram.py uses the same inference equation
+    (Apache-2.0). This dependency version returns an out-of-place output and
+    leaves optional image masking to its caller.
+    """
+    hc, dim = hidden.shape[-2:]
+    kv = projection.reshape(-1, hc + 1, dim)
+    output, *_ = _gate_kernels().engram_gate_fwd(
+        hidden.reshape(-1, hc, dim),
+        kv[:, :hc],
+        kv[:, hc],
+        weight,
+        eps,
+        1e-6,
+        save_for_backward=False,
+    )
+    return output.view_as(hidden)
 
 
 class EngramRuntime:

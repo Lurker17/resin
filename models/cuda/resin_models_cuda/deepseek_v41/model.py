@@ -702,6 +702,8 @@ class Transformer(nn.Module):
             last.confidence_head = ConfidenceHead(args.dim + args.dspark_markov_rank)
 
     def prepare_weights(self, reducer, *, expert_backend="flashinfer", max_tokens=1):
+        from resin_models_cuda.deepseek_v41.engram import Engram
+
         collective = None
         if expert_backend == "deepgemm":
             from resin.backend.cuda.mega_moe import MegaMoeCollective
@@ -722,6 +724,8 @@ class Transformer(nn.Module):
             raise ValueError(f"unknown expert backend: {expert_backend}")
 
         def lower(source):
+            if isinstance(source, Engram):
+                source.prepare_gate()
             if isinstance(source, Attention):
                 from resin_models_cuda.deepseek_v41.attention import prepare_attention
 
