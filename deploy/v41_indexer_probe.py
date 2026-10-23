@@ -165,13 +165,55 @@ def _case(ratio, *, context=4096, batch=2, queries=5, heads=32):
     sparse = paged_index(
         indexer, hidden, query, None, positions, context, cache, freqs, runtime
     )
+    compact_scores = deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
+        (q[:, None], sf[:, None]),
+        cache.index_cache(2),
+        weights.flatten(0, 1),
+        schedules["sparse"],
+        candidates.shape[1],
+        indexer.block_size,
+    )
+    logical_candidates = (
+        candidates[..., None] * indexer.block_size
+        + torch.arange(indexer.block_size, device="cuda")
+    ).flatten(1)
+    compact_valid = (candidates >= 0).repeat_interleave(indexer.block_size, -1) & (
+        logical_candidates < lengths[:, None]
+    )
+    compact_reference = reference.flatten(0, 1).gather(
+        1, logical_candidates.clamp(0, reference.shape[-1] - 1).long()
+    )
+    compact_delta = (
+        compact_scores[compact_valid].float() - compact_reference[compact_valid]
+    )
+    sparse_l2 = (
+        compact_delta.norm() / compact_reference[compact_valid].norm().clamp_min(1e-8)
+    ).item()
+    if sparse_l2 > 0.02:
+        raise AssertionError(f"FP4 sparse paged MQA relative L2: {sparse_l2}")
+    max_crossing = 0.0
     for row in range(batch * queries):
         chosen = sparse.flatten(0, 1)[row]
         valid_chosen = chosen[chosen >= 0]
+        if len(valid_chosen) != min(indexer.topk, int(compact_valid[row].sum())):
+            raise AssertionError("sparse indexer returned the wrong selection count")
         if not (valid_chosen < lengths[row]).all():
             raise AssertionError("sparse indexer selected a future key")
         if not torch.isin(valid_chosen // 8, candidates[row]).all():
             raise AssertionError("sparse indexer escaped its CED candidates")
+        if len(valid_chosen):
+            boundary = (
+                compact_reference[row, compact_valid[row]]
+                .topk(len(valid_chosen))
+                .values[-1]
+            )
+            selected_min = reference.flatten(0, 1)[row, valid_chosen.long()].min()
+            crossing = max(0.0, (boundary - selected_min).item())
+            max_crossing = max(max_crossing, crossing)
+            # The fused kernel returns BF16 scores. A top-k boundary may move
+            # within its observed score-rounding error, including BF16 ties.
+            if crossing > 2 * compact_delta.abs().max().item():
+                raise AssertionError("sparse top-k omitted a higher-scoring candidate")
 
     # Recompute schedules inside the graph as serving does, then change causal
     # positions without recapturing. Compare exact selected IDs to eager.
@@ -211,6 +253,9 @@ def _case(ratio, *, context=4096, batch=2, queries=5, heads=32):
         "heads": heads,
         "score_relative_l2": relative_l2,
         "score_max_abs": delta.abs().max().item(),
+        "sparse_score_relative_l2": sparse_l2,
+        "sparse_score_max_abs": compact_delta.abs().max().item(),
+        "sparse_topk_max_crossing": max_crossing,
         "graph_replays": 3,
         "cache_bytes_per_index_token": 68,
     }
