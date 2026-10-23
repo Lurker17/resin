@@ -97,3 +97,35 @@ def test_completion_owns_copied_results_and_counts_stats_once(monkeypatch):
         "emitted": 6,
         "acceptance_rate": 1 / 3,
     }
+
+
+def test_feedback_fits_the_captured_decode_token_column_and_metadata_buffers():
+    from resin.backend.cuda.staging import TensorStager
+
+    output = torch.tensor([[3, 4, 5, 3, 9, 7, 6]] * 12, dtype=torch.int64)
+    _, _, feedback = accepted_block(output, torch.ones(12, dtype=torch.int64), 3)
+    feedback.restrict(8)
+    # These are the actual shapes/dtypes allocated by the shared CUDA runner.
+    targets = {
+        "token_ids": torch.empty((12, 1), dtype=torch.int64),
+        "positions": torch.empty(12, dtype=torch.int64),
+        "sampling_offsets": torch.empty(12, dtype=torch.int64),
+    }
+    TensorStager("cpu").copy_into(targets, feedback.inputs())
+    assert targets["token_ids"][:, 0].tolist() == [9] * 8 + [0] * 4
+    assert targets["positions"].tolist() == [3] * 8 + [1] * 4
+    assert targets["sampling_offsets"].tolist() == [128] * 8 + [64] * 4
+
+
+def test_staging_error_identifies_the_device_field_shape_and_dtype():
+    from resin.backend.cuda.staging import StagingError, TensorStager
+
+    targets = {"positions": torch.zeros(4, dtype=torch.int64)}
+    with pytest.raises(
+        StagingError,
+        match=r"positions.*shape \(4,\).*torch.int32.*expected shape \(4,\).*torch.int64",
+    ):
+        TensorStager("cpu").copy_into(
+            targets, {"positions": torch.ones(4, dtype=torch.int32)}
+        )
+    assert targets["positions"].tolist() == [0] * 4

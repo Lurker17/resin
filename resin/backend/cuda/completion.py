@@ -26,7 +26,7 @@ class DeviceFeedback:
 
     def inputs(self):
         return {
-            "token_ids": self.token_ids,
+            "token_ids": self.token_ids[:, None],
             "positions": self.positions,
             "sampling_offsets": (self.positions + 1) * SAMPLING_OFFSET_STRIDE,
         }

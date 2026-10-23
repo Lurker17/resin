@@ -82,13 +82,19 @@ class TensorStager:
                 if isinstance(value, getattr(torch, "Tensor", ())):
                     if value.shape != target.shape or value.dtype != target.dtype:
                         raise StagingError(
-                            f"device input {name!r} does not match its graph buffer"
+                            f"device input {name!r} has shape {tuple(value.shape)} and dtype {value.dtype}; "
+                            f"expected shape {tuple(target.shape)} and dtype {target.dtype}"
                         )
                     source = value
                 else:
                     source = self.host(name, value, target.dtype).view(target.shape)
                 staged.append((name, target, source))
+        except StagingError:
+            raise
         except Exception as error:
-            raise StagingError("inputs do not fit fixed device buffers") from error
+            raise StagingError(
+                f"input {name!r} does not fit graph buffer with shape "
+                f"{tuple(target.shape)} and dtype {target.dtype}: {error}"
+            ) from error
         for name, target, source in staged:
             target.copy_(source, non_blocking=True)
