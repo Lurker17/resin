@@ -207,3 +207,21 @@ def test_client_against_real_resin_http_listener(stream):
         assert result["ok"], result
         assert result["completion_tokens"] == 2
         assert errors == []
+
+
+def test_each_routed_rank_gets_both_protocols_scoring_modes_and_prompt_lengths():
+    cases = [chat_case("model", i, 4, 16) for i in range(192)]
+    for rank in range(4):
+        routed = [
+            c
+            for c in cases
+            if c.body.get("routed_dp_rank") == rank
+            or c.headers.get("resin-routed-dp-rank") == str(rank)
+        ]
+        assert {c.body["stream"] for c in routed} == {False, True}
+        assert {c.body.get("logprobs", False) for c in routed} == {False, True}
+        assert (
+            len({c.body["messages"][0]["content"].count("observatory") for c in routed})
+            == 4
+        )
+    assert all(c.body["stream"] for c in robustness_cases("model", 4) if c.disconnect)

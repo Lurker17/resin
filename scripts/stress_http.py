@@ -255,7 +255,7 @@ def chat_case(model: str, index: int, dp_size: int, max_tokens: int) -> Case:
     # Four prompt lengths, distinct suffixes, and repeatable shared prefixes.
     context = (
         "The observatory tracks weather and records clear skies each evening. "
-        * (1, 8, 32, 128)[index % 4]
+        * (1, 8, 32, 128)[(index // (4 * dp_size)) % 4]
     )
     body: dict[str, Any] = {
         "model": model,
@@ -268,11 +268,11 @@ def chat_case(model: str, index: int, dp_size: int, max_tokens: int) -> Case:
         "max_tokens": max_tokens,
         "temperature": 0.7,
         "seed": index,
-        "stream": index % 2 == 0,
+        "stream": (index // dp_size) % 2 == 0,
     }
     if body["stream"]:
         body["stream_options"] = {"include_usage": True}
-    if index % 4 in (0, 1):
+    if (index // (2 * dp_size)) % 2 == 0:
         body.update(logprobs=True, top_logprobs=3)
     headers = {}
     if index % 3 == 1:
@@ -322,7 +322,12 @@ def robustness_cases(model: str, dp_size: int) -> list[Case]:
         cases.append(
             Case(
                 name=f"disconnect-rank-{rank}",
-                body={**dict(case.body), "routed_dp_rank": rank},
+                body={
+                    **case.body,
+                    "routed_dp_rank": rank,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                },
                 disconnect=True,
             )
         )
