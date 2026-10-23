@@ -186,8 +186,6 @@ def test_capabilities_declare_axes_and_reject_unsupported_combinations():
 @pytest.mark.parametrize(
     "module,runner",
     [
-        ("resin_models_cuda.gemma4.cuda", "Gemma4CudaRunner"),
-        ("resin_models_cuda.qwen3_5.cuda", "Qwen3_5CudaRunner"),
         ("resin_models_cuda.inkling.cuda", "InklingCudaRunner"),
         ("resin_models_torch.lfm2.reference", "Lfm2TorchRunner"),
     ],
@@ -198,3 +196,21 @@ def test_unsharded_model_implementations_reject_attention_tp(module, runner):
         implementation.parallelism_capabilities.validate(
             Parallelism(world_size=2, attn_tp=2), model=runner
         )
+
+
+@pytest.mark.parametrize(
+    "module,runner",
+    [
+        ("resin_models_cuda.gemma4.cuda", "Gemma4CudaRunner"),
+        ("resin_models_cuda.qwen3_5.cuda", "Qwen3_5CudaRunner"),
+    ],
+)
+def test_dense_cuda_models_shard_ffns_with_optional_attention_tp(module, runner):
+    capabilities = getattr(import_module(module), runner).parallelism_capabilities
+    for attention in (1, 2):
+        capabilities.validate(
+            Parallelism(world_size=2, attn_tp=attention), model=runner
+        )
+    for axis in ("attn_dp", "ep", "cp"):
+        with pytest.raises(ValueError, match=f"does not support {axis}=2"):
+            capabilities.validate(Parallelism(world_size=2, **{axis: 2}), model=runner)

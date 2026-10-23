@@ -18,6 +18,10 @@ from resin.backend.cuda.graphs import (
     GraphShape,
     resolve_decode_graph_shapes,
 )
+from resin.backend.cuda.parallel import (
+    TensorParallelContext,
+    replicated_cache_capacity,
+)
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
@@ -32,6 +36,7 @@ from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import PromptScores, format_output, prompt_scores
 from resin.backend.speculative import SpeculativeStats
+from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
 from resin.models.qwen3_5.media import Qwen35Media
 from resin_models_cuda.nvfp4 import select_nvfp4_backend
@@ -66,6 +71,7 @@ class Qwen3_5CudaRunner(CudaRunner):
 
     page_size = 128
     prefill_chunk_size = PREFILL_CHUNK_SIZE
+    parallelism_capabilities = ParallelismCapabilities(attn_tp=True, expert_tp=True)
 
     def __init__(
         self,
@@ -83,7 +89,19 @@ class Qwen3_5CudaRunner(CudaRunner):
         cuda_graph_prefill: str = "breakable",
         cuda_graph_decode: str = "full",
         cuda_graph_decode_shapes: object | None = None,
+        parallel_groups: ParallelGroups | None = None,
     ) -> None:
+        if parallel_groups is not None:
+            self.parallelism_capabilities.validate(
+                parallel_groups.topology, model="Qwen3.5"
+            )
+        self.parallel_groups = parallel_groups
+        self.attention_parallel = TensorParallelContext.from_group(
+            None if parallel_groups is None else parallel_groups.attn_tp
+        )
+        self.expert_parallel = TensorParallelContext.from_group(
+            None if parallel_groups is None else parallel_groups.expert_tp
+        )
         if (
             isinstance(speculative_tokens, bool)
             or not isinstance(speculative_tokens, int)
@@ -137,7 +155,11 @@ class Qwen3_5CudaRunner(CudaRunner):
             include_mtp=speculative_tokens > 0,
             include_vision=True,
             nvfp4_backend=nvfp4_backend,
+            tensor_parallel=self.expert_parallel,
+            attention_parallel=self.attention_parallel,
         )
+        self.attention_config = self._model.language_model.config
+        self._configure_parallel_graphs(self._model, parallel_groups)
         self.image_token_id = self.raw_config.get("image_token_id")
         vision_config = self.raw_config.get("vision_config") or {}
         self.spatial_merge_size = int(vision_config.get("spatial_merge_size", 1))
@@ -169,7 +191,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         cache_dtype = self.kv_cache_torch_dtype
 
         self.cache_geometry = CacheGeometry.from_config(
-            self.config,
+            self.attention_config,
             include_mtp=speculative_tokens > 0,
             kv_element_bytes=cache_dtype.itemsize,
         )
@@ -185,6 +207,9 @@ class Qwen3_5CudaRunner(CudaRunner):
         slab_capacity = capacity.parent_capacity
         if cache_slab_capacity is not None:
             slab_capacity = min(slab_capacity, cache_slab_capacity)
+        slab_capacity = replicated_cache_capacity(
+            slab_capacity, None if parallel_groups is None else parallel_groups.replica
+        )
         self.cache_capacity_plan = replace(
             capacity,
             parent_capacity=slab_capacity,
@@ -201,8 +226,8 @@ class Qwen3_5CudaRunner(CudaRunner):
         self._configure_cache_binding(self._cache.binding)
         self._attention = PagedAttentionRuntime(
             self.device,
-            num_attention_heads=self.config.num_attention_heads,
-            num_key_value_heads=self.config.num_key_value_heads,
+            num_attention_heads=self.attention_config.num_attention_heads,
+            num_key_value_heads=self.attention_config.num_key_value_heads,
             head_dim=self.config.head_dim,
             workspace_bytes=_CACHE_WORKSPACE_BYTES,
         )
@@ -402,8 +427,8 @@ class Qwen3_5CudaRunner(CudaRunner):
                 self.device,
                 cache,
                 self._graph_specs(),
-                num_attention_heads=self.config.num_attention_heads,
-                num_key_value_heads=self.config.num_key_value_heads,
+                num_attention_heads=self.attention_config.num_attention_heads,
+                num_key_value_heads=self.attention_config.num_key_value_heads,
                 head_dim=self.config.head_dim,
                 workspace=self._graph_workspace,
             )
