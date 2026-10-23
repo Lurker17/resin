@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 def decode_trace(directory: str | Path, rank: int, metadata: dict | None = None):
-    """Profile one extra full Engine step after a case's timing window."""
+    """Profile live completions after timing, including an overlap interval."""
     import torch
 
     directory = Path(directory)
@@ -25,13 +25,15 @@ def decode_trace(directory: str | Path, rank: int, metadata: dict | None = None)
             ],
         ) as profiler:
             profiler.add_metadata("resin_rank", str(rank))
-            profiler.add_metadata("resin_timing", "extra step after measurement")
+            profiler.add_metadata("resin_timing", "extra completions after measurement")
             profiler.add_metadata_json(
                 "resin_benchmark",
                 json.dumps({"case": asdict(case), **(metadata or {})}),
             )
             with torch.profiler.record_function(f"resin.{name}"):
-                step()
+                for _ in range(2 if (metadata or {}).get("overlap") else 1):
+                    step()
+                torch.cuda.synchronize()
         profiler.export_chrome_trace(str(target))
         with (
             target.open("rb") as source,

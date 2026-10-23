@@ -264,7 +264,7 @@ def run_sweep(
     reductions until the continuous measurement window ends. The caller retains
     engine ownership.
     on_result receives each completed record after request cleanup, outside timing.
-    trace_step may run one extra decode step on the live cohort after recording
+    trace_step may run one extra decode step (two with overlap) after recording
     measurements. Its outputs are excluded from records; all distributed drivers
     must participate in that step.
     """

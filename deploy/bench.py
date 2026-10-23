@@ -304,6 +304,7 @@ def _rank(
     capture_seconds = time.perf_counter() - started
     if rank == 0:
         print(f"[bench] graphs ready in {capture_seconds:.1f}s", flush=True)
+    overlap = options.get("overlap", True) and callable(getattr(raw, "enqueue", None))
     metadata = {
         **options["metadata"],
         "model": model,
@@ -322,10 +323,8 @@ def _rank(
         "load_seconds": loaded_seconds,
         "capture_seconds": capture_seconds,
         "profile_graph_phases": options.get("profile_graph_phases", False),
-        "overlap": options.get("overlap", True),
-        "timing": "continuous_completions"
-        if options.get("overlap", True)
-        else "synchronized_steps",
+        "overlap": overlap,
+        "timing": "continuous_completions" if overlap else "synchronized_steps",
         "prefill_chunk_size": options["prefill_chunk_size"],
         "max_batch_tokens": prefill_budget,
     }

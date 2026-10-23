@@ -11,8 +11,9 @@ from deploy.bench_trace import decode_trace
 from resin.bench import BenchCase
 
 
+@pytest.mark.parametrize("overlap", [False, True])
 def test_trace_preserves_cpu_diagnostics_but_rejects_missing_cuda(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, overlap
 ):
     profile = torch.profiler.profile
     monkeypatch.setattr(
@@ -21,10 +22,18 @@ def test_trace_preserves_cpu_diagnostics_but_rejects_missing_cuda(
         lambda **kwargs: profile(activities=[torch.profiler.ProfilerActivity.CPU]),
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-    trace = decode_trace(tmp_path, 3, {"git_commit": "qualified-source"})
+    trace = decode_trace(
+        tmp_path, 3, {"git_commit": "qualified-source", "overlap": overlap}
+    )
     case = BenchCase(phase="decode", context_length=4096, batch_size=256)
+    steps = []
+
+    def step():
+        steps.append(torch.ones(8).sum())
+
     with pytest.raises(RuntimeError, match="no CUDA kernel activity"):
-        trace(case, lambda: torch.ones(8).sum())
+        trace(case, step)
+    assert len(steps) == (2 if overlap else 1)
     target = tmp_path / "decode-ctx4096-b256-rank003.json.gz"
     with gzip.open(target, "rt") as stream:
         data = json.load(stream)
