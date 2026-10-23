@@ -43,7 +43,7 @@ class ForwardMetadata:
             output = torch.empty_like(selected, dtype=torch.int32)
             batch, queries, topk = selected.shape
             table = self.block_tables[:batch]
-            convert_kv_index_tl(queries, topk, 128 // ratio)(
+            convert_kv_index_tl(topk, 128 // ratio)(
                 selected,
                 self.klen[ratio],
                 table,
@@ -117,7 +117,7 @@ def prepare_forward(cache, positions: Tensor, *, draft=False, valid_tokens=None)
     block_tables = empty(batch * queries, width_ca)
     draft_indices = empty(batch, queries, (queries + 7) // 8 * 8 if draft else 1)
     prepare_engine_metadata_tl(
-        queries,
+        queries if draft else None,
         tuple(cache.geometry.packings[:3]),
         cache.geometry.window_size,
         cache.geometry.draft_tokens,
@@ -153,7 +153,7 @@ def prepare_forward(cache, positions: Tensor, *, draft=False, valid_tokens=None)
         draft_indices,
     )
     if queries > 8:
-        copy_engine_tables_tl(queries, tuple(cache.geometry.packings[:2]))(
+        copy_engine_tables_tl(tuple(cache.geometry.packings[:2]))(
             swa.parent_ids,
             swa.child_slots,
             ca.parent_ids,

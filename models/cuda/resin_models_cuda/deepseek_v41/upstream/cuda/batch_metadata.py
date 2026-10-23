@@ -22,7 +22,7 @@ _PASS_CONFIGS: dict[str, Any] = {
     pass_configs=_PASS_CONFIGS,
 )
 def prepare_engine_metadata_tl(
-    queries: int,
+    queries: int | None,
     packings: tuple[int, ...],
     window_size: int,
     draft_capacity: int,
@@ -31,6 +31,9 @@ def prepare_engine_metadata_tl(
     draft: bool,
     has_valid_mask: bool,
 ) -> Any:
+    # Ordinary query counts vary with every prompt and retained suffix. Only
+    # the draft's private attention rectangle needs a static query dimension.
+    queries = T.dynamic("queries") if queries is None else queries
     batch = T.dynamic("batch")
     width_swa = T.dynamic("width_swa")
     width_ca = T.dynamic("width_ca")
@@ -235,8 +238,9 @@ def prepare_engine_metadata_tl(
 
 
 @tilelang.jit(out_idx=None, pass_configs=_PASS_CONFIGS)
-def copy_engine_tables_tl(queries: int, packings: tuple[int, int]) -> Any:
-    """Expand prefill page tables with one CTA per query, keeping widths runtime."""
+def copy_engine_tables_tl(packings: tuple[int, int]) -> Any:
+    """Expand prefill tables without specializing on prompt or history length."""
+    rows = T.dynamic("rows")
     batch = T.dynamic("batch")
     width_swa = T.dynamic("width_swa")
     width_ca = T.dynamic("width_ca")
@@ -247,10 +251,11 @@ def copy_engine_tables_tl(queries: int, packings: tuple[int, int]) -> Any:
         swa_slots: T.Tensor((batch, width_swa), T.int32),  # ty: ignore[invalid-type-form]
         ca_parents: T.Tensor((batch, width_ca), T.int32),  # ty: ignore[invalid-type-form]
         ca_slots: T.Tensor((batch, width_ca), T.int32),  # ty: ignore[invalid-type-form]
-        swa_tables: T.Tensor((batch * queries, width_swa), T.int32),  # ty: ignore[invalid-type-form]
-        block_tables: T.Tensor((batch * queries, width_ca), T.int32),  # ty: ignore[invalid-type-form]
+        swa_tables: T.Tensor((rows, width_swa), T.int32),  # ty: ignore[invalid-type-form]
+        block_tables: T.Tensor((rows, width_ca), T.int32),  # ty: ignore[invalid-type-form]
     ):
-        with T.Kernel(batch * queries, threads=128) as row:
+        with T.Kernel(rows, threads=128) as row:
+            queries = rows // batch
             bid, sid = row // queries, row % queries
             T.pdl_sync()
             # Preserve DG's sequence-major first B CA rows, while SWA lookup

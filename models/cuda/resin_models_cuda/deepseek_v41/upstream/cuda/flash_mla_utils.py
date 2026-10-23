@@ -17,11 +17,11 @@ T: Any = _language
     },
 )
 def convert_kv_index_tl(
-    s: int,
     k: int,
     block_size: int,
 ) -> Any:
     b = T.dynamic("b")
+    s = T.dynamic("s")
     n = T.dynamic("n")
 
     @T.prim_func

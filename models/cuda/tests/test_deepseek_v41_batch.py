@@ -230,14 +230,14 @@ def test_preparation_rejects_incompatible_positions_or_masks(positions, mask):
         cache.prepare_metadata(positions, valid_tokens=mask)
 
 
-@pytest.mark.parametrize("queries", [4, 16])
-def test_growing_engine_tables_reuse_metadata_kernel_dispatch(monkeypatch, queries):
-    """Vary retained and full-history widths without another JIT factory key."""
+@pytest.mark.parametrize("draft", [False, True])
+def test_growing_prompts_and_engine_tables_reuse_metadata_kernels(monkeypatch, draft):
+    """Only the draft's private rectangle specializes on its query count."""
     import sys
     from functools import lru_cache
     from types import SimpleNamespace
 
-    compiled = {"metadata": [], "copy": []}
+    compiled = {"metadata": [], "copy": [], "indices": []}
 
     def factory(name):
         @lru_cache
@@ -260,23 +260,87 @@ def test_growing_engine_tables_reuse_metadata_kernel_dispatch(monkeypatch, queri
         "resin_models_cuda.deepseek_v41.upstream.cuda.get_kv_index",
         SimpleNamespace(load_kv_index_tl=lambda *args: lambda *tensors: None),
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "resin_models_cuda.deepseek_v41.upstream.cuda.flash_mla_utils",
+        SimpleNamespace(convert_kv_index_tl=factory("indices")),
+    )
     # Exercise the actual CUDA dispatch using CPU allocations and inert kernels.
     monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
     cache, _ = cache_and_positions()
-    positions = torch.arange(queries).expand(3, -1).clone()
-    mask = torch.ones(3 * queries, dtype=torch.bool)
-    for widths in ((1, 1, 1), (5, 33, 9), (67, 1027, 65)):
-        groups = tuple(
-            DevicePageGroup(
-                torch.ones(3, width, dtype=torch.int32),
-                torch.zeros(3, width, dtype=torch.int32),
-                torch.zeros(3, dtype=torch.int32),
+    query_counts = (1, 3, 5) if draft else (1, 4, 9, 140, 141, 1025)
+    for queries in query_counts:
+        positions = torch.arange(queries).expand(3, -1).clone()
+        mask = torch.ones(3 * queries, dtype=torch.bool)
+        for widths in ((1, 1, 1), (5, 33, 9), (67, 1027, 65)):
+            groups = tuple(
+                DevicePageGroup(
+                    torch.ones(3, width, dtype=torch.int32),
+                    torch.zeros(3, width, dtype=torch.int32),
+                    torch.zeros(3, dtype=torch.int32),
+                )
+                for width in widths
             )
-            for width in widths
-        )
-        current = DeviceCache(cache.geometry, groups + cache.groups[3:], cache.storage)
-        frame = current.prepare_metadata(positions, valid_tokens=mask)
-        assert frame.block_tables.shape == (3 * queries, widths[1])
-        assert frame.positions.shape == positions.shape
-    assert len(compiled["metadata"]) == 1
-    assert len(compiled["copy"]) == (1 if queries > 8 else 0)
+            current = DeviceCache(
+                cache.geometry, groups + cache.groups[3:], cache.storage
+            )
+            frame = current.prepare_metadata(positions, draft=draft, valid_tokens=mask)
+            assert frame.block_tables.shape == (3 * queries, widths[1])
+            assert frame.positions.shape == positions.shape
+            frame.compressed_indices(
+                2, 2, torch.zeros(3, queries, 8, dtype=torch.int32)
+            )
+    assert len(compiled["metadata"]) == (len(query_counts) if draft else 1)
+    assert len(compiled["copy"]) == (0 if draft else 1)
+    assert len(compiled["indices"]) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("draft", [False, True])
+def test_native_metadata_matches_reference_across_query_lengths(draft):
+    """Exercise runtime loops, the inline/copy split, and physical index mapping."""
+    from dataclasses import fields
+
+    cache, starts = cache_and_positions()
+    device_cache = DeviceCache(
+        cache.geometry,
+        tuple(
+            DevicePageGroup(
+                group.parent_ids.cuda(),
+                group.child_slots.cuda(),
+                group.first_blocks.cuda(),
+            )
+            for group in cache.groups
+        ),
+        cache.storage.cuda(),
+    )
+    query_counts = (1, 3, 5) if draft else (1, 4, 9, 140, 141, 257)
+    for queries in query_counts:
+        positions = starts[:, :1] + torch.arange(queries)
+        for masked in (False, True):
+            mask = torch.arange(positions.numel()) % 7 != 2 if masked else None
+            expected = cache.prepare_metadata(positions, draft=draft, valid_tokens=mask)
+            actual = device_cache.prepare_metadata(
+                positions.cuda(),
+                draft=draft,
+                valid_tokens=None if mask is None else mask.cuda(),
+            )
+            for field in fields(expected):
+                if field.name.startswith("_"):
+                    continue
+                left, right = getattr(expected, field.name), getattr(actual, field.name)
+                pairs = (
+                    ((left[key], right[key]) for key in left)
+                    if isinstance(left, dict)
+                    else ((left, right),)
+                )
+                for reference, native in pairs:
+                    torch.testing.assert_close(native.cpu(), reference, rtol=0, atol=0)
+            selected = torch.tensor([0, -1, 2, 511, 3, 128, -1, 1], dtype=torch.int32)
+            selected = selected.expand(3, queries, -1).clone()
+            torch.testing.assert_close(
+                actual.compressed_indices(2, 2, selected.cuda()).cpu(),
+                expected.compressed_indices(2, 2, selected),
+                rtol=0,
+                atol=0,
+            )
