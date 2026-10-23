@@ -333,7 +333,7 @@ def test_indexer_metadata_preserves_causal_lengths_and_request_grouping():
     from resin_models_cuda.deepseek_v41.indexer import index_metadata
 
     cache = _cache()
-    positions = torch.arange(6).expand(2, -1)
+    positions = torch.arange(6).repeat(2, 1)
     runtime = {}
     metadata = index_metadata(cache, positions, 2, runtime)
     lengths, requests, tables, schedules = metadata
@@ -444,7 +444,7 @@ def test_indexer_allocation_bound_stays_fixed_while_causal_lengths_advance(
     )
     cache = SimpleNamespace(
         index_cache=lambda _layer: torch.zeros(1, 128 // ratio, 1, 68),
-        index_block_table=lambda queries: torch.zeros(queries, 1, dtype=torch.int32),
+        prepare_metadata=_cache().row(0).prepare_metadata,
     )
     hidden = torch.zeros(1, 3, args.dim, dtype=torch.bfloat16)
     query = torch.zeros(1, 3, args.index_head_dim, dtype=torch.bfloat16)
@@ -503,7 +503,9 @@ def test_final_hidden_collapses_with_last_ffn_pre_mix_instead_of_mean(implementa
             ], torch.tensor([[[2.0, 3.0]]])
 
     model.layers = nn.ModuleList([Layer()])
-    hidden, collected = model._run(torch.tensor([[0]]), torch.tensor([[0]]), 1, None)
+    hidden, collected = model._run(
+        torch.tensor([[0]]), torch.tensor([[0]]), 1, _cache().row(0)
+    )
     torch.testing.assert_close(hidden, torch.tensor([[[37.0]]]))
     torch.testing.assert_close(collected, torch.tensor([[[1.0]]]))
 
@@ -552,25 +554,32 @@ def test_dspark_query_rope_starts_at_anchor_while_main_history_ends_before_it(
         return query
 
     monkeypatch.setattr(implementation, "fused_attention", fused)
+    real_cache = _cache()
     cache = SimpleNamespace(
-        geometry=SimpleNamespace(draft_tokens=8),
         draft_cache=draft_cache,
         window_cache=lambda layer: window_cache,
-        window_rows=lambda layer, positions: positions,
     )
     anchor = torch.tensor([7, 130])
-    model._draft_attention(attention, hidden, anchor, cache)
-    positions = torch.tensor([[7, 8, 9], [130, 131, 132]])
+    positions = torch.tensor([[7, 8, 9], [130, 131, 132]], dtype=torch.int32)
+    metadata = real_cache.prepare_metadata(positions, draft=True)
+    model._draft_attention(attention, hidden, metadata, cache)
     assert [name for name, _ in observed] == ["rope", "finish"]
     for _, actual in observed:
-        torch.testing.assert_close(actual, positions)
+        torch.testing.assert_close(actual, positions, check_dtype=False)
     query_positions, history_cache, history, extra = calls[0]
     assert history_cache is window_cache and extra["extra_cache"] is draft_cache
     torch.testing.assert_close(query_positions, positions)
     for row, start in enumerate((0, 2)):
-        expected = torch.arange(start, int(anchor[row]))
+        expected = (
+            real_cache.row(row)
+            .window_rows(0, torch.arange(start, int(anchor[row]))[None])
+            .flatten()
+        )
         for query in history[row]:
             torch.testing.assert_close(query[query >= 0], expected)
     assert written[0][0] is draft_cache
     assert written[0][1].tolist() == [[0, 1, 2], [8, 9, 10]]
-    assert extra["extra_indices"].tolist() == [[[0, 1, 2]] * 3, [[8, 9, 10]] * 3]
+    assert extra["extra_indices"].tolist() == [
+        [[0, 1, 2, -1, -1, -1, -1, -1]] * 3,
+        [[8, 9, 10, -1, -1, -1, -1, -1]] * 3,
+    ]

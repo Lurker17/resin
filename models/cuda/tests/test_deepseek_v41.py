@@ -126,14 +126,14 @@ def _args():
     )
 
 
-def _cache():
+def _cache(batch_size=1):
     geometry = CacheGeometry.build(_args(), prefill_chunk_size=32)
     arena = CacheArena("cpu", geometry.layout(8), geometry, dtype=torch.bfloat16)
     groups = tuple(
         DevicePageGroup(
-            torch.tensor([[i + 1, i + 5]], dtype=torch.int32),
-            torch.tensor([[0, 0]], dtype=torch.int32),
-            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([[i + 1, i + 5]], dtype=torch.int32).repeat(batch_size, 1),
+            torch.zeros(batch_size, 2, dtype=torch.int32),
+            torch.zeros(batch_size, dtype=torch.int32),
         )
         for i in range(4)
     )

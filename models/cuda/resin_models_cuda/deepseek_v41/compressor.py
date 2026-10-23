@@ -8,7 +8,9 @@ from torch import nn
 from resin_models_cuda.deepseek_v41.linear import PreparedLinear
 
 
-def compress_projected(scores, values, positions, cache, layer, ratio):
+def compress_projected(
+    scores, values, positions, cache, layer, ratio, *, metadata=None
+):
     """Store projections then pool complete windows with the upstream kernel.
 
     C2 windows divide the Engine's 128-token pages. Each physical state page
@@ -30,8 +32,16 @@ def compress_projected(scores, values, positions, cache, layer, ratio):
         scores,
         values,
         cache.compressor_state(layer),
-        cache.compressor_pages(positions).flatten().int(),
-        (positions.flatten() + 1).int(),
+        (
+            cache.compressor_pages(positions)
+            if metadata is None
+            else metadata.state_block_idx
+        )
+        .flatten()
+        .int(),
+        ((positions + 1) if metadata is None else metadata.context_lens)
+        .flatten()
+        .int(),
         output,
     )
     return output.reshape(*shape, -1)
@@ -60,11 +70,17 @@ class PreparedCompressor(nn.Module):
                 use_fp32_output=True,
             )
 
-    def forward(self, hidden, positions, cache):
+    def forward(self, hidden, positions, cache, *, metadata=None):
         projected = self.projection(hidden)
         if self.ratio == 2:
             scores, values = projected.chunk(2, -1)
             projected = compress_projected(
-                scores, values, positions, cache, self.layer, self.ratio
+                scores,
+                values,
+                positions,
+                cache,
+                self.layer,
+                self.ratio,
+                metadata=metadata,
             )
         return self.norm(projected)

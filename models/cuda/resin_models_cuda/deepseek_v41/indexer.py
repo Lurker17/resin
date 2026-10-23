@@ -23,11 +23,15 @@ def index_metadata(cache, positions, ratio, runtime):
     """Share causal lengths and Engine page tables across index query sources."""
     metadata = runtime.setdefault("index_metadata", {})
     if ratio not in metadata:
-        batch, queries = positions.shape
-        lengths = ((positions + 1) // ratio).flatten().int()
-        request_ids = torch.arange(batch, device=positions.device, dtype=torch.int32)
-        request_ids = request_ids.repeat_interleave(queries)
-        metadata[ratio] = (lengths, request_ids, cache.index_block_table(queries), {})
+        frame = runtime.get("metadata")
+        if frame is None:
+            frame = runtime["metadata"] = cache.prepare_metadata(positions)
+        metadata[ratio] = (
+            frame.klen[ratio].flatten(),
+            frame.query_indices,
+            frame.block_tables,
+            {},
+        )
     return metadata[ratio]
 
 
@@ -54,24 +58,20 @@ def paged_index(
     )
 
     shape = positions.shape
+    metadata = runtime.get("metadata")
+    if metadata is None:
+        metadata = runtime["metadata"] = cache.prepare_metadata(positions)
+    positions = metadata.positions
     cos_sin = _cos_sin(freqs)
     cast_args = CastArgs("e2m1", 32, round_sf=True, sf_format="ue8m0")
     if indexer.owns_k:
         keys = indexer.wk(latent).reshape(-1, indexer.head_dim)
-        slots = (
-            torch.where(
-                (positions + 1).remainder(indexer.ratio) == 0,
-                cache.index_rows(indexer.layer, positions),
-                -1,
-            )
-            .flatten()
-            .int()
-        )
+        slots = metadata.slot_mapping_store_ca[indexer.ratio].flatten()
         transform(
             keys,
             norm_args=NormArgs(indexer.k_norm.weight, indexer.k_norm.eps),
             rope_args=RopeArgs(
-                (positions - positions.remainder(indexer.ratio)).flatten().int(),
+                metadata.positions_c[indexer.ratio].flatten(),
                 cos_sin,
                 indexer.rope_dim,
                 False,

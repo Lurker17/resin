@@ -125,7 +125,10 @@ def test_dspark_collects_target_hidden_before_target_layer(implementation):
             return hidden + 10 * (self.layer_id + 1), pre
 
     model.layers = nn.ModuleList([Layer(0), Layer(1), Layer(2)])
-    hidden, target = model._run(torch.tensor([[0]]), torch.tensor([[0]]), 1, None)
+    from test_deepseek_v41 import _cache
+
+    _, cache = _cache()
+    hidden, target = model._run(torch.tensor([[0]]), torch.tensor([[0]]), 1, cache)
     torch.testing.assert_close(target, torch.full((1, 1, 2), 11.0))
     torch.testing.assert_close(hidden, torch.full((1, 1, 2), 61.0))
 
@@ -272,7 +275,7 @@ def test_attention_bounds_sparse_active_lengths_for_short_queries(
         positions,
         256,
         cache,
-        {"indices": selected},
+        {"indices": selected, "index_source": layer},
     )
     assert (observed["extra"] >= 0).sum(-1).tolist() == [
         [value - 128 for value in expected]
@@ -332,16 +335,14 @@ def test_batched_verification_bypasses_single_sequence_prefill_callbacks(
         lambda attention, query, *args, **kwargs: query,
     )
     monkeypatch.setattr(
-        implementation,
-        "gather_kv",
+        "resin_models_cuda.deepseek_v41.attention.gather_kv",
         lambda packed, indices: torch.zeros(indices.numel(), 64),
     )
-    cache = SimpleNamespace(
-        window_cache=lambda layer: torch.zeros(1, 128, 1, 528, dtype=torch.uint8),
-        window_rows=lambda layer, positions: torch.zeros_like(positions),
-    )
+    from test_deepseek_v41 import _cache
+
+    _, cache = _cache(batch_size)
     hidden = torch.randn(batch_size, 5, 64)
-    positions = torch.arange(5)[None].expand(batch_size, -1)
+    positions = torch.arange(5)[None].repeat(batch_size, 1)
     result = attention(hidden, positions, 5, cache, {}, prefill=prefill)
     torch.testing.assert_close(result, hidden)
     assert result.shape == (batch_size, 5, 64)

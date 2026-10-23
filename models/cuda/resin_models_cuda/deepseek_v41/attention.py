@@ -22,9 +22,11 @@ def pack_kv(value, *, fp4=False):
 
 def store_kv(cache, indices, values):
     indices = indices.flatten().long()
+    valid = indices >= 0
+    indices = indices[valid]
     cache[indices // cache.shape[1], indices % cache.shape[1], 0] = values.reshape(
         -1, values.shape[-1]
-    )
+    )[valid]
 
 
 def gather_kv(cache, indices):
@@ -33,8 +35,48 @@ def gather_kv(cache, indices):
     return unpack_kv(cache, indices.flatten().int())
 
 
+def prefill_inputs(attention, cache, metadata, capacity, runtime):
+    """Reuse gather addresses and each shared compressed source within a forward."""
+    layout = runtime.setdefault("prefill_layout", {})
+    if "window" not in layout:
+        positions = metadata.positions
+        start = max(0, capacity - positions.shape[1] - attention.window_size + 1)
+        history = torch.arange(start, capacity, device=positions.device)[None]
+        columns = torch.arange(attention.window_size, device=positions.device)
+        counts = (positions + 1).clamp_max(attention.window_size)
+        windows = positions[..., None] + 1 - counts[..., None] + columns
+        layout["window"] = (
+            cache.window_rows(attention.layer_id, history),
+            torch.where(columns < counts[..., None], windows - start, -1),
+        )
+    rows, indices = layout["window"]
+    values = gather_kv(cache.window_cache(attention.layer_id), rows)
+    if not attention.ratio:
+        return values, indices
+    ratio = attention.ratio
+    if ratio not in layout:
+        positions = (
+            torch.arange(capacity // ratio, device=metadata.positions.device)[None]
+            * ratio
+        )
+        layout[ratio] = cache.compressed_rows(attention.layer_id, ratio, positions)
+    owner = cache.geometry.compressed_offsets[attention.layer_id]
+    shared = runtime.setdefault("prefill_compressed", {})
+    if owner not in shared:
+        shared[owner] = gather_kv(
+            cache.compressed_cache(attention.layer_id), layout[ratio]
+        )
+    selected = runtime["indices"]
+    indices = torch.cat(
+        (indices, torch.where(selected >= 0, selected + values.shape[0], -1)), -1
+    )
+    return torch.cat((values, shared[owner])), indices
+
+
 def padded_indices(indices):
-    return F.pad(indices.int(), (0, -indices.shape[-1] % 8), value=-1).contiguous()
+    indices = indices.int()
+    padding = -indices.shape[-1] % 8
+    return (F.pad(indices, (0, padding), value=-1) if padding else indices).contiguous()
 
 
 class QueryProjection(PreparedLinear):
