@@ -145,6 +145,11 @@ class DeviceCache:
     groups: tuple
     storage: torch.Tensor
 
+    def prepare_metadata(self, positions, *, draft=False, valid_tokens=None):
+        from resin_models_cuda.deepseek_v41.batch import prepare_forward
+
+        return prepare_forward(self, positions, draft=draft, valid_tokens=valid_tokens)
+
     def row(self, index):
         return replace(self, groups=slice_page_groups(self.groups, index))
 
