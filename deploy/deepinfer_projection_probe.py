@@ -59,6 +59,8 @@ def _graph(call):
 @torch.inference_mode()
 def run_probe():
     """Include small decode and B256 × five verification rows per GPU."""
+    from resin_models_cuda.deepseek_v41.attention import QueryProjection
+
     if torch.cuda.get_device_capability()[0] != 10:
         raise RuntimeError("prepared block32 DeepGEMM projections require SM10x")
     torch.manual_seed(4141)
@@ -72,6 +74,11 @@ def run_probe():
             *(_source(inputs, width) for width in widths), strict=True
         )
         prepared = PreparedLinear(*sources)
+        query = (
+            QueryProjection(sources[0], 128, 512, sources[1])
+            if name == "q_b_index"
+            else None
+        )
         weight = torch.cat(weights)
         for rows in (1, 5, 1280):
             hidden = torch.randn(rows, inputs, device="cuda", dtype=torch.bfloat16)
@@ -113,4 +120,30 @@ def run_probe():
                     ),
                 }
             )
+            if query is not None and rows == 5:
+                main, index = query.project(hidden)
+                # Independently invert FlashMLA's Q-B lane layout; the index
+                # suffix is ordinary head-major data and must not be permuted.
+                restored_main = (
+                    main.reshape(rows, 32, 128, 16).transpose(1, 2).reshape(rows, -1)
+                )
+                query_errors = {}
+                for label, actual_part, expected_part in (
+                    ("main", restored_main, expected[:, : 128 * 512]),
+                    ("index", index, expected[:, 128 * 512 :]),
+                ):
+                    difference = actual_part.float() - expected_part.float()
+                    error = (difference.norm() / expected_part.float().norm()).item()
+                    if error > 0.005:
+                        raise AssertionError(
+                            f"merged query {label}: relative L2 {error}"
+                        )
+                    query_errors[label] = {
+                        "relative_l2": error,
+                        "max_abs": difference.abs().max().item(),
+                    }
+                result[-1]["merged_query"] = {
+                    **query_errors,
+                    "capture": _graph(lambda: torch.cat(query.project(hidden), dim=-1)),
+                }
     return {"gpu": torch.cuda.get_device_name(), "projections": result}

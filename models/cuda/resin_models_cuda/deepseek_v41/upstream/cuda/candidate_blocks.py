@@ -4,9 +4,9 @@
 # deepinfer/model_executor/layers/tilelang_ops/cuda/candidate_blocks.py
 from typing import Any
 
-import tile_kernels
 import tilelang
 import tilelang.language as _language
+from deep_gemm import get_num_sms
 
 # TileLang interprets this body as GPU IR, rather than Python tensor operations.
 T: Any = _language
@@ -30,7 +30,7 @@ def candidate_block_max_tl(
     valid_blocks_size = T.dynamic("valid_blocks_size")
     num_blocks = T.ceildiv(max_model_len, block_size)
     # Use the dense kernel's single-row compute tile with compacted tasks.
-    num_sms = tile_kernels.get_num_sms()
+    num_sms = get_num_sms()
     ctas_per_sm = 1
     threads = 1024  # 1024
     requests_per_cta = 2

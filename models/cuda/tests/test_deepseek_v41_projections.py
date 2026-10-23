@@ -56,9 +56,8 @@ def deepgemm(monkeypatch):
             bf16_gemm_nt=bf16_gemm,
         ),
     )
-    monkeypatch.setitem(sys.modules, "tile_kernels", SimpleNamespace())
-    monkeypatch.setitem(
-        sys.modules, "tile_kernels.quant", SimpleNamespace(per_token_cast=quantize)
+    monkeypatch.setattr(
+        "resin_models_cuda.deepseek_v4.tilelang_kernels.per_token_cast", quantize
     )
     return calls, quantize
 
