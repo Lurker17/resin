@@ -148,8 +148,38 @@ than the full 384-expert checkpoint. Artifacts live under
 `artifacts/benchmarks/2026-10-22-v41-forward-port-microprobes/`, alongside
 `artifacts/benchmarks/deepinfer-v41-output-probe.json`.
 
-New throughput measurements are queued from `7087a31`. Subsequent TileKernels HC
-materialization and Engram gate ports require fresh full-checkpoint validation.
+The [prepared-forward EP8 baseline](https://modal.com/apps/ekzhang/main/ap-lfw5WzD1XFQrU1UZ06dAXN)
+at clean `de438e4` completes six B300 points at 128K context: 126,976 shared tokens
+and a 4,096-token private suffix, K3 with two forced draft acceptances, balanced
+experts, five warmup steps and 20 measured steps. Device times use CUDA phase
+events; Engine times include native planning and distributed coordination.
+Throughput below projects 75% draft acceptance (3.25 tokens/step); measured
+acceptance was fixed at two of three drafts (3 tokens/step).
+
+| Batch/GPU | Engine ms | Device ms | Projected tokens/s/GPU |
+| ---: | ---: | ---: | ---: |
+| 8 | 60.920 | 21.640 | 426.79 |
+| 16 | 65.611 | 22.727 | 792.55 |
+| 32 | 70.023 | 23.920 | 1,485.24 |
+| 64 | 77.823 | 26.926 | 2,672.71 |
+| 128 | 99.315 | 33.906 | 4,188.70 |
+| 256 | 140.853 | 46.469 | 5,906.86 |
+
+At batch8/GPU, the comparable four-GPU baseline takes 41.94 ms in the Engine and
+26.75 ms on device. Eight GPUs reduce device time but increase the interval
+outside those device phases to 39.28 ms; at batch256/GPU that interval is
+94.38 ms. This difference includes host work and synchronization waits, so it
+does not measure isolated CPU execution. Raw records, source provenance, plots
+and all-rank CPU/CUDA Perfetto traces are archived under
+`artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-deepinfer/`; four-GPU
+records use the sibling `2026-10-22-deepseek-v41-b300-ep4-deepinfer/` directory.
+The B200 attempt failed during Quack RMSNorm graph capture with
+`cudaErrorNoKernelImageForDevice`, producing no throughput result; its log and
+failure metadata are under the sibling `2026-10-22-deepseek-v41-b200-ep8-deepinfer/`.
+
+These measurements precede the current CPU planning, native overlap and prepared
+metadata changes. Current source requires fresh full-checkpoint validation and
+throughput measurement.
 The implementation uses fixed-width greedy proposals, loads the confidence head
 without applying its length policy, and supports up to the released five-token
 block. Benchmark defaults remain four drafts. Wider meshes and longer contexts

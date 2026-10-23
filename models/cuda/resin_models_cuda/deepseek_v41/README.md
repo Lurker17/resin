@@ -131,9 +131,17 @@ It reached 1,430.90 output tokens/s/GPU at batch256/GPU. Those measurements pred
 the paged FP4 indexer, fused dense projections, cross-block lazy HC and Engram
 prefetch; they do not measure the new forward pass. Raw records and PNG/SVG plots
 remain under `artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-128k/`.
-New throughput measurements for `7087a31` are queued; see
-[the benchmark protocol](../../../../docs/benchmarks.md). Subsequent TileKernels
-HC materialization and Engram gate ports need fresh full-checkpoint qualification.
+The [prepared-forward EP8 baseline](https://modal.com/apps/ekzhang/main/ap-lfw5WzD1XFQrU1UZ06dAXN)
+at `de438e4` completes all six 128K points with K3, two forced draft acceptances
+and balanced experts. At batch256/GPU, Engine steps take 140.85 ms and device work
+takes 46.47 ms; projecting 75% acceptance yields 5,906.86 output tokens/s/GPU.
+At batch8/GPU, the corresponding times are 60.92/21.64 ms, exposing substantial
+host coordination and planning overhead. Raw records, PNG/SVG plots and all-rank
+Perfetto traces live under
+`artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-deepinfer/`.
+These historical records precede the current scheduling, overlap and prepared
+metadata changes; current source needs fresh full-checkpoint qualification and
+throughput measurement. See [the benchmark protocol](../../../../docs/benchmarks.md).
 
 The runner accepts text token IDs and rejects image tokens. DSpark uses fixed-width
 greedy proposals up to the released five-token block; its confidence head is loaded
