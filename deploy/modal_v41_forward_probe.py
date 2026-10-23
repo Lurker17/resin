@@ -27,6 +27,7 @@ for helper in (
     "deepseek_v41_validation",
     "v41_transform_probe",
     "v41_residual_probe",
+    "v41_batch_probe",
 ):
     image = image.add_local_file(
         ROOT / f"deploy/{helper}.py", f"/root/deploy/{helper}.py", copy=True
@@ -53,6 +54,7 @@ def probe() -> dict:
             ("attention", "flashmla_validation"),
             ("transforms", "v41_transform_probe"),
             ("residuals", "v41_residual_probe"),
+            ("metadata", "v41_batch_probe"),
         ):
             # Give each check an independent CUDA context, so a device assert
             # yields useful diagnostics for the remaining operator families.
