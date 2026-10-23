@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -108,6 +108,7 @@ def test_indexer_prefill_and_graph_map_the_same_fixed_sparse_rows(native, monkey
         wq_b=lambda qr: qr,
         weights_proj=lambda hidden: torch.ones(*hidden.shape[:2], 2),
     )
+    indexer._select = MethodType(native.Indexer._select, indexer)
     positions = torch.tensor([[15, 19]])
     scores_widths = []
 
@@ -145,7 +146,7 @@ def test_indexer_prefill_and_graph_map_the_same_fixed_sparse_rows(native, monkey
     prefill = native.Indexer.forward_prefill(
         indexer, hidden, hidden, positions, 15, 20, cache=cache
     )
-    graph = native.Indexer._forward_graph(
+    graph = native.Indexer._select(
         indexer, hidden, hidden, positions, 0, 512, cache=cache
     )
 

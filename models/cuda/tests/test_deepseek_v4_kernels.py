@@ -665,3 +665,57 @@ def test_routing_normalizes_negative_logits_without_nan(kernels, router, level):
     assert weights.isfinite().all()
     torch.testing.assert_close(indices, expected_ids, atol=0, rtol=0)
     torch.testing.assert_close(weights, expected, atol=0, rtol=0.008)
+
+
+@pytest.mark.parametrize("context", [4096, 32768, 131072])
+@pytest.mark.parametrize("queries", [1, 129, 1024])
+def test_prefill_topk_maps_long_context_and_replayed_page_tables(
+    kernels, context, queries
+):
+    width = context // 128
+    mapping = DeviceMapping(
+        parent_ids=torch.randint(1, 128, (1, width), dtype=torch.int32, device="cuda"),
+        child_slots=torch.randint(0, 2, (1, width), dtype=torch.int32, device="cuda"),
+        first_blocks=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        block_tokens=128,
+        divisor=4,
+        parent_rows=512,
+        packing=2,
+        row_scale=1,
+        layer_offset=64,
+    )
+    positions = torch.arange(
+        context - queries, context, dtype=torch.int32, device="cuda"
+    )[None]
+    indices = (
+        torch.arange(192, dtype=torch.int32, device="cuda")[None, None]
+        .expand(1, queries, -1)
+        .clone()
+    )
+    indices *= 137
+    indices %= (positions + 1)[..., None] // 4
+    indices[..., ::7] = -1
+
+    def call():
+        return kernels.finish_index_topk(
+            indices, positions, 4, 0, cache_mapping=mapping
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        call()
+        call()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = call()
+    torch.cuda.current_stream().wait_stream(stream)
+    for shift in (0, 1, 7):
+        mapping.parent_ids.copy_(mapping.parent_ids.roll(shift, -1))
+        graph.replay()
+        # Independent page equations, including positions spanning many pages.
+        logical = indices.clamp_min(0) * 4
+        physical = _rows(mapping, logical.flatten(1)).reshape_as(indices)
+        expected = torch.where(indices >= 0, physical, -1).int()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)

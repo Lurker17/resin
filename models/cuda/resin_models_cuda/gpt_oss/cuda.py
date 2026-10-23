@@ -1160,7 +1160,7 @@ def _route(router: TopKRouter, logits: Tensor) -> tuple[Tensor, Tensor]:
             router.benchmark_expert_parallel_size,
         )
         return indices, torch.softmax(logits.gather(1, indices), dim=-1)
-    if router.top_k == 4 and logits.shape[-1] == 128:
+    if router.top_k == 4 and logits.shape[-1] in (32, 128):
         return top4_softmax(logits)
     values, indices = torch.topk(logits, router.top_k, dim=-1, sorted=True)
     return indices, torch.softmax(values, dim=-1)
