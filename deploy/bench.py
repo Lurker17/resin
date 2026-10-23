@@ -320,6 +320,7 @@ def _rank(
         "expert_backend": options["expert_backend"],
         "load_seconds": loaded_seconds,
         "capture_seconds": capture_seconds,
+        "profile_graph_phases": options.get("profile_graph_phases", False),
         "prefill_chunk_size": options["prefill_chunk_size"],
         "max_batch_tokens": prefill_budget,
     }
