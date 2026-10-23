@@ -193,7 +193,9 @@ class CudaRunner(Runner):
         if groups is None:
             records = [record]
         else:
-            records, _ = self._expert_graph_control.gather(
+            control = self._expert_graph_control
+            assert control is not None
+            records, _ = control.gather(
                 groups.domain, f"cuda_graph_select:{mode}", record
             )
         if any(row[2] != len(required_shape) for row in records):

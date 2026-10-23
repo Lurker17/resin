@@ -387,7 +387,7 @@ def test_driver_policy_disables_every_peer_without_hiding_catalogs(
 
     runner._expert_graph_catalogs[mode] = catalog
     runner._expert_graph_groups = SimpleNamespace(domain=RankGroup((0, 1), None, rank))
-    runner._expert_graph_control = SimpleNamespace(gather=gather)
+    monkeypatch.setattr(runner, "_expert_graph_control", SimpleNamespace(gather=gather))
     context = SimpleNamespace(max_num_tokens=2)
     assert (
         runner._select_distributed_cuda_graph(mode, context, required_shape=catalog[0])
