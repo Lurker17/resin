@@ -311,6 +311,37 @@ class Attention(nn.Module):
             pack_kv(kv),
         )
 
+    def _store_compressed_kv(self, latent, metadata, cache):
+        positions = metadata.positions_c[self.ratio]
+        if hasattr(self, "cos_sin"):
+            store_attention_kv(
+                self,
+                latent,
+                positions,
+                cache.compressed_cache(self.layer_id),
+                metadata.slot_mapping_store_ca[self.ratio],
+                compressed=True,
+            )
+        else:
+            apply_rotary_emb(
+                latent[..., -self.rope_head_dim :], self.freqs_cis[positions]
+            )
+            store_kv(
+                cache.compressed_cache(self.layer_id),
+                metadata.slot_mapping_store_ca[self.ratio],
+                pack_kv(latent, fp4=True),
+            )
+
+    def prepare_shared_kv(self, hidden, positions, cache, runtime):
+        """Write complete C1 main/index history before consumer queries compact."""
+        from resin_models_cuda.deepseek_v41.indexer import store_index_kv
+
+        metadata = runtime["metadata"]
+        latent = self.compressor(hidden, positions, cache, metadata=metadata)
+        store_index_kv(self.indexer, latent, cache, self.freqs_cis, metadata)
+        self._store_compressed_kv(latent, metadata, cache)
+        runtime.setdefault("full_index_kv_stored", set()).add(self.layer_id)
+
     def forward(
         self,
         hidden,
@@ -359,6 +390,7 @@ class Attention(nn.Module):
         latent = (
             self.compressor(hidden, positions, cache, metadata=metadata)
             if hasattr(self, "compressor")
+            and self.layer_id not in runtime.get("full_index_kv_stored", ())
             else None
         )
         if hasattr(self, "indexer"):
@@ -375,26 +407,7 @@ class Attention(nn.Module):
                 query=index_query,
             )
         if latent is not None:
-            compressed_positions = metadata.positions_c[self.ratio]
-            if hasattr(self, "cos_sin"):
-                store_attention_kv(
-                    self,
-                    latent,
-                    compressed_positions,
-                    cache.compressed_cache(self.layer_id),
-                    metadata.slot_mapping_store_ca[self.ratio],
-                    compressed=True,
-                )
-            else:
-                apply_rotary_emb(
-                    latent[..., -self.rope_head_dim :],
-                    self.freqs_cis[compressed_positions],
-                )
-                store_kv(
-                    cache.compressed_cache(self.layer_id),
-                    metadata.slot_mapping_store_ca[self.ratio],
-                    pack_kv(latent, fp4=True),
-                )
+            self._store_compressed_kv(latent, metadata, cache)
         if context_parallel is not None:
             query, positions = (
                 query.index_select(1, context_parallel.token_indices),
@@ -641,6 +654,14 @@ class Transformer(nn.Module):
         self.target_layer_ids = frozenset(
             args.dspark_target_layer_ids if self.mtp else ()
         )
+        self.prefill_boundary = next(
+            (
+                layer
+                for layer in args.kv_source_layers
+                if args.compress_ratios[layer] == 1
+            ),
+            None,
+        )
         if args.engram_layer_ids:
             from resin.backend.embedding import ShardedEmbeddingLookup
             from resin_models_cuda.deepseek_v41.engram import (
@@ -777,7 +798,18 @@ class Transformer(nn.Module):
             else:
                 layer.ffn.forward_empty()
 
-    def _run(self, ids, positions, capacity, cache, cp=None, *, prefill=False):
+    def _run(
+        self,
+        ids,
+        positions,
+        capacity,
+        cache,
+        cp=None,
+        *,
+        prefill=False,
+        replay_start=None,
+        replay_indices=None,
+    ):
         metadata = cache.prepare_metadata(positions)
         positions = metadata.positions
         hashes = (
@@ -791,6 +823,46 @@ class Transformer(nn.Module):
         pre[..., 0] = 1
         runtime, collected = {"metadata": metadata}, []
         for layer in self.layers:
+            if (
+                prefill
+                and replay_start is not None
+                and layer.layer_id == self.prefill_boundary
+            ):
+                from resin_models_cuda.deepseek_v41.yoco import compact_runtime
+
+                # The C1 source observes every producer row. Consumer queries
+                # and their residual streams only retain the final rectangle.
+                full_value = (
+                    mega_transition(layer, hidden, pre, "attn")[0]
+                    if isinstance(pre, HCLazyPost)
+                    else layer.attn_norm(Block.collapse(hidden, pre))
+                )
+                layer.attn.prepare_shared_kv(full_value, positions, cache, runtime)
+                del full_value
+                assert replay_indices is not None
+                hidden = hidden.index_select(1, replay_indices)
+                pre = (
+                    HCLazyPost(
+                        *(
+                            value.index_select(1, replay_indices)
+                            for value in (pre.residual, pre.pre, pre.post, pre.comb)
+                        )
+                    )
+                    if isinstance(pre, HCLazyPost)
+                    else pre.index_select(1, replay_indices)
+                )
+                ids = ids.index_select(1, replay_indices)
+                runtime = compact_runtime(
+                    runtime, replay_indices, swa_start=replay_start
+                )
+                positions = runtime["metadata"].positions
+                if cp is not None:
+                    cp = ContextParallelTokens(
+                        (ids.shape[1],),
+                        cp.group,
+                        device=ids.device,
+                        distributed=cp.distributed,
+                    )
             # Engram and feature taps observe all residual streams. Everywhere
             # else, keep the previous post-mix lazy so the next HC can fuse it.
             if isinstance(pre, HCLazyPost) and (
@@ -818,7 +890,16 @@ class Transformer(nn.Module):
         ) if collected else None
 
     @torch.inference_mode()
-    def forward_prefill(self, input_ids, start_position, *, cache, return_hidden=False):
+    def forward_prefill(
+        self,
+        input_ids,
+        start_position,
+        *,
+        cache,
+        return_hidden=False,
+        replay_start=None,
+        compact_replay=True,
+    ):
         positions = (
             start_position
             + torch.arange(input_ids.shape[1], device=input_ids.device)[None]
@@ -840,6 +921,18 @@ class Transformer(nn.Module):
             cache,
             cp,
             prefill=True,
+            replay_start=replay_start,
+            replay_indices=(
+                torch.arange(
+                    min(max(replay_start - start_position, 0), input_ids.shape[1] - 1)
+                    if compact_replay
+                    else 0,
+                    input_ids.shape[1],
+                    device=input_ids.device,
+                )
+                if replay_start is not None
+                else None
+            ),
         )
         return (hidden if return_hidden else self.head(hidden)), main
 
@@ -873,12 +966,14 @@ class Transformer(nn.Module):
         for layer in self.mtp:
             layer.attn.store(hidden, positions, cache, metadata=metadata)
 
-    def commit_dspark_main_block(self, main_hidden, position, *, cache):
+    def commit_dspark_main_block(
+        self, main_hidden, position, *, cache, valid_tokens=None
+    ):
         hidden = self._project_main(main_hidden)
         positions = position[:, None] + torch.arange(
             hidden.shape[1], device=hidden.device
         )
-        metadata = cache.prepare_metadata(positions)
+        metadata = cache.prepare_metadata(positions, valid_tokens=valid_tokens)
         for layer in self.mtp:
             layer.attn.store(hidden, positions, cache, metadata=metadata)
 

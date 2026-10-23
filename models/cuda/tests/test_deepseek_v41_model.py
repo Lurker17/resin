@@ -356,7 +356,7 @@ def test_only_prompt_forward_enables_prefill_projection_callbacks(implementation
     model.head = lambda hidden, **kwargs: hidden
     modes = []
 
-    def run(ids, positions, capacity, cache, cp=None, *, prefill=False):
+    def run(ids, positions, capacity, cache, cp=None, *, prefill=False, **kwargs):
         modes.append(prefill)
         return ids, None
 
@@ -369,3 +369,122 @@ def test_only_prompt_forward_enables_prefill_projection_callbacks(implementation
         torch.zeros(4, 5, dtype=torch.long), torch.arange(4), 16, cache=None
     )
     assert modes == [True, False, False]
+
+
+@pytest.mark.parametrize("replay_start,offset", [(132, 6), (200, 7)])
+def test_replay_keeps_full_source_and_compacts_consumer_state(
+    implementation, replay_start, offset
+):
+    from test_deepseek_v41 import _cache
+
+    calls, sources = [], []
+
+    class Attention(nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.layer = layer
+
+        def prepare_shared_kv(self, hidden, positions, cache, runtime):
+            sources.append((hidden.clone(), positions.clone()))
+            runtime["full_index_kv_stored"] = {self.layer}
+
+        def forward(self, hidden, positions, capacity, cache, runtime, cp, **kwargs):
+            frame = runtime["metadata"]
+            calls.append((self.layer, positions.clone(), frame.slot_mapping_store_swa))
+            return hidden + 1
+
+    class Layer(nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.layer_id, self.engram = index, None
+            self.attn, self.attn_norm = Attention(index), nn.Identity()
+
+        def forward(self, hidden, pre, ids, attention, **kwargs):
+            value = implementation.Block.collapse(hidden, pre)
+            return attention(value).unsqueeze(2), pre
+
+    model = implementation.Transformer.__new__(implementation.Transformer)
+    nn.Module.__init__(model)
+    model.parallel_groups, model.engram_hash = None, None
+    model.hc_mult, model.prefill_boundary = 1, 1
+    model.target_layer_ids = {2}
+    model.embed = lambda ids: ids.float()[..., None].expand(-1, -1, 2)
+    model.norm, model.head = nn.Identity(), nn.Identity()
+    model.layers = nn.ModuleList(Layer(index) for index in range(3))
+    _, cache = _cache()
+    ids = torch.arange(8)[None]
+    full, full_main = model.forward_prefill(
+        ids, 126, cache=cache, replay_start=replay_start, compact_replay=False
+    )
+    calls.clear()
+    compact, main = model.forward_prefill(
+        ids, 126, cache=cache, replay_start=replay_start
+    )
+    assert [positions.shape[1] for _, positions, _ in calls] == [
+        8,
+        8 - offset,
+        8 - offset,
+    ]
+    assert all(
+        positions.tolist() == [list(range(126, 134))] for _, positions in sources
+    )
+    assert torch.equal(sources[0][0], sources[1][0])
+    torch.testing.assert_close(compact, full[:, offset:])
+    torch.testing.assert_close(main, full_main[:, offset:])
+    for _, positions, stores in calls[1:]:
+        assert positions.tolist() == [list(range(126 + offset, 134))]
+        assert torch.equal(stores >= 0, positions >= replay_start)
+
+
+@pytest.mark.parametrize(
+    "mode,scored,context,count,retained",
+    [
+        ("compact", False, 0, 4096, 1),
+        ("compact", False, 130900, 172, 140),
+        ("mask", False, 130900, 172, 172),
+        ("compact", True, 0, 4096, 4096),
+        ("off", False, 0, 4096, 4096),
+    ],
+)
+def test_runner_replay_policy_keeps_dspark_absolute_positions_and_full_scores(
+    mode, scored, context, count, retained
+):
+    from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
+
+    runner = object.__new__(DeepSeekV41CudaRunner)
+    runner._swa_replay_tokens, runner._swa_replay_mode = 140, mode
+    runner.speculative_tokens = 3
+    stores = []
+
+    def forward(ids, start, *, replay_start, compact_replay, return_hidden, cache):
+        assert return_hidden == scored
+        assert replay_start == (None if scored or mode == "off" else 130932)
+        rows = retained
+        return torch.zeros(1, rows, 2), torch.zeros(1, rows, 2)
+
+    def commit(hidden, position, *, cache, valid_tokens):
+        stores.append((position, valid_tokens))
+
+    runner._model = SimpleNamespace(
+        prefill_boundary=20,
+        layers=range(40),
+        forward_prefill=forward,
+        commit_dspark_main_block=commit,
+    )
+    plan = SimpleNamespace(
+        needs_prompt_logprobs=scored,
+        context_lengths=[context],
+        prefill_lengths=[131072],
+    )
+    positions = torch.arange(context, context + count)
+    runner._prefill_row(
+        plan, 0, torch.zeros(1, count, dtype=torch.long), positions, None
+    )
+    assert stores[0][0].tolist() == [context + count - retained]
+    valid = stores[0][1]
+    if scored or mode == "off":
+        assert valid is None
+    else:
+        assert torch.equal(valid, positions[count - retained :] >= 130932)
+    demands = runner._prefill_region_tokens(plan, ((0, count),))
+    assert demands == ({} if mode == "off" else {range(20, 40): retained})

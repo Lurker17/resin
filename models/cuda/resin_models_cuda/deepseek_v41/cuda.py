@@ -18,7 +18,20 @@ class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
         attn_tp=False, attn_dp=True, cp=True, ep=True, expert_tp=True
     )
 
-    def __init__(self, *args, expert_backend="flashinfer", **kwargs):
+    def __init__(
+        self,
+        *args,
+        expert_backend="flashinfer",
+        swa_replay_tokens=140,
+        swa_replay_mode="compact",
+        **kwargs,
+    ):
+        if type(swa_replay_tokens) is not int or swa_replay_tokens < 0:
+            raise ValueError("swa_replay_tokens must be a nonnegative integer")
+        if swa_replay_mode not in ("off", "mask", "compact"):
+            raise ValueError("swa_replay_mode must be off, mask, or compact")
+        self._swa_replay_tokens = swa_replay_tokens
+        self._swa_replay_mode = swa_replay_mode
         if expert_backend not in ("flashinfer", "deepgemm"):
             raise ValueError(f"unknown expert backend: {expert_backend}")
         if expert_backend == "deepgemm":
@@ -49,11 +62,91 @@ class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
         return cache
 
     def _build_cache_geometry(self, args):
+        boundary = self._model.prefill_boundary
+        replay = (
+            self._swa_replay_tokens
+            if boundary is not None and self._swa_replay_mode != "off"
+            else 0
+        )
+        if replay:
+            if replay < args.window_size + self.speculative_tokens + 1:
+                raise ValueError(
+                    "SWA replay must cover the window and speculative rollback"
+                )
+            if (
+                any(layer > boundary for layer in args.kv_source_layers)
+                or any(layer >= boundary for layer in args.engram_layer_ids)
+                or any(layer < boundary for layer in self._model.target_layer_ids)
+            ):
+                raise ValueError(
+                    "SWA replay requires producer KV/Engram and consumer DSpark taps"
+                )
         return self._cache_backend().CacheGeometry.build(
             args,
             prefill_chunk_size=self.prefill_chunk_size,
             max_batch_size=self.max_batch_size,
+            replay_suffix_tokens=replay,
         )
+
+    def _replay_start(self, plan, slot, tokens):
+        """A host-only boundary; scored histories stay full."""
+        if (
+            not self._swa_replay_tokens
+            or self._swa_replay_mode == "off"
+            or self._model.prefill_boundary is None
+            or plan.needs_prompt_logprobs
+        ):
+            return None
+        prompt = int(plan.prefill_lengths[slot])
+        if int(plan.context_lengths[slot]) + tokens > prompt:
+            return None
+        return max(0, prompt - self._swa_replay_tokens)
+
+    def _prefill_region_tokens(self, plan, rows):
+        boundary = self._model.prefill_boundary
+        if (
+            not self._swa_replay_tokens
+            or boundary is None
+            or self._swa_replay_mode == "off"
+        ):
+            return {}
+        demand = 1
+        if plan is not None:
+            for slot, (begin, end) in enumerate(rows):
+                tokens = end - begin
+                lower = self._replay_start(plan, slot, tokens)
+                clipped = (
+                    min(max(lower - int(plan.context_lengths[slot]), 0), tokens - 1)
+                    if lower is not None and self._swa_replay_mode == "compact"
+                    else 0
+                )
+                demand = max(demand, tokens - clipped)
+        return {range(boundary, len(self._model.layers)): demand}
+
+    def _prefill_row(self, plan, slot, input_ids, positions, cache):
+        context = int(plan.context_lengths[slot])
+        replay_start = self._replay_start(plan, slot, input_ids.shape[1])
+        logits, main = self._model.forward_prefill(
+            input_ids,
+            context,
+            cache=cache,
+            return_hidden=plan.needs_prompt_logprobs,
+            replay_start=replay_start,
+            compact_replay=self._swa_replay_mode == "compact",
+        )
+        if self.speculative_tokens:
+            if main is None:
+                raise RuntimeError("target did not produce DSpark hidden states")
+            offset = input_ids.shape[1] - main.shape[1]
+            valid = (
+                (positions[offset:] >= replay_start)
+                if replay_start is not None
+                else None
+            )
+            self._model.commit_dspark_main_block(
+                main, positions[offset : offset + 1], cache=cache, valid_tokens=valid
+            )
+        return logits
 
     def _build_model(self, values):
         from resin_models_cuda.deepseek_v41.model import ModelArgs, Transformer

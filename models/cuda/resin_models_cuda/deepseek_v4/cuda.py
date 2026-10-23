@@ -856,6 +856,28 @@ class DeepSeekV4CudaRunner(CudaRunner):
             raise ValueError("DeepSeek-V4 plan phase must be prefill or decode")
         return rows
 
+    def _prefill_region_tokens(self, plan, rows):
+        """Optional per-region row demands, agreed before distributed prefill."""
+        return {}
+
+    def _prefill_row(self, plan, slot, input_ids, positions, cache):
+        """Execute one sequence and commit its model-specific speculative state."""
+        context = int(plan.context_lengths[slot])
+        logits, main = self._model.forward_prefill(
+            input_ids,
+            context,
+            cache=cache,
+            **({"return_hidden": True} if plan.needs_prompt_logprobs else {}),
+        )
+        if self.speculative_tokens:
+            if main is None:
+                raise RuntimeError("target did not produce DSpark hidden states")
+            if context == 0:
+                self._model.prefill_dspark(main, cache=cache)
+            else:
+                self._model.commit_dspark_main_block(main, positions[:1], cache=cache)
+        return logits
+
     def _prefill(
         self,
         plan: BatchPlan,
@@ -871,12 +893,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
         for slot, (start, end) in enumerate(rows):
             row_cache = cache.row(slot)
             input_ids = token_ids[start:end].unsqueeze(0)
-            context = int(plan.context_lengths[slot])
-            row_logits, main_hidden = self._model.forward_prefill(
-                input_ids,
-                context,
-                cache=row_cache,
-                **({"return_hidden": True} if plan.needs_prompt_logprobs else {}),
+            row_logits = self._prefill_row(
+                plan, slot, input_ids, positions[start:end], row_cache
             )
             if plan.needs_prompt_logprobs:
 
@@ -887,17 +905,6 @@ class DeepSeekV4CudaRunner(CudaRunner):
                     prompt_scores(plan, row_logits[0], project, token_start=start)
                 )
                 row_logits = self._model.head(row_logits[:, -1:])
-            if self.speculative_tokens:
-                if main_hidden is None:
-                    raise RuntimeError("target did not produce DSpark hidden states")
-                if context == 0:
-                    self._model.prefill_dspark(main_hidden, cache=row_cache)
-                else:
-                    self._model.commit_dspark_main_block(
-                        main_hidden,
-                        positions[start : start + 1],
-                        cache=row_cache,
-                    )
             logits.append(row_logits)
         return torch.cat(logits, dim=0), PromptScores.concat(prompt_rows)
 
@@ -1179,7 +1186,11 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 else nullcontext(),
             ):
                 if context.phase == BatchPhase.PREFILL:
-                    with self._distributed_prefill_graphs(context, per_sequence=True):
+                    with self._distributed_prefill_graphs(
+                        context,
+                        per_sequence=True,
+                        region_tokens=self._prefill_region_tokens(plan, rows),
+                    ):
                         prefill_output = (
                             self._prefill(plan, rows, cache, token_ids, positions)
                             if plan is not None

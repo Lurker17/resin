@@ -37,9 +37,18 @@ class CacheGeometry:
     window_size: int
     draft_tokens: int
     max_batch_size: int = 1
+    replay_suffix_tokens: int = 0
 
     @classmethod
-    def build(cls, args, *, prefill_chunk_size: int, max_batch_size: int = 1, **_):
+    def build(
+        cls,
+        args,
+        *,
+        prefill_chunk_size: int,
+        max_batch_size: int = 1,
+        replay_suffix_tokens: int = 0,
+        **_,
+    ):
         count = args.n_layers + args.n_mtp_layers
         ratios = tuple(args.compress_ratios)
         cursor, compressed, indices = 0, [None] * count, [None] * count
@@ -87,6 +96,7 @@ class CacheGeometry:
             args.window_size,
             math.ceil(args.dspark_block_size / 8) * 8,
             max_batch_size,
+            replay_suffix_tokens,
         )
 
     @property
@@ -136,6 +146,7 @@ class CacheGeometry:
                     PAGE_TOKENS, blocks_per_slab=self.packings[TOKENS], **window(4)
                 ),
             ),
+            replay_suffix_tokens=self.replay_suffix_tokens,
         )
 
 

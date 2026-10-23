@@ -35,6 +35,39 @@ def index_metadata(cache, positions, ratio, runtime):
     return metadata[ratio]
 
 
+def store_index_kv(indexer, latent, cache, freqs, metadata):
+    """Write a full source before compacting its consumer query rows."""
+    from resin_models_cuda.deepseek_v41.attention import _cos_sin
+    from resin_models_cuda.deepseek_v41.upstream.fused_transform import (
+        CastArgs,
+        KVCacheOutArgs,
+        NormArgs,
+        RopeArgs,
+    )
+    from resin_models_cuda.deepseek_v41.upstream.fused_transform import (
+        fused_norm_rope_hadamard_cast_store_kvcache as transform,
+    )
+
+    if not indexer.owns_k:
+        raise ValueError("only an index-K source may store its projected keys")
+    transform(
+        indexer.wk(latent).reshape(-1, indexer.head_dim),
+        norm_args=NormArgs(indexer.k_norm.weight, indexer.k_norm.eps),
+        rope_args=RopeArgs(
+            metadata.positions_c[indexer.ratio].flatten(),
+            _cos_sin(freqs),
+            indexer.rope_dim,
+            False,
+            offset=indexer.head_dim - indexer.rope_dim,
+        ),
+        cast_args=CastArgs("e2m1", 32, round_sf=True, sf_format="ue8m0"),
+        out_args=KVCacheOutArgs(
+            cache.index_cache(indexer.layer),
+            metadata.slot_mapping_store_ca[indexer.ratio].flatten(),
+        ),
+    )
+
+
 def paged_index(
     indexer, hidden, query, latent, positions, capacity, cache, freqs, runtime
 ):
@@ -49,8 +82,6 @@ def paged_index(
     )
     from resin_models_cuda.deepseek_v41.upstream.fused_transform import (
         CastArgs,
-        KVCacheOutArgs,
-        NormArgs,
         RopeArgs,
     )
     from resin_models_cuda.deepseek_v41.upstream.fused_transform import (
@@ -64,25 +95,8 @@ def paged_index(
     positions = metadata.positions
     cos_sin = _cos_sin(freqs)
     cast_args = CastArgs("e2m1", 32, round_sf=True, sf_format="ue8m0")
-    if indexer.owns_k:
-        keys = indexer.wk(latent).reshape(-1, indexer.head_dim)
-        slots = metadata.slot_mapping_store_ca[indexer.ratio].flatten()
-        transform(
-            keys,
-            norm_args=NormArgs(indexer.k_norm.weight, indexer.k_norm.eps),
-            rope_args=RopeArgs(
-                metadata.positions_c[indexer.ratio].flatten(),
-                cos_sin,
-                indexer.rope_dim,
-                False,
-                offset=indexer.head_dim - indexer.rope_dim,
-            ),
-            cast_args=cast_args,
-            out_args=KVCacheOutArgs(
-                cache.index_cache(indexer.layer),
-                slots,
-            ),
-        )
+    if indexer.owns_k and indexer.layer not in runtime.get("full_index_kv_stored", ()):
+        store_index_kv(indexer, latent, cache, freqs, metadata)
     q, sf = cast(
         tuple[torch.Tensor, torch.Tensor],
         transform(

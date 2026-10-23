@@ -40,14 +40,22 @@ def prefill_inputs(attention, cache, metadata, capacity, runtime):
     layout = runtime.setdefault("prefill_layout", {})
     if "window" not in layout:
         positions = metadata.positions
-        start = max(0, capacity - positions.shape[1] - attention.window_size + 1)
-        history = torch.arange(start, capacity, device=positions.device)[None]
+        lower = runtime.get("swa_start", 0)
+        start = max(lower, capacity - positions.shape[1] - attention.window_size + 1)
+        history = torch.arange(start, max(start, capacity), device=positions.device)[
+            None
+        ]
         columns = torch.arange(attention.window_size, device=positions.device)
         counts = (positions + 1).clamp_max(attention.window_size)
         windows = positions[..., None] + 1 - counts[..., None] + columns
+        visible = (
+            (columns < counts[..., None])
+            & (windows >= lower)
+            & metadata.valid_token_mask.reshape_as(positions)[..., None]
+        )
         layout["window"] = (
             cache.window_rows(attention.layer_id, history),
-            torch.where(columns < counts[..., None], windows - start, -1),
+            torch.where(visible, windows - start, -1),
         )
     rows, indices = layout["window"]
     values = gather_kv(cache.window_cache(attention.layer_id), rows)
