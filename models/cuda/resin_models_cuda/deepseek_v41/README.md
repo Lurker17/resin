@@ -164,10 +164,17 @@ At batch8/GPU, the corresponding times are 60.92/21.64 ms, exposing substantial
 host coordination and planning overhead. Raw records, PNG/SVG plots and all-rank
 Perfetto traces live under
 `artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-deepinfer/`.
-These historical records precede the current scheduling, overlap and prepared
-metadata changes. The checkpoint qualification above does not measure their
-throughput; performance results must identify the same source revision.
-See [the benchmark protocol](../../../../docs/benchmarks.md).
+The [Engine-overlap EP8 sweep](https://modal.com/apps/ekzhang/main/ap-gnaa8Li1vQmHzzujs8tZT4)
+at `cd5ecfd` measures the same six workloads with prepared batch metadata and
+continuous completion timing. Batch256/GPU takes 39.79 ms: 20,907.62 projected
+tokens/s/GPU at 75% acceptance, or 19,299.34 actual tokens/s/GPU with two forced
+acceptances. This is 3.54× the historical baseline. Each point records 160 native
+continuations across eight drivers and zero eager fallbacks. The 48 raw rank
+traces each contain two forwards; batch8/GPU drops from 5,116 to 1,436 CUDA
+kernels per forward. Records, plots, source provenance and merged Perfetto traces
+are under `artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-overlap/`.
+See [the benchmark protocol](../../../../docs/benchmarks.md) for all six points,
+timing scope and the distinction between measured and projected acceptance.
 
 The runner accepts text token IDs and rejects image tokens. DSpark uses fixed-width
 greedy proposals up to the released five-token block; its confidence head is loaded

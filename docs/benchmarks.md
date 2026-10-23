@@ -185,9 +185,36 @@ The B200 attempt failed during Quack RMSNorm graph capture with
 `cudaErrorNoKernelImageForDevice`, producing no throughput result; its log and
 failure metadata are under the sibling `2026-10-22-deepseek-v41-b200-ep8-deepinfer/`.
 
-These measurements precede the current CPU planning, native overlap and prepared
-metadata changes. Current source requires fresh full-checkpoint validation and
-throughput measurement.
+The [Engine-overlap EP8 sweep](https://modal.com/apps/ekzhang/main/ap-gnaa8Li1vQmHzzujs8tZT4)
+at clean `cd5ecfd` measures the same six workloads after the CPU planning,
+prepared metadata and native overlap changes. Timing covers continuous completion
+intervals, including intervening host work; metric reductions run after the
+window. Per-step CUDA timing events are disabled because another replay can
+overwrite them before harvest.
+
+| Batch/GPU | Engine ms | Projected tokens/s/GPU | Actual tokens/s/GPU | Baseline speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 31.099 | 836.03 | 771.72 | 1.96× |
+| 16 | 32.209 | 1,614.47 | 1,490.28 | 2.04× |
+| 32 | 32.784 | 3,172.28 | 2,928.26 | 2.14× |
+| 64 | 32.621 | 6,376.32 | 5,885.84 | 2.39× |
+| 128 | 33.660 | 12,358.75 | 11,408.08 | 2.95× |
+| 256 | 39.794 | 20,907.62 | 19,299.34 | 3.54× |
+
+Every point records 160 enqueues, 160 continuations and 160 full graph replays
+across eight drivers, with no eager fallbacks. Each sequence commits 20 three-token
+results; measured live context grows from 131,087 to 131,147. Projected and actual
+throughput use the same measured completion intervals and differ only in their
+acceptance factor (3.25 versus 3 tokens/step).
+
+All 48 rank traces contain two complete forwards. After normalizing by that
+count, batch8/GPU uses 1,436 CUDA kernels per forward versus 5,116 in the baseline;
+PyTorch tensor kernels drop from 4,283 to 670. These are extra profiler traces
+outside throughput timing. Their category comparison preserves per-rank results
+and distinguishes summed kernel work from elapsed GPU activity. Records, plots,
+source provenance, the comparison and six merged Perfetto traces are under
+`artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-overlap/`.
+
 The implementation uses fixed-width greedy proposals, loads the confidence head
 without applying its length policy, and supports up to the released five-token
 block. Benchmark defaults remain four drafts. Wider meshes and longer contexts
