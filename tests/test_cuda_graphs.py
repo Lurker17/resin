@@ -864,6 +864,63 @@ class TestCudaGraph:
             with pytest.raises(RuntimeError, match="closed"):
                 operation()
 
+    def test_runtime_counts_track_success_and_survive_close_without_catalog_scan(
+        self, monkeypatch
+    ):
+        torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
+        monkeypatch.setattr(graph_runtime, "torch", torch)
+
+        def build(_shape):
+            state = _Tensor([0])
+            return CudaGraphStep({"value": state}, state, lambda: None)
+
+        executor = CudaGraphExecutor(
+            "cuda:0",
+            {
+                "decode": CudaGraphMode(
+                    ((1, 4), (2, 4)), build, lambda _: {"value": [1]}
+                )
+            },
+            synchronize_failure=lambda: None,
+        )
+        cache = executor.mode("decode")
+        executor.capture("decode", (1, 4))
+        assert cache.runtime_counts["replay_count"] == 0
+        cache.run((1, 4), {"value": [2]})
+        cache.run((1, 4), {"value": [3]})
+        cache.fallback("padding")
+        cache.fallback("padding")
+        expected = {
+            "decode": {
+                "replay_count": 2,
+                "eager_fallback_count": 2,
+                "fallback_counts": {"padding": 2},
+            }
+        }
+        assert executor.runtime_counts == expected
+        assert {
+            "replay_count": cache.stats["replay_count"],
+            "eager_fallback_count": cache.stats["eager_fallback_count"],
+            "fallback_counts": cache.stats["fallback_counts"],
+        } == cache.runtime_counts
+        torch.cuda.graphs[0].error = RuntimeError("illegal replay")
+        with pytest.raises(PostAcceptCudaError, match="illegal replay"):
+            cache.run((1, 4), {"value": [4]})
+        assert executor.runtime_counts == expected
+        executor.close()
+        assert executor.runtime_counts == expected
+        assert cache.stats["shape_stats"][0]["replay_count"] == 2
+
+        class UnreadableCatalog(dict):
+            def values(self):
+                raise AssertionError("runtime counters scanned graph shapes")
+
+        cache._entries = UnreadableCatalog(cache._entries)
+        snapshot = executor.runtime_counts
+        snapshot["decode"]["fallback_counts"]["padding"] = -1
+        assert executor.runtime_counts == expected
+
     def test_closing_uncaptured_modes_needs_no_cuda_context(self, monkeypatch):
         torch = _Torch()
         monkeypatch.setattr(graph_runtime, "torch", torch)

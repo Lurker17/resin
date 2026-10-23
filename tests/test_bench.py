@@ -479,6 +479,46 @@ def test_graph_counters_exclude_prefill_and_decode_warmup():
     }
 
 
+def test_benchmark_graph_counts_avoid_diagnostic_catalogs():
+    class GraphRunner(Runner):
+        def __init__(self):
+            super().__init__()
+            self.replays = 0
+
+        @property
+        def cuda_graph_counts(self):
+            return {
+                "decode": {
+                    "replay_count": self.replays,
+                    "eager_fallback_count": 0,
+                    "fallback_counts": {},
+                }
+            }
+
+        @property
+        def cuda_graph_stats(self):
+            raise AssertionError("benchmark rebuilt per-shape graph diagnostics")
+
+        def forward(self, plan):
+            if plan.phase == BatchPhase.DECODE:
+                self.replays += 1
+            return super().forward(plan)
+
+    runner = BenchmarkRunner(GraphRunner())
+    record = run_sweep(
+        Engine(runner, context_length=64),
+        [BenchCase(phase="decode", context_length=4, batch_size=1)],
+        runner=runner,
+        prompt_tokens=[1],
+        warmup_steps=2,
+        measure_steps=3,
+    )[0]
+    assert record["graph_counts"] == {
+        "decode.replay_count": 3,
+        "decode.eager_fallback_count": 0,
+    }
+
+
 def test_partial_admission_is_canceled_on_failure():
     class EngineAdapter:
         def __init__(self, runner):

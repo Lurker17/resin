@@ -18,6 +18,7 @@ from resin.backend.collectives import (
 from resin.backend.control_plane import ControlPlane
 from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
+    CudaGraphCounts,
     CudaGraphExecutor,
     CudaGraphMode,
     CudaGraphProgram,
@@ -472,6 +473,11 @@ class CudaRunner(Runner):
             if tokens != bucket:
                 output = output[:tokens]
         return output if flat_input else output.view_as(hidden)
+
+    @property
+    def cuda_graph_counts(self) -> dict[str, CudaGraphCounts]:
+        """Return cheap runtime counters without rebuilding graph diagnostics."""
+        return self._require_cuda_graph_executor().runtime_counts
 
     @property
     def cuda_graph_stats(self) -> dict[str, CudaGraphStats]:

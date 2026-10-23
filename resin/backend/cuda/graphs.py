@@ -48,6 +48,12 @@ class CudaGraphShapeStats(TypedDict):
     graph_break_count: int
 
 
+class CudaGraphCounts(TypedDict):
+    replay_count: int
+    eager_fallback_count: int
+    fallback_counts: dict[str, int]
+
+
 class CudaGraphStats(TypedDict):
     capture_scope: NotRequired[str]
     captured_operations: NotRequired[tuple[str, ...]]
@@ -339,6 +345,7 @@ class CudaGraphCache:
         self._entries = {shape: _GraphEntry(shape) for shape in shapes}
         self._pending_captures = len(self._entries)
         self._fallbacks: Counter[str] = Counter()
+        self._replay_count = 0
         self._poison: str | None = None
         self._share_pool = share_pool
         self._pool: Any | None = None
@@ -522,6 +529,7 @@ class CudaGraphCache:
         except BaseException as error:
             self._fail("graph replay", error)
         entry.replays += 1
+        self._replay_count += 1
         return result
 
     def _capture(self, entry: _GraphEntry, allocation_before: int) -> None:
@@ -621,6 +629,15 @@ class CudaGraphCache:
                 graph.replay()
 
     @property
+    def runtime_counts(self) -> CudaGraphCounts:
+        """Snapshot runtime counters without visiting the configured graph catalog."""
+        return {
+            "replay_count": self._replay_count,
+            "eager_fallback_count": sum(self._fallbacks.values()),
+            "fallback_counts": dict(self._fallbacks),
+        }
+
+    @property
     def stats(self) -> CudaGraphStats:
         if self._closed_stats is not None:
             return self._closed_stats
@@ -651,7 +668,7 @@ class CudaGraphCache:
             "configured_shapes": self.shapes,
             "captured_shapes": tuple(row["shape"] for row in rows if row["captured"]),
             "capture_count": sum(entry.captures for entry in self._entries.values()),
-            "replay_count": sum(entry.replays for entry in self._entries.values()),
+            "replay_count": self._replay_count,
             "graph_region_count": sum(row["graph_region_count"] for row in rows),
             "graph_break_count": sum(row["graph_break_count"] for row in rows),
             "eager_fallback_count": sum(self._fallbacks.values()),
@@ -760,6 +777,11 @@ class CudaGraphExecutor:
             if after_capture is not None:
                 after_capture()
         return self.stats
+
+    @property
+    def runtime_counts(self) -> dict[str, CudaGraphCounts]:
+        """Read mode counters without constructing per-shape diagnostics."""
+        return {name: cache.runtime_counts for name, cache in self._caches.items()}
 
     @property
     def stats(self) -> dict[str, CudaGraphStats]:

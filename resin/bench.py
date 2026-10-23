@@ -146,7 +146,10 @@ class BenchmarkRunner:
 
     def graph_counts(self):
         counts = {}
-        for mode, stats in getattr(self.runner, "cuda_graph_stats", {}).items():
+        stats = getattr(self.runner, "cuda_graph_counts", None)
+        if stats is None:
+            stats = getattr(self.runner, "cuda_graph_stats", {})
+        for mode, stats in stats.items():
             for name in ("replay_count", "eager_fallback_count"):
                 counts[f"{mode}.{name}"] = stats[name]
             for reason, value in stats["fallback_counts"].items():
