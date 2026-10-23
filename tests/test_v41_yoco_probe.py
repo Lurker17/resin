@@ -9,15 +9,58 @@ import torch
 
 from deploy.v41_yoco_probe import (
     ProbeFailure,
+    ProbeRunner,
     ValidationFailure,
     _cache_snapshot,
     _compare,
     _public,
+    _restore_observations,
     _sample_positions,
     _tensor_report,
     compare_fixed_mode_reports,
     run_probe,
 )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("tile_control", [True, False])
+def test_probe_kernel_controls_precede_model_init_and_preserve_false(
+    monkeypatch, enabled, tile_control
+):
+    from deploy import v41_yoco_probe as probe
+
+    events = []
+    modules = {
+        "resin_models_cuda.deepseek_v4.tilelang_kernels": SimpleNamespace(),
+        "deep_gemm": SimpleNamespace(
+            use_deterministic_algorithms=lambda value: events.append(
+                ("deep_gemm", value)
+            )
+        ),
+        "tile_kernels": SimpleNamespace(),
+    }
+    if tile_control:
+        modules["tile_kernels"].use_deterministic_algorithms = lambda value: (
+            events.append(("tile_kernels", value))
+        )
+    monkeypatch.setattr(probe, "import_module", modules.__getitem__)
+
+    def model_init(self, *args, **kwargs):
+        events.append(("model", args, kwargs))
+
+    monkeypatch.setattr(probe.DeepSeekV41CudaRunner, "__init__", model_init)
+    options = {} if enabled else dict(batch_invariant=False)
+    runner = ProbeRunner("weights", device="cuda:0", **options)
+    expected = [("deep_gemm", enabled)]
+    if tile_control:
+        expected.append(("tile_kernels", enabled))
+    assert events == [*expected, ("model", ("weights",), {"device": "cuda:0"})]
+    assert runner._yoco_kernel_configuration == dict(
+        batch_invariant_requested=enabled,
+        deep_gemm_deterministic_algorithms=enabled,
+        tile_kernels_deterministic_control_available=tile_control,
+        tile_kernels_deterministic_algorithms=enabled if tile_control else None,
+    )
 
 
 @pytest.mark.parametrize(
@@ -84,6 +127,36 @@ def test_public_report_preserves_scores_and_hashes_without_tensor_payloads():
     assert "state" not in public["snapshots"][0]
     assert len(public["snapshots"][0]["state_sha256"]["main.20"]) == 64
     assert _compare(result, copy.deepcopy(result))["state"]
+
+
+def test_restore_shape_differences_are_diagnostic_and_cross_mode_checks_stay_strict():
+    fresh, restored = _result(), _result()
+    restored["requests"][129].update(
+        cached_tokens=128, tokens=[2, 4], scores=[-0.5, -0.7]
+    )
+    restored["snapshots"][(129, 129)]["input_rows"] = 1
+    restored["snapshots"][(129, 129)]["state"]["main.20"][0] = 3
+    observations = _restore_observations(fresh, restored)["129"]
+    assert observations["qualifies_equivalence"] is False
+    assert observations["restored_cached_tokens"] == 128
+    assert observations["first_token_difference"] == 1
+    assert observations["first_flat_score_difference"] == 1
+    assert observations["final_state_differences"]["main.20"]["max_abs"] == 2
+    assert observations["chunks"] == {"fresh": [[1, 129]], "restored": [[128, 129]]}
+    json.dumps(observations)
+    # The same restored trajectory still requires exact mask/compact parity.
+    assert _compare(restored, copy.deepcopy(restored))["state"]
+    changed = copy.deepcopy(restored)
+    changed["snapshots"][(129, 129)]["state"]["main.20"][0] += 1
+    with pytest.raises(AssertionError, match="main.20"):
+        _compare(restored, changed)
+
+
+def test_cross_mode_equivalence_requires_identical_prefill_chunk_trajectory():
+    left, right = _result(), _result()
+    right["snapshots"][(129, 129)]["input_rows"] = 1
+    with pytest.raises(AssertionError, match="cache trajectory"):
+        _compare(left, right)
 
 
 def test_snapshot_keeps_compressor_vectors_and_empty_early_consumer_ranges(monkeypatch):
@@ -167,6 +240,7 @@ def test_separate_cp_reports_compare_scores_and_canonical_state_hashes():
         expert_backend="flashinfer",
         quant="checkpoint",
         hardware="B300",
+        kernel_configuration=dict(deep_gemm_deterministic_algorithms=True),
     )
 
     def report(mode):

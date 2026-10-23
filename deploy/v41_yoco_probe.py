@@ -4,6 +4,11 @@ Use ProbeRunner as deploy.bench._rank's runner_factory implementation and pass
 run_validation as its validation callback. Enable prefix caching and admit two
 requests per driver. Paired modes require ADP=world; CP uses separate runs with
 one constructor-fixed mode and compares the exported scores/state hashes.
+ProbeRunner requests batch-invariant arithmetic before model initialization:
+DeepGEMM deterministic kernels are enabled by default; TileKernels receives
+the same setting when its installed version exposes that control. Reports
+record the exact applied controls, including an unavailable TileKernels API.
+This probe setting does not change the regular benchmark runner.
 """
 
 from __future__ import annotations
@@ -11,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import math
 import time
+from importlib import import_module
 from pathlib import Path
 
 import torch
@@ -80,10 +86,37 @@ def _cache_snapshot(runner, cache, end, replay_start):
 
 
 class ProbeRunner(DeepSeekV41CudaRunner):
-    """Observe the production row path after its normal DSpark cache commit."""
+    """Observe production rows with explicit probe-only arithmetic controls.
+
+    batch_invariant=False explicitly restores DeepGEMM's fast algorithms for
+    diagnostics. Locked TileKernels1.0.0 has no corresponding global control;
+    its absence is recorded, so this never claims whole-stack invariance.
+    """
 
     _yoco_rows: list[int]
     _yoco_snapshots: list[dict]
+
+    def __init__(self, *args, batch_invariant=True, **kwargs):
+        if not isinstance(batch_invariant, bool):
+            raise TypeError("batch_invariant must be a bool")
+        # Install the locked TileLang/TileKernels import compatibility first.
+        import_module("resin_models_cuda.deepseek_v4.tilelang_kernels")
+        deep_gemm = import_module("deep_gemm")
+        tile_kernels = import_module("tile_kernels")
+        deep_gemm.use_deterministic_algorithms(batch_invariant)
+        setter = getattr(tile_kernels, "use_deterministic_algorithms", None)
+        tile_control = callable(setter)
+        if tile_control:
+            setter(batch_invariant)
+        self._yoco_kernel_configuration = dict(
+            batch_invariant_requested=batch_invariant,
+            deep_gemm_deterministic_algorithms=batch_invariant,
+            tile_kernels_deterministic_control_available=tile_control,
+            tile_kernels_deterministic_algorithms=(
+                batch_invariant if tile_control else None
+            ),
+        )
+        super().__init__(*args, **kwargs)
 
     def _prefill_row(self, plan, slot, input_ids, positions, cache):
         before = len(getattr(self, "_yoco_rows", ()))
@@ -156,6 +189,8 @@ def _compare(left, right, *, atol=0, rtol=0, label="case"):
     state = {}
     for key, a in left["snapshots"].items():
         b = right["snapshots"][key]
+        assert a["input_rows"] == b["input_rows"], f"{label} cache trajectory {key}"
+        assert a["prompt_scores"] == b["prompt_scores"]
         assert a["state"].keys() == b["state"].keys()
         state[str(key)] = {
             name: _tensor_report(
@@ -167,6 +202,64 @@ def _compare(left, right, *, atol=0, rtol=0, label="case"):
             for name, value in a["state"].items()
         }
     return dict(scores=scores, state=state)
+
+
+def _restore_observations(fresh, restored):
+    """Record changed restore trajectories without qualifying their equivalence."""
+
+    def first_difference(left, right):
+        return next(
+            (index for index, (a, b) in enumerate(zip(left, right)) if a != b),
+            None if len(left) == len(right) else min(len(left), len(right)),
+        )
+
+    observations = {}
+    for prompt, reference in fresh["requests"].items():
+        candidate = restored["requests"][prompt]
+        final = (prompt, prompt)
+        left, right = (
+            fresh["snapshots"][final]["state"],
+            restored["snapshots"][final]["state"],
+        )
+        differences = {}
+        for name in left.keys() | right.keys():
+            a, b = left.get(name), right.get(name)
+            if a is None or b is None or a.shape != b.shape or a.dtype != b.dtype:
+                differences[name] = dict(comparable=False)
+            elif not torch.equal(a, b):
+                delta = a.double() - b.double()
+                differences[name] = dict(
+                    max_abs=delta.abs().max().item() if delta.numel() else 0.0,
+                    relative_l2=(
+                        delta.norm() / a.double().norm().clamp_min(1e-20)
+                    ).item(),
+                    values=a.numel(),
+                )
+        observations[str(prompt)] = dict(
+            qualifies_equivalence=False,
+            fresh_cached_tokens=reference["cached_tokens"],
+            restored_cached_tokens=candidate["cached_tokens"],
+            first_token_difference=first_difference(
+                reference["tokens"], candidate["tokens"]
+            ),
+            first_top_ids_difference=first_difference(
+                reference["top_ids"], candidate["top_ids"]
+            ),
+            first_flat_score_difference=first_difference(
+                reference["scores"], candidate["scores"]
+            ),
+            final_state_fields_compared=len(left.keys() | right.keys()),
+            final_state_differences=differences,
+            chunks={
+                label: [
+                    [row["endpoint"] - row["input_rows"], row["endpoint"]]
+                    for row in report["snapshots"].values()
+                    if row["prompt"] == prompt
+                ]
+                for label, report in (("fresh", fresh), ("restored", restored))
+            },
+        )
+    return observations
 
 
 def _public(result):
@@ -195,8 +288,9 @@ def run_probe(
 ):
     """Qualify fresh, restored, scored, unequal/idle, and natural decode cohorts.
 
-    Paired mask/compact comparisons are exact by default. Report wall time only
-    as qualification time: these runs deliberately copy small state samples.
+    Paired mask/compact comparisons are exact within each cache trajectory.
+    Fresh/restored observations use different chunk shapes and are diagnostic.
+    Wall time is qualification time, including small state-sample copies.
     """
     local = getattr(engine, "local", engine)
     groups = runner.parallel_groups
@@ -352,7 +446,16 @@ def run_probe(
                     if not request.done and not getattr(local, "poisoned", False):
                         engine.cancel(request)
 
-    results = {}
+    results, comparisons, restore_observations = {}, {}, {}
+
+    def record(mode, name, value):
+        results[mode][name] = value
+        if len(modes) == 2 and mode == modes[1]:
+            with _validation_stage(name + " mask compact comparison", coordinate):
+                comparisons[name] = _compare(
+                    results[modes[0]][name], value, atol=atol, rtol=rtol, label=name
+                )
+
     try:
         for mode in modes:
             with _validation_stage(mode + " setup", coordinate):
@@ -361,69 +464,29 @@ def run_probe(
                 local.clear_prefix_cache()
             results[mode] = {}
             fresh = cohort(mode + " fresh", lengths)
-            results[mode]["fresh"] = fresh
+            record(mode, "fresh", fresh)
             restored = cohort(mode + " restored", lengths, restored=True)
-            results[mode]["restored"] = restored
-            # Fresh/restored follow the same logical contexts and must agree.
-            with _validation_stage(mode + " restored parity", coordinate):
-                for length in lengths:
-                    assert (
-                        fresh["requests"][length]["tokens"]
-                        == restored["requests"][length]["tokens"]
-                    ), f"{mode} fresh/restored prompt {length} tokens"
-                    assert (
-                        fresh["requests"][length]["top_ids"]
-                        == restored["requests"][length]["top_ids"]
-                    ), f"{mode} fresh/restored prompt {length} top token IDs"
-                    _tensor_report(
-                        torch.tensor(fresh["requests"][length]["scores"]),
-                        torch.tensor(restored["requests"][length]["scores"]),
-                        atol=atol,
-                        rtol=rtol,
-                        label=f"{mode} fresh/restored prompt {length} scores",
-                    )
-                    a = fresh["snapshots"][(length, length)]["state"]
-                    b = restored["snapshots"][(length, length)]["state"]
-                    for name, value in a.items():
-                        _tensor_report(
-                            value,
-                            b[name],
-                            label=f"{mode} fresh/restored prompt {length} {name}",
-                            **(
-                                {}
-                                if not value.is_floating_point()
-                                else dict(atol=atol, rtol=rtol)
-                            ),
-                        )
+            record(mode, "restored", restored)
+            with _validation_stage(mode + " restore observations", coordinate):
+                restore_observations[mode] = _restore_observations(fresh, restored)
                 local.clear_prefix_cache()
             scored = cohort(mode + " scored fallback", (lengths[1],), scored=True)
-            results[mode]["scored"] = scored
+            record(mode, "scored", scored)
             with _validation_stage(mode + " unequal setup", coordinate):
                 local.clear_prefix_cache()
             count = 2 if driver == 0 else 1 if driver == 1 else 0
             unequal = cohort(
                 mode + " unequal idle overlap", lengths[:count], overlap=True
             )
-            results[mode]["unequal"] = unequal
-        comparisons = {}
-        if len(modes) == 2:
-            with _validation_stage("mask compact comparisons", coordinate):
-                comparisons = {
-                    name: _compare(
-                        results[modes[0]][name],
-                        results[modes[1]][name],
-                        atol=atol,
-                        rtol=rtol,
-                        label=name,
-                    )
-                    for name in results[modes[0]]
-                }
+            record(mode, "unequal", unequal)
         return dict(
             ok=True,
             modes=modes,
             retained_tokens=140,
             generated=generated,
+            kernel_configuration=dict(runner._yoco_kernel_configuration),
             comparisons=comparisons,
+            restore_observations=restore_observations,
             results={
                 mode: {name: _public(value) for name, value in rows.items()}
                 for mode, rows in results.items()
@@ -436,6 +499,7 @@ def run_probe(
                 mode: {name: _public(value) for name, value in rows.items()}
                 for mode, rows in results.items()
             },
+            restore_observations=restore_observations,
         ) from error
     finally:
         runner._swa_replay_mode = original_mode
@@ -444,9 +508,10 @@ def run_probe(
 
 
 class ProbeFailure(RuntimeError):
-    def __init__(self, message, partial_results):
+    def __init__(self, message, partial_results, *, restore_observations=None):
         super().__init__(message)
         self.partial_results = partial_results
+        self.restore_observations = restore_observations or {}
 
 
 class ValidationFailure(RuntimeError):
@@ -469,6 +534,8 @@ def run_validation(raw, engine, checkpoint, metadata, groups):
 
     rank = 0 if groups is None else groups.rank
     drivers = None if groups is None else groups.drivers
+    kernel_configuration = dict(raw._yoco_kernel_configuration)
+    metadata = {**metadata, "kernel_configuration": kernel_configuration}
 
     def gather(stage, value):
         if drivers is None or drivers.size == 1:
@@ -507,8 +574,10 @@ def run_validation(raw, engine, checkpoint, metadata, groups):
         result = dict(
             rank=rank,
             ok=False,
+            kernel_configuration=kernel_configuration,
             error=f"{type(error).__name__}: {error}",
             partial_results=getattr(error, "partial_results", {}),
+            restore_observations=getattr(error, "restore_observations", {}),
         )
     reports = gather("reports", result)
     records = [
@@ -537,6 +606,7 @@ def compare_fixed_mode_reports(mask, compact, *, atol=0, rtol=0):
         "expert_backend",
         "quant",
         "hardware",
+        "kernel_configuration",
     ):
         assert mask["metadata"][field] == compact["metadata"][field], field
     left = {rank["rank"]: rank for rank in mask["ranks"]}
