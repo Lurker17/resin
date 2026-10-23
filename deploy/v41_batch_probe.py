@@ -157,19 +157,19 @@ def _growing_table_probe():
         convert_kv_index_tl,
     )
 
+    static = (None, (4, 8, 2), 128, 8, (1, 2), "int64", False, True)
+    kernel = prepare_engine_metadata_tl(*static)
+    tables = copy_engine_tables_tl((4, 8))
+    converters = {ratio: convert_kv_index_tl(512, 128 // ratio) for ratio in (1, 2)}
+    counts = {
+        "metadata": len(prepare_engine_metadata_tl._kernel_cache),
+        "table_copy": len(copy_engine_tables_tl._kernel_cache),
+        "conversion": len(convert_kv_index_tl._kernel_cache),
+    }
     results = []
-    for queries in (4, 4096, 8192):
-        static = (queries, (4, 8, 2), 128, 8, (1, 2), "int64", False, True)
-        kernel = prepare_engine_metadata_tl(*static)
-        tables = copy_engine_tables_tl(queries, (4, 8)) if queries > 8 else None
-        converters = {
-            ratio: convert_kv_index_tl(queries, 512, 128 // ratio) for ratio in (1, 2)
-        }
-        counts = {
-            "metadata": len(prepare_engine_metadata_tl._kernel_cache),
-            "table_copy": len(copy_engine_tables_tl._kernel_cache),
-            "conversion": len(convert_kv_index_tl._kernel_cache),
-        }
+    # Include both sides of the fused-table-copy boundary and a retained SWA
+    # suffix. Every ordinary prompt must reuse these same compiled operators.
+    for queries in (1, 4, 5, 8, 9, 16, 140, 256, 4096, 8192):
         for index, total in enumerate((max(4096, queries), 131072)):
             context = total - queries
             retained = max(5, (queries + 127) // 128 + 3)
@@ -217,12 +217,9 @@ def _growing_table_probe():
                 torch.cuda.synchronize()
                 _equal(output, _prepare(cpu, positions, mask, selected, False))
             assert prepare_engine_metadata_tl(*static) is kernel
-            if tables is not None:
-                assert copy_engine_tables_tl(queries, (4, 8)) is tables
+            assert copy_engine_tables_tl((4, 8)) is tables
             for ratio in (1, 2):
-                assert (
-                    convert_kv_index_tl(queries, 512, 128 // ratio) is converters[ratio]
-                )
+                assert convert_kv_index_tl(512, 128 // ratio) is converters[ratio]
             after = {
                 "metadata": len(prepare_engine_metadata_tl._kernel_cache),
                 "table_copy": len(copy_engine_tables_tl._kernel_cache),
@@ -238,11 +235,16 @@ def _growing_table_probe():
                     "mutable_graph_replays": 5,
                     "compiled_variants": after,
                     "new_variants_during_context_growth": 0,
+                    "new_variants_during_query_growth": 0,
                     "native_ms": _latency(graph),
                 }
             )
             print(f"[metadata-growth] {results[-1]}", flush=True)
-    return {"same_compiled_factories": True, "cases": results}
+    return {
+        "same_compiled_factories": True,
+        "same_factories_across_query_counts": True,
+        "cases": results,
+    }
 
 
 def _table_grid_probe():
@@ -259,7 +261,7 @@ def _table_grid_probe():
         slots = torch.zeros_like(swa)
         swa_out = torch.empty(batch * queries, 1, dtype=torch.int32, device="cuda")
         ca_out = torch.empty_like(swa_out)
-        kernel = copy_engine_tables_tl(queries, (4, 8))
+        kernel = copy_engine_tables_tl((4, 8))
 
         def call():
             kernel(swa, slots, ca, slots, swa_out, ca_out)
