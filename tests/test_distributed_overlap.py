@@ -32,7 +32,9 @@ class ParallelRunner:
         cache_layout=CacheLayout(32, [CacheGroupLayout(128)]),
         cache_write_lookahead_tokens=2,
     )
-    parallelism_capabilities = ParallelismCapabilities(cp=True, ep=True, expert_tp=True, attn_dp=True)
+    parallelism_capabilities = ParallelismCapabilities(
+        cp=True, ep=True, expert_tp=True, attn_dp=True
+    )
 
     def __init__(self, groups):
         self.groups = groups
@@ -138,6 +140,41 @@ def _worker(rank, rendezvous):
         assert engine.local.cache_free_parent_count == 32
     else:
         worker.serve()
+    for scenario in ("idle_cancel", "partial_cancel", "unequal_budget"):
+        runner = ParallelRunner(groups)
+        worker = DistributedWorker(runner, groups)
+        if groups.is_driver:
+            engine = DistributedEngine(worker)
+            dp = groups.attn_dp.local_rank
+            limit = 12 if scenario == "unequal_budget" and dp == 0 else 34
+            request = engine.submit([1], max_new_tokens=limit)
+            survivor = (
+                engine.submit([20], max_new_tokens=34)
+                if scenario == "partial_cancel"
+                else None
+            )
+            for _ in range(3):
+                engine.step()
+            assert engine.local.overlap_pending
+            if scenario != "unequal_budget" and dp == 0:
+                assert engine.cancel(request)
+            steps = 0
+            while engine.has_work():
+                engine.step()
+                steps += 1
+                assert steps < 60
+            if scenario != "unequal_budget" and dp == 0:
+                assert request.cancelled
+            else:
+                assert request.take_result() == list(range(2, limit + 2))
+            if survivor is not None:
+                assert survivor.take_result() == list(range(21, 55))
+            engine.close()
+            assert engine.local.cache_free_parent_count == 32
+        else:
+            worker.serve()
+        dist.barrier()
+
     groups.close()
     dist.destroy_process_group()
 
