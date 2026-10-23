@@ -228,3 +228,55 @@ def test_preparation_rejects_incompatible_positions_or_masks(positions, mask):
     cache, _ = cache_and_positions()
     with pytest.raises(ValueError):
         cache.prepare_metadata(positions, valid_tokens=mask)
+
+
+@pytest.mark.parametrize("queries", [4, 16])
+def test_growing_engine_tables_reuse_metadata_kernel_dispatch(monkeypatch, queries):
+    """Vary retained and full-history widths without another JIT factory key."""
+    import sys
+    from functools import lru_cache
+    from types import SimpleNamespace
+
+    compiled = {"metadata": [], "copy": []}
+
+    def factory(name):
+        @lru_cache
+        def compile_kernel(*arguments):
+            compiled[name].append(arguments)
+            return lambda *tensors: None
+
+        return compile_kernel
+
+    monkeypatch.setitem(
+        sys.modules,
+        "resin_models_cuda.deepseek_v41.upstream.cuda.batch_metadata",
+        SimpleNamespace(
+            prepare_engine_metadata_tl=factory("metadata"),
+            copy_engine_tables_tl=factory("copy"),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "resin_models_cuda.deepseek_v41.upstream.cuda.get_kv_index",
+        SimpleNamespace(load_kv_index_tl=lambda *args: lambda *tensors: None),
+    )
+    # Exercise the actual CUDA dispatch using CPU allocations and inert kernels.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    cache, _ = cache_and_positions()
+    positions = torch.arange(queries).expand(3, -1).clone()
+    mask = torch.ones(3 * queries, dtype=torch.bool)
+    for widths in ((1, 1, 1), (5, 33, 9), (67, 1027, 65)):
+        groups = tuple(
+            DevicePageGroup(
+                torch.ones(3, width, dtype=torch.int32),
+                torch.zeros(3, width, dtype=torch.int32),
+                torch.zeros(3, dtype=torch.int32),
+            )
+            for width in widths
+        )
+        current = DeviceCache(cache.geometry, groups + cache.groups[3:], cache.storage)
+        frame = current.prepare_metadata(positions, valid_tokens=mask)
+        assert frame.block_tables.shape == (3 * queries, widths[1])
+        assert frame.positions.shape == positions.shape
+    assert len(compiled["metadata"]) == 1
+    assert len(compiled["copy"]) == (1 if queries > 8 else 0)

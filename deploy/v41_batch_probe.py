@@ -9,17 +9,19 @@ from resin_models_cuda.deepseek_v41.batch import ForwardMetadata, _reference
 from resin_models_cuda.deepseek_v41.cache import CacheGeometry, DeviceCache
 
 
-def _case(batch, queries, context, *, ca_width=None):
+def _case(batch, queries, context, *, table_widths=None):
     anchors = torch.arange(batch) % 7 + context
     positions = anchors[:, None] + torch.arange(queries)
     packings = (4, 8, 2, 16)
     groups = []
     for index, packing in enumerate(packings):
         width = (
-            (int(positions.max()) // 128 + 3 if ca_width is None else ca_width)
+            int(positions.max()) // 128 + 3
             if index == 1
             else max(5, (queries + 127) // 128 + 3)
         )
+        if table_widths is not None and index < 3:
+            width = table_widths[index]
         ordinal = torch.arange(batch * width).reshape(batch, width) * 3 + 17
         first = torch.zeros(batch, dtype=torch.int32)
         if index != 1:
@@ -148,38 +150,131 @@ def _latency(graph):
 
 def _growing_table_probe():
     from resin_models_cuda.deepseek_v41.upstream.cuda.batch_metadata import (
+        copy_engine_tables_tl,
         prepare_engine_metadata_tl,
     )
     from resin_models_cuda.deepseek_v41.upstream.cuda.flash_mla_utils import (
         convert_kv_index_tl,
     )
 
-    # Only runtime table tensors change. These handles must stay identical even
-    # when the last table grows to a 128K history; no new specialization is needed.
-    static = (4, 5, 5, (4, 8, 2), 128, 8, (1, 2), "int64", False, True)
-    kernel = prepare_engine_metadata_tl(*static)
-    converters = {ratio: convert_kv_index_tl(4, 512, 128 // ratio) for ratio in (1, 2)}
     results = []
-    for width, context in ((1, 0), (3, 126), (1025, 131070)):
-        cpu, gpu, positions, mask, selected = _case(3, 4, context, ca_width=width)
-        device_positions, device_mask = positions.cuda(), mask.cuda()
-        device_selected = {ratio: value.cuda() for ratio, value in selected.items()}
+    for queries in (4, 4096, 8192):
+        static = (queries, (4, 8, 2), 128, 8, (1, 2), "int64", False, True)
+        kernel = prepare_engine_metadata_tl(*static)
+        tables = copy_engine_tables_tl(queries, (4, 8)) if queries > 8 else None
+        converters = {
+            ratio: convert_kv_index_tl(queries, 512, 128 // ratio) for ratio in (1, 2)
+        }
+        counts = {
+            "metadata": len(prepare_engine_metadata_tl._kernel_cache),
+            "table_copy": len(copy_engine_tables_tl._kernel_cache),
+            "conversion": len(convert_kv_index_tl._kernel_cache),
+        }
+        for index, total in enumerate((max(4096, queries), 131072)):
+            context = total - queries
+            retained = max(5, (queries + 127) // 128 + 3)
+            widths = (retained + index, (total + 127) // 128 + 3, retained + 2 * index)
+            cpu, gpu, positions, mask, selected = _case(
+                1, queries, context, table_widths=widths
+            )
+            device_positions, device_mask = positions.cuda(), mask.cuda()
+            device_selected = {ratio: value.cuda() for ratio, value in selected.items()}
+
+            def call():
+                return _prepare(
+                    gpu, device_positions, device_mask, device_selected, False
+                )
+
+            _assert_owned(cpu, positions, False)
+            _equal(call(), _prepare(cpu, positions, mask, selected, False))
+            graph, output = _capture(call)
+            initial = positions.clone()
+            first = [group.first_blocks.clone() for group in cpu.groups]
+            for replay in range(5):
+                positions.copy_(initial + replay)
+                mask.copy_((torch.arange(queries) + replay).remainder(11) != 0)
+                for group_index, (source, target) in enumerate(
+                    zip(cpu.groups, gpu.groups)
+                ):
+                    source.parent_ids.add_(3)
+                    source.child_slots.add_(1).remainder_(
+                        cpu.geometry.packings[group_index]
+                    )
+                    if group_index != 1:
+                        source.first_blocks.copy_(
+                            (first[group_index] - replay % 2).clamp_min(0)
+                        )
+                    for value, device_value in zip(_group(source), _group(target)):
+                        device_value.copy_(value)
+                for ratio, values in selected.items():
+                    values[..., 2] = (positions + 1) // ratio - 1
+                    values[..., 3] = (positions + 1) // ratio
+                    device_selected[ratio].copy_(values)
+                device_positions.copy_(positions)
+                device_mask.copy_(mask)
+                _assert_owned(cpu, positions, False)
+                graph.replay()
+                torch.cuda.synchronize()
+                _equal(output, _prepare(cpu, positions, mask, selected, False))
+            assert prepare_engine_metadata_tl(*static) is kernel
+            if tables is not None:
+                assert copy_engine_tables_tl(queries, (4, 8)) is tables
+            for ratio in (1, 2):
+                assert (
+                    convert_kv_index_tl(queries, 512, 128 // ratio) is converters[ratio]
+                )
+            after = {
+                "metadata": len(prepare_engine_metadata_tl._kernel_cache),
+                "table_copy": len(copy_engine_tables_tl._kernel_cache),
+                "conversion": len(convert_kv_index_tl._kernel_cache),
+            }
+            assert after == counts, (counts, after)
+            results.append(
+                {
+                    "queries": queries,
+                    "context_end": total,
+                    "table_widths": widths,
+                    "exact_fields": len(output),
+                    "mutable_graph_replays": 5,
+                    "compiled_variants": after,
+                    "new_variants_during_context_growth": 0,
+                    "native_ms": _latency(graph),
+                }
+            )
+            print(f"[metadata-growth] {results[-1]}", flush=True)
+    return {"same_compiled_factories": True, "cases": results}
+
+
+def _table_grid_probe():
+    from resin_models_cuda.deepseek_v41.upstream.cuda.batch_metadata import (
+        copy_engine_tables_tl,
+    )
+
+    results = []
+    # Distinct batch rows check CA/SWA ordering. The second case exceeds the
+    # CUDA grid.y limit without needing a large model or history allocation.
+    for batch, queries in ((3, 17), (1, 65537), (2, 65537)):
+        swa = torch.arange(batch, dtype=torch.int32, device="cuda")[:, None] + 7
+        ca = swa + 13
+        slots = torch.zeros_like(swa)
+        swa_out = torch.empty(batch * queries, 1, dtype=torch.int32, device="cuda")
+        ca_out = torch.empty_like(swa_out)
+        kernel = copy_engine_tables_tl(queries, (4, 8))
 
         def call():
-            return _prepare(gpu, device_positions, device_mask, device_selected, False)
+            kernel(swa, slots, ca, slots, swa_out, ca_out)
+            return swa_out, ca_out
 
-        expected = _prepare(cpu, positions, mask, selected, False)
-        _assert_owned(cpu, positions, False)
-        _equal(call(), expected)
         graph, output = _capture(call)
-        graph.replay()
-        torch.cuda.synchronize()
-        _equal(output, expected)
-        assert prepare_engine_metadata_tl(*static) is kernel
-        for ratio in (1, 2):
-            assert convert_kv_index_tl(4, 512, 128 // ratio) is converters[ratio]
-        results.append({"width_ca": width, "exact_fields": len(output)})
-    return {"same_compiled_factories": True, "cases": results}
+        for replay in range(3):
+            swa.add_(1)
+            ca.add_(3)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(output[0], (swa * 4).repeat_interleave(queries, 0))
+            assert torch.equal(output[1], (ca * 8).repeat(queries, 1))
+        results.append({"batch": batch, "queries": queries, "exact_replays": 3})
+    return results
 
 
 @torch.inference_mode()
@@ -188,6 +283,7 @@ def run_probe():
     for batch, queries, context, draft, masked, int32 in (
         (2, 1, 0, False, False, True),
         (3, 5, 126, False, True, False),
+        (3, 16, 126, False, True, False),
         (3, 3, 126, True, True, True),
         (256, 4, 131070, False, False, False),
         (256, 4, 131070, False, True, False),
@@ -266,4 +362,5 @@ def run_probe():
         "gpu": torch.cuda.get_device_name(),
         "cases": results,
         "growing_tables": _growing_table_probe(),
+        "table_grid": _table_grid_probe(),
     }

@@ -10,19 +10,19 @@ import tilelang.language as _language
 
 T: Any = _language
 
+_PASS_CONFIGS: dict[str, Any] = {
+    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
+}
+
 
 @tilelang.jit(
     out_idx=None,
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
-    },
+    pass_configs=_PASS_CONFIGS,
 )
 def prepare_engine_metadata_tl(
     queries: int,
-    width_swa: int,
-    width_state: int,
     packings: tuple[int, ...],
     window_size: int,
     draft_capacity: int,
@@ -32,7 +32,9 @@ def prepare_engine_metadata_tl(
     has_valid_mask: bool,
 ) -> Any:
     batch = T.dynamic("batch")
+    width_swa = T.dynamic("width_swa")
     width_ca = T.dynamic("width_ca")
+    width_state = T.dynamic("width_state")
     num_ratios = max(len(ca_ratios), 1)
     padded_draft = (queries + 7) // 8 * 8 if draft else 1
     ratio_items = tuple(enumerate(ca_ratios))
@@ -179,28 +181,37 @@ def prepare_engine_metadata_tl(
                             draft and valid, bid * draft_capacity + sid, -1
                         )
 
-            # DG's varlen paged API reserves one table row per query, while its
-            # query_indices point at the first B request rows. Preserve that ABI.
-            # Full-history tables grow on each prefill chunk. Keep their width
-            # runtime-valued, with bounded tiles rather than one JIT per page.
-            for tile in T.serial(T.ceildiv(width_ca, 128)):
-                for lane in T.Parallel(128):
-                    column = tile * 128 + lane
-                    if column < width_ca:
-                        page = (
-                            ca_parents[bid, column] * packings[1]
-                            + ca_slots[bid, column]
-                        )
-                        for sid in T.serial(queries):
-                            block_tables[sid * batch + bid, column] = T.if_then_else(
-                                ca_parents[bid, column] > 0, page, -1
+            # Decode copies its few rows in this CTA. Long prefills expand the
+            # same tables in a separate grid, as DeepInfer's copy_block_tables.
+            if queries <= 8:
+                for tile in T.serial(T.ceildiv(width_ca, 128)):
+                    for lane in T.Parallel(128):
+                        column = tile * 128 + lane
+                        if column < width_ca:
+                            page = (
+                                ca_parents[bid, column] * packings[1]
+                                + ca_slots[bid, column]
                             )
-            for column in T.Parallel(width_swa):
-                page = swa_parents[bid, column] * packings[0] + swa_slots[bid, column]
-                for sid in T.serial(queries):
-                    swa_tables[bid * queries + sid, column] = T.if_then_else(
-                        swa_parents[bid, column] > 0, page, -1
-                    )
+                            for sid in T.serial(queries):
+                                block_tables[sid * batch + bid, column] = (
+                                    T.if_then_else(
+                                        ca_parents[bid, column] > 0, page, -1
+                                    )
+                                )
+                for tile in T.serial(T.ceildiv(width_swa, 128)):
+                    for lane in T.Parallel(128):
+                        column = tile * 128 + lane
+                        if column < width_swa:
+                            page = (
+                                swa_parents[bid, column] * packings[0]
+                                + swa_slots[bid, column]
+                            )
+                            for sid in T.serial(queries):
+                                swa_tables[bid * queries + sid, column] = (
+                                    T.if_then_else(
+                                        swa_parents[bid, column] > 0, page, -1
+                                    )
+                                )
             if draft:
                 for sid, column in T.Parallel(queries, padded_draft):
                     valid = T.bool(True)
@@ -221,3 +232,50 @@ def prepare_engine_metadata_tl(
                     draft_indices[bid, sid, 0] = -1
 
     return prepare_engine_metadata
+
+
+@tilelang.jit(out_idx=None, pass_configs=_PASS_CONFIGS)
+def copy_engine_tables_tl(queries: int, packings: tuple[int, int]) -> Any:
+    """Expand prefill page tables with one CTA per query, keeping widths runtime."""
+    batch = T.dynamic("batch")
+    width_swa = T.dynamic("width_swa")
+    width_ca = T.dynamic("width_ca")
+
+    @T.prim_func
+    def copy_engine_tables(
+        swa_parents: T.Tensor((batch, width_swa), T.int32),  # ty: ignore[invalid-type-form]
+        swa_slots: T.Tensor((batch, width_swa), T.int32),  # ty: ignore[invalid-type-form]
+        ca_parents: T.Tensor((batch, width_ca), T.int32),  # ty: ignore[invalid-type-form]
+        ca_slots: T.Tensor((batch, width_ca), T.int32),  # ty: ignore[invalid-type-form]
+        swa_tables: T.Tensor((batch * queries, width_swa), T.int32),  # ty: ignore[invalid-type-form]
+        block_tables: T.Tensor((batch * queries, width_ca), T.int32),  # ty: ignore[invalid-type-form]
+    ):
+        with T.Kernel(batch * queries, threads=128) as row:
+            bid, sid = row // queries, row % queries
+            T.pdl_sync()
+            # Preserve DG's sequence-major first B CA rows, while SWA lookup
+            # uses the flattened [batch, queries] row order.
+            for tile in T.serial(T.ceildiv(width_ca, 128)):
+                for lane in T.Parallel(128):
+                    column = tile * 128 + lane
+                    if column < width_ca:
+                        page = (
+                            ca_parents[bid, column] * packings[1]
+                            + ca_slots[bid, column]
+                        )
+                        block_tables[sid * batch + bid, column] = T.if_then_else(
+                            ca_parents[bid, column] > 0, page, -1
+                        )
+            for tile in T.serial(T.ceildiv(width_swa, 128)):
+                for lane in T.Parallel(128):
+                    column = tile * 128 + lane
+                    if column < width_swa:
+                        page = (
+                            swa_parents[bid, column] * packings[0]
+                            + swa_slots[bid, column]
+                        )
+                        swa_tables[bid * queries + sid, column] = T.if_then_else(
+                            swa_parents[bid, column] > 0, page, -1
+                        )
+
+    return copy_engine_tables

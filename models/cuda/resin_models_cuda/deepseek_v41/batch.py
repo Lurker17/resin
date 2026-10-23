@@ -90,6 +90,7 @@ def prepare_forward(cache, positions: Tensor, *, draft=False, valid_tokens=None)
         return _reference(cache, positions, ratios, draft, valid_tokens)
 
     from resin_models_cuda.deepseek_v41.upstream.cuda.batch_metadata import (
+        copy_engine_tables_tl,
         prepare_engine_metadata_tl,
     )
     from resin_models_cuda.deepseek_v41.upstream.cuda.get_kv_index import (
@@ -100,9 +101,7 @@ def prepare_forward(cache, positions: Tensor, *, draft=False, valid_tokens=None)
         return torch.empty(shape, dtype=dtype, device=positions.device)
 
     swa, ca, state = cache.groups[:3]
-    width_swa, width_ca, width_state = (
-        group.parent_ids.shape[1] for group in (swa, ca, state)
-    )
+    width_swa, width_ca = (group.parent_ids.shape[1] for group in (swa, ca))
     position_out, context, store_swa, state_idx, draft_slots = (
         empty(batch, queries) for _ in range(5)
     )
@@ -119,8 +118,6 @@ def prepare_forward(cache, positions: Tensor, *, draft=False, valid_tokens=None)
     draft_indices = empty(batch, queries, (queries + 7) // 8 * 8 if draft else 1)
     prepare_engine_metadata_tl(
         queries,
-        width_swa,
-        width_state,
         tuple(cache.geometry.packings[:3]),
         cache.geometry.window_size,
         cache.geometry.draft_tokens,
@@ -155,6 +152,15 @@ def prepare_forward(cache, positions: Tensor, *, draft=False, valid_tokens=None)
         draft_slots,
         draft_indices,
     )
+    if queries > 8:
+        copy_engine_tables_tl(queries, tuple(cache.geometry.packings[:2]))(
+            swa.parent_ids,
+            swa.child_slots,
+            ca.parent_ids,
+            ca.child_slots,
+            swa_tables,
+            block_tables,
+        )
     swa_indices = empty(batch * queries, cache.geometry.window_size)
     load_kv_index_tl(cache.geometry.window_size, 128, True)(
         swa_pivots, swa_indices, swa_tables.flatten()
