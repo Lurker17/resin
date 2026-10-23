@@ -177,6 +177,7 @@ class Indexer(nn.Module):
         )
         self.head_dim, self.rope_dim = args.index_head_dim, args.rope_head_dim
         self.topk = args.index_topk
+        self.max_kv_len = args.max_seq_len // self.ratio
         self.candidate_source = args.candidate_source_layer
         self.candidate_topk, self.block_size = (
             args.candidate_topk_blocks,

@@ -351,6 +351,119 @@ def test_indexer_metadata_preserves_causal_lengths_and_request_grouping():
     assert c1 is not metadata
 
 
+@pytest.mark.parametrize(
+    ("ratio", "max_seq_len", "topk", "candidate_source", "expected_width"),
+    [(2, 128, 8, -1, 64), (1, 16, 32, -1, 32), (2, 32, 8, 1, 32)],
+)
+def test_indexer_allocation_bound_stays_fixed_while_causal_lengths_advance(
+    implementation,
+    monkeypatch,
+    ratio,
+    max_seq_len,
+    topk,
+    candidate_source,
+    expected_width,
+):
+    import sys
+
+    from resin.backend.cuda.parallel import TensorParallelContext
+
+    calls = []
+
+    def logits(query, kv, weights, lengths, table, schedule, width, **kwargs):
+        calls.append((width, lengths.flatten().clone()))
+        # Future keys deliberately score highest; selection must respect the
+        # live end passed to DeepSelect even though storage spans the bound.
+        return torch.arange(width, dtype=torch.float32).expand(len(lengths), -1)
+
+    def select(scores, count, *, end, **kwargs):
+        valid = torch.arange(scores.shape[-1]) < end[:, None]
+        values, indices = scores.masked_fill(~valid, -torch.inf).topk(count, -1)
+        return None, indices.masked_fill(~values.isfinite(), -1).int()
+
+    def blocks(scores, lengths, block_size):
+        valid = torch.arange(scores.shape[-1]) < lengths[:, None]
+        scores = scores.masked_fill(~valid, -torch.inf)
+        return scores.unflatten(-1, (-1, block_size)).amax(-1), (
+            lengths + block_size - 1
+        ) // block_size
+
+    monkeypatch.setitem(
+        sys.modules,
+        "deep_gemm",
+        SimpleNamespace(
+            get_num_sms=lambda: 148,
+            get_paged_mqa_logits_metadata=lambda *_args, **_kwargs: object(),
+            fp8_fp4_paged_mqa_logits=logits,
+        ),
+    )
+    selection = SimpleNamespace(topk=select)
+    monkeypatch.setitem(
+        sys.modules, "deep_select", SimpleNamespace(interface=selection)
+    )
+    monkeypatch.setitem(sys.modules, "deep_select.interface", selection)
+    monkeypatch.setitem(
+        sys.modules,
+        "resin_models_cuda.deepseek_v41.upstream.candidate_blocks",
+        SimpleNamespace(
+            candidate_block_max=blocks,
+            get_candidate_compact_lens=None,
+            restore_candidate_indices_inplace=None,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "resin_models_cuda.deepseek_v41.upstream.fused_transform",
+        SimpleNamespace(
+            CastArgs=lambda *_args, **_kwargs: None,
+            KVCacheOutArgs=None,
+            NormArgs=None,
+            RopeArgs=lambda *_args, **_kwargs: None,
+            fused_norm_rope_hadamard_cast_store_kvcache=lambda value, **_kwargs: (
+                value,
+                torch.ones(len(value), 1, dtype=torch.int32),
+            ),
+        ),
+    )
+    args = implementation.ModelArgs(
+        dim=8,
+        max_seq_len=max_seq_len,
+        compress_ratios=(ratio, ratio),
+        kv_source_layers=(0,),
+        index_n_heads=1,
+        index_topk=topk,
+        candidate_source_layer=candidate_source,
+        candidate_topk_blocks=4,
+        candidate_block_size=8,
+    )
+    indexer = implementation.Indexer(args, 1, TensorParallelContext())
+    monkeypatch.setattr(
+        indexer.weights_proj,
+        "forward",
+        lambda value: torch.ones(*value.shape[:-1], 1, dtype=value.dtype),
+    )
+    cache = SimpleNamespace(
+        index_cache=lambda _layer: torch.zeros(1, 128 // ratio, 1, 68),
+        index_block_table=lambda queries: torch.zeros(queries, 1, dtype=torch.int32),
+    )
+    hidden = torch.zeros(1, 3, args.dim, dtype=torch.bfloat16)
+    query = torch.zeros(1, 3, args.index_head_dim, dtype=torch.bfloat16)
+    freqs = torch.ones(max_seq_len, 32, dtype=torch.complex64)
+    for start, capacity in ((0, 3), (4, 7), (8, 11)):
+        positions = torch.arange(start, start + 3)[None]
+        result = indexer(
+            hidden, None, None, positions, capacity, cache, freqs, {}, query=query
+        )
+        expected_lengths = ((positions + 1) // ratio).flatten()
+        assert calls[-1][0] == expected_width
+        assert torch.equal(calls[-1][1], expected_lengths)
+        for selected, length in zip(result.flatten(0, 1), expected_lengths):
+            live = selected[selected >= 0]
+            assert len(live) == min(topk, length)
+            assert (live < length).all()
+    assert indexer.max_kv_len == max_seq_len // ratio
+
+
 def test_indexer_accepts_the_shared_query_projection(implementation, monkeypatch):
     from resin_models_cuda.deepseek_v41 import indexer as kernels
 

@@ -96,6 +96,7 @@ def _case(ratio, *, context=4096, batch=2, queries=5, heads=32):
         n_heads=heads,
         rope_dim=64,
         topk=16,
+        max_kv_len=context // ratio,
         candidate_source=0,
         candidate_topk=16,
         block_size=8,

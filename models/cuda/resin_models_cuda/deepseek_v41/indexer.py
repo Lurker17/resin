@@ -145,7 +145,9 @@ def paged_index(
                 deep_gemm.get_num_sms(),
                 indices=request_ids,
             )
-        width = max(capacity // indexer.ratio, indexer.topk)
+        # DeepInfer allocates against the fixed runtime context bound. Live
+        # lengths above still mask unfinished/future keys in each invocation.
+        width = max(indexer.max_kv_len, indexer.topk)
         if indexer.layer == indexer.candidate_source:
             width = max(width, indexer.candidate_topk * indexer.block_size)
         scores = deep_gemm.fp8_fp4_paged_mqa_logits(
