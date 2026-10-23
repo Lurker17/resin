@@ -15,6 +15,7 @@ from resin.backend.collectives import (
     fixed_layer_capacity,
     layer_collectives,
 )
+from resin.backend.control_plane import ControlPlane
 from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
     CudaGraphExecutor,
@@ -99,6 +100,8 @@ class CudaRunner(Runner):
         self._cuda_graph_executor: CudaGraphExecutor | None = None
         self._expert_graph_model = None
         self._expert_graph_groups = None
+        self._expert_graph_catalogs = {}
+        self._expert_graph_control = None
         self._distributed_prefill_bucket = None
         self._distributed_prefill_scope = False
 
@@ -106,6 +109,10 @@ class CudaRunner(Runner):
         """Attach explicit expert collectives to the ordinary graph machinery."""
 
         self._expert_graph_model, self._expert_graph_groups = model, groups
+        self._expert_graph_catalogs = {}
+        self._expert_graph_control = (
+            None if groups is None else ControlPlane(groups.distributed)
+        )
 
     def _expert_graph_capacity(self, capacity: int, *, valid_rows=None):
         if getattr(self, "_expert_graph_groups", None) is None:
@@ -142,11 +149,24 @@ class CudaRunner(Runner):
             raise ValueError(
                 "distributed CUDA graph catalogs and capture order must agree"
             )
+        self._expert_graph_catalogs = {
+            mode: tuple(
+                tuple(shape)
+                for shape in self._require_cuda_graph_executor().mode(mode).shapes
+            )
+            for mode in self.cuda_graph_stats
+        }
 
     def _select_distributed_cuda_graph(
         self, mode, context, *, required_shape, eligible=True, fallback="shape"
     ):
-        """Vote before GPU work so every attention replica chooses the same path."""
+        """Vote before GPU work so every attention replica chooses the same path.
+
+        The hot vote carries eligibility, dimensions and local catalog changes.
+        Any changed or untrusted catalog makes every rank join an exact object
+        comparison before selection; only successful agreement updates trust.
+        Wider demands also keep their complete shape through that cold path.
+        """
 
         eligible = eligible and (
             self.cuda_graph_decode != "disabled"
@@ -156,15 +176,40 @@ class CudaRunner(Runner):
             else True
         )
         cache = self._require_cuda_graph_executor().mode(mode)
-        values = self._graph_domain_values(
-            (bool(eligible), tuple(required_shape), cache.shapes)
+        required_shape = tuple(required_shape)
+        catalog = tuple(tuple(shape) for shape in cache.shapes)
+        trusted = self._expert_graph_catalogs
+        changed = trusted.get(mode) != catalog
+        # Ordinary graph demands fit the fixed control record. Wider generic
+        # GraphShapes retain the full object path rather than losing dimensions.
+        record = (
+            int(bool(eligible)),
+            int(changed),
+            len(required_shape),
+            *required_shape[:3],
+            *(0 for _ in range(max(0, 3 - len(required_shape)))),
         )
-        if any(value[2] != values[0][2] for value in values):
-            raise ValueError("distributed CUDA graph catalogs must agree")
-        if not all(value[0] for value in values):
+        groups = getattr(self, "_expert_graph_groups", None)
+        if groups is None:
+            records = [record]
+        else:
+            records, _ = self._expert_graph_control.gather(
+                groups.domain, f"cuda_graph_select:{mode}", record
+            )
+        if any(row[2] != len(required_shape) for row in records):
+            raise ValueError("distributed CUDA graph demand dimensions must agree")
+        if any(row[1] for row in records) or len(required_shape) > 3:
+            values = self._graph_domain_values((required_shape, catalog))
+            if any(value[1] != values[0][1] for value in values):
+                raise ValueError("distributed CUDA graph catalogs must agree")
+            trusted[mode] = catalog
+            demands = [value[0] for value in values]
+        else:
+            demands = [row[3 : 3 + len(required_shape)] for row in records]
+        if not all(row[0] for row in records):
             cache.fallback("distributed_eligibility")
             return None
-        required = tuple(max(parts) for parts in zip(*(v[1] for v in values)))
+        required = tuple(max(parts) for parts in zip(*demands))
         return self._select_cuda_graph(
             mode,
             match=lambda shape: all(a >= b for a, b in zip(shape, required)),

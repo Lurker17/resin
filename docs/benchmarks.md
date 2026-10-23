@@ -214,6 +214,9 @@ outside throughput timing. Their category comparison preserves per-rank results
 and distinguishes summed kernel work from elapsed GPU activity. Records, plots,
 source provenance, the comparison and six merged Perfetto traces are under
 `artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-overlap/`.
+These archived `cd5ecfd` results precede the compact graph-selection vote added
+afterward. That change retains exact catalog revalidation on mutation; it needs
+its own GPU measurement and does not change the recorded plots above.
 
 The implementation uses fixed-width greedy proposals, loads the confidence head
 without applying its length policy, and supports up to the released five-token

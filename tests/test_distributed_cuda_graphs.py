@@ -19,7 +19,7 @@ from resin.backend.cuda.graphs import CudaGraphMode
 from resin.backend.cuda.runner import CudaRunner
 from resin.backend.distributed import StepContext
 from resin.backend.expert_parallel import ExpertParallelDispatch
-from resin.backend.topology import ParallelGroups
+from resin.backend.topology import ParallelGroups, RankGroup
 
 
 def _unreachable() -> NoReturn:
@@ -167,6 +167,24 @@ def _selection_worker(rank, rendezvous):
         groups = ParallelGroups.create(
             Parallelism(world_size=2, ep=2, attn_dp=2), device_backend="gloo"
         )
+
+        class CountTransport:
+            fixed = 0
+            objects = 0
+
+            def all_gather_single(self, *args, **kwargs):
+                self.fixed += 1
+                return dist.all_gather_single(*args, **kwargs)
+
+            def all_gather_object(self, *args, **kwargs):
+                self.objects += 1
+                return dist.all_gather_object(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(dist, name)
+
+        transport = CountTransport()
+        groups.distributed = transport
         runner = _CpuRunner(groups)
         context = _context(groups)
 
@@ -177,6 +195,47 @@ def _selection_worker(rank, rendezvous):
             "decode", context, required_shape=required
         )
         assert shape == (4, 8)
+        assert (transport.fixed, transport.objects) == (1, 1)
+        for _ in range(3):
+            before = transport.fixed, transport.objects
+            assert runner._select_distributed_cuda_graph(
+                "decode", context, required_shape=required
+            ) == (4, 8)
+            assert (transport.fixed, transport.objects) == (before[0] + 1, before[1])
+
+        # An identical live catalog update is revalidated once on every rank.
+        # A later one-rank mutation must invalidate warm trust on all peers.
+        mutable = _CpuRunner(groups)
+        assert mutable._select_distributed_cuda_graph(
+            "decode", context, required_shape=(1, 1)
+        ) == (1, 4)
+        cache = mutable._require_cuda_graph_executor().mode("decode")
+        cache.shapes = ((1, 4), (4, 8))
+        before = transport.fixed, transport.objects
+        assert mutable._select_distributed_cuda_graph(
+            "decode", context, required_shape=(1, 1)
+        ) == (1, 4)
+        assert (transport.fixed, transport.objects) == (before[0] + 1, before[1] + 1)
+        if rank == 0:
+            cache.shapes = ((1, 4),)
+        with pytest.raises(ValueError, match="catalogs must agree"):
+            mutable._select_distributed_cuda_graph(
+                "decode", context, required_shape=(1, 1)
+            )
+        assert mutable._expert_graph_catalogs["decode"] == ((1, 4), (4, 8))
+
+        with pytest.raises(ValueError, match="dimensions must agree"):
+            runner._select_distributed_cuda_graph(
+                "decode", context, required_shape=(1,) if rank else (1, 1)
+            )
+        modes = _CpuRunner(groups)
+        modes._configure_prefill_graphs(
+            (lambda hidden, ids: hidden,), hidden_size=2, max_tokens=4
+        )
+        with pytest.raises(RuntimeError, match="different orders"):
+            modes._select_distributed_cuda_graph(
+                "decode" if rank else "prefill", context, required_shape=(1, 1)
+            )
 
         # Model-level graph eligibility is also collective. Mixing a replay
         # and eager variable-size exchange would deadlock the NCCL domain.
@@ -322,11 +381,13 @@ def test_driver_policy_disables_every_peer_without_hiding_catalogs(
     cache = runner._require_cuda_graph_executor().mode(mode)
     catalog = cache.shapes
 
-    def gather(value):
-        assert value[0] == (rank == 1)
-        return [(False, value[1], value[2]), (True, value[1], value[2])]
+    def gather(group, operation, value):
+        assert bool(value[0]) == (rank == 1)
+        return [(0, *value[1:]), (1, *value[1:])], [None, None]
 
-    monkeypatch.setattr(runner, "_graph_domain_values", gather)
+    runner._expert_graph_catalogs[mode] = catalog
+    runner._expert_graph_groups = SimpleNamespace(domain=RankGroup((0, 1), None, rank))
+    runner._expert_graph_control = SimpleNamespace(gather=gather)
     context = SimpleNamespace(max_num_tokens=2)
     assert (
         runner._select_distributed_cuda_graph(mode, context, required_shape=catalog[0])
@@ -348,3 +409,11 @@ def test_driver_policy_disables_every_peer_without_hiding_catalogs(
             )
 
         assert runner._select_cuda_graph(mode, match=cannot_select) is None
+
+
+def test_wide_graph_demands_keep_every_dimension():
+    runner = _CpuRunner(None, shapes=((1, 2, 3, 4), (2, 3, 4, 5)))
+    for _ in range(2):
+        assert runner._select_distributed_cuda_graph(
+            "decode", None, required_shape=(2, 2, 2, 2)
+        ) == (2, 3, 4, 5)
