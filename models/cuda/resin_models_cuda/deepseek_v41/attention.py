@@ -48,10 +48,15 @@ class QueryProjection(PreparedLinear):
             heads,
             dim,
         )
-        # Only attention Q is permuted; the appended index Q keeps its ordinary
-        # head layout. Preserve the packed scale tensor's TMA-aligned stride.
-        self.weight[: self.query_width].copy_(weight)
-        self.scale[: self.query_width].copy_(scales)
+        if index_source is None:
+            # A single prepared projection shares its checkpoint storage.
+            # Own the permuted tensors rather than modifying that source.
+            self.weight, self.scale = weight.detach(), scales.detach()
+        else:
+            # Only attention Q is permuted; the appended index Q keeps its
+            # ordinary head layout and the packed scales keep their TMA stride.
+            self.weight[: self.query_width].copy_(weight)
+            self.scale[: self.query_width].copy_(scales)
 
     def forward(self, value):
         return self.project(value)[0]

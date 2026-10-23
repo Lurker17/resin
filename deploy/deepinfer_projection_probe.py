@@ -121,29 +121,42 @@ def run_probe():
                 }
             )
             if query is not None and rows == 5:
-                main, index = query.project(hidden)
-                # Independently invert FlashMLA's Q-B lane layout; the index
-                # suffix is ordinary head-major data and must not be permuted.
-                restored_main = (
-                    main.reshape(rows, 32, 128, 16).transpose(1, 2).reshape(rows, -1)
-                )
-                query_errors = {}
-                for label, actual_part, expected_part in (
-                    ("main", restored_main, expected[:, : 128 * 512]),
-                    ("index", index, expected[:, 128 * 512 :]),
+                for query_kind, projection in (
+                    ("merged_query", query),
+                    ("unmerged_query", QueryProjection(sources[0], 128, 512)),
                 ):
-                    difference = actual_part.float() - expected_part.float()
-                    error = (difference.norm() / expected_part.float().norm()).item()
-                    if error > 0.005:
-                        raise AssertionError(
-                            f"merged query {label}: relative L2 {error}"
-                        )
-                    query_errors[label] = {
-                        "relative_l2": error,
-                        "max_abs": difference.abs().max().item(),
+                    main, index = projection.project(hidden)
+                    # Invert FlashMLA's Q-B lane layout independently. The
+                    # optional index suffix stays in ordinary head-major order.
+                    restored_main = (
+                        main.reshape(rows, 32, 128, 16)
+                        .transpose(1, 2)
+                        .reshape(rows, -1)
+                    )
+                    parts = [("main", restored_main, expected[:, : 128 * 512])]
+                    if index is not None:
+                        parts.append(("index", index, expected[:, 128 * 512 :]))
+                    errors = {}
+                    for label, actual_part, expected_part in parts:
+                        difference = actual_part.float() - expected_part.float()
+                        error = (
+                            difference.norm() / expected_part.float().norm()
+                        ).item()
+                        if error > 0.005:
+                            raise AssertionError(
+                                f"{query_kind} {label}: relative L2 {error}"
+                            )
+                        errors[label] = {
+                            "relative_l2": error,
+                            "max_abs": difference.abs().max().item(),
+                        }
+
+                    def captured_query(projection=projection):
+                        main, index = projection.project(hidden)
+                        return main if index is None else torch.cat((main, index), -1)
+
+                    result[-1][query_kind] = {
+                        **errors,
+                        "capture": _graph(captured_query),
                     }
-                result[-1]["merged_query"] = {
-                    **query_errors,
-                    "capture": _graph(lambda: torch.cat(query.project(hidden), dim=-1)),
-                }
     return {"gpu": torch.cuda.get_device_name(), "projections": result}

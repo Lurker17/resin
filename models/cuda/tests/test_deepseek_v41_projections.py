@@ -128,7 +128,10 @@ def test_bf16_projection_preserves_reduction_and_fp32_stays_unmodified(deepgemm)
     assert prepare_linear(fp32) is fp32
 
 
-def test_query_merge_permutates_only_attention_rows(deepgemm, monkeypatch):
+@pytest.mark.parametrize("merged", [False, True])
+def test_query_permutation_preserves_source_and_index_rows(
+    deepgemm, monkeypatch, merged
+):
     from resin_models_cuda.deepseek_v41.attention import QueryProjection
 
     def permute(pair, heads, dim):
@@ -144,15 +147,20 @@ def test_query_merge_permutates_only_attention_rows(deepgemm, monkeypatch):
         ),
     )
     attention, index = projection(32), projection(17, start=3)
-    query = QueryProjection(attention, 1, 32, index)
-    torch.testing.assert_close(
-        query.weight[:32].float(), attention.weight.float().flip(0)
-    )
-    torch.testing.assert_close(query.weight[32:].float(), index.weight.float())
+    original = attention.weight.float().clone()
+    query = QueryProjection(attention, 1, 32, index if merged else None)
+    torch.testing.assert_close(query.weight[:32].float(), original.flip(0))
+    torch.testing.assert_close(attention.weight.float(), original, rtol=0, atol=0)
+    assert query.weight.data_ptr() != attention.weight.data_ptr()
+    if merged:
+        torch.testing.assert_close(query.weight[32:].float(), index.weight.float())
     hidden = torch.ones(2, 3, 32, dtype=torch.bfloat16)
     main, index_query = query.project(hidden)
     assert main.shape == (2, 3, 32)
-    assert index_query.shape == (2, 3, 17)
+    if merged:
+        assert index_query.shape == (2, 3, 17)
+    else:
+        assert index_query is None
     assert len(deepgemm[0]) == 1
 
 
