@@ -157,6 +157,7 @@ async def run_case(client: httpx.AsyncClient, case: Case, timeout: float):
             async with client.stream(
                 "POST",
                 "chat/completions",
+                follow_redirects=True,
                 content=(
                     case.raw_body
                     if case.raw_body is not None

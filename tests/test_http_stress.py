@@ -225,3 +225,30 @@ def test_each_routed_rank_gets_both_protocols_scoring_modes_and_prompt_lengths()
             == 4
         )
     assert all(c.body["stream"] for c in robustness_cases("model", 4) if c.disconnect)
+
+
+def test_modal_result_redirect_preserves_completion_validation():
+    methods = []
+
+    def handle(request):
+        methods.append(request.method)
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(303, headers={"location": "/result/123"})
+        return httpx.Response(200, json=payload())
+
+    async def run():
+        async with httpx.AsyncClient(
+            base_url="http://test/v1/", transport=httpx.MockTransport(handle)
+        ) as client:
+            return await run_case(
+                client,
+                Case(
+                    name="redirect",
+                    body={"max_tokens": 4, "logprobs": True, "top_logprobs": 1},
+                ),
+                1,
+            )
+
+    result = asyncio.run(run())
+    assert result["ok"]
+    assert methods == ["POST", "GET"]
