@@ -11,7 +11,7 @@ import json
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, overload
 
 import numpy as np
 import torch
@@ -19,6 +19,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from resin import BatchPhase, RunnerConfig
+from resin.backend.cuda.completion import DeviceCompletion
 from resin.backend.cuda.graphs import (
     CudaGraphMode,
     CudaGraphProgram,
@@ -709,9 +710,37 @@ class DeepSeekV4CudaRunner(CudaRunner):
             prepare=self._reset_model_state,
         )
 
+    @overload
     def _graph_forward(
-        self, plan: BatchPlan, cache_plan, *, shape: GraphShape | None = None
-    ) -> list[int] | list[list[int]] | ForwardOutput | None:
+        self,
+        plan: BatchPlan,
+        cache_plan,
+        *,
+        shape: GraphShape | None = None,
+        enqueue: Literal[False] = False,
+        feedback=None,
+    ) -> list[int] | list[list[int]] | ForwardOutput | None: ...
+
+    @overload
+    def _graph_forward(
+        self,
+        plan: BatchPlan,
+        cache_plan,
+        *,
+        shape: GraphShape | None = None,
+        enqueue: Literal[True],
+        feedback=None,
+    ) -> DeviceCompletion | None: ...
+
+    def _graph_forward(
+        self,
+        plan: BatchPlan,
+        cache_plan,
+        *,
+        shape: GraphShape | None = None,
+        enqueue: bool = False,
+        feedback=None,
+    ) -> list[int] | list[list[int]] | ForwardOutput | DeviceCompletion | None:
         batch_size = plan.num_sequences
         positions = plan.positions
         sequence_length = int(np.max(positions)) + 1
@@ -737,6 +766,43 @@ class DeepSeekV4CudaRunner(CudaRunner):
         )
         if getattr(self, "parallel_groups", None) is not None:
             inputs["ep_valid_rows"] = batch_size
+        if enqueue:
+            from resin.backend.cuda.completion import accepted_block
+
+            self._last_dspark_phase_ms = {}
+            if feedback is not None:
+                inputs.update(feedback.inputs())
+                device_positions = feedback.positions
+            else:
+                device_positions = torch.as_tensor(
+                    inputs["positions"], device=self.device, dtype=torch.long
+                )
+            output = (
+                self._require_cuda_graph_executor()
+                .mode("decode")
+                .run(shape, inputs, output_to_host=False)
+            )
+            tokens, counts, next_inputs = accepted_block(
+                output,
+                device_positions,
+                self.speculative_tokens,
+                fixed_acceptance=self._speculation.benchmark_accepted_drafts,
+            )
+            if self.speculative_tokens:
+                self._model.clear_rejected_speculative_state(
+                    device_positions,
+                    counts,
+                    self.speculative_tokens + 1,
+                    cache=graph_cache,
+                )
+            return DeviceCompletion(
+                tokens,
+                counts,
+                next_inputs,
+                rows=batch_size,
+                stats=self._speculation if self.speculative_tokens else None,
+                device=self.device,
+            )
         output = self._run_cuda_graph("decode", shape, inputs)[:batch_size]
         phase_events = self._dspark_phase_events.get(shape)
         if phase_events is not None:
@@ -917,6 +983,82 @@ class DeepSeekV4CudaRunner(CudaRunner):
             cache,
         )
         return format_output(verify_logits, accepted, plan)
+
+    def enqueue(self, plan: BatchPlan, *, feedback=None):
+        """Submit graph decode and keep exact continuation inputs on the GPU.
+
+        The Engine owns overlap and page leases. Unsupported shapes and scored
+        outputs retain the ordinary synchronous forward contract.
+        """
+        if self.parallel_groups is not None:
+            raise RuntimeError("explicit rank groups require enqueue_distributed")
+        if (
+            plan.phase != BatchPhase.DECODE
+            or plan.needs_logprobs
+            or plan.needs_prompt_logprobs
+        ):
+            return self.forward(plan)
+        self._check_cuda_graphs(plan.phase)
+        self._validate_plan(plan)
+        cache_plan = self._cache_plan(plan)
+        with self._cuda_failure:
+            result = self._graph_forward(
+                plan, cache_plan, enqueue=True, feedback=feedback
+            )
+        return self.forward(plan) if result is None else result
+
+    def enqueue_distributed(self, plan, context, *, prepared=None, feedback=None):
+        """Generic asynchronous graph submission across composed rank meshes."""
+        if context.phase != BatchPhase.DECODE or (
+            plan is not None and (plan.needs_logprobs or plan.needs_prompt_logprobs)
+        ):
+            return self.forward_distributed(plan, context, prepared=prepared)
+        prepared = (
+            self.validate_distributed(plan, context) if prepared is None else prepared
+        )
+        with self._cuda_failure:
+            shape = self._select_distributed_cuda_graph(
+                "decode",
+                context,
+                required_shape=(
+                    0 if plan is None else plan.num_sequences,
+                    0
+                    if plan is None
+                    else int(np.max(plan.positions)) + self.speculative_tokens + 1,
+                ),
+            )
+            if shape is not None:
+                if plan is not None:
+                    return self._graph_forward(
+                        plan,
+                        prepared.cache_plan,
+                        shape=shape,
+                        enqueue=True,
+                        feedback=feedback,
+                    )
+                from resin.backend.cuda.completion import (
+                    DeviceCompletion,
+                    accepted_block,
+                )
+
+                inputs = self._decode_graph_capture_inputs(shape)
+                inputs["ep_valid_rows"] = 0
+                output = (
+                    self._require_cuda_graph_executor()
+                    .mode("decode")
+                    .run(shape, inputs, output_to_host=False)
+                )
+                positions = torch.ones(shape[0], device=self.device, dtype=torch.long)
+                tokens, counts, next_inputs = accepted_block(
+                    output,
+                    positions,
+                    self.speculative_tokens,
+                    fixed_acceptance=self._speculation.benchmark_accepted_drafts,
+                )
+                return DeviceCompletion(
+                    tokens, counts, next_inputs, rows=0, device=self.device
+                )
+        return self.forward_distributed(plan, context, prepared=prepared)
 
     def forward(self, plan: BatchPlan) -> list[int] | list[list[int]] | ForwardOutput:
         """Run one dynamically batched prefill or decode sampling step."""

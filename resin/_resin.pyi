@@ -394,6 +394,7 @@ class Engine:
         scheduler_config: SchedulerConfig | None = None,
         eos_token_id: int | None = None,
         prefix_cache: bool = False,
+        overlap: bool = True,
     ) -> Engine: ...
     def __repr__(self, /) -> str: ...
     @property
@@ -427,6 +428,14 @@ class Engine:
         """
         Read-only admission-aware proposal; reserves no requests or resources.
         """
+    @property
+    def overlap(self, /) -> bool: ...
+    @property
+    def overlap_pending(self, /) -> bool: ...
+    @property
+    def overlap_ready(self, /) -> bool: ...
+    @property
+    def overlap_stats(self, /) -> tuple[int, int]: ...
     def poison(self, /, reason: str) -> None:
         """
         Contain a failure reported by a peer without releasing local resources.
@@ -444,7 +453,9 @@ class Engine:
     def ready_request_count(self, /) -> int: ...
     @property
     def scheduler_config(self, /) -> SchedulerConfig: ...
-    def step(self, /, *, phase: BatchPhase | None = None) -> list[TokenEvent]: ...
+    def step(
+        self, /, *, phase: BatchPhase | None = None, allow_overlap: bool = True
+    ) -> list[TokenEvent]: ...
     def submit(
         self,
         /,

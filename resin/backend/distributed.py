@@ -1,4 +1,4 @@
-"""Synchronous serving over shared ranks with attention and expert meshes.
+"""Serving over shared ranks with attention and expert meshes.
 
 The Rust Engine retains scheduling and page ownership. This module coordinates
 its existing step boundary; model runtimes own partitioning and device collectives.
@@ -109,7 +109,9 @@ class DistributedWorker:
     checks before a domain-wide readiness vote. A non-None validation result is
     passed to forward_distributed as the keyword-only ``prepared`` argument;
     runners can reuse validated host metadata without retaining pending state.
-    The forward callback must finish device work before returning.
+    The forward callback finishes device work before returning. Optional enqueue
+    callbacks return an owned completion with GPU feedback; the Engine retains
+    scheduling and cache leases while it overlaps the next submission.
     Bind/release may communicate within a replica;
     collectives across replicas belong only in the forward callback.
     """
@@ -120,12 +122,18 @@ class DistributedWorker:
         self.failure = None
         self._entered = False
         self._step_id, self._phase = 0, None
-        self._forward, self._validate = None, None
+        self._forward, self._validate, self._enqueue = None, None, None
+        self._completion = None
         lookahead = None
         error = None
         try:
             self._forward = getattr(runner, "forward_distributed", None)
             self._validate = getattr(runner, "validate_distributed", None)
+            self._enqueue = (
+                getattr(runner, "enqueue_distributed", None)
+                if self._forward is not None
+                else getattr(runner, "enqueue", None)
+            )
             self.runner_config = getattr(runner, "runner_config", RunnerConfig())
             capabilities = getattr(runner, "parallelism_capabilities", None)
             if capabilities is not None:
@@ -209,6 +217,9 @@ class DistributedWorker:
         operation = command["operation"]
         error = None
         try:
+            if self._completion is not None:
+                self._completion.result()
+                self._completion = None
             if operation == "bind":
                 getattr(self.runner, "bind_resources")(
                     SimpleNamespace(
@@ -249,7 +260,23 @@ class DistributedWorker:
             self.failure = _message(exc)
             raise DistributedExecutionError(self.failure) from exc
 
-    def _coordinate(self, plan: BatchPlan | None, error: str | None = None):
+    def enqueue(self, plan: BatchPlan, *, feedback=None):
+        try:
+            return self._coordinate(plan, enqueue=True, feedback=feedback is not None)
+        except DistributedExecutionError:
+            raise
+        except BaseException as exc:
+            self.failure = _message(exc)
+            raise DistributedExecutionError(self.failure) from exc
+
+    def _coordinate(
+        self,
+        plan: BatchPlan | None,
+        error: str | None = None,
+        *,
+        enqueue=False,
+        feedback=False,
+    ):
         self._entered = True
         payload = None
         try:
@@ -268,12 +295,19 @@ class DistributedWorker:
                 0 if plan is None else plan.num_sequences,
                 0 if plan is None else len(plan.token_ids),
                 error,
+                bool(enqueue and self._enqueue is not None),
+                bool(feedback),
             ),
         )
         failure = _first_error(self._driver_group, [item[2] for item in descriptors])
         if failure:
             raise DistributedExecutionError(failure)
-        sizes = tuple((rows, tokens) for rows, tokens, _ in descriptors)
+        sizes = tuple((item[0], item[1]) for item in descriptors)
+        asynchronous = all(item[3] for item in descriptors)
+        if any(item[4] for item in descriptors) and not asynchronous:
+            raise DistributedExecutionError(
+                "decode continuations must enqueue together across attention replicas"
+            )
         if not any(rows for rows, _ in sizes):
             return None
         command = {
@@ -282,6 +316,8 @@ class DistributedWorker:
             "step_id": self._step_id,
             "phase": "prefill" if self._phase == BatchPhase.PREFILL else "decode",
             "sizes": sizes,
+            "enqueue": asynchronous,
+            "feedback": bool(feedback),
         }
         self._send(command)
         return self._execute(command, plan)
@@ -307,8 +343,37 @@ class DistributedWorker:
             error = _message(exc)
         self._consensus(self.groups.domain, error)
         result, error = None, None
+        previous = self._completion
         try:
-            if self._forward is not None:
+            asynchronous = command.get("enqueue", False)
+            if not asynchronous and previous is not None:
+                previous.result()
+                self._completion = None
+                previous = None
+            if asynchronous:
+                enqueue = self._enqueue
+                if enqueue is None:
+                    raise RuntimeError(
+                        "coordinated enqueue requires an asynchronous runner"
+                    )
+                kwargs = {} if prepared is None else {"prepared": prepared}
+                if command.get("feedback", False):
+                    if previous is None:
+                        raise RuntimeError(
+                            "device continuation has no previous completion"
+                        )
+                    kwargs["feedback"] = previous.feedback
+                result = (
+                    enqueue(plan, context, **kwargs)
+                    if self._forward is not None
+                    else enqueue(plan, **kwargs)
+                )
+                self._completion = result if hasattr(result, "result") else None
+                # Resolve the previous copy only after current GPU submission.
+                # Followers harvest too, so their release/poison lifetime agrees.
+                if previous is not None:
+                    previous.result()
+            elif self._forward is not None:
                 result = (
                     self._forward(plan, context)
                     if prepared is None
@@ -335,6 +400,9 @@ class DistributedWorker:
             command = commands[0]
             operation = command["operation"]
             if operation == "close":
+                if self._completion is not None and not command["error"]:
+                    self._completion.result()
+                    self._completion = None
                 self.closed = True
                 if command["error"]:
                     raise DistributedExecutionError(command["error"])
@@ -433,7 +501,7 @@ class DistributedEngine:
             self._finish(failure)
         return any(work for work, _ in states)
 
-    def step(self):
+    def step(self, *, allow_overlap=True):
         if self.closed:
             raise RuntimeError("distributed engine is closed")
         proposal, error = None, self.worker.failure
@@ -446,13 +514,22 @@ class DistributedEngine:
             )
         except BaseException as exc:
             error = _message(exc)
-        proposals = self.worker._drivers("phase", (proposal, error))
+        proposals = self.worker._drivers(
+            "phase",
+            (
+                proposal,
+                error,
+                self.local.overlap_pending,
+                bool(allow_overlap and self.local.overlap_ready),
+            ),
+        )
         failure = _first_error(
-            self.worker._driver_group, [error for _, error in proposals]
+            self.worker._driver_group, [item[1] for item in proposals]
         )
         if failure:
             self._finish(failure)
-        available = {phase for phase, _ in proposals} - {None}
+        available = {item[0] for item in proposals} - {None}
+        allow_overlap = available == {"decode"} and all(item[3] for item in proposals)
         if not available:
             return []
         # A mixed domain alternates phases, bounding starvation of either cohort.
@@ -471,7 +548,9 @@ class DistributedEngine:
         self.worker._entered = False
         events, error = [], None
         try:
-            events = self.local.step(phase=self.worker._phase)
+            events = self.local.step(
+                phase=self.worker._phase, allow_overlap=allow_overlap
+            )
         except BaseException as exc:
             error = _message(exc)
         if not self.worker._entered:

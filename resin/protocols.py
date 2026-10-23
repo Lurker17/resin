@@ -104,6 +104,31 @@ class Runner(Protocol):
     ) -> ForwardOutput | Sequence[int] | Sequence[Sequence[int]]: ...
 
 
+class RunnerCompletion(Protocol):
+    """Owned accepted output with device feedback for an Engine continuation.
+
+    ``result`` waits only for this step and may be called repeatedly. Feedback
+    owns its tensors independently of graph buffers reused by the next launch.
+    """
+
+    @property
+    def feedback(self) -> Any: ...
+
+    def result(self) -> ForwardOutput | Sequence[int] | Sequence[Sequence[int]]: ...
+
+
+class EnqueuingRunner(Runner, Protocol):
+    """Optional device submission boundary; overlap belongs to the Engine.
+
+    A synchronous result is a supported fallback. Engine(overlap=False) uses
+    forward directly. Models themselves retain their ordinary tensor forward.
+    """
+
+    def enqueue(
+        self, plan: BatchPlan, *, feedback: Any = None
+    ) -> RunnerCompletion | ForwardOutput | Sequence[int] | Sequence[Sequence[int]]: ...
+
+
 class ManagedRunner(Runner, Protocol):
     """Declare cache resources and bind their arena once during construction.
 
@@ -127,5 +152,7 @@ __all__ = [
     "RenderedPrompt",
     "ResponseParser",
     "Runner",
+    "RunnerCompletion",
+    "EnqueuingRunner",
     "TokenSpan",
 ]

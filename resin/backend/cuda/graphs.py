@@ -480,7 +480,13 @@ class CudaGraphCache:
             else entry.program.output
         )
 
-    def run(self, shape: GraphShape, inputs: Mapping[str, object]) -> Any:
+    def run(
+        self,
+        shape: GraphShape,
+        inputs: Mapping[str, object],
+        *,
+        output_to_host: bool | None = None,
+    ) -> Any:
         """Stage and replay one current batch using a pre-captured graph."""
 
         self.check()
@@ -503,9 +509,14 @@ class CudaGraphCache:
         try:
             with torch.cuda.device(self.device), torch.inference_mode():
                 self._replay(entry.program, entry.graphs)
+            host_output = (
+                entry.program.output_to_host
+                if output_to_host is None
+                else output_to_host
+            )
             result = (
                 _map_output(entry.program.output, lambda tensor: tensor.tolist())
-                if entry.program.output_to_host
+                if host_output
                 else entry.program.output
             )
         except BaseException as error:

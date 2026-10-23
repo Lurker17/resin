@@ -25,8 +25,8 @@ use output::{BorrowedLogprobs, BorrowedOutput, ForwardOutput};
 use parallelism::Parallelism;
 use resin_core::engine::{self as core, CompletionReason};
 use runner::{
-    ResourceBinding, RunnerConfig, bind_runner_resources, resolve_runner_config,
-    resolve_runner_contract, runner_error_is_post_accept,
+    ResourceBinding, RunnerConfig, bind_runner_resources, optional_runner_callable,
+    resolve_runner_config, resolve_runner_contract, runner_error_is_post_accept,
 };
 
 fn default_sampling_seed(engine_id: u64, request_id: u64) -> i64 {
@@ -1054,12 +1054,115 @@ struct Engine {
     runner_forward: Py<PyAny>,
     runner_release: Option<Py<PyAny>>,
     runner_config: RunnerConfig,
+    runner_enqueue: Option<Py<PyAny>>,
+    overlap: bool,
+    pending: Option<PendingExecution>,
+    deferred_events: Vec<Py<TokenEvent>>,
+    overlap_enqueues: u64,
+    overlap_continuations: u64,
+}
+
+struct PendingExecution {
+    plan: Py<BatchPlan>,
+    completion: Py<PyAny>,
+}
+
+impl Engine {
+    fn consume_output(
+        &mut self,
+        py: Python<'_>,
+        plan: &Py<BatchPlan>,
+        output: &Bound<'_, PyAny>,
+        continuing: bool,
+    ) -> PyResult<Vec<Py<TokenEvent>>> {
+        let forward = self.runner_forward.clone_ref(py);
+        let release = self
+            .runner_release
+            .as_ref()
+            .map(|value| value.clone_ref(py));
+        let mut runner = PythonRunner {
+            py,
+            forward: &forward,
+            release: release.as_ref(),
+            error: None,
+            logprobs: None,
+            prompt_logprobs: None,
+        };
+        let output = match extract_runner_output(output, &plan.borrow(py)) {
+            Ok(output) => {
+                runner.logprobs = output.logprobs;
+                runner.prompt_logprobs = output.prompt_logprobs;
+                Ok(output.tokens)
+            }
+            Err(error) => Err(runner.failed(error, true)),
+        };
+        let mut event_error = None;
+        let make_event = |event: core::TokenEvent| {
+            Py::new(
+                py,
+                TokenEvent {
+                    request_id: event.request_id,
+                    token_id: event.token_id,
+                    index: event.index,
+                    finished: event.finished,
+                    finish_reason: event.finish_reason,
+                    logprobs: event.logprobs,
+                },
+            )
+            .map_err(|error| {
+                event_error = Some(error);
+                core::Error::memory("could not allocate token event")
+            })
+        };
+        let result = if continuing {
+            self.core
+                .complete_continuing_step_with(&mut runner, output, make_event)
+        } else {
+            self.core
+                .complete_step_with(&mut runner, output, make_event)
+        };
+        result.map_err(|error| {
+            runner
+                .error
+                .or(event_error)
+                .unwrap_or_else(|| core_error(error))
+        })
+    }
+
+    fn fail_output(&mut self, py: Python<'_>, error: PyErr, accepted: bool) -> PyErr {
+        let forward = self.runner_forward.clone_ref(py);
+        let release = self
+            .runner_release
+            .as_ref()
+            .map(|value| value.clone_ref(py));
+        let mut runner = PythonRunner {
+            py,
+            forward: &forward,
+            release: release.as_ref(),
+            error: None,
+            logprobs: None,
+            prompt_logprobs: None,
+        };
+        let accepted = accepted || runner_error_is_post_accept(py, &error);
+        let failure = runner.failed(error, accepted);
+        let result = self.core.complete_step_with(&mut runner, Err(failure), Ok);
+        result.err();
+        runner.error.expect("preserved runner exception")
+    }
+
+    fn harvest(&mut self, py: Python<'_>, continuing: bool) -> PyResult<Vec<Py<TokenEvent>>> {
+        let pending = self.pending.take().expect("harvest pending execution");
+        match pending.completion.bind(py).call_method0("result") {
+            Ok(output) => self.consume_output(py, &pending.plan, &output, continuing),
+            Err(error) => Err(self.fail_output(py, error, true)),
+        }
+    }
 }
 
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner, *, max_running_requests = 32, context_length = 32768, scheduler_config = None, eos_token_id = None, prefix_cache = false))]
+    #[pyo3(signature = (runner, *, max_running_requests = 32, context_length = 32768, scheduler_config = None, eos_token_id = None, prefix_cache = false, overlap = true))]
     fn new(
         py: Python<'_>,
         runner: Py<PyAny>,
@@ -1068,7 +1171,9 @@ impl Engine {
         scheduler_config: Option<Py<SchedulerConfig>>,
         eos_token_id: Option<u32>,
         prefix_cache: bool,
+        overlap: bool,
     ) -> PyResult<Self> {
+        let runner_enqueue = optional_runner_callable(py, runner.bind(py), "enqueue")?;
         let (runner_forward, runner_release) = resolve_runner_contract(py, runner.bind(py))?;
         let resolved = resolve_runner_config(py, runner.bind(py))?;
         let config = &resolved.config;
@@ -1104,6 +1209,12 @@ impl Engine {
             runner_forward,
             runner_release,
             runner_config,
+            runner_enqueue,
+            overlap,
+            pending: None,
+            deferred_events: Vec::new(),
+            overlap_enqueues: 0,
+            overlap_continuations: 0,
         })
     }
     #[pyo3(signature = (
@@ -1221,42 +1332,139 @@ impl Engine {
             .map_err(|error| handle_error.unwrap_or_else(|| core_error(error)))
     }
 
-    #[pyo3(signature = (*, phase = None))]
-    fn step(&mut self, py: Python<'_>, phase: Option<BatchPhase>) -> PyResult<Vec<Py<TokenEvent>>> {
+    #[pyo3(signature = (*, phase = None, allow_overlap = true))]
+    fn step(
+        &mut self,
+        py: Python<'_>,
+        phase: Option<BatchPhase>,
+        allow_overlap: bool,
+    ) -> PyResult<Vec<Py<TokenEvent>>> {
+        self.core.raise_if_open().map_err(core_error)?;
+        let mut events = std::mem::take(&mut self.deferred_events);
+        if self.pending.is_some() {
+            let next = if self.overlap
+                && allow_overlap
+                && phase.is_none_or(|phase| matches!(phase, BatchPhase::Decode))
+            {
+                self.core.continuation_plan().map_err(core_error)?
+            } else {
+                None
+            };
+            if let Some(next) = next {
+                let next_plan = Py::new(py, planning::from_core(next))?;
+                let previous = self.pending.as_ref().expect("pending execution");
+                let feedback = previous.completion.bind(py).getattr("feedback")?;
+                let kwargs = pyo3::types::PyDict::new(py);
+                kwargs.set_item("feedback", feedback)?;
+                let enqueue = self
+                    .runner_enqueue
+                    .as_ref()
+                    .expect("pending runner can enqueue");
+                let result = match enqueue.bind(py).call((&next_plan,), Some(&kwargs)) {
+                    Ok(result) => result.unbind(),
+                    Err(error) => {
+                        self.core
+                            .poison_message(format!("overlapped enqueue failed: {error}"));
+                        return Err(error);
+                    }
+                };
+                if !result.bind(py).hasattr("result")? {
+                    // Distributed peers may collectively choose a synchronous
+                    // fallback. It still executed the future step, so harvest
+                    // and commit both results without releasing pages between.
+                    let previous_events = self.harvest(py, true)?;
+                    events.extend(previous_events);
+                    events.extend(self.consume_output(py, &next_plan, result.bind(py), false)?);
+                    return Ok(events);
+                }
+                let previous_events = self.harvest(py, true)?;
+                self.pending = Some(PendingExecution {
+                    plan: next_plan,
+                    completion: result,
+                });
+                self.overlap_enqueues += 1;
+                self.overlap_continuations += 1;
+                events.extend(previous_events);
+            } else {
+                events.extend(self.harvest(py, false)?);
+            }
+            return Ok(events);
+        }
+
+        let forward = self.runner_forward.clone_ref(py);
+        let release = self
+            .runner_release
+            .as_ref()
+            .map(|value| value.clone_ref(py));
         let mut runner = PythonRunner {
             py,
-            forward: &self.runner_forward,
-            release: self.runner_release.as_ref(),
+            forward: &forward,
+            release: release.as_ref(),
             error: None,
             logprobs: None,
             prompt_logprobs: None,
         };
-        let mut event_error = None;
-        let result = self
+        let Some(plan) = self
             .core
-            .step_phase_with(&mut runner, phase.map(BatchPhase::core), |event| {
-                Py::new(
-                    py,
-                    TokenEvent {
-                        request_id: event.request_id,
-                        token_id: event.token_id,
-                        index: event.index,
-                        finished: event.finished,
-                        finish_reason: event.finish_reason,
-                        logprobs: event.logprobs,
-                    },
-                )
-                .map_err(|error| {
-                    event_error = Some(error);
-                    core::Error::memory("could not allocate token event")
-                })
-            });
-        result.map_err(|error| {
-            runner
-                .error
-                .or(event_error)
-                .unwrap_or_else(|| core_error(error))
-        })
+            .prepare_step(&mut runner, phase.map(BatchPhase::core))
+            .map_err(|error| runner.error.take().unwrap_or_else(|| core_error(error)))?
+        else {
+            return Ok(events);
+        };
+        let can_enqueue = self.overlap
+            && allow_overlap
+            && self.runner_enqueue.is_some()
+            && plan.phase == resin_core::Phase::Decode
+            && plan
+                .payloads
+                .iter()
+                .all(|payload| !payload.sampling_params.logprobs)
+            && self.core.retain_continuation(&plan);
+        let plan = match Py::new(py, planning::from_core(plan)) {
+            Ok(plan) => plan,
+            Err(error) => return Err(self.fail_output(py, error, false)),
+        };
+        if can_enqueue {
+            let enqueue = self.runner_enqueue.as_ref().expect("checked enqueue");
+            match enqueue.bind(py).call1((&plan,)) {
+                Ok(output) if output.hasattr("result")? => {
+                    self.pending = Some(PendingExecution {
+                        plan,
+                        completion: output.unbind(),
+                    });
+                    self.overlap_enqueues += 1;
+                    return Ok(events);
+                }
+                Ok(output) => events.extend(self.consume_output(py, &plan, &output, false)?),
+                Err(error) => return Err(self.fail_output(py, error, false)),
+            }
+        } else {
+            match self.runner_forward.bind(py).call1((&plan,)) {
+                Ok(output) => events.extend(self.consume_output(py, &plan, &output, false)?),
+                Err(error) => return Err(self.fail_output(py, error, false)),
+            }
+        }
+        Ok(events)
+    }
+
+    #[getter]
+    fn overlap(&self) -> bool {
+        self.overlap
+    }
+
+    #[getter]
+    fn overlap_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    #[getter]
+    fn overlap_ready(&self) -> bool {
+        !self.pending.is_some() || self.core.has_continuation()
+    }
+
+    #[getter]
+    fn overlap_stats(&self) -> (u64, u64) {
+        (self.overlap_enqueues, self.overlap_continuations)
     }
 
     /// Read-only admission-aware proposal; reserves no requests or resources.
@@ -1278,6 +1486,22 @@ impl Engine {
     }
 
     fn cancel(&mut self, py: Python<'_>, request: PyRef<'_, RequestLease>) -> PyResult<bool> {
+        self.core.raise_if_open().map_err(core_error)?;
+        if request.inner.engine_id() != self.core.id() {
+            return Err(PyValueError::new_err(
+                "RequestLease belongs to a different Engine",
+            ));
+        }
+        if self.pending.is_some() {
+            let events = self.harvest(py, false)?;
+            self.deferred_events.extend(
+                events
+                    .into_iter()
+                    .filter(|event| event.borrow(py).request_id != request.inner.id()),
+            );
+        }
+        self.deferred_events
+            .retain(|event| event.borrow(py).request_id != request.inner.id());
         let mut runner = PythonRunner {
             py,
             forward: &self.runner_forward,
@@ -1290,6 +1514,10 @@ impl Engine {
         runner.result(result)
     }
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.pending.is_some() {
+            self.harvest(py, false)?;
+        }
+        self.deferred_events.clear();
         let mut runner = PythonRunner {
             py,
             forward: &self.runner_forward,
@@ -1318,7 +1546,7 @@ impl Engine {
     }
 
     fn has_work(&self) -> bool {
-        self.core.has_work()
+        self.core.has_work() || !self.deferred_events.is_empty()
     }
 
     #[getter]

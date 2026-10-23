@@ -285,7 +285,7 @@ fn engine_actor(
         }
         let token_events = Python::attach(|py| {
             let mut engine = engine.bind(py).borrow_mut();
-            engine.step(py, None).map(|events| {
+            engine.step(py, None, true).map(|events| {
                 events
                     .into_iter()
                     .map(|event| {

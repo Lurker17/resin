@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+from datetime import timedelta
+from types import SimpleNamespace
+
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+from resin import CacheGroupLayout, CacheLayout, Parallelism, RunnerConfig
+from resin.backend.distributed import DistributedEngine, DistributedWorker
+from resin.backend.topology import ParallelGroups, ParallelismCapabilities
+
+
+class CpuCompletion:
+    def __init__(self, rows, positions):
+        self.rows = rows
+        self.feedback = SimpleNamespace(
+            tokens=[row[-1] for row in rows],
+            positions=[
+                position + len(row)
+                for position, row in zip(positions, rows, strict=True)
+            ],
+        )
+
+    def result(self):
+        return self.rows
+
+
+class ParallelRunner:
+    runner_config = RunnerConfig(
+        cache_layout=CacheLayout(32, [CacheGroupLayout(128)]),
+        cache_write_lookahead_tokens=2,
+    )
+    parallelism_capabilities = ParallelismCapabilities(cp=True, ep=True, expert_tp=True, attn_dp=True)
+
+    def __init__(self, groups):
+        self.groups = groups
+        self.calls = []
+
+    def bind_resources(self, binding):
+        pass
+
+    def release(self, ids):
+        pass
+
+    def _join(self, context, asynchronous):
+        codes = [None] * self.groups.domain.size
+        dist.all_gather_object(
+            codes, (context.step_id, asynchronous), group=self.groups.domain.handle
+        )
+        assert all(code == codes[0] for code in codes)
+        self.calls.append((context.step_id, asynchronous, context.placeholder))
+
+    def forward_distributed(self, plan, context):
+        self._join(context, False)
+        if plan is None:
+            return None
+        return [
+            [int(plan.token_ids[int(end) - 1]) + 1] for end in plan.token_indptr[1:]
+        ]
+
+    def enqueue_distributed(self, plan, context, *, feedback=None):
+        self._join(context, True)
+        if plan is None:
+            return CpuCompletion([], [])
+        tokens = plan.token_ids.tolist() if feedback is None else feedback.tokens
+        positions = plan.positions.tolist() if feedback is None else feedback.positions
+        return CpuCompletion([[token + 1, token + 2] for token in tokens], positions)
+
+
+def _worker(rank, rendezvous):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=30),
+    )
+    topology = Parallelism(world_size=4, attn_dp=2, cp=2, ep=2)
+    groups = ParallelGroups.create(topology, distributed=dist, device_backend="gloo")
+    for overlap in (False, True):
+        runner = ParallelRunner(groups)
+        worker = DistributedWorker(runner, groups)
+        if groups.is_driver:
+            engine = DistributedEngine(worker, overlap=overlap)
+            start = 1 + groups.attn_dp.local_rank * 20
+            request = engine.submit([start], max_new_tokens=34)
+            events = []
+            steps = 0
+            while engine.has_work():
+                events.extend(engine.step())
+                steps += 1
+                assert steps < 50
+            assert request.take_result() == list(range(start + 1, start + 35))
+            assert [event.token_id for event in events] == list(
+                range(start + 1, start + 35)
+            )
+            assert (
+                engine.local.overlap_stats[1] > 0
+                if overlap
+                else engine.local.overlap_stats == (0, 0)
+            )
+            engine.close()
+            assert engine.local.cache_free_parent_count == 32
+        else:
+            worker.serve()
+        dist.barrier()
+
+    # An arrival changes phase on one DP replica while another has queued GPU
+    # feedback. All ranks drain together before choosing the mixed-phase work.
+    runner = ParallelRunner(groups)
+    worker = DistributedWorker(runner, groups)
+    if groups.is_driver:
+        engine = DistributedEngine(worker)
+        request = engine.submit([1], max_new_tokens=40)
+        events = []
+        for _ in range(3):
+            events.extend(engine.step())
+        assert engine.local.overlap_pending
+        if groups.attn_dp.local_rank == 0:
+            engine.cancel(request)
+            added = engine.submit([20] * 5, max_new_tokens=9)
+        else:
+            added = None
+        steps = 0
+        while engine.has_work():
+            events.extend(engine.step())
+            steps += 1
+            assert steps < 60
+        if added is not None:
+            assert added.take_result() == list(range(21, 30))
+            assert request.cancelled
+        else:
+            assert request.take_result() == list(range(2, 42))
+        engine.close()
+        assert engine.local.cache_free_parent_count == 32
+    else:
+        worker.serve()
+    groups.close()
+    dist.destroy_process_group()
+
+
+def test_overlap_feedback_composes_with_attention_dp_cp_ep_and_followers(tmp_path):
+    mp.spawn(_worker, args=(tmp_path / "rendezvous",), nprocs=4, join=True)

@@ -878,6 +878,10 @@ impl<P: Clone> EngineCore<P> {
         self.in_flight.is_some()
     }
 
+    pub fn has_continuation(&self) -> bool {
+        self.continuation.is_some() && self.scheduler.is_empty()
+    }
+
     /// Harvest an enqueued result using the same atomic commit as synchronous execution.
     pub fn complete_step_with<E>(
         &mut self,
@@ -915,7 +919,8 @@ impl<P: Clone> EngineCore<P> {
         let Some(batch) = &self.in_flight else {
             return false;
         };
-        let allowed = plan.phase == Phase::Decode
+        let allowed = self.scheduler.is_empty()
+            && plan.phase == Phase::Decode
             && batch.rows.len() == plan.sequence_ids.len()
             && batch.rows.iter().all(|row| {
                 row.request.stop_token_ids.is_empty()
@@ -947,6 +952,9 @@ impl<P: Clone> EngineCore<P> {
     /// the runtime substitutes exact GPU token/position feedback before launch.
     pub fn continuation_plan(&mut self) -> Result<Option<ExecutionPlan<P>>> {
         self.raise_if_open()?;
+        if !self.scheduler.is_empty() {
+            return Ok(None);
+        }
         let Some(template) = &self.continuation else {
             return Ok(None);
         };

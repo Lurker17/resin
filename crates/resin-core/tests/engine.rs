@@ -553,3 +553,46 @@ fn unsafe_decode_boundaries_fall_back_before_enqueuing_a_continuation() {
         engine.close(&mut model).unwrap();
     }
 }
+
+#[test]
+fn failure_after_next_enqueue_keeps_transferred_lease_quarantined() {
+    for output in [
+        Err(Error::rejected("prior result unavailable")),
+        Ok(vec![vec![]]),
+    ] {
+        let mut engine = EngineCore::new(
+            RunnerConfig {
+                cache_layout: Some(
+                    KvLayout::new(
+                        4,
+                        vec![KvGroupLayout::new(128, 1, KvRetention::FullContext).unwrap()],
+                    )
+                    .unwrap(),
+                ),
+                cache_write_lookahead_tokens: 3,
+                ..Default::default()
+            },
+            4,
+            512,
+            SchedulerConfig::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        let mut model = Model::default();
+        let request = engine.submit(input(vec![1], 40)).unwrap();
+        engine.step(&mut model).unwrap();
+        let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+        assert!(engine.retain_continuation(&plan));
+        engine.continuation_plan().unwrap().unwrap(); // Next GPU work is accepted.
+        engine
+            .complete_continuing_step_with(&mut model, output, Ok)
+            .unwrap_err();
+        assert!(engine.poisoned());
+        assert_eq!(engine.ready_request_count(), 0);
+        assert_eq!(engine.cache_free_parent_count(), Some(3));
+        assert!(model.released.is_empty());
+        assert!(!request.done());
+        assert!(engine.close(&mut model).is_err());
+    }
+}

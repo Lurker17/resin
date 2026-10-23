@@ -146,7 +146,7 @@ pub(super) struct ResolvedRunnerConfig {
     binder: Option<Py<PyAny>>,
 }
 
-fn optional_runner_callable(
+pub(super) fn optional_runner_callable(
     py: Python<'_>,
     runner: &Bound<'_, PyAny>,
     name: &str,
