@@ -241,7 +241,8 @@ def test_row_shards_keep_fp8_storage_and_mask_other_ranks():
     )
 
 
-def test_engram_runtime_keeps_layer_hash_selection_and_empty_fetches():
+@pytest.mark.parametrize("overlap", [False, True])
+def test_engram_runtime_keeps_layer_hash_selection_and_empty_fetches(overlap):
     layers = {}
     for layer, hash_index in ((14, 1), (1, 0)):
         embed = ParallelEngramEmbedding(17, 32)
@@ -251,7 +252,7 @@ def test_engram_runtime_keeps_layer_hash_selection_and_empty_fetches():
         layers[layer] = SimpleNamespace(
             embed=embed, layer_hash_index=hash_index, hash_columns=2
         )
-    runtime = EngramRuntime(layers)
+    runtime = EngramRuntime(layers, overlap=overlap)
     hashes = torch.arange(12).reshape(1, 3, 2, 2)
     hooks = runtime.fetch(hashes)
     for layer, module in layers.items():
@@ -261,6 +262,51 @@ def test_engram_runtime_keeps_layer_hash_selection_and_empty_fetches():
         assert torch.equal(hooks[layer](), expected * (2 if layer == 14 else 1))
         assert runtime.fetch(None)[layer]().shape == (0, 2, 32)
     assert EngramRuntime({}).fetch(hashes) == {}
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+def test_engram_runtime_joins_all_fetches_before_persistent_compute(overlap, empty):
+    events = []
+
+    class Lookup:
+        def prefetch(self, requests):
+            events.append("issue-all")
+            assert [indices.shape for indices, _ in requests] == (
+                [(0, 2), (0, 2)] if empty else [(1, 3, 2), (1, 3, 2)]
+            )
+
+            def wait(index, indices):
+                events.append(f"wait-{index}")
+                return indices
+
+            return [
+                lambda index=index, indices=indices: wait(index, indices)
+                for index, (indices, _) in enumerate(requests)
+            ]
+
+    lookup = Lookup()
+    layers = {
+        layer: SimpleNamespace(
+            embed=SimpleNamespace(
+                lookup=lookup, weight=torch.empty(1), local=lambda indices: indices
+            ),
+            layer_hash_index=index,
+            hash_columns=2,
+        )
+        for index, layer in enumerate((1, 14))
+    }
+    runtime = EngramRuntime(layers, overlap=overlap)
+    hooks = runtime.fetch(None if empty else torch.arange(12).reshape(1, 3, 2, 2))
+    assert events == (["issue-all"] if overlap else ["issue-all", "wait-0", "wait-1"])
+    events.append("compute")
+    hooks[1]()
+    hooks[14]()
+    assert events == (
+        ["issue-all", "compute", "wait-0", "wait-1"]
+        if overlap
+        else ["issue-all", "wait-0", "wait-1", "compute"]
+    )
 
 
 def test_engram_gate_normalizes_each_hc_copy_and_preserves_mask(monkeypatch):

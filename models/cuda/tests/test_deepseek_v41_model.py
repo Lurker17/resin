@@ -84,6 +84,7 @@ def test_deepgemm_preparation_enables_lazy_hc_across_both_sublayers(
     model = implementation.Transformer.__new__(implementation.Transformer)
     nn.Module.__init__(model)
     model.args = SimpleNamespace(dim=5120, hc_mult=4)
+    model.engram_hash = None
     model.parallel_groups = SimpleNamespace(ep=object())
     block = implementation.Block.__new__(implementation.Block)
     nn.Module.__init__(block)

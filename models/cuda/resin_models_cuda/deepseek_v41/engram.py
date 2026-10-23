@@ -262,15 +262,16 @@ class Engram(nn.Module):
 
 
 class EngramRuntime:
-    """Prefetch every layer's table rows and defer its wait until consumption.
+    """Fetch every layer's table rows, optionally overlapping model computation.
 
     The fetch/hook boundary follows DeepInfer v4_modules/engram.py at
     774ce244b87cc0eb8d4b94ab9f5de2ab22049f01 (Apache-2.0). This transport
     uses NCCL owner lookups and does not require DeepEP's RDMA devices.
     """
 
-    def __init__(self, layers):
+    def __init__(self, layers, *, overlap: bool = True):
         self.layers = tuple(layers.items())
+        self.overlap = overlap
         self.lookup = self.layers[0][1].embed.lookup if self.layers else None
         if any(layer.embed.lookup is not self.lookup for _, layer in self.layers):
             raise ValueError("Engram layers must share one lookup transport")
@@ -294,6 +295,10 @@ class EngramRuntime:
                 for indices, local in requests
             ]
         )
+        if not self.overlap:
+            # These hooks add device-stream dependencies, without a host sync.
+            values = [hook() for hook in hooks]
+            hooks = [lambda value=value: value for value in values]
         return {
             layer: hook for (layer, _), hook in zip(self.layers, hooks, strict=True)
         }

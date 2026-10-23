@@ -710,6 +710,11 @@ class Transformer(nn.Module):
                     "DeepGEMM shifted HC requires hc_mult=4 and dim divisible by 1024"
                 )
             collective = MegaMoeCollective(self.parallel_groups.ep, max_tokens)
+            if self.engram_hash is not None:
+                # DeepGEMM requires every SM for its persistent grid barriers
+                # (get_num_sms_for_mega_moe). Complete NCCL table fetches before
+                # entering that grid so resident NCCL kernels cannot block it.
+                self.engram_runtime.overlap = False
         elif expert_backend != "flashinfer":
             raise ValueError(f"unknown expert backend: {expert_backend}")
 
