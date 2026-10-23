@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import socket
 import time
+import warnings
 from datetime import timedelta
 from pathlib import Path
 
@@ -23,7 +24,7 @@ REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 CHECKPOINT = Path("/models/deepseek/flash-1017") / REVISION
 WORLD_SIZE = 4
 MAX_SEQUENCES = 32  # Per attention-DP replica; 128 requests across the engine.
-CONTEXT_LENGTH = 32768
+CONTEXT_LENGTH = 1_048_576
 PREFILL_CHUNK_SIZE = 8192
 
 model_volume = modal.Volume.from_name("resin-deepseek-v4-models-v1", version=1)
@@ -51,6 +52,13 @@ app = modal.App(
 
 
 def _serve_rank(rank: int, port: int) -> None:
+    # Keep compatibility with older Torch releases without logging its renamed
+    # collective aliases on every serving-thread callback in Torch 2.13.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"`torch.distributed.(all_gather_into_tensor|reduce_scatter_tensor)` is deprecated.*",
+        category=FutureWarning,
+    )
     import torch
     import torch.distributed as dist
     from tokenizers import Tokenizer
@@ -121,10 +129,14 @@ def _serve_rank(rank: int, port: int) -> None:
             engine.step()
         warmup.take_result()
         torch.cuda.synchronize()
+        captures = {
+            mode: stats["capture_count"]
+            for mode, stats in runner.cuda_graph_stats.items()
+        }
         print(
             f"[deepseek-http rank={rank}] ready after "
             f"{time.perf_counter() - started:.1f}s; "
-            f"graphs={runner.cuda_graph_stats}",
+            f"captured graphs={captures}",
             flush=True,
         )
         if rank == 0:

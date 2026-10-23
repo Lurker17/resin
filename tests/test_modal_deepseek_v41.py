@@ -39,7 +39,7 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
 
     class Runner:
         eos_token_id = 1
-        cuda_graph_stats = {"prefill": {"captured": True}}
+        cuda_graph_stats = {"prefill": {"capture_count": 1}}
 
         def __init__(self, model, **options):
             assert options.pop("expert_backend") == "deepgemm"
@@ -51,7 +51,7 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
             assert options["device"] == f"cuda:{rank}"
             assert options["speculative_tokens"] == 3
             assert options["max_batch_size"] == 32
-            assert options["max_seq_len"] == 32768
+            assert options["max_seq_len"] == 1_048_576
             assert options["prefill_chunk_size"] == 8192
             calls.append("runner")
 
@@ -82,7 +82,7 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
             signature(Engine).bind(worker, **options)
             assert isinstance(worker, Worker)
             assert options["overlap"] and options["prefix_cache"]
-            assert options["context_length"] == 32768
+            assert options["context_length"] == 1_048_576
             assert options["max_running_requests"] == 32
             scheduler = options["scheduler_config"]
             assert scheduler.prefill_chunk_size == 8192

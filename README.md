@@ -213,7 +213,7 @@ uv run modal run deploy/modal_bench.py --download-only --model deepseek-v41
 uv run modal deploy deploy/modal_deepseek_v41.py
 ```
 
-DeepSeek uses the shared distributed HTTP coordinator, with a 32K context limit,
+DeepSeek uses the shared distributed HTTP coordinator, with a 1,048,576-token context limit,
 32 running requests per attention-DP replica, CUDA graphs, and three speculative
 draft tokens with natural acceptance. Requests are routed round-robin unless
 `routed_dp_rank` in the JSON body or `resin-routed-dp-rank` in the header selects
