@@ -250,7 +250,6 @@ are under `artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-overlap/`.
 See [the benchmark protocol](../../../../docs/benchmarks.md) for all six points,
 timing scope and the distinction between measured and projected acceptance.
 
-The runner accepts text token IDs and rejects image tokens. DSpark uses fixed-width
-greedy proposals up to the released five-token block; its confidence head is loaded
+DSpark uses fixed-width greedy proposals up to the released five-token block; its confidence head is loaded
 but does not choose proposal length. Adaptive draft length, host RDMA Engram,
 wider EP and broader quality workloads remain separate work.
