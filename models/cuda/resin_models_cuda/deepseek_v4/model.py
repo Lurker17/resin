@@ -1796,7 +1796,7 @@ class MoE(nn.Module):
             hidden.new_empty((0, self.gate.topk)),
         )
 
-    def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, input_ids: torch.Tensor | None) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
         main_stream = None
@@ -1809,7 +1809,9 @@ class MoE(nn.Module):
             with torch.cuda.stream(self.decode_overlap_stream):
                 shared = self.shared_experts(x)
 
-        weights, indices = self.gate(x, input_ids.flatten())
+        weights, indices = self.gate(
+            x, None if input_ids is None else input_ids.flatten()
+        )
         y = self.routed(x, indices, weights)
         if main_stream is None:
             shared = self.shared_experts(x)

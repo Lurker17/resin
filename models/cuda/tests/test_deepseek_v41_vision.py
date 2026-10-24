@@ -216,3 +216,95 @@ def test_prefill_injects_embeddings_and_masks_engram_but_decode_stays_text(
     model._run(ids[:, :1], positions[:, :1], 3, cache)
     assert masks[1] is None
     assert contributions[1] is None
+
+
+@pytest.mark.parametrize("lazy", [False, True])
+@pytest.mark.parametrize("phase", ["prefill", "decode", "verify", "draft"])
+def test_generated_image_ids_keep_text_expert_routing(
+    implementation, monkeypatch, lazy, phase
+):
+    """A sampled/draft image marker is text; only actual prompt spans use VL bias."""
+    gate = implementation.Gate(
+        implementation.ModelArgs(
+            dim=4,
+            n_routed_experts=4,
+            n_activated_experts=2,
+            vision_n_layers=1,
+        )
+    )
+    with torch.no_grad():
+        gate.weight.zero_()
+        gate.bias.copy_(torch.tensor([4.0, 3.0, 2.0, 1.0]))
+        gate.bias_vl.copy_(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    routes = []
+
+    class Routed(nn.Module):
+        def forward(self, hidden, indices, weights):
+            routes.append(indices)
+            return torch.zeros_like(hidden)
+
+    class Attention(nn.Module):
+        def forward(self, hidden, *args, **kwargs):
+            return hidden
+
+    block = implementation.Block.__new__(implementation.Block)
+    nn.Module.__init__(block)
+    block.args, block.layer_id, block.engram = SimpleNamespace(hc_mult=1), 0, None
+    block.attn_norm = block.ffn_norm = block.norm = nn.Identity()
+    block.attn = Attention()
+    block.lazy_hc, block.prefill_ffn = lazy, None
+    block.ffn = implementation.MoE(
+        SimpleNamespace(
+            dim=4,
+            gate=gate,
+            shared_experts=nn.Identity(),
+            decode_overlap_stream=None,
+        ),
+        Routed(),
+    )
+    block.ffn.forward_prepared = block.ffn.forward
+    block.mixes = lambda hidden, _: (
+        hidden.new_ones(*hidden.shape[:-1]),
+        hidden.new_ones(*hidden.shape[:-1]),
+        hidden.new_zeros(*hidden.shape[:-1], 1),
+    )
+    if lazy:
+
+        def transition(layer, hidden, state, name, **kwargs):
+            residual = implementation.materialize(hidden, state)
+            pre, post, comb = block.mixes(residual, name)
+            return residual.squeeze(2), implementation.HCLazyPost(
+                residual, pre, post, comb
+            )
+
+        monkeypatch.setattr(implementation, "mega_transition", transition)
+    block.markov_head = lambda ids: (torch.zeros(ids.numel(), 2), None)
+    model = implementation.Transformer.__new__(implementation.Transformer)
+    nn.Module.__init__(model)
+    model.args, model.vision, model.parallel_groups = gate, nn.Identity(), None
+    model.engram_hash, model.target_layer_ids, model.hc_mult = None, set(), 1
+    model.layers, model.mtp, model.norm = (
+        nn.ModuleList([block]),
+        nn.ModuleList([block]),
+        nn.Identity(),
+    )
+    model.dspark_block_size, model.dspark_noise_token_id = 3, 0
+    model.embed = lambda ids: torch.ones(*ids.shape, 4)
+    model.head = lambda hidden, **kwargs: hidden[..., :2]
+    model._draft_attention = lambda attention, hidden, metadata, cache: hidden
+    cache = SimpleNamespace(
+        prepare_metadata=lambda positions, **kwargs: SimpleNamespace(
+            positions=positions
+        )
+    )
+    ids = torch.tensor([[129264]])
+    if phase == "prefill":
+        model.forward_prefill(ids, 0, cache=cache)
+    elif phase == "decode":
+        model.forward_decode(ids, torch.tensor([0]), 4, cache=cache)
+    elif phase == "verify":
+        model.forward_verify(ids.repeat(1, 3), torch.tensor([0]), 4, cache=cache)
+    else:
+        model.draft(ids, torch.tensor([0]), cache=cache)
+    expected = [3, 2] if phase == "prefill" else [0, 1]
+    assert routes[0].tolist() == [expected] * routes[0].shape[0]

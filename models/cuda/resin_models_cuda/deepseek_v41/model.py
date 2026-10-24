@@ -588,7 +588,7 @@ class Block(nn.Module):
         residual = self.expand(output, residual, post, comb)
         ffn_pre, post, comb = self.mixes(residual, "ffn")
         hidden = self.ffn_norm(self.collapse(residual, attn_pre))
-        output = (self.prefill_ffn or self.ffn)(hidden, ids)
+        output = (self.prefill_ffn or self.ffn)(hidden, ids if prefill else None)
         return self.expand(output, residual, post, comb), ffn_pre
 
 
