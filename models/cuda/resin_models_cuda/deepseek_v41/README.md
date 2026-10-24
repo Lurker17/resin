@@ -1,4 +1,4 @@
-# DeepSeek V4.1 Flash text runner
+# DeepSeek V4.1 Flash runner
 
 `DeepSeekV41CudaRunner` loads indexed safetensors from
 `deepseek-ai/DeepSeek-V4.1-Flash-1017`, revision
@@ -16,6 +16,7 @@ DeepSelect `bfa4507d`, and TileKernels 1.0.0; full revisions live in
 | Component | Responsibility |
 | --- | --- |
 | `model.py` | Shifted HC, shared KV/index ownership, Engram, and DSpark architecture. |
+| `vision.py` | Checkpoint-shaped ViT and 3x3 patch-to-language projection. |
 | `linear.py`, `attention.py`, `compressor.py`, `experts.py` | Lower loaded checkpoint tensors into fused projections, packed scales and prepared operators. |
 | `indexer.py`, `upstream/` | Paged FP4 MQA, candidate selection and fused cache transforms. |
 | `batch.py` | Prepare shared store slots, attention indices, compression lengths and state-page mappings once per forward. |
@@ -23,6 +24,16 @@ DeepSelect `bfa4507d`, and TileKernels 1.0.0; full revisions live in
 | `cache.py` | Typed zero-copy views over Engine-owned byte slabs and live page tables. |
 | `cuda.py` | Adapt the shared V4 serving runtime and prepare graph regions. |
 | Shared Resin runtime | Scheduling, cache admission, graph lifecycle, sampling, scores and distributed steps. |
+
+`DeepSeekV41Codec` prepares image content through the shared HTTP media adapter.
+Its resize, padding, normalization and patch order follow the pinned checkpoint's
+image processor. The Rust recipe expands trusted image slots; `DeepSeekV41Media`
+owns the CPU patches and includes their identity in prefix-cache keys. The runner
+encodes each image once per live request and slices its embeddings across causal
+prefill chunks, including partial prefix-cache restores. Image rows use the
+checkpoint's vision routing bias and are masked from Engram; generated tokens
+keep the ordinary text path. Vision encoding runs outside the language-model
+graph regions, and decode retains full CUDA graphs and DSpark.
 
 Preparation fuses Q-A/KV and Q-B/index-Q. BF16 vocabulary/Markov GEMMs return FP32
 logits; FP8 projections use per-token block32 casts and packed UE8M0 TMA scales.

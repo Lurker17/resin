@@ -317,7 +317,9 @@ attention TP1. Engram tables are sharded over the GPU domain, and packed FP8/FP4
 KV shares Engine-owned slabs. Prepared DeepInfer operators and metadata pass
 full-checkpoint eager/graph checks on four B300s; traced eight-B300 throughput
 baselines are recorded in the family README. Earlier TP4 debug runs used replicated KV and do
-not qualify the supported attention-TP contract. Vision inputs are rejected.
+not qualify the supported attention-TP contract. Image inputs use the checkpoint's
+vision tower and aligner through the shared HTTP media interface, with causal
+chunked prefill and image-aware prefix-cache keys.
 See the family README for memory and optimization limits.
 
 Current limits include no prefill/decode disaggregation. A
