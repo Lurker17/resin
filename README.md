@@ -173,8 +173,8 @@ from resin import BatchPlan, ForwardOutput
 class Runner:
     def forward(self, plan: BatchPlan) -> ForwardOutput:
         return ForwardOutput(
-            np.zeros(plan.num_sequences, dtype=np.uint32),
-            np.arange(plan.num_sequences + 1, dtype=np.uint32),
+            token_ids=np.zeros(plan.num_sequences, dtype=np.uint32),
+            token_indptr=np.arange(plan.num_sequences + 1, dtype=np.uint32),
         )
 ```
 

@@ -46,8 +46,8 @@ class DryRunner:
             self.before_forward_ns = time.perf_counter_ns() - self.started
         width = self.accepted if plan.phase == BatchPhase.DECODE else 1
         return ForwardOutput(
-            np.full(plan.num_sequences * width, 3, dtype=np.uint32),
-            np.arange(plan.num_sequences + 1, dtype=np.uint32) * width,
+            token_ids=np.full(plan.num_sequences * width, 3, dtype=np.uint32),
+            token_indptr=np.arange(plan.num_sequences + 1, dtype=np.uint32) * width,
         )
 
 

@@ -224,8 +224,8 @@ class TestEngine:
         class NativeRunner:
             def forward(self, plan):
                 return ForwardOutput(
-                    np.asarray([plan.token_ids[-1] + 1], np.uint32),
-                    np.asarray([0, 1], np.uint32),
+                    token_ids=np.asarray([plan.token_ids[-1] + 1], np.uint32),
+                    token_indptr=np.asarray([0, 1], np.uint32),
                     logprobs=np.asarray([-0.25], np.float32) if scored else None,
                 )
 

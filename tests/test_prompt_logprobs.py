@@ -209,8 +209,8 @@ def test_invalid_prompt_columns_leave_scores_unpublished(bad_scores, monkeypatch
         runner,
         "forward",
         lambda plan: ForwardOutput(
-            np.array([3], np.uint32),
-            np.array([0, 1], np.uint32),
+            token_ids=np.array([3], np.uint32),
+            token_indptr=np.array([0, 1], np.uint32),
             prompt_logprobs=bad_scores,
             prompt_logprob_indptr=np.array([0, len(bad_scores)], np.uint32),
         ),

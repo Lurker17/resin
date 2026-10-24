@@ -234,7 +234,7 @@ def token_output(token_ids, *, counts=None):
     from resin import ForwardOutput
 
     ids, offsets = _token_columns(token_ids, counts)
-    return ForwardOutput(ids, offsets)
+    return ForwardOutput(token_ids=ids, token_indptr=offsets)
 
 
 def format_output(logits, token_ids, plan, *, prompt_logprobs=None):
@@ -265,7 +265,7 @@ def format_output(logits, token_ids, plan, *, prompt_logprobs=None):
                 ),
             }
     if not plan.needs_logprobs:
-        return ForwardOutput(ids, offsets, **prompt_columns)
+        return ForwardOutput(token_ids=ids, token_indptr=offsets, **prompt_columns)
     if logits.ndim == 2:
         logits = logits[:, None, :]
     if logits.ndim != 3 or len(lengths) != logits.shape[0]:
@@ -305,8 +305,8 @@ def format_output(logits, token_ids, plan, *, prompt_logprobs=None):
     scores = _score_distribution(values, selected, counts)
     columns = {} if scores.top is None else scores.top.output("top")
     return ForwardOutput(
-        ids,
-        offsets,
+        token_ids=ids,
+        token_indptr=offsets,
         logprobs=scores.logprobs.detach().cpu().numpy(),
         logprob_indptr=score_offsets,
         **columns,

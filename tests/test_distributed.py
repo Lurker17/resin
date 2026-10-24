@@ -167,8 +167,8 @@ class CollectiveRunner:
         # Exercise the same array handoff while coordinator metadata remains separate.
         scores = np.full(len(output), -0.25, np.float32)
         return ForwardOutput(
-            output,
-            np.arange(len(output) + 1, dtype=np.uint32),
+            token_ids=output,
+            token_indptr=np.arange(len(output) + 1, dtype=np.uint32),
             logprobs=scores,
             top_indptr=np.arange(0, 2 * len(output) + 1, 2, dtype=np.uint32),
             top_token_ids=np.repeat(output, 2),

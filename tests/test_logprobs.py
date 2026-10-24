@@ -20,6 +20,15 @@ from resin.backend.plan_transport import PlanTransport
 from resin.backend.sampling import TorchSampler, format_output, token_output
 
 
+def test_forward_output_requires_keyword_arguments():
+    ids = np.array([3], np.uint32)
+    offsets = np.array([0, 1], np.uint32)
+    output = ForwardOutput(token_ids=ids, token_indptr=offsets)
+    assert output.token_ids is ids and output.token_indptr is offsets
+    with pytest.raises(TypeError, match="positional"):
+        ForwardOutput(ids, offsets)  # ty: ignore[too-many-positional-arguments, missing-argument]
+
+
 def test_token_only_output_owns_tensor_storage_without_python_scalars(monkeypatch):
     tokens = torch.tensor([[3, 4], [5, 6]])
     plan = BatchPlan([1, 2], [0, 0], [0, 0], [0, 1, 2])
@@ -115,8 +124,8 @@ class OutputRunner:
 
 def scored_output(rows, scores, **kwargs):
     return ForwardOutput(
-        np.asarray([token for row in rows for token in row], np.uint32),
-        np.asarray([0, *np.cumsum(list(map(len, rows)))], np.uint32),
+        token_ids=np.asarray([token for row in rows for token in row], np.uint32),
+        token_indptr=np.asarray([0, *np.cumsum(list(map(len, rows)))], np.uint32),
         logprobs=np.asarray([value for row in scores for value in row], np.float32),
         logprob_indptr=np.asarray([0, *np.cumsum(list(map(len, scores)))], np.uint32),
         **kwargs,
@@ -270,7 +279,10 @@ def test_invalid_scores_after_stop_still_quarantine_the_whole_batch(scores):
 
 @pytest.mark.parametrize("offsets", [[1, 3], [0, 4], [0, 2], [0, 3, 2]])
 def test_invalid_output_offsets_fail_before_commit(offsets):
-    output = ForwardOutput(np.array([3, 4, 5], np.uint32), np.array(offsets, np.uint32))
+    output = ForwardOutput(
+        token_ids=np.array([3, 4, 5], np.uint32),
+        token_indptr=np.array(offsets, np.uint32),
+    )
     engine = Engine(OutputRunner(forward=lambda plan: output))
     request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1))
     with pytest.raises(RuntimeError):
@@ -281,7 +293,9 @@ def test_invalid_output_offsets_fail_before_commit(offsets):
 def test_array_handoff_retains_storage_and_events_own_their_scores():
     values = np.array([-0.125], np.float32)
     ids = np.array([3], np.uint32)
-    output = ForwardOutput(ids, np.array([0, 1], np.uint32), logprobs=values)
+    output = ForwardOutput(
+        token_ids=ids, token_indptr=np.array([0, 1], np.uint32), logprobs=values
+    )
     assert output.token_ids is ids and output.logprobs is values
     assert np.shares_memory(output.logprobs, values)
     sources = []
@@ -291,7 +305,9 @@ def test_array_handoff_retains_storage_and_events_own_their_scores():
         local_offsets = np.array([0, 1], np.uint32)
         local_scores = np.array([-0.5], np.float32)
         sources.extend(map(weakref.ref, (local_ids, local_offsets, local_scores)))
-        return ForwardOutput(local_ids, local_offsets, logprobs=local_scores)
+        return ForwardOutput(
+            token_ids=local_ids, token_indptr=local_offsets, logprobs=local_scores
+        )
 
     def release(sequence_ids):
         # Storage stays alive until the complete transaction has released the row.
@@ -319,10 +335,13 @@ def test_array_handoff_retains_storage_and_events_own_their_scores():
 def test_exact_array_dtypes_and_contiguity_are_required_without_coercion():
     with pytest.raises(TypeError):
         # Wrong array dtype must fail without coercion.
-        ForwardOutput(np.array([3], np.int64), np.array([0, 1], np.uint32))  # ty: ignore[invalid-argument-type]
+        ForwardOutput(
+            token_ids=np.array([3], np.int64),  # ty: ignore[invalid-argument-type]
+            token_indptr=np.array([0, 1], np.uint32),
+        )
     output = ForwardOutput(
-        np.array([3], np.uint32),
-        np.array([0, 1], np.uint32),
+        token_ids=np.array([3], np.uint32),
+        token_indptr=np.array([0, 1], np.uint32),
         logprobs=np.zeros(4, np.float32)[::2],
     )
     engine = Engine(OutputRunner(forward=lambda plan: output))

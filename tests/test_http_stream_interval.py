@@ -82,8 +82,8 @@ class Runner:
             )
         offsets = np.asarray([0, *np.cumsum([len(row) for row in rows])], np.uint32)
         return ForwardOutput(
-            np.asarray([token for row in rows for token in row], np.uint32),
-            offsets,
+            token_ids=np.asarray([token for row in rows for token in row], np.uint32),
+            token_indptr=offsets,
             logprobs=np.asarray(values, np.float32) if values else None,
         )
 

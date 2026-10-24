@@ -445,8 +445,8 @@ def test_speculative_checks_reject_incomplete_execution(
 
 def test_speculative_output_lengths_read_native_csr_blocks():
     output = ForwardOutput(
-        np.array([1, 2, 3, 4], np.uint32),
-        np.array([0, 3, 4], np.uint32),
+        token_ids=np.array([1, 2, 3, 4], np.uint32),
+        token_indptr=np.array([0, 3, 4], np.uint32),
     )
     assert validation._output_lengths(output) == [3, 1]
     assert validation._output_lengths(forward_output([1, 2])) == [1, 1]

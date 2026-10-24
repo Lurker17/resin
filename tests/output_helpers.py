@@ -26,6 +26,8 @@ def forward_output(
     ):
         raise ValueError("test output token IDs must be uint32 integers")
     return ForwardOutput(
-        np.asarray(tokens, dtype=np.uint32),
-        np.concatenate((np.zeros(1, dtype=np.uint32), lengths.cumsum(dtype=np.uint32))),
+        token_ids=np.asarray(tokens, dtype=np.uint32),
+        token_indptr=np.concatenate(
+            (np.zeros(1, dtype=np.uint32), lengths.cumsum(dtype=np.uint32))
+        ),
     )

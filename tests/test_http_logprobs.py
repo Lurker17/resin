@@ -75,8 +75,8 @@ def test_byte_fallback_scores_preserve_raw_bytes_and_literal_metaspace(metaspace
             row = [0] if self.offset == 0 else [1, 2, 3, 4]
             self.offset += len(row)
             return ForwardOutput(
-                np.asarray(row, np.uint32),
-                np.asarray([0, len(row)], np.uint32),
+                token_ids=np.asarray(row, np.uint32),
+                token_indptr=np.asarray([0, len(row)], np.uint32),
                 logprobs=np.asarray([-np.inf] * len(row), np.float32),
             )
 
@@ -261,8 +261,8 @@ def scored_exchange(
             )
             self.offset = end
             return ForwardOutput(
-                np.asarray(row, np.uint32),
-                np.asarray([0, len(row)], np.uint32),
+                token_ids=np.asarray(row, np.uint32),
+                token_indptr=np.asarray([0, len(row)], np.uint32),
                 logprobs=scores,
                 logprob_indptr=np.asarray([0, len(row)], np.uint32),
                 top_indptr=np.arange(0, len(row) * 2 + 1, 2, dtype=np.uint32),
@@ -520,8 +520,8 @@ def test_prompt_scores_allow_zero_output_tokens(api, stream):
             assert not any(plan.sampling_mask)
             return ForwardOutput(
                 # Non-sampling rows retain the runner's ordinary dummy token.
-                np.asarray([0], np.uint32),
-                np.asarray([0, 1], np.uint32),
+                token_ids=np.asarray([0], np.uint32),
+                token_indptr=np.asarray([0, 1], np.uint32),
                 prompt_logprobs=np.asarray(
                     [-index / 100 for index in range(1, len(prompt_ids))], np.float32
                 ),
@@ -630,8 +630,8 @@ def custom_scored_codec(*, with_spans, calls, invalid=None):
         def forward(self, plan):
             token = ids[0] if plan.positions[0] == 0 else ids[1]
             return ForwardOutput(
-                np.asarray([token], np.uint32),
-                np.asarray([0, 1], np.uint32),
+                token_ids=np.asarray([token], np.uint32),
+                token_indptr=np.asarray([0, 1], np.uint32),
                 logprobs=(
                     np.asarray([-1], np.float32)
                     if plan.sampling_params[0].logprobs

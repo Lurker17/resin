@@ -587,9 +587,9 @@ class ForwardOutput:
     def __new__(
         cls,
         /,
+        *,
         token_ids: npt.NDArray[np.uint32],
         token_indptr: npt.NDArray[np.uint32],
-        *,
         logprobs: npt.NDArray[np.float32] | None = None,
         logprob_indptr: npt.NDArray[np.uint32] | None = None,
         top_indptr: npt.NDArray[np.uint32] | None = None,
