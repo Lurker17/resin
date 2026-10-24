@@ -1,29 +1,20 @@
 # Resin
 
-_Inspired by SGLang, TokenSpeed, and DeepInfer._
+Resin is an inference engine _shell_. It provides modular, low-level building
+blocks for making your own LLM inference engine.
 
-> [!WARNING]
-> Almost the entire repository is vibe coded right now. Big chunks of code
-> (~10K lines or more) will be added and removed in the coming days, mostly
-> removed, as I iterate to make it ready for human programmers.
-
-Resin is an inference engine _engine_. It provides modular, low-level
-building blocks for making your own LLM inference engine. At its core is the
-`Engine` class: a native request lifecycle, scheduler, and KV cache allocator,
-which hands off to a `Runner` – you write the forward pass yourself in Python.
-The same lifecycle is available directly to Rust applications through the
-PyO3-free `resin-core::engine::EngineCore`.
+At its core is the `Engine` class: a Rust scheduler and KV cache allocator,
+which hands off to a `Runner` – **you write the model's forward pass, on any
+hardware, with any kernels.**
 
 ```text
-token IDs -> Rust Engine -> frozen BatchPlan -> Python Runner -> token IDs
-                 ^                                  |
-                 +------- ownership and commit -----+
+token IDs ──► Rust Engine ──► frozen BatchPlan ──► Python Runner ───► token IDs
+                  ▲                                    │
+                  └──────── ownership & commit ────────┘
 ```
 
-The Engine boundary is token-ID in/token-ID out. Shared Resin also includes
-native conversation recipes, incremental response parsing, media preprocessing,
-and HTTP serving above that boundary. You can use these components together or
-write your own request admission and frontend.
+Resin also has built-in HTTP serving and metrics above that boundary, using a
+per-model _recipe_ for chat formatting, response parsing and media handling.
 
 Model authoring is supported through the library/model-package split and the
 runner contract. Model packages supply their weights, kernels, and forward pass
@@ -64,26 +55,9 @@ fails.
 The control-plane tests do not require a GPU. Importing a concrete model module
 loads PyTorch; importing `resin` or a model package namespace does not.
 
-`sync_type_libraries.py` gives ty and its editor extension the Python interfaces of
-the CUDA package's Linux-only dependencies. It follows their locked dependency
-graph, reuses ordinary installed dependencies, and extracts Python source and
-`.pyi` files into ignored `.type-libs/sources/`. Namespace packages are merged,
-CUTLASS and bundled TVM import roots are exposed without executing their setup
-code, and the small corrections in `type_stubs/` are applied last.
-The script verifies the lockfile checksum, installs no packages, and never
-imports the extracted code. Rerun it after dependency or stub changes; cached
-wheels allow repeat runs offline. To refresh only these sources, run
-`uv run scripts/sync_type_libraries.py`.
-Only ty uses these sources; Python's runtime import path is unchanged. Type
-detail depends on upstream annotations: compiled exports may lack `.pyi` files,
-and some decorators erase signatures. Corrections belong in `type_stubs/`.
-
 Install `resin-models-cuda`; it pulls in `resin[cuda]` for the shared
-accelerator runtime. The uv lock intentionally
-overrides FlashAttention-4's stale CUTLASS
-DSL metadata pin so FA4 and Quack use one tested toolchain.
-Reusable device-neutral helpers live in `resin.backend`; CUDA helpers
-are explicit imports from `resin.backend.cuda`.
+accelerator runtime. Reusable device-neutral helpers live in `resin.backend`; CUDA
+helpers are explicit imports from `resin.backend.cuda`.
 
 ## Developing
 
@@ -459,3 +433,7 @@ traces are available. Server metrics export and OTLP integration are planned.
 
 Resin is alpha software. Its surface is intentionally small enough to review
 end to end, but the managed plan ABI is still evolving.
+
+## Acknowledgements
+
+Resin was based on and inspired by systems from SGLang, TokenSpeed, and DeepInfer.
