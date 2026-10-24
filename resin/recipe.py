@@ -47,28 +47,6 @@ MediaBlock = Image | Video | Audio
 ContentBlock = Text | Thinking | MediaBlock | ToolCall | ToolResult
 
 
-class MediaProcessor(Protocol):
-    """Optional preprocessing boundary for custom Python recipe implementations.
-
-    Processing owns pixel/audio geometry; binding adds final prompt positions.
-    Request state belongs to ProcessedMedia, so processors can be reused.
-    Stock recipes perform these phases internally in Rust.
-    """
-
-    def process(self, media: Sequence[MediaBlock]) -> ProcessedMedia:
-        """Return one token expansion per media block, in the same order."""
-        ...
-
-    def bind(
-        self,
-        processed: ProcessedMedia,
-        token_ids: Sequence[int],
-        spans: Sequence[MediaTokenSpan],
-    ) -> MediaInput:
-        """Bind the payload to final token ranges, ordered like the input blocks."""
-        ...
-
-
 class Recipe(Protocol):
     """Render requests for a model and construct an incremental response parser.
 
@@ -107,7 +85,6 @@ __all__ = [
     "Lfm2Recipe",
     "MediaBlock",
     "MediaInput",
-    "MediaProcessor",
     "MediaTokens",
     "MediaTokenSpan",
     "Message",
