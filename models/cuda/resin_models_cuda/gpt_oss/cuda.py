@@ -745,7 +745,7 @@ class GptOssCudaRunner(CudaRunner):
             return hidden
         logits = _router_logits(mlp.router, flat)
         indices, weights = _route(mlp.router, logits)
-        return mlp.experts(flat, indices, weights, logits).reshape(shape)
+        return mlp.experts(flat, indices, weights).reshape(shape)
 
     def _forward_batch(
         self,

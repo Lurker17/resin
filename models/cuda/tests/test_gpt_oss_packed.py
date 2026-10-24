@@ -5,7 +5,7 @@ from typing import cast
 
 import torch
 
-from resin.moe_kernels import MoEKernelConfig
+from resin_models_cuda.gpt_oss.flashinfer import MXFP4Config
 
 
 class TestGptOssPackedBridge:
@@ -15,30 +15,26 @@ class TestGptOssPackedBridge:
             kernel_expert_factory,
         )
 
-        config = MoEKernelConfig(
-            architecture="sm90",
-            quantization="mxfp4",
-            activation="swiglu",
+        config = MXFP4Config(
             top_k=2,
             num_experts=4,
             hidden_size=32,
             intermediate_size=32,
-            group_size=32,
-            expert_bias=True,
-            activation_alpha=1.702,
-            activation_limit=7.0,
+            swiglu_limit=7.0,
         )
 
         class Kernel:
             def __init__(self) -> None:
                 self.prepared = []
+                self.calls = []
 
             def prepare_weights(self, weights, actual_config):
                 self.prepared.append((weights, actual_config))
                 return weights
 
-            def forward(self, hidden, routing, weights, actual_config):
-                del routing, weights, actual_config
+            def forward(self, hidden, indices, route_weights, weights):
+                assert weights is self.prepared[0][0]
+                self.calls.append((indices, route_weights))
                 return hidden
 
         class Args:
@@ -87,3 +83,12 @@ class TestGptOssPackedBridge:
         assert weights.gate_up.shape == (4, 64, 16)
         assert weights.down.shape == (4, 32, 16)
         assert model.model.layers[0].mlp.experts.is_prepared
+
+        hidden = torch.ones(3, 32, dtype=torch.bfloat16)
+        indices = torch.tensor([[0, 1], [2, 3], [1, 2]])
+        route_weights = torch.full((3, 2), 0.5)
+        output = model.model.layers[0].mlp.experts(hidden, indices, route_weights)
+        assert output is hidden
+        assert len(kernel.calls) == 1
+        assert kernel.calls[0][0] is indices
+        assert kernel.calls[0][1] is route_weights

@@ -46,9 +46,8 @@ DSpark uses the same meshes for draft and target verification, including
 empty-replica participation and captured expert exchanges.
 The GPT-OSS and DeepSeek explicit-group paths provide
 captured prefill FFN and attention-projection regions, plus full decode graphs.
-GPT-OSS EP additionally
-requires a kernel advertising FP32 local expert partials so the cross-rank
-combine does not add an intermediate activation rounding step.
+GPT-OSS's FlashInfer implementation returns FP32 local expert partials so the
+cross-rank combine does not add an intermediate activation rounding step.
 `DistributedWorker` validates a declared capability set collectively before
 serving begins. Custom distributed runners may supply the same declaration.
 

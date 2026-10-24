@@ -5,8 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from resin.moe_kernels import MoEExpertWeights, MoEKernelConfig, MoERouting
-from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
+from resin_models_cuda.gpt_oss.flashinfer import (
+    FlashInferSM90MXFP4Kernel,
+    MXFP4Config,
+    MXFP4Weights,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
@@ -17,19 +20,12 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("num_tokens", [3, 2051])
 def test_partial_cuda_graph_replays_active_and_idle_routes(num_tokens):
     device = torch.device("cuda")
-    config = MoEKernelConfig(
-        architecture="sm90",
-        quantization="mxfp4",
-        activation="swiglu",
+    config = MXFP4Config(
         top_k=4,
         num_experts=4,
         hidden_size=128,
         intermediate_size=128,
-        group_size=32,
-        expert_bias=True,
-        activation_alpha=1.702,
-        activation_beta=1.0,
-        activation_limit=7.0,
+        swiglu_limit=7.0,
     )
     generator = torch.Generator(device=device).manual_seed(1729)
 
@@ -46,7 +42,7 @@ def test_partial_cuda_graph_replays_active_and_idle_routes(num_tokens):
 
     kernel = FlashInferSM90MXFP4Kernel()
     prepared = kernel.prepare_weights(
-        MoEExpertWeights(
+        MXFP4Weights(
             gate_up=packed((4, 256, 64)),
             down=packed((4, 128, 64)),
             gate_up_scales=torch.full(
@@ -65,13 +61,10 @@ def test_partial_cuda_graph_replays_active_and_idle_routes(num_tokens):
     probabilities = torch.randn(
         num_tokens, 4, device=device, generator=generator
     ).softmax(-1)
-    routing = MoERouting(
-        torch.zeros(num_tokens, 4, device=device), indices, probabilities
-    )
     output = torch.empty_like(hidden, dtype=torch.float32)
 
     def launch():
-        output.copy_(kernel.forward_partial(hidden, routing, prepared, config))
+        output.copy_(kernel.forward_partial(hidden, indices, probabilities, prepared))
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -94,7 +87,7 @@ def test_partial_cuda_graph_replays_active_and_idle_routes(num_tokens):
         else:
             indices.copy_(original_indices.roll(1, 1) if phase else original_indices)
             probabilities.copy_(original_probabilities)
-        reference = kernel.forward_partial(hidden, routing, prepared, config)
+        reference = kernel.forward_partial(hidden, indices, probabilities, prepared)
         graph.replay()
         torch.cuda.synchronize()
         assert output.dtype == torch.float32

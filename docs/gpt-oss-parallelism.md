@@ -51,8 +51,10 @@ The router retains every global expert. Checkpoint preparation independently
 slices attention heads, the expert ownership axis, and expert intermediate
 channels. All six MXFP4 weight/scale/bias tensors receive their appropriate
 slices before kernel packing. Gate/up biases follow intermediate channels;
-down-projection bias belongs only to expert-TP lane zero. The kernel config
-describes the local expert count and intermediate width.
+down-projection bias belongs only to expert-TP lane zero. GPT-OSS's local
+`MXFP4Config` describes the expert count, hidden and intermediate widths, top-k,
+and SwiGLU limit. `MXFP4Weights` carries the six checkpoint tensors into
+FlashInfer preparation; the prepared weights retain their configuration.
 
 `ExpertParallelDispatch` is shared with DeepSeek-V4. With explicit groups it
 preserves each attention rank as an independent origin, sends selected rows to
@@ -62,12 +64,12 @@ across attention TP. Sampling broadcasts across `groups.device_replica` so all
 ranks executing the same logical requests agree on selected tokens.
 
 The GPT callback maps global IDs to local IDs and marks foreign routes inactive
-without renormalizing weights. EP kernels advertise `supports_fp32_partial` and
-implement `forward_partial`. The Hopper adapter retains its BF16 GEMMs but
-expands fixed assignment slots, applies output bias and routing probabilities
-in FP32, and preserves FP32 owner sums through communication. Only the combined
-origin result is cast to the activation dtype. Packing and kernel selection
-remain inside the prepared kernel adapter.
+without renormalizing weights. Its concrete FlashInfer `forward_partial` takes
+hidden rows, expert IDs, routing probabilities, and prepared weights. It retains
+BF16 GEMMs, expands fixed assignment slots, applies output bias and routing
+probabilities in FP32, and preserves FP32 owner sums through communication. Only
+the combined origin result is cast to the activation dtype. Packing and kernel
+invocation live in the GPT-OSS implementation.
 
 ## Context parallelism
 

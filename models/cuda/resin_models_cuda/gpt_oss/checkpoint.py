@@ -18,13 +18,12 @@ from resin.backend.loading import (
 )
 from resin.backend.quantization import MXFP4, QuantizationConfig
 from resin.models.gpt_oss.config import GptOssConfig
+from resin_models_cuda.gpt_oss.flashinfer import MXFP4Config
 from resin_models_cuda.gpt_oss.model import MoEForCausalLM
 from resin_models_cuda.gpt_oss.mxfp4 import (
     EXPERT_CHECKPOINT_NAMES,
-    cuda_architecture,
     install_expert_layer,
     kernel_expert_factory,
-    moe_kernel_config,
     shard_checkpoint_tensor,
     shard_model_config,
 )
@@ -164,8 +163,9 @@ def load_model(
         if expert_parallel is not None
         else local_args
     )
-    kernel_config = moe_kernel_config(expert_args, cuda_architecture(target))
+    kernel_config = MXFP4Config.from_model(expert_args)
     assert kernel_moe is not None
+    kernel_moe.validate_device(target)
     kernel_moe.validate(kernel_config)
     with torch.device("meta"):
         model = MoEForCausalLM(

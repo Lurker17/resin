@@ -9,11 +9,7 @@ import torch
 
 from resin.backend.cuda.parallel import TensorParallelLayout, TensorShard
 from resin.backend.expert_parallel import ExpertParallelDispatch
-from resin.moe_kernels import (
-    MoEExpertWeights,
-    MoEKernelConfig,
-    MoERouting,
-)
+from resin_models_cuda.gpt_oss.flashinfer import MXFP4Config, MXFP4Weights
 
 if TYPE_CHECKING:
     from resin.backend.topology import ParallelGroups
@@ -141,49 +137,14 @@ def shard_checkpoint_tensor(
     return tensor
 
 
-def cuda_architecture(device) -> str:
-    if device.type != "cuda":
-        raise ValueError("packed GPT-OSS MXFP4 execution requires a CUDA device")
-    major, minor = torch.cuda.get_device_capability(device)
-    return f"sm{major}{minor}"
-
-
-def moe_kernel_config(args, architecture: str) -> MoEKernelConfig:
-    return MoEKernelConfig(
-        architecture=architecture,
-        quantization="mxfp4",
-        activation="swiglu",
-        top_k=args.num_experts_per_tok,
-        num_experts=args.num_local_experts,
-        hidden_size=args.hidden_size,
-        intermediate_size=args.intermediate_size,
-        group_size=32,
-        expert_bias=True,
-        activation_alpha=1.702,
-        activation_beta=1.0,
-        activation_limit=args.swiglu_limit,
-        gate_up_layout="interleaved_gate_up",
-    )
-
-
 def kernel_expert_factory(
     kernel,
-    config: MoEKernelConfig,
+    config: MXFP4Config,
     *,
     parallel_groups: ParallelGroups | None = None,
 ):
-    if parallel_groups is not None and (
-        not getattr(
-            getattr(kernel, "capabilities", None), "supports_fp32_partial", False
-        )
-        or not callable(getattr(kernel, "forward_partial", None))
-    ):
-        raise ValueError(
-            "expert parallelism requires kernel FP32 forward_partial support"
-        )
-
     class KernelExperts(torch.nn.Module):
-        storage_format = config.quantization
+        storage_format = "mxfp4"
 
         def __init__(self, args) -> None:
             super().__init__()
@@ -238,7 +199,7 @@ def kernel_expert_factory(
         def is_prepared(self) -> bool:
             return self._prepared_weights is not None
 
-        def forward(self, hidden, indices, weights, logits):
+        def forward(self, hidden, indices, weights):
             if self._prepared_weights is None:
                 raise RuntimeError("packed expert weights have not been loaded")
             if self._dispatch is not None:
@@ -247,12 +208,7 @@ def kernel_expert_factory(
                 return self._dispatch(
                     hidden, indices.to(torch.int32), weights.to(torch.float32)
                 )
-            routing = MoERouting(
-                router_logits=logits,
-                selected_experts=indices,
-                expert_weights=weights,
-            )
-            return kernel.forward(hidden, routing, self._prepared_weights, config)
+            return kernel.forward(hidden, indices, weights, self._prepared_weights)
 
         def forward_local(self, hidden, indices, weights):
             """Execute owned experts with their original global routing weights."""
@@ -263,16 +219,13 @@ def kernel_expert_factory(
                 return torch.zeros_like(hidden, dtype=torch.float32)
             local = indices - self._expert_start
             owned = (local >= 0) & (local < config.num_experts)
-            routing = MoERouting(
-                # The kernel consumes precomputed routes, not these logits.
-                router_logits=hidden.new_zeros((hidden.shape[0], config.num_experts)),
-                # MoERouting's inactive sentinel preserves the owned routes
-                # without substituting another expert for foreign assignments.
-                selected_experts=torch.where(owned, local, config.num_experts),
-                expert_weights=weights.masked_fill(~owned, 0),
-            )
+            # Local num_experts is the inactive sentinel: substituting expert
+            # zero could hide a real route because CUTLASS takes the first match.
             return kernel.forward_partial(
-                hidden, routing, self._prepared_weights, config
+                hidden,
+                torch.where(owned, local, config.num_experts),
+                weights.masked_fill(~owned, 0),
+                self._prepared_weights,
             )
 
         def forward_empty(self) -> None:
@@ -297,7 +250,7 @@ def kernel_expert_factory(
 def install_expert_layer(
     model,
     kernel,
-    config: MoEKernelConfig,
+    config: MXFP4Config,
     layer_index: int,
     checkpoint_tensors: dict[str, Any],
 ) -> None:
@@ -313,7 +266,7 @@ def install_expert_layer(
             tensor = tensor.reshape(tensor.shape[0], tensor.shape[1], -1)
         raw_tensors[standard_name] = tensor
 
-    raw = MoEExpertWeights(
+    raw = MXFP4Weights(
         gate_up=raw_tensors["gate_up"],
         down=raw_tensors["down"],
         gate_up_scales=raw_tensors["gate_up_scales"],
@@ -331,10 +284,8 @@ def install_expert_layer(
 
 __all__ = [
     "EXPERT_CHECKPOINT_NAMES",
-    "cuda_architecture",
     "install_expert_layer",
     "kernel_expert_factory",
-    "moe_kernel_config",
     "shard_checkpoint_tensor",
     "shard_model_config",
 ]
