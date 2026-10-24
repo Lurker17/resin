@@ -264,9 +264,12 @@ def _new_runner(
     )
 
 
-def _sampling(*, max_new_tokens):
+def _sampling(*, max_output_tokens):
     return SamplingParams(
-        max_new_tokens=max_new_tokens, temperature=0.0, logprobs=True, top_logprobs=3
+        max_output_tokens=max_output_tokens,
+        temperature=0.0,
+        logprobs=True,
+        top_logprobs=3,
     )
 
 
@@ -317,7 +320,7 @@ def _teacher_logits(engine, runner, prompts):
             latest.clear()
             request = engine.submit(
                 [*prompts["probe"], *suffix],
-                sampling_params=_sampling(max_new_tokens=1),
+                sampling_params=_sampling(max_output_tokens=1),
             )
             _drain(engine, [])
             request.take_result()
@@ -347,7 +350,7 @@ def _driver_workload(
 
         def submit(name, prompt, limit):
             request = engine.submit(
-                prompt, sampling_params=_sampling(max_new_tokens=limit)
+                prompt, sampling_params=_sampling(max_output_tokens=limit)
             )
             requests[name] = (request, limit)
             return request
@@ -368,7 +371,7 @@ def _driver_workload(
         if dp == 0:
             submit("short", prompts["short"], 3)
             queued = engine.submit(
-                prompts["late"], sampling_params=_sampling(max_new_tokens=4)
+                prompts["late"], sampling_params=_sampling(max_output_tokens=4)
             )
             cancel("queued", queued)
         if dp == 1 or groups.topology.attn_dp == 1:
@@ -396,7 +399,7 @@ def _driver_workload(
         for _ in range(2):
             probe = engine.submit(
                 prompts["probe"],
-                sampling_params=_sampling(max_new_tokens=probe_tokens),
+                sampling_params=_sampling(max_output_tokens=probe_tokens),
             )
             probe_events = []
             _drain(engine, probe_events)
@@ -413,7 +416,9 @@ def _driver_workload(
                     request = engine.submit(
                         prompts["probe"],
                         sampling_params=SamplingParams(
-                            max_new_tokens=len(decode_reference["advanced_token_ids"]),
+                            max_output_tokens=len(
+                                decode_reference["advanced_token_ids"]
+                            ),
                             temperature=0.0,
                         ),
                     )
@@ -579,7 +584,8 @@ def _run_tp_baseline_rank(
     try:
         with _DecodeTrace(runner) if numerical else nullcontext() as trace:
             request = engine.submit(
-                prompts["probe"], sampling_params=_sampling(max_new_tokens=probe_tokens)
+                prompts["probe"],
+                sampling_params=_sampling(max_output_tokens=probe_tokens),
             )
             _drain(engine, events)
         result = {
@@ -590,7 +596,8 @@ def _run_tp_baseline_rank(
         if speculative_tokens:
             free_after_reference = engine.cache_free_parent_count
             replay = engine.submit(
-                prompts["probe"], sampling_params=_sampling(max_new_tokens=probe_tokens)
+                prompts["probe"],
+                sampling_params=_sampling(max_output_tokens=probe_tokens),
             )
             _drain(engine, replay_events)
             replay_ids = replay.take_result()

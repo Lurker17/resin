@@ -123,7 +123,7 @@ class TestLfm2Torch:
         request = engine.submit(
             tokens,
             sampling_params=SamplingParams(
-                max_new_tokens=2, temperature=0, top_logprobs=3
+                max_output_tokens=2, temperature=0, top_logprobs=3
             ),
         )
         for _ in range(2):
@@ -173,7 +173,7 @@ class TestLfm2Torch:
         )
         request = engine.submit(
             tokens,
-            sampling_params=SamplingParams(max_new_tokens=0, prompt_top_logprobs=3),
+            sampling_params=SamplingParams(max_output_tokens=0, prompt_top_logprobs=3),
             prompt_target_logprobs=[[], [7, 2, 7], [], [63], [4, 4]],
         )
         while engine.has_work():

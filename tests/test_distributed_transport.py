@@ -141,7 +141,7 @@ def _transport_process(rank, rendezvous, directory):
                 engine = DistributedEngine(worker)
                 media = _media()
                 sampling = SamplingParams(
-                    max_new_tokens=3,
+                    max_output_tokens=3,
                     temperature=0.75,
                     top_p=0.875,
                     top_k=13,

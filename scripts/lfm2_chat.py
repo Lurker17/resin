@@ -33,7 +33,7 @@ def main() -> None:
         request = engine.submit(
             prompt.token_ids,
             sampling_params=SamplingParams(
-                max_new_tokens=256, stop_token_ids=prompt.stop_token_ids
+                max_output_tokens=256, stop_token_ids=prompt.stop_token_ids
             ),
         )
         while engine.has_work():

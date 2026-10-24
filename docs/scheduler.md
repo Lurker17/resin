@@ -22,7 +22,7 @@ request = engine.submit(
     priority=5,
     batch_key=7,
     sampling_params=SamplingParams(
-        max_new_tokens=64,  # optional hard stop, not a KV reservation
+        max_output_tokens=64,  # optional hard stop, not a KV reservation
         stop_token_ids=prompt.stop_token_ids,
         temperature=1.0,
         top_p=0.95,
@@ -34,7 +34,7 @@ request = engine.submit(
 
 `context_length` is an Engine-level model limit, not a batching preference. It
 defaults to 32768 and rejects requests whose requested sequence would exceed
-that bound. If `SamplingParams.max_new_tokens` is `None` (the default), generation
+that bound. If `SamplingParams.max_output_tokens` is `None` (the default), generation
 may use the remaining model context. The value is always a terminal generation
 cap; Resin never reserves that entire lifetime at submission.
 
@@ -174,7 +174,7 @@ On successful completion Resin:
 6. returns survivors to the sticky admitted set;
 7. emits events for sampled rows.
 
-Stop token IDs and `SamplingParams.max_new_tokens` are terminal conditions.
+Stop token IDs and `SamplingParams.max_output_tokens` are terminal conditions.
 Cancellation completes a ready request without running another model step.
 
 ## Failure semantics

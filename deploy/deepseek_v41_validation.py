@@ -228,7 +228,10 @@ def validate_overlap(runner, engine, prompt, *, coordinate=None, generated=160):
             request = engine.submit(
                 prompt,
                 sampling_params=SamplingParams(
-                    max_new_tokens=generated, stop_token_ids=[], temperature=0, seed=41
+                    max_output_tokens=generated,
+                    stop_token_ids=[],
+                    temperature=0,
+                    seed=41,
                 ),
             )
         tokens, steps = [], 0
@@ -349,7 +352,7 @@ def validate_model(
             request = engine.submit(
                 prompt,
                 sampling_params=SamplingParams(
-                    max_new_tokens=generated,
+                    max_output_tokens=generated,
                     stop_token_ids=[runner.eos_token_id],
                     temperature=0,
                     seed=41,

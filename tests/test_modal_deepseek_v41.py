@@ -99,7 +99,7 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
                 8,
             )
             assert options["sampling_params"].temperature == 0
-            assert options["sampling_params"].max_new_tokens == 64 and rank == 0
+            assert options["sampling_params"].max_output_tokens == 64 and rank == 0
             calls.append("submit")
             return SimpleNamespace(take_result=lambda: calls.append("warmup_done"))
 

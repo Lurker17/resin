@@ -139,14 +139,14 @@ def _drain(engine, events, *, after_step=None):
 def _workload(engine, prompts):
     events, requests, requested_scores = {}, {}, {}
     sampling = SamplingParams(
-        max_new_tokens=8, temperature=0.0, logprobs=True, top_logprobs=3
+        max_output_tokens=8, temperature=0.0, logprobs=True, top_logprobs=3
     )
 
     def submit(name, prompt, tokens=8, *, scored=True, **kwargs):
         request = engine.submit(
             prompt,
             sampling_params=SamplingParams(
-                max_new_tokens=tokens,
+                max_output_tokens=tokens,
                 temperature=0.0,
                 logprobs=scored,
                 top_logprobs=3 if scored else 0,
@@ -183,7 +183,7 @@ def _workload(engine, prompts):
     scored = engine.submit(
         prompts["long"],
         sampling_params=SamplingParams(
-            max_new_tokens=0,
+            max_output_tokens=0,
             temperature=0.0,
             prompt_logprobs=True,
             prompt_top_logprobs=3,

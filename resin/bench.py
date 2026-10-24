@@ -395,7 +395,7 @@ def run_sweep(
         cached_tokens = []
         shared = case.shared_prefix_tokens
 
-        def admit(max_new_tokens):
+        def admit(max_output_tokens):
             nonlocal nonce
             if not shared:
                 local.clear_prefix_cache()
@@ -413,7 +413,7 @@ def run_sweep(
                 lease = engine.submit(
                     request_tokens,
                     sampling_params=SamplingParams(
-                        max_new_tokens=max_new_tokens,
+                        max_output_tokens=max_output_tokens,
                         stop_token_ids=[],
                         temperature=0.0,
                     ),
@@ -437,7 +437,7 @@ def run_sweep(
                     engine.submit(
                         tokens[:shared],
                         sampling_params=SamplingParams(
-                            max_new_tokens=1, stop_token_ids=[], temperature=0.0
+                            max_output_tokens=1, stop_token_ids=[], temperature=0.0
                         ),
                     )
                 )

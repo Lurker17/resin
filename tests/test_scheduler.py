@@ -83,7 +83,7 @@ class TestSchedulerConfigContract:
         runner = LimitedRunner()
         engine = Engine(runner)
         request = engine.submit(
-            [1, 2, 3, 4, 5], sampling_params=SamplingParams(max_new_tokens=1)
+            [1, 2, 3, 4, 5], sampling_params=SamplingParams(max_output_tokens=1)
         )
 
         engine.step()
@@ -103,10 +103,10 @@ class TestSchedulerConfigContract:
         runner = LimitedRunner()
         engine = Engine(runner, max_running_requests=2)
         first = engine.submit(
-            [1, 2, 3, 4], sampling_params=SamplingParams(max_new_tokens=1)
+            [1, 2, 3, 4], sampling_params=SamplingParams(max_output_tokens=1)
         )
         second = engine.submit(
-            [5, 6, 7, 8], sampling_params=SamplingParams(max_new_tokens=1)
+            [5, 6, 7, 8], sampling_params=SamplingParams(max_output_tokens=1)
         )
 
         engine.step()
@@ -144,7 +144,7 @@ class TestSchedulerConfigContract:
         runner = MultiPageRunner()
         engine = Engine(runner)
         request = engine.submit(
-            [1, 2, 3, 4, 5, 6], sampling_params=SamplingParams(max_new_tokens=1)
+            [1, 2, 3, 4, 5, 6], sampling_params=SamplingParams(max_output_tokens=1)
         )
 
         events = engine.step()
@@ -220,7 +220,9 @@ class TestSchedulerConfigContract:
                 runner,
                 scheduler_config=SchedulerConfig(prefill_chunk_size=2),
             )
-            engine.submit([1, 2, 3], sampling_params=SamplingParams(max_new_tokens=1))
+            engine.submit(
+                [1, 2, 3], sampling_params=SamplingParams(max_output_tokens=1)
+            )
             with pytest.raises(
                 ValueError, match="runner_config.continuation_prefill is false"
             ):
@@ -291,11 +293,13 @@ class TestSchedulerConfigContract:
         engine = Engine(RecordingRunner())
         with pytest.raises(OverflowError):
             engine.submit(
-                [1], priority=2**31, sampling_params=SamplingParams(max_new_tokens=1)
+                [1], priority=2**31, sampling_params=SamplingParams(max_output_tokens=1)
             )
         with pytest.raises(OverflowError):
             engine.submit(
-                [1], batch_key=2**64, sampling_params=SamplingParams(max_new_tokens=1)
+                [1],
+                batch_key=2**64,
+                sampling_params=SamplingParams(max_output_tokens=1),
             )
 
     def test_batch_plan_freezes_phase_and_sampling_mask(self) -> None:
@@ -348,7 +352,9 @@ class TestSchedulerConfigContract:
             token_ids=(1, 2, 3), cache_key=(1, 2, 3), token_spans=(), image=object()
         )
         engine.submit(
-            [1, 2, 3], sampling_params=SamplingParams(max_new_tokens=2), media=payload
+            [1, 2, 3],
+            sampling_params=SamplingParams(max_output_tokens=2),
+            media=payload,
         )
 
         while engine.has_work():
@@ -371,14 +377,14 @@ class TestSchedulerConfigContract:
         engine = Engine(runner)
         media = Media()
 
-        engine.submit(sampling_params=SamplingParams(max_new_tokens=1), media=media)
+        engine.submit(sampling_params=SamplingParams(max_output_tokens=1), media=media)
         engine.step()
 
         assert runner.plans[0].token_ids.tolist() == [4, 5]
         assert runner.plans[0].media == (media,)
 
         with pytest.raises(ValueError, match="only when media supplies"):
-            engine.submit(sampling_params=SamplingParams(max_new_tokens=1))
+            engine.submit(sampling_params=SamplingParams(max_output_tokens=1))
 
     @pytest.mark.parametrize("missing", ["cache_key", "token_spans"])
     @pytest.mark.parametrize("tokens", [None, [1, 2]])
@@ -389,7 +395,7 @@ class TestSchedulerConfigContract:
         delattr(media, missing)
         with pytest.raises(AttributeError, match=missing):
             engine.submit(
-                tokens, sampling_params=SamplingParams(max_new_tokens=1), media=media
+                tokens, sampling_params=SamplingParams(max_output_tokens=1), media=media
             )
         assert not engine.has_work() and not engine.poisoned
         assert runner.plans == []
@@ -408,7 +414,9 @@ class TestSchedulerConfigContract:
         setattr(media, legacy, getattr(media, current))
         delattr(media, current)
         with pytest.raises(AttributeError, match=current):
-            engine.submit(sampling_params=SamplingParams(max_new_tokens=1), media=media)
+            engine.submit(
+                sampling_params=SamplingParams(max_output_tokens=1), media=media
+            )
         assert not engine.has_work() and not engine.poisoned
         assert runner.plans == []
 
@@ -489,12 +497,14 @@ class TestNativePolicyIntegration:
             if config is not None:
                 kwargs["scheduler_config"] = config
             engine = Engine(runner, **kwargs)
-            first = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=3))
+            first = engine.submit(
+                [1], sampling_params=SamplingParams(max_output_tokens=3)
+            )
             second = engine.submit(
-                [10], sampling_params=SamplingParams(max_new_tokens=1)
+                [10], sampling_params=SamplingParams(max_output_tokens=1)
             )
             third = engine.submit(
-                [20], sampling_params=SamplingParams(max_new_tokens=1)
+                [20], sampling_params=SamplingParams(max_output_tokens=1)
             )
             engine.step()
             engine.step()
@@ -513,28 +523,28 @@ class TestNativePolicyIntegration:
             [10],
             priority=0,
             batch_key=7,
-            sampling_params=SamplingParams(max_new_tokens=1),
+            sampling_params=SamplingParams(max_output_tokens=1),
         )
         high_keyed_first = engine.submit(
             [20],
             priority=5,
             batch_key=7,
-            sampling_params=SamplingParams(max_new_tokens=1),
+            sampling_params=SamplingParams(max_output_tokens=1),
         )
         high_none = engine.submit(
-            [30], priority=5, sampling_params=SamplingParams(max_new_tokens=1)
+            [30], priority=5, sampling_params=SamplingParams(max_output_tokens=1)
         )
         high_keyed_second = engine.submit(
             [40],
             priority=5,
             batch_key=7,
-            sampling_params=SamplingParams(max_new_tokens=1),
+            sampling_params=SamplingParams(max_output_tokens=1),
         )
         middle = engine.submit(
             [50],
             priority=4,
             batch_key=7,
-            sampling_params=SamplingParams(max_new_tokens=1),
+            sampling_params=SamplingParams(max_output_tokens=1),
         )
 
         engine.step()
@@ -557,13 +567,13 @@ class TestNativePolicyIntegration:
         runner = RecordingRunner()
         engine = Engine(runner, max_running_requests=3)
         none_first = engine.submit(
-            [1], sampling_params=SamplingParams(max_new_tokens=1)
+            [1], sampling_params=SamplingParams(max_output_tokens=1)
         )
         zero = engine.submit(
-            [2], batch_key=0, sampling_params=SamplingParams(max_new_tokens=1)
+            [2], batch_key=0, sampling_params=SamplingParams(max_output_tokens=1)
         )
         none_second = engine.submit(
-            [3], sampling_params=SamplingParams(max_new_tokens=1)
+            [3], sampling_params=SamplingParams(max_output_tokens=1)
         )
 
         engine.step()
@@ -576,9 +586,11 @@ class TestNativePolicyIntegration:
     def test_fresh_prefill_runs_before_the_decode_batch_resumes(self) -> None:
         runner = RecordingRunner()
         engine = Engine(runner, max_running_requests=2)
-        decode = engine.submit([10], sampling_params=SamplingParams(max_new_tokens=2))
+        decode = engine.submit(
+            [10], sampling_params=SamplingParams(max_output_tokens=2)
+        )
         engine.step()
-        fresh = engine.submit([20], sampling_params=SamplingParams(max_new_tokens=1))
+        fresh = engine.submit([20], sampling_params=SamplingParams(max_output_tokens=1))
         engine.step()
         assert runner.plans[-1].sequence_ids.tolist() == [fresh]
         assert runner.plans[-1].phase == BatchPhase.PREFILL
@@ -589,11 +601,13 @@ class TestNativePolicyIntegration:
     def test_survivors_stay_ahead_of_later_submissions(self) -> None:
         runner = ControlledRunner([[11, 21], [12, 22]])
         engine = Engine(runner, max_running_requests=2)
-        first = engine.submit([10], sampling_params=SamplingParams(max_new_tokens=3))
-        second = engine.submit([20], sampling_params=SamplingParams(max_new_tokens=3))
+        first = engine.submit([10], sampling_params=SamplingParams(max_output_tokens=3))
+        second = engine.submit(
+            [20], sampling_params=SamplingParams(max_output_tokens=3)
+        )
         engine.step()
-        engine.submit([30], sampling_params=SamplingParams(max_new_tokens=1))
-        engine.submit([40], sampling_params=SamplingParams(max_new_tokens=1))
+        engine.submit([30], sampling_params=SamplingParams(max_output_tokens=1))
+        engine.submit([40], sampling_params=SamplingParams(max_output_tokens=1))
 
         engine.step()
         assert runner.plans[-1].sequence_ids.tolist() == [first, second]
@@ -606,22 +620,22 @@ class TestNativePolicyIntegration:
             [10],
             priority=3,
             batch_key=7,
-            sampling_params=SamplingParams(max_new_tokens=1),
+            sampling_params=SamplingParams(max_output_tokens=1),
         )
         other_key = engine.submit(
-            [20], priority=3, sampling_params=SamplingParams(max_new_tokens=1)
+            [20], priority=3, sampling_params=SamplingParams(max_output_tokens=1)
         )
         third = engine.submit(
             [30],
             priority=3,
             batch_key=7,
-            sampling_params=SamplingParams(max_new_tokens=1),
+            sampling_params=SamplingParams(max_output_tokens=1),
         )
         lower = engine.submit(
             [40],
             priority=2,
             batch_key=7,
-            sampling_params=SamplingParams(max_new_tokens=1),
+            sampling_params=SamplingParams(max_output_tokens=1),
         )
 
         with pytest.raises(RuntimeError, match="forward rejected"):
@@ -659,13 +673,13 @@ class TestNativePolicyIntegration:
         ready_runner = RecordingRunner()
         ready_engine = Engine(ready_runner, max_running_requests=3)
         first = ready_engine.submit(
-            [10], sampling_params=SamplingParams(max_new_tokens=1)
+            [10], sampling_params=SamplingParams(max_output_tokens=1)
         )
         middle = ready_engine.submit(
-            [20], sampling_params=SamplingParams(max_new_tokens=1)
+            [20], sampling_params=SamplingParams(max_output_tokens=1)
         )
         third = ready_engine.submit(
-            [30], sampling_params=SamplingParams(max_new_tokens=1)
+            [30], sampling_params=SamplingParams(max_output_tokens=1)
         )
         assert ready_engine.cancel(middle)
         ready_engine.step()
@@ -684,12 +698,13 @@ class TestNativePolicyIntegration:
             ),
         )
         decoding = engine.submit(
-            [10], sampling_params=SamplingParams(max_new_tokens=2, stop_token_ids=[22])
+            [10],
+            sampling_params=SamplingParams(max_output_tokens=2, stop_token_ids=[22]),
         )
         assert [event.token_id for event in engine.step()] == [11]
         partial = engine.submit(
             [20, 21, 22, 23],
-            sampling_params=SamplingParams(max_new_tokens=1, stop_token_ids=[22]),
+            sampling_params=SamplingParams(max_output_tokens=1, stop_token_ids=[22]),
         )
 
         events = engine.step()
@@ -729,9 +744,11 @@ class TestNativePolicyIntegration:
                 prefill_chunk_size=1,
             ),
         )
-        first = engine.submit([1, 2], sampling_params=SamplingParams(max_new_tokens=1))
+        first = engine.submit(
+            [1, 2], sampling_params=SamplingParams(max_output_tokens=1)
+        )
         second = engine.submit(
-            [10, 11], sampling_params=SamplingParams(max_new_tokens=1)
+            [10, 11], sampling_params=SamplingParams(max_output_tokens=1)
         )
         while engine.has_work():
             engine.step()
@@ -744,7 +761,7 @@ class TestNativePolicyIntegration:
             compact,
             scheduler_config=SchedulerConfig(prefill_chunk_size=1),
         )
-        poisoned.submit([1, 2], sampling_params=SamplingParams(max_new_tokens=1))
+        poisoned.submit([1, 2], sampling_params=SamplingParams(max_output_tokens=1))
         with pytest.raises(
             RuntimeError, match="runner returned 0 token rows for 1 sequences"
         ):
@@ -760,7 +777,9 @@ class TestNativePolicyIntegration:
             FailingRelease(),
             scheduler_config=SchedulerConfig(prefill_chunk_size=1),
         )
-        request = engine.submit([4], sampling_params=SamplingParams(max_new_tokens=1))
+        request = engine.submit(
+            [4], sampling_params=SamplingParams(max_output_tokens=1)
+        )
         with pytest.raises(RuntimeError, match="cleanup failed"):
             engine.step()
         assert engine.poisoned

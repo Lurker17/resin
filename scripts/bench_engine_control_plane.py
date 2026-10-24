@@ -84,7 +84,7 @@ def run_case(
         if shared:
             seed = engine.submit(
                 [2] * shared,
-                sampling_params=SamplingParams(max_new_tokens=1, stop_token_ids=[]),
+                sampling_params=SamplingParams(max_output_tokens=1, stop_token_ids=[]),
             )
             while not seed.done:
                 engine.step()
@@ -94,7 +94,7 @@ def run_case(
             lease = engine.submit(
                 prompt,
                 sampling_params=SamplingParams(
-                    max_new_tokens=maximum, stop_token_ids=[]
+                    max_output_tokens=maximum, stop_token_ids=[]
                 ),
             )
             cached.append(lease.cached_tokens)

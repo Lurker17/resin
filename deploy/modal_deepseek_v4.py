@@ -336,7 +336,7 @@ def _run_rank_workload(
     model_path: Path,
     checkpoint: dict[str, object],
     prompt_rows: list[list[int]],
-    max_new_tokens: int,
+    max_output_tokens: int,
     context_length: int,
     temperature: float,
     top_p: float,
@@ -356,7 +356,10 @@ def _run_rank_workload(
     load_start = time.perf_counter()
     batch_size = len(prompt_rows)
     graph_capacity = (
-        max(len(row) for row in prompt_rows) + max_new_tokens + speculative_tokens + 1
+        max(len(row) for row in prompt_rows)
+        + max_output_tokens
+        + speculative_tokens
+        + 1
     )
     runner_type, _ = _implementation(model_path)
     runner = runner_type(
@@ -407,7 +410,7 @@ def _run_rank_workload(
         ),
     )
     sampling_params = SamplingParams(
-        max_new_tokens=max_new_tokens,
+        max_output_tokens=max_output_tokens,
         stop_token_ids=[runner.eos_token_id]
         if stop_token_ids is None
         else stop_token_ids,
@@ -505,7 +508,7 @@ def _run_rank_workload(
                 engine.submit(
                     row,
                     sampling_params=SamplingParams(
-                        max_new_tokens=1,
+                        max_output_tokens=1,
                         stop_token_ids=sampling_params.stop_token_ids,
                         temperature=0.0,
                     ),
@@ -527,7 +530,7 @@ def _run_rank_workload(
                 engine.submit(
                     row,
                     sampling_params=SamplingParams(
-                        max_new_tokens=1,
+                        max_output_tokens=1,
                         stop_token_ids=sampling_params.stop_token_ids,
                         temperature=0.0,
                     ),
@@ -581,7 +584,7 @@ def _run_rank_workload(
                 if tensor_parallel.rank == 0 and generated_steps % 256 == 0:
                     print(
                         f"[deepseek-v4] batch={batch_size}: "
-                        f"generated {generated_steps}/{max_new_tokens}",
+                        f"generated {generated_steps}/{max_output_tokens}",
                         flush=True,
                     )
         torch.cuda.synchronize(runner.device)
@@ -593,7 +596,7 @@ def _run_rank_workload(
         output_rows = [request.take_result() for request in requests]
 
         output_tensor = torch.full(
-            (batch_size, max_new_tokens),
+            (batch_size, max_output_tokens),
             -1,
             dtype=torch.int64,
             device=runner.device,
@@ -603,14 +606,16 @@ def _run_rank_workload(
                 output_ids, dtype=torch.int64, device=runner.device
             )
         gathered = torch.empty(
-            tensor_parallel.size * batch_size * max_new_tokens,
+            tensor_parallel.size * batch_size * max_output_tokens,
             dtype=torch.int64,
             device=runner.device,
         )
         dist.all_gather_single(
             gathered, output_tensor.flatten(), group=dist.group.WORLD
         )
-        rank_outputs = gathered.view(tensor_parallel.size, batch_size, max_new_tokens)
+        rank_outputs = gathered.view(
+            tensor_parallel.size, batch_size, max_output_tokens
+        )
         if any(
             not torch.equal(rank_outputs[0], rank_outputs[index])
             for index in range(1, tensor_parallel.size)
@@ -674,7 +679,7 @@ def _run_rank(
     checkpoint: dict[str, object],
     prompt_rows: list[list[int]],
     stop_token_ids: list[int] | None,
-    max_new_tokens: int,
+    max_output_tokens: int,
     context_length: int,
     temperature: float,
     top_p: float,
@@ -692,7 +697,7 @@ def _run_rank(
         model_path,
         checkpoint,
         prompt_rows,
-        max_new_tokens,
+        max_output_tokens,
         context_length,
         temperature,
         top_p,
@@ -716,7 +721,7 @@ def _launch_tensor_parallel(
     checkpoint: dict[str, object],
     prompt_rows: list[list[int]],
     stop_token_ids: list[int] | None,
-    max_new_tokens: int,
+    max_output_tokens: int,
     context_length: int,
     temperature: float,
     top_p: float,
@@ -741,7 +746,7 @@ def _launch_tensor_parallel(
                 checkpoint,
                 prompt_rows,
                 stop_token_ids,
-                max_new_tokens,
+                max_output_tokens,
                 context_length,
                 temperature,
                 top_p,
@@ -762,7 +767,7 @@ def _benchmark_point(
     tensor_parallel: TensorParallelContext,
     prompt_ids: list[int],
     batch_size: int,
-    max_new_tokens: int,
+    max_output_tokens: int,
     context_length: int,
     sampling_params: SamplingParams,
 ) -> dict[str, object]:
@@ -800,9 +805,9 @@ def _benchmark_point(
         end = time.perf_counter()
         output_rows = [request.take_result() for request in requests]
         output_lengths = [len(row) for row in output_rows]
-        if any(length != max_new_tokens for length in output_lengths):
+        if any(length != max_output_tokens for length in output_lengths):
             raise RuntimeError(
-                f"benchmark generated {output_lengths}, expected {max_new_tokens} each"
+                f"benchmark generated {output_lengths}, expected {max_output_tokens} each"
             )
         if first_token_time is None:
             raise RuntimeError("benchmark produced no first-token event")
@@ -814,7 +819,7 @@ def _benchmark_point(
         return {
             "batch_size": batch_size,
             "input_tokens_per_request": len(prompt_ids),
-            "output_tokens_per_request": max_new_tokens,
+            "output_tokens_per_request": max_output_tokens,
             "time_to_first_token_ms": (first_token_time - start) * 1000,
             "elapsed_ms": (end - start) * 1000,
             "decode_elapsed_ms": decode_elapsed * 1000,
@@ -834,14 +839,14 @@ def _run_rank_benchmark(
     model_path: Path,
     checkpoint: dict[str, object],
     prompt_ids: list[int],
-    max_new_tokens: int,
+    max_output_tokens: int,
     batch_sizes: tuple[int, ...],
     use_cuda_graphs: bool,
 ) -> None:
     tensor_parallel = _initialize_tensor_parallel(
         rank, master_port, tensor_parallel_size
     )
-    context_length = len(prompt_ids) + max_new_tokens
+    context_length = len(prompt_ids) + max_output_tokens
     max_batch_size = max(batch_sizes)
     if rank == 0:
         print(
@@ -881,9 +886,9 @@ def _run_rank_benchmark(
         capture_cuda_graphs(runner)
         capture_elapsed = time.perf_counter() - capture_start
         validate_prefill_graphs(runner)
-    # Force exactly max_new_tokens so every benchmark has the same denominator.
+    # Force exactly max_output_tokens so every benchmark has the same denominator.
     sampling_params = SamplingParams(
-        max_new_tokens=max_new_tokens,
+        max_output_tokens=max_output_tokens,
         stop_token_ids=(),
         temperature=1.0,
         top_p=0.95,
@@ -896,7 +901,7 @@ def _run_rank_benchmark(
         if rank == 0:
             print(
                 f"[deepseek-v4] TP={tensor_parallel_size} batch={batch_size} "
-                f"{len(prompt_ids)}/{max_new_tokens}",
+                f"{len(prompt_ids)}/{max_output_tokens}",
                 flush=True,
             )
         point = _benchmark_point(
@@ -904,7 +909,7 @@ def _run_rank_benchmark(
             tensor_parallel,
             prompt_ids,
             batch_size,
-            max_new_tokens,
+            max_output_tokens,
             context_length,
             sampling_params,
         )
@@ -928,7 +933,7 @@ def _run_rank_benchmark(
             "allreduce_backend": runner.allreduce_backend,
             "checkpoint": checkpoint,
             "input_tokens_per_request": len(prompt_ids),
-            "output_tokens_per_request": max_new_tokens,
+            "output_tokens_per_request": max_output_tokens,
             "sampling": {
                 "temperature": sampling_params.temperature,
                 "top_p": sampling_params.top_p,
@@ -950,7 +955,7 @@ def _launch_batch_benchmark(
     model_path: Path,
     checkpoint: dict[str, object],
     prompt_ids: list[int],
-    max_new_tokens: int,
+    max_output_tokens: int,
     batch_sizes: tuple[int, ...],
     use_cuda_graphs: bool,
 ) -> dict[str, object]:
@@ -968,7 +973,7 @@ def _launch_batch_benchmark(
                 model_path,
                 checkpoint,
                 prompt_ids,
-                max_new_tokens,
+                max_output_tokens,
                 batch_sizes,
                 use_cuda_graphs,
             ),
@@ -982,11 +987,11 @@ def _benchmark_remote(
     model: ModelSpec,
     tensor_parallel_size: int,
     input_tokens: int = 8192,
-    max_new_tokens: int = 1024,
+    max_output_tokens: int = 1024,
     batch_sizes: tuple[int, ...] = BENCHMARK_BATCH_SIZES,
     use_cuda_graphs: bool = True,
 ) -> dict[str, object]:
-    if input_tokens <= 0 or max_new_tokens <= 1:
+    if input_tokens <= 0 or max_output_tokens <= 1:
         raise ValueError("benchmark token counts must be positive")
     _check_legacy_topology(model, tensor_parallel_size)
     model_path, checkpoint = _require_checkpoint(model)
@@ -1011,7 +1016,7 @@ def _benchmark_remote(
         model_path,
         checkpoint,
         prompt_ids,
-        max_new_tokens,
+        max_output_tokens,
         batch_sizes,
         use_cuda_graphs,
     )
@@ -1372,7 +1377,7 @@ def benchmark_tp4(model_key: str = DEFAULT_MODEL_KEY) -> dict[str, object]:
 )
 def run_model_tp4(
     prompt: str,
-    max_new_tokens: int = 16384,
+    max_output_tokens: int = 16384,
     context_length: int = 32768,
     thinking_mode: str = "chat",
     reasoning_effort: str = "low",
@@ -1394,7 +1399,7 @@ def run_model_tp4(
         raise ValueError("batch_size must be positive")
     if not 0 <= speculative_tokens <= DSPARK_TOKENS:
         raise ValueError(f"speculative_tokens must be in [0, {DSPARK_TOKENS}]")
-    if profile and max_new_tokens < 32:
+    if profile and max_output_tokens < 32:
         raise ValueError("profile runs require at least 32 output tokens")
     model = _model_spec(model_key)
     _check_legacy_topology(model, DEFAULT_TP_SIZE)
@@ -1419,8 +1424,8 @@ def run_model_tp4(
         rendered = None
         prompt_ids = _real_prompt_ids(tokenizer, profile_input_tokens)
     prompt_rows = [prompt_ids.copy() for _ in range(batch_size)]
-    if max(map(len, prompt_rows)) + max_new_tokens - 1 > context_length:
-        raise ValueError("prompt plus max_new_tokens exceeds context_length")
+    if max(map(len, prompt_rows)) + max_output_tokens - 1 > context_length:
+        raise ValueError("prompt plus max_output_tokens exceeds context_length")
 
     profile_run_id = (
         datetime.now(timezone.utc).strftime("resin-0731-%Y%m%dT%H%M%SZ")
@@ -1433,7 +1438,7 @@ def run_model_tp4(
         checkpoint,
         prompt_rows,
         None if rendered is None else rendered.stop_token_ids,
-        max_new_tokens,
+        max_output_tokens,
         context_length,
         temperature,
         top_p,
@@ -1465,7 +1470,7 @@ def run_model_tp4(
 def main(
     mode: str = "run",
     prompt: str = "Explain why batching improves language-model throughput.",
-    max_new_tokens: int = 16384,
+    max_output_tokens: int = 16384,
     context_length: int = 32768,
     thinking_mode: str = "chat",
     reasoning_effort: str = "low",
@@ -1547,7 +1552,7 @@ def main(
         capture_profile = profile or mode == "profile"
         report = run_model_tp4.remote(
             prompt,
-            max_new_tokens,
+            max_output_tokens,
             context_length,
             thinking_mode,
             reasoning_effort,

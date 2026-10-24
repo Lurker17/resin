@@ -184,7 +184,7 @@ def test_submit_media_uses_its_tokenized_prompt_without_engine_media_logic() -> 
     )
     engine = Engine(Runner())
 
-    engine.submit(media=media, sampling_params=SamplingParams(max_new_tokens=1))
+    engine.submit(media=media, sampling_params=SamplingParams(max_output_tokens=1))
     engine.step()
 
     assert Runner.plans[0].token_ids.tolist() == [2, 8]

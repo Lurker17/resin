@@ -69,7 +69,7 @@ fn engine(lookahead: u32, chunk: u32) -> EngineCore<&'static str> {
 }
 fn input(tokens: Vec<u32>, limit: usize) -> Submission<&'static str> {
     let mut input = Submission::new(tokens, "opaque model metadata");
-    input.max_new_tokens = Some(limit);
+    input.max_output_tokens = Some(limit);
     input
 }
 
@@ -422,7 +422,7 @@ fn a_panicking_payload_clone_restores_the_cohort_and_releases_its_cache_access()
                 fail_clone: Arc::new(AtomicBool::new(fail_clone)),
             },
         );
-        submission.max_new_tokens = Some(1);
+        submission.max_output_tokens = Some(1);
         handles.push(engine.submit(submission).unwrap());
     }
     let mut model = NativeModel::default();

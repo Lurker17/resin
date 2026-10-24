@@ -54,7 +54,7 @@ def test_prompt_scores_cover_chunk_successor_and_do_not_change_generation(chunk)
     request = engine.submit(
         tokens,
         sampling_params=SamplingParams(
-            max_new_tokens=2, prompt_logprobs=True, logprobs=True, temperature=0
+            max_output_tokens=2, prompt_logprobs=True, logprobs=True, temperature=0
         ),
     )
     while engine.has_work():
@@ -82,7 +82,7 @@ def test_prompt_cache_reuse_is_bypassed_only_when_scores_are_requested():
         request = engine.submit(
             [1, 2, 3, 4, 5],
             sampling_params=SamplingParams(
-                max_new_tokens=1, prompt_logprobs=scoring, temperature=0
+                max_output_tokens=1, prompt_logprobs=scoring, temperature=0
             ),
         )
         if scoring:
@@ -101,7 +101,7 @@ def test_single_token_prompt_has_no_distribution_to_score():
     runner = TransitionRunner()
     engine = Engine(runner)
     request = engine.submit(
-        [1], sampling_params=SamplingParams(max_new_tokens=1, prompt_logprobs=True)
+        [1], sampling_params=SamplingParams(max_output_tokens=1, prompt_logprobs=True)
     )
     engine.step()
     assert request.prompt_logprobs == [None]
@@ -112,7 +112,8 @@ def test_score_only_request_retires_without_generated_events(tokens):
     runner = TransitionRunner()
     engine = Engine(runner, scheduler_config=SchedulerConfig(prefill_chunk_size=2))
     request = engine.submit(
-        tokens, sampling_params=SamplingParams(max_new_tokens=0, prompt_logprobs=True)
+        tokens,
+        sampling_params=SamplingParams(max_output_tokens=0, prompt_logprobs=True),
     )
     while engine.has_work():
         assert engine.step() == []
@@ -128,7 +129,7 @@ def test_score_only_full_prompt_does_not_require_continuation_support():
     engine = Engine(runner)
     request = engine.submit(
         [1, 2, 3],
-        sampling_params=SamplingParams(max_new_tokens=0, prompt_logprobs=True),
+        sampling_params=SamplingParams(max_output_tokens=0, prompt_logprobs=True),
     )
     assert engine.step() == []
     assert request.done and len(runner.calls) == 1
@@ -139,7 +140,8 @@ def test_score_only_full_prompt_does_not_require_continuation_support():
 def test_missing_requested_prompt_scores_poison_without_partial_progress():
     engine = Engine(TransitionRunner(malformed=True))
     request = engine.submit(
-        [1, 2], sampling_params=SamplingParams(max_new_tokens=1, prompt_logprobs=True)
+        [1, 2],
+        sampling_params=SamplingParams(max_output_tokens=1, prompt_logprobs=True),
     )
     with pytest.raises(RuntimeError, match="requested prompt logprobs"):
         engine.step()
@@ -178,10 +180,12 @@ def test_mixed_rows_keep_input_and_output_scores_separate():
     scored = engine.submit(
         [1, 3, 5],
         sampling_params=SamplingParams(
-            max_new_tokens=2, prompt_logprobs=True, logprobs=True
+            max_output_tokens=2, prompt_logprobs=True, logprobs=True
         ),
     )
-    ordinary = engine.submit([2, 4], sampling_params=SamplingParams(max_new_tokens=2))
+    ordinary = engine.submit(
+        [2, 4], sampling_params=SamplingParams(max_output_tokens=2)
+    )
     while engine.has_work():
         engine.step()
     scores = scored.prompt_logprobs
@@ -217,7 +221,8 @@ def test_invalid_prompt_columns_leave_scores_unpublished(bad_scores, monkeypatch
     )
     engine = Engine(runner)
     request = engine.submit(
-        [1, 2], sampling_params=SamplingParams(max_new_tokens=1, prompt_logprobs=True)
+        [1, 2],
+        sampling_params=SamplingParams(max_output_tokens=1, prompt_logprobs=True),
     )
     with pytest.raises(RuntimeError, match="prompt"):
         engine.step()
@@ -317,7 +322,7 @@ def test_prompt_top_and_per_position_targets_enable_raw_score_only_requests(
     request = engine.submit(
         tokens,
         sampling_params=SamplingParams(
-            max_new_tokens=0,
+            max_output_tokens=0,
             prompt_top_logprobs=top,
             temperature=0.13,
             top_k=1,
@@ -359,15 +364,17 @@ def test_mixed_prompt_views_preserve_row_ownership_and_target_request_storage():
     engine = Engine(runner, scheduler_config=SchedulerConfig(prefill_chunk_size=2))
     top = engine.submit(
         [1, 3, 2],
-        sampling_params=SamplingParams(max_new_tokens=1, prompt_top_logprobs=20),
+        sampling_params=SamplingParams(max_output_tokens=1, prompt_top_logprobs=20),
     )
     targets = [[], [7, 2], [1], [3, 3]]
     target = engine.submit(
         [2, 4, 1, 5],
-        sampling_params=SamplingParams(max_new_tokens=1),
+        sampling_params=SamplingParams(max_output_tokens=1),
         prompt_target_logprobs=targets,
     )
-    ordinary = engine.submit([6, 3], sampling_params=SamplingParams(max_new_tokens=1))
+    ordinary = engine.submit(
+        [6, 3], sampling_params=SamplingParams(max_output_tokens=1)
+    )
     targets[1].clear()
     while engine.has_work():
         engine.step()
@@ -387,7 +394,7 @@ def test_empty_target_rows_still_enable_input_scoring():
     engine = Engine(runner)
     request = engine.submit(
         [1, 2],
-        sampling_params=SamplingParams(max_new_tokens=0),
+        sampling_params=SamplingParams(max_output_tokens=0),
         prompt_target_logprobs=[[], []],
     )
     assert engine.step() == []
@@ -404,7 +411,7 @@ def test_prompt_target_request_shape_and_ids_are_validated_before_admission(targ
     with pytest.raises((ValueError, TypeError, OverflowError)):
         engine.submit(
             [1, 2],
-            sampling_params=SamplingParams(max_new_tokens=0),
+            sampling_params=SamplingParams(max_output_tokens=0),
             prompt_target_logprobs=targets,
         )
     assert not engine.has_work()
@@ -414,7 +421,7 @@ def test_out_of_vocabulary_targets_are_rejected_before_any_gather(monkeypatch):
     engine = Engine(TransitionRunner())
     request = engine.submit(
         [1, 2],
-        sampling_params=SamplingParams(max_new_tokens=0),
+        sampling_params=SamplingParams(max_output_tokens=0),
         prompt_target_logprobs=[[], [8]],
     )
     gathers = []

@@ -185,6 +185,6 @@ To repeat the persistent checks and model smoke:
 uv run pytest -q
 uv run modal run deploy/modal_deepseek_v4.py --mode validate-kernels
 uv run modal run deploy/modal_deepseek_v4.py --mode profile \
-  --input-tokens 8192 --max-new-tokens 128 --temperature 0 \
+  --input-tokens 8192 --max-output-tokens 128 --temperature 0 \
   --speculative-tokens 5 --batch-size 1
 ```

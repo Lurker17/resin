@@ -78,7 +78,7 @@ def test_benchmark_does_not_wrap_noncallable_result_as_pending():
         cache_write_lookahead_tokens=2,
     )
     engine = Engine(BenchmarkRunner(runner))
-    request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=8))
+    request = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=8))
     assert [event.token_id for event in engine.step()] == [0]
     with pytest.raises(
         TypeError, match=r"runner.enqueue\(\) must return ForwardOutput"
@@ -116,7 +116,7 @@ def test_prefill_measures_actual_chunked_inputs_and_keeps_engine_resident():
     # run_sweep never closes a caller-owned resident engine.
     assert (
         engine.submit(
-            [1], sampling_params=SamplingParams(max_new_tokens=1)
+            [1], sampling_params=SamplingParams(max_output_tokens=1)
         ).cached_tokens
         == 0
     )

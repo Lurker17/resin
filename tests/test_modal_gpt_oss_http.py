@@ -71,7 +71,9 @@ def test_http_rank_uses_shared_worker_and_closes_after_warmup_or_server_failure(
             calls.append("engine")
 
         def submit(self, tokens, **options):
-            assert tokens == [1, 2] and options["sampling_params"].max_new_tokens == 2
+            assert (
+                tokens == [1, 2] and options["sampling_params"].max_output_tokens == 2
+            )
             assert options["sampling_params"].temperature == 0
             assert options["sampling_params"].stop_token_ids == (97, 98)
             calls.append("submit")

@@ -83,7 +83,7 @@ impl Runner<()> for Model {
 fn unscored_plans_do_not_allocate_prompt_target_metadata() {
     let mut engine = engine(4);
     let mut input = Submission::new(vec![1, 2, 3], ());
-    input.max_new_tokens = Some(1);
+    input.max_output_tokens = Some(1);
     engine.submit(input).unwrap();
     let mut model = Model::default();
     engine.step(&mut model).unwrap();
@@ -101,7 +101,7 @@ fn prompt_top_and_position_targets_work_alone_or_together_across_chunks() {
         ] {
             let mut engine = engine(chunk);
             let mut input = Submission::new(vec![1, 2, 3, 4], ());
-            input.max_new_tokens = Some(0);
+            input.max_output_tokens = Some(0);
             input.prompt_top_logprobs = top;
             input.prompt_target_logprobs = targets.clone();
             let request = engine.submit(input).unwrap();

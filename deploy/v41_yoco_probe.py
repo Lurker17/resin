@@ -425,7 +425,7 @@ def run_probe(
                 request = engine.submit(
                     prompts[length],
                     sampling_params=SamplingParams(
-                        max_new_tokens=generated,
+                        max_output_tokens=generated,
                         stop_token_ids=[],
                         temperature=0,
                         seed=583,

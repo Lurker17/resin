@@ -132,7 +132,7 @@ def _serve_rank(rank: int, port: int) -> None:
                     ]
                 ),
                 sampling_params=SamplingParams(
-                    max_new_tokens=64,
+                    max_output_tokens=64,
                     stop_token_ids=codec.get_stop_token_ids(),
                     temperature=0.0,
                 ),

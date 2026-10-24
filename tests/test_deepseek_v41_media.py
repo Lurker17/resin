@@ -210,7 +210,7 @@ def test_engine_slices_causal_image_spans_across_prefill_chunks(codec):
     )
     engine = Engine(Runner(), scheduler_config=SchedulerConfig(prefill_chunk_size=32))
     engine.submit(
-        media=rendered.media, sampling_params=SamplingParams(max_new_tokens=1)
+        media=rendered.media, sampling_params=SamplingParams(max_output_tokens=1)
     )
     while engine.has_work():
         engine.step()

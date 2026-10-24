@@ -165,12 +165,12 @@ impl BatchPhase {
 ///
 /// A zero temperature selects the maximum-logit token. Positive temperatures
 /// enable stochastic sampling after optional top-k and top-p filtering.
-/// An omitted `max_new_tokens` uses the remaining context budget. Stop tokens
+/// An omitted `max_output_tokens` uses the remaining context budget. Stop tokens
 /// are explicit: pass a rendered prompt's `stop_token_ids` for recipe stopping.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug)]
 struct SamplingParams {
-    max_new_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
     stop_token_ids: Arc<[u32]>,
     temperature: f64,
     top_p: f64,
@@ -186,7 +186,7 @@ struct SamplingParams {
 impl Default for SamplingParams {
     fn default() -> Self {
         Self {
-            max_new_tokens: None,
+            max_output_tokens: None,
             stop_token_ids: Arc::default(),
             temperature: 1.0,
             top_p: 1.0,
@@ -204,10 +204,10 @@ impl Default for SamplingParams {
 #[pymethods]
 impl SamplingParams {
     #[new]
-    #[pyo3(signature = (*, max_new_tokens = None, stop_token_ids = Vec::new(), temperature = 1.0, top_p = 1.0, top_k = None, seed = None, logprobs = false, top_logprobs = 0, prompt_logprobs = false, prompt_top_logprobs = 0, extra = None))]
+    #[pyo3(signature = (*, max_output_tokens = None, stop_token_ids = Vec::new(), temperature = 1.0, top_p = 1.0, top_k = None, seed = None, logprobs = false, top_logprobs = 0, prompt_logprobs = false, prompt_top_logprobs = 0, extra = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        max_new_tokens: Option<u32>,
+        max_output_tokens: Option<u32>,
         stop_token_ids: Vec<u32>,
         temperature: f64,
         top_p: f64,
@@ -250,7 +250,7 @@ impl SamplingParams {
             ));
         }
         Ok(Self {
-            max_new_tokens,
+            max_output_tokens,
             stop_token_ids: stop_token_ids.into(),
             temperature,
             top_p,
@@ -265,8 +265,8 @@ impl SamplingParams {
     }
 
     #[getter]
-    fn max_new_tokens(&self) -> Option<u32> {
-        self.max_new_tokens
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
     }
 
     #[getter]
@@ -321,8 +321,8 @@ impl SamplingParams {
 
     fn __repr__(&self) -> String {
         format!(
-            "SamplingParams(max_new_tokens={:?}, stop_token_ids={:?}, temperature={:?}, top_p={:?}, top_k={:?}, seed={:?}, logprobs={}, top_logprobs={}, extra={})",
-            self.max_new_tokens,
+            "SamplingParams(max_output_tokens={:?}, stop_token_ids={:?}, temperature={:?}, top_p={:?}, top_k={:?}, seed={:?}, logprobs={}, top_logprobs={}, extra={})",
+            self.max_output_tokens,
             self.stop_token_ids,
             self.temperature,
             self.top_p,
@@ -1635,7 +1635,9 @@ impl Engine {
             prompt_top_logprobs: sampling_params.prompt_top_logprobs as u32,
             prompt_target_logprobs,
             token_ids,
-            max_new_tokens: sampling_params.max_new_tokens.map(|value| value as usize),
+            max_output_tokens: sampling_params
+                .max_output_tokens
+                .map(|value| value as usize),
             priority,
             batch_key,
             stop_token_ids: sampling_params.stop_token_ids.to_vec(),

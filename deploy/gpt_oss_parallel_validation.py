@@ -76,9 +76,12 @@ def _new_runner(
     )
 
 
-def _sampling(*, max_new_tokens):
+def _sampling(*, max_output_tokens):
     return SamplingParams(
-        max_new_tokens=max_new_tokens, temperature=0.0, logprobs=True, top_logprobs=3
+        max_output_tokens=max_output_tokens,
+        temperature=0.0,
+        logprobs=True,
+        top_logprobs=3,
     )
 
 
@@ -142,7 +145,7 @@ def _score_prompt(engine, prompt, *, oracle_head=None):
         request = engine.submit(
             prompt,
             sampling_params=SamplingParams(
-                max_new_tokens=0,
+                max_output_tokens=0,
                 temperature=0.37,
                 top_k=1,
                 top_p=0.5,
@@ -375,7 +378,7 @@ def _baseline_rank(rank, port, directory, model_path, prompts, world_size):
         teachers, teacher_reports = {}, {}
         for name in ("short", "long", "probe"):
             request = engine.submit(
-                prompts[name], sampling_params=_sampling(max_new_tokens=1)
+                prompts[name], sampling_params=_sampling(max_output_tokens=1)
             )
             progress = _drain(engine)
             assert capture.logits is not None
@@ -384,7 +387,7 @@ def _baseline_rank(rank, port, directory, model_path, prompts, world_size):
         capture.begin_history()
         request = engine.submit(
             prompts["probe"],
-            sampling_params=_sampling(max_new_tokens=GENERATION_TOKENS),
+            sampling_params=_sampling(max_output_tokens=GENERATION_TOKENS),
         )
         generation = {**_drain(engine), "token_ids": request.take_result()}
         generation_logits = capture.end_history()
@@ -393,7 +396,7 @@ def _baseline_rank(rank, port, directory, model_path, prompts, world_size):
         repeated_teachers = {}
         for name in ("short", "long", "probe"):
             request = engine.submit(
-                prompts[name], sampling_params=_sampling(max_new_tokens=1)
+                prompts[name], sampling_params=_sampling(max_output_tokens=1)
             )
             _drain(engine)
             repeated_teachers[name] = {
@@ -409,7 +412,7 @@ def _baseline_rank(rank, port, directory, model_path, prompts, world_size):
         capture.begin_history(forced_tokens=generation["token_ids"])
         repeated_request = engine.submit(
             prompts["probe"],
-            sampling_params=_sampling(max_new_tokens=GENERATION_TOKENS),
+            sampling_params=_sampling(max_output_tokens=GENERATION_TOKENS),
         )
         _drain(engine)
         repeated_ids = repeated_request.take_result()
@@ -610,7 +613,7 @@ def _driver_workload(worker, capture, reference, prompts, baseline, *, graphs=Fa
         for index in range(len(names)):
             name = names[(index + dp) % len(names)]
             request = engine.submit(
-                prompts[name], sampling_params=_sampling(max_new_tokens=1)
+                prompts[name], sampling_params=_sampling(max_output_tokens=1)
             )
             progress = _drain(engine)
             teachers[name] = {
@@ -633,7 +636,7 @@ def _driver_workload(worker, capture, reference, prompts, baseline, *, graphs=Fa
         )
         forced_request = engine.submit(
             prompts["probe"],
-            sampling_params=_sampling(max_new_tokens=GENERATION_TOKENS),
+            sampling_params=_sampling(max_output_tokens=GENERATION_TOKENS),
         )
         forced_progress = _drain(engine)
         forced_ids = forced_request.take_result()
@@ -655,7 +658,7 @@ def _driver_workload(worker, capture, reference, prompts, baseline, *, graphs=Fa
 
         def submit(name, prompt, limit):
             request = engine.submit(
-                prompts[prompt], sampling_params=_sampling(max_new_tokens=limit)
+                prompts[prompt], sampling_params=_sampling(max_output_tokens=limit)
             )
             requests[name] = (request, limit)
             return request
@@ -675,7 +678,7 @@ def _driver_workload(worker, capture, reference, prompts, baseline, *, graphs=Fa
         if dp == 0:
             submit("short", "short", 3)
             queued = engine.submit(
-                prompts["late"], sampling_params=_sampling(max_new_tokens=4)
+                prompts["late"], sampling_params=_sampling(max_output_tokens=4)
             )
             cancel("queued", queued)
         if dp == 1 or groups.topology.attn_dp == 1:
@@ -698,7 +701,7 @@ def _driver_workload(worker, capture, reference, prompts, baseline, *, graphs=Fa
         for _ in range(2):
             request = engine.submit(
                 prompts["probe"],
-                sampling_params=_sampling(max_new_tokens=GENERATION_TOKENS),
+                sampling_params=_sampling(max_output_tokens=GENERATION_TOKENS),
             )
             probe = {**_drain(engine), "token_ids": request.take_result()}
             probe["matches_baseline"] = (

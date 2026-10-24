@@ -321,15 +321,15 @@ def _bench_prompt_ids(
 
 def _required_parent_capacity(
     prompt_tokens: int,
-    max_new_tokens: int,
+    max_output_tokens: int,
 ) -> int:
-    maximum_input = prompt_tokens + max_new_tokens - 1
+    maximum_input = prompt_tokens + max_output_tokens - 1
     history_blocks = (maximum_input + PAGE_TOKENS - 1) // PAGE_TOKENS
     return history_blocks + WINDOW_RESIDENT_BLOCKS
 
 
-def _required_history_width(prompt_tokens: int, max_new_tokens: int) -> int:
-    maximum_input = prompt_tokens + max_new_tokens - 1
+def _required_history_width(prompt_tokens: int, max_output_tokens: int) -> int:
+    maximum_input = prompt_tokens + max_output_tokens - 1
     return (maximum_input + PAGE_TOKENS - 1) // PAGE_TOKENS
 
 
@@ -410,18 +410,20 @@ def _run_prompt(
     warmup_sampling_params: SamplingParams,
     tensor_parallel: TensorParallelContext,
 ) -> dict[str, object]:
-    max_new_tokens = sampling_params.max_new_tokens
-    if max_new_tokens is None:
-        raise ValueError("timed prompts require a max_new_tokens limit")
-    if len(prompt_ids) + max_new_tokens - 1 > context_length:
-        raise ValueError("prompt plus max_new_tokens exceeds context_length")
-    cache_parent_capacity = _required_parent_capacity(len(prompt_ids), max_new_tokens)
+    max_output_tokens = sampling_params.max_output_tokens
+    if max_output_tokens is None:
+        raise ValueError("timed prompts require a max_output_tokens limit")
+    if len(prompt_ids) + max_output_tokens - 1 > context_length:
+        raise ValueError("prompt plus max_output_tokens exceeds context_length")
+    cache_parent_capacity = _required_parent_capacity(
+        len(prompt_ids), max_output_tokens
+    )
     runner = _new_cuda_runner(
         model_path,
         cache_parent_capacity,
         tensor_parallel,
         cuda_graph_decode_shapes=(
-            (1, _required_history_width(len(prompt_ids), max_new_tokens)),
+            (1, _required_history_width(len(prompt_ids), max_output_tokens)),
         ),
     )
     capture_cuda_graphs(runner, validate=True)
@@ -462,7 +464,7 @@ def _run_prompt(
         output_ids = request.take_result()
         if tensor_parallel.enabled:
             output_tensor = torch.full(
-                (max_new_tokens,),
+                (max_output_tokens,),
                 -1,
                 dtype=torch.int64,
                 device=runner.device,
@@ -473,7 +475,7 @@ def _run_prompt(
                 device=runner.device,
             )
             gathered_outputs = torch.empty(
-                tensor_parallel.size * max_new_tokens,
+                tensor_parallel.size * max_output_tokens,
                 dtype=torch.int64,
                 device=runner.device,
             )
@@ -485,7 +487,7 @@ def _run_prompt(
             )
             output_rows = gathered_outputs.view(
                 tensor_parallel.size,
-                max_new_tokens,
+                max_output_tokens,
             )
             if any(
                 not torch.equal(output_rows[0], output_rows[rank])
@@ -506,7 +508,7 @@ def _run_prompt(
             "allreduce_backend": runner.allreduce_backend,
             "checkpoint": model_cache,
             "prompt_tokens": len(prompt_ids),
-            "max_new_tokens": max_new_tokens,
+            "max_output_tokens": max_output_tokens,
             "sampling": {
                 "temperature": sampling_params.temperature,
                 "top_p": sampling_params.top_p,
@@ -553,10 +555,10 @@ def _render_prompt_report(
     return report
 
 
-def _validate_decode_padding(engine, runner, prompt_ids, max_new_tokens):
+def _validate_decode_padding(engine, runner, prompt_ids, max_output_tokens):
     """Compare live requests with a fourth live row replacing graph padding."""
     prompt = prompt_ids[:129]
-    output_tokens = min(8, max_new_tokens)
+    output_tokens = min(8, max_output_tokens)
     outputs = []
     replay_counts = []
     for batch_size in (3, 4):
@@ -566,7 +568,7 @@ def _validate_decode_padding(engine, runner, prompt_ids, max_new_tokens):
                 prompt,
                 batch_key=len(prompt),
                 sampling_params=SamplingParams(
-                    max_new_tokens=output_tokens,
+                    max_output_tokens=output_tokens,
                     stop_token_ids=(),
                     temperature=0.0,
                     seed=173 + row,
@@ -612,7 +614,7 @@ def _bench_cuda(
     model_cache: dict[str, object],
     prompt_ids: list[int],
     prompt_tokens: int,
-    max_new_tokens: int,
+    max_output_tokens: int,
     batch_sizes: tuple[int, ...],
     context_length: int,
     schedule_conservativeness: float,
@@ -622,9 +624,9 @@ def _bench_cuda(
     if len(prompt_ids) != prompt_tokens:
         raise ValueError("benchmark prompt IDs do not match prompt_tokens")
     cache_parent_capacity = _required_parent_capacity(
-        prompt_tokens, max_new_tokens
+        prompt_tokens, max_output_tokens
     ) * max(batch_sizes)
-    graph_width = _required_history_width(prompt_tokens, max_new_tokens)
+    graph_width = _required_history_width(prompt_tokens, max_output_tokens)
     runner = _new_cuda_runner(
         model_path,
         cache_parent_capacity,
@@ -649,7 +651,7 @@ def _bench_cuda(
                 prompt_ids,
                 batch_key=prompt_tokens,
                 sampling_params=SamplingParams(
-                    max_new_tokens=max_new_tokens,
+                    max_output_tokens=max_output_tokens,
                     stop_token_ids=()
                     if runner.eos_token_id is None
                     else (runner.eos_token_id,),
@@ -671,7 +673,7 @@ def _bench_cuda(
         tensor_parallel.barrier()
         end = time.perf_counter()
         for request in requests:
-            if len(request.take_result()) != max_new_tokens:
+            if len(request.take_result()) != max_output_tokens:
                 raise RuntimeError("benchmark request returned the wrong token count")
         elapsed_s = end - start
         first_s = elapsed_s if first_token_time is None else first_token_time - start
@@ -679,17 +681,17 @@ def _bench_cuda(
         return {
             "batch_size": batch_size,
             "prompt_tokens": prompt_tokens,
-            "output_tokens": max_new_tokens,
+            "output_tokens": max_output_tokens,
             "time_to_first_token_ms": first_s * 1000,
             "total_ms": elapsed_s * 1000,
-            "per_user_output_tok_s": max_new_tokens / elapsed_s,
-            "aggregate_output_tok_s": batch_size * max_new_tokens / elapsed_s,
-            "per_user_decode_tok_s": (max_new_tokens - 1) / decode_s,
+            "per_user_output_tok_s": max_output_tokens / elapsed_s,
+            "aggregate_output_tok_s": batch_size * max_output_tokens / elapsed_s,
+            "per_user_decode_tok_s": (max_output_tokens - 1) / decode_s,
             "event_count": event_count,
         }
 
     def profile_decode(batch_size: int) -> dict[str, object]:
-        profiled_steps = min(profile_decode_steps, max_new_tokens - 1)
+        profiled_steps = min(profile_decode_steps, max_output_tokens - 1)
         if profiled_steps <= 0:
             raise ValueError("profile_decode_steps requires at least two output tokens")
         requests = [
@@ -697,7 +699,7 @@ def _bench_cuda(
                 prompt_ids,
                 batch_key=prompt_tokens,
                 sampling_params=SamplingParams(
-                    max_new_tokens=max_new_tokens,
+                    max_output_tokens=max_output_tokens,
                     stop_token_ids=()
                     if runner.eos_token_id is None
                     else (runner.eos_token_id,),
@@ -731,7 +733,7 @@ def _bench_cuda(
         while engine.has_work():
             engine.step()
         for request in requests:
-            if len(request.take_result()) != max_new_tokens:
+            if len(request.take_result()) != max_output_tokens:
                 raise RuntimeError("profile request returned the wrong token count")
         if cuda_profile is None:
             return {}
@@ -777,8 +779,8 @@ def _bench_cuda(
 
     try:
         padding_validation = (
-            _validate_decode_padding(engine, runner, prompt_ids, max_new_tokens)
-            if max(batch_sizes) >= 4 and max_new_tokens >= 2
+            _validate_decode_padding(engine, runner, prompt_ids, max_output_tokens)
+            if max(batch_sizes) >= 4 and max_output_tokens >= 2
             else None
         )
         # Warm each batch shape once so the reported rows represent steady
@@ -852,7 +854,7 @@ def _run_prompt_rank(
     model_cache: dict[str, object],
     prompt_ids: list[int],
     stop_token_ids: list[int],
-    max_new_tokens: int,
+    max_output_tokens: int,
     context_length: int,
     schedule_conservativeness: float,
     temperature: float,
@@ -872,7 +874,7 @@ def _run_prompt_rank(
         context_length,
         schedule_conservativeness,
         SamplingParams(
-            max_new_tokens=max_new_tokens,
+            max_output_tokens=max_output_tokens,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
             top_p=top_p,
@@ -880,7 +882,7 @@ def _run_prompt_rank(
             seed=seed,
         ),
         SamplingParams(
-            max_new_tokens=2,
+            max_output_tokens=2,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
             top_p=top_p,
@@ -905,7 +907,7 @@ def _launch_tensor_parallel_prompt(
     model_cache: dict[str, object],
     prompt_ids: list[int],
     stop_token_ids: list[int],
-    max_new_tokens: int,
+    max_output_tokens: int,
     context_length: int,
     schedule_conservativeness: float,
     temperature: float,
@@ -927,7 +929,7 @@ def _launch_tensor_parallel_prompt(
                 model_cache,
                 prompt_ids,
                 stop_token_ids,
-                max_new_tokens,
+                max_output_tokens,
                 context_length,
                 schedule_conservativeness,
                 temperature,
@@ -948,7 +950,7 @@ def _bench_rank_workload(
     prompt_ids: list[int],
     cache_mode: str,
     prompt_tokens: int,
-    max_new_tokens: int,
+    max_output_tokens: int,
     batch_sizes: tuple[int, ...],
     context_length: int,
     schedule_conservativeness: float,
@@ -977,7 +979,7 @@ def _bench_rank_workload(
             model_cache,
             prompt_ids,
             prompt_tokens,
-            max_new_tokens,
+            max_output_tokens,
             batch_sizes,
             context_length,
             schedule_conservativeness,
@@ -1017,7 +1019,7 @@ def _run_bench_rank(
     prompt_ids: list[int],
     cache_mode: str,
     prompt_tokens: int,
-    max_new_tokens: int,
+    max_output_tokens: int,
     batch_sizes: tuple[int, ...],
     context_length: int,
     schedule_conservativeness: float,
@@ -1033,7 +1035,7 @@ def _run_bench_rank(
         prompt_ids,
         cache_mode,
         prompt_tokens,
-        max_new_tokens,
+        max_output_tokens,
         batch_sizes,
         context_length,
         schedule_conservativeness,
@@ -1054,7 +1056,7 @@ def _launch_tensor_parallel_bench(
     prompt_ids: list[int],
     cache_mode: str,
     prompt_tokens: int,
-    max_new_tokens: int,
+    max_output_tokens: int,
     batch_sizes: tuple[int, ...],
     context_length: int,
     schedule_conservativeness: float,
@@ -1075,7 +1077,7 @@ def _launch_tensor_parallel_bench(
                 prompt_ids,
                 cache_mode,
                 prompt_tokens,
-                max_new_tokens,
+                max_output_tokens,
                 batch_sizes,
                 context_length,
                 schedule_conservativeness,
@@ -1091,7 +1093,7 @@ def _run_bench(
     model_key: str,
     cache_mode: str,
     prompt_tokens: int,
-    max_new_tokens: int,
+    max_output_tokens: int,
     batch_sizes: tuple[int, ...],
     context_length: int,
     schedule_conservativeness: float,
@@ -1101,8 +1103,8 @@ def _run_bench(
         raise ValueError("model must be '20b' or '120b'")
     if cache_mode not in {"prewarm", "verify"}:
         raise ValueError("cache_mode must be 'prewarm' or 'verify'")
-    if prompt_tokens + max_new_tokens - 1 > context_length:
-        raise ValueError("prompt_tokens plus max_new_tokens exceeds context_length")
+    if prompt_tokens + max_output_tokens - 1 > context_length:
+        raise ValueError("prompt_tokens plus max_output_tokens exceeds context_length")
     if tuple(sorted(set(batch_sizes))) != batch_sizes:
         raise ValueError("batch_sizes must be sorted and contain no duplicates")
     if profile_decode_steps < 0:
@@ -1122,7 +1124,7 @@ def _run_bench(
             prompt_ids,
             cache_mode,
             prompt_tokens,
-            max_new_tokens,
+            max_output_tokens,
             batch_sizes,
             context_length,
             schedule_conservativeness,
@@ -1232,7 +1234,7 @@ def _serve_http_rank(
         warmup = engine.submit(
             _encode_prompt(recipe, "Reply with one word."),
             sampling_params=SamplingParams(
-                max_new_tokens=2,
+                max_output_tokens=2,
                 stop_token_ids=recipe.get_stop_token_ids(),
                 temperature=0.0,
             ),
@@ -1323,7 +1325,7 @@ def serve_gpt_oss_120b() -> None:
 def _run_model(
     model_key: str,
     prompt: str,
-    max_new_tokens: int = 16384,
+    max_output_tokens: int = 16384,
     context_length: int = 131072,
     schedule_conservativeness: float = 1.0,
     temperature: float = 1.0,
@@ -1350,7 +1352,7 @@ def _run_model(
             model_cache,
             prompt_ids,
             rendered.stop_token_ids,
-            max_new_tokens,
+            max_output_tokens,
             context_length,
             schedule_conservativeness,
             temperature,
@@ -1379,7 +1381,7 @@ def _run_model(
 def run_model(
     model_key: str,
     prompt: str,
-    max_new_tokens: int = 16384,
+    max_output_tokens: int = 16384,
     context_length: int = 131072,
     schedule_conservativeness: float = 1.0,
     temperature: float = 1.0,
@@ -1390,7 +1392,7 @@ def run_model(
     return _run_model(
         model_key,
         prompt,
-        max_new_tokens,
+        max_output_tokens,
         context_length,
         schedule_conservativeness,
         temperature,
@@ -1411,7 +1413,7 @@ def bench_model(
     model_key: str,
     cache_mode: str = "prewarm",
     prompt_tokens: int = 8192,
-    max_new_tokens: int = 256,
+    max_output_tokens: int = 256,
     batch_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
     context_length: int = 32768,
     schedule_conservativeness: float = 1.0,
@@ -1421,7 +1423,7 @@ def bench_model(
         model_key,
         cache_mode,
         prompt_tokens,
-        max_new_tokens,
+        max_output_tokens,
         batch_sizes,
         context_length,
         schedule_conservativeness,
@@ -1435,7 +1437,7 @@ def main(
     model: str = "120b",
     cache_mode: str = "prewarm",
     prompt: str = "Explain why batching improves language-model throughput.",
-    max_new_tokens: int = 16384,
+    max_output_tokens: int = 16384,
     prompt_tokens: int = 8192,
     batch_sizes: str = "1,2,8,16,32",
     context_length: int = 131072,
@@ -1454,7 +1456,7 @@ def main(
         report = run_model.remote(
             model,
             prompt,
-            max_new_tokens,
+            max_output_tokens,
             context_length,
             schedule_conservativeness,
             temperature,
@@ -1473,7 +1475,7 @@ def main(
             model,
             cache_mode,
             prompt_tokens,
-            max_new_tokens,
+            max_output_tokens,
             parsed_batch_sizes,
             context_length,
             schedule_conservativeness,

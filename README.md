@@ -145,7 +145,7 @@ with Engine(runner, context_length=32768) as engine:
     request = engine.submit(
         [1, 6, 24131],
         sampling_params=SamplingParams(
-            max_new_tokens=8,
+            max_output_tokens=8,
             stop_token_ids=[runner.eos_token_id],
             temperature=1.0,
             top_p=0.95,

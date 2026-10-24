@@ -230,7 +230,7 @@ def _prompt_ids(recipe: Any, prompt: str) -> list[int]:
     single_use_containers=True,
 )
 def smoke_test(
-    max_new_tokens: int = 512,
+    max_output_tokens: int = 512,
     *,
     context_length: int = 32_768,
 ) -> dict[str, Any]:
@@ -249,7 +249,7 @@ def smoke_test(
         lease = engine.submit(
             prompt_ids,
             sampling_params=SamplingParams(
-                max_new_tokens=max_new_tokens,
+                max_output_tokens=max_output_tokens,
                 stop_token_ids=recipe.get_stop_token_ids(),
                 temperature=1.0,
                 top_p=0.95,
@@ -289,7 +289,7 @@ def _serve(_: int) -> None:
         warmup = engine.submit(
             _prompt_ids(recipe, "Reply with one word."),
             sampling_params=SamplingParams(
-                max_new_tokens=2,
+                max_output_tokens=2,
                 stop_token_ids=recipe.get_stop_token_ids(),
                 temperature=0.0,
             ),
@@ -338,11 +338,11 @@ def serve_inkling() -> None:
 
 
 @app.local_entrypoint()
-def main(mode: str = "smoke", max_new_tokens: int = 512) -> None:
+def main(mode: str = "smoke", max_output_tokens: int = 512) -> None:
     if mode == "download":
         report = download_models.remote()
     elif mode == "smoke":
-        report = smoke_test.remote(max_new_tokens)
+        report = smoke_test.remote(max_output_tokens)
     else:
         raise ValueError("mode must be 'download' or 'smoke'")
     print(json.dumps(report, indent=2, sort_keys=True))

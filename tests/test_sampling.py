@@ -51,7 +51,7 @@ class TestSamplingContract:
         marker = object()
         params = SamplingParams(extra=marker)
 
-        assert params.max_new_tokens is None
+        assert params.max_output_tokens is None
         assert params.stop_token_ids == ()
         assert params.temperature == 1.0
         assert params.top_p == 1.0
@@ -74,8 +74,8 @@ class TestSamplingContract:
     @pytest.mark.parametrize(
         "kwargs",
         [
-            {"max_new_tokens": -1},
-            {"max_new_tokens": 2**32},
+            {"max_output_tokens": -1},
+            {"max_output_tokens": 2**32},
             {"stop_token_ids": [-1]},
             {"stop_token_ids": [2**32]},
         ],
@@ -86,9 +86,13 @@ class TestSamplingContract:
         with pytest.raises((OverflowError, ValueError)):
             SamplingParams(**kwargs)
 
+    def test_sampling_params_rejects_retired_generation_limit_name(self) -> None:
+        with pytest.raises(TypeError, match="max_new_tokens"):
+            SamplingParams(max_new_tokens=1)  # ty: ignore[unknown-argument]
+
     def test_stop_tokens_are_snapshotted_before_submission(self) -> None:
         stops = [0]
-        params = SamplingParams(max_new_tokens=3, stop_token_ids=stops)
+        params = SamplingParams(max_output_tokens=3, stop_token_ids=stops)
         stops[0] = 1
         engine = Engine(RecordingRunner())
         request = engine.submit([7], sampling_params=params)
@@ -106,7 +110,7 @@ class TestSamplingContract:
         first = engine.submit(
             [1],
             sampling_params=SamplingParams(
-                max_new_tokens=2,
+                max_output_tokens=2,
                 temperature=0.7,
                 top_p=0.9,
                 top_k=32,
@@ -117,7 +121,7 @@ class TestSamplingContract:
         second = engine.submit(
             [2],
             sampling_params=SamplingParams(
-                max_new_tokens=2,
+                max_output_tokens=2,
                 temperature=0.0,
                 seed=22,
                 extra=second_extra,
@@ -156,7 +160,7 @@ class TestSamplingContract:
         runner = BlockRunner()
         engine = Engine(runner)
         request = engine.submit(
-            [0], sampling_params=SamplingParams(max_new_tokens=5, seed=7)
+            [0], sampling_params=SamplingParams(max_output_tokens=5, seed=7)
         )
 
         while engine.has_work():

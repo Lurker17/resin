@@ -255,7 +255,7 @@ pub struct Submission<P> {
     pub prompt_top_logprobs: u32,
     pub prompt_target_logprobs: Option<Vec<Vec<u32>>>,
     pub token_ids: Vec<u32>,
-    pub max_new_tokens: Option<usize>,
+    pub max_output_tokens: Option<usize>,
     pub priority: i32,
     pub batch_key: Option<u64>,
     pub stop_token_ids: Vec<u32>,
@@ -272,7 +272,7 @@ impl<P> Submission<P> {
             prompt_target_logprobs: None,
             token_ids,
             payload,
-            max_new_tokens: None,
+            max_output_tokens: None,
             priority: 0,
             batch_key: None,
             stop_token_ids: Vec::new(),
@@ -343,7 +343,7 @@ struct Request<P> {
     atomic_prefill_spans: Vec<(u32, u32)>,
     resident_tokens: u32,
     generated: Vec<u32>,
-    max_new_tokens: usize,
+    max_output_tokens: usize,
     stop_token_ids: Vec<u32>,
     payload: P,
     cacheable: bool,
@@ -393,7 +393,7 @@ impl<P> Request<P> {
     }
 
     fn sample_at_prefill_end(&self) -> bool {
-        self.max_new_tokens > 0 && self.generated.is_empty()
+        self.max_output_tokens > 0 && self.generated.is_empty()
     }
 
     /// Check the frozen row both before execution and before committing progress.
@@ -684,7 +684,7 @@ impl<P: Clone> EngineCore<P> {
             prompt_top_logprobs,
             prompt_target_logprobs,
             token_ids,
-            max_new_tokens,
+            max_output_tokens,
             priority,
             batch_key,
             mut stop_token_ids,
@@ -745,17 +745,17 @@ impl<P: Clone> EngineCore<P> {
             }
             previous_end = end;
         }
-        if max_new_tokens == Some(0) && !prompt_logprobs {
+        if max_output_tokens == Some(0) && !prompt_logprobs {
             return Err(Error::invalid(
-                "max_new_tokens must be positive unless prompt_logprobs is enabled",
+                "max_output_tokens must be positive unless prompt_logprobs is enabled",
             ));
         }
-        let max_new_tokens = max_new_tokens.unwrap_or_else(|| {
+        let max_output_tokens = max_output_tokens.unwrap_or_else(|| {
             (self.context_length.get() as usize).saturating_sub(token_ids.len()) + 1
         });
         let max_input_tokens = token_ids
             .len()
-            .checked_add(max_new_tokens.saturating_sub(1))
+            .checked_add(max_output_tokens.saturating_sub(1))
             .filter(|length| *length <= u32::MAX as usize)
             .ok_or_else(|| {
                 Error::invalid("maximum request input length exceeds the u32 metadata range")
@@ -829,7 +829,7 @@ impl<P: Clone> EngineCore<P> {
             atomic_prefill_spans,
             resident_tokens,
             generated: Vec::new(),
-            max_new_tokens,
+            max_output_tokens,
             stop_token_ids,
             payload,
             cacheable,
@@ -943,7 +943,7 @@ impl<P: Clone> EngineCore<P> {
                 !row.terminal
                     && row
                         .request
-                        .max_new_tokens
+                        .max_output_tokens
                         .saturating_sub(row.request.generated.len()) as u64
                         > 2 * maximum
                     && u64::from(row.scheduled.token_start()) + 2 * maximum
@@ -1318,7 +1318,7 @@ impl<P: Clone> EngineCore<P> {
                 continue;
             }
             if !row.scheduled.sample {
-                let finished = request.max_new_tokens == 0
+                let finished = request.max_output_tokens == 0
                     && row.scheduled.token_end() == Some(request.prompt_length());
                 retired.push(finished);
                 if finished {
@@ -1328,14 +1328,15 @@ impl<P: Clone> EngineCore<P> {
                 continue;
             }
             let remaining = request
-                .max_new_tokens
+                .max_output_tokens
                 .saturating_sub(request.generated.len());
             let mut committed = Vec::with_capacity(token_ids.len().min(remaining));
             let mut finished = false;
             for (token_index, &token_id) in token_ids.iter().take(remaining).enumerate() {
                 let finish_reason = if request.stop_token_ids.binary_search(&token_id).is_ok() {
                     Some(CompletionReason::Stop)
-                } else if request.generated.len() + committed.len() + 1 >= request.max_new_tokens {
+                } else if request.generated.len() + committed.len() + 1 >= request.max_output_tokens
+                {
                     Some(CompletionReason::Length)
                 } else {
                     None
@@ -1598,7 +1599,7 @@ impl<P: Clone> EngineCore<P> {
     }
 
     fn estimated_context(&self, request: &Request<P>) -> u32 {
-        let future_inputs = request.max_new_tokens.saturating_sub(1);
+        let future_inputs = request.max_output_tokens.saturating_sub(1);
         let estimated_future = ((future_inputs as f64) * self.new_token_ratio).ceil() as usize;
         let estimate = request
             .prompt
@@ -1663,7 +1664,7 @@ impl<P: Clone> EngineCore<P> {
                 (
                     count + 1,
                     generated.saturating_add(request.generated.len()),
-                    limits.saturating_add(request.max_new_tokens),
+                    limits.saturating_add(request.max_output_tokens),
                 )
             },
         );
@@ -2124,7 +2125,7 @@ mod tests {
                 (prompt.len() + generated.len() - 1) as u32
             },
             generated: generated.to_vec(),
-            max_new_tokens: 8,
+            max_output_tokens: 8,
             stop_token_ids: Vec::new(),
             payload: (),
             cacheable: true,

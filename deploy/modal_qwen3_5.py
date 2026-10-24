@@ -294,7 +294,7 @@ def _drain(engine: Any) -> tuple[list[float], list[float]]:
     single_use_containers=True,
 )
 def smoke_test(
-    max_new_tokens: int = 128,
+    max_output_tokens: int = 128,
     *,
     context_length: int = DEFAULT_CONTEXT_LENGTH,
     speculative_tokens: int = DEFAULT_SPECULATIVE_TOKENS,
@@ -324,7 +324,7 @@ def smoke_test(
         request = engine.submit(
             prompt_ids,
             sampling_params=SamplingParams(
-                max_new_tokens=max_new_tokens,
+                max_output_tokens=max_output_tokens,
                 stop_token_ids=recipe.get_stop_token_ids(),
                 temperature=0.0,
             ),
@@ -353,7 +353,7 @@ def smoke_test(
         image_request = engine.submit(
             media=image_prompt.media,
             sampling_params=SamplingParams(
-                max_new_tokens=16,
+                max_output_tokens=16,
                 stop_token_ids=image_prompt.stop_token_ids,
                 temperature=0.0,
             ),
@@ -432,7 +432,7 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
         text_request = engine.submit(
             text_prompt.token_ids,
             sampling_params=SamplingParams(
-                max_new_tokens=4,
+                max_output_tokens=4,
                 stop_token_ids=text_prompt.stop_token_ids,
                 temperature=0.0,
             ),
@@ -454,7 +454,7 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
         image_request = engine.submit(
             media=image_prompt.media,
             sampling_params=SamplingParams(
-                max_new_tokens=2,
+                max_output_tokens=2,
                 stop_token_ids=image_prompt.stop_token_ids,
                 temperature=0.0,
             ),
@@ -518,14 +518,14 @@ def serve_qwen3_5() -> None:
 @app.local_entrypoint()
 def main(
     mode: str = "smoke",
-    max_new_tokens: int = 128,
+    max_output_tokens: int = 128,
     speculative_tokens: int = DEFAULT_SPECULATIVE_TOKENS,
 ) -> None:
     if mode == "download":
         report = download_model.remote()
     elif mode == "smoke":
         report = smoke_test.remote(
-            max_new_tokens,
+            max_output_tokens,
             speculative_tokens=speculative_tokens,
         )
     else:

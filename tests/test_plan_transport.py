@@ -21,7 +21,7 @@ def media(value=0.5):
 
 def rich_plan(batch_key):
     params = SamplingParams(
-        max_new_tokens=100,
+        max_output_tokens=100,
         stop_token_ids=[3, 7, 2**32 - 1],
         temperature=0.75,
         top_p=0.9,
@@ -114,7 +114,7 @@ def test_packet_roundtrips_all_plan_fields_and_full_width_ids(batch_key):
             assert not np.shares_memory(getattr(actual, name), packet.data)
     for actual, expected in zip(restored.sampling_params, original.sampling_params):
         for name in (
-            "max_new_tokens",
+            "max_output_tokens",
             "stop_token_ids",
             "temperature",
             "top_p",

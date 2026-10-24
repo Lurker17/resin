@@ -43,11 +43,13 @@ class TestEngine:
         assert engine.max_running_requests == 3
         assert engine.context_length == 4
         with pytest.raises(ValueError, match="exceeds Engine context_length 4"):
-            engine.submit([1, 2, 3], sampling_params=SamplingParams(max_new_tokens=3))
+            engine.submit(
+                [1, 2, 3], sampling_params=SamplingParams(max_output_tokens=3)
+            )
         with pytest.raises(ValueError, match="context_length must be positive"):
             Engine(RecordingRunner(), context_length=0)
 
-    @pytest.mark.parametrize("params", [None, SamplingParams(max_new_tokens=None)])
+    @pytest.mark.parametrize("params", [None, SamplingParams(max_output_tokens=None)])
     def test_missing_generation_limit_uses_remaining_model_context(
         self, params
     ) -> None:
@@ -57,7 +59,7 @@ class TestEngine:
             engine.step()
         assert request.take_result() == [3, 4]
 
-    @pytest.mark.parametrize("params", [None, SamplingParams(max_new_tokens=3)])
+    @pytest.mark.parametrize("params", [None, SamplingParams(max_output_tokens=3)])
     def test_runner_eos_does_not_supply_an_implicit_stop_policy(self, params) -> None:
         class EosRunner(RecordingRunner):
             eos_token_id = 2
@@ -74,13 +76,14 @@ class TestEngine:
     def test_generation_policies_are_isolated_between_requests(self) -> None:
         engine = Engine(RecordingRunner(), max_running_requests=3)
         first = engine.submit(
-            [1], sampling_params=SamplingParams(max_new_tokens=6, stop_token_ids=[3])
+            [1], sampling_params=SamplingParams(max_output_tokens=6, stop_token_ids=[3])
         )
         second = engine.submit(
-            [1], sampling_params=SamplingParams(max_new_tokens=6, stop_token_ids=(4,))
+            [1],
+            sampling_params=SamplingParams(max_output_tokens=6, stop_token_ids=(4,)),
         )
         third = engine.submit(
-            [1], sampling_params=SamplingParams(max_new_tokens=4, stop_token_ids=[])
+            [1], sampling_params=SamplingParams(max_output_tokens=4, stop_token_ids=[])
         )
         finished = {}
         while engine.has_work():
@@ -96,18 +99,19 @@ class TestEngine:
     def test_zero_generation_budget_requires_and_supports_prompt_scoring(self) -> None:
         engine = Engine(RecordingRunner())
         with pytest.raises(ValueError, match="unless prompt_logprobs is enabled"):
-            engine.submit([1], sampling_params=SamplingParams(max_new_tokens=0))
+            engine.submit([1], sampling_params=SamplingParams(max_output_tokens=0))
 
         request = engine.submit(
             [1],
-            sampling_params=SamplingParams(max_new_tokens=0, prompt_logprobs=True),
+            sampling_params=SamplingParams(max_output_tokens=0, prompt_logprobs=True),
         )
         assert engine.step() == []
         assert request.done and request.take_result() == []
         assert request.prompt_logprobs == [None]
 
     @pytest.mark.parametrize(
-        "retired", [{"max_new_tokens": 1}, {"stop_token_ids": [2]}]
+        "retired",
+        [{"max_output_tokens": 1}, {"max_new_tokens": 1}, {"stop_token_ids": [2]}],
     )
     def test_submit_rejects_retired_generation_keywords(self, retired) -> None:
         engine = Engine(RecordingRunner())
@@ -127,7 +131,9 @@ class TestEngine:
 
     def test_request_lease_owns_result_without_engine_retention(self) -> None:
         engine = Engine(RecordingRunner())
-        request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1))
+        request = engine.submit(
+            [1], sampling_params=SamplingParams(max_output_tokens=1)
+        )
 
         assert isinstance(request, RequestLease)
         assert request.id == request.request_id
@@ -147,7 +153,7 @@ class TestEngine:
     def test_request_lease_is_bound_to_its_engine(self) -> None:
         first = Engine(RecordingRunner())
         second = Engine(RecordingRunner())
-        request = first.submit([1], sampling_params=SamplingParams(max_new_tokens=1))
+        request = first.submit([1], sampling_params=SamplingParams(max_output_tokens=1))
 
         with pytest.raises(ValueError, match="different Engine"):
             second.cancel(request)
@@ -157,8 +163,10 @@ class TestEngine:
     def test_rust_owns_prefill_decode_and_completion_transitions(self) -> None:
         runner = RecordingRunner()
         engine = Engine(runner, max_running_requests=2)
-        first = engine.submit([1, 2], sampling_params=SamplingParams(max_new_tokens=2))
-        second = engine.submit([8], sampling_params=SamplingParams(max_new_tokens=1))
+        first = engine.submit(
+            [1, 2], sampling_params=SamplingParams(max_output_tokens=2)
+        )
+        second = engine.submit([8], sampling_params=SamplingParams(max_output_tokens=1))
 
         initial = engine.step()
         assert [event.token_id for event in initial] == [3, 9]
@@ -187,7 +195,9 @@ class TestEngine:
                 return forward_output(rows)
 
         engine = Engine(BadRunner())
-        request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1))
+        request = engine.submit(
+            [1], sampling_params=SamplingParams(max_output_tokens=1)
+        )
         with pytest.raises(RuntimeError, match=error):
             engine.step()
         assert engine.poisoned and not request.done
@@ -209,7 +219,9 @@ class TestEngine:
 
         runner = InvalidRunner()
         engine = Engine(runner)
-        request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=3))
+        request = engine.submit(
+            [1], sampling_params=SamplingParams(max_output_tokens=3)
+        )
         assert [event.token_id for event in engine.step()] == [2]
         with pytest.raises(TypeError, match="runner must return ForwardOutput"):
             engine.step()
@@ -231,7 +243,7 @@ class TestEngine:
 
         engine = Engine(NativeRunner())
         request = engine.submit(
-            [1], sampling_params=SamplingParams(max_new_tokens=2, logprobs=scored)
+            [1], sampling_params=SamplingParams(max_output_tokens=2, logprobs=scored)
         )
         events = [*engine.step(), *engine.step()]
         assert request.take_result() == [2, 3]
@@ -258,7 +270,9 @@ class TestEngine:
 
         runner = BlockRunner()
         engine = Engine(runner)
-        request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=6))
+        request = engine.submit(
+            [1], sampling_params=SamplingParams(max_output_tokens=6)
+        )
 
         assert [event.token_id for event in engine.step()] == [2]
         block = engine.step()
@@ -299,7 +313,9 @@ class TestEngine:
         runner = BlockRunner()
         assert runner.runner_config.cache_write_lookahead_tokens == 2
         engine = Engine(runner)
-        request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=4))
+        request = engine.submit(
+            [1], sampling_params=SamplingParams(max_output_tokens=4)
+        )
 
         engine.step()
         events = engine.step()
@@ -322,7 +338,7 @@ class TestEngine:
 
         engine = Engine(BlockRunner())
         request = engine.submit(
-            [1], sampling_params=SamplingParams(max_new_tokens=8, stop_token_ids=[7])
+            [1], sampling_params=SamplingParams(max_output_tokens=8, stop_token_ids=[7])
         )
         engine.step()
 
@@ -337,7 +353,7 @@ class TestEngine:
         engine = Engine(RecordingRunner())
         request = engine.submit(
             [1],
-            sampling_params=SamplingParams(max_new_tokens=5, stop_token_ids=[99, 3]),
+            sampling_params=SamplingParams(max_output_tokens=5, stop_token_ids=[99, 3]),
         )
 
         first = engine.step()[0]
@@ -351,7 +367,9 @@ class TestEngine:
 
     def test_length_finish_reason_is_explicit(self) -> None:
         engine = Engine(RecordingRunner())
-        request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1))
+        request = engine.submit(
+            [1], sampling_params=SamplingParams(max_output_tokens=1)
+        )
 
         event = engine.step()[0]
 
@@ -359,8 +377,10 @@ class TestEngine:
         assert event.finish_reason == "length"
         assert request.take_result() == [2]
 
-    @pytest.mark.parametrize("max_new_tokens", [1, 2])
-    def test_speculative_rows_are_rejected_during_prefill(self, max_new_tokens) -> None:
+    @pytest.mark.parametrize("max_output_tokens", [1, 2])
+    def test_speculative_rows_are_rejected_during_prefill(
+        self, max_output_tokens
+    ) -> None:
         class BadRunner:
             @staticmethod
             def forward(plan: BatchPlan):
@@ -368,7 +388,7 @@ class TestEngine:
 
         engine = Engine(BadRunner())
         engine.submit(
-            [1], sampling_params=SamplingParams(max_new_tokens=max_new_tokens)
+            [1], sampling_params=SamplingParams(max_output_tokens=max_output_tokens)
         )
 
         with pytest.raises(RuntimeError, match="only supported during decode"):
@@ -395,7 +415,7 @@ class TestEngine:
         request = engine.submit(
             [1],
             sampling_params=SamplingParams(
-                max_new_tokens=2, stop_token_ids=stop_token_ids
+                max_output_tokens=2, stop_token_ids=stop_token_ids
             ),
         )
         engine.step()
@@ -407,8 +427,10 @@ class TestEngine:
     def test_batch_limit_keeps_running_request_ahead_of_waiter(self) -> None:
         runner = RecordingRunner()
         engine = Engine(runner, max_running_requests=1)
-        first = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=3))
-        second = engine.submit([10], sampling_params=SamplingParams(max_new_tokens=1))
+        first = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=3))
+        second = engine.submit(
+            [10], sampling_params=SamplingParams(max_output_tokens=1)
+        )
         engine.step()
         event = engine.step()[0]
         assert event.request_id == first
@@ -423,10 +445,14 @@ class TestEngine:
     def test_ready_prefill_fills_a_vacancy_before_decode_resumes(self) -> None:
         runner = RecordingRunner()
         engine = Engine(runner, max_running_requests=2)
-        surviving = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=3))
-        terminal = engine.submit([10], sampling_params=SamplingParams(max_new_tokens=1))
+        surviving = engine.submit(
+            [1], sampling_params=SamplingParams(max_output_tokens=3)
+        )
+        terminal = engine.submit(
+            [10], sampling_params=SamplingParams(max_output_tokens=1)
+        )
         untouched = engine.submit(
-            [20], sampling_params=SamplingParams(max_new_tokens=1)
+            [20], sampling_params=SamplingParams(max_output_tokens=1)
         )
 
         first_events = engine.step()
@@ -473,7 +499,7 @@ class TestEngine:
         runner = CachedRunner()
         engine = Engine(runner)
         request = engine.submit(
-            [4, 5, 6], sampling_params=SamplingParams(max_new_tokens=2)
+            [4, 5, 6], sampling_params=SamplingParams(max_output_tokens=2)
         )
 
         assert runner.binding == (engine.cache_pool_id, layout)
@@ -544,8 +570,10 @@ class TestEngine:
             context_length=3,
             scheduler_config=SchedulerConfig(schedule_conservativeness=0.0),
         )
-        first = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=3))
-        second = engine.submit([10], sampling_params=SamplingParams(max_new_tokens=3))
+        first = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=3))
+        second = engine.submit(
+            [10], sampling_params=SamplingParams(max_output_tokens=3)
+        )
 
         engine.step()
         assert engine.cache_occupied_block_count == 2
@@ -578,8 +606,10 @@ class TestEngine:
 
         runner = TinyCachedRunner()
         engine = Engine(runner, max_running_requests=2, context_length=3)
-        first = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=3))
-        second = engine.submit([10], sampling_params=SamplingParams(max_new_tokens=3))
+        first = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=3))
+        second = engine.submit(
+            [10], sampling_params=SamplingParams(max_output_tokens=3)
+        )
         engine.step()
         assert runner.plans[-1].sequence_ids.tolist() == [first]
         assert not second.done

@@ -88,7 +88,7 @@ def test_engine_quarantines_state_advanced_before_sampling_failure() -> None:
 
     runner = StatefulRunner()
     engine = Engine(runner)
-    engine.submit([1, 2], sampling_params=SamplingParams(max_new_tokens=2))
+    engine.submit([1, 2], sampling_params=SamplingParams(max_output_tokens=2))
     engine.step()
     with pytest.raises(PostAcceptCudaError, match="sampling failed"):
         engine.step()

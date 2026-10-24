@@ -284,7 +284,7 @@ class TestFlatCacheEngine:
         engine = Engine(runner, prefix_cache=True)
 
         first = engine.submit(
-            [1, 2, 3, 4], sampling_params=SamplingParams(max_new_tokens=1)
+            [1, 2, 3, 4], sampling_params=SamplingParams(max_output_tokens=1)
         )
         while engine.has_work():
             engine.step()
@@ -294,7 +294,7 @@ class TestFlatCacheEngine:
         assert engine.cache_occupied_block_count == 2
 
         second = engine.submit(
-            [1, 2, 3, 4, 5], sampling_params=SamplingParams(max_new_tokens=1)
+            [1, 2, 3, 4, 5], sampling_params=SamplingParams(max_output_tokens=1)
         )
         assert second.cached_tokens == 4
         assert engine.prefix_cache_stats == (2, 1, 1, 0)
@@ -321,13 +321,13 @@ class TestFlatCacheEngine:
         engine = Engine(runner, prefix_cache=True)
 
         first = Media([1, 101, 102, 4])
-        engine.submit(media=first, sampling_params=SamplingParams(max_new_tokens=1))
+        engine.submit(media=first, sampling_params=SamplingParams(max_output_tokens=1))
         while engine.has_work():
             engine.step()
 
         same_media = Media([1, 101, 102, 4])
         engine.submit(
-            media=same_media, sampling_params=SamplingParams(max_new_tokens=1)
+            media=same_media, sampling_params=SamplingParams(max_output_tokens=1)
         )
         while engine.has_work():
             engine.step()
@@ -336,7 +336,7 @@ class TestFlatCacheEngine:
 
         changed_media = Media([1, 201, 202, 4])
         engine.submit(
-            media=changed_media, sampling_params=SamplingParams(max_new_tokens=1)
+            media=changed_media, sampling_params=SamplingParams(max_output_tokens=1)
         )
         engine.step()
         assert runner.plans[-1].context_lengths.tolist() == [0]
@@ -350,7 +350,9 @@ class TestFlatCacheEngine:
         runner = RecordingCachedRunner(CacheLayout(4, [CacheGroupLayout(4)]))
         engine = Engine(runner, prefix_cache=True)
 
-        engine.submit(media=Media(), sampling_params=SamplingParams(max_new_tokens=1))
+        engine.submit(
+            media=Media(), sampling_params=SamplingParams(max_output_tokens=1)
+        )
         engine.step()
 
         assert runner.plans[0].token_ids.tolist() == [1, 2, 3, 4, 5]
@@ -359,7 +361,7 @@ class TestFlatCacheEngine:
     def test_prefix_cache_is_disabled_by_default(self) -> None:
         runner = RecordingCachedRunner(CacheLayout(2, [CacheGroupLayout(2)]))
         engine = Engine(runner)
-        engine.submit([1, 2], sampling_params=SamplingParams(max_new_tokens=1))
+        engine.submit([1, 2], sampling_params=SamplingParams(max_output_tokens=1))
         engine.step()
         assert engine.prefix_cache_stats is None
         assert engine.cache_occupied_block_count == 0
@@ -369,7 +371,7 @@ class TestFlatCacheEngine:
         runner = RecordingCachedRunner(layout)
         engine = Engine(runner)
         request = engine.submit(
-            [4, 5, 6], sampling_params=SamplingParams(max_new_tokens=2)
+            [4, 5, 6], sampling_params=SamplingParams(max_output_tokens=2)
         )
 
         assert engine.cache_free_parent_count == 3
@@ -414,7 +416,7 @@ class TestFlatCacheEngine:
         )
         runner = RecordingCachedRunner(layout)
         engine = Engine(runner)
-        engine.submit([1, 2, 3], sampling_params=SamplingParams(max_new_tokens=2))
+        engine.submit([1, 2, 3], sampling_params=SamplingParams(max_output_tokens=2))
 
         assert engine.cache_free_parent_count == 3
         assert engine.cache_occupied_block_count == 0
@@ -447,7 +449,9 @@ class TestFlatCacheEngine:
         layout = CacheLayout(1, [CacheGroupLayout(2)])
         runner = RecordingCachedRunner(layout, forward_failures=1)
         engine = Engine(runner)
-        request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1))
+        request = engine.submit(
+            [1], sampling_params=SamplingParams(max_output_tokens=1)
+        )
 
         with pytest.raises(RuntimeError, match="rejected the batch"):
             engine.step()
@@ -480,7 +484,9 @@ class TestFlatCacheEngine:
         )
         runner = RecordingCachedRunner(layout)
         engine = Engine(runner)
-        engine.submit(list(range(12)), sampling_params=SamplingParams(max_new_tokens=1))
+        engine.submit(
+            list(range(12)), sampling_params=SamplingParams(max_output_tokens=1)
+        )
 
         events = engine.step()
         assert len(events) == 1
@@ -564,7 +570,7 @@ def test_window_attention_reads_survive_prefill_writes_and_prefix_reuse(
         scheduler_config=SchedulerConfig(prefill_chunk_size=6),
     ) as engine:
         first = engine.submit(
-            list(range(13)), sampling_params=SamplingParams(max_new_tokens=1)
+            list(range(13)), sampling_params=SamplingParams(max_output_tokens=1)
         )
         while engine.has_work():
             engine.step()
@@ -573,7 +579,7 @@ def test_window_attention_reads_survive_prefill_writes_and_prefix_reuse(
             assert runner.plans[0].num_tokens == 6
             assert runner.plans[1].num_tokens == 6
         second = engine.submit(
-            list(range(19)), sampling_params=SamplingParams(max_new_tokens=1)
+            list(range(19)), sampling_params=SamplingParams(max_output_tokens=1)
         )
         assert second.cached_tokens == (12 if prefix_cache else 0)
         while engine.has_work():

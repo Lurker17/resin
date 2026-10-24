@@ -207,7 +207,7 @@ def _synthetic_image(size: int = 96):
     return np.stack((horizontal, vertical, 1.0 - horizontal), axis=-1).copy()
 
 
-def _generate(engine, processor, prompt: str, max_new_tokens: int):
+def _generate(engine, processor, prompt: str, max_output_tokens: int):
     from resin import SamplingParams
 
     prepared = Gemma4Recipe(processor, eos_token_ids=(1, 106)).render(
@@ -222,7 +222,7 @@ def _generate(engine, processor, prompt: str, max_new_tokens: int):
     lease = engine.submit(
         media=media,
         sampling_params=SamplingParams(
-            max_new_tokens=max_new_tokens,
+            max_output_tokens=max_output_tokens,
             stop_token_ids=prepared.stop_token_ids,
             temperature=0.0,
         ),
@@ -253,7 +253,7 @@ def _warmup_text(engine, processor) -> None:
     lease = engine.submit(
         prepared.token_ids,
         sampling_params=SamplingParams(
-            max_new_tokens=3, stop_token_ids=prepared.stop_token_ids, temperature=0.0
+            max_output_tokens=3, stop_token_ids=prepared.stop_token_ids, temperature=0.0
         ),
     )
     while engine.has_work():
@@ -269,7 +269,7 @@ def _warmup_text(engine, processor) -> None:
     single_use_containers=True,
 )
 def smoke_test(
-    max_new_tokens: int = 16,
+    max_output_tokens: int = 16,
     *,
     speculative_tokens: int,
 ) -> dict[str, Any]:
@@ -295,7 +295,7 @@ def smoke_test(
             engine,
             processor,
             "Describe this image briefly and mention its dominant visual pattern.",
-            max_new_tokens,
+            max_output_tokens,
         )
         torch.cuda.synchronize()
         first_token_step = next(
@@ -389,7 +389,7 @@ def serve_gemma4() -> None:
 @app.local_entrypoint()
 def main(
     mode: str = "smoke",
-    max_new_tokens: int = 16,
+    max_output_tokens: int = 16,
     speculative_tokens: int = PRODUCTION_SPECULATIVE_TOKENS,
 ) -> None:
     if mode == "download":
@@ -398,7 +398,7 @@ def main(
         print(
             json.dumps(
                 smoke_test.remote(
-                    max_new_tokens,
+                    max_output_tokens,
                     speculative_tokens=speculative_tokens,
                 ),
                 indent=2,

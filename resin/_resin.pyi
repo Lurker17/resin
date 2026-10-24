@@ -1114,14 +1114,14 @@ class SamplingParams:
 
     A zero temperature selects the maximum-logit token. Positive temperatures
     enable stochastic sampling after optional top-k and top-p filtering.
-    An omitted `max_new_tokens` uses the remaining context budget. Stop tokens
+    An omitted `max_output_tokens` uses the remaining context budget. Stop tokens
     are explicit: pass a rendered prompt's `stop_token_ids` for recipe stopping.
     """
     def __new__(
         cls,
         /,
         *,
-        max_new_tokens: int | None = None,
+        max_output_tokens: int | None = None,
         stop_token_ids: Sequence[int] = ...,
         temperature: float = 1.0,
         top_p: float = 1.0,
@@ -1139,7 +1139,7 @@ class SamplingParams:
     @property
     def logprobs(self, /) -> bool: ...
     @property
-    def max_new_tokens(self, /) -> int | None: ...
+    def max_output_tokens(self, /) -> int | None: ...
     @property
     def prompt_logprobs(self, /) -> bool: ...
     @property
