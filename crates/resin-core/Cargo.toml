@@ -5,4 +5,8 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Pure Rust scheduling and resource ownership for Resin"
 
+[features]
+archive = ["dep:rkyv"]
+
 [dependencies]
+rkyv = { workspace = true, optional = true }

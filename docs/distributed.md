@@ -312,7 +312,7 @@ does not multiply logical capacity. The native configuration type does not add a
 request router or move the current Python serving coordinator into Rust. The
 HTTP bridge below adds explicit replica routing above these local engines.
 
-## One synchronous step
+## One coordinated step
 
 Drivers in the same world call `has_work()`, `step()`, and `close()` in matching
 order. `submit()` and `cancel()` remain local operations. Applications can drive
@@ -330,14 +330,16 @@ drivers stepping together.
 4. Each driver broadcasts its logical plan to all ranks in its request replica. All workers
    validate inputs and vote readiness before calling the model. An idle replica
    receives `plan=None` and participates in the model's empty execution path.
-5. Workers finish the forward callback and exchange execution status. The native
-   Engine validates and commits the local result using its existing synchronous
-   transaction, including NumPy [logprob columns](logprobs.md).
+5. Workers execute or enqueue the forward callback and exchange execution status.
+   The native Engine validates and commits completed results, including NumPy
+   [logprob columns](logprobs.md). Eligible decode steps can enqueue the next
+   continuation before collecting the previous completion.
 6. Drivers exchange commit status before returning events. A failure permanently
    poisons every native Engine in the domain and stops further execution.
 
-Each batch still has one synchronous call and return. There is no pending-step
-handle, deferred commit, or previous-step output bookkeeping.
+Applications retain the same `step()` API. The Engine owns pending plans and
+cache leases during overlap; workers retain per-rank completions and drain them
+before resource release or close. Model tensor forwards do not schedule batches.
 
 Replica commands also propagate resource binding and release. Page allocation
 exists only on the driver; followers bind their device arenas to the same logical
@@ -354,12 +356,20 @@ cancellation and retraction release that state after outstanding work has draine
 Plans already in flight retain their own references and array storage.
 
 Successful step commands use typed Gloo broadcasts: a fixed integer header and
-packed token, sequence, scoring and page-table arrays. They do not use pickle or
-object collectives. Media buffers and JSON request descriptors are sent only on
-registration, never on repeated decode steps. Request policy and media stay
-unchanged until release. Distributed sampling `extra` values
-must be JSON data, and distributed media must use Resin's native payloads. Local
-execution retains support for arbitrary custom Python payloads.
+a native plan archive. The archive schema is derived directly from Rust's
+`BatchPlan` and cache-group types using rkyv; Python does not repeat their field
+lists, sizes or alignment rules. Request sampling, media and derived positions
+are excluded from the archive. Receivers validate the archive, attach retained
+request state, and apply the ordinary plan validation before execution. Restored
+arrays own their storage, so subsequent receives cannot overwrite an in-flight
+plan. The private format is versioned and requires the same Resin build on every
+rank. This is not a zero-copy receive path or a persistent storage format.
+Successful step commands do not use pickle or object collectives. Media buffers
+and JSON request descriptors are sent only on registration, never on repeated
+decode steps. Request policy and media stay unchanged until release. Distributed
+sampling `extra` values must be JSON data, and distributed media must use Resin's
+native payloads. Local execution retains support for arbitrary custom Python
+payloads.
 
 ## Model callback
 
@@ -390,18 +400,20 @@ it cannot roll back in-place model state or globally undo a peer's completed loc
 commit. Failure marks all native Engines poisoned, preserving resources and
 preventing cleanup/reuse through normal Engine operations.
 
-Existing TP-only runtimes that use an injected TP group can continue implementing
-`forward(plan)` with `Parallelism(world_size=2, attn_tp=2)`, for example when
-running GPT-OSS 120B over two ranks. Here `cp`, `ep`, and `attn_dp` remain one,
-and attention TP and expert TP both equal `world_size`. GPT-OSS's
-`TensorParallelContext` can be constructed from
-`groups.attn_tp.local_rank`, `groups.attn_tp.size`, and `groups.attn_tp.handle`
-(use `None` for a single-rank context). The ordinary `forward(plan)` callback
-also remains allowed whenever `cp=ep=attn_dp=1`, including attention replication
-greater than one; the runtime owns weight preparation and communication across
-its attention and expert groups. GPT-OSS and DeepSeek-V4 accept either this
-legacy `tensor_parallel=` context or explicit `parallel_groups=`, and their
-explicit-group paths use `forward_distributed` for composed layouts.
+TP-only runtimes can implement ordinary `forward(plan)` whenever
+`cp=ep=attn_dp=1`, including attention replication greater than one. They use
+the same `DistributedWorker` and `DistributedEngine` lifecycle; the runtime
+owns weight preparation and communication across its groups.
+
+The GPT-OSS 120B HTTP deployment constructs
+`Parallelism(world_size=2, attn_tp=2)` and passes `parallel_groups=` to its
+runner. Attention TP and expert TP both equal two, and its distributed callback
+uses the same coordinated validation and execution path as composed layouts.
+The separate TP server wrapper/follower loop has been removed. Model-level
+`tensor_parallel=` contexts remain available for diagnostic callers; they are
+mutually exclusive with `parallel_groups=`. DeepSeek's single KV head still
+requires `attn_tp=1`, and the retired query-head-only TP HTTP route fails before
+loading a model.
 
 ## Process integration
 

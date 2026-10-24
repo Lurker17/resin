@@ -338,6 +338,10 @@ impl std::error::Error for KvLayoutError {}
 
 /// Executor-facing block table and append locations for one cache group.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "archive",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub struct KvGroupPlan {
     pub group_index: u32,
     pub blocks_per_slab: u32,
@@ -380,6 +384,9 @@ impl KvGroupPlan {
     }
 
     pub fn validate(&self) -> Result<(), KvPlanError> {
+        if self.blocks_per_slab == 0 {
+            return Err(KvPlanError("blocks_per_slab must be positive"));
+        }
         if self.block_slab_ids.len() > u32::MAX as usize {
             return Err(KvPlanError(
                 "block address length exceeds the u32 CSR range",

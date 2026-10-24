@@ -1,10 +1,10 @@
 use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock};
 
-use numpy::{PyArray1, PyArrayLike1};
+use numpy::{PyArray1, PyArrayLike1, PyReadonlyArray1};
 use pyo3::exceptions::{PyAttributeError, PyMemoryError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyDict, PyTuple};
 
 mod arrays;
 mod cache;
@@ -14,11 +14,11 @@ mod http_logprobs;
 mod http_output;
 mod http_session;
 mod http_stop;
+mod media_payload;
+mod media_preprocess;
 mod output;
 mod parallelism;
 mod planning;
-mod media_payload;
-mod media_preprocess;
 mod recipe;
 mod recipe_events;
 mod recipe_media;
@@ -130,7 +130,9 @@ impl SchedulerConfig {
     from_py_object,
     module = "resin._resin"
 )]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 enum BatchPhase {
     Prefill,
     Decode,
@@ -324,7 +326,7 @@ impl SamplingParams {
 /// fixed across those prefill chunks and is only meaningful during prefill.
 /// Public constructors that omit it infer each endpoint from its scheduled end.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct BatchPlan {
     prompt_score_indices: Vec<u32>,
     prompt_score_token_ids: Vec<u32>,
@@ -342,12 +344,79 @@ struct BatchPlan {
     batch_key: Option<u64>,
     cache_groups: Vec<CacheGroupPlan>,
     sampling_mask: Vec<bool>,
+    #[rkyv(with = rkyv::with::Skip)]
     sampling_params: Vec<SamplingParams>,
+    #[rkyv(with = rkyv::with::Skip)]
     media: Vec<Option<Arc<Py<PyAny>>>>,
+    #[rkyv(with = rkyv::with::Skip)]
     positions: OnceLock<Vec<u32>>,
 }
 
+const PLAN_WIRE_MAGIC: &[u8; 8] = b"RSNPLAN\0";
+// Private same-build protocol: bump when the archived BatchPlan, BatchPhase,
+// CacheGroupPlan or KvGroupPlan schema, or rkyv format flags, change.
+const PLAN_WIRE_VERSION: u32 = 1;
+const PLAN_WIRE_HEADER: usize = 20;
+
 impl BatchPlan {
+    fn encode_wire(&self) -> PyResult<Vec<u8>> {
+        // Serialize directly into the eventual NumPy owner. The envelope is
+        // separate from the derived schema and rejects version/length mistakes.
+        let mut bytes =
+            rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(self, vec![0; PLAN_WIRE_HEADER])
+                .map_err(|error| PyValueError::new_err(format!("cannot encode plan: {error}")))?;
+        let length = (bytes.len() - PLAN_WIRE_HEADER) as u64;
+        bytes[..8].copy_from_slice(PLAN_WIRE_MAGIC);
+        bytes[8..12].copy_from_slice(&PLAN_WIRE_VERSION.to_le_bytes());
+        bytes[12..PLAN_WIRE_HEADER].copy_from_slice(&length.to_le_bytes());
+        Ok(bytes)
+    }
+
+    fn decode_wire(bytes: &[u8]) -> PyResult<Self> {
+        if bytes.len() < PLAN_WIRE_HEADER || &bytes[..8] != PLAN_WIRE_MAGIC {
+            return Err(PyValueError::new_err("invalid plan wire format"));
+        }
+        if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != PLAN_WIRE_VERSION {
+            return Err(PyValueError::new_err("unsupported plan wire version"));
+        }
+        let length = u64::from_le_bytes(bytes[12..PLAN_WIRE_HEADER].try_into().unwrap());
+        if length != (bytes.len() - PLAN_WIRE_HEADER) as u64 {
+            return Err(PyValueError::new_err("plan wire length mismatch"));
+        }
+        rkyv::from_bytes::<Self, rkyv::rancor::Error>(&bytes[PLAN_WIRE_HEADER..])
+            .map_err(|error| PyValueError::new_err(format!("invalid plan archive: {error}")))
+    }
+
+    fn restore_requests(
+        mut self,
+        requests: &Bound<'_, PyDict>,
+        pending: &Bound<'_, PyDict>,
+    ) -> PyResult<Self> {
+        self.sampling_params.reserve(self.sequence_ids.len());
+        self.media.reserve(self.sequence_ids.len());
+        for &id in &self.sequence_ids {
+            let request = match pending.get_item(id)? {
+                Some(request) => request,
+                None => requests.get_item(id)?.ok_or_else(|| {
+                    PyValueError::new_err(format!("request {id} has not been registered"))
+                })?,
+            };
+            self.sampling_params.push(
+                request
+                    .getattr("sampling_params")?
+                    .extract::<PyRef<'_, SamplingParams>>()?
+                    .clone(),
+            );
+            let media = request.getattr("media")?;
+            self.media.push(if media.is_none() {
+                None
+            } else {
+                Some(Arc::new(media.unbind()))
+            });
+        }
+        Self::checked(self)
+    }
+
     fn checked(plan: Self) -> PyResult<Self> {
         let Self {
             token_ids,
@@ -547,6 +616,22 @@ impl BatchPlan {
 }
 #[pymethods]
 impl BatchPlan {
+    fn _to_wire<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u8>>> {
+        Ok(PyArray1::from_vec(py, self.encode_wire()?))
+    }
+
+    #[staticmethod]
+    fn _from_wire(
+        data: PyReadonlyArray1<'_, u8>,
+        requests: &Bound<'_, PyDict>,
+        pending: &Bound<'_, PyDict>,
+    ) -> PyResult<Self> {
+        let bytes = data.as_slice().map_err(|_| {
+            PyValueError::new_err("plan wire data must be a contiguous uint8 array")
+        })?;
+        Self::decode_wire(bytes)?.restore_requests(requests, pending)
+    }
+
     #[new]
     #[pyo3(signature = (
         sequence_ids,
@@ -1378,7 +1463,10 @@ impl Engine {
 impl Engine {
     #[new]
     #[pyo3(signature = (runner, *, max_running_requests = 32, context_length = 32768, scheduler_config = None, eos_token_id = None, prefix_cache = false, overlap = true))]
-    #[allow(clippy::too_many_arguments, reason = "Python constructor exposes keyword configuration")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Python constructor exposes keyword configuration"
+    )]
     fn new(
         py: Python<'_>,
         runner: Py<PyAny>,
@@ -1936,8 +2024,8 @@ mod _resin {
 
     #[pymodule_export]
     use crate::media_payload::{
-        DeepSeekV41Image, DeepSeekV41Media, Gemma4Media, InklingMedia, Qwen35Media,
-        _media_from_buffers, _media_to_buffers,
+        _media_from_buffers, _media_to_buffers, DeepSeekV41Image, DeepSeekV41Media, Gemma4Media,
+        InklingMedia, Qwen35Media,
     };
 
     #[pymodule_export]
@@ -1957,10 +2045,10 @@ mod _resin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn batch_plan_rejects_noncanonical_cache_group_order() {
+
+    fn wire_plan(group_index: u32) -> BatchPlan {
         let group = CacheGroupPlan::from_parts(
-            1,
+            group_index,
             vec![0, 1],
             vec![7],
             vec![0],
@@ -1971,7 +2059,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let plan = BatchPlan {
+        BatchPlan {
             prompt_score_indices: Vec::new(),
             prompt_score_token_ids: Vec::new(),
             prompt_score_indptr: vec![0, 0],
@@ -1994,7 +2082,88 @@ mod tests {
             }],
             media: vec![None],
             positions: OnceLock::new(),
-        };
-        assert!(BatchPlan::checked(plan).is_err());
+        }
+    }
+
+    #[test]
+    fn batch_plan_rejects_noncanonical_cache_group_order() {
+        assert!(BatchPlan::checked(wire_plan(1)).is_err());
+    }
+
+    #[test]
+    fn plan_archive_skips_request_objects_and_derived_positions() {
+        let plan = wire_plan(0);
+        let bytes = plan.encode_wire().unwrap();
+        plan.positions.set(vec![0, 1]).unwrap();
+        assert_eq!(bytes, plan.encode_wire().unwrap());
+        let restored = BatchPlan::decode_wire(&bytes).unwrap();
+        assert_eq!(restored.sequence_ids, plan.sequence_ids);
+        assert_eq!(restored.token_ids, plan.token_ids);
+        assert_eq!(restored.cache_groups, plan.cache_groups);
+        assert!(restored.sampling_params.is_empty());
+        assert!(restored.media.is_empty());
+        assert!(restored.positions.get().is_none());
+    }
+
+    #[test]
+    fn structurally_valid_plan_archives_still_require_semantic_validation() {
+        Python::initialize();
+        Python::attach(|py| {
+            let requests = PyDict::new(py);
+            let pending = PyDict::new(py);
+            let kwargs = PyDict::new(py);
+            kwargs
+                .set_item(
+                    "sampling_params",
+                    Py::new(
+                        py,
+                        SamplingParams {
+                            seed: Some(1),
+                            ..SamplingParams::default()
+                        },
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            kwargs.set_item("media", py.None()).unwrap();
+            let request = py
+                .import("types")
+                .unwrap()
+                .getattr("SimpleNamespace")
+                .unwrap()
+                .call((), Some(&kwargs))
+                .unwrap();
+            pending.set_item(1, request).unwrap();
+            let valid = BatchPlan::decode_wire(&wire_plan(0).encode_wire().unwrap()).unwrap();
+            assert!(valid.restore_requests(&requests, &pending).is_ok());
+
+            for (case, expected) in [
+                (0, "token_indptr must start at zero"),
+                (1, "prefill_lengths must cover"),
+                (2, "blocks_per_slab must be positive"),
+                (3, "block_indptr must end"),
+                (4, "contiguous group_index"),
+            ] {
+                let mut plan = wire_plan(0);
+                match case {
+                    0 => plan.token_indptr[0] = 1,
+                    1 => plan.prefill_lengths[0] = 1,
+                    _ => {
+                        let mut group = plan.cache_groups[0].inner_native().clone();
+                        match case {
+                            2 => group.blocks_per_slab = 0,
+                            3 => group.block_indptr[1] = 0,
+                            _ => group.group_index = 1,
+                        }
+                        plan.cache_groups[0] = CacheGroupPlan::from_inner(group);
+                    }
+                }
+                // These bytes pass rkyv's memory/representation checks. Only
+                // BatchPlan::checked can reject their inconsistent semantics.
+                let decoded = BatchPlan::decode_wire(&plan.encode_wire().unwrap()).unwrap();
+                let error = decoded.restore_requests(&requests, &pending).unwrap_err();
+                assert!(error.to_string().contains(expected), "{error}");
+            }
+        });
     }
 }

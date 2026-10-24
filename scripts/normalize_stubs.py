@@ -50,6 +50,11 @@ PARAMETERS = {
         "prompt_target_token_ids": f"{U32_INPUT} | None",
         "media": "Sequence[MediaInput | None] | None",
     },
+    ("BatchPlan", "_from_wire"): {
+        "data": "npt.NDArray[np.uint8]",
+        "requests": "dict[int, Any]",
+        "pending": "dict[int, Any]",
+    },
     ("CacheGroupPlan", "__new__"): {
         name: U32_INPUT
         for name in (
@@ -128,6 +133,7 @@ RETURNS = {
     ("InklingResponseParser", "feed"): "list[ParserEvent]",
     ("InklingResponseParser", "finish"): "list[ParserEvent]",
     ("BatchPlan", "sequence_ids"): "npt.NDArray[np.uint64]",
+    ("BatchPlan", "_to_wire"): "npt.NDArray[np.uint8]",
     **{
         (owner, name): "npt.NDArray[np.uint32]"
         for owner, names in (

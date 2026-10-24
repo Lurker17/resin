@@ -69,7 +69,6 @@ def test_packet_roundtrips_all_plan_fields_and_full_width_ids(batch_key):
     original = rich_plan(batch_key)
     packet = PlanTransport().prepare(original)
     restored = PlanTransport().restore(packet)
-    assert packet.header.dtype == np.uint64 and packet.header.flags.c_contiguous
     assert packet.data.dtype == np.uint8 and packet.data.flags.c_contiguous
     assert len(packet.registrations) == 2
     assert restored.batch_id == original.batch_id
@@ -185,7 +184,6 @@ def test_restore_owns_step_arrays_and_registration_buffers():
     restored = receiver.restore(packet)
     receiver.clear()
     packet.data.fill(0)
-    packet.header.fill(0)
     for registration in packet.registrations:
         for array in registration.buffers:
             array.fill(0)
@@ -327,22 +325,43 @@ def test_restore_is_atomic_and_requires_registration():
     assert receiver.restore(packet).sequence_ids.tolist() == [1]
 
 
-@pytest.mark.parametrize("damage", ["header", "length", "data", "trailing"])
+@pytest.mark.parametrize(
+    "damage", ["dtype", "strided", "magic", "version", "truncated", "trailing"]
+)
 def test_malformed_packet_cannot_commit_registrations(damage):
     packet = PlanTransport().prepare(BatchPlan([1], [0], [7], [0, 1]))
     receiver = PlanTransport()
     match damage:
-        case "header":
-            broken = replace(packet, header=packet.header.astype(np.int64))
-        case "length":
-            broken = replace(packet, header=packet.header[:-1])
-        case "data":
-            broken = replace(packet, data=packet.data[:-1])
+        case "dtype":
+            data = packet.data.astype(np.int64)
+        case "strided":
+            storage = np.zeros(packet.data.size * 2, dtype=np.uint8)
+            storage[::2] = packet.data
+            data = storage[::2]
+        case "magic":
+            data = packet.data.copy()
+            data[0] ^= 0xFF
+        case "version":
+            data = packet.data.copy()
+            data[8] ^= 0xFF
+        case "truncated":
+            data = packet.data[:-1]
         case _:
-            broken = replace(packet, data=np.append(packet.data, np.uint8(0)))
-    with pytest.raises(ValueError, match="plan packet"):
-        receiver.restore(broken)
+            data = np.append(packet.data, np.uint8(0))
+    with pytest.raises((ValueError, TypeError)):
+        receiver.restore(replace(packet, data=data))
     assert receiver.restore(packet).token_ids.tolist() == [7]
+
+
+def test_archive_accepts_unaligned_transport_storage():
+    packet = PlanTransport().prepare(rich_plan(None))
+    storage = np.zeros(packet.data.size + 1, dtype=np.uint8)
+    storage[1:] = packet.data
+    assert storage[1:].ctypes.data % 8 != 0
+    restored = PlanTransport().restore(replace(packet, data=storage[1:]))
+    np.testing.assert_array_equal(restored.token_ids, [10, 11, 12])
+    storage.fill(0)
+    np.testing.assert_array_equal(restored.cache_groups[0].block_indptr, [0, 2, 3])
 
 
 def test_clear_requires_registering_live_requests_again():

@@ -388,7 +388,7 @@ impl CacheLayout {
 /// cached-token location: `(append_slab_ids[k], append_slotnums[k],
 /// append_block_offsets[k])`.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct CacheGroupPlan {
     inner: Arc<KvGroupPlan>,
 }

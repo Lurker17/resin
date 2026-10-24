@@ -20,8 +20,8 @@ class CommandTransport:
     """
 
     _operations = ("bind", "release", "forward", "finish", "close")
-    _version = 1
-    _header_size = 13
+    _version = 2
+    _header_size = 12
 
     def __init__(self, distributed, group, *, source=0):
         self.distributed, self.group, self.source = distributed, group, source
@@ -54,7 +54,6 @@ class CommandTransport:
                 sizes.size // 2,
                 ids.size,
                 len(error),
-                0 if packet is None else packet.header.size,
                 0 if packet is None else packet.data.size,
                 0 if packet is None else len(packet.registrations),
             ],
@@ -66,7 +65,7 @@ class CommandTransport:
             np.frombuffer(error, np.uint8),
         ]
         if packet is not None:
-            pieces.extend((packet.header.view(np.uint8), packet.data))
+            pieces.append(packet.data)
         body = np.concatenate(pieces)
         self._broadcast(header)
         if body.size:
@@ -89,24 +88,17 @@ class CommandTransport:
             size_count,
             id_count,
             error_size,
-            plan_header_size,
             plan_size,
             registrations,
         ) = map(int, header)
         if version != self._version or operation >= len(self._operations):
             raise ValueError("unsupported replica command format")
         details_size = (size_count * 2 + id_count) * 8
-        body = np.empty(
-            details_size + error_size + plan_header_size * 8 + plan_size, np.uint8
-        )
+        body = np.empty(details_size + error_size + plan_size, np.uint8)
         if body.size:
             self._broadcast(body)
         details = body[:details_size].view(np.uint64)
         offset = details_size + error_size
-        plan_header = np.frombuffer(
-            body, dtype=np.uint64, count=plan_header_size, offset=offset
-        )
-        plan_data = body[offset + plan_header_size * 8 :]
         admitted = tuple(self._receive_registration() for _ in range(registrations))
         return {
             "operation": self._operations[operation],
@@ -120,9 +112,7 @@ class CommandTransport:
             ),
             "ids": details[size_count * 2 :].tolist(),
             "error": body[details_size:offset].tobytes().decode() or None,
-            "payload": PlanPacket(plan_header, plan_data, admitted)
-            if plan_header_size
-            else None,
+            "payload": PlanPacket(body[offset:], admitted) if plan_size else None,
         }
 
     def _send_registration(self, registration):
