@@ -153,6 +153,15 @@ def _serve_rank(rank, world_size, directory, port, case):
                 codec=codec,
                 model=model,
                 enable_openai=not (case == "flags" and groups.drivers.local_rank == 0),
+                request_queue_capacity=(
+                    2
+                    if case == "request_queue_capacity"
+                    and groups.drivers.local_rank == 1
+                    else 0
+                    if case == "invalid_request_queue_capacity"
+                    and groups.drivers.local_rank == 1
+                    else 1024
+                ),
                 stream_interval=(
                     3
                     if case == "normal"
@@ -240,6 +249,8 @@ def _wait_ready(base, directory):
         ("frontend", 2),
         ("stream_interval", 2),
         ("invalid_stream_interval", 2),
+        ("request_queue_capacity", 2),
+        ("invalid_request_queue_capacity", 2),
     ],
 )
 def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size):
@@ -359,13 +370,16 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
         "initialize",
         "stream_interval",
         "invalid_stream_interval",
+        "request_queue_capacity",
+        "invalid_request_queue_capacity",
     ):
         assert len({record["error"] for record in records}) == 1
         assert records[0]["error"] is not None
         assert all(record["engine_closed"] for record in records)
-        if case == "stream_interval":
+        if case in ("stream_interval", "request_queue_capacity"):
             assert "configuration must agree" in records[0]["error"]
-        elif case == "invalid_stream_interval":
-            assert "stream_interval must be a positive integer" in records[0]["error"]
+        elif case.startswith("invalid_"):
+            setting = case.removeprefix("invalid_")
+            assert f"{setting} must be a positive integer" in records[0]["error"]
     else:
         assert all("injected" in record["error"] for record in records)

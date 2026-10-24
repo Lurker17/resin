@@ -152,17 +152,23 @@ def test_http_server_validates_route_configuration() -> None:
         )
 
 
-@pytest.mark.parametrize("interval", [0, -1, 2**32, True, False, 1.5, "2", None])
-def test_http_server_requires_a_positive_integer_stream_interval(interval) -> None:
+@pytest.mark.parametrize("setting", ["stream_interval", "request_queue_capacity"])
+@pytest.mark.parametrize("value", [0, -1, 2**32, True, False, 1.5, "2", None])
+def test_http_server_requires_positive_integer_settings(setting, value) -> None:
     engine = Engine(IncrementingRunner())
-    with pytest.raises(ValueError, match="stream_interval.*positive integer"):
-        HttpServer(engine, codec=_Codec(), model="test", stream_interval=interval)
+    with pytest.raises(ValueError, match=f"{setting}.*positive integer"):
+        HttpServer(engine, codec=_Codec(), model="test", **{setting: value})
     assert not engine.closed
     engine.close()
 
 
-@pytest.mark.parametrize("interval", [None, 4, 2**32 - 1])
-def test_http_server_forwards_default_and_custom_stream_interval(interval, monkeypatch):
+@pytest.mark.parametrize(
+    "setting,default", [("stream_interval", 1), ("request_queue_capacity", 1024)]
+)
+@pytest.mark.parametrize("value", [None, 4, 2**32 - 1])
+def test_http_server_forwards_default_and_custom_settings(
+    setting, default, value, monkeypatch
+):
     import resin.server as serving
 
     created = []
@@ -173,17 +179,24 @@ def test_http_server_forwards_default_and_custom_stream_interval(interval, monke
 
     monkeypatch.setattr(serving, "_HttpServer", native)
     engine = Engine(IncrementingRunner())
-    options = {} if interval is None else {"stream_interval": interval}
+    options = {} if value is None else {setting: value}
     server = HttpServer(engine, codec=_Codec(), model="test", **options)
     assert server.model == "test"
-    assert created[0]["stream_interval"] == (1 if interval is None else interval)
+    assert created[0][setting] == (default if value is None else value)
     engine.close()
 
 
-def test_native_http_server_rejects_zero_stream_interval():
+@pytest.mark.parametrize("setting", ["stream_interval", "request_queue_capacity"])
+def test_native_http_server_rejects_zero_settings(setting):
     from resin._resin import _HttpServer
 
     engine = Engine(IncrementingRunner())
-    with pytest.raises(ValueError, match="stream_interval.*positive"):
-        _HttpServer(engine, _Codec(), model="test", stream_interval=0)
+    with pytest.raises(ValueError, match=f"{setting}.*positive"):
+        _HttpServer(
+            engine,
+            _Codec(),
+            model="test",
+            stream_interval=0 if setting == "stream_interval" else 1,
+            request_queue_capacity=0 if setting == "request_queue_capacity" else 1024,
+        )
     engine.close()

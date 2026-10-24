@@ -6,7 +6,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 
 import pytest
 from test_recipe import _byte_tokenizer, _FastTokenizer, _token_ids
@@ -67,12 +67,12 @@ def request_body(content="fast", *, stream=False, max_tokens=2):
 
 
 @contextmanager
-def running_server(runner, codec=None):
+def running_server(runner, codec=None, **options):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     engine = Engine(runner)
-    server = HttpServer(engine, codec=codec or Codec(), model="test")
+    server = HttpServer(engine, codec=codec or Codec(), model="test", **options)
     errors = []
 
     def serve():
@@ -126,6 +126,66 @@ def test_programmatic_shutdown_stops_idle_server_and_closes_engine():
         with pytest.raises(OSError):
             socket.create_connection(("127.0.0.1", port), timeout=0.2)
         server.shutdown()  # Shutdown remains harmless after serving has stopped.
+
+
+def test_configured_intake_queue_rejects_overflow_then_drains_and_recovers():
+    rendering = threading.Event()
+    resume = threading.Event()
+
+    class BlockingCodec(Codec):
+        def render(self, request):
+            if not rendering.is_set():
+                rendering.set()
+                assert resume.wait(timeout=5), "test did not release the first render"
+            return super().render(request)
+
+    with running_server(Runner(), BlockingCodec(), request_queue_capacity=2) as (
+        _server,
+        engine,
+        _thread,
+        errors,
+        base,
+        _port,
+    ):
+        with ExitStack() as responses:
+            streams = []
+            try:
+                streams.append(
+                    responses.enter_context(post(base, request_body(stream=True)))
+                )
+                assert rendering.wait(timeout=2)
+                # The actor holds the first job; exactly two more fit in ingress.
+                for _ in range(2):
+                    streams.append(
+                        responses.enter_context(post(base, request_body(stream=True)))
+                    )
+                with pytest.raises(urllib.error.HTTPError) as caught:
+                    post(base, request_body())
+                with caught.value as response:
+                    assert response.code == 429
+                    assert "queue is full" in json.load(response)["error"]["message"]
+            finally:
+                resume.set()
+            for response in streams:
+                payloads = [
+                    line.removeprefix("data: ")
+                    for line in response.read().decode().splitlines()
+                    if line.startswith("data: ")
+                ]
+                assert response.status == 200
+                assert payloads[-1] == "[DONE]"
+                choices = [json.loads(value)["choices"][0] for value in payloads[:-1]]
+                assert (
+                    "".join(
+                        (choice["delta"].get("content") or "") for choice in choices
+                    )
+                    == "okok"
+                )
+                assert choices[-1]["finish_reason"] == "length"
+        with post(base, request_body()) as response:
+            assert json.load(response)["choices"][0]["message"]["content"] == "okok"
+        assert not engine.poisoned
+        assert errors == []
 
 
 def test_actor_failure_stops_listener_and_propagates_from_serve():
