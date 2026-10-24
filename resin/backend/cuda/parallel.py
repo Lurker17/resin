@@ -5,9 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
+
+from resin.backend.topology import RankGroup
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +104,14 @@ class TensorParallelContext:
                 "single-rank tensor parallelism cannot use a process group"
             )
 
+    @classmethod
+    def from_group(cls, group: RankGroup | None) -> TensorParallelContext:
+        """Bind one mesh axis, treating singleton groups as local execution."""
+
+        if group is None or group.size == 1:
+            return cls()
+        return cls(TensorParallelLayout(group.local_rank, group.size), group.handle)
+
     @property
     def rank(self) -> int:
         return self.layout.rank
@@ -125,6 +136,22 @@ class TensorParallelContext:
 
         if self.process_group is not None:
             dist.barrier(group=self.process_group)
+
+
+def replicated_cache_capacity(capacity: int, group: RankGroup | None) -> int:
+    """Agree on cache capacity before ranks allocate the same logical slots.
+
+    ``group`` is the host-side attention replica group, including every KV head
+    shard and replicated attention copy driven by the same scheduler.
+    """
+
+    if group is None or group.size == 1:
+        return capacity
+    # Gloo writes on worker threads outside the caller's inference-mode scope.
+    with torch.inference_mode(False):
+        value = torch.tensor(capacity, dtype=torch.int64, device="cpu")
+        dist.all_reduce(value, op=dist.ReduceOp.MIN, group=group.handle)
+    return int(value.item())
 
 
 class FlashInferAllReduce:
@@ -200,4 +227,5 @@ __all__ = [
     "TensorParallelContext",
     "TensorParallelLayout",
     "TensorShard",
+    "replicated_cache_capacity",
 ]

@@ -27,19 +27,27 @@ covering the complete serving world. The coordinator never
 infers model weight layouts or uses the default world group for those operations.
 
 CUDA runners declare `parallelism_capabilities`; the shared base defaults to
-single-rank execution. GPT-OSS and DeepSeek-V4 declare attention TP, attention DP,
-CP, EP, and expert TP. Attention replication is always allowed; it repeats the
-same attention computation without introducing another sharding axis.
+single-rank execution. The current CUDA implementations declare:
+
+| Model | Attention TP | Attention DP | CP | EP | Expert / dense FFN TP |
+| --- | --- | --- | --- | --- | --- |
+| GPT-OSS | Yes | Yes | Yes | Yes | Yes |
+| DeepSeek-V4 / V4.1 | No: one MLA KV head | Yes | Yes | Yes | Yes |
+| Gemma 4 | Yes | No | No | No | Yes |
+| Qwen3.5 / Qwen3.8 | Yes | No | No | No | Yes |
+| Inkling | No | No | No | No | No |
+
+Attention replication is always allowed; it repeats the same attention
+computation without introducing another sharding axis.
 These axes compose through the explicit `parallel_groups=` preparation path.
 Model dimensions, quantization blocks, and kernel capabilities still constrain
 valid layouts. DeepSeek-V4
 DSpark uses the same meshes for draft and target verification, including
 empty-replica participation and captured expert exchanges.
-Both explicit-group paths provide
+The GPT-OSS and DeepSeek explicit-group paths provide
 captured prefill FFN and attention-projection regions, plus full decode graphs.
-GPT-OSS EP additionally
-requires a kernel advertising FP32 local expert partials so the cross-rank
-combine does not add an intermediate activation rounding step.
+GPT-OSS's FlashInfer implementation returns FP32 local expert partials so the
+cross-rank combine does not add an intermediate activation rounding step.
 `DistributedWorker` validates a declared capability set collectively before
 serving begins. Custom distributed runners may supply the same declaration.
 
@@ -47,7 +55,72 @@ See [DeepSeek-V4 parallelism](deepseek-v4-parallelism.md) and
 [GPT-OSS parallelism](gpt-oss-parallelism.md) for the implemented
 model paths and real-GPU validation commands.
 
-## CUDA graphs across expert owners
+### Dense model tensor parallelism
+
+Gemma and Qwen accept `Parallelism(world_size=2, attn_tp=2)` for attention and
+FFN TP together. `Parallelism(world_size=2)` instead replicates attention and
+shards the FFNs. Both configurations keep one request Engine and one logical
+batch; neither introduces attention-DP request routing. These models require
+`attn_dp=cp=ep=1`, so dense FFN TP equals `world_size`.
+
+Attention TP partitions complete KV heads. Gemma requires the TP size to divide
+both its 16 sliding-window and four global KV heads, as well as its query heads;
+the assistant uses the corresponding target KV shards. Qwen requires divisibility
+of its full-attention query/KV heads and DeltaNet key/value heads. Qwen also shards
+the recurrent state, convolution channels, and bundled MTP attention. Remaining
+attention copies replicate their assigned head shard.
+
+The shared dense preparation partitions gate/up output rows and down input
+columns, then sums BF16 partial outputs before the model's residual or output
+normalization. It covers target and assistant/MTP FFNs. Intermediate widths must
+divide evenly by FFN TP; NVFP4 shards must also align to 64 channels. NVFP4 uses
+W4A16 kernels, retaining the checkpoint's packed weights and quantization scales.
+Checkpoint tensors are validated against their original shapes on CPU, sharded
+there, and transferred to CUDA before kernel layout preparation, avoiding a full
+unsharded model allocation on each GPU.
+
+These dense paths capture prefill FFN regions and the full decode forward,
+including attention and TP reductions. Prefill attention and recurrent-state
+updates remain eager.
+
+CPU tests cover head ordering, continued DeltaNet states, packed quantization
+coordinates, and reductions. The [two-B300 checkpoint run](https://modal.com/apps/ekzhang/main/ap-zoL3hOYaVgLsjvc54Nb6uC)
+exercised Gemma 4 31B NVFP4 and Qwen3.8 27B NVFP4, with attention TP1/TP2,
+FFN TP2, and speculative lengths zero/two. It covers two-request decode,
+chunked prefill, assistant/MTP verification, generation and prompt scores,
+cancellation, and cache reuse. Generation logprobs currently select eager
+decode in these two runners; separate unscored requests exercise captured decode.
+
+The [eager/graph controls](https://modal.com/apps/ekzhang/main/ap-MScJzgLu2mX3n4eTB1KyLT)
+produce bit-exact tokens and scores at each fixed topology, including the
+unsharded baseline. Cross-topology BF16 arithmetic is not bit-exact. On this
+short workload, Gemma preserves generated IDs but prompt observed-logprob
+maximum differences reach 2.81 nats with attention TP2 and 4.68 with replicated
+attention. Qwen attention TP2 turns a 0.125-logit lead into a tie, changing the
+first generated token of one prompt; its prompt observed-logprob maximum
+difference is 0.117 nats. These are execution and arithmetic checks, not a
+model-quality evaluation. The validation report keeps these differences visible
+instead of accepting them through a blanket tolerance.
+
+A [Gemma projection diagnostic](https://modal.com/apps/ekzhang/main/ap-pSi5v0KJxB1RH3uswRKunI)
+uses actual checkpoint weights and prefill inputs from layers 0, 29 and 59.
+Gate/up projections and gated activations are bit-exact after sharding. The
+down-projection split differs by 0.268–0.303% relative L2; an independent
+dequantized reference reproduces this when each partial is rounded to BF16
+before addition. Packed weight/scales retain the original quantization groups.
+A [single-GPU split-FFN control](https://modal.com/apps/ekzhang/main/ap-sJJhAtGlzOUBvYLiiAYUE5)
+then reproduces every distributed FFN-TP2 prompt score exactly, including the
+4.68-nat maximum difference. It runs both shards locally and adds their BF16
+outputs, establishing that this drift comes from the split FFN arithmetic rather
+than distributed communication, cache mapping, or graph execution.
+
+Run `deploy.dense_parallel_validation.run_validation(model, checkpoint,
+assistant_path=None)` in a two-GPU environment with the deployment dependencies;
+`model` is `"gemma4"` or `"qwen3_5"`. Pass the Gemma assistant checkpoint to include
+its speculative cases. Raw checkpoint and control records are retained under
+`artifacts/cuda-model-improvements/`.
+
+## CUDA graphs across ranks
 
 Graph-enabled CUDA runners call `runner.capture_cuda_graphs()` on every rank
 before constructing workers or entering serving loops. All ranks must configure

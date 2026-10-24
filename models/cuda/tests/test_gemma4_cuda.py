@@ -121,13 +121,23 @@ def test_default_graph_history_uses_packed_cache_and_context_bounds(
         max_position_embeddings=641,
         history_blocks_per_parent=4,
         num_attention_heads=2,
+        num_key_value_heads=2,
+        num_global_key_value_heads=1,
         head_dim=4,
         global_head_dim=8,
         hidden_size=8,
         vocab_size=16,
     )
     model = SimpleNamespace(prepare_attention=lambda: None)
-    assistant_config = SimpleNamespace(backbone_hidden_size=8, vocab_size=16)
+    assistant_config = SimpleNamespace(
+        backbone_hidden_size=8,
+        vocab_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_global_key_value_heads=1,
+        head_dim=4,
+        global_head_dim=8,
+    )
     received = []
 
     def initialize(runner, **options):
@@ -356,6 +366,7 @@ def test_graph_attention_contract_matches_capture_and_replay(
         ),
     )
     runner.speculative_tokens = speculative_tokens
+    runner.attention_config = runner.config
     setattr(runner, "_assistant", object())
     setattr(
         runner,

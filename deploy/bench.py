@@ -468,9 +468,9 @@ def run_benchmark(
     if model.startswith("gpt-oss") and topology.world_size == 1:
         from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
 
-        limit = FlashInferSM90MXFP4Kernel.capabilities.max_tokens
+        limit = FlashInferSM90MXFP4Kernel.max_tokens
         budget = max(case["batch_size"] for case in cases) * prefill_chunk_size
-        if limit is not None and budget > limit:
+        if budget > limit:
             raise ValueError(
                 f"single-GPU GPT-OSS prefill budget {budget} exceeds the kernel's "
                 f"{limit}-token limit; reduce batch size or prefill_chunk_size"

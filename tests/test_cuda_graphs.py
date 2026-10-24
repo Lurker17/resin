@@ -318,8 +318,8 @@ class TestCudaGraph:
         runner.device = runner_runtime.torch.device("cuda:0")
         runner._cuda_graph_executor = None
         runner._prefill_buffers = {}
-        runner._expert_graph_model = model
-        runner._expert_graph_groups = SimpleNamespace(
+        runner._parallel_graph_model = model
+        runner._parallel_graph_groups = SimpleNamespace(
             distributed=SimpleNamespace(barrier=barrier),
             domain=SimpleNamespace(handle=object()),
         )
@@ -840,8 +840,8 @@ class TestCudaGraph:
         runner = CudaRunner.__new__(CudaRunner)
         runner._cuda_graph_executor = executor
         runner._prefill_buffers = {"retained": object()}
-        runner._expert_graph_model = None
-        runner._expert_graph_groups = None
+        runner._parallel_graph_model = None
+        runner._parallel_graph_groups = None
 
         runner.close_cuda_graphs()
         runner.close_cuda_graphs()

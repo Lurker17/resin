@@ -13,10 +13,13 @@ import torch
 from resin.backend.cuda.parallel import TensorParallelLayout
 from resin.backend.topology import ParallelGroups, RankGroup
 from resin.models.gpt_oss.config import GptOssConfig
+from resin_models_cuda.gpt_oss.flashinfer import (
+    FlashInferSM90MXFP4Kernel,
+    MXFP4Config,
+)
 from resin_models_cuda.gpt_oss.mxfp4 import (
     EXPERT_CHECKPOINT_NAMES,
     kernel_expert_factory,
-    moe_kernel_config,
     shard_checkpoint_tensor,
     shard_model_config,
 )
@@ -304,6 +307,7 @@ def test_checkpoint_prepares_independent_attention_ep_and_expert_tp_shards(
     )
     dispatches = []
     prepared = []
+    validated_devices = []
 
     class Dispatch:
         def __init__(self, local, *, num_experts, groups, replication):
@@ -311,10 +315,12 @@ def test_checkpoint_prepares_independent_attention_ep_and_expert_tp_shards(
             assert replication == (groups.attn_tp, groups.attn_replication)
 
     class Kernel:
-        capabilities = SimpleNamespace(supports_fp32_partial=True)
-
         def forward_partial(self, *args):
             raise AssertionError("weight preparation must not execute experts")
+
+        def validate_device(self, device):
+            validated_devices.append(device)
+            assert prepared == []
 
         def validate(self, config):
             assert config.num_experts == 4
@@ -328,6 +334,7 @@ def test_checkpoint_prepares_independent_attention_ep_and_expert_tp_shards(
             return weights
 
     def load_weights(root, model, *, transform_tensor, install_expert_layer, **kwargs):
+        assert validated_devices == [torch.device("cpu")]
         model.to_empty(device="cpu")
         tensors = {
             "gate_up_proj_blocks": torch.zeros(8, 192, 1, 16, dtype=torch.uint8),
@@ -346,7 +353,6 @@ def test_checkpoint_prepares_independent_attention_ep_and_expert_tp_shards(
         )
 
     monkeypatch.setattr(mxfp4, "ExpertParallelDispatch", Dispatch)
-    monkeypatch.setattr(checkpoint, "cuda_architecture", lambda device: "sm90")
     monkeypatch.setattr(checkpoint, "load_gpt_oss_weights", load_weights)
     model, _ = checkpoint.load_model(
         tmp_path,
@@ -355,6 +361,7 @@ def test_checkpoint_prepares_independent_attention_ep_and_expert_tp_shards(
         parallel_groups=cast(ParallelGroups, groups),
     )
     assert dispatches == [(8, groups)]
+    assert validated_devices == [torch.device("cpu")]
     assert len(prepared) == 1
     assert model.args.intermediate_size == 32
     assert model.args.num_attention_heads == 2
@@ -371,7 +378,7 @@ def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty(monke
     args = _args()
     local_args = SimpleNamespace(**vars(args))
     local_args.num_local_experts = 4
-    config = moe_kernel_config(local_args, "sm90")
+    config = MXFP4Config.from_model(local_args)
     groups = SimpleNamespace(
         ep=RankGroup((0, 1), object(), 1),
         attn_tp=RankGroup((1,), object(), 0),
@@ -381,19 +388,17 @@ def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty(monke
     storage = object()
 
     class Kernel:
-        capabilities = SimpleNamespace(supports_fp32_partial=True)
-
-        def forward_partial(self, hidden, routing, weights, actual):
-            assert actual is config and weights is storage
-            calls.append(routing)
+        def forward_partial(self, hidden, indices, route_weights, weights):
+            assert weights is storage
+            calls.append((indices, route_weights))
             result = torch.zeros_like(hidden, dtype=torch.float32)
             for expert in range(config.num_experts):
                 # CUTLASS's W4 expert map stops at the first matching slot.
                 # A foreign zero-weight expert-0 placeholder would conceal
                 # the real owned expert-0 route later in the same row.
-                matches = routing.selected_experts == expert
+                matches = indices == expert
                 first = matches.int().argmax(1)
-                scales = routing.expert_weights.gather(1, first[:, None])
+                scales = route_weights.gather(1, first[:, None])
                 scales = scales * matches.any(1)[:, None]
                 result += hidden * scales * (expert + 5)
             return result
@@ -406,16 +411,17 @@ def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty(monke
     indices = torch.tensor([[0, 4], [7, 3], [5, 6]])
     weights = torch.tensor([[0.2, 0.8], [0.4, 0.6], [0.3, 0.7]])
     output = module.forward_local(hidden, indices, weights)
+    assert output.dtype == torch.float32
     torch.testing.assert_close(output[:, 0], torch.tensor([4.0, 3.2, 6.7]))
-    assert calls[0].selected_experts.tolist() == [[4, 0], [3, 4], [1, 2]]
+    assert calls[0][0].tolist() == [[4, 0], [3, 4], [1, 2]]
     torch.testing.assert_close(
-        calls[0].expert_weights,
+        calls[0][1],
         torch.tensor([[0.0, 0.8], [0.4, 0.0], [0.3, 0.7]]),
     )
-    assert calls[0].router_logits.shape == (3, 4)
     assert torch.equal(weights, torch.tensor([[0.2, 0.8], [0.4, 0.6], [0.3, 0.7]]))
     empty = module.forward_local(hidden[:0], indices[:0], weights[:0])
     assert empty.shape == (0, 32) and len(calls) == 1
+    assert empty.dtype == torch.float32
 
     # Both the torch router (int64/BF16) and idle ranks use one wire format.
     routed = []
@@ -425,7 +431,7 @@ def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty(monke
         return hidden
 
     module._dispatch = dispatch
-    module(hidden, indices, weights.bfloat16(), torch.empty(3, 8))
+    module(hidden, indices, weights.bfloat16())
     module.forward_empty()
     for _, expert_ids, probabilities in routed:
         assert expert_ids.dtype == torch.int32
@@ -434,9 +440,31 @@ def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty(monke
     assert routed[1][1].shape == routed[1][2].shape == (0, 2)
 
 
-def test_ep_rejects_kernels_without_fp32_partial_execution():
+def test_ep_requires_prepared_weights_before_local_execution_or_dispatch(monkeypatch):
+    from resin_models_cuda.gpt_oss import mxfp4
+
+    def dispatch(*args, **kwargs):
+        raise AssertionError("unprepared experts must not enter a collective")
+
+    monkeypatch.setattr(
+        mxfp4, "ExpertParallelDispatch", lambda *args, **kwargs: dispatch
+    )
     args = _args()
-    config = moe_kernel_config(args, "sm90")
-    with pytest.raises(ValueError, match="FP32 forward_partial"):
-        # Reject the kernel before reading any fields from this opaque group.
-        kernel_expert_factory(object(), config, parallel_groups=object())  # ty: ignore[invalid-argument-type]
+    config = replace(MXFP4Config.from_model(args), num_experts=4)
+    groups = SimpleNamespace(
+        ep=RankGroup((0, 1), object(), 0),
+        attn_tp=RankGroup((0,), object(), 0),
+        attn_replication=RankGroup((0,), object(), 0),
+    )
+    module = kernel_expert_factory(
+        FlashInferSM90MXFP4Kernel(),
+        config,
+        parallel_groups=cast(ParallelGroups, groups),
+    )(args)
+    hidden = torch.ones(1, args.hidden_size, dtype=torch.bfloat16)
+    indices = torch.tensor([[0, 7]])
+    weights = torch.tensor([[0.25, 0.75]])
+    with pytest.raises(RuntimeError, match="weights have not been loaded"):
+        module.forward_local(hidden, indices, weights)
+    with pytest.raises(RuntimeError, match="weights have not been loaded"):
+        module(hidden, indices, weights)

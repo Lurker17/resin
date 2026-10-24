@@ -115,7 +115,7 @@ class _RegionRunner(CudaRunner):
         self.runner_config = RunnerConfig()
         self.prefill_chunk_size = _PRODUCER_ROWS
         self.replays = []
-        self._configure_expert_parallel_graphs(torch.nn.Module(), groups)
+        self._configure_parallel_graphs(torch.nn.Module(), groups)
         self._configure_cuda_graphs(
             {"decode": CudaGraphMode((), _unused, lambda shape: {})}
         )

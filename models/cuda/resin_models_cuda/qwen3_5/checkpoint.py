@@ -7,17 +7,27 @@ from typing import Any, cast
 
 import torch
 
+from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.loading import (
     MODEL_FILES,
     assign_model_tensor,
+    prepare_model,
     read_config,
     resolve_model,
 )
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 from resin.backend.torch import use_default_dtype
 from resin.models.qwen3_5.config import Qwen35Config
+from resin_models_cuda.dense_parallel import shard_dense_mlp
 from resin_models_cuda.nvfp4 import prepare_nvfp4_modules, select_nvfp4_backend
-from resin_models_cuda.qwen3_5.model import Qwen3_5ForConditionalGeneration
+from resin_models_cuda.qwen3_5.model import (
+    Qwen3_5ForConditionalGeneration,
+    Qwen35MLP,
+)
+from resin_models_cuda.qwen3_5.parallel import (
+    prepare_attention_parallel,
+    shard_attention_config,
+)
 
 DEFAULT_MODEL = "RadixArk/Qwen3.8-27B-NVFP4"
 DEFAULT_REVISION = "554ebba9b5f1b79dc11246341960360e6ef05ef4"
@@ -131,6 +141,8 @@ def load_model(
     include_mtp: bool,
     include_vision: bool = True,
     nvfp4_backend: str = "auto",
+    tensor_parallel: TensorParallelContext | None = None,
+    attention_parallel: TensorParallelContext | None = None,
 ) -> tuple[Qwen3_5ForConditionalGeneration, Qwen35Config, dict[str, Any]]:
     """Stream the target, visual tower, and optional bundled MTP weights."""
 
@@ -139,6 +151,8 @@ def load_model(
     model, config = build_meta_model(
         raw_config, include_mtp=include_mtp, include_vision=include_vision
     )
+    if attention_parallel is not None:
+        shard_attention_config(config, attention_parallel.layout)
     target = torch.device(device)
     if target.type != "cuda":
         raise ValueError("the Qwen3.5 CUDA runner can only load weights on CUDA")
@@ -149,8 +163,6 @@ def load_model(
                 "Qwen3.5 NVFP4 weights require Blackwell-class FP4 hardware, "
                 f"got sm{capability[0]}{capability[1]}"
             )
-    model.to_empty(device=target)
-
     expected = set(model.state_dict())
     tensor_files = _select_tensor_files(
         indexed_tensor_files(root, require_index=True),
@@ -158,23 +170,38 @@ def load_model(
         include_mtp=include_mtp,
         include_vision=include_vision,
     )
+    # Keep checkpoint storage mmap-backed until heads and FFNs are sharded.
+    # Allocating the full model on every GPU first defeats TP's memory savings.
+    host = torch.device("cpu")
     with SafetensorReader() as reader:
         for key, path in tensor_files.items():
-            assign_model_tensor(model, key, reader.read(path, key), device=target)
-    model.language_model.materialize_buffers(target)
+            assign_model_tensor(model, key, reader.read(path, key), device=host)
+    model.language_model.materialize_buffers(host)
     if model.visual is not None:
         rotary = model.visual.rotary_pos_emb
         rotary.inv_freq = 1.0 / (
             rotary.theta
             ** (
-                torch.arange(0, rotary.dim, 2, dtype=torch.float32, device=target)
+                torch.arange(0, rotary.dim, 2, dtype=torch.float32, device=host)
                 / rotary.dim
             )
         )
+    if attention_parallel is not None:
+        prepare_attention_parallel(model, attention_parallel)
+    prepared = prepare_model(
+        model,
+        lambda module: (
+            shard_dense_mlp(module, tensor_parallel)
+            if tensor_parallel is not None and isinstance(module, Qwen35MLP)
+            else module
+        ),
+    )
+    prepared.to(target)
     model = cast(
         Qwen3_5ForConditionalGeneration,
         prepare_nvfp4_modules(
-            model, select_nvfp4_backend(nvfp4_backend, torch.backends.cudnn.version())
+            prepared,
+            select_nvfp4_backend(nvfp4_backend, torch.backends.cudnn.version()),
         ),
     )
     model.eval()

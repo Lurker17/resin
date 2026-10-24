@@ -496,7 +496,7 @@ def test_decode_capture_wraps_experts_and_replica_sampling_broadcast(monkeypatch
         scopes.append((rows, int(valid_rows)))
         yield
 
-    runner._expert_graph_capacity = capacity
+    runner._parallel_graph_capacity = capacity
     step = runner._new_decode_graph_step((2, 1))
     step.inputs["token_ids"].copy_(torch.tensor([4, 6]))
     step.inputs["positions"].copy_(torch.tensor([3, 5]))

@@ -803,7 +803,7 @@ class Indexer(torch.nn.Module):
             cache_mapping=cache.index_mapping(self.layer_id),
             state_mapping=cache.state_mapping(INDEX_STATE_GROUP),
         )
-        return self._forward_graph(
+        return self._select(
             x, qr, position[:, None], offset, graph_seq_len, cache=cache
         )
 
@@ -820,12 +820,8 @@ class Indexer(torch.nn.Module):
     ) -> torch.Tensor:
         """Select compressed history for an arbitrary cached prompt suffix."""
 
-        batch_size, block_length, _ = x.shape
-        ratio, rope_dim = self.compress_ratio, self.rope_head_dim
-        if positions.shape != (batch_size, block_length):
+        if positions.shape != x.shape[:2]:
             raise ValueError("index prefill positions must match the token block")
-        if self.freqs_cis is None:
-            raise RuntimeError("index frequencies are not initialized")
 
         self.compressor.forward_prefill(
             x,
@@ -840,67 +836,24 @@ class Indexer(torch.nn.Module):
             x = x.index_select(1, query_indices)
             qr = qr.index_select(1, query_indices)
             positions = positions.index_select(1, query_indices)
-            block_length = query_indices.numel()
-        if block_length == 0:
-            return torch.empty(
-                (batch_size, 0, self.selected_capacity),
-                dtype=torch.int32,
-                device=x.device,
-            )
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rope_dim:], self.freqs_cis[positions])
-        q = rotate_activation(q)
-        fp4_act_quant(q, fp4_block_size, True)
-        weights = self.weights_proj(x)
-        width = math.ceil(sequence_length / ratio / 64) * 64
-        if width == 0:
-            return torch.full(
-                (batch_size, block_length, self.selected_capacity),
-                -1,
-                dtype=torch.int32,
-                device=x.device,
-            )
-        index_score = index_scores(
-            q,
-            cache.index_keys.view(-1, self.head_dim),
-            weights,
-            positions,
-            ratio,
-            self.softmax_scale * self.n_heads**-0.5,
-            cache_mapping=cache.index_mapping(self.layer_id),
-            cache_width=width,
-        )
-        if self.tensor_parallel.enabled:
-            index_score = self.allreduce(index_score)
-        complete = (positions + 1).div(ratio, rounding_mode="floor")
-        logical = _compact_topk_indices(
-            index_score.flatten(0, 1),
-            self.selected_capacity,
-            complete=complete.reshape(-1, 1),
-        ).view(batch_size, block_length, self.selected_capacity)
-        physical = cache.compressed_rows(
-            self.layer_id,
-            ratio,
-            logical.clamp_min(0) * ratio,
-        )
-        return torch.where(logical >= 0, physical, -1).to(torch.int32)
+        return self._select(x, qr, positions, 0, sequence_length, cache=cache)
 
-    def _forward_graph(
+    def _select(
         self,
         x: torch.Tensor,
         qr: torch.Tensor,
         positions: torch.Tensor,
         offset: int,
-        graph_seq_len: int,
+        sequence_length: int,
         *,
         cache: DeviceCache,
     ) -> torch.Tensor:
-        """Score one fixed graph block with one projection and collective."""
+        """Score and map local queries with the same kernels in every phase."""
 
         bsz, block_length, _ = x.shape
         ratio = self.compress_ratio
-        width = math.ceil(graph_seq_len / ratio / 64) * 64
-        if width == 0:
+        width = math.ceil(sequence_length / ratio / 64) * 64
+        if width == 0 or block_length == 0:
             return torch.full(
                 (bsz, block_length, self.selected_capacity),
                 -1,
@@ -1405,7 +1358,7 @@ class Attention(nn.Module):
         generated_compressed_width = 0
         if ratio:
             if self.indexer is not None:
-                block_compressed_indices = self.indexer._forward_graph(
+                block_compressed_indices = self.indexer._select(
                     x,
                     qr,
                     token_positions,

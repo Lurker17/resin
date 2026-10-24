@@ -12,11 +12,13 @@ from resin.backend.cuda.parallel import TensorParallelLayout
 from resin.backend.loading import read_config
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 from resin.models.gpt_oss.config import GptOssConfig
-from resin.moe_kernels import MoEExpertWeights, MoERouting
-from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
+from resin_models_cuda.gpt_oss.flashinfer import (
+    FlashInferSM90MXFP4Kernel,
+    MXFP4Config,
+    MXFP4Weights,
+)
 from resin_models_cuda.gpt_oss.mxfp4 import (
     EXPERT_CHECKPOINT_NAMES,
-    moe_kernel_config,
     shard_checkpoint_tensor,
 )
 
@@ -120,7 +122,7 @@ def _weights(raw):
         if name.endswith("_blocks"):
             value = value.flatten(-2)
         tensors[_RAW_FIELDS[name]] = value
-    return MoEExpertWeights(**tensors)
+    return MXFP4Weights(**tensors)
 
 
 @torch.inference_mode()
@@ -134,7 +136,6 @@ def run_expert_probe(model_path, reference_path, *, device="cuda:0"):
     hidden = reference["hidden"].to(device=device, dtype=torch.bfloat16)
     indices = reference["indices"].to(device=device, dtype=torch.int32)
     probabilities = reference["weights"].to(device=device, dtype=torch.float32)
-    routing = MoERouting(reference["logits"].to(device), indices, probabilities)
     paths = indexed_tensor_files(Path(model_path))
     raw = {}
     with SafetensorReader() as reader:
@@ -142,10 +143,10 @@ def run_expert_probe(model_path, reference_path, *, device="cuda:0"):
             key = f"model.layers.0.mlp.experts.{name}"
             raw[name] = reader.read(paths[key], key).to(device)
     kernel = FlashInferSM90MXFP4Kernel()
-    config = moe_kernel_config(args, "sm90")
+    config = MXFP4Config.from_model(args)
     prepared = kernel.prepare_weights(_weights(raw), config)
-    full = kernel.forward(hidden, routing, prepared, config)
-    full_partial = kernel.forward_partial(hidden, routing, prepared, config)
+    full = kernel.forward(hidden, indices, probabilities, prepared)
+    full_partial = kernel.forward_partial(hidden, indices, probabilities, prepared)
     del prepared
     report = {
         "gpu": torch.cuda.get_device_name(),
@@ -184,20 +185,19 @@ def run_expert_probe(model_path, reference_path, *, device="cuda:0"):
                         args.intermediate_size, alignment=32, name="intermediate_size"
                     )
                     local = replace(config, intermediate_size=intermediate.size)
-                    selected = routing
+                    selected, selected_weights = indices, probabilities
                 else:
                     experts = layout.even_shard(
                         args.num_local_experts, name="num_experts"
                     )
                     local = replace(config, num_experts=experts.size)
                     owned = (indices >= experts.start) & (indices < experts.stop)
-                    selected = MoERouting(
-                        routing.router_logits,
-                        torch.where(owned, indices - experts.start, experts.size),
-                        probabilities.masked_fill(~owned, 0),
-                    )
+                    selected = torch.where(owned, indices - experts.start, experts.size)
+                    selected_weights = probabilities.masked_fill(~owned, 0)
                 prepared = kernel.prepare_weights(_weights(shard), local)
-                result += kernel.forward_partial(hidden, selected, prepared, local)
+                result += kernel.forward_partial(
+                    hidden, selected, selected_weights, prepared
+                )
                 del prepared, shard
             name = f"{axis}{size}"
             oracle = dense[f"bf16_fc2_tp{size}" if axis == "expert_tp" else "bf16_fc2"]

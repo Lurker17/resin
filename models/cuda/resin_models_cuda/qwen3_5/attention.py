@@ -52,7 +52,7 @@ class PreparedPagedAttention:
 
     wrapper: Any
     cache: SlabPagedKvCache
-    logical_pages: Tensor
+    base_pages: Tensor
     physical_pages: Tensor
     layer_count: int
     tokens: int
@@ -60,7 +60,7 @@ class PreparedPagedAttention:
     def run(self, queries: Tensor, layer: int) -> Tensor:
         if not 0 <= layer < self.layer_count:
             raise ValueError("Qwen3.5 attention layer lies outside its cache group")
-        self.physical_pages.copy_(self.logical_pages * self.layer_count + layer)
+        torch.add(self.base_pages, layer, out=self.physical_pages)
         query = queries[:, 0] if self.tokens == 1 else queries.flatten(0, 1)
         output = self.wrapper.run(query, (self.cache.keys, self.cache.values))
         return output.view_as(queries)
@@ -127,7 +127,8 @@ class PagedAttentionRuntime:
         page_table = group.slab_ids * pages_per_slab + group.slotnums
         columns = torch.arange(width, device=self.device)[None]
         logical_pages = page_table[columns < required_pages[:, None]].to(torch.int32)
-        physical_pages = logical_pages * layer_count
+        base_pages = logical_pages * layer_count
+        physical_pages = base_pages.clone()
         kv_indptr = torch.zeros(
             len(used_lengths) + 1, dtype=torch.int32, device=self.device
         )
@@ -156,7 +157,7 @@ class PagedAttentionRuntime:
         return PreparedPagedAttention(
             wrapper,
             cache,
-            logical_pages,
+            base_pages,
             physical_pages,
             layer_count,
             tokens,
@@ -215,8 +216,8 @@ class GraphPagedAttentionRuntime:
         for spec in specs:
             group = cache.groups[spec.group_index]
             page_capacity = batch_size * group.slab_ids.shape[1]
-            logical_pages = torch.empty(page_capacity, dtype=torch.int32, device=device)
-            physical_pages = torch.empty_like(logical_pages)
+            base_pages = torch.empty(page_capacity, dtype=torch.int32, device=device)
+            physical_pages = torch.empty_like(base_pages)
             kv_indptr = torch.empty(batch_size + 1, dtype=torch.int32, device=device)
             last = torch.empty(batch_size, dtype=torch.int32, device=device)
             common = {
@@ -276,7 +277,7 @@ class GraphPagedAttentionRuntime:
                     PreparedPagedAttention(
                         wrapper,
                         cache,
-                        logical_pages,
+                        base_pages,
                         physical_pages,
                         spec.layer_count,
                         spec.tokens,
@@ -318,7 +319,7 @@ class GraphPagedAttentionRuntime:
 
     def graph_inputs(self) -> dict[str, Tensor]:
         return {
-            f"attention.{index}.logical_pages": call.prepared.logical_pages
+            f"attention.{index}.base_pages": call.prepared.base_pages
             for index, call in enumerate(self.calls)
         }
 
@@ -418,7 +419,7 @@ class GraphPagedAttentionRuntime:
                 page_tokens=self.cache.page_tokens,
                 common=common,
             )
-            inputs[f"attention.{index}.logical_pages"] = logical
+            inputs[f"attention.{index}.base_pages"] = physical
         self.reset()
         return inputs
 

@@ -190,9 +190,7 @@ class DenseExperts(nn.Module):
         hidden: Tensor,
         expert_indices: Tensor,
         routing_weights: Tensor,
-        router_logits: Tensor | None = None,
     ) -> Tensor:
-        del router_logits
         gate_up = torch.einsum(
             "tkhi,th->tki", self.gate_up_proj[expert_indices], hidden
         )
@@ -223,8 +221,8 @@ class MLP(nn.Module):
     def forward(self, hidden: Tensor) -> Tensor:
         shape = hidden.shape
         flat = hidden.reshape(-1, shape[-1])
-        logits, weights, indices = self.router(flat)
-        return self.experts(flat, indices, weights, logits).reshape(shape)
+        _, weights, indices = self.router(flat)
+        return self.experts(flat, indices, weights).reshape(shape)
 
 
 class MoEDecoderLayer(nn.Module):

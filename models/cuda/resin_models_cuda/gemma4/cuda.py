@@ -27,6 +27,10 @@ from resin.backend.cuda.graphs import (
     GraphShape,
     resolve_decode_graph_shapes,
 )
+from resin.backend.cuda.parallel import (
+    TensorParallelContext,
+    replicated_cache_capacity,
+)
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
@@ -38,6 +42,7 @@ from resin.backend.cuda.sampling import (
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, format_output, prompt_scores
 from resin.backend.speculative import SpeculativeStats
+from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.models.gemma4.config import SLIDING_ATTENTION
 from resin.models.gemma4.media import Gemma4Media
 from resin.models.gemma4.plan import (
@@ -61,7 +66,10 @@ from resin_models_cuda.gemma4.checkpoint import (
     load_model,
     resolve_model_path,
 )
-from resin_models_cuda.gemma4.model import Gemma4ForConditionalGeneration
+from resin_models_cuda.gemma4.model import (
+    Gemma4ForConditionalGeneration,
+)
+from resin_models_cuda.gemma4.parallel import attention_geometry
 from resin_models_cuda.nvfp4 import select_nvfp4_backend as _select_nvfp4_backend
 
 if TYPE_CHECKING:
@@ -85,12 +93,21 @@ def plan_gemma4_kv_capacity(
     *,
     workspace_bytes: int = _DEFAULT_WORKSPACE_BYTES,
     cache_element_bytes: int = 1,
+    tensor_parallel_size: int = 1,
 ) -> CacheCapacityPlan:
     if cache_element_bytes not in {1, 2}:
         raise ValueError("cache_element_bytes must be one or two")
+    if (
+        type(tensor_parallel_size) is not int
+        or tensor_parallel_size <= 0
+        or 4 % tensor_parallel_size
+    ):
+        raise ValueError("tensor_parallel_size must divide both Gemma KV head counts")
     # One parent holds all 50 local layers for one 64-token page. Global
     # history pages use an equal-sized, differently shaped view of a parent.
-    bytes_per_parent = 2 * 50 * PAGE_SIZE * 16 * 256 * cache_element_bytes
+    bytes_per_parent = (
+        2 * 50 * PAGE_SIZE * (16 // tensor_parallel_size) * 256 * cache_element_bytes
+    )
     return plan_cache_capacity(
         total_memory_bytes,
         free_memory_bytes,
@@ -154,6 +171,7 @@ class Gemma4CudaRunner(CudaRunner):
     page_size = PAGE_SIZE
     prefill_chunk_size = PREFILL_CHUNK_SIZE
     sliding_window = SLIDING_WINDOW
+    parallelism_capabilities = ParallelismCapabilities(attn_tp=True, expert_tp=True)
 
     def __init__(
         self,
@@ -171,7 +189,19 @@ class Gemma4CudaRunner(CudaRunner):
         cuda_graph_decode: str = "full",
         cuda_graph_decode_shapes: object | None = None,
         static_memory_fraction: float = 0.95,
+        parallel_groups: ParallelGroups | None = None,
     ) -> None:
+        if parallel_groups is not None:
+            self.parallelism_capabilities.validate(
+                parallel_groups.topology, model="Gemma 4"
+            )
+        self.parallel_groups = parallel_groups
+        self.attention_parallel = TensorParallelContext.from_group(
+            None if parallel_groups is None else parallel_groups.attn_tp
+        )
+        self.expert_parallel = TensorParallelContext.from_group(
+            None if parallel_groups is None else parallel_groups.expert_tp
+        )
         if cache_parent_capacity is not None and (
             isinstance(cache_parent_capacity, bool)
             or not isinstance(cache_parent_capacity, int)
@@ -204,8 +234,16 @@ class Gemma4CudaRunner(CudaRunner):
 
         self.model_path = resolve_model_path(model, revision)
         self._model, self.config, self.raw_config = load_model(
-            self.model_path, device=self.device, nvfp4_backend=nvfp4_backend
+            self.model_path,
+            device=self.device,
+            nvfp4_backend=nvfp4_backend,
+            tensor_parallel=self.expert_parallel,
+            attention_parallel=self.attention_parallel,
         )
+        self.attention_config = attention_geometry(
+            self.config, self.attention_parallel.layout
+        )
+        self._configure_parallel_graphs(self._model, parallel_groups)
         self.nvfp4_backend = nvfp4_backend
         self.speculative_tokens = speculative_tokens
         self._assistant = None
@@ -216,7 +254,10 @@ class Gemma4CudaRunner(CudaRunner):
                 selected_assistant, assistant_revision
             )
             self._assistant, assistant_config = load_assistant(
-                self.assistant_path, device=self.device
+                self.assistant_path,
+                device=self.device,
+                tensor_parallel=self.expert_parallel,
+                attention_parallel=self.attention_parallel,
             )
             if assistant_config.backbone_hidden_size != self.config.hidden_size:
                 raise ValueError(
@@ -224,6 +265,15 @@ class Gemma4CudaRunner(CudaRunner):
                 )
             if assistant_config.vocab_size != self.config.vocab_size:
                 raise ValueError("assistant vocabulary does not match Gemma 4 target")
+            for field in (
+                "num_attention_heads",
+                "num_key_value_heads",
+                "num_global_key_value_heads",
+                "head_dim",
+                "global_head_dim",
+            ):
+                if getattr(assistant_config, field) != getattr(self.config, field):
+                    raise ValueError(f"assistant {field} does not match Gemma 4 target")
         self._speculation = SpeculativeStats(speculative_tokens)
         self._graph_attention: dict[GraphShape, tuple[Any, Any]] = {}
         self._graph_spec_attention: dict[GraphShape, tuple[Any, Any, Any, Any]] = {}
@@ -237,15 +287,19 @@ class Gemma4CudaRunner(CudaRunner):
             workspace_bytes=(
                 2 * _GRAPH_WORKSPACE_BYTES
                 + PREFILL_CHUNK_SIZE
-                * self.config.num_attention_heads
+                * self.attention_config.num_attention_heads
                 * (self.config.head_dim + self.config.global_head_dim)
                 * _PREFILL_WORKSPACE_BYTES_PER_ELEMENT
             ),
             cache_element_bytes=cache_dtype.itemsize,
+            tensor_parallel_size=self.attention_parallel.size,
         )
         local_capacity = capacity_plan.parent_capacity
         if cache_parent_capacity is not None:
             local_capacity = min(local_capacity, cache_parent_capacity)
+        local_capacity = replicated_cache_capacity(
+            local_capacity, None if parallel_groups is None else parallel_groups.replica
+        )
         self.cache_parent_capacity = local_capacity
         self.cache_capacity_plan = replace(
             capacity_plan,
@@ -311,7 +365,7 @@ class Gemma4CudaRunner(CudaRunner):
         )
         self._cache = _Gemma4KvArena(
             self.device,
-            self.config,
+            self.attention_config,
             self.cache_parent_capacity,
             dtype=cache_dtype,
         )
@@ -357,7 +411,7 @@ class Gemma4CudaRunner(CudaRunner):
         def prefill_workspace(head_dim: int) -> Tensor:
             size = (
                 PREFILL_CHUNK_SIZE
-                * self.config.num_attention_heads
+                * self.attention_config.num_attention_heads
                 * head_dim
                 * _PREFILL_WORKSPACE_BYTES_PER_ELEMENT
             )
@@ -411,8 +465,8 @@ class Gemma4CudaRunner(CudaRunner):
                 local.kv_indptr,
                 local.page_indices,
                 local.last_page_lengths,
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
+                self.attention_config.num_attention_heads,
+                self.attention_config.num_key_value_heads,
                 self.config.head_dim,
                 PAGE_SIZE,
                 custom_mask=custom_mask,
@@ -428,8 +482,8 @@ class Gemma4CudaRunner(CudaRunner):
                 global_.kv_indptr,
                 global_.page_indices,
                 global_.last_page_lengths,
-                self.config.num_attention_heads,
-                self.config.num_global_key_value_heads,
+                self.attention_config.num_attention_heads,
+                self.attention_config.num_global_key_value_heads,
                 self.config.global_head_dim,
                 PAGE_SIZE,
                 causal=True,
@@ -451,8 +505,8 @@ class Gemma4CudaRunner(CudaRunner):
             local.kv_indptr,
             local.page_indices,
             local.last_page_lengths,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
+            self.attention_config.num_attention_heads,
+            self.attention_config.num_key_value_heads,
             self.config.head_dim,
             PAGE_SIZE,
             window_left=SLIDING_WINDOW - 1,
@@ -462,8 +516,8 @@ class Gemma4CudaRunner(CudaRunner):
             global_.kv_indptr,
             global_.page_indices,
             global_.last_page_lengths,
-            self.config.num_attention_heads,
-            self.config.num_global_key_value_heads,
+            self.attention_config.num_attention_heads,
+            self.attention_config.num_global_key_value_heads,
             self.config.global_head_dim,
             PAGE_SIZE,
             **common,
@@ -740,11 +794,11 @@ class Gemma4CudaRunner(CudaRunner):
             args = (qo_indptr, *args)
         wrapper.plan(
             *args,
-            self.config.num_attention_heads,
+            self.attention_config.num_attention_heads,
             (
-                self.config.num_key_value_heads
+                self.attention_config.num_key_value_heads
                 if local
-                else self.config.num_global_key_value_heads
+                else self.attention_config.num_global_key_value_heads
             ),
             self.config.head_dim if local else self.config.global_head_dim,
             PAGE_SIZE,

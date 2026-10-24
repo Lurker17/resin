@@ -271,7 +271,7 @@ class GptOssCudaRunner(CudaRunner):
             tensor_parallel=self.tensor_parallel.layout,
             parallel_groups=parallel_groups,
         )
-        self._configure_expert_parallel_graphs(self._model, parallel_groups)
+        self._configure_parallel_graphs(self._model, parallel_groups)
         self._graph_logits = {}
         self._last_graph_logits = None
         args = self._model.args
@@ -745,7 +745,7 @@ class GptOssCudaRunner(CudaRunner):
             return hidden
         logits = _router_logits(mlp.router, flat)
         indices, weights = _route(mlp.router, logits)
-        return mlp.experts(flat, indices, weights, logits).reshape(shape)
+        return mlp.experts(flat, indices, weights).reshape(shape)
 
     def _forward_batch(
         self,
@@ -858,7 +858,7 @@ class GptOssCudaRunner(CudaRunner):
         )
 
         def launch() -> None:
-            with self._expert_graph_capacity(batch_size, valid_rows=valid_rows):
+            with self._parallel_graph_capacity(batch_size, valid_rows=valid_rows):
                 hidden = self._forward_batch(token_ids, positions, batch)
                 final_hidden.index_copy_(0, batch.sequence_indices, hidden)
                 logits = self._model.lm_head(final_hidden)
@@ -1160,7 +1160,7 @@ def _route(router: TopKRouter, logits: Tensor) -> tuple[Tensor, Tensor]:
             router.benchmark_expert_parallel_size,
         )
         return indices, torch.softmax(logits.gather(1, indices), dim=-1)
-    if router.top_k == 4 and logits.shape[-1] == 128:
+    if router.top_k == 4 and logits.shape[-1] in (32, 128):
         return top4_softmax(logits)
     values, indices = torch.topk(logits, router.top_k, dim=-1, sorted=True)
     return indices, torch.softmax(values, dim=-1)

@@ -1,11 +1,81 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
 import torch
 from test_qwen3_5_config import _qwen38
 
 from resin import CacheGroupFamily
+from resin.backend.cuda.parallel import TensorParallelLayout
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_cuda.qwen3_5.cache import CacheArena, CacheGeometry
+
+
+@pytest.mark.parametrize("size", [2, 4])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_tp_cache_restores_local_recurrent_state_and_replicated_mtp_hidden(
+    size, kv_dtype
+):
+    from test_qwen3_5_model import _tiny_config
+
+    from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
+    from resin_models_cuda.qwen3_5.parallel import shard_attention_config
+
+    config = replace(
+        _tiny_config(),
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+    )
+    local = shard_attention_config(config, TensorParallelLayout(size=size))
+    geometry = CacheGeometry.from_config(
+        local, include_mtp=True, kv_element_bytes=kv_dtype.itemsize
+    )
+    arena = CacheArena("cpu", geometry.layout(2), geometry, kv_dtype=kv_dtype)
+    cache = arena.graph_cache(batch_size=1, sequence_capacity=4097)
+    for group in cache.groups:
+        group.slab_ids.zero_()
+        group.slotnums.zero_()
+        group.first_blocks.zero_()
+    cache.groups[1].slab_ids.copy_(torch.tensor([[1, 2]], dtype=torch.int32))
+    assert arena.keys.shape[-2] == config.num_key_value_heads // size
+    assert arena.values.shape == arena.keys.shape
+    assert len(cache.groups) == 3  # Target KV, recurrent state, and MTP KV.
+
+    recurrent = torch.randn(
+        1,
+        config.linear_layer_count,
+        config.linear_num_value_heads // size,
+        config.linear_key_head_dim,
+        config.linear_value_head_dim,
+    )
+    convolution = torch.randn(
+        1,
+        config.linear_layer_count,
+        config.linear_conv_dim // size,
+        config.linear_conv_kernel_dim - 1,
+        dtype=torch.bfloat16,
+    )
+    hidden = torch.randn(1, config.hidden_size, dtype=torch.bfloat16)
+    runner = Qwen3_5CudaRunner.__new__(Qwen3_5CudaRunner)
+    for position, multiplier in ((4095, 1), (4096, 2)):
+        runner._store_state(
+            cache,
+            torch.tensor([position]),
+            recurrent * multiplier,
+            convolution * multiplier,
+            hidden * multiplier,
+        )
+    # The two recurrent checkpoints occupy separate slots across a chunk
+    # boundary. TP partitions heads/channels but keeps the MTP hidden row whole.
+    for context, multiplier in ((4096, 1), (4097, 2), (0, 0)):
+        restored = runner._initial_state(cache, torch.tensor([context]))
+        for actual, expected in zip(
+            restored, (recurrent, convolution, hidden), strict=True
+        ):
+            torch.testing.assert_close(actual, expected * multiplier)
 
 
 def test_qwen38_cache_geometry_accounts_for_fp32_recurrent_state() -> None:

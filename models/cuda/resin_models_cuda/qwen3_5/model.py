@@ -56,6 +56,13 @@ class Qwen35RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden: Tensor) -> Tensor:
+        if hidden.is_cuda:
+            from flashinfer.norm import gemma_rmsnorm
+
+            # This kernel uses Qwen's FP32 (1 + checkpoint_weight) convention.
+            return gemma_rmsnorm(
+                hidden.reshape(-1, hidden.shape[-1]), self.weight, eps=self.eps
+            ).view_as(hidden)
         normalized = hidden.float() * torch.rsqrt(
             hidden.float().square().mean(-1, keepdim=True) + self.eps
         )
@@ -69,6 +76,11 @@ class Qwen35GatedRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden: Tensor, gate: Tensor) -> Tensor:
+        if hidden.is_cuda:
+            from fla.modules.fused_norm_gate import rms_norm_gated
+
+            # FLA supports bias=None but its public annotation omits it.
+            return rms_norm_gated(hidden, gate, self.weight, None, eps=self.eps)  # ty: ignore[invalid-argument-type]
         normalized = hidden.float() * torch.rsqrt(
             hidden.float().square().mean(-1, keepdim=True) + self.eps
         )
@@ -179,9 +191,6 @@ class Qwen35GatedDeltaNet(nn.Module):
             self.config.linear_num_value_heads,
             self.config.linear_value_head_dim,
         )
-        repeats = self.config.linear_num_value_heads // self.config.linear_num_key_heads
-        query = query.repeat_interleave(repeats, dim=2)
-        key = key.repeat_interleave(repeats, dim=2)
         beta = self.in_proj_b(hidden).sigmoid()
         decay = -self.A_log.float().exp() * F.softplus(
             self.in_proj_a(hidden).float() + self.dt_bias
@@ -198,10 +207,19 @@ class Qwen35GatedDeltaNet(nn.Module):
 
         kernels = _fla_kernels() if hidden.is_cuda else None
         if kernels is None:
+            repeats = (
+                self.config.linear_num_value_heads // self.config.linear_num_key_heads
+            )
             core, recurrent_state = _reference_delta_rule(
-                query, key, value, decay, beta, recurrent_state
+                query.repeat_interleave(repeats, dim=2),
+                key.repeat_interleave(repeats, dim=2),
+                value,
+                decay,
+                beta,
+                recurrent_state,
             )
         else:
+            # FLA handles grouped value heads without materializing repeated Q/K.
             chunk, recurrent = kernels
             kernel = recurrent if tokens == 1 else chunk
             core, recurrent_state = kernel(

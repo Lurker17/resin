@@ -6,16 +6,17 @@ import cuda.tile as ct
 import torch
 from torch import Tensor
 
-_NUM_EXPERTS = 128
 _TOP_K = 4
 _NEGATIVE = -3.402823466e38
 
 
 @ct.kernel
-def _top4_softmax_kernel(logits, expert_indices, expert_weights):
+def _top4_softmax_kernel(
+    logits, expert_indices, expert_weights, num_experts: ct.Constant[int]
+):
     row = ct.bid(0)
-    scores = ct.load(logits, (row, 0), shape=(1, _NUM_EXPERTS))
-    expert_ids = ct.arange(_NUM_EXPERTS, dtype=ct.int32).reshape((1, _NUM_EXPERTS))
+    scores = ct.load(logits, (row, 0), shape=(1, num_experts))
+    expert_ids = ct.arange(num_experts, dtype=ct.int32).reshape((1, num_experts))
 
     index0 = ct.argmax(scores, 1, keepdims=True)
     score0 = ct.max(scores, 1, keepdims=True)
@@ -52,7 +53,11 @@ def _top4_softmax_kernel(logits, expert_indices, expert_weights):
 def top4_softmax(logits: Tensor) -> tuple[Tensor, Tensor]:
     """Select four experts per row and emit FlashInfer-ready routing tensors."""
 
-    rows = logits.shape[0]
+    if logits.ndim != 2 or logits.shape[1] not in (32, 128):
+        raise ValueError("GPT-OSS routing requires 32 or 128 experts")
+    if logits.dtype != torch.bfloat16:
+        raise TypeError("GPT-OSS routing requires BF16 logits")
+    rows, num_experts = logits.shape
     expert_indices = torch.empty(
         (rows, _TOP_K),
         dtype=torch.int32,
@@ -67,7 +72,7 @@ def top4_softmax(logits: Tensor) -> tuple[Tensor, Tensor]:
         torch.cuda.current_stream(logits.device),
         (rows,),
         _top4_softmax_kernel,
-        (logits, expert_indices, expert_weights),
+        (logits, expert_indices, expert_weights, num_experts),
     )
     return expert_indices, expert_weights
 

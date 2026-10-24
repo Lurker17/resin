@@ -1,7 +1,7 @@
 """GPT-OSS FlashInfer Hopper MXFP4 fused-MoE kernel adapter.
 
-The public boundary is :mod:`resin.moe_kernels`; this module contains only the
-FlashInfer-specific cold-path layout conversion and hot-path invocation.
+Checkpoint preparation and execution are specific to GPT-OSS: MXFP4 group-32
+weights, paired gate/up rows, biased projections, and capped SwiGLU.
 
 FlashInfer's SM90 W4A16 scale layout groups four consecutive MXFP4 groups.
 For a width of 2880 (90 groups), preparation pads the hidden and intermediate
@@ -17,18 +17,12 @@ model-facing kernel interface.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
-
-from resin.moe_kernels import (
-    MoEExpertWeights,
-    MoEKernelCapabilities,
-    MoEKernelConfig,
-    MoERouting,
-    UnsupportedMoEConfiguration,
-)
+from torch import Tensor
 
 KERNEL_ID = "flashinfer_cutlass_sm90_mxfp4"
 _MXFP4_GROUP_SIZE = 32
@@ -37,43 +31,75 @@ _K_ALIGNMENT = _MXFP4_GROUP_SIZE * _SM90_SCALE_ALIGNMENT
 _MAX_TOKENS = 8192
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MXFP4Config:
+    """GPT-OSS expert dimensions after EP and intermediate-channel TP sharding."""
+
+    top_k: int
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+    swiglu_limit: float
+
+    def __post_init__(self) -> None:
+        for name in ("top_k", "num_experts", "hidden_size", "intermediate_size"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.top_k > self.num_experts:
+            raise ValueError("top_k cannot exceed num_experts")
+        if self.hidden_size % 32 or self.intermediate_size % 32:
+            raise ValueError(
+                "MXFP4 hidden and intermediate sizes must be divisible by 32"
+            )
+        if (
+            isinstance(self.swiglu_limit, bool)
+            or not isinstance(self.swiglu_limit, (int, float))
+            or not math.isfinite(self.swiglu_limit)
+            or self.swiglu_limit <= 0
+        ):
+            raise ValueError("swiglu_limit must be finite and positive")
+
+    @classmethod
+    def from_model(cls, args):
+        return cls(
+            top_k=args.num_experts_per_tok,
+            num_experts=args.num_local_experts,
+            hidden_size=args.hidden_size,
+            intermediate_size=args.intermediate_size,
+            swiglu_limit=args.swiglu_limit,
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MXFP4Weights:
+    """Checkpoint tensors: paired gate/up rows and two input values per byte."""
+
+    gate_up: Tensor
+    down: Tensor
+    gate_up_scales: Tensor
+    down_scales: Tensor
+    gate_up_bias: Tensor
+    down_bias: Tensor
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedFlashInferMXFP4Weights:
-    """One layer's interleaved tensors, ready for the FlashInfer hot path."""
+    """One layer's interleaved tensors and dimensions for FlashInfer execution."""
 
-    fc1_weights: Any
-    fc2_weights: Any
-    fc1_scales: Any
-    fc2_scales: Any
-    fc1_bias: Any | None
-    fc2_bias: Any | None
-    swiglu_alpha: Any
-    swiglu_beta: Any
-    swiglu_limit: Any
-    hidden_size: int
+    fc1_weights: Tensor
+    fc2_weights: Tensor
+    fc1_scales: Tensor
+    fc2_scales: Tensor
+    fc1_bias: Tensor
+    fc2_bias: Tensor
+    swiglu_alpha: Tensor
+    swiglu_beta: Tensor
+    swiglu_limit: Tensor
     padded_hidden_size: int
-    intermediate_size: int
     padded_intermediate_size: int
-    config_key: tuple[object, ...]
-    fc2_zero_bias: Any | None = None
-
-
-def _config_key(config: MoEKernelConfig) -> tuple[object, ...]:
-    return (
-        config.architecture,
-        config.quantization,
-        config.activation,
-        config.top_k,
-        config.num_experts,
-        config.hidden_size,
-        config.intermediate_size,
-        config.group_size,
-        config.expert_bias,
-        float(config.activation_alpha),
-        float(config.activation_beta),
-        config.activation_limit,
-        config.gate_up_layout,
-    )
+    config: MXFP4Config
+    fc2_zero_bias: Tensor
 
 
 def _round_up(value: int, alignment: int) -> int:
@@ -155,36 +181,25 @@ def _reorder_and_pad_gate_up(tensor: Any, shape: tuple[int, ...], fill: int):
 class FlashInferSM90MXFP4Kernel:
     """Adapter for ``flashinfer.fused_moe.cutlass_fused_moe`` on H100."""
 
-    capabilities = MoEKernelCapabilities(
-        kernel_id=KERNEL_ID,
-        architectures=frozenset({"sm90"}),
-        quantizations=frozenset({"mxfp4"}),
-        activations=frozenset({"swiglu"}),
-        top_k_values=frozenset({4}),
-        group_sizes=frozenset({_MXFP4_GROUP_SIZE}),
-        supports_expert_bias=True,
-        min_experts=4,
-        max_experts=128,
-        min_tokens=1,
-        max_tokens=_MAX_TOKENS,
-        gate_up_layouts=frozenset({"interleaved_gate_up"}),
-        supports_fp32_partial=True,
-    )
+    max_tokens = _MAX_TOKENS
 
-    def supports(
-        self, config: MoEKernelConfig, *, num_tokens: int | None = None
-    ) -> bool:
-        if not self.capabilities.supports(config, num_tokens=num_tokens):
-            return False
-        return config.activation_limit is not None
+    def validate(self, config: MXFP4Config, *, num_tokens: int | None = None) -> None:
+        if config.top_k != 4:
+            raise ValueError("GPT-OSS FlashInfer requires top_k=4")
+        if not 4 <= config.num_experts <= 128:
+            raise ValueError("GPT-OSS FlashInfer requires 4 to 128 local experts")
+        if num_tokens is not None and (
+            type(num_tokens) is not int or not 1 <= num_tokens <= self.max_tokens
+        ):
+            raise ValueError(f"num_tokens must be between 1 and {self.max_tokens}")
 
-    def validate(
-        self, config: MoEKernelConfig, *, num_tokens: int | None = None
-    ) -> None:
-        self.capabilities.validate(config, num_tokens=num_tokens)
-        if config.activation_limit is None:
-            raise UnsupportedMoEConfiguration(
-                f"kernel {KERNEL_ID!r} requires activation_limit for SwiGLU"
+    def validate_device(self, device) -> None:
+        if device.type != "cuda":
+            raise ValueError("packed GPT-OSS MXFP4 execution requires a CUDA device")
+        capability = tuple(torch.cuda.get_device_capability(device))
+        if capability != (9, 0):
+            raise ValueError(
+                f"kernel {KERNEL_ID!r} requires SM90, got sm{capability[0]}{capability[1]}"
             )
 
     def _get_fused_moe(self):
@@ -210,13 +225,9 @@ class FlashInferSM90MXFP4Kernel:
     def _validate_sm90_tensor(self, tensor: Any, field: str) -> None:
         if not bool(getattr(tensor, "is_cuda", False)):
             raise ValueError(f"{field} must be a CUDA tensor")
-        capability = tuple(torch.cuda.get_device_capability(tensor.device))
-        if capability != (9, 0):
-            raise UnsupportedMoEConfiguration(
-                f"kernel {KERNEL_ID!r} requires SM90, got sm{capability[0]}{capability[1]}"
-            )
+        self.validate_device(tensor.device)
 
-    def _expected_shapes(self, config: MoEKernelConfig) -> dict[str, tuple[int, ...]]:
+    def _expected_shapes(self, config: MXFP4Config) -> dict[str, tuple[int, ...]]:
         experts = config.num_experts
         hidden = config.hidden_size
         intermediate = config.intermediate_size
@@ -231,7 +242,7 @@ class FlashInferSM90MXFP4Kernel:
         }
 
     def _validate_weight_field(
-        self, field: str, tensor: Any, config: MoEKernelConfig
+        self, field: str, tensor: Any, config: MXFP4Config
     ) -> None:
         expected = self._expected_shapes(config)[field]
         actual = _shape(tensor)
@@ -260,32 +271,17 @@ class FlashInferSM90MXFP4Kernel:
                 )
 
     def prepare_weights(
-        self, weights: MoEExpertWeights[Any], config: MoEKernelConfig
+        self, weights: MXFP4Weights, config: MXFP4Config
     ) -> PreparedFlashInferMXFP4Weights:
         self.validate(config)
         fused_moe = self._get_fused_moe()
 
-        required = {
-            "gate_up": weights.gate_up,
-            "down": weights.down,
-            "gate_up_scales": weights.gate_up_scales,
-            "down_scales": weights.down_scales,
-        }
-        if config.expert_bias:
-            required.update(
-                gate_up_bias=weights.gate_up_bias,
-                down_bias=weights.down_bias,
-            )
-        missing = [field for field, tensor in required.items() if tensor is None]
-        if missing:
-            raise ValueError("missing MXFP4 expert tensors: " + ", ".join(missing))
-
-        present = [
-            (field, tensor) for field, tensor in required.items() if tensor is not None
+        tensors = [
+            (field, getattr(weights, field)) for field in self._expected_shapes(config)
         ]
-        for field, tensor in present:
+        for field, tensor in tensors:
             self._validate_weight_field(field, tensor, config)
-        self._validate_weight_devices(present)
+        self._validate_weight_devices(tensors)
 
         hidden = config.hidden_size
         intermediate = config.intermediate_size
@@ -332,38 +328,33 @@ class FlashInferSM90MXFP4Kernel:
         fc2_scales = _reinterpret_interleaved_scales(fc2_scales, "down_scales")
 
         device = weights.gate_up.device
-        fc1_bias = None
-        fc2_bias = None
-        if config.expert_bias:
-            assert weights.gate_up_bias is not None and weights.down_bias is not None
-            fc1_bias = weights.gate_up_bias.to(
-                device=device, dtype=torch.bfloat16
-            ).contiguous()
-            fc1_bias = _reorder_and_pad_gate_up(
-                fc1_bias, (experts, 2 * padded_intermediate), 0
-            )
-            fc2_bias = weights.down_bias.to(
-                device=device, dtype=torch.bfloat16
-            ).contiguous()
-            fc2_bias = _copy_into_padded(fc2_bias, (experts, padded_hidden), 0)
+        fc1_bias = weights.gate_up_bias.to(
+            device=device, dtype=torch.bfloat16
+        ).contiguous()
+        fc1_bias = _reorder_and_pad_gate_up(
+            fc1_bias, (experts, 2 * padded_intermediate), 0
+        )
+        fc2_bias = weights.down_bias.to(
+            device=device, dtype=torch.bfloat16
+        ).contiguous()
+        fc2_bias = _copy_into_padded(fc2_bias, (experts, padded_hidden), 0)
 
         activation_shape = (experts,)
         alpha = torch.full(
             activation_shape,
-            fill_value=float(config.activation_alpha),
+            fill_value=1.702,
             dtype=torch.float32,
             device=device,
         )
         beta = torch.full(
             activation_shape,
-            fill_value=float(config.activation_beta),
+            fill_value=1.0,
             dtype=torch.float32,
             device=device,
         )
-        assert config.activation_limit is not None
         limit = torch.full(
             activation_shape,
-            fill_value=float(config.activation_limit),
+            fill_value=float(config.swiglu_limit),
             dtype=torch.float32,
             device=device,
         )
@@ -377,29 +368,23 @@ class FlashInferSM90MXFP4Kernel:
             swiglu_alpha=alpha,
             swiglu_beta=beta,
             swiglu_limit=limit,
-            hidden_size=hidden,
             padded_hidden_size=padded_hidden,
-            intermediate_size=intermediate,
             padded_intermediate_size=padded_intermediate,
-            config_key=_config_key(config),
-            fc2_zero_bias=(
-                torch.full(
-                    (experts, padded_hidden),
-                    fill_value=0,
-                    dtype=torch.bfloat16,
-                    device=device,
-                )
-                if fc2_bias is not None
-                else None
+            config=config,
+            fc2_zero_bias=torch.full(
+                (experts, padded_hidden),
+                fill_value=0,
+                dtype=torch.bfloat16,
+                device=device,
             ),
         )
 
     def forward_partial(
         self,
-        hidden_states: Any,
-        routing: MoERouting[Any],
+        hidden_states: Tensor,
+        selected_experts: Tensor,
+        expert_weights: Tensor,
         weights: PreparedFlashInferMXFP4Weights,
-        config: MoEKernelConfig,
     ):
         """Keep weighted expert sums in FP32 until EP has combined all owners.
 
@@ -414,20 +399,21 @@ class FlashInferSM90MXFP4Kernel:
         back to the host or allocating tensors with data-dependent shapes.
         """
 
+        config = weights.config
         self.validate(config)
         result = hidden_states.new_zeros(hidden_states.shape, dtype=torch.float32)
         active = (
-            (routing.selected_experts >= 0)
-            & (routing.selected_experts < config.num_experts)
-            & (routing.expert_weights != 0)
+            (selected_experts >= 0)
+            & (selected_experts < config.num_experts)
+            & (expert_weights != 0)
         )
         # Both bias arguments must exist when FC1 has bias in the pinned ABI.
         # This view shares all packed weights; only the small zero bias is new.
         unbiased = replace(weights, fc2_bias=weights.fc2_zero_bias)
         assignments = hidden_states.shape[0] * config.top_k
-        limit = self.capabilities.max_tokens or assignments or 1
-        flat_experts = routing.selected_experts.reshape(-1)
-        flat_weights = routing.expert_weights.reshape(-1)
+        limit = self.max_tokens
+        flat_experts = selected_experts.reshape(-1)
+        flat_weights = expert_weights.reshape(-1)
         flat_active = active.reshape(-1)
         for start in range(0, assignments, limit):
             stop = min(start + limit, assignments)
@@ -453,17 +439,11 @@ class FlashInferSM90MXFP4Kernel:
                 indices.shape, device=hidden_states.device, dtype=torch.float32
             )
             scales[:, 0] = selected_active
-            selected = MoERouting(
-                hidden_states.new_zeros((count, config.num_experts)),
-                indices,
-                scales,
-            )
             output = self.forward(
-                hidden_states[token_rows], selected, unbiased, config
+                hidden_states[token_rows], indices, scales, unbiased
             ).float()
-            if weights.fc2_bias is not None:
-                safe_experts = experts.clamp(0, config.num_experts - 1).long()
-                output += weights.fc2_bias[safe_experts, : config.hidden_size].float()
+            safe_experts = experts.clamp(0, config.num_experts - 1).long()
+            output += weights.fc2_bias[safe_experts, : config.hidden_size].float()
             output *= flat_weights[start:stop, None].float()
             output.masked_fill_(~selected_active[:, None], 0)
             # Assignments are contiguous in token/top-k order. Reduce each
@@ -489,11 +469,12 @@ class FlashInferSM90MXFP4Kernel:
 
     def forward(
         self,
-        hidden_states: Any,
-        routing: MoERouting[Any],
+        hidden_states: Tensor,
+        selected_experts: Tensor,
+        expert_weights: Tensor,
         weights: PreparedFlashInferMXFP4Weights,
-        config: MoEKernelConfig,
     ):
+        config = weights.config
         tokens_shape = _shape(hidden_states)
         if len(tokens_shape) != 2:
             raise ValueError(
@@ -501,8 +482,6 @@ class FlashInferSM90MXFP4Kernel:
             )
         num_tokens, hidden_size = tokens_shape
         self.validate(config, num_tokens=num_tokens)
-        if weights.config_key != _config_key(config):
-            raise ValueError("prepared expert weights do not match this configuration")
         if hidden_size != config.hidden_size:
             raise ValueError(
                 f"hidden_states width must be {config.hidden_size}, got {hidden_size}"
@@ -520,14 +499,12 @@ class FlashInferSM90MXFP4Kernel:
             )
 
         expected_routing = {
-            "router_logits": (num_tokens, config.num_experts),
             "selected_experts": (num_tokens, config.top_k),
             "expert_weights": (num_tokens, config.top_k),
         }
         routing_values = {
-            "router_logits": routing.router_logits,
-            "selected_experts": routing.selected_experts,
-            "expert_weights": routing.expert_weights,
+            "selected_experts": selected_experts,
+            "expert_weights": expert_weights,
         }
         for field, expected in expected_routing.items():
             tensor = routing_values[field]
@@ -536,21 +513,19 @@ class FlashInferSM90MXFP4Kernel:
                 raise ValueError(f"{field} must have shape {expected}, got {actual}")
             if tensor.device != hidden_states.device:
                 raise ValueError(f"{field} must be on {hidden_states.device}")
-        if routing.selected_experts.dtype not in {torch.int32, torch.int64}:
+        if selected_experts.dtype not in {torch.int32, torch.int64}:
             raise ValueError("selected_experts must have an integer dtype")
         floating = {torch.float16, torch.bfloat16, torch.float32}
-        if routing.router_logits.dtype not in floating:
-            raise ValueError("router_logits must have a floating dtype")
-        if routing.expert_weights.dtype not in floating:
+        if expert_weights.dtype not in floating:
             raise ValueError("expert_weights must have a floating dtype")
 
         # Preserve the inactive ID config.num_experts for CUTLASS's range filter.
         # Its W4 prologue stores one row per (token, expert), stopping at the
         # first matching slot. A zero-weight duplicate can hide a real route.
-        selected_experts = routing.selected_experts.to(
+        selected_experts = selected_experts.to(
             device=hidden_states.device, dtype=torch.int32
         ).contiguous()
-        expert_weights = routing.expert_weights.to(
+        expert_weights = expert_weights.to(
             device=hidden_states.device, dtype=torch.float32
         ).contiguous()
 
@@ -606,6 +581,8 @@ class FlashInferSM90MXFP4Kernel:
 
 __all__ = [
     "KERNEL_ID",
+    "MXFP4Config",
+    "MXFP4Weights",
     "FlashInferSM90MXFP4Kernel",
     "PreparedFlashInferMXFP4Weights",
 ]

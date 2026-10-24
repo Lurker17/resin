@@ -127,14 +127,13 @@ class FlashInferSampler:
         if logits.shape[0] != len(values["temperatures"]):
             raise ValueError("sampling logits must contain one row per plan sequence")
 
-        greedy = logits.argmax(dim=-1)
         if not any(
             should_sample and temperature > 0.0
             for temperature, should_sample in zip(
                 values["temperatures"], values["sampling_mask"], strict=True
             )
         ):
-            result = greedy
+            result = logits.argmax(dim=-1)
         else:
             device = logits.device
             host = self.host_inputs(plan, logits.shape[-1], offset_delta=offset_delta)

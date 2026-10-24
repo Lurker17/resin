@@ -50,6 +50,25 @@ def test_short_convolution_split_matches_one_pass() -> None:
     torch.testing.assert_close(actual_state, expected_state)
 
 
+@requires_cutile
+@pytest.mark.parametrize("tokens", [1, 2, 127, 4096])
+def test_cuda_prefill_convolution_matches_fp32_reference(tokens: int) -> None:
+    torch.manual_seed(17)
+    convolution = ShortConvolution(1024).cuda()
+    with torch.no_grad():
+        convolution.weight.uniform_(-0.25, 0.25)
+    hidden = torch.randn(2, tokens, 1024, dtype=torch.bfloat16, device="cuda")
+    initial = torch.randn(2, 3, 1024, dtype=torch.bfloat16, device="cuda")
+    history = torch.cat((initial, hidden), dim=1)
+    expected = torch.nn.functional.conv1d(
+        history.transpose(1, 2).float(), convolution.weight, groups=1024
+    ).transpose(1, 2)
+    expected = (expected + hidden.float()).bfloat16()
+    actual, state = convolution(hidden, initial)
+    torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.00003)
+    torch.testing.assert_close(state, history[:, -3:], rtol=0, atol=0)
+
+
 def test_prefill_ffn_shared_output_preserves_convolution_state_and_dspark_taps():
     from test_cuda_runner_graph_policy import cpu_prefill_regions
 

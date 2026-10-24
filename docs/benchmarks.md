@@ -559,6 +559,48 @@ five-warmup/20-measurement windows reach 1,430.895 output tokens/s/GPU at batch
 separately in `artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-128k` and the
 [family qualification record](../models/cuda/resin_models_cuda/deepseek_v41/README.md).
 
+## CUDA model primitive checks
+
+The 2026-10-23 B300 probes cover GPT-OSS routing, DeepSeek-V4 indexer preparation,
+Inkling short convolution, and Qwen normalization/DeltaNet preparation. These
+are synthetic primitive measurements, not full-model throughput or interactivity
+results. CUDA-event intervals include repeated submissions from Python, so they
+can also include submission gaps. Compilation and graph capture precede timing.
+
+| Primitive | Shape | Timing mode | Before (µs) | After (µs) |
+| --- | --- | --- | ---: | ---: |
+| GPT-OSS 20B top-4 router | 8 rows, 32 experts | Graph replay | 14.39 | 4.12 |
+| GPT-OSS 20B top-4 router | 1,024 rows, 32 experts | Graph replay | 18.45 | 12.31 |
+| DeepSeek-V4 selected page rows | 1,024 queries, 131,072 context | Graph replay | 16.40 | 4.13 |
+| DeepSeek-V4 indexer RoPE | 1,024 queries, 131,072 context | Graph replay | 20.50 | 14.38 |
+| Qwen RMSNorm | 1,024 × 5,120 | Graph replay | 77.63 | 6.18 |
+| Qwen gated RMSNorm | 1,024 × 5,120 | Graph replay | 112.62 | 10.28 |
+| Qwen DeltaNet block | Batch 1, 1,024 tokens, synthetic width 256 | Graph replay | 186.30 | 151.40 |
+| Inkling short convolution | Batch 1, 4,096 tokens, width 4,096 | Eager launches | 496.74 | 122.11 |
+
+The 128-expert GPT router was already fused; the new production path is the
+32-expert router. V4 reuses its existing decode RoPE and page-map kernels during
+prefill. Qwen uses fused normalization and grouped value-head kernels without
+materializing repeated Q/K heads. Numerical probes compare independent reference
+paths and changed-input graph replays; Inkling also verifies chunk continuation
+and exact recurrent-state updates.
+
+The context-length audit found no kernel factory specializing on every exact
+context length in these paths. Inkling's new short-convolution kernel was checked
+across odd lengths 127/255/1,023/4,095/8,191 and power-of-two lengths
+128/256/1,024/4,096/8,192. Each layout class compiled once, then reused that
+specialization for the remaining lengths. This does not imply that different
+layouts, graph buckets, or kernel scheduling choices never compile separately.
+
+Raw results and source digests are in
+[`artifacts/cuda-model-improvements/result.json`](../artifacts/cuda-model-improvements/result.json)
+and the successful Qwen rerun
+[`qwen_result.json`](../artifacts/cuda-model-improvements/qwen_result.json).
+The first file records the initial Qwen probe failure; the rerun is the Qwen
+qualification record. The reproducible probes are
+`deploy/cuda_index_routing_probe.py`, `deploy/inkling_prefill_probe.py`, and
+`deploy/qwen3_5_kernel_probe.py`.
+
 ## Shared sampler checks
 
 On a CUDA environment with deployment dependencies, run:

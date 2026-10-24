@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -171,7 +171,7 @@ def test_indexer_updates_complete_compressor_before_selecting_queries(
         calls.append(("scores", q.shape[1], token_positions.clone()))
         return torch.zeros((1, len(local_indices), 64))
 
-    monkeypatch.setattr(native, "apply_rotary_emb", lambda *args: None)
+    monkeypatch.setattr(native, "rope_last_block_inplace", lambda *args: None)
     monkeypatch.setattr(native, "rotate_activation", lambda x: x)
     monkeypatch.setattr(native, "fp4_act_quant", lambda *args: None)
     monkeypatch.setattr(native, "index_scores", score)
@@ -192,11 +192,15 @@ def test_indexer_updates_complete_compressor_before_selecting_queries(
         wq_b=lambda qr: qr,
         weights_proj=lambda hidden: torch.ones(*hidden.shape[:2], 2),
     )
+    indexer._select = MethodType(native.Indexer._select, indexer)
+    monkeypatch.setattr(
+        native, "finish_index_topk", lambda indices, *args, **kwargs: indices
+    )
     cache = SimpleNamespace(
         index_keys=torch.zeros(16, 2),
         index_rows=lambda *args: positions,
         index_mapping=lambda layer: object(),
-        compressed_rows=lambda layer, ratio, values: values,
+        compressed_mapping=lambda *args: object(),
     )
 
     result = native.Indexer.forward_prefill(

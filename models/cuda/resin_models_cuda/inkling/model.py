@@ -52,6 +52,10 @@ class ShortConvolution(nn.Module):
             self.width,
         ):
             raise ValueError("Inkling short-convolution state has the wrong shape")
+        if hidden.is_cuda and hidden.dtype == torch.bfloat16 and self.width % 128 == 0:
+            from resin_models_cuda.inkling.cutile import short_convolution
+
+            return short_convolution(hidden, state, self.weight)
         combined = torch.cat((state, hidden), dim=1)
         convolved = F.conv1d(
             combined.transpose(1, 2).float(),
@@ -504,10 +508,12 @@ class InklingAttention(nn.Module):
         q = self.q_norm(q)
         relative = self.wr(hidden).view(batch * tokens, self.heads, -1)
         relative = relative @ self.rel_proj
-        if not self.local:
-            tau = log_scaling_tau(
-                positions, n_floor=self.log_floor, alpha=self.log_alpha
-            )
+        if not self.local and max_sequence_length > self.log_floor:
+            tau = attention_batch.log_tau
+            if tau is None:
+                tau = log_scaling_tau(
+                    positions, n_floor=self.log_floor, alpha=self.log_alpha
+                )
             q = (q.float() * tau[..., None, None]).to(q.dtype)
             relative = (relative.float() * tau.reshape(-1, 1, 1)).to(relative.dtype)
         attended = paged_attention(
@@ -782,7 +788,16 @@ class InklingTarget(nn.Module):
             max_sequence_length,
             batch=token_ids.shape[0],
             tokens=token_ids.shape[1],
-            layer_counts=(GLOBAL_LAYERS, LOCAL_LAYERS),
+            layer_counts={GLOBAL_GROUP: GLOBAL_LAYERS, LOCAL_GROUP: LOCAL_LAYERS},
+            log_tau=(
+                log_scaling_tau(
+                    positions,
+                    n_floor=self.config.log_scaling_n_floor,
+                    alpha=self.config.log_scaling_alpha,
+                )
+                if max_sequence_length > self.config.log_scaling_n_floor
+                else None
+            ),
         )
         if state_inputs_out is not None and state_inputs_out.shape != (
             token_ids.shape[0],

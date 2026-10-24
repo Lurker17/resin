@@ -797,15 +797,16 @@ class TestGptOssCudaTinyOracle:
             (128, False),
         ]
 
+    @pytest.mark.parametrize("experts", [32, 128])
     def test_official_top4_router_uses_cutile_and_other_layouts_fall_back(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, experts: int
     ) -> None:
         import torch
 
         official = cast(
             TopKRouter, SimpleNamespace(top_k=4, benchmark_balanced_experts=False)
         )
-        logits = torch.randn(32, 128, dtype=torch.bfloat16)
+        logits = torch.randn(32, experts, dtype=torch.bfloat16)
         expected_values, expected_indices = torch.topk(logits, 4, dim=-1, sorted=True)
         expected_weights = torch.softmax(expected_values, dim=-1)
         calls = []
@@ -818,7 +819,7 @@ class TestGptOssCudaTinyOracle:
             context.setattr("resin_models_cuda.gpt_oss.cuda.top4_softmax", top4_softmax)
             indices, weights = _route(official, logits)
 
-        assert calls == [torch.Size([32, 128])]
+        assert calls == [torch.Size([32, experts])]
         torch.testing.assert_close(indices, expected_indices.to(torch.int32))
         torch.testing.assert_close(weights, expected_weights.to(torch.float32))
 
@@ -830,7 +831,7 @@ class TestGptOssCudaTinyOracle:
         torch.testing.assert_close(indices, expected_indices)
         torch.testing.assert_close(weights, torch.softmax(values, dim=-1))
 
-        large_logits = torch.randn(8192, 128, dtype=torch.bfloat16)
+        large_logits = torch.randn(8192, experts, dtype=torch.bfloat16)
         large_values, large_indices = torch.topk(large_logits, 4, dim=-1, sorted=True)
         fused_calls = []
 

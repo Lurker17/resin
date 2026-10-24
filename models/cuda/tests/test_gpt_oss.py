@@ -154,12 +154,12 @@ class TestGptOssTorch:
             atol=1e-6,
         )
 
-    def test_expert_kernel_boundary_receives_all_routing_metadata(self) -> None:
+    def test_expert_boundary_receives_selected_routes_and_weights(self) -> None:
         calls = []
 
         class RecordingExperts(torch.nn.Module):
-            def forward(self, hidden, indices, weights, logits):
-                calls.append((hidden.shape, indices.shape, weights.shape, logits.shape))
+            def forward(self, hidden, indices, weights):
+                calls.append((hidden.shape, indices.shape, weights.shape))
                 return torch.zeros_like(hidden)
 
         model = MoEForCausalLM(
@@ -175,7 +175,6 @@ class TestGptOssTorch:
                 torch.Size([3, self.args.hidden_size]),
                 torch.Size([3, self.args.num_experts_per_tok]),
                 torch.Size([3, self.args.num_experts_per_tok]),
-                torch.Size([3, self.args.num_local_experts]),
             )
         ]
 

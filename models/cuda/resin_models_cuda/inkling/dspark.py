@@ -16,7 +16,12 @@ from resin.models.inkling.config import (
     InklingDSparkConfig,
     YarnConfig,
 )
-from resin_models_cuda.inkling.attention import append_kv, paged_attention
+from resin_models_cuda.inkling.attention import (
+    PagedAttentionBatch,
+    append_kv,
+    paged_attention,
+    prepare_paged_attention_batch,
+)
 from resin_models_cuda.inkling.cache import DRAFT_GROUP, DRAFT_LAYERS, DeviceCache
 from resin_models_cuda.inkling.model import InklingTarget, RMSNorm
 
@@ -128,6 +133,7 @@ class DSparkAttention(nn.Module):
         cache: DeviceCache,
         sequence_lengths: Tensor,
         max_sequence_length: int,
+        attention_batch: PagedAttentionBatch,
     ) -> Tensor:
         batch, tokens, _ = hidden.shape
         queries = self.q_proj(hidden).view(batch, tokens, self.heads, self.head_dim)
@@ -152,6 +158,7 @@ class DSparkAttention(nn.Module):
             sequence_lengths=sequence_lengths,
             max_sequence_length=max_sequence_length,
             softmax_scale=self.head_dim**-0.5,
+            prepared_batch=attention_batch,
         )
         return self.o_proj(output.reshape(batch, tokens, -1))
 
@@ -203,6 +210,7 @@ class DSparkLayer(nn.Module):
         cache: DeviceCache,
         sequence_lengths: Tensor,
         max_sequence_length: int,
+        attention_batch: PagedAttentionBatch,
     ) -> Tensor:
         hidden = hidden + self.attn(
             self.input_norm(hidden),
@@ -210,6 +218,7 @@ class DSparkLayer(nn.Module):
             cache,
             sequence_lengths,
             max_sequence_length,
+            attention_batch,
         )
         return hidden + self.mlp(self.post_norm(hidden))
 
@@ -280,6 +289,14 @@ class DSparkDraft(nn.Module):
         max_sequence_length: int,
     ) -> tuple[Tensor, Tensor]:
         hidden = self.target.embed_tokens(input_ids)
+        attention_batch = prepare_paged_attention_batch(
+            cache,
+            sequence_lengths,
+            max_sequence_length,
+            batch=input_ids.shape[0],
+            tokens=input_ids.shape[1],
+            layer_counts={DRAFT_GROUP: DRAFT_LAYERS},
+        )
         for layer in self.layers:
             hidden = layer(
                 hidden,
@@ -287,6 +304,7 @@ class DSparkDraft(nn.Module):
                 cache,
                 sequence_lengths,
                 max_sequence_length,
+                attention_batch,
             )
         hidden = self.norm(hidden)
         base_logits = self.target.unembed(

@@ -724,7 +724,7 @@ def test_decode_graph_launch_fixes_expert_capacity_and_replica_broadcast(monkeyp
         scopes.append((rows, int(valid_rows)))
         yield
 
-    runner._expert_graph_capacity = capacity
+    runner._parallel_graph_capacity = capacity
     runner._model.forward_decode = lambda *args, **kwargs: logits
     step = runner._new_decode_graph_step((2, 128))
     step.inputs["ep_valid_rows"].fill_(1)

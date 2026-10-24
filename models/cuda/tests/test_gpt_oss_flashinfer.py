@@ -6,13 +6,7 @@ from typing import Any
 
 import pytest
 
-from resin.moe_kernels import (
-    MoEExpertWeights,
-    MoEKernel,
-    MoEKernelConfig,
-    MoERouting,
-    UnsupportedMoEConfiguration,
-)
+from resin_models_cuda.gpt_oss.flashinfer import MXFP4Config, MXFP4Weights
 
 
 class _DType:
@@ -175,23 +169,16 @@ class _FakeFusedMoE:
         return [kwargs["output"], "auxiliary-output"]
 
 
-def _config(**changes) -> MoEKernelConfig:
+def _config(**changes) -> MXFP4Config:
     values: dict[str, Any] = {
-        "architecture": "sm90",
-        "quantization": "mxfp4",
-        "activation": "swiglu",
         "top_k": 4,
         "num_experts": 128,
         "hidden_size": 2880,
         "intermediate_size": 2880,
-        "group_size": 32,
-        "expert_bias": True,
-        "activation_alpha": 1.702,
-        "activation_beta": 1.0,
-        "activation_limit": 7.0,
+        "swiglu_limit": 7.0,
     }
     values.update(changes)
-    return MoEKernelConfig(**values)
+    return MXFP4Config(**values)
 
 
 def _tensor(runtime, shape, dtype=None, *, device=None):
@@ -207,7 +194,7 @@ def _weights(runtime, config=None):
     experts = config.num_experts
     hidden = config.hidden_size
     intermediate = config.intermediate_size
-    return MoEExpertWeights(
+    return MXFP4Weights(
         gate_up=_tensor(runtime, (experts, 2 * intermediate, hidden // 2)),
         down=_tensor(runtime, (experts, hidden, intermediate // 2)),
         gate_up_scales=_tensor(runtime, (experts, 2 * intermediate, hidden // 32)),
@@ -231,16 +218,40 @@ class TestFlashInferMXFP4Adapter:
         monkeypatch.setattr(kernel, "_fused_moe", fused_moe, raising=False)
         return kernel, torch, fused_moe
 
-    def test_capabilities_implement_the_standard_contract(self, monkeypatch) -> None:
+    def test_validate_accepts_supported_geometry_and_token_limits(self, monkeypatch):
         kernel, _, _ = self._kernel(monkeypatch)
-        assert isinstance(kernel, MoEKernel)
-        assert kernel.supports(_config(), num_tokens=16)
-        assert not kernel.supports(replace(_config(), architecture="sm100"))
-        assert not kernel.supports(replace(_config(), activation_limit=None))
-        with pytest.raises(
-            UnsupportedMoEConfiguration, match="requires activation_limit"
-        ):
-            kernel.validate(replace(_config(), activation_limit=None))
+        kernel.validate(_config(), num_tokens=8192)
+        kernel.validate(
+            _config(num_experts=4, hidden_size=32, intermediate_size=32), num_tokens=1
+        )
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"top_k": 1},
+            {"top_k": 8},
+            {"num_experts": 3},
+            {"num_experts": 129},
+            {"hidden_size": 0},
+            {"hidden_size": 31},
+            {"intermediate_size": -32},
+            {"intermediate_size": 33},
+            {"swiglu_limit": 0.0},
+            {"swiglu_limit": -1.0},
+            {"swiglu_limit": float("nan")},
+            {"swiglu_limit": float("inf")},
+        ],
+    )
+    def test_validate_rejects_unsupported_geometry(self, monkeypatch, changes):
+        kernel, _, _ = self._kernel(monkeypatch)
+        with pytest.raises(ValueError):
+            kernel.validate(_config(**changes))
+
+    @pytest.mark.parametrize("num_tokens", [0, 8193])
+    def test_validate_rejects_unsupported_token_count(self, monkeypatch, num_tokens):
+        kernel, _, _ = self._kernel(monkeypatch)
+        with pytest.raises(ValueError):
+            kernel.validate(_config(), num_tokens=num_tokens)
 
     def test_prepare_pads_2880_and_uses_exact_sm90_interleavers(
         self, monkeypatch
@@ -303,13 +314,10 @@ class TestFlashInferMXFP4Adapter:
         config = _config()
         prepared = kernel.prepare_weights(_weights(torch), config)
         hidden = _tensor(torch, (16, 2880), torch.bfloat16)
-        routing = MoERouting(
-            router_logits=_tensor(torch, (16, 128), torch.float32),
-            selected_experts=_tensor(torch, (16, 4), torch.int64),
-            expert_weights=_tensor(torch, (16, 4), torch.bfloat16),
-        )
+        indices = _tensor(torch, (16, 4), torch.int64)
+        routing_weights = _tensor(torch, (16, 4), torch.bfloat16)
 
-        output = kernel.forward(hidden, routing, prepared, config)
+        output = kernel.forward(hidden, indices, routing_weights, prepared)
         assert output.shape == (16, 2880)
         assert output.dtype is torch.bfloat16
         assert len(fused_moe.forward_calls) == 1
@@ -347,7 +355,7 @@ class TestFlashInferMXFP4Adapter:
         wrong_arch_kernel, wrong_arch_torch, _ = self._kernel(
             monkeypatch, capability=(10, 0)
         )
-        with pytest.raises(UnsupportedMoEConfiguration, match="requires SM90"):
+        with pytest.raises(ValueError, match="requires SM90"):
             wrong_arch_kernel.prepare_weights(_weights(wrong_arch_torch), config)
 
     def test_inactive_route_sentinel_reaches_cutlass_without_rerouting(
@@ -384,22 +392,22 @@ class TestFlashInferMXFP4Adapter:
                 cutlass_fused_moe=cutlass,
             ),
         )
-        prepared = SimpleNamespace(
-            config_key=adapter._config_key(config),
+        prepared = adapter.PreparedFlashInferMXFP4Weights(
+            config=config,
             fc1_weights=torch.empty(1),
             fc2_weights=torch.empty(1),
-            fc1_scales=None,
-            fc2_scales=None,
-            fc1_bias=None,
-            fc2_bias=None,
-            swiglu_alpha=None,
-            swiglu_beta=None,
-            swiglu_limit=None,
+            fc1_scales=torch.empty(1, dtype=torch.int32),
+            fc2_scales=torch.empty(1, dtype=torch.int32),
+            fc1_bias=torch.zeros(4, 64, dtype=torch.bfloat16),
+            fc2_bias=torch.zeros(4, 32, dtype=torch.bfloat16),
+            swiglu_alpha=torch.full((4,), 1.702),
+            swiglu_beta=torch.ones(4),
+            swiglu_limit=torch.full((4,), config.swiglu_limit),
             padded_hidden_size=32,
+            padded_intermediate_size=32,
+            fc2_zero_bias=torch.zeros(4, 32, dtype=torch.bfloat16),
         )
-        routing = MoERouting(torch.zeros(2, 4), indices, weights)
-        # This partial prepared-weight fixture supplies only fields read by forward.
-        output = kernel.forward(hidden, routing, prepared, config)  # ty: ignore[invalid-argument-type]
+        output = kernel.forward(hidden, indices, weights, prepared)
         torch.testing.assert_close(
             output[:, 0], torch.tensor([1.75, 1.0], dtype=torch.bfloat16)
         )
@@ -414,45 +422,43 @@ class TestFlashInferMXFP4Adapter:
 
         config = _config(num_experts=4, hidden_size=32, intermediate_size=32)
         kernel = adapter.FlashInferSM90MXFP4Kernel()
-        kernel.capabilities = replace(kernel.capabilities, max_tokens=limit)
+        monkeypatch.setattr(kernel, "max_tokens", limit)
         packed = torch.empty(1, dtype=torch.uint8)
         bias = torch.zeros(4, 32, dtype=torch.bfloat16)
         bias[0] = 0.75
         bias[1] = 1.25
         prepared = adapter.PreparedFlashInferMXFP4Weights(
-            packed,
-            packed,
-            packed,
-            packed,
-            torch.zeros(4, 64, dtype=torch.bfloat16),
-            bias,
-            None,
-            None,
-            None,
-            32,
-            32,
-            32,
-            32,
-            adapter._config_key(config),
-            torch.zeros_like(bias),
+            config=config,
+            fc1_weights=packed,
+            fc2_weights=packed,
+            fc1_scales=packed,
+            fc2_scales=packed,
+            fc1_bias=torch.zeros(4, 64, dtype=torch.bfloat16),
+            fc2_bias=bias,
+            swiglu_alpha=torch.full((4,), 1.702),
+            swiglu_beta=torch.ones(4),
+            swiglu_limit=torch.full((4,), config.swiglu_limit),
+            padded_hidden_size=32,
+            padded_intermediate_size=32,
+            fc2_zero_bias=torch.zeros_like(bias),
         )
         calls = []
 
-        def unweighted(hidden, routing, weights, actual):
-            assert actual is config
+        def unweighted(hidden, indices, routing_weights, weights):
+            assert weights.config is config
             assert len(hidden) <= limit
             assert weights.fc1_weights is packed and weights.fc2_weights is packed
             assert weights.fc1_bias is prepared.fc1_bias
             assert not weights.fc2_bias.any()
-            assert routing.selected_experts[:, 1:].eq(config.num_experts).all()
-            active = routing.selected_experts[:, 0] < config.num_experts
-            torch.testing.assert_close(routing.expert_weights[:, 0], active.float())
-            assert not routing.expert_weights[:, 1:].any()
+            assert indices[:, 1:].eq(config.num_experts).all()
+            active = indices[:, 0] < config.num_experts
+            torch.testing.assert_close(routing_weights[:, 0], active.float())
+            assert not routing_weights[:, 1:].any()
             calls.append(len(hidden))
             values = torch.tensor(
                 [1000, -1000, 4, -8, float("nan")], dtype=torch.bfloat16
             )
-            return values[routing.selected_experts[:, 0].long(), None].expand(-1, 32)
+            return values[indices[:, 0].long(), None].expand(-1, 32)
 
         monkeypatch.setattr(kernel, "forward", unweighted)
 
@@ -471,8 +477,7 @@ class TestFlashInferMXFP4Adapter:
                 [0.25, 0.5, 0.125, 0.125],
             ]
         )
-        routing = MoERouting(torch.zeros(4, 4), ids, scales)
-        output = kernel.forward_partial(hidden, routing, prepared, config)
+        output = kernel.forward_partial(hidden, ids, scales, prepared)
         assert output.dtype == torch.float32
         torch.testing.assert_close(
             output[:, 0], torch.tensor([1000.75, -998.75, -248.1875, -249.6875])
@@ -488,9 +493,9 @@ class TestFlashInferMXFP4Adapter:
         assert prepared.fc2_bias is bias and bias[0, 0] == 0.75
         empty = kernel.forward_partial(
             hidden[:0],
-            MoERouting(torch.empty(0, 4), ids[:0], scales[:0]),
+            ids[:0],
+            scales[:0],
             prepared,
-            config,
         )
         assert empty.shape == (0, 32) and empty.dtype == torch.float32
         assert calls == expected_calls
@@ -499,9 +504,9 @@ class TestFlashInferMXFP4Adapter:
         # kernel shapes and chunk counts stable, including entirely idle input.
         idle = kernel.forward_partial(
             hidden,
-            MoERouting(torch.zeros(4, 4), ids, torch.zeros_like(scales)),
+            ids,
+            torch.zeros_like(scales),
             prepared,
-            config,
         )
         assert idle.dtype == torch.float32
         assert torch.equal(idle, torch.zeros_like(idle))

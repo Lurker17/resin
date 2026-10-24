@@ -2,12 +2,34 @@ from __future__ import annotations
 
 import inspect
 
+import numpy as np
 import pytest
+import torch
+from test_qwen3_5_media import _media
 
 from resin import BatchPhase, BatchPlan
 from resin.backend.cuda.runner import CudaRunner
 from resin_models_cuda.qwen3_5.checkpoint import DEFAULT_MODEL
 from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
+
+
+def test_graph_rope_deltas_stay_on_host_and_match_eager_positions() -> None:
+    runner = object.__new__(Qwen3_5CudaRunner)
+    # No CUDA operations are needed to prepare the graph's host metadata.
+    runner.device = torch.device("cpu")
+    plan = BatchPlan(
+        [1, 2],
+        [6, 9],
+        [1, 2],
+        [0, 1, 2],
+        phase=BatchPhase.DECODE,
+        media=[_media(), None],
+    )
+    deltas = runner._host_rope_deltas(plan)
+    assert isinstance(deltas, np.ndarray)
+    np.testing.assert_array_equal(deltas, [-2, 0])
+    adjusted = runner._decode_rotary_positions(plan, torch.tensor([6, 9]))
+    torch.testing.assert_close(adjusted, torch.tensor([[[4], [9]]] * 3))
 
 
 def test_qwen38_is_runner_default_and_public_name_is_consistent() -> None:
