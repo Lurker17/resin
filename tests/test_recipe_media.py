@@ -49,7 +49,16 @@ def model_processor(request):
         "qwen3_5": Qwen38Recipe,
         "gemma4": Gemma4Recipe,
     }[model]
-    return model, processor, constructor(processor)
+    image_config = processor.image_processor.to_dict()
+    config = (
+        {
+            "image_processor": image_config,
+            "video_processor": processor.video_processor.to_dict(),
+        }
+        if model == "gemma4"
+        else image_config
+    )
+    return model, processor, constructor(processor.tokenizer, media_config=config)
 
 
 def image():
@@ -60,7 +69,9 @@ def video():
     return np.linspace(0, 1, 32 * 64 * 64 * 3, dtype=np.float32).reshape(32, 64, 64, 3)
 
 
-def assert_reference_tensors(processor, recipe, messages, *, tools=None):
+def assert_reference_tensors(
+    processor, recipe, messages, *, tools=None, resized_pixels=False
+):
     request = {"messages": messages, "tools": tools}
     expected = processor.apply_chat_template(
         messages,
@@ -81,12 +92,23 @@ def assert_reference_tensors(processor, recipe, messages, *, tools=None):
             if key == "mm_token_type_ids":
                 assert tuple(value[0].tolist()) == prepared
             else:
-                assert torch.equal(value, prepared), key
+                reference = value.numpy()
+                assert reference.shape == prepared.shape, key
+                assert reference.dtype == prepared.dtype, key
+                if resized_pixels and key.startswith("pixel_values"):
+                    # The Rust resize filter need not match Torchvision's pixel
+                    # arithmetic. Placement and padding geometry remain exact;
+                    # no-resize pixel parity is checked independently below.
+                    np.testing.assert_allclose(
+                        reference, prepared, atol=0.01, rtol=0, err_msg=key
+                    )
+                else:
+                    assert np.array_equal(reference, prepared), key
     return actual
 
 
 def test_native_recipe_preserves_real_image_geometry_and_tools(model_processor):
-    _, processor, recipe = model_processor
+    model, processor, recipe = model_processor
     messages = [
         {
             "role": "user",
@@ -112,7 +134,41 @@ def test_native_recipe_preserves_real_image_geometry_and_tools(model_processor):
             },
         }
     ]
-    assert_reference_tensors(processor, recipe, messages, tools=tools)
+    assert_reference_tensors(
+        processor, recipe, messages, tools=tools, resized_pixels=model != "inkling"
+    )
+
+
+def test_native_recipe_matches_unresized_reference_pixels(model_processor):
+    model, processor, recipe = model_processor
+    config = processor.image_processor.to_dict()
+    if model == "inkling":
+        factor = config["size"]["height"]
+    else:
+        config["do_resize"] = False
+        factor = config["patch_size"] * config.get(
+            "pooling_kernel_size", config.get("merge_size", 1)
+        )
+    pixels = np.linspace(0, 1, factor * factor * 2 * 3, dtype=np.float32).reshape(
+        factor, factor * 2, 3
+    )
+    reference_processor = type(processor.image_processor)(**config)
+    expected = reference_processor(
+        images=[pixels], do_rescale=False, return_tensors="pt"
+    )
+    native_config = {"image_processor": config} if model == "gemma4" else config
+    configured = type(recipe)(processor.tokenizer, media_config=native_config)
+    actual = configured.render(
+        [
+            resin.recipe.Message(
+                resin.recipe.Role.USER, [resin.recipe.Image.from_rgb(pixels)]
+            )
+        ]
+    ).media
+    assert actual is not None
+    for key, value in expected.items():
+        if isinstance(value, torch.Tensor) and hasattr(actual, key):
+            assert np.array_equal(value.numpy(), getattr(actual, key)), key
 
 
 def test_literal_media_marker_does_not_acquire_a_pixel_slot(model_processor):
@@ -166,7 +222,7 @@ def test_native_recipe_preserves_gemma_video_timestamps_and_geometry(
             ],
         }
     ]
-    assert_reference_tensors(processor, recipe, messages)
+    assert_reference_tensors(processor, recipe, messages, resized_pixels=True)
 
 
 def test_native_recipe_preserves_gemma_mixed_media_order(model_processor):
@@ -187,4 +243,4 @@ def test_native_recipe_preserves_gemma_mixed_media_order(model_processor):
             ],
         }
     ]
-    assert_reference_tensors(processor, recipe, messages)
+    assert_reference_tensors(processor, recipe, messages, resized_pixels=True)

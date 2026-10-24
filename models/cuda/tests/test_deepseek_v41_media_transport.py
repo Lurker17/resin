@@ -1,7 +1,6 @@
 """Image identity and cached features survive follower plan serialization."""
 
 import pickle
-from dataclasses import replace
 
 import pytest
 import torch
@@ -9,6 +8,7 @@ from test_deepseek_v41_vision import media_fixture, plan_for, runner_fixture
 
 from resin import BatchPhase, BatchPlan
 from resin.backend.parallel import batch_plan_from_payload, batch_plan_payload
+from resin.models.deepseek_v41.media import DeepSeekV41Image, DeepSeekV41Media
 
 
 def transported(plan):
@@ -63,14 +63,21 @@ def test_serialized_plans_reject_changed_media_or_prompt(change, phase):
     follower._validate_plan(initial)
     follower._media_embeddings(initial, 0, torch.tensor([media.token_ids[:5]]))
     if change == "pixels":
-        image = replace(media.images[0], patches=media.images[0].patches + 1)
-        changed = replace(media, images=(image,))
+        original = media.images[0]
+        image = DeepSeekV41Image(
+            original.start,
+            original.patches + 1,
+            original.n_vit_h,
+            original.n_vit_w,
+            original.types,
+        )
+        changed = DeepSeekV41Media(media.token_ids, (image,))
         assert changed.token_ids == media.token_ids
         assert changed.digest != media.digest
     else:
         # The digest covers image inputs. Changing text outside the next chunk
         # must still invalidate the live sequence, even with identical images.
-        changed = replace(media, token_ids=media.token_ids[:-1] + (11,))
+        changed = DeepSeekV41Media(media.token_ids[:-1] + (11,), media.images)
         assert changed.digest == media.digest
     plan = (
         plan_for(changed, 5, 7)

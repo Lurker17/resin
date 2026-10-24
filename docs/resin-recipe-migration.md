@@ -2,8 +2,8 @@
 
 The engine stays token-based. `resin-recipe` owns stock conversation formatting,
 token encoding, model-output parsing, and semantic response events. Model-owned
-`MediaProcessor` implementations prepare image/video tensors; the HTTP crate
-owns wire protocols.
+Rust media processors prepare image/video arrays; the HTTP crate owns wire
+protocols.
 Applications can pass any structural `resin.recipe.Recipe` to `HttpServer(recipe=...)`.
 The public recipe interface accepts typed messages, tools and render options.
 
@@ -34,17 +34,25 @@ Use an explicit native constructor: `GptOssRecipe`, `DeepSeekV4Recipe`,
 `Message` contains a `Role` and typed `Text`, `Thinking`, `Image`, `Video`, `Audio`,
 `ToolCall` or `ToolResult` blocks. Tool declarations and `RenderOptions` are
 separate rendering arguments. Supported media depends on the model recipe.
-Image/video recipes accept a processor; V4.1 prepares its checkpoint's pixels
-internally. `prompt.media` carries the prepared model payload for
-`engine.submit(media=prompt.media, ...)`.
+Image/video recipes snapshot configuration from a supplied processor at
+construction, or accept `media_config` with a tokenizer. Their stock preparation
+runs in Rust without invoking HF pixel processors. `prompt.media` carries
+native-owned NumPy arrays and token metadata for
+`engine.submit(media=prompt.media, ...)`; the runner transfers the arrays to its
+GPU vision encoder.
 
-`MediaProcessor.process(media)` returns `ProcessedMedia`: ordered `MediaTokens`
-expansions and a request-owned payload. The recipe inserts their token IDs and
-calls `bind(processed, token_ids, spans)` with final `MediaTokenSpan` positions.
-The model implementation owns pixel preprocessing, rotary positions and cache
-identity; the shared recipe never switches on model names or calls HF processors.
+Model-owned Rust modules decode, resize, normalize and patchify pixels, supply
+media token expansions, and compute rotary positions and cache identity.
+The recipe inserts explicit media token IDs at their final prompt positions.
 Media formatting may supply ordinary text at its edges (for example Gemma video
-timestamps), which is coalesced with adjacent text before tokenization.
+timestamps), which is coalesced with adjacent text before tokenization. Literal
+marker spellings in text never become media slots.
+
+Image decoding and resizing use Rust's `image` crate. Geometry, normalization,
+padding and patch order follow the reference processors; resize filters need
+not produce pixel-identical values. Strict no-resize oracle tests cover pixels,
+positions and token expansions. Gemma video accepts decoded RGB frames, with
+optional fps and original frame indices; applications decode video files.
 
 `RenderedPrompt` exposes `token_ids`, `stop_token_ids` and `media`. Native prompts
 also retain the parser context. Pass the actual prompt back to the same recipe;
@@ -80,8 +88,9 @@ actor directly, without converting events through Python or JSON.
 - The Python binding uses one native parser handle for all formats, and the
   HTTP actor consumes its events directly. Custom Python parsers retain their
   `feed` and optional `finish` contract.
-- Media preprocessing may use model processors, but stock processors must not
-  execute chat templates or own model-format interpretation.
+- Stock CPU media preprocessing runs in Rust and exposes owned NumPy arrays.
+  GPU vision encoding stays in model runners. Reference HF processors are test
+  oracles and optional construction-time sources of configuration.
 
 ## Required model coverage
 
@@ -128,11 +137,12 @@ one-ULP secondary float exception is isolated in the test comparison.
 
 Native HTTP tests cover each family's reasoning, text and tool events with both
 streaming and complete responses, stop/length finalization, ordinary marker
-provenance and user stop encoding. Cached pinned processors match all output
-tensors for Inkling/Qwen/Gemma image prompts and Gemma video, including explicit
-media expansion without retokenizing ordinary text. Native fixtures and actual
-pinned tokenizers verify format/token parity; the few deliberate HF differences
-preserve literal user marker text as ordinary tokens.
+provenance and user stop encoding. Native media tests cover geometry, patch
+ordering, ownership and cache identities. No-resize image/video cases compare
+pixels and position IDs against reference processors, while resize paths permit
+filter differences. Token expansion preserves ordinary text boundaries. Native
+fixtures and actual pinned tokenizers verify format/token parity; deliberate HF
+differences preserve literal user marker text as ordinary tokens.
 
 The complete local CPU suite passed 812 Python tests (67 skips) and 150 Rust
 tests. The shared build/type-refresh script, ty, Ruff and workspace Clippy passed.

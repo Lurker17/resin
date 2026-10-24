@@ -1,25 +1,26 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
+from test_recipe_media_preparation import Tokenizer, render_media
 
-from resin._recipe_media import canonical_rgb_image, normalize_image
+import resin
+from resin.recipe import InklingRecipe
 
 
-def test_image_helpers_return_owned_processor_inputs():
+def test_image_preparation_owns_input_pixels():
     image = np.ones((2, 3, 3), dtype=np.float32)
-    normalized = normalize_image(image)
-    assert normalized is not image
-    assert normalized.flags.c_contiguous
+    recipe = InklingRecipe(Tokenizer(), media_config={"do_normalize": False})
+    media = render_media(recipe, [resin.recipe.Image.from_rgb(image)])
+    prepared = media.pixel_values.copy()
+    assert media.pixel_values.flags.c_contiguous
+    assert not np.shares_memory(image, media.pixel_values)
     image.fill(0)
-    assert normalized.sum() == 18
+    assert np.array_equal(media.pixel_values, prepared)
 
 
-def test_canonical_rgb_image_rejects_implicit_dtype_conversion() -> None:
+def test_image_preparation_rejects_implicit_dtype_conversion() -> None:
     image = np.zeros((2, 3, 3), dtype=np.uint8)
-
-    try:
-        canonical_rgb_image(image)
-    except TypeError as error:
-        assert "dtype float32" in str(error)
-    else:
-        raise AssertionError("uint8 input must be rejected")
+    recipe = InklingRecipe(Tokenizer())
+    with pytest.raises((TypeError, ValueError), match="float32|dtype"):
+        render_media(recipe, [resin.recipe.Image(image)])

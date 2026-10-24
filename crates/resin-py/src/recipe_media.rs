@@ -11,10 +11,28 @@ use resin_recipe::{Encoder, Error, Prompt, PromptSpan};
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone)]
 pub(crate) struct MediaTokens {
+    #[pyo3(get)]
     placeholder: String,
     token_ids: Arc<[u32]>,
+    #[pyo3(get)]
     prefix: String,
+    #[pyo3(get)]
     suffix: String,
+}
+impl MediaTokens {
+    pub(crate) fn from_parts(
+        placeholder: &str,
+        token_ids: Vec<u32>,
+        prefix: String,
+        suffix: String,
+    ) -> Self {
+        Self {
+            placeholder: placeholder.into(),
+            token_ids: token_ids.into(),
+            prefix,
+            suffix,
+        }
+    }
 }
 #[pymethods]
 impl MediaTokens {
@@ -39,20 +57,8 @@ impl MediaTokens {
         })
     }
     #[getter]
-    fn placeholder(&self) -> &str {
-        &self.placeholder
-    }
-    #[getter]
     fn token_ids(&self) -> Vec<u32> {
         self.token_ids.to_vec()
-    }
-    #[getter]
-    fn prefix(&self) -> &str {
-        &self.prefix
-    }
-    #[getter]
-    fn suffix(&self) -> &str {
-        &self.suffix
     }
 }
 
@@ -60,6 +66,7 @@ impl MediaTokens {
 #[pyclass(frozen, module = "resin._resin")]
 pub(crate) struct ProcessedMedia {
     pub(crate) spans: Vec<MediaTokens>,
+    #[pyo3(get)]
     payload: Py<PyAny>,
 }
 #[pymethods]
@@ -80,10 +87,6 @@ impl ProcessedMedia {
             .map(|s| Py::new(py, s))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(PyTuple::new(py, spans)?.unbind())
-    }
-    #[getter]
-    fn payload(&self, py: Python<'_>) -> Py<PyAny> {
-        self.payload.clone_ref(py)
     }
 }
 

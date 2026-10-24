@@ -48,10 +48,11 @@ ContentBlock = Text | Thinking | MediaBlock | ToolCall | ToolResult
 
 
 class MediaProcessor(Protocol):
-    """Turn media blocks into model tokens and prepared inference payloads.
+    """Optional preprocessing boundary for custom Python recipe implementations.
 
     Processing owns pixel/audio geometry; binding adds final prompt positions.
     Request state belongs to ProcessedMedia, so processors can be reused.
+    Stock recipes perform these phases internally in Rust.
     """
 
     def process(self, media: Sequence[MediaBlock]) -> ProcessedMedia:
@@ -85,7 +86,9 @@ class Recipe(Protocol):
         *,
         tools: Sequence[Tool] = (),
         options: RenderOptions | None = None,
-    ) -> RenderedPrompt: ...
+    ) -> RenderedPrompt:
+        """Prepare media and render tokens with their final media positions."""
+        ...
 
     def create_parser(self, prompt: RenderedPrompt) -> ResponseParser: ...
 

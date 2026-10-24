@@ -5,16 +5,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::media_preprocess::{self, Kind as MediaKind, Processor as MediaProcessor};
 use crate::recipe_events::{self, ParserEvent};
-use crate::recipe_media::{self, ProcessedMedia};
+use crate::recipe_media;
 use crate::recipe_types::{
     BlockKind, MediaSources, Message, MessagePolicy, RenderOptions, Role, Tool, ToolScope,
-    media_blocks,
 };
 use pyo3::{
     exceptions::{PyAttributeError, PyValueError},
     prelude::*,
-    sync::PyOnceLock,
     types::{PyBool, PyDict},
 };
 use pythonize::{depythonize, pythonize};
@@ -79,7 +78,7 @@ impl RecipeTokenizer {
     }
 }
 
-fn optional_attr<'py>(
+pub(crate) fn optional_attr<'py>(
     object: &Bound<'py, PyAny>,
     name: &str,
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
@@ -379,7 +378,7 @@ struct RecipeDefinition {
     options: &'static [&'static str],
     initialize_options: Option<OptionInitializer>,
     normalize_options: Option<OptionNormalizer>,
-    media_module: Option<&'static str>,
+    media_kind: Option<MediaKind>,
 }
 impl RecipeDefinition {
     const fn new(
@@ -394,7 +393,7 @@ impl RecipeDefinition {
             options,
             initialize_options: None,
             normalize_options: None,
-            media_module: None,
+            media_kind: None,
         }
     }
 }
@@ -409,9 +408,7 @@ pub(crate) struct NativeRecipe {
     options: Map<String, Value>,
     id: u64,
     stop_token_ids: Option<Vec<u32>>,
-    media_owner: Arc<Py<PyAny>>,
-    media_config: Map<String, Value>,
-    media_processor: PyOnceLock<Py<PyAny>>,
+    media_processor: Option<MediaProcessor>,
 }
 impl NativeRecipe {
     fn new(
@@ -420,9 +417,14 @@ impl NativeRecipe {
         definition: &'static RecipeDefinition,
         options: Option<&RenderOptions>,
         stop_token_ids: Option<Vec<u32>>,
-        media_config: Map<String, Value>,
+        media_config: Option<Value>,
     ) -> PyResult<Self> {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        if media_config.is_some() && definition.media_kind.is_none() {
+            return Err(PyValueError::new_err(
+                "this recipe does not accept media_config",
+            ));
+        }
         let original_tokenizer =
             optional_attr(owner, "tokenizer")?.unwrap_or_else(|| owner.clone());
         let tokenizer = RecipeTokenizer::new(&original_tokenizer)?;
@@ -438,9 +440,10 @@ impl NativeRecipe {
             options: defaults,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             stop_token_ids,
-            media_owner: Arc::new(owner.clone().unbind()),
-            media_config,
-            media_processor: PyOnceLock::new(),
+            media_processor: definition
+                .media_kind
+                .map(|kind| MediaProcessor::new(kind, owner, media_config))
+                .transpose()?,
         };
         value.resolve_options(None)?;
         Ok(value)
@@ -519,29 +522,6 @@ impl NativeRecipe {
             sources,
         ))
     }
-    fn processor(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let processor = self
-            .media_processor
-            .get_or_try_init(py, || -> PyResult<_> {
-                let module = self.definition.media_module.ok_or_else(|| {
-                    PyValueError::new_err(format!(
-                        "{} does not support media",
-                        self.definition.name
-                    ))
-                })?;
-                let kwargs = PyDict::new(py);
-                for (key, value) in &self.media_config {
-                    kwargs.set_item(key, pythonize(py, value)?)?;
-                }
-                Ok(py
-                    .import(module)?
-                    .getattr("make_media_processor")?
-                    .call((self.media_owner.bind(py),), Some(&kwargs))?
-                    .unbind())
-            })?;
-        Ok(processor.clone_ref(py))
-    }
-
     fn render_request(
         &self,
         py: Python<'_>,
@@ -549,49 +529,41 @@ impl NativeRecipe {
         sources: MediaSources,
         prepare: bool,
     ) -> PyResult<RenderedPrompt> {
-        let preparation = if prepare && !sources.is_empty() {
-            let source_count = sources.len();
-            let processor = self.processor(py)?;
-            let processed: Py<ProcessedMedia> = processor
-                .bind(py)
-                .call_method1("process", (media_blocks(py, sources)?,))?
-                .extract()?;
-            if processed.borrow(py).spans.len() != source_count {
-                return Err(PyValueError::new_err(
-                    "media processor must return one expansion per source",
-                ));
-            }
-            Some((processor, processed))
+        let sources = if prepare {
+            media_preprocess::sources(py, sources)?
         } else {
-            None
+            Vec::new()
         };
-        let expansions = preparation
-            .as_ref()
-            .map(|(_, processed)| processed.borrow(py).spans.clone())
-            .unwrap_or_default();
-        let (token_ids, placements) = py.detach(|| {
+        let (token_ids, preparation, placements) = py.detach(|| -> PyResult<_> {
+            let preparation = if sources.is_empty() {
+                None
+            } else {
+                let processor = self
+                    .media_processor
+                    .as_ref()
+                    .ok_or_else(|| PyValueError::new_err("this recipe does not support media"))?;
+                Some(
+                    processor
+                        .process(sources, self.encoder.as_ref())
+                        .map_err(recipe_error)?,
+                )
+            };
             let prompt = self
                 .definition
                 .format
                 .render(&request)
                 .map_err(recipe_error)?;
-            recipe_media::encode(prompt, &expansions, self.encoder.as_ref()).map_err(recipe_error)
+            let expansions = preparation
+                .as_ref()
+                .map(|p| p.expansions.as_slice())
+                .unwrap_or(&[]);
+            let (ids, placements) = recipe_media::encode(prompt, expansions, self.encoder.as_ref())
+                .map_err(recipe_error)?;
+            Ok((ids, preparation, placements))
         })?;
-        let media = if let Some((processor, processed)) = preparation {
-            let span_class = py.import("resin.protocols")?.getattr("MediaTokenSpan")?;
-            let spans = placements
-                .into_iter()
-                .map(|span| span_class.call1(span))
-                .collect::<PyResult<Vec<_>>>()?;
-            Some(
-                processor
-                    .bind(py)
-                    .call_method1("bind", (processed, &token_ids, spans))?
-                    .unbind(),
-            )
-        } else {
-            None
-        };
+        let media = preparation
+            .map(|p| p.bind(py, &token_ids, &placements))
+            .transpose()?;
         // Parser creation needs controls, schemas and IDs, never images or conversation history.
         let seed = ParserSeed {
             recipe_id: self.id,
@@ -748,11 +720,12 @@ macro_rules! recipe_class {
         #[pymethods]
         impl $class {
             #[new]
-            #[pyo3(signature=(tokenizer, *, options=None))]
+            #[pyo3(signature=(tokenizer, *, options=None, media_config=None))]
             fn new(
                 py: Python<'_>,
                 tokenizer: &Bound<'_, PyAny>,
                 options: Option<&RenderOptions>,
+                media_config: Option<&Bound<'_, PyAny>>,
             ) -> PyResult<PyClassInitializer<Self>> {
                 Ok(PyClassInitializer::from(NativeRecipe::new(
                     py,
@@ -760,7 +733,7 @@ macro_rules! recipe_class {
                     &Self::DEFINITION,
                     options,
                     None,
-                    Map::new(),
+                    media_config.map(depythonize::<Value>).transpose()?,
                 )?)
                 .add_subclass(Self))
             }
@@ -818,7 +791,7 @@ const DEEPSEEK: RecipeDefinition = RecipeDefinition {
     )
 };
 const QWEN: RecipeDefinition = RecipeDefinition {
-    media_module: Some("resin.models.qwen3_5.media"),
+    media_kind: Some(MediaKind::Qwen),
     ..RecipeDefinition::new(
         "qwen3_5",
         ModelFormat::Qwen,
@@ -873,7 +846,7 @@ recipe_class!(
 recipe_class!(
     InklingRecipe,
     RecipeDefinition {
-        media_module: Some("resin.models.inkling.media"),
+        media_kind: Some(MediaKind::Inkling),
         ..RecipeDefinition::new("inkling", ModelFormat::Inkling, &["reasoning_effort"])
     }
 );
@@ -895,19 +868,20 @@ impl Gemma4Recipe {
             reorder_wire_fields: true,
             ..MessagePolicy::STANDARD
         },
-        media_module: Some("resin.models.gemma4.media"),
+        media_kind: Some(MediaKind::Gemma),
         ..RecipeDefinition::new("gemma4", ModelFormat::Gemma, &["enable_thinking"])
     };
 }
 #[pymethods]
 impl Gemma4Recipe {
     #[new]
-    #[pyo3(signature=(tokenizer, *, options=None, eos_token_ids=Vec::new()))]
+    #[pyo3(signature=(tokenizer, *, options=None, eos_token_ids=Vec::new(), media_config=None))]
     fn new(
         py: Python<'_>,
         tokenizer: &Bound<'_, PyAny>,
         options: Option<&RenderOptions>,
         eos_token_ids: Vec<u32>,
+        media_config: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyClassInitializer<Self>> {
         Ok(PyClassInitializer::from(NativeRecipe::new(
             py,
@@ -915,7 +889,7 @@ impl Gemma4Recipe {
             &Self::DEFINITION,
             options,
             (!eos_token_ids.is_empty()).then_some(eos_token_ids),
-            Map::new(),
+            media_config.map(depythonize::<Value>).transpose()?,
         )?)
         .add_subclass(Self))
     }
@@ -930,7 +904,7 @@ impl DeepSeekV41Recipe {
             media_roles: Some(&[Role::USER]),
             ..DEEPSEEK.messages
         },
-        media_module: Some("resin.models.deepseek_v41.media"),
+        media_kind: Some(MediaKind::DeepSeek),
         ..DEEPSEEK
     };
 }
@@ -955,10 +929,7 @@ impl DeepSeekV41Recipe {
             &Self::DEFINITION,
             options,
             None,
-            Map::from_iter([
-                ("vision_config".into(), vision_config),
-                ("image_token_id".into(), json!(image_token_id)),
-            ]),
+            Some(json!({"vision_config":vision_config,"image_token_id":image_token_id})),
         )?)
         .add_subclass(Self))
     }

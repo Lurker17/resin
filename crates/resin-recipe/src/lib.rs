@@ -6,6 +6,7 @@ pub mod gpt_oss;
 pub mod inkling;
 mod json;
 pub mod lfm2;
+pub mod media;
 mod model;
 mod parser;
 mod prompt;

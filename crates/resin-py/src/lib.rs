@@ -17,6 +17,8 @@ mod http_stop;
 mod output;
 mod parallelism;
 mod planning;
+mod media_payload;
+mod media_preprocess;
 mod recipe;
 mod recipe_events;
 mod recipe_media;
@@ -1931,6 +1933,12 @@ mod _resin {
 
     #[pymodule_export]
     use crate::recipe_media::{MediaTokens, ProcessedMedia};
+
+    #[pymodule_export]
+    use crate::media_payload::{DeepSeekV41Image, DeepSeekV41Media, Gemma4Media, InklingMedia, Qwen35Media};
+
+    #[pymodule_export]
+    use crate::media_preprocess::{DeepSeekV41ImageProcessor, image_token_types};
 
     #[pymodule_export]
     use crate::recipe_types::{

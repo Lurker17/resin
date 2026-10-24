@@ -4,13 +4,11 @@ import io
 
 import numpy as np
 import pytest
-import torch
 from PIL import Image
 from recipe_fuzz.gemma import GemmaAdapter
 
 import resin
 from resin import Engine, MediaInput, MediaTokenSpan
-from resin._recipe_media import decode_image
 from resin.models.gemma4.media import Gemma4Media
 from resin.recipe import Gemma4Recipe
 
@@ -22,27 +20,58 @@ def _png_bytes() -> bytes:
 
 
 def test_encoded_image_boundary_is_bytes_plus_explicit_mime() -> None:
-    image = decode_image(_png_bytes(), "image/png")
-
-    assert image.mode == "RGB"
-    assert image.size == (4, 3)
+    recipe = Gemma4Recipe(
+        GemmaAdapter().codec.tokenizer,
+        media_config={
+            "image_processor": {
+                "patch_size": 1,
+                "pooling_kernel_size": 1,
+                "max_soft_tokens": 70,
+                "do_resize": False,
+            }
+        },
+    )
+    prompt = recipe.render(
+        [
+            resin.recipe.Message(
+                resin.recipe.Role.USER,
+                [resin.recipe.Image.from_bytes(_png_bytes(), media_type="image/png")],
+            )
+        ]
+    )
+    assert isinstance(prompt.media, Gemma4Media)
+    pixels = prompt.media.pixel_values
+    assert pixels is not None
+    assert pixels.shape == (1, 70, 3)
+    np.testing.assert_allclose(
+        pixels[0, :12], np.tile(np.array([10, 20, 30]) / 255, (12, 1))
+    )
     with pytest.raises(ValueError, match="media type"):
-        decode_image(_png_bytes(), "application/octet-stream")
+        recipe.render(
+            [
+                resin.recipe.Message(
+                    resin.recipe.Role.USER,
+                    [
+                        resin.recipe.Image.from_bytes(
+                            _png_bytes(), media_type="application/octet-stream"
+                        )
+                    ],
+                )
+            ]
+        )
 
 
 def test_media_owns_processor_tensors_and_absolute_placeholder_mapping() -> None:
-    pixels = torch.ones(1, 9, 12)
-    output = {
-        "input_ids": torch.tensor([[2, 8, 8, 3, 9, 9]]),
-        "mm_token_type_ids": torch.tensor([[0, 1, 1, 0, 2, 2]]),
-        "pixel_values": pixels,
-        "image_position_ids": torch.zeros(1, 9, 2, dtype=torch.int64),
-        "pixel_values_videos": torch.ones(1, 1, 9, 12),
-        "video_position_ids": torch.zeros(1, 1, 9, 2, dtype=torch.int64),
-    }
-
-    media = Gemma4Media.from_processor_output(output)
-    pixels.zero_()
+    pixels = np.ones((1, 9, 12), dtype=np.float32)
+    media = Gemma4Media(
+        token_ids=(2, 8, 8, 3, 9, 9),
+        mm_token_type_ids=(0, 1, 1, 0, 2, 2),
+        pixel_values=pixels,
+        image_position_ids=np.zeros((1, 9, 2), dtype=np.int64),
+        pixel_values_videos=np.ones((1, 1, 9, 12), dtype=np.float32),
+        video_position_ids=np.zeros((1, 1, 9, 2), dtype=np.int64),
+    )
+    pixels.fill(0)
 
     assert isinstance(media, MediaInput)
     assert media.token_ids == (2, 8, 8, 3, 9, 9)
@@ -63,50 +92,79 @@ def test_media_owns_processor_tensors_and_absolute_placeholder_mapping() -> None
     assert media.cache_key[1] != media.token_ids[1]
 
 
-def test_canonical_normalized_arrays_are_copied_before_processing() -> None:
-    tokenizer = GemmaAdapter().codec.tokenizer
-    image_id = tokenizer.token_to_id("<|image|>")
+@pytest.mark.parametrize("is_video", [False, True])
+def test_native_patches_match_reference_without_resize_and_own_input(is_video) -> None:
+    from transformers.models.gemma4.image_processing_gemma4 import (
+        Gemma4ImageProcessor,
+        Gemma4ImageProcessorKwargs,
+    )
+    from transformers.models.gemma4.video_processing_gemma4 import Gemma4VideoProcessor
 
-    class ImageProcessor:
-        seen = None
-
-        def __call__(self, **kwargs):
-            self.seen = kwargs
-            return {
-                "pixel_values": torch.ones(1, 9, 12),
-                "image_position_ids": torch.zeros(1, 9, 2, dtype=torch.int64),
-            }
-
-    class Processor:
-        image_token = "<|image|>"
-        image_processor = ImageProcessor()
-
-        def __init__(self):
-            self.tokenizer = tokenizer
-
-        def replace_image_token(self, output, image_idx):
-            return self.image_token
-
-        def create_mm_token_type_ids(self, ids):
-            return [[int(token == image_id) for token in row] for row in ids]
-
-    image = np.ones((3, 4, 3), dtype=np.float32)
-    processor = Processor()
-    prompt = Gemma4Recipe(processor).render(
-        [
-            resin.recipe.Message(
-                resin.recipe.Role.USER,
-                [resin.recipe.Image(image), resin.recipe.Text("describe")],
-            )
-        ]
+    config: Gemma4ImageProcessorKwargs = {
+        "patch_size": 2,
+        "pooling_kernel_size": 1,
+        "max_soft_tokens": 70,
+        "do_resize": False,
+        "do_normalize": True,
+        "image_mean": [0.5, 0.25, 0.0],
+        "image_std": [0.5, 0.25, 1.0],
+    }
+    image = (np.arange(24).reshape(2, 4, 3) / 24).astype(np.float32)
+    if is_video:
+        image = np.stack([image, image / 2], dtype=np.float32)
+        expected = Gemma4VideoProcessor(**config, do_sample_frames=False)(
+            videos=[image],
+            do_rescale=False,
+            return_tensors="np",
+            input_data_format="channels_last",
+        )
+        block = resin.recipe.Video(image)
+        field = "video_processor"
+    else:
+        expected = Gemma4ImageProcessor(**config)(
+            images=[image],
+            do_rescale=False,
+            return_tensors="np",
+            input_data_format="channels_last",
+        )
+        block = resin.recipe.Image.from_rgb(image)
+        field = "image_processor"
+    native_config = {**config, "do_sample_frames": False} if is_video else config
+    recipe = Gemma4Recipe(
+        GemmaAdapter().codec.tokenizer, media_config={field: native_config}
+    )
+    messages = [
+        resin.recipe.Message(
+            resin.recipe.Role.USER, [block, resin.recipe.Text("describe")]
+        )
+    ]
+    prompt = recipe.render(messages)
+    marker = "<|video|>" if is_video else "<|image|>"
+    frame = "<|image>" + marker * 2 + "<image|>"
+    expansion = " ".join(["00:00 " + frame] * 2) if is_video else frame
+    expected_text = recipe.render_text(messages).replace(marker, expansion)
+    assert (
+        prompt.token_ids
+        == recipe.tokenizer.encode(expected_text, add_special_tokens=False).ids
     )
     image.fill(0)
-    assert processor.image_processor.seen is not None
-    passed = processor.image_processor.seen["images"][0]
-    assert passed.sum() == 36
-    assert processor.image_processor.seen["do_rescale"] is False
     assert isinstance(prompt.media, Gemma4Media)
-    assert len(prompt.media.image_positions) == 1
+    if is_video:
+        np.testing.assert_array_equal(
+            prompt.media.pixel_values_videos, expected["pixel_values_videos"]
+        )
+        np.testing.assert_array_equal(
+            prompt.media.video_position_ids, expected["video_position_ids"]
+        )
+        assert len(prompt.media.video_positions) == 4
+    else:
+        np.testing.assert_array_equal(
+            prompt.media.pixel_values, expected["pixel_values"]
+        )
+        np.testing.assert_array_equal(
+            prompt.media.image_position_ids, expected["image_position_ids"]
+        )
+        assert len(prompt.media.image_positions) == 2
 
 
 def test_submit_media_uses_its_tokenized_prompt_without_engine_media_logic() -> None:
@@ -121,8 +179,8 @@ def test_submit_media_uses_its_tokenized_prompt_without_engine_media_logic() -> 
     media = Gemma4Media(
         token_ids=(2, 8),
         mm_token_type_ids=(0, 1),
-        pixel_values=torch.ones(1, 9, 12),
-        image_position_ids=torch.zeros(1, 9, 2, dtype=torch.int64),
+        pixel_values=np.ones((1, 9, 12), dtype=np.float32),
+        image_position_ids=np.zeros((1, 9, 2), dtype=np.int64),
     )
     engine = Engine(Runner())
 

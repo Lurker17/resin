@@ -6,7 +6,7 @@ from resin.recipe import Recipe
 from resin.recipe import ContentBlock
 import numpy as np
 import numpy.typing as npt
-from resin.protocols import MediaInput, Runner, TokenSpan
+from resin.protocols import MediaInput, MediaTokenSpan, Runner, TokenSpan
 
 __version__: Final[str]
 
@@ -413,6 +413,68 @@ class CacheRetention:
     def __repr__(self, /) -> str: ...
 
 @final
+class DeepSeekV41Image:
+    def __new__(
+        cls,
+        /,
+        start: int,
+        patches: Any,
+        n_vit_h: int,
+        n_vit_w: int,
+        types: Sequence[int],
+    ) -> DeepSeekV41Image: ...
+    def __reduce__(self, /) -> Any: ...
+    @property
+    def n_vit_h(self, /) -> int: ...
+    @property
+    def n_vit_w(self, /) -> int: ...
+    @property
+    def patches(self, /) -> npt.NDArray[np.float32]: ...
+    @property
+    def start(self, /) -> int: ...
+    @property
+    def types(self, /) -> tuple[int, ...]: ...
+
+@final
+class DeepSeekV41ImageProcessor:
+    def __new__(
+        cls,
+        /,
+        *,
+        patch_size: int = 14,
+        downsample_ratio: int = 3,
+        max_image_tokens: int = 1024,
+        min_pixels: int = 295936,
+        max_wh_ratio: float | None = None,
+    ) -> DeepSeekV41ImageProcessor: ...
+    def grid(self, /, width: int, height: int) -> tuple[int, int]: ...
+    def prepare(self, /, image: Any, *, start: int = 0) -> DeepSeekV41Image: ...
+    def token_count(self, /, width: int, height: int) -> int: ...
+
+@final
+class DeepSeekV41Media:
+    def __new__(
+        cls,
+        /,
+        token_ids: Sequence[int],
+        images: Sequence[DeepSeekV41Image],
+        image_token_id: int = 129264,
+    ) -> DeepSeekV41Media: ...
+    def __reduce__(self, /) -> Any: ...
+    @property
+    def cache_key(self, /) -> tuple[int, ...]: ...
+    @property
+    def digest(self, /) -> str: ...
+    @property
+    def image_token_id(self, /) -> int: ...
+    @property
+    def images(self, /) -> tuple[DeepSeekV41Image, ...]: ...
+    @property
+    def token_ids(self, /) -> tuple[int, ...]: ...
+    @property
+    def token_spans(self, /) -> tuple[MediaTokenSpan, ...]: ...
+
+@final
 class DeepSeekV41Recipe(_NativeRecipe):
     def __new__(
         cls,
@@ -427,7 +489,12 @@ class DeepSeekV41Recipe(_NativeRecipe):
 @final
 class DeepSeekV4Recipe(_NativeRecipe):
     def __new__(
-        cls, /, tokenizer: Any, *, options: RenderOptions | None = None
+        cls,
+        /,
+        tokenizer: Any,
+        *,
+        options: RenderOptions | None = None,
+        media_config: Any | None = None,
     ) -> DeepSeekV4Recipe: ...
 
 @final
@@ -585,6 +652,47 @@ class ForwardOutput:
     def top_token_ids(self, /) -> npt.NDArray[np.uint32] | None: ...
 
 @final
+class Gemma4Media:
+    def __new__(
+        cls,
+        /,
+        token_ids: Sequence[int],
+        mm_token_type_ids: Sequence[int],
+        pixel_values: Any | None = None,
+        image_position_ids: Any | None = None,
+        pixel_values_videos: Any | None = None,
+        video_position_ids: Any | None = None,
+    ) -> Gemma4Media: ...
+    def __reduce__(self, /) -> Any: ...
+    @property
+    def block_ids(self, /) -> tuple[int, ...]: ...
+    @property
+    def cache_key(self, /) -> tuple[int, ...]: ...
+    @property
+    def digest(self, /) -> str: ...
+    @property
+    def image_position_ids(self, /) -> npt.NDArray[np.int64] | None: ...
+    @property
+    def image_positions(self, /) -> tuple[int, ...]: ...
+    @property
+    def mm_token_type_ids(self, /) -> tuple[int, ...]: ...
+    @property
+    def pixel_values(self, /) -> npt.NDArray[np.float32] | None: ...
+    @property
+    def pixel_values_videos(self, /) -> npt.NDArray[np.float32] | None: ...
+    @property
+    def token_ids(self, /) -> tuple[int, ...]: ...
+    @property
+    def token_spans(self, /) -> tuple[MediaTokenSpan, ...]: ...
+    def validate_placeholder_tokens(
+        self, /, *, image_token_id: int, video_token_id: int
+    ) -> None: ...
+    @property
+    def video_position_ids(self, /) -> npt.NDArray[np.int64] | None: ...
+    @property
+    def video_positions(self, /) -> tuple[int, ...]: ...
+
+@final
 class Gemma4Recipe(_NativeRecipe):
     def __new__(
         cls,
@@ -593,12 +701,18 @@ class Gemma4Recipe(_NativeRecipe):
         *,
         options: RenderOptions | None = None,
         eos_token_ids: Sequence[int] = ...,
+        media_config: Any | None = None,
     ) -> Gemma4Recipe: ...
 
 @final
 class GptOssRecipe(_NativeRecipe):
     def __new__(
-        cls, /, tokenizer: Any, *, options: RenderOptions | None = None
+        cls,
+        /,
+        tokenizer: Any,
+        *,
+        options: RenderOptions | None = None,
+        media_config: Any | None = None,
     ) -> GptOssRecipe: ...
 
 @final
@@ -612,9 +726,39 @@ class Image:
     def source(self, /) -> Any: ...
 
 @final
+class InklingMedia:
+    def __new__(
+        cls,
+        /,
+        token_ids: Sequence[int],
+        image_token_id: int,
+        pixel_values: Any | None = None,
+    ) -> InklingMedia: ...
+    def __reduce__(self, /) -> Any: ...
+    @property
+    def cache_key(self, /) -> tuple[int, ...]: ...
+    @property
+    def digest(self, /) -> str: ...
+    @property
+    def image_positions(self, /) -> tuple[int, ...]: ...
+    @property
+    def image_token_id(self, /) -> int: ...
+    @property
+    def pixel_values(self, /) -> npt.NDArray[np.float32] | None: ...
+    @property
+    def token_ids(self, /) -> tuple[int, ...]: ...
+    @property
+    def token_spans(self, /) -> tuple[MediaTokenSpan, ...]: ...
+
+@final
 class InklingRecipe(_NativeRecipe):
     def __new__(
-        cls, /, tokenizer: Any, *, options: RenderOptions | None = None
+        cls,
+        /,
+        tokenizer: Any,
+        *,
+        options: RenderOptions | None = None,
+        media_config: Any | None = None,
     ) -> InklingRecipe: ...
 
 @final
@@ -636,7 +780,12 @@ class InklingResponseParser:
 @final
 class Lfm2Recipe(_NativeRecipe):
     def __new__(
-        cls, /, tokenizer: Any, *, options: RenderOptions | None = None
+        cls,
+        /,
+        tokenizer: Any,
+        *,
+        options: RenderOptions | None = None,
+        media_config: Any | None = None,
     ) -> Lfm2Recipe: ...
 
 @final
@@ -762,15 +911,61 @@ class ProcessedMedia:
     def spans(self, /) -> tuple[MediaTokens, ...]: ...
 
 @final
+class Qwen35Media:
+    def __new__(
+        cls,
+        /,
+        token_ids: Sequence[int],
+        image_positions: Sequence[int],
+        pixel_values: Any,
+        image_grid_thw: Any,
+        spatial_merge_size: int,
+        image_token_id: int,
+    ) -> Qwen35Media: ...
+    def __reduce__(self, /) -> Any: ...
+    @property
+    def cache_key(self, /) -> tuple[int, ...]: ...
+    @property
+    def digest(self, /) -> str: ...
+    @property
+    def image_grid_thw(self, /) -> npt.NDArray[np.int64]: ...
+    @property
+    def image_positions(self, /) -> tuple[int, ...]: ...
+    @property
+    def image_token_id(self, /) -> int: ...
+    @property
+    def pixel_values(self, /) -> npt.NDArray[np.float32]: ...
+    @property
+    def position_ids(self, /) -> npt.NDArray[np.int64]: ...
+    @property
+    def rope_delta(self, /) -> int: ...
+    @property
+    def spatial_merge_size(self, /) -> int: ...
+    @property
+    def token_ids(self, /) -> tuple[int, ...]: ...
+    @property
+    def token_spans(self, /) -> tuple[MediaTokenSpan, ...]: ...
+
+@final
 class Qwen35Recipe(_NativeRecipe):
     def __new__(
-        cls, /, tokenizer: Any, *, options: RenderOptions | None = None
+        cls,
+        /,
+        tokenizer: Any,
+        *,
+        options: RenderOptions | None = None,
+        media_config: Any | None = None,
     ) -> Qwen35Recipe: ...
 
 @final
 class Qwen38Recipe(_NativeRecipe):
     def __new__(
-        cls, /, tokenizer: Any, *, options: RenderOptions | None = None
+        cls,
+        /,
+        tokenizer: Any,
+        *,
+        options: RenderOptions | None = None,
+        media_config: Any | None = None,
     ) -> Qwen38Recipe: ...
 
 @final
@@ -1260,3 +1455,5 @@ class _NativeRecipe:
     ) -> str: ...
     @property
     def tokenizer(self, /) -> Any: ...
+
+def image_token_types(height: int, width: int) -> tuple[int, ...]: ...

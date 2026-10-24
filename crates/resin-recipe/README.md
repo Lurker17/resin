@@ -13,9 +13,12 @@ and span operations while retaining their model-specific ordering and framing.
 A renderer produces a `Prompt`: ordinary text plus explicit control-token spans.
 Adjacent text coalesces before encoding, preserving BPE boundaries. A prepared
 `TokenizerEncoder` shares the tokenizer and encodes ordinary marker spellings as
-text. Trusted image/video processor expansions replace only explicit media
-slots, then use the same encoding boundary. Model adapters retain pixel/tensor
-preparation and cache identities; they do not run chat templates.
+text. Native image/video processor expansions replace only explicit media
+slots, then use the same encoding boundary. Model-owned modules under `media/`
+prepare pixels and model geometry using the Rust `image` crate. The Python
+binding exposes owned NumPy payload arrays and cache identities; runners execute
+the GPU vision encoder. Resize pixels can differ from HF filters; strict
+no-resize oracles check normalization, padding and patch order.
 
 `ResponseParser::feed` consumes only new token IDs. `finish(Stop | Length)` flushes
 buffered text, including truncated UTF-8; finalization is idempotent. A shared
@@ -27,8 +30,10 @@ not invent complete arguments for an unfinished call.
 
 Python callers import concrete native classes such as
 `from resin.recipe import GptOssRecipe, Gemma4Recipe` and instantiate
-`GptOssRecipe(tokenizer)` or `Gemma4Recipe(processor)`. `resin.recipe.Recipe` is a structural
-protocol. `render(messages, *, tools=(), options=None)` accepts typed `Message`
+`GptOssRecipe(tokenizer)` or `Gemma4Recipe(processor)`. A media recipe snapshots
+processor configuration once; callers may instead supply a tokenizer and
+`media_config` mapping. Video inputs are decoded frames. `resin.recipe.Recipe`
+is a structural protocol. `render(messages, *, tools=(), options=None)` accepts typed `Message`
 content and returns `RenderedPrompt`; its token IDs, model stops and prepared
 media are available as attributes. `create_parser(prompt)` binds a fresh parser
 to the actual rendered prefix and options. A native prompt belongs to the

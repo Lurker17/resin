@@ -83,7 +83,9 @@ class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
         hidden = self._model.embed(input_ids)
         for index, image in overlaps:
             if index not in features:
-                patches = image.patches.to(self.device)
+                patches = torch.from_numpy(image.patches).to(
+                    self.device, dtype=torch.bfloat16
+                )
                 encoded = self._model.vision(patches, image.n_vit_h, image.n_vit_w)
                 encoded = self._model.aligner(encoded, image.n_vit_h, image.n_vit_w)
                 span = encoded.new_empty(len(image.types), encoded.shape[-1])

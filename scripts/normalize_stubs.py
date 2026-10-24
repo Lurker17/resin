@@ -75,6 +75,45 @@ PARAMETERS = {
 }
 
 RETURNS = {
+    ("", "image_token_types"): "tuple[int, ...]",
+    ("DeepSeekV41Image", "types"): "tuple[int, ...]",
+    ("DeepSeekV41Image", "patches"): "npt.NDArray[np.float32]",
+    ("DeepSeekV41Media", "images"): "tuple[DeepSeekV41Image, ...]",
+    **{
+        (owner, name): "tuple[int, ...]"
+        for owner, extra in (
+            ("DeepSeekV41Media", ()),
+            (
+                "Gemma4Media",
+                (
+                    "image_positions",
+                    "video_positions",
+                    "block_ids",
+                    "mm_token_type_ids",
+                ),
+            ),
+            ("InklingMedia", ("image_positions",)),
+            ("Qwen35Media", ("image_positions",)),
+        )
+        for name in ("token_ids", "cache_key", *extra)
+    },
+    **{
+        (owner, "token_spans"): "tuple[MediaTokenSpan, ...]"
+        for owner in ("DeepSeekV41Media", "Gemma4Media", "InklingMedia", "Qwen35Media")
+    },
+    **{
+        (owner, name): f"npt.NDArray[np.{dtype}]" + (" | None" if optional else "")
+        for owner, name, dtype, optional in (
+            ("InklingMedia", "pixel_values", "float32", True),
+            ("Qwen35Media", "pixel_values", "float32", False),
+            ("Qwen35Media", "image_grid_thw", "int64", False),
+            ("Qwen35Media", "position_ids", "int64", False),
+            ("Gemma4Media", "pixel_values", "float32", True),
+            ("Gemma4Media", "image_position_ids", "int64", True),
+            ("Gemma4Media", "pixel_values_videos", "float32", True),
+            ("Gemma4Media", "video_position_ids", "int64", True),
+        )
+    },
     ("ProcessedMedia", "spans"): "tuple[MediaTokens, ...]",
     ("ParserEvent", "token_spans"): "tuple[TokenSpan, ...]",
     ("Message", "content"): "tuple[ContentBlock, ...]",
@@ -270,6 +309,7 @@ def import_edits(
         additions.append("import numpy.typing as npt")
     missing_protocols = {
         "MediaInput",
+        "MediaTokenSpan",
         "TokenSpan",
         "Runner",
     } - protocol_names

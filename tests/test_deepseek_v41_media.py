@@ -1,7 +1,6 @@
 """Image codec equivalence, cache identity and scheduler-neutral ownership."""
 
 import base64
-import hashlib
 import io
 import json
 import random
@@ -17,7 +16,6 @@ from tokenizers import Tokenizer
 
 import resin
 from resin import Engine, MediaInput, RunnerConfig, SchedulerConfig
-from resin._recipe_media import digest_tensors
 from resin.models.deepseek_v41 import (
     DeepSeekV41Image,
     DeepSeekV41Media,
@@ -53,19 +51,34 @@ def codec():
 
 
 @pytest.mark.parametrize("case", FIXTURE["cases"])
-def test_pixels_and_patch_order_match_published_processor(case):
+def test_native_pixels_preserve_published_geometry(case):
     processor = DeepSeekV41ImageProcessor(max_wh_ratio=case["max_wh_ratio"])
     rgb = _pattern(case["width"], case["height"])
     image = processor.prepare(rgb.astype(np.float32) / 255)
     assert (image.n_vit_h, image.n_vit_w) == tuple(case["grid"])
     assert image.types == image_token_types(*case["llm_grid"])
     assert len(image.types) <= 1024
-    assert image.patches.dtype == torch.bfloat16
-    assert image.patches.is_contiguous()
-    assert (
-        hashlib.sha256(image.patches.view(torch.uint8).numpy().tobytes()).hexdigest()
-        == case["patch_sha256"]
-    )
+    assert image.patches.dtype == np.float32
+    assert image.patches.flags.c_contiguous
+    assert np.isfinite(image.patches).all()
+    assert np.all(image.patches >= -1) and np.all(image.patches <= 1)
+    # Native resize need not reproduce Pillow pixels, but the tower still sees
+    # exactly BF16-rounded values with the checkpoint's geometry and packing.
+    expected = torch.from_numpy(image.patches).to(torch.bfloat16).float().numpy()
+    np.testing.assert_array_equal(image.patches, expected)
+
+
+def test_native_patch_order_and_normalization_are_exact_without_resizing():
+    rgb = _pattern(28, 14)
+    source = rgb.astype(np.float32) / 255
+    image = DeepSeekV41ImageProcessor(min_pixels=0).prepare(source)
+    expected = torch.from_numpy(source).permute(2, 0, 1)
+    expected = ((expected - 0.5) / 0.5).to(torch.bfloat16).float()
+    expected = expected.reshape(3, 1, 14, 2, 14).permute(1, 3, 0, 2, 4)
+    np.testing.assert_array_equal(image.patches, expected.reshape(2, 3, 14, 14).numpy())
+    before = image.patches.copy()
+    source.fill(0)
+    np.testing.assert_array_equal(image.patches, before)
 
 
 def test_geometry_matches_official_recipe_for_varied_aspect_ratios():
@@ -124,7 +137,7 @@ def test_media_codec_expands_only_explicit_images_and_owns_inputs(codec):
     )
     assert codec.render_ids(messages) == codec.render(messages).token_ids
     second.fill(1)
-    assert media.images[1].patches.max().item() < 0
+    assert np.all(media.images[1].patches < 0)
 
 
 def test_image_identity_changes_only_its_media_cache_identity(codec):
@@ -152,7 +165,7 @@ def test_prepared_media_rejects_bad_layout_and_owns_patch_storage():
     patches = torch.ones((1, 3, 14, 14), dtype=torch.bfloat16)
     image = DeepSeekV41Image(1, patches, 1, 1, (0, 1, 2, 3))
     patches.zero_()
-    assert image.patches.min().item() == 1
+    assert np.all(image.patches == 1)
     media = DeepSeekV41Media((7, 129264, 129264, 129264, 129264), (image,))
     with pytest.raises(ValueError, match="different placeholder"):
         DeepSeekV41Media((7, 129264, 129264, 129264, 8), (image,))
@@ -162,22 +175,6 @@ def test_prepared_media_rejects_bad_layout_and_owns_patch_storage():
         DeepSeekV41Image(1, image.patches, 1, 1, (0, 1, 3))
     with pytest.raises(ValueError, match="ordered, disjoint"):
         DeepSeekV41Media(media.token_ids, (image, image))
-
-
-@pytest.mark.parametrize(
-    "dtype", [torch.bfloat16, torch.float8_e4m3fn, torch.float32, torch.int64]
-)
-def test_shared_digest_supports_torch_dtypes_and_scalar_shapes(dtype):
-    tensor = torch.tensor([[0, 1], [2, 3]]).to(dtype)
-    assert digest_tensors(b"test", [("x", tensor)]) == digest_tensors(
-        b"test", [("x", tensor.clone())]
-    )
-    assert digest_tensors(b"test", [("x", tensor)]) != digest_tensors(
-        b"test", [("x", tensor.T)]
-    )
-    assert digest_tensors(b"test", [("x", tensor[0, 0])]) != digest_tensors(
-        b"test", [("x", tensor[0, :1])]
-    )
 
 
 def test_engine_slices_causal_image_spans_across_prefill_chunks(codec):

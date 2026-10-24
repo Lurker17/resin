@@ -5,13 +5,14 @@ from __future__ import annotations
 import gc
 import json
 import weakref
-from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from test_http_lifecycle import post, running_server
 from test_recipe import _byte_tokenizer
 
 import resin
+from resin.models.inkling.media import InklingMedia
 
 
 def tokenizer():
@@ -128,39 +129,21 @@ def test_native_event_constructor_validates_span_storage(spans, error):
         resin.recipe.TextDelta("x", token_spans=spans)
 
 
-def test_parser_does_not_retain_media_or_the_rendered_prompt(monkeypatch):
-    import resin.models.inkling.media as media
-
-    class Payload:
-        pass
-
-    class Processor:
-        def process(self, sources):
-            assert isinstance(sources[0], resin.recipe.Image)
-            return resin.recipe.ProcessedMedia(
-                [resin.recipe.MediaTokens("<|content_image|>", [1])],
-                SimpleNamespace(payload=sources[0].source),
-            )
-
-        def bind(self, processed, token_ids, spans):
-            assert isinstance(spans[0], resin.MediaTokenSpan)
-            position, length = spans[0]
-            assert token_ids[position : position + length] == [1]
-            return processed.payload
-
-    monkeypatch.setattr(
-        media, "make_media_processor", lambda *_args, **_kwargs: Processor()
-    )
+def test_parser_does_not_retain_media_or_the_rendered_prompt():
     native = resin.recipe.InklingRecipe(tokenizer())
-    payload = Payload()
-    reference = weakref.ref(payload)
+    pixels = np.zeros((40, 40, 3), dtype=np.float32)
+    source = weakref.ref(pixels)
     messages = [
-        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Image(payload)])
+        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Image(pixels)])
     ]
     prompt = native.render(messages)
+    assert isinstance(prompt.media, InklingMedia)
+    assert prompt.media.pixel_values is not None
+    reference = weakref.ref(prompt.media.pixel_values)
     parser = native.create_parser(prompt)
-    del payload, messages, prompt
+    del pixels, messages, prompt
     gc.collect()
+    assert source() is None
     assert reference() is None
     assert parser.feed([]) == []
 
@@ -185,25 +168,21 @@ def test_processed_media_owns_token_buffers_and_retains_only_its_payload():
         setattr(processed, "payload", None)
 
 
-def test_media_processor_cannot_silently_drop_a_source(monkeypatch):
-    import resin.models.inkling.media as media
-
-    class EmptyProcessor:
-        def process(self, sources):
-            return resin.recipe.ProcessedMedia([], None)
-
-        def bind(self, processed, token_ids, spans):
-            raise AssertionError("invalid media output must fail before binding")
-
-    monkeypatch.setattr(
-        media, "make_media_processor", lambda *_args, **_kwargs: EmptyProcessor()
-    )
+def test_native_media_accounts_for_each_source():
     native = resin.recipe.InklingRecipe(tokenizer())
-    with pytest.raises(ValueError, match="one expansion per source"):
+    valid = resin.recipe.Image(np.zeros((40, 40, 3), dtype=np.float32))
+    prompt = native.render(
+        [resin.recipe.Message(resin.recipe.Role.USER, [valid, valid])]
+    )
+    assert isinstance(prompt.media, InklingMedia)
+    assert prompt.media.pixel_values is not None
+    assert prompt.media.pixel_values.shape[0] == 4
+    assert len(prompt.media.image_positions) == 4
+    with pytest.raises(ValueError, match="dtype float32"):
         native.render(
             [
                 resin.recipe.Message(
-                    resin.recipe.Role.USER, [resin.recipe.Image(object())]
+                    resin.recipe.Role.USER, [valid, resin.recipe.Image(object())]
                 )
             ]
         )

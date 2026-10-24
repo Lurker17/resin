@@ -29,7 +29,9 @@ MARKERS = (
     "<|tool>",
     "<tool|>",
     "<|think|>",
+    "<|image>",
     "<|image|>",
+    "<image|>",
     "<|video|>",
 )
 

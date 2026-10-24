@@ -174,8 +174,8 @@ The built-in native server exposes one Engine through OpenAI Chat Completions an
 Responses, Anthropic Messages, and a small streaming chat page. Model-specific
 prompt rendering and incremental response parsing live in the independent
 `resin-recipe` Rust crate. Native model recipes implement the same `Recipe`
-protocol as application-provided recipes. Python pixel processors remain an
-internal preparation step for models that need them.
+protocol as application-provided recipes. Stock image/video preprocessing also
+runs in Rust; the model runner performs the GPU vision encoder.
 
 The bridge bounds queued jobs with `HttpServer(request_queue_capacity=1024)`.
 This shared intake queue absorbs bursts while requests await engine admission;
@@ -264,11 +264,20 @@ inheriting a Resin class or using the native tokenizer/parser.
 For images, put `resin.recipe.Image.from_rgb(array)` or
 `resin.recipe.Image.from_bytes(data, media_type="image/png")` in a message and pass
 the model's processor to its recipe, for example `Gemma4Recipe(processor)`.
-Each model implements `resin.recipe.MediaProcessor`: `process()` produces media
-token expansions and an owned payload; `bind()` uses their final prompt positions
-to construct the inference input. The shared recipe inserts the tokens without
-knowing image processors, patch geometry, mRoPE, or model cache identities.
-Literal marker spellings in ordinary text cannot acquire media slots.
+The recipe snapshots processor configuration once; image/video requests then use
+Rust decoding, resizing, normalization and patchification. A tokenizer plus an
+explicit `media_config` mapping also works. Model-owned preprocessing supplies
+token expansions, positions and cache identity; the runner receives native-owned
+NumPy arrays and transfers them to the GPU vision encoder. Literal marker
+spellings in ordinary text cannot acquire media slots.
+
+Gemma video input contains decoded frames, optionally with frame indices and fps;
+video-file decoding remains the application's responsibility. Rust's `image`
+crate provides image decoding and resize filters. Geometry, normalization and
+patch order follow the model processors; resize pixels intentionally need not
+match HF bit-for-bit. No-resize tests compare pixels and positions exactly.
+Encoded inputs support PNG, JPEG, WebP, GIF, BMP and TIFF. Other formats,
+including AVIF, must be decoded by the application and passed with `Image.from_rgb`.
 
 `stream_interval` is an integer from 1 through `2**32 - 1`, set once per server,
 and defaults to 1.
@@ -279,7 +288,7 @@ Text and its logprobs stay aligned. Inference, stop matching, and cancellation
 still run on every step. The setting applies to all requests and HTTP APIs.
 
 Image data URLs are decoded locally; remote image fetching remains an application
-concern. Prepared media owns its pixel tensors through request execution and
+concern. Prepared media owns its pixel arrays through request execution and
 does not become part of response parser state.
 
 ## Current shape

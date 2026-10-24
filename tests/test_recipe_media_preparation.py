@@ -1,10 +1,10 @@
-"""Pixel strategy contracts independent of native chat formatting."""
+"""Native media geometry, ownership, and dependency-free recipe processing."""
 
 from __future__ import annotations
 
 import base64
-import hashlib
 import io
+import pickle
 from types import SimpleNamespace
 from typing import Any
 
@@ -14,21 +14,67 @@ import torch
 from PIL import Image
 
 import resin
-from resin._recipe_media import (
-    digest_tensors,
-    normalize_image,
-)
-from resin.models.deepseek_v41.media import DeepSeekV41Media
-from resin.models.deepseek_v41.media import (
-    make_media_processor as make_deepseek_processor,
-)
-from resin.models.gemma4.media import Gemma4Media
-from resin.models.gemma4.media import make_media_processor as make_gemma_processor
-from resin.models.inkling.media import InklingMedia
-from resin.models.inkling.media import make_media_processor as make_inkling_processor
-from resin.models.qwen3_5.media import Qwen35Media
-from resin.models.qwen3_5.media import make_media_processor as make_qwen_processor
-from resin.protocols import MediaTokenSpan
+from resin.recipe import DeepSeekV41Recipe, Gemma4Recipe, InklingRecipe, Qwen35Recipe
+
+
+class Tokenizer:
+    """Minimal tokenizer for testing media without checkpoint files."""
+
+    def __init__(self):
+        self.tokens = {}
+
+    def encode_ordinary(self, text):
+        return list(text.encode())
+
+    def encode(self, text, *, add_special_tokens=False):
+        return list(text.encode())
+
+    def convert_tokens_to_ids(self, text):
+        return self.tokens.setdefault(text, 1000 + len(self.tokens))
+
+    def convert_ids_to_tokens(self, token):
+        return next(text for text, value in self.tokens.items() if token == value)
+
+    def decode(self, ids, *, skip_special_tokens=False):
+        return bytes(ids).decode()
+
+
+GEMMA_CONFIG = {
+    "image_processor": {
+        "patch_size": 2,
+        "pooling_kernel_size": 1,
+        "max_soft_tokens": 70,
+        "do_resize": False,
+    },
+    "video_processor": {
+        "patch_size": 2,
+        "pooling_kernel_size": 1,
+        "max_soft_tokens": 70,
+        "do_resize": False,
+        "do_sample_frames": False,
+    },
+}
+
+
+def render_media(recipe, blocks):
+    prompt = recipe.render([resin.recipe.Message(resin.recipe.Role.USER, blocks)])
+    assert prompt.media is not None
+    assert tuple(prompt.token_ids) == prompt.media.token_ids
+    return prompt.media
+
+
+def assert_pickle_roundtrip(media, *array_fields):
+    restored = pickle.loads(pickle.dumps(media))
+    assert type(restored) is type(media)
+    assert restored.token_ids == media.token_ids
+    assert restored.token_spans == media.token_spans
+    assert restored.digest == media.digest
+    assert restored.cache_key == media.cache_key
+    for name in array_fields:
+        original, copied = getattr(media, name), getattr(restored, name)
+        assert np.array_equal(original, copied), name
+        assert not np.shares_memory(original, copied), name
+    return restored
 
 
 def test_image_sources_share_one_owned_rgb_boundary() -> None:
@@ -36,193 +82,154 @@ def test_image_sources_share_one_owned_rgb_boundary() -> None:
     encoded = io.BytesIO()
     Image.fromarray(pixels).save(encoded, format="PNG")
     raw = encoded.getvalue()
-    expected = pixels.astype(np.float32) / np.float32(255)
+    rgb = pixels.astype(np.float32) / np.float32(255)
+    recipe = InklingRecipe(
+        Tokenizer(), media_config={"size": {"height": 2, "width": 2}}
+    )
     sources = (
-        expected,
-        (raw, "image/png"),
-        "data:image/png;base64," + base64.b64encode(raw).decode(),
+        resin.recipe.Image.from_rgb(rgb),
+        resin.recipe.Image.from_bytes(raw, media_type="image/png"),
+        resin.recipe.Image("data:image/png;base64," + base64.b64encode(raw).decode()),
     )
-    for source in sources:
-        image = normalize_image(source)
-        assert np.array_equal(image, expected)
-        assert image.flags.c_contiguous
-        assert not np.shares_memory(image, expected)
+    payloads = [render_media(recipe, [source]) for source in sources]
+    assert_pickle_roundtrip(payloads[0], "pixel_values")
+    for payload in payloads:
+        assert np.array_equal(payload.pixel_values, payloads[0].pixel_values)
+        assert payload.pixel_values.flags.c_contiguous
+        assert not np.shares_memory(payload.pixel_values, rgb)
+        assert payload.digest == payloads[0].digest
+        assert payload.cache_key == payloads[0].cache_key
+    before = payloads[0].pixel_values.copy()
+    rgb.fill(0)
+    assert np.array_equal(payloads[0].pixel_values, before)
 
 
-def test_unsupported_media_rejected_before_processor_runs() -> None:
-    processor = SimpleNamespace(tokenizer=object())
-    for factory in (make_inkling_processor, make_qwen_processor):
-        media_processor = factory(processor)
-        with pytest.raises(ValueError, match="does not support video"):
-            media_processor.process(
-                [resin.recipe.Video(np.zeros((2, 2, 2, 3), dtype=np.float32))]
-            )
-    with pytest.raises(ValueError, match="requires a pixel processor"):
-        make_inkling_processor(object()).process(
-            [resin.recipe.Image.from_rgb(np.zeros((2, 3, 3), dtype=np.float32))]
+@pytest.mark.parametrize("constructor", [InklingRecipe, Qwen35Recipe])
+def test_image_only_recipes_reject_video(constructor) -> None:
+    recipe = constructor(Tokenizer())
+    with pytest.raises(ValueError, match="image|video"):
+        render_media(
+            recipe,
+            [resin.recipe.Video(np.zeros((2, 2, 2, 3), dtype=np.float32))],
         )
 
 
-def test_gemma_preparation_preserves_interleaved_geometry_and_atomic_spans() -> None:
-    seen: dict[str, Any] = {}
-    pixels = torch.ones((2, 1, 6))
-    video_pixels = torch.ones((1, 2, 1, 6))
-
-    def images(**kwargs):
-        seen["images"] = kwargs["images"]
-        return {"pixel_values": pixels, "image_position_ids": torch.zeros((2, 1, 2))}
-
-    def videos(**kwargs):
-        seen["videos"] = kwargs["videos"]
-        return {
-            "pixel_values_videos": video_pixels,
-            "video_position_ids": torch.zeros((1, 2, 1, 2)),
-            "video_metadata": ["temporary"],
-        }
-
-    class Tokenizer:
-        markers = {"<image>": 8, "<video>": 9, "<boi>": 10, "<eoi>": 11}
-
-        def convert_tokens_to_ids(self, token):
-            return self.markers[token]
-
-        def encode(self, text, *, add_special_tokens=False):
-            import re
-
-            return [self.markers[token] for token in re.findall(r"<[^>]*>", text)]
-
-    processor = SimpleNamespace(
-        tokenizer=Tokenizer(),
-        image_processor=images,
-        video_processor=videos,
-        image_token="<image>",
-        video_token="<video>",
-        boi_token="<boi>",
-        replace_image_token=lambda prepared, image_idx: "<boi><image><eoi>",
-        replace_video_token=lambda prepared, video_idx: (
-            "00:00 <boi><video><video><eoi>"
-        ),
-    )
-    image = np.ones((2, 3, 3), dtype=np.float32)
-    frames = np.ones((2, 2, 3, 3), dtype=np.float32)
-    processor_impl = make_gemma_processor(processor)
-    processed = processor_impl.process(
+def test_gemma_interleaved_geometry_and_atomic_spans() -> None:
+    recipe = Gemma4Recipe(Tokenizer(), media_config=GEMMA_CONFIG)
+    first = np.full((2, 2, 3), 0.25, dtype=np.float32)
+    second = np.full((2, 2, 3), 0.75, dtype=np.float32)
+    frames = np.stack([np.full_like(first, 0.5), np.ones_like(first)])
+    media = render_media(
+        recipe,
         [
-            resin.recipe.Image.from_rgb(image),
+            resin.recipe.Text("first"),
+            resin.recipe.Image.from_rgb(first),
             resin.recipe.Video(frames),
-            resin.recipe.Image.from_rgb(image * 0.5),
-        ]
+            resin.recipe.Image.from_rgb(second),
+            resin.recipe.Text("last"),
+        ],
     )
-    assert [list(span.token_ids) for span in processed.spans] == [
-        [10, 8, 11],
-        [10, 9, 9, 11],
-        [10, 8, 11],
+    assert media.pixel_values.shape == (2, 70, 12)
+    assert media.pixel_values_videos.shape == (1, 2, 70, 12)
+    assert np.array_equal(
+        media.pixel_values[:, 0], np.stack([first, second]).reshape(2, 12)
+    )
+    assert np.array_equal(media.pixel_values_videos[0, :, 0], frames.reshape(2, 12))
+    assert np.count_nonzero(media.pixel_values[:, 1:]) == 0
+    assert np.array_equal(media.image_position_ids[:, 0], np.zeros((2, 2)))
+    assert np.all(media.image_position_ids[:, 1:] == -1)
+    first_position, second_position = media.image_positions
+    assert (
+        first_position
+        < media.video_positions[0]
+        < media.video_positions[1]
+        < second_position
+    )
+    assert [(span.position, span.length) for span in media.token_spans] == [
+        (position, 1)
+        for position in sorted((*media.image_positions, *media.video_positions))
     ]
-    assert [span.prefix for span in processed.spans] == ["", "00:00 ", ""]
-    assert "video_metadata" not in processed.payload
-    assert np.array_equal(seen["images"][1], image * 0.5)
-    assert not np.shares_memory(seen["images"][0], image)
-    assert not np.shares_memory(seen["videos"][0], frames)
-    media = processor_impl.bind(
-        processed,
-        [0, 10, 8, 11, 13, 10, 9, 9, 11, 10, 8, 11, 0],
-        [MediaTokenSpan(1, 3), MediaTokenSpan(5, 4), MediaTokenSpan(9, 3)],
+    assert media.cache_key[0] == media.token_ids[0]
+    assert media.cache_key[-1] == media.token_ids[-1]
+    first.fill(0)
+    frames.fill(0)
+    assert media.pixel_values[0, 0].sum() == 3
+    assert media.pixel_values_videos[0, :, 0].sum() == 18
+    restored = assert_pickle_roundtrip(
+        media,
+        "pixel_values",
+        "image_position_ids",
+        "pixel_values_videos",
+        "video_position_ids",
     )
-    assert isinstance(media, Gemma4Media)
-    assert media.image_positions == (2, 10)
-    assert media.video_positions == (6, 7)
-    assert media.token_spans == (
-        MediaTokenSpan(2, 1),
-        MediaTokenSpan(6, 2),
-        MediaTokenSpan(10, 1),
-    )
-    assert media.cache_key[0] == media.cache_key[-1] == 0
-    pixels.zero_()
-    video_pixels.zero_()
-    assert media.pixel_values is not None and media.pixel_values.sum() == 12
-    assert (
-        media.pixel_values_videos is not None and media.pixel_values_videos.sum() == 12
-    )
+    assert restored.image_positions == media.image_positions
+    assert restored.video_positions == media.video_positions
 
 
-def test_qwen_and_inkling_bind_ids_without_temporary_token_tensors() -> None:
-    class ImageProcessor:
-        merge_size = 2
-
-        def __call__(self, **kwargs):
-            return {
-                "pixel_values": torch.ones(4, 12),
-                "image_grid_thw": torch.tensor([[1, 2, 2]]),
-            }
-
-    source = resin.recipe.Image.from_rgb(np.ones((2, 3, 3), dtype=np.float32))
-    tokenizer = SimpleNamespace(convert_tokens_to_ids=lambda token: 8)
-    qwen = make_qwen_processor(
-        SimpleNamespace(tokenizer=tokenizer, image_processor=ImageProcessor())
+def test_qwen_and_inkling_native_patch_counts_and_layout() -> None:
+    pixels = np.full((4, 8, 3), 0.5, dtype=np.float32)
+    qwen = Qwen35Recipe(
+        Tokenizer(),
+        media_config={
+            "patch_size": 2,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "do_resize": False,
+            "image_mean": [0.5] * 3,
+            "image_std": [0.5] * 3,
+        },
     )
-    processed = qwen.process([source])
-    assert list(processed.spans[0].token_ids) == [8]
-    media = qwen.bind(processed, [1, 8, 2], [MediaTokenSpan(1, 1)])
-    assert isinstance(media, Qwen35Media)
-    assert media.image_positions == (1,)
-    assert media.position_ids.tolist() == [[0, 1, 2]] * 3
+    media = render_media(qwen, [resin.recipe.Image.from_rgb(pixels)])
+    assert len(media.image_positions) == 2
+    assert media.image_grid_thw.tolist() == [[1, 2, 4]]
+    assert media.pixel_values.shape == (8, 24)
+    assert np.count_nonzero(media.pixel_values) == 0
     assert media.token_spans == ()
-    inkling = make_inkling_processor(
-        SimpleNamespace(
-            tokenizer=tokenizer,
-            image_token_id=8,
-            image_token="<image>",
-            image_processor=lambda **kwargs: {
-                "pixel_values": torch.ones(2, 1, 3, 2, 3),
-                "num_patches": [2],
-            },
-        )
+    restored = assert_pickle_roundtrip(
+        media, "pixel_values", "image_grid_thw", "position_ids"
     )
-    processed = inkling.process([source])
-    assert list(processed.spans[0].token_ids) == [8, 8]
-    media = inkling.bind(processed, [1, 8, 8, 2], [MediaTokenSpan(1, 2)])
-    assert isinstance(media, InklingMedia)
-    assert media.image_positions == (1, 2)
+    assert restored.rope_delta == media.rope_delta
+    inkling = InklingRecipe(
+        Tokenizer(),
+        media_config={"size": {"height": 2, "width": 2}, "do_normalize": False},
+    )
+    media = render_media(inkling, [resin.recipe.Image.from_rgb(pixels)])
+    assert len(media.image_positions) == 10
+    assert media.pixel_values.shape == (10, 2, 2, 2, 3)
+    assert np.all(media.pixel_values[[4, 9]] == -1)
+    assert np.all(media.pixel_values[[0, 1, 2, 3, 5, 6, 7, 8]] == 0.5)
     assert media.token_spans == ()
 
 
-def test_deepseek_preparation_preserves_geometry_positions_and_cache_identity() -> None:
-    tokenizer = SimpleNamespace(token_to_id=lambda token: 8)
-    media_processor = make_deepseek_processor(
-        tokenizer, vision_config={"min_pixels": 0}, image_token_id=8
-    )
-    source = np.ones((14, 14, 3), dtype=np.float32)
-    processed = media_processor.process([resin.recipe.Image.from_rgb(source)] * 2)
-    assert [list(span.token_ids) for span in processed.spans] == [[8] * 4] * 2
-    placements = [MediaTokenSpan(1, 4), MediaTokenSpan(6, 4)]
-    media = media_processor.bind(
-        processed, [1, 8, 8, 8, 8, 2, 8, 8, 8, 8, 3], placements
-    )
-    assert isinstance(media, DeepSeekV41Media)
-    assert [image.start for image in media.images] == [1, 6]
+def test_deepseek_geometry_positions_and_cache_identity() -> None:
+    recipe = DeepSeekV41Recipe(Tokenizer(), vision_config={"min_pixels": 0})
+    source = np.ones((14, 28, 3), dtype=np.float32)
+    blocks = [
+        resin.recipe.Image.from_rgb(source),
+        resin.recipe.Text("between"),
+        resin.recipe.Image.from_rgb(source),
+    ]
+    media = render_media(recipe, blocks)
+    assert len(media.images) == 2
+    assert [image.patches.shape for image in media.images] == [(2, 3, 14, 14)] * 2
+    assert media.images[0].start + 4 < media.images[1].start
     assert media.token_spans == ()
-    assert media.cache_key[0] == 1 and media.cache_key[5] == 2
-    repeated = media_processor.bind(processed, list(media.token_ids), placements)
-    assert isinstance(repeated, DeepSeekV41Media)
+    repeated = render_media(recipe, blocks)
     assert media.digest == repeated.digest
-    with pytest.raises(ValueError, match="different placeholder"):
-        media_processor.bind(processed, [1, 8, 8, 8, 2, 8, 8, 8, 8, 8, 3], placements)
-
-
-def test_buffer_hash_preserves_existing_digest_encoding() -> None:
-    tensor = torch.tensor([[1, 2], [3, 4]], dtype=torch.bfloat16).T
-    expected = hashlib.sha256(b"namespace")
-    for part in (b"metadata", b"pixels", b"torch.bfloat16", b"(2, 2)"):
-        expected.update(part)
-    expected.update(tensor.contiguous().view(torch.uint8).numpy().tobytes())
-    assert (
-        digest_tensors(b"namespace", [("pixels", tensor)], metadata=[b"metadata"])
-        == expected.hexdigest()
-    )
+    assert media.cache_key == repeated.cache_key
+    source.fill(0)
+    assert np.all(media.images[0].patches == 1)
+    restored = assert_pickle_roundtrip(media)
+    for actual, expected in zip(restored.images, media.images, strict=True):
+        assert actual.start == expected.start
+        assert actual.n_vit_h == expected.n_vit_h
+        assert actual.n_vit_w == expected.n_vit_w
+        assert actual.types == expected.types
+        assert np.array_equal(actual.patches, expected.patches)
+        assert not np.shares_memory(actual.patches, expected.patches)
 
 
 def test_gemma_text_only_skips_media_embeddings_and_custom_attention_mask() -> None:
-    import resin
     from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
 
     runner = object.__new__(Gemma4CudaRunner)
@@ -236,56 +243,51 @@ def test_gemma_text_only_skips_media_embeddings_and_custom_attention_mask() -> N
     assert runner._local_custom_mask(batch, features) is None
 
 
-def test_text_only_recipes_do_not_import_pixel_processors() -> None:
+def test_native_media_does_not_import_python_image_or_tensor_libraries() -> None:
+    import inspect
     import subprocess
     import sys
     import textwrap
 
+    encoded = io.BytesIO()
+    Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8)).save(encoded, format="PNG")
+    script = "import resin\nimport numpy as np\nimport pickle\n" + inspect.getsource(
+        Tokenizer
+    )
+    script += textwrap.dedent(f"""
+        import importlib.abc
+        import sys
+
+        class BlockPythonMedia(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split('.')[0] in {{'PIL', 'torch', 'transformers'}}:
+                    raise AssertionError('native media imported ' + fullname)
+
+        sys.meta_path.insert(0, BlockPythonMedia())
+        cases = [
+            ('Gemma4Recipe', {{'media_config': {GEMMA_CONFIG!r}}}, (2, 2)),
+            ('Qwen35Recipe', {{'media_config': {{'patch_size': 2, 'merge_size': 2, 'do_resize': False}}}}, (4, 4)),
+            ('Qwen38Recipe', {{'media_config': {{'patch_size': 2, 'merge_size': 2, 'do_resize': False}}}}, (4, 4)),
+            ('InklingRecipe', {{'media_config': {{'size': {{'height': 2, 'width': 2}}}}}}, (2, 2)),
+            ('DeepSeekV41Recipe', {{'vision_config': {{'min_pixels': 0}}}}, (14, 14)),
+        ]
+        for name, config, size in cases:
+            recipe = getattr(resin.recipe, name)(Tokenizer(), **config)
+            plain = recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text('hello')])])
+            assert plain.media is None
+            image = resin.recipe.Image.from_rgb(np.zeros((*size, 3), dtype=np.float32))
+            prompt = recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [image])])
+            assert prompt.media is not None
+            assert isinstance(prompt.media.token_ids, tuple)
+            assert pickle.loads(pickle.dumps(prompt.media)).cache_key == prompt.media.cache_key
+            if name == 'InklingRecipe':
+                encoded = resin.recipe.Image.from_bytes({encoded.getvalue()!r}, media_type='image/png')
+                assert recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [encoded])]).media is not None
+            if name == 'Gemma4Recipe':
+                video = resin.recipe.Video(np.zeros((2, *size, 3), dtype=np.float32))
+                assert recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [video])]).media is not None
+        assert not {{'PIL', 'torch', 'transformers'}} & sys.modules.keys()
+    """)
     subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            textwrap.dedent("""
-                import sys
-                import resin
-
-                class Tokenizer:
-                    def __init__(self):
-                        self.tokens = {}
-                    def encode_ordinary(self, text):
-                        return list(text.encode())
-                    def encode(self, text, *, add_special_tokens=False):
-                        return list(text.encode())
-                    def convert_tokens_to_ids(self, text):
-                        return self.tokens.setdefault(text, 1000 + len(self.tokens))
-                    def convert_ids_to_tokens(self, token):
-                        return next(text for text, value in self.tokens.items() if token == value)
-                    def decode(self, ids, *, skip_special_tokens=False):
-                        return bytes(ids).decode()
-
-                names = ('Gemma4Recipe', 'Qwen35Recipe', 'Qwen38Recipe', 'InklingRecipe', 'DeepSeekV41Recipe')
-                recipes = [getattr(resin.recipe, name)(Tokenizer()) for name in names]
-                for recipe in recipes:
-                    prompt = recipe.render([
-                        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text('hello')])
-                    ])
-                    assert prompt.media is None
-                assert 'torch' not in sys.modules
-                assert 'resin._recipe_media' not in sys.modules
-
-                import numpy as np
-                for recipe in recipes[:-1]:
-                    try:
-                        recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [
-                            resin.recipe.Image.from_rgb(np.zeros((1, 1, 3), dtype=np.float32))
-                        ])])
-                    except ValueError as error:
-                        assert 'requires a pixel processor' in str(error)
-                    else:
-                        raise AssertionError('sourced images need a pixel processor')
-            """),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+        [sys.executable, "-c", script], check=True, capture_output=True, text=True
     )

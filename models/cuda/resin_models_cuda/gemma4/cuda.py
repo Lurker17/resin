@@ -539,15 +539,19 @@ class Gemma4CudaRunner(CudaRunner):
             if media.pixel_values is not None:
                 assert media.image_position_ids is not None
                 image = self._model.get_image_features(
-                    media.pixel_values.to(self.device, dtype=torch.bfloat16),
-                    media.image_position_ids.to(self.device),
+                    torch.from_numpy(media.pixel_values).to(
+                        self.device, dtype=torch.bfloat16
+                    ),
+                    torch.from_numpy(media.image_position_ids).to(self.device),
                 )
             video = None
             if media.pixel_values_videos is not None:
                 assert media.video_position_ids is not None
                 video = self._model.get_video_features(
-                    media.pixel_values_videos.to(self.device, dtype=torch.bfloat16),
-                    media.video_position_ids.to(self.device),
+                    torch.from_numpy(media.pixel_values_videos).to(
+                        self.device, dtype=torch.bfloat16
+                    ),
+                    torch.from_numpy(media.video_position_ids).to(self.device),
                 )
         if image is not None and len(image) != len(media.image_positions):
             raise ValueError("vision features do not match image placeholder count")
@@ -603,10 +607,11 @@ class Gemma4CudaRunner(CudaRunner):
                 raise TypeError("Gemma4CudaRunner media must be Gemma4Media")
             start, end = map(int, batch.token_indptr[row : row + 2])
             positions = batch.positions[start:end]
+            prompt_tokens = media.token_ids
             for flat_index, position in zip(range(start, end), positions, strict=True):
                 absolute = int(position)
-                if absolute < len(media.token_ids) and (
-                    int(batch.token_ids[flat_index]) != media.token_ids[absolute]
+                if absolute < len(prompt_tokens) and (
+                    int(batch.token_ids[flat_index]) != prompt_tokens[absolute]
                 ):
                     raise ValueError(
                         "scheduled token does not match Gemma4Media prompt"

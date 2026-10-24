@@ -42,6 +42,23 @@ def test_qwen_media_owns_pixels_cache_identity_and_mrope_positions() -> None:
     assert media.cache_key[1] != media.token_ids[1]
 
 
+def test_qwen_media_keeps_adjacent_images_distinct_for_mrope() -> None:
+    media = Qwen35Media(
+        token_ids=(2, 8, 8, 8, 8, 8, 8, 3),
+        image_positions=(1, 2, 3, 4, 5, 6),
+        pixel_values=np.ones((24, 12), dtype=np.float32),
+        image_grid_thw=np.array([[1, 4, 4], [1, 2, 4]], dtype=np.int64),
+        spatial_merge_size=2,
+        image_token_id=8,
+    )
+    assert media.position_ids.tolist() == [
+        [0, 1, 1, 1, 1, 3, 3, 5],
+        [0, 1, 1, 2, 2, 3, 3, 5],
+        [0, 1, 2, 1, 2, 3, 4, 5],
+    ]
+    assert media.rope_delta == -2
+
+
 def _data_url() -> str:
     output = io.BytesIO()
     Image.new("RGB", (2, 2), (255, 0, 0)).save(output, format="PNG")
@@ -52,44 +69,47 @@ def test_qwen_recipe_normalizes_images_and_attaches_processor_payload() -> None:
     tokenizer = QwenAdapter().codec.tokenizer
     image_id = tokenizer.token_to_id("<|image_pad|>")
 
-    class ImageProcessor:
-        merge_size = 2
-        seen = None
-
-        def __call__(self, **kwargs):
-            self.seen = kwargs
-            return {
-                "pixel_values": torch.ones(16, 12),
-                "image_grid_thw": torch.tensor([[1, 4, 4]]),
-            }
-
-    class Processor:
-        image_processor = ImageProcessor()
-        image_token = "<|image_pad|>"
-
-        def __init__(self):
-            self.tokenizer = tokenizer
-
-        def replace_image_token(self, output, image_idx):
-            return self.image_token * 4
-
-    processor = Processor()
-    model_recipe = Qwen35Recipe(processor)
+    model_recipe = Qwen35Recipe(
+        tokenizer,
+        media_config={
+            "patch_size": 2,
+            "temporal_patch_size": 1,
+            "merge_size": 1,
+            "min_pixels": 16,
+            "max_pixels": 16,
+            "image_mean": [0.5] * 3,
+            "image_std": [0.5] * 3,
+        },
+    )
     output = model_recipe.render(
         [
             resin.recipe.Message(
                 resin.recipe.Role.USER,
                 [resin.recipe.Image(_data_url()), resin.recipe.Text("describe")],
-            ),
+            )
         ]
     )
     assert output.stop_token_ids == model_recipe.get_stop_token_ids()
     assert isinstance(output.media, Qwen35Media)
     assert output.token_ids.count(image_id) == 4
-    assert processor.image_processor.seen is not None
-    assert processor.image_processor.seen["images"][0].dtype == np.float32
-    assert processor.image_processor.seen["return_tensors"] == "pt"
-    assert processor.image_processor.seen["do_rescale"] is False
+    assert output.media.pixel_values.shape == (4, 12)
+    assert output.media.pixel_values.dtype == np.float32
+    assert output.media.image_grid_thw.tolist() == [[1, 2, 2]]
+    np.testing.assert_allclose(
+        output.media.pixel_values, [[1.0] * 4 + [-1.0] * 8] * 4, atol=1e-6
+    )
+
+
+def test_native_qwen_rotary_positions_cover_prompt_and_decode_continuation():
+    from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
+
+    runner = object.__new__(Qwen3_5CudaRunner)
+    runner.device = torch.device("cpu")
+    media = _media()
+    positions = torch.arange(8)[None]
+    result = runner._prefill_rotary_positions(media, positions)
+    expected = np.concatenate((media.position_ids, [[4, 5]] * 3), axis=1)
+    np.testing.assert_array_equal(result[:, 0].numpy(), expected)
 
 
 def test_qwen_recipe_rejects_video_instead_of_dropping_its_embeddings() -> None:

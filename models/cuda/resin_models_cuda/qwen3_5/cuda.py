@@ -315,16 +315,13 @@ class Qwen3_5CudaRunner(CudaRunner):
     ) -> torch.Tensor:
         if media is None:
             return positions[None].expand(3, -1, -1)
-        columns = []
-        for position in positions[0].tolist():
-            absolute = int(position)
-            if absolute < len(media.token_ids):
-                columns.append(media.position_ids[:, absolute])
-            else:
-                columns.append(
-                    torch.full((3,), absolute + media.rope_delta, dtype=torch.int64)
-                )
-        return torch.stack(columns, dim=1).to(self.device)[:, None]
+        absolute = positions[0].cpu().numpy()
+        columns = np.broadcast_to(
+            absolute + media.rope_delta, (3, len(absolute))
+        ).copy()
+        prompt = absolute < len(media.token_ids)
+        columns[:, prompt] = media.position_ids[:, absolute[prompt]]
+        return torch.from_numpy(columns).to(self.device)[:, None]
 
     def _features_for(self, sequence_id: int, media: Qwen35Media) -> torch.Tensor:
         existing = self._media_features.get(sequence_id)
@@ -337,8 +334,10 @@ class Qwen3_5CudaRunner(CudaRunner):
             raise RuntimeError("Qwen checkpoint did not load a visual tower")
         with torch.inference_mode():
             output = visual(
-                media.pixel_values.to(self.device, dtype=torch.bfloat16),
-                media.image_grid_thw.to(self.device),
+                torch.from_numpy(media.pixel_values).to(
+                    self.device, dtype=torch.bfloat16
+                ),
+                torch.from_numpy(media.image_grid_thw).to(self.device),
             )
             features = output.pooler_output.detach()
         if features.shape != (len(media.image_positions), self.config.hidden_size):
@@ -358,13 +357,11 @@ class Qwen3_5CudaRunner(CudaRunner):
         if media is None:
             return None
         position_list = [int(position) for position in positions[0].tolist()]
+        prompt_ids = media.token_ids
         for token_id, position in zip(
             token_ids[0].tolist(), position_list, strict=True
         ):
-            if (
-                position < len(media.token_ids)
-                and int(token_id) != media.token_ids[position]
-            ):
+            if position < len(prompt_ids) and int(token_id) != prompt_ids[position]:
                 raise ValueError("scheduled token does not match Qwen35Media prompt")
         feature_indices = {
             position: index for index, position in enumerate(media.image_positions)

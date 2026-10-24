@@ -444,7 +444,7 @@ class InklingCudaRunner(CudaRunner):
         if pixels is None:
             raise ValueError("Inkling image placeholders require pixel_values")
         features = self._model.vision(
-            pixels.to(self.device, dtype=torch.bfloat16)
+            torch.tensor(pixels, device=self.device, dtype=torch.bfloat16)
         ).detach()
         if features.shape != (len(media.image_positions), self.config.hidden_size):
             raise ValueError("Inkling vision features do not match placeholders")
@@ -467,11 +467,9 @@ class InklingCudaRunner(CudaRunner):
         flat_ids = token_ids[0]
         flat_positions = positions[0]
         position_list = flat_positions.tolist()
+        prompt_ids = media.token_ids
         for token_id, position in zip(flat_ids.tolist(), position_list):
-            if (
-                position < len(media.token_ids)
-                and token_id != media.token_ids[position]
-            ):
+            if position < len(prompt_ids) and token_id != prompt_ids[position]:
                 raise ValueError("scheduled token does not match InklingMedia prompt")
         feature_indices = {
             position: index for index, position in enumerate(media.image_positions)

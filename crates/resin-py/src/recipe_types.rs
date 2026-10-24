@@ -330,12 +330,6 @@ pub(crate) enum Block {
     Result(ToolResult),
 }
 pub(crate) type MediaSources = Vec<(&'static str, Py<PyAny>)>;
-pub(crate) fn media_blocks(py: Python<'_>, sources: MediaSources) -> PyResult<Vec<Py<PyAny>>> {
-    sources
-        .into_iter()
-        .map(|(kind, source)| Block::Media(kind, Arc::new(source)).to_python(py))
-        .collect()
-}
 impl Block {
     fn from_wire(py: Python<'_>, part: &Value) -> PyResult<Self> {
         if let Some(text) = part.as_str() {
@@ -500,8 +494,10 @@ impl Block {
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone)]
 pub(crate) struct Message {
+    #[pyo3(get)]
     pub(crate) role: Role,
     blocks: Vec<Block>,
+    #[pyo3(get)]
     pub(crate) tools: Vec<Tool>,
     metadata: Map<String, Value>,
 }
@@ -536,10 +532,6 @@ impl Message {
         })
     }
     #[getter]
-    fn role(&self) -> Role {
-        self.role
-    }
-    #[getter]
     fn content(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         Ok(PyTuple::new(
             py,
@@ -549,14 +541,6 @@ impl Message {
                 .collect::<PyResult<Vec<_>>>()?,
         )?
         .unbind())
-    }
-    #[getter]
-    fn tools(&self, py: Python<'_>) -> PyResult<Vec<Py<Tool>>> {
-        self.tools
-            .iter()
-            .cloned()
-            .map(|tool| Py::new(py, tool))
-            .collect()
     }
     #[getter]
     fn task(&self) -> Option<&str> {
