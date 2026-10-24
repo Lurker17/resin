@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from resin._resin import _HttpEvents, _HttpIngress, _HttpSession
+from resin._resin import (
+    _HttpEvents,
+    _HttpIngress,
+    _HttpSession,
+    _runner_metrics_prometheus_protobuf,
+)
 from resin.backend.distributed import DistributedExecutionError
 from resin.server.transport import HttpTransport
 
@@ -28,8 +33,10 @@ class DistributedHttpCoordinator:
         recipe: Recipe,
         *,
         stream_interval: int = 1,
+        model: str = "resin",
     ):
         self.engine = engine
+        self.model = model
         self.group = engine.worker._driver_group
         self._wire = HttpTransport(engine.worker)
         self.rank = self.group.local_rank
@@ -42,7 +49,10 @@ class DistributedHttpCoordinator:
         error = None
         try:
             self.session = _HttpSession(
-                engine.local, recipe, stream_interval=stream_interval
+                engine.local,
+                recipe,
+                stream_interval=stream_interval,
+                emit_first_token=engine.local.metrics_enabled,
             )
         except BaseException as exc:
             error = str(exc)
@@ -147,6 +157,30 @@ class DistributedHttpCoordinator:
         try:
             assert self.session is not None
             packet = self.session.process(events)
+            assert ingress is not None
+            if ingress.collect_metrics:
+                snapshot = self.engine.local._metrics_prometheus_protobuf(
+                    model_name=self.model,
+                    rank=self.engine.worker.groups.rank,
+                    attn_dp_rank=self.rank,
+                    include_runner=False,
+                )
+                assert snapshot is not None
+                physical = self.engine.worker.collect_metrics()
+                packet = packet.with_metrics(
+                    [
+                        snapshot,
+                        *(
+                            _runner_metrics_prometheus_protobuf(
+                                observation,
+                                model_name=self.model,
+                                rank=rank,
+                                attn_dp_rank=self.rank,
+                            )
+                            for rank, observation in physical
+                        ),
+                    ]
+                )
             if not self.is_root:
                 payload = packet.to_bytes()
         except BaseException as exc:

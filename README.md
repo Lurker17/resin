@@ -33,6 +33,7 @@ The focused contracts are:
 - [runner/kernel boundary](docs/kernel-boundary.md)
 - [authoring a CUDA model runner](docs/model-forward-pass.md)
 - [CUDA graph policies and startup](docs/cuda-graphs.md)
+- [engine metrics and Prometheus export](docs/metrics.md)
 - [CUDA model package boundaries](models/cuda/ARCHITECTURE.md)
 - [GPT-OSS execution and parallelism](docs/gpt-oss-parallelism.md)
 - [persistent kernel artifacts](docs/kernel-cache.md)
@@ -159,10 +160,10 @@ Managed history and recurrent state are cache groups declared through a frozen
 `RunnerConfig`. The Engine binds their one physical arena during construction.
 Pass `prefix_cache=True` to reuse aligned prefixes across requests.
 
-`Engine(overlap=True)` enables device submission/completion overlap when the
-runner provides it. The initial DeepSeek CUDA path covers stable decode cohorts;
-generated-token logprobs and ownership changes take a synchronous
-fallback. Use `overlap=False` for reference execution. See
+`Engine(enable_overlap=True)` enables device submission/completion overlap when
+the runner provides it. The initial DeepSeek CUDA path covers stable decode
+cohorts; generated-token logprobs and ownership changes take a synchronous
+fallback. Use `enable_overlap=False` for reference execution. See
 [Engine overlap](docs/architecture.md#engine-overlap).
 
 ## Local HTTP server
@@ -304,7 +305,7 @@ The native layer currently provides:
 
 `crates/resin-core` is Python-independent Rust containing request
 lifecycle, scheduling, token-range planning, grouped cache allocation, and
-execution transactions. Its optional archive feature supplies the distributed
+execution transactions. It uses `rkyv` for the distributed
 plan wire format. `crates/resin-py` converts Python inputs and adapts runner
 callbacks, plans, errors, handles, and events to that core. `crates/resin-recipe`
 owns conversation formats and CPU media preparation; `crates/resin-http` owns
@@ -410,8 +411,10 @@ Use the current report instead of a checked-in line-count snapshot.
 
 For resident prefill/decode sweeps, fixed speculative acceptance, balanced
 expert routing, and throughput/latency charts, see [benchmarking](docs/benchmarks.md).
-Engine prefix-cache and overlap counters, CUDA graph counters, and benchmark
-traces are available. Server metrics export and OTLP integration are planned.
+`Engine` collects native request/cache metrics and optional runner observations
+by default (`enable_metrics=True`). Use `enable_metrics=False` to opt out.
+The HTTP server publishes `/metrics`; see [metrics](docs/metrics.md)
+for Prometheus queries and forwarding through an OTLP Collector.
 
 ## Repository map
 

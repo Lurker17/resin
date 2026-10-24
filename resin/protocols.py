@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         ParserEvent,
         ResourceBinding,
         RunnerConfig,
+        RunnerMetrics,
     )
 
 
@@ -95,7 +96,7 @@ class RunnerCompletion(Protocol):
 class EnqueuingRunner(Runner, Protocol):
     """Optional device submission boundary; overlap belongs to the Engine.
 
-    A synchronous result is a supported fallback. Engine(overlap=False) uses
+    A synchronous result is a supported fallback. Engine(enable_overlap=False) uses
     forward directly. Models themselves retain their ordinary tensor forward.
     """
 
@@ -117,11 +118,26 @@ class ManagedRunner(Runner, Protocol):
     def bind_resources(self, resources: ResourceBinding) -> None: ...
 
 
+class MetricsRunner(Protocol):
+    """Optional physical execution observations, independent of forward output.
+
+    The Engine enables collection before resource binding, so captured runtimes
+    can include timing boundaries. Snapshots contain cumulative observations and
+    must not synchronize the device or enter distributed collectives. Each read
+    returns independent data; the serving layer publishes it periodically.
+    """
+
+    def configure_metrics(self, *, enabled: bool = True) -> None: ...
+
+    def metrics_snapshot(self) -> RunnerMetrics: ...
+
+
 __all__ = [
     "FinalizingResponseParser",
     "ManagedRunner",
     "MediaInput",
     "MediaTokenSpan",
+    "MetricsRunner",
     "ResponseParser",
     "Runner",
     "RunnerCompletion",

@@ -497,9 +497,22 @@ class Engine:
         context_length: int = 32768,
         scheduler_config: SchedulerConfig | None = None,
         prefix_cache: bool = False,
-        overlap: bool = True,
+        enable_overlap: bool = True,
+        enable_metrics: bool = True,
     ) -> Engine: ...
     def __repr__(self, /) -> str: ...
+    def _metrics_prometheus_protobuf(
+        self,
+        /,
+        *,
+        model_name: str,
+        rank: int = 0,
+        attn_dp_rank: int = 0,
+        include_runner: bool = True,
+    ) -> bytes | None:
+        """
+        Native serving export; avoids constructing Python inspector dictionaries.
+        """
     @property
     def active_request_count(self, /) -> int: ...
     @property
@@ -525,6 +538,13 @@ class Engine:
     def has_work(self, /) -> bool: ...
     @property
     def max_running_requests(self, /) -> int: ...
+    @property
+    def metrics_enabled(self, /) -> bool: ...
+    def metrics_snapshot(self, /) -> EngineMetrics | None:
+        """
+        Collect a read-only native snapshot of engine and runner observations.
+        Call periodically: cache inventory requires a scan of allocated blocks.
+        """
     @property
     def new_token_ratio(self, /) -> float: ...
     def next_phase(self, /) -> BatchPhase | None:
@@ -570,6 +590,19 @@ class Engine:
         media: MediaInput | None = None,
         prompt_target_logprobs: Sequence[Sequence[int]] | None = None,
     ) -> RequestLease: ...
+
+@final
+class EngineMetrics:
+    """
+    An immutable engine snapshot with request, cache, and runner observations.
+    Request and cache properties return independent dictionary views.
+    """
+    @property
+    def cache(self, /) -> dict[str, Any] | None: ...
+    @property
+    def requests(self, /) -> dict[str, Any]: ...
+    @property
+    def runner(self, /) -> RunnerMetrics | None: ...
 
 @final
 class ForwardOutput:
@@ -1108,6 +1141,45 @@ class RunnerConfig:
     def prefill_chunk_size(self, /) -> int | None: ...
 
 @final
+class RunnerMetrics:
+    """
+    A nonblocking snapshot of cumulative observations for one physical rank.
+
+    Forward categories are exclusive: prefill, decode, target_verify, draft,
+    and idle. Graph counts describe executions, not regions; DP wait uses a
+    bounded exponential histogram. The core snapshot is stored directly.
+    """
+    def __eq__(self, value: object, /) -> bool: ...
+    def __ne__(self, value: object, /) -> bool: ...
+    def __new__(
+        cls,
+        /,
+        *,
+        forward_execution_seconds: dict[str, float] | None = None,
+        cuda_graph_passes: dict[str, int] | None = None,
+        spec_draft_tokens: int = 0,
+        spec_accepted_tokens: int = 0,
+        spec_verify_rows: int = 0,
+        dp_attention_sync_wait_seconds: dict[str, Any] | None = None,
+    ) -> RunnerMetrics: ...
+    def as_dict(self, /) -> dict[str, Any]:
+        """
+        Plain fields for inspection and explicit distributed transport.
+        """
+    @property
+    def cuda_graph_passes(self, /) -> dict[str, int]: ...
+    @property
+    def dp_attention_sync_wait_seconds(self, /) -> dict[str, Any] | None: ...
+    @property
+    def forward_execution_seconds(self, /) -> dict[str, float]: ...
+    @property
+    def spec_accepted_tokens(self, /) -> int: ...
+    @property
+    def spec_draft_tokens(self, /) -> int: ...
+    @property
+    def spec_verify_rows(self, /) -> int: ...
+
+@final
 class SamplingParams:
     """
     Per-request generation policy, including sampling, length, and stop tokens.
@@ -1329,6 +1401,19 @@ class Video:
     def source(self, /) -> Any: ...
 
 @final
+class _HistogramAccumulator:
+    """
+    Native accumulator; snapshots are plain Python dictionaries.
+    """
+    def __new__(cls, /) -> _HistogramAccumulator: ...
+    def attach(self, /, snapshot: RunnerMetrics) -> RunnerMetrics:
+        """
+        Return a snapshot with this coordinator's wait observations included.
+        """
+    def observe(self, /, value: float, *, weight: int = 1) -> None: ...
+    def snapshot(self, /) -> dict[str, Any]: ...
+
+@final
 class _HttpEvents:
     def __new__(cls, /) -> _HttpEvents: ...
     @staticmethod
@@ -1336,6 +1421,7 @@ class _HttpEvents:
     @staticmethod
     def from_bytes(data: bytes) -> _HttpEvents: ...
     def to_bytes(self, /) -> bytes: ...
+    def with_metrics(self, /, snapshots: Sequence[Sequence[int]]) -> _HttpEvents: ...
 
 @final
 class _HttpIngress:
@@ -1344,6 +1430,8 @@ class _HttpIngress:
     between ranks encodes it; JSON never becomes a Python object graph.
     """
     def __new__(cls, /, *, shutdown: bool = False) -> _HttpIngress: ...
+    @property
+    def collect_metrics(self, /) -> bool: ...
     @property
     def error(self, /) -> str | None: ...
     @staticmethod
@@ -1386,7 +1474,13 @@ class _HttpSession:
     The same native lifecycle used by the ordinary actor, attached to one DP driver.
     """
     def __new__(
-        cls, /, engine: Engine, recipe: Recipe, *, stream_interval: int = 1
+        cls,
+        /,
+        engine: Engine,
+        recipe: Recipe,
+        *,
+        stream_interval: int = 1,
+        emit_first_token: bool = False,
     ) -> _HttpSession: ...
     @property
     def active_count(self, /) -> int: ...
@@ -1437,4 +1531,11 @@ def _media_from_buffers(
 def _media_to_buffers(
     media: MediaInput,
 ) -> tuple[bytes, tuple[npt.NDArray[Any], ...]]: ...
+def _runner_metrics_prometheus_protobuf(
+    snapshot: RunnerMetrics, *, model_name: str, rank: int, attn_dp_rank: int
+) -> bytes:
+    """
+    Encode physical-rank observations separately from logical request ownership.
+    """
+
 def image_token_types(height: int, width: int) -> tuple[int, ...]: ...
