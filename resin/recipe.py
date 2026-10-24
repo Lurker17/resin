@@ -13,8 +13,10 @@ from resin._resin import (
     InklingRecipe,
     InklingResponseParser,
     Lfm2Recipe,
+    MediaTokens,
     Message,
     ParserEvent,
+    ProcessedMedia,
     Qwen35Recipe,
     Qwen38Recipe,
     ReasoningDelta,
@@ -36,11 +38,34 @@ from resin._resin import RecipeTokenizer as Tokenizer
 from resin.protocols import (
     FinalizingResponseParser,
     MediaInput,
+    MediaTokenSpan,
     ResponseParser,
     TokenSpan,
 )
 
-ContentBlock = Text | Thinking | Image | Video | Audio | ToolCall | ToolResult
+MediaBlock = Image | Video | Audio
+ContentBlock = Text | Thinking | MediaBlock | ToolCall | ToolResult
+
+
+class MediaProcessor(Protocol):
+    """Turn media blocks into model tokens and prepared inference payloads.
+
+    Processing owns pixel/audio geometry; binding adds final prompt positions.
+    Request state belongs to ProcessedMedia, so processors can be reused.
+    """
+
+    def process(self, media: Sequence[MediaBlock]) -> ProcessedMedia:
+        """Return one token expansion per media block, in the same order."""
+        ...
+
+    def bind(
+        self,
+        processed: ProcessedMedia,
+        token_ids: Sequence[int],
+        spans: Sequence[MediaTokenSpan],
+    ) -> MediaInput:
+        """Bind the payload to final token ranges, ordered like the input blocks."""
+        ...
 
 
 class Recipe(Protocol):
@@ -77,9 +102,14 @@ __all__ = [
     "InklingRecipe",
     "InklingResponseParser",
     "Lfm2Recipe",
+    "MediaBlock",
     "MediaInput",
+    "MediaProcessor",
+    "MediaTokens",
+    "MediaTokenSpan",
     "Message",
     "ParserEvent",
+    "ProcessedMedia",
     "Qwen35Recipe",
     "Qwen38Recipe",
     "Recipe",

@@ -1,8 +1,9 @@
 # Stock model recipe migration
 
 The engine stays token-based. `resin-recipe` owns stock conversation formatting,
-token encoding, model-output parsing, and semantic response events. Python model
-adapters prepare image/video tensors; the HTTP crate owns wire protocols.
+token encoding, model-output parsing, and semantic response events. Model-owned
+`MediaProcessor` implementations prepare image/video tensors; the HTTP crate
+owns wire protocols.
 Applications can pass any structural `resin.recipe.Recipe` to `HttpServer(recipe=...)`.
 The public recipe interface accepts typed messages, tools and render options.
 
@@ -36,6 +37,14 @@ separate rendering arguments. Supported media depends on the model recipe.
 Image/video recipes accept a processor; V4.1 prepares its checkpoint's pixels
 internally. `prompt.media` carries the prepared model payload for
 `engine.submit(media=prompt.media, ...)`.
+
+`MediaProcessor.process(media)` returns `ProcessedMedia`: ordered `MediaTokens`
+expansions and a request-owned payload. The recipe inserts their token IDs and
+calls `bind(processed, token_ids, spans)` with final `MediaTokenSpan` positions.
+The model implementation owns pixel preprocessing, rotary positions and cache
+identity; the shared recipe never switches on model names or calls HF processors.
+Media formatting may supply ordinary text at its edges (for example Gemma video
+timestamps), which is coalesced with adjacent text before tokenization.
 
 `RenderedPrompt` exposes `token_ids`, `stop_token_ids` and `media`. Native prompts
 also retain the parser context. Pass the actual prompt back to the same recipe;

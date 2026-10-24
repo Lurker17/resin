@@ -640,6 +640,31 @@ class Lfm2Recipe(_NativeRecipe):
     ) -> Lfm2Recipe: ...
 
 @final
+class MediaTokens:
+    """
+    Explicit media IDs replacing one trusted template placeholder.
+
+    Prefix and suffix are ordinary text and share BPE boundaries with nearby text.
+    """
+    def __new__(
+        cls,
+        /,
+        placeholder: str,
+        token_ids: Sequence[int],
+        *,
+        prefix: str = ...,
+        suffix: str = ...,
+    ) -> MediaTokens: ...
+    @property
+    def placeholder(self, /) -> str: ...
+    @property
+    def prefix(self, /) -> str: ...
+    @property
+    def suffix(self, /) -> str: ...
+    @property
+    def token_ids(self, /) -> list[int]: ...
+
+@final
 class Message:
     def __new__(
         cls,
@@ -722,6 +747,19 @@ class ParserEvent:
     def token_spans(self, /) -> tuple[TokenSpan, ...]: ...
     @property
     def type(self, /) -> str: ...
+
+@final
+class ProcessedMedia:
+    """
+    Model-processed media expansions and an opaque payload retained until binding.
+    """
+    def __new__(
+        cls, /, spans: Sequence[MediaTokens], payload: Any
+    ) -> ProcessedMedia: ...
+    @property
+    def payload(self, /) -> Any: ...
+    @property
+    def spans(self, /) -> tuple[MediaTokens, ...]: ...
 
 @final
 class Qwen35Recipe(_NativeRecipe):

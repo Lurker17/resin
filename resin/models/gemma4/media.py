@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -9,11 +11,14 @@ import numpy as np
 import torch
 from torch import Tensor
 
+import resin
 from resin._recipe_media import (
     digest_tensors,
+    normalize_image,
     owned_cpu_tensor,
     salt_token_positions,
     single_row,
+    token_id,
 )
 from resin.protocols import MediaTokenSpan
 
@@ -199,4 +204,100 @@ def _cache_identity(media: Gemma4Media, digest: str) -> tuple[int, ...]:
     return salt_token_positions(media.token_ids, media_positions, digest)
 
 
-__all__ = ["Gemma4Media"]
+class Gemma4MediaProcessor:
+    """Prepare Gemma pixels and the token spans that consume them."""
+
+    def __init__(self, processor: Any) -> None:
+        self.processor = processor
+
+    def process(
+        self,
+        media: Sequence[resin.recipe.MediaBlock],
+    ) -> resin.recipe.ProcessedMedia:
+        images, videos = [], []
+        for item in media:
+            if isinstance(item, resin.recipe.Image):
+                images.append(normalize_image(item.source))
+            elif isinstance(item, resin.recipe.Video):
+                if item.source is None or isinstance(item.source, (str, bytes)):
+                    raise ValueError("video content must contain decoded frames")
+                videos.append(copy.deepcopy(item.source))
+            else:
+                raise ValueError("Gemma 4 does not support audio input")
+        processor = self.processor
+        if not hasattr(processor, "tokenizer"):
+            raise ValueError("media input requires a pixel processor")
+        payload: dict[str, Any] = {}
+        expansions: dict[type, list[resin.recipe.MediaTokens]] = {}
+        kwargs = {"do_rescale": False, "return_tensors": "pt"}
+        if images:
+            prepared = processor.image_processor(images=images, **kwargs)
+            expansions[resin.recipe.Image] = [
+                resin.recipe.MediaTokens(
+                    processor.image_token,
+                    self._encode(
+                        processor.replace_image_token(prepared, image_idx=index)
+                    ),
+                )
+                for index in range(len(images))
+            ]
+            payload.update(prepared)
+        if videos:
+            prepared = processor.video_processor(
+                videos=videos, return_metadata=True, **kwargs
+            )
+            expanded = []
+            for index in range(len(videos)):
+                text = processor.replace_video_token(prepared, video_idx=index)
+                first_image = text.index(processor.boi_token)
+                # Keep the leading timestamp beside adjacent prompt text for BPE.
+                expanded.append(
+                    resin.recipe.MediaTokens(
+                        processor.video_token,
+                        self._encode(text[first_image:]),
+                        prefix=text[:first_image],
+                    )
+                )
+            expansions[resin.recipe.Video] = expanded
+            payload.update(prepared)
+        payload.pop("video_metadata", None)
+        pending = {kind: iter(spans) for kind, spans in expansions.items()}
+        return resin.recipe.ProcessedMedia(
+            [next(pending[type(item)]) for item in media], payload
+        )
+
+    def _encode(self, text: str) -> Sequence[int]:
+        tokenizer = self.processor.tokenizer
+        backend = getattr(tokenizer, "backend_tokenizer", tokenizer)
+        encoded = backend.encode(text, add_special_tokens=False)
+        return encoded.ids if hasattr(encoded, "ids") else encoded
+
+    def bind(
+        self,
+        processed: resin.recipe.ProcessedMedia,
+        token_ids: Sequence[int],
+        spans: Sequence[MediaTokenSpan],
+    ) -> Gemma4Media:
+        kinds = {token_id(self.processor.tokenizer, self.processor.image_token): 1}
+        if hasattr(self.processor, "video_token"):
+            kinds[token_id(self.processor.tokenizer, self.processor.video_token)] = 2
+        token_types = [0] * len(token_ids)
+        for span in spans:
+            for index in range(span.position, span.position + span.length):
+                token_types[index] = kinds.get(token_ids[index], 0)
+        payload = processed.payload
+        return Gemma4Media(
+            tuple(token_ids),
+            tuple(token_types),
+            pixel_values=payload.get("pixel_values"),
+            image_position_ids=payload.get("image_position_ids"),
+            pixel_values_videos=payload.get("pixel_values_videos"),
+            video_position_ids=payload.get("video_position_ids"),
+        )
+
+
+def make_media_processor(processor: Any) -> Gemma4MediaProcessor:
+    return Gemma4MediaProcessor(processor)
+
+
+__all__ = ["Gemma4Media", "Gemma4MediaProcessor"]

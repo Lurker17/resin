@@ -129,19 +129,28 @@ def test_native_event_constructor_validates_span_storage(spans, error):
 
 
 def test_parser_does_not_retain_media_or_the_rendered_prompt(monkeypatch):
-    import resin._recipe_media as media
+    import resin.models.inkling.media as media
 
     class Payload:
         pass
 
-    class Preparer:
-        def prepare(self, sources):
-            return {}, SimpleNamespace(payload=sources[0][1])
+    class Processor:
+        def process(self, sources):
+            assert isinstance(sources[0], resin.recipe.Image)
+            return resin.recipe.ProcessedMedia(
+                [resin.recipe.MediaTokens("<|content_image|>", [1])],
+                SimpleNamespace(payload=sources[0].source),
+            )
 
-        def finalize(self, state, token_ids):
-            return state
+        def bind(self, processed, token_ids, spans):
+            assert isinstance(spans[0], resin.MediaTokenSpan)
+            position, length = spans[0]
+            assert token_ids[position : position + length] == [1]
+            return processed.payload
 
-    monkeypatch.setattr(media, "make_preparer", lambda *_args, **_kwargs: Preparer())
+    monkeypatch.setattr(
+        media, "make_media_processor", lambda *_args, **_kwargs: Processor()
+    )
     native = resin.recipe.InklingRecipe(tokenizer())
     payload = Payload()
     reference = weakref.ref(payload)
@@ -154,6 +163,50 @@ def test_parser_does_not_retain_media_or_the_rendered_prompt(monkeypatch):
     gc.collect()
     assert reference() is None
     assert parser.feed([]) == []
+
+
+def test_processed_media_owns_token_buffers_and_retains_only_its_payload():
+    ids = [10, 11]
+    span = resin.recipe.MediaTokens("<image>", ids, prefix="00:00 ", suffix=" ")
+    payload = object()
+    spans = [span]
+    processed = resin.recipe.ProcessedMedia(spans, payload)
+    ids.clear()
+    spans.clear()
+    span.token_ids.clear()
+    assert span.token_ids == [10, 11]
+    assert span.prefix == "00:00 " and span.suffix == " "
+    assert processed.spans[0].placeholder == "<image>"
+    assert processed.spans[0].token_ids == [10, 11]
+    assert processed.payload is payload
+    with pytest.raises(AttributeError):
+        setattr(span, "token_ids", [12])
+    with pytest.raises(AttributeError):
+        setattr(processed, "payload", None)
+
+
+def test_media_processor_cannot_silently_drop_a_source(monkeypatch):
+    import resin.models.inkling.media as media
+
+    class EmptyProcessor:
+        def process(self, sources):
+            return resin.recipe.ProcessedMedia([], None)
+
+        def bind(self, processed, token_ids, spans):
+            raise AssertionError("invalid media output must fail before binding")
+
+    monkeypatch.setattr(
+        media, "make_media_processor", lambda *_args, **_kwargs: EmptyProcessor()
+    )
+    native = resin.recipe.InklingRecipe(tokenizer())
+    with pytest.raises(ValueError, match="one expansion per source"):
+        native.render(
+            [
+                resin.recipe.Message(
+                    resin.recipe.Role.USER, [resin.recipe.Image(object())]
+                )
+            ]
+        )
 
 
 def test_public_order_and_per_message_controls_are_not_silently_dropped():

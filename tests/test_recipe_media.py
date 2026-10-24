@@ -56,6 +56,10 @@ def image():
     return np.linspace(0, 1, 64 * 64 * 3, dtype=np.float32).reshape(64, 64, 3)
 
 
+def video():
+    return np.linspace(0, 1, 32 * 64 * 64 * 3, dtype=np.float32).reshape(32, 64, 64, 3)
+
+
 def assert_reference_tensors(processor, recipe, messages, *, tools=None):
     request = {"messages": messages, "tools": tools}
     expected = processor.apply_chat_template(
@@ -137,20 +141,49 @@ def test_literal_media_marker_does_not_acquire_a_pixel_slot(model_processor):
     assert actual.token_ids.count(processor.image_token_id) == expected_slots
 
 
-def test_native_recipe_preserves_gemma_video_timestamps_and_geometry(model_processor):
+@pytest.mark.parametrize(
+    ("prefix", "suffix"),
+    [
+        ("Compare frame 12", "34 and describe."),
+        ("Compare video:", ": describe."),
+        ("Compare video ", " then describe."),
+    ],
+    ids=["digits", "colon", "space"],
+)
+def test_native_recipe_preserves_gemma_video_timestamps_and_geometry(
+    model_processor, prefix, suffix
+):
     model, processor, recipe = model_processor
     if model != "gemma4":
         pytest.skip("only the Gemma runner implements video inputs")  # ty: ignore[too-many-positional-arguments]
-    frames = np.linspace(0, 1, 32 * 64 * 64 * 3, dtype=np.float32).reshape(
-        32, 64, 64, 3
-    )
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "Compare video:"},
-                {"type": "video", "video": frames},
-                {"type": "text", "text": "Describe."},
+                {"type": "text", "text": prefix},
+                {"type": "video", "video": video()},
+                {"type": "text", "text": suffix},
+            ],
+        }
+    ]
+    assert_reference_tensors(processor, recipe, messages)
+
+
+def test_native_recipe_preserves_gemma_mixed_media_order(model_processor):
+    model, processor, recipe = model_processor
+    if model != "gemma4":
+        pytest.skip("only the Gemma runner implements mixed image/video inputs")  # ty: ignore[too-many-positional-arguments]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "First image: "},
+                {"type": "image", "image": image()},
+                {"type": "text", "text": " Compare with video 12:"},
+                {"type": "video", "video": video()},
+                {"type": "text", "text": " Then this differently shaped image: "},
+                {"type": "image", "image": image()[:, ::-2].copy()},
+                {"type": "text", "text": " Explain the differences."},
             ],
         }
     ]

@@ -263,9 +263,11 @@ inheriting a Resin class or using the native tokenizer/parser.
 
 For images, put `resin.recipe.Image.from_rgb(array)` or
 `resin.recipe.Image.from_bytes(data, media_type="image/png")` in a message and pass
-the model's processor to its recipe, for example `resin.recipe.Gemma4Recipe(processor)`. Shared internal
-preparation normalizes the sources and expands explicit media slots. Model
-processors retain their own patch geometry, rotary positions, and cache identity.
+the model's processor to its recipe, for example `Gemma4Recipe(processor)`.
+Each model implements `resin.recipe.MediaProcessor`: `process()` produces media
+token expansions and an owned payload; `bind()` uses their final prompt positions
+to construct the inference input. The shared recipe inserts the tokens without
+knowing image processors, patch geometry, mRoPE, or model cache identities.
 Literal marker spellings in ordinary text cannot acquire media slots.
 
 `stream_interval` is an integer from 1 through `2**32 - 1`, set once per server,

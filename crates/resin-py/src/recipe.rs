@@ -6,17 +6,21 @@ use std::{
 };
 
 use crate::recipe_events::{self, ParserEvent};
-use crate::recipe_types::{MediaSources, Message, RenderOptions, Role, Tool};
+use crate::recipe_media::{self, ProcessedMedia};
+use crate::recipe_types::{
+    BlockKind, MediaSources, Message, MessagePolicy, RenderOptions, Role, Tool, ToolScope,
+    media_blocks,
+};
 use pyo3::{
     exceptions::{PyAttributeError, PyValueError},
     prelude::*,
+    sync::PyOnceLock,
     types::{PyBool, PyDict},
 };
 use pythonize::{depythonize, pythonize};
 use resin_recipe::{
     AttributedEvent, AttributedText, Decoder, Encoder, Error, FinishReason, InklingParser,
-    InklingTokens, ModelFormat, Prompt, PromptSpan, ResponseParser, Tokenizer, TokenizerDecoder,
-    TokenizerEncoder,
+    InklingTokens, ModelFormat, ResponseParser, Tokenizer, TokenizerDecoder, TokenizerEncoder,
 };
 use serde_json::{Map, Value, json};
 
@@ -363,64 +367,87 @@ impl RenderedPrompt {
     }
 }
 
+type OptionInitializer = fn(Python<'_>, &mut Map<String, Value>) -> PyResult<()>;
+type OptionNormalizer = fn(&mut Map<String, Value>) -> PyResult<()>;
+
+/// A concrete recipe selects its grammar, input contract, and optional media factory.
+/// Shared rendering does not infer behavior from a checkpoint or model name.
+struct RecipeDefinition {
+    name: &'static str,
+    format: ModelFormat,
+    messages: MessagePolicy,
+    options: &'static [&'static str],
+    initialize_options: Option<OptionInitializer>,
+    normalize_options: Option<OptionNormalizer>,
+    media_module: Option<&'static str>,
+}
+impl RecipeDefinition {
+    const fn new(
+        name: &'static str,
+        format: ModelFormat,
+        options: &'static [&'static str],
+    ) -> Self {
+        Self {
+            name,
+            format,
+            messages: MessagePolicy::STANDARD,
+            options,
+            initialize_options: None,
+            normalize_options: None,
+            media_module: None,
+        }
+    }
+}
+
 /// Shared native implementation inherited by the concrete model recipes.
 #[pyclass(name = "_NativeRecipe", frozen, subclass, module = "resin._resin")]
 pub(crate) struct NativeRecipe {
     tokenizer: RecipeTokenizer,
     original_tokenizer: Arc<Py<PyAny>>,
     encoder: Arc<dyn Encoder>,
-    model: ModelFormat,
-    name: &'static str,
+    definition: &'static RecipeDefinition,
     options: Map<String, Value>,
     id: u64,
     stop_token_ids: Option<Vec<u32>>,
     media_owner: Arc<Py<PyAny>>,
-    media_config: Value,
-    media_preparer: Mutex<Option<Py<PyAny>>>,
+    media_config: Map<String, Value>,
+    media_processor: PyOnceLock<Py<PyAny>>,
 }
 impl NativeRecipe {
     fn new(
         py: Python<'_>,
         owner: &Bound<'_, PyAny>,
-        name: &'static str,
+        definition: &'static RecipeDefinition,
         options: Option<&RenderOptions>,
         stop_token_ids: Option<Vec<u32>>,
-        media_config: Value,
+        media_config: Map<String, Value>,
     ) -> PyResult<Self> {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let original_tokenizer =
             optional_attr(owner, "tokenizer")?.unwrap_or_else(|| owner.clone());
         let tokenizer = RecipeTokenizer::new(&original_tokenizer)?;
         let mut defaults = options.map(|o| o.value.clone()).unwrap_or_default();
-        if name == "gpt_oss" && !defaults.contains_key("conversation_start_date") {
-            let date: String = py
-                .import("datetime")?
-                .getattr("date")?
-                .call_method0("today")?
-                .call_method0("isoformat")?
-                .extract()?;
-            defaults.insert("conversation_start_date".into(), Value::String(date));
+        if let Some(initialize) = definition.initialize_options {
+            initialize(py, &mut defaults)?;
         }
         let value = Self {
             encoder: tokenizer.encoder(),
             tokenizer,
             original_tokenizer: Arc::new(original_tokenizer.unbind()),
-            model: ModelFormat::parse(if name == "qwen3_8" { "qwen3_5" } else { name })
-                .map_err(recipe_error)?,
-            name,
+            definition,
             options: defaults,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             stop_token_ids,
             media_owner: Arc::new(owner.clone().unbind()),
             media_config,
-            media_preparer: Mutex::new(None),
+            media_processor: PyOnceLock::new(),
         };
         value.resolve_options(None)?;
         Ok(value)
     }
     pub(crate) fn message_from_wire(&self, py: Python<'_>, value: &Value) -> PyResult<Message> {
         let mut message = Message::from_wire(py, value)?;
-        message.lower_wire_fields(self.name);
+        message.lower_wire_fields(&self.definition.messages);
         Ok(message)
     }
     fn resolve_options(&self, options: Option<&RenderOptions>) -> PyResult<Map<String, Value>> {
@@ -429,56 +456,15 @@ impl NativeRecipe {
             resolved.extend(options.value.clone());
         }
         for key in resolved.keys() {
-            let supported = key == "add_generation_prompt"
-                || match self.name {
-                    "gpt_oss" => matches!(
-                        key.as_str(),
-                        "reasoning_effort"
-                            | "use_system_prompt"
-                            | "model_identity"
-                            | "knowledge_cutoff"
-                            | "conversation_start_date"
-                            | "auto_drop_analysis"
-                    ),
-                    "qwen3_5" | "qwen3_8" => matches!(
-                        key.as_str(),
-                        "reasoning_effort"
-                            | "enable_thinking"
-                            | "preserve_thinking"
-                            | "add_vision_id"
-                    ),
-                    "deepseek_v4" | "deepseek_v41" => matches!(
-                        key.as_str(),
-                        "reasoning_effort"
-                            | "thinking_mode"
-                            | "enable_thinking"
-                            | "response_format"
-                    ),
-                    "gemma4" => key == "enable_thinking",
-                    "inkling" => key == "reasoning_effort",
-                    "lfm2" => key == "preserve_thinking",
-                    _ => false,
-                };
-            if !supported {
+            if key != "add_generation_prompt" && !self.definition.options.contains(&key.as_str()) {
                 return Err(PyValueError::new_err(format!(
                     "{} does not support rendering option {key}",
-                    self.name
+                    self.definition.name
                 )));
             }
         }
-        if self.name.starts_with("qwen3_") {
-            resolved.insert("recipe_variant".into(), json!(self.name));
-        }
-        if self.name.starts_with("deepseek_")
-            && let Some(enabled) = resolved.remove("enable_thinking")
-        {
-            let mode = if enabled == true { "thinking" } else { "chat" };
-            if resolved.get("thinking_mode").is_some_and(|v| v != mode) {
-                return Err(PyValueError::new_err(
-                    "conflicting enable_thinking and thinking_mode",
-                ));
-            }
-            resolved.insert("thinking_mode".into(), json!(mode));
+        if let Some(normalize) = self.definition.normalize_options {
+            normalize(&mut resolved)?;
         }
         Ok(resolved)
     }
@@ -497,12 +483,7 @@ impl NativeRecipe {
             .collect::<Vec<_>>();
         for (index, message) in messages.iter().enumerate() {
             let message = message.borrow(py);
-            message.validate_for(self.name)?;
-            if self.name == "deepseek_v41" && message.has_media() && message.role != Role::USER {
-                return Err(PyValueError::new_err(
-                    "DeepSeek V4.1 images belong in user messages",
-                ));
-            }
+            message.validate_for(&self.definition.messages)?;
             let mut rendered = message.render_values(py, &mut sources)?;
             if !message.tools.is_empty() {
                 if !matches!(message.role, Role::SYSTEM | Role::DEVELOPER) {
@@ -510,11 +491,14 @@ impl NativeRecipe {
                         "tool declarations belong to instruction messages",
                     ));
                 }
-                if !self.name.starts_with("deepseek_") {
+                if matches!(
+                    self.definition.messages.tools,
+                    ToolScope::InitialInstruction
+                ) {
                     if index != 0 {
                         return Err(PyValueError::new_err(format!(
                             "{} supports tool declarations only in the initial instruction message",
-                            self.name
+                            self.definition.name
                         )));
                     }
                     if !definitions.is_empty() {
@@ -535,35 +519,29 @@ impl NativeRecipe {
             sources,
         ))
     }
-    fn preparer(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let mut stored = self
-            .media_preparer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(preparer) = stored.as_ref() {
-            return Ok(preparer.clone_ref(py));
-        }
-        let kwargs = PyDict::new(py);
-        kwargs.set_item(
-            "eos_token_ids",
-            self.stop_token_ids.as_deref().unwrap_or(&[]),
-        )?;
-        kwargs.set_item(
-            "vision_config",
-            pythonize(py, &self.media_config["vision_config"])?,
-        )?;
-        kwargs.set_item(
-            "image_token_id",
-            pythonize(py, &self.media_config["image_token_id"])?,
-        )?;
-        let preparer = py
-            .import("resin._recipe_media")?
-            .getattr("make_preparer")?
-            .call((self.name, self.media_owner.bind(py)), Some(&kwargs))?
-            .unbind();
-        *stored = Some(preparer.clone_ref(py));
-        Ok(preparer)
+    fn processor(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let processor = self
+            .media_processor
+            .get_or_try_init(py, || -> PyResult<_> {
+                let module = self.definition.media_module.ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "{} does not support media",
+                        self.definition.name
+                    ))
+                })?;
+                let kwargs = PyDict::new(py);
+                for (key, value) in &self.media_config {
+                    kwargs.set_item(key, pythonize(py, value)?)?;
+                }
+                Ok(py
+                    .import(module)?
+                    .getattr("make_media_processor")?
+                    .call((self.media_owner.bind(py),), Some(&kwargs))?
+                    .unbind())
+            })?;
+        Ok(processor.clone_ref(py))
     }
+
     fn render_request(
         &self,
         py: Python<'_>,
@@ -571,30 +549,46 @@ impl NativeRecipe {
         sources: MediaSources,
         prepare: bool,
     ) -> PyResult<RenderedPrompt> {
-        let mut preparation = None;
-        let mut replacements = None;
-        if prepare && !sources.is_empty() {
-            let preparer = self.preparer(py)?;
-            let result = preparer.bind(py).call_method1("prepare", (sources,))?;
-            let (markers, state): (HashMap<String, Vec<String>>, Py<PyAny>) = result.extract()?;
-            replacements = Some(markers);
-            preparation = Some((preparer, state));
-        }
-        let token_ids = py.detach(|| {
-            let prompt = self.model.render(&request).map_err(recipe_error)?;
-            let prompt = if let Some(replacements) = &replacements {
-                self.expand_media(prompt, replacements)
-                    .map_err(recipe_error)?
-            } else {
-                prompt
-            };
-            prompt.encode(self.encoder.as_ref()).map_err(recipe_error)
-        })?;
-        let media = if let Some((preparer, state)) = preparation {
-            let media = preparer
+        let preparation = if prepare && !sources.is_empty() {
+            let source_count = sources.len();
+            let processor = self.processor(py)?;
+            let processed: Py<ProcessedMedia> = processor
                 .bind(py)
-                .call_method1("finalize", (state, &token_ids))?;
-            (!media.is_none()).then(|| media.unbind())
+                .call_method1("process", (media_blocks(py, sources)?,))?
+                .extract()?;
+            if processed.borrow(py).spans.len() != source_count {
+                return Err(PyValueError::new_err(
+                    "media processor must return one expansion per source",
+                ));
+            }
+            Some((processor, processed))
+        } else {
+            None
+        };
+        let expansions = preparation
+            .as_ref()
+            .map(|(_, processed)| processed.borrow(py).spans.clone())
+            .unwrap_or_default();
+        let (token_ids, placements) = py.detach(|| {
+            let prompt = self
+                .definition
+                .format
+                .render(&request)
+                .map_err(recipe_error)?;
+            recipe_media::encode(prompt, &expansions, self.encoder.as_ref()).map_err(recipe_error)
+        })?;
+        let media = if let Some((processor, processed)) = preparation {
+            let span_class = py.import("resin.protocols")?.getattr("MediaTokenSpan")?;
+            let spans = placements
+                .into_iter()
+                .map(|span| span_class.call1(span))
+                .collect::<PyResult<Vec<_>>>()?;
+            Some(
+                processor
+                    .bind(py)
+                    .call_method1("bind", (processed, &token_ids, spans))?
+                    .unbind(),
+            )
         } else {
             None
         };
@@ -609,50 +603,6 @@ impl NativeRecipe {
             media,
             seed: Some(seed),
         })
-    }
-    fn expand_media(
-        &self,
-        prompt: Prompt,
-        replacements: &HashMap<String, Vec<String>>,
-    ) -> Result<Prompt, Error> {
-        let mut counts: HashMap<&str, usize> = HashMap::new();
-        let mut expanded = Prompt::new();
-        for span in prompt.spans {
-            match span {
-                PromptSpan::Text(text) => {
-                    expanded.text(text);
-                }
-                PromptSpan::Special(token) => {
-                    if let Some(values) = replacements.get(&token) {
-                        let index = counts
-                            .entry(replacements.get_key_value(&token).unwrap().0.as_str())
-                            .or_default();
-                        let value = values.get(*index).ok_or_else(|| {
-                            Error::new(format!("missing media expansion for {token}"))
-                        })?;
-                        *index += 1;
-                        match &self.tokenizer.source {
-                            TokenizerSource::Native(_, encoder) => {
-                                encoder.append_format(&mut expanded, value)
-                            }
-                            TokenizerSource::Python { .. } => {
-                                expanded.text(value);
-                            }
-                        }
-                    } else {
-                        expanded.special(token);
-                    }
-                }
-            }
-        }
-        for (marker, values) in replacements {
-            if counts.get(marker.as_str()).copied().unwrap_or(0) != values.len() {
-                return Err(Error::new(format!(
-                    "media expansion count does not match {marker}"
-                )));
-            }
-        }
-        Ok(expanded)
     }
 }
 #[pymethods]
@@ -682,7 +632,8 @@ impl NativeRecipe {
     ) -> PyResult<String> {
         let (request, _) = self.request(py, &messages, &tools, options)?;
         py.detach(|| {
-            self.model
+            self.definition
+                .format
                 .render(&request)
                 .map(|prompt| prompt.rendered_text())
                 .map_err(recipe_error)
@@ -706,7 +657,8 @@ impl NativeRecipe {
         if let Some(ids) = &self.stop_token_ids {
             return Ok(ids.clone());
         }
-        self.model
+        self.definition
+            .format
             .stop_token_ids(self.encoder.as_ref())
             .map_err(recipe_error)
     }
@@ -723,7 +675,8 @@ impl NativeRecipe {
                 PyValueError::new_err("prompt must have been rendered by this recipe instance")
             })?;
         let parser = py.detach(|| {
-            self.model
+            self.definition
+                .format
                 .create_parser(
                     self.encoder.as_ref(),
                     self.tokenizer.decoder().map_err(recipe_error)?,
@@ -786,9 +739,12 @@ impl NativeRecipe {
 }
 
 macro_rules! recipe_class {
-    ($class:ident,$model:literal) => {
+    ($class:ident, $definition:expr) => {
         #[pyclass(extends=NativeRecipe, frozen, module="resin._resin")]
         pub(crate) struct $class;
+        impl $class {
+            const DEFINITION: RecipeDefinition = $definition;
+        }
         #[pymethods]
         impl $class {
             #[new]
@@ -801,24 +757,148 @@ macro_rules! recipe_class {
                 Ok(PyClassInitializer::from(NativeRecipe::new(
                     py,
                     tokenizer,
-                    $model,
+                    &Self::DEFINITION,
                     options,
                     None,
-                    Value::Null,
+                    Map::new(),
                 )?)
                 .add_subclass(Self))
             }
         }
     };
 }
-recipe_class!(GptOssRecipe, "gpt_oss");
-recipe_class!(DeepSeekV4Recipe, "deepseek_v4");
-recipe_class!(Qwen35Recipe, "qwen3_5");
-recipe_class!(Qwen38Recipe, "qwen3_8");
-recipe_class!(InklingRecipe, "inkling");
-recipe_class!(Lfm2Recipe, "lfm2");
+fn conversation_date(py: Python<'_>, options: &mut Map<String, Value>) -> PyResult<()> {
+    if !options.contains_key("conversation_start_date") {
+        let date: String = py
+            .import("datetime")?
+            .getattr("date")?
+            .call_method0("today")?
+            .call_method0("isoformat")?
+            .extract()?;
+        options.insert("conversation_start_date".into(), Value::String(date));
+    }
+    Ok(())
+}
+fn deepseek_thinking(options: &mut Map<String, Value>) -> PyResult<()> {
+    if let Some(enabled) = options.remove("enable_thinking") {
+        let mode = if enabled == true { "thinking" } else { "chat" };
+        if options.get("thinking_mode").is_some_and(|v| v != mode) {
+            return Err(PyValueError::new_err(
+                "conflicting enable_thinking and thinking_mode",
+            ));
+        }
+        options.insert("thinking_mode".into(), json!(mode));
+    }
+    Ok(())
+}
+const DEEPSEEK: RecipeDefinition = RecipeDefinition {
+    messages: MessagePolicy {
+        roles: &[
+            Role::SYSTEM,
+            Role::DEVELOPER,
+            Role::USER,
+            Role::ASSISTANT,
+            Role::TOOL,
+            Role::LATEST_REMINDER,
+        ],
+        controls: &["task", "wo_eos", "response_format"],
+        tools: ToolScope::AnyInstruction,
+        ..MessagePolicy::STANDARD
+    },
+    normalize_options: Some(deepseek_thinking),
+    ..RecipeDefinition::new(
+        "deepseek_v4",
+        ModelFormat::DeepSeek,
+        &[
+            "reasoning_effort",
+            "thinking_mode",
+            "enable_thinking",
+            "response_format",
+        ],
+    )
+};
+const QWEN: RecipeDefinition = RecipeDefinition {
+    media_module: Some("resin.models.qwen3_5.media"),
+    ..RecipeDefinition::new(
+        "qwen3_5",
+        ModelFormat::Qwen,
+        &[
+            "reasoning_effort",
+            "enable_thinking",
+            "preserve_thinking",
+            "add_vision_id",
+        ],
+    )
+};
+recipe_class!(
+    GptOssRecipe,
+    RecipeDefinition {
+        initialize_options: Some(conversation_date),
+        ..RecipeDefinition::new(
+            "gpt_oss",
+            ModelFormat::GptOss,
+            &[
+                "reasoning_effort",
+                "use_system_prompt",
+                "model_identity",
+                "knowledge_cutoff",
+                "conversation_start_date",
+                "auto_drop_analysis"
+            ]
+        )
+    }
+);
+recipe_class!(DeepSeekV4Recipe, DEEPSEEK);
+recipe_class!(
+    Qwen35Recipe,
+    RecipeDefinition {
+        normalize_options: Some(|options| {
+            options.insert("recipe_variant".into(), json!("qwen3_5"));
+            Ok(())
+        }),
+        ..QWEN
+    }
+);
+recipe_class!(
+    Qwen38Recipe,
+    RecipeDefinition {
+        name: "qwen3_8",
+        normalize_options: Some(|options| {
+            options.insert("recipe_variant".into(), json!("qwen3_8"));
+            Ok(())
+        }),
+        ..QWEN
+    }
+);
+recipe_class!(
+    InklingRecipe,
+    RecipeDefinition {
+        media_module: Some("resin.models.inkling.media"),
+        ..RecipeDefinition::new("inkling", ModelFormat::Inkling, &["reasoning_effort"])
+    }
+);
+recipe_class!(
+    Lfm2Recipe,
+    RecipeDefinition::new("lfm2", ModelFormat::Lfm2, &["preserve_thinking"])
+);
 #[pyclass(extends=NativeRecipe, frozen, module="resin._resin")]
 pub(crate) struct Gemma4Recipe;
+impl Gemma4Recipe {
+    const DEFINITION: RecipeDefinition = RecipeDefinition {
+        messages: MessagePolicy {
+            assistant_order: &[
+                BlockKind::Thinking,
+                BlockKind::Call,
+                BlockKind::Result,
+                BlockKind::Text,
+            ],
+            reorder_wire_fields: true,
+            ..MessagePolicy::STANDARD
+        },
+        media_module: Some("resin.models.gemma4.media"),
+        ..RecipeDefinition::new("gemma4", ModelFormat::Gemma, &["enable_thinking"])
+    };
+}
 #[pymethods]
 impl Gemma4Recipe {
     #[new]
@@ -832,16 +912,28 @@ impl Gemma4Recipe {
         Ok(PyClassInitializer::from(NativeRecipe::new(
             py,
             tokenizer,
-            "gemma4",
+            &Self::DEFINITION,
             options,
             (!eos_token_ids.is_empty()).then_some(eos_token_ids),
-            Value::Null,
+            Map::new(),
         )?)
         .add_subclass(Self))
     }
 }
 #[pyclass(extends=NativeRecipe, frozen, module="resin._resin")]
 pub(crate) struct DeepSeekV41Recipe;
+impl DeepSeekV41Recipe {
+    const DEFINITION: RecipeDefinition = RecipeDefinition {
+        name: "deepseek_v41",
+        format: ModelFormat::DeepSeekV41,
+        messages: MessagePolicy {
+            media_roles: Some(&[Role::USER]),
+            ..DEEPSEEK.messages
+        },
+        media_module: Some("resin.models.deepseek_v41.media"),
+        ..DEEPSEEK
+    };
+}
 #[pymethods]
 impl DeepSeekV41Recipe {
     #[new]
@@ -860,10 +952,13 @@ impl DeepSeekV41Recipe {
         Ok(PyClassInitializer::from(NativeRecipe::new(
             py,
             tokenizer,
-            "deepseek_v41",
+            &Self::DEFINITION,
             options,
             None,
-            json!({"vision_config":vision_config,"image_token_id":image_token_id}),
+            Map::from_iter([
+                ("vision_config".into(), vision_config),
+                ("image_token_id".into(), json!(image_token_id)),
+            ]),
         )?)
         .add_subclass(Self))
     }

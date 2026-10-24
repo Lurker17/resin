@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 /// Code matching roles should include a fallback for unsupported roles.
 /// Some roles are model-specific; recipes validate supported roles.
 #[non_exhaustive]
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[pyclass(frozen, eq, eq_int, from_py_object, module = "resin._resin")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Role {
@@ -330,6 +330,12 @@ pub(crate) enum Block {
     Result(ToolResult),
 }
 pub(crate) type MediaSources = Vec<(&'static str, Py<PyAny>)>;
+pub(crate) fn media_blocks(py: Python<'_>, sources: MediaSources) -> PyResult<Vec<Py<PyAny>>> {
+    sources
+        .into_iter()
+        .map(|(kind, source)| Block::Media(kind, Arc::new(source)).to_python(py))
+        .collect()
+}
 impl Block {
     fn from_wire(py: Python<'_>, part: &Value) -> PyResult<Self> {
         if let Some(text) = part.as_str() {
@@ -356,7 +362,7 @@ impl Block {
                 };
                 let source = part
                     .get(kind)
-                    .or_else(|| part.get(&format!("{kind}_url")))
+                    .or_else(|| part.get(format!("{kind}_url")))
                     .unwrap_or(&Value::Null);
                 let source = source.get("url").unwrap_or(source);
                 Ok(Self::Media(kind, Arc::new(pythonize(py, source)?.unbind())))
@@ -440,6 +446,55 @@ fn extract_blocks(content: &Bound<'_, PyAny>) -> PyResult<Vec<Block>> {
         .try_iter()?
         .map(|item| Block::from_py(&item?))
         .collect()
+}
+
+/// Structural requirements supplied by a concrete recipe, not inferred from model names.
+#[derive(Clone, Copy)]
+pub(crate) struct MessagePolicy {
+    pub(crate) roles: &'static [Role],
+    pub(crate) assistant_order: &'static [BlockKind],
+    pub(crate) reorder_wire_fields: bool,
+    pub(crate) controls: &'static [&'static str],
+    pub(crate) tools: ToolScope,
+    pub(crate) media_roles: Option<&'static [Role]>,
+}
+impl MessagePolicy {
+    pub(crate) const STANDARD: Self = Self {
+        roles: &[
+            Role::SYSTEM,
+            Role::DEVELOPER,
+            Role::USER,
+            Role::ASSISTANT,
+            Role::TOOL,
+        ],
+        assistant_order: &[BlockKind::Thinking, BlockKind::Text, BlockKind::Call],
+        reorder_wire_fields: false,
+        controls: &[],
+        tools: ToolScope::InitialInstruction,
+        media_roles: None,
+    };
+}
+#[derive(Clone, Copy)]
+pub(crate) enum ToolScope {
+    InitialInstruction,
+    AnyInstruction,
+}
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum BlockKind {
+    Thinking,
+    Text,
+    Call,
+    Result,
+}
+impl Block {
+    fn kind(&self) -> BlockKind {
+        match self {
+            Self::Thinking(_) => BlockKind::Thinking,
+            Self::Call(_) => BlockKind::Call,
+            Self::Result(_) => BlockKind::Result,
+            _ => BlockKind::Text,
+        }
+    }
 }
 
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
@@ -581,69 +636,56 @@ impl Message {
             metadata,
         })
     }
-    pub(crate) fn lower_wire_fields(&mut self, model: &str) {
-        // Legacy JSON tool_calls/tool_responses are unordered message fields. Gemma's
-        // template places them before public text; expose that order in the typed value.
-        if self.role == Role::ASSISTANT && model == "gemma4" {
-            self.blocks.sort_by_key(|block| match block {
-                Block::Thinking(_) => 0,
-                Block::Call(_) => 1,
-                Block::Result(_) => 2,
-                _ => 3,
+    pub(crate) fn lower_wire_fields(&mut self, policy: &MessagePolicy) {
+        // JSON named fields have no block order. Lower them into the concrete
+        // template's declared order before exposing the same typed Message API.
+        if self.role == Role::ASSISTANT && policy.reorder_wire_fields {
+            self.blocks.sort_by_key(|block| {
+                policy
+                    .assistant_order
+                    .iter()
+                    .position(|kind| *kind == block.kind())
             });
         }
     }
-    pub(crate) fn validate_for(&self, model: &str) -> PyResult<()> {
-        if self.role == Role::LATEST_REMINDER && !model.starts_with("deepseek_") {
+    pub(crate) fn validate_for(&self, policy: &MessagePolicy) -> PyResult<()> {
+        if !policy.roles.contains(&self.role) {
             return Err(PyValueError::new_err(format!(
-                "{model} does not support the latest_reminder role"
+                "this recipe does not support the {} role",
+                self.role.spelling()
             )));
         }
-        if !model.starts_with("deepseek_")
-            && ["task", "wo_eos", "response_format"].iter().any(|key| {
-                self.metadata
-                    .get(*key)
-                    .is_some_and(|value| !value.is_null())
-            })
+        if self
+            .metadata
+            .iter()
+            .any(|(key, value)| !value.is_null() && !policy.controls.contains(&key.as_str()))
         {
-            return Err(PyValueError::new_err(format!(
-                "{model} does not support per-message task, continuation or response format"
-            )));
+            return Err(PyValueError::new_err(
+                "this recipe does not support these per-message controls",
+            ));
+        }
+        if self.has_media()
+            && policy
+                .media_roles
+                .is_some_and(|roles| !roles.contains(&self.role))
+        {
+            return Err(PyValueError::new_err(
+                "this recipe does not support media in this message role",
+            ));
         }
         if self.role != Role::ASSISTANT {
             return Ok(());
         }
         let mut previous = 0;
         for block in &self.blocks {
-            let stage = match block {
-                Block::Thinking(_) => 0,
-                Block::Call(_) => {
-                    if model == "gemma4" {
-                        1
-                    } else {
-                        2
-                    }
-                }
-                Block::Result(_) => {
-                    if model != "gemma4" {
-                        return Err(PyValueError::new_err(
-                            "assistant tool-result blocks are supported only by Gemma; use a tool message",
-                        ));
-                    }
-                    2
-                }
-                _ => {
-                    if model == "gemma4" {
-                        3
-                    } else {
-                        1
-                    }
-                }
-            };
+            let stage = policy.assistant_order.iter().position(|kind| *kind == block.kind())
+                .ok_or_else(|| PyValueError::new_err(
+                    "this recipe does not support this assistant block; use a tool message for tool results",
+                ))?;
             if stage < previous {
-                return Err(PyValueError::new_err(format!(
-                    "unsupported assistant block order for {model}"
-                )));
+                return Err(PyValueError::new_err(
+                    "unsupported assistant block order for this recipe",
+                ));
             }
             previous = stage;
         }

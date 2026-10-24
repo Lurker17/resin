@@ -1,18 +1,15 @@
-"""Internal pixel preparation for native conversation recipes.
+"""Source normalization and cache-identity helpers for model media processors.
 
-Recipes own message ordering, control-token expansion and response parsing.
-These strategies only prepare model pixels and bind their geometry to the
-rendered token positions. Importing this module does not import Torch.
+Importing this module does not import Torch.
 """
 
 from __future__ import annotations
 
 import base64
-import copy
 import hashlib
 import io
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -20,7 +17,6 @@ import numpy as np
 if TYPE_CHECKING:
     from torch import Tensor
 
-    from resin.protocols import MediaInput
 
 _IMAGE_MIME_TYPES = {
     "image/avif",
@@ -152,7 +148,7 @@ def digest_tensors(
     return digest.hexdigest()
 
 
-def _token_id(tokenizer: Any, spelling: str) -> int:
+def token_id(tokenizer: Any, spelling: str) -> int:
     backend = getattr(tokenizer, "backend_tokenizer", tokenizer)
     lookup = getattr(backend, "token_to_id", None)
     token = lookup(spelling) if lookup is not None else None
@@ -162,183 +158,3 @@ def _token_id(tokenizer: Any, spelling: str) -> int:
     if token is None:
         raise ValueError(f"tokenizer must define image token {spelling}")
     return int(token)
-
-
-class _ProcessorPreparer:
-    def __init__(self, model: str, processor_or_tokenizer: Any) -> None:
-        self.model = model
-        self.processor = (
-            processor_or_tokenizer
-            if hasattr(processor_or_tokenizer, "tokenizer")
-            else None
-        )
-
-    def prepare(
-        self, sources: Sequence[tuple[str, Any]]
-    ) -> tuple[dict[str, list[str]], dict[str, Any]]:
-        if not sources:
-            return {}, {}
-        allowed = {"image", "video"} if self.model == "gemma4" else {"image"}
-        for kind, _ in sources:
-            if kind not in allowed:
-                raise ValueError(f"{self.model} does not support {kind} input")
-        processor = self.processor
-        if processor is None:
-            raise ValueError(f"{self.model} media input requires a pixel processor")
-        images, videos = [], []
-        for kind, source in sources:
-            if kind == "image":
-                images.append(normalize_image(source))
-            else:
-                if source is None or isinstance(source, (str, bytes)):
-                    raise ValueError("video content must contain decoded frames")
-                # Only the actual frames need ownership, not the conversation.
-                videos.append(copy.deepcopy(source))
-        output: dict[str, Any] = {}
-        replacements: dict[str, list[str]] = {}
-        kwargs = {"do_rescale": False, "return_tensors": "pt"}
-        if images:
-            prepared = processor.image_processor(images=images, **kwargs)
-            replacements[processor.image_token] = [
-                processor.replace_image_token(prepared, image_idx=index)
-                for index in range(len(images))
-            ]
-            output.update(prepared)
-        if videos:
-            prepared = processor.video_processor(
-                videos=videos, return_metadata=True, **kwargs
-            )
-            replacements[processor.video_token] = [
-                processor.replace_video_token(prepared, video_idx=index)
-                for index in range(len(videos))
-            ]
-            output.update(prepared)
-        output.pop("video_metadata", None)
-        return replacements, output
-
-    def finalize(
-        self, state: dict[str, Any], token_ids: list[int]
-    ) -> MediaInput | None:
-        tokens = tuple(token_ids)
-        processor = self.processor
-        if self.model == "gemma4":
-            from resin.models.gemma4.media import Gemma4Media
-
-            token_types = (
-                processor.create_mm_token_type_ids([token_ids])[0]
-                if processor is not None
-                else [0] * len(tokens)
-            )
-            return Gemma4Media(
-                tokens,
-                tuple(token_types),
-                pixel_values=state.get("pixel_values"),
-                image_position_ids=state.get("image_position_ids"),
-                pixel_values_videos=state.get("pixel_values_videos"),
-                video_position_ids=state.get("video_position_ids"),
-            )
-        if state.get("pixel_values") is None:
-            return None
-        if processor is None:
-            raise ValueError("prepared pixels require a pixel processor")
-        if self.model in {"qwen3_5", "qwen3_8"}:
-            from resin.models.qwen3_5.media import Qwen35Media
-
-            marker = _token_id(processor.tokenizer, "<|image_pad|>")
-            return Qwen35Media(
-                tokens,
-                tuple(index for index, token in enumerate(tokens) if token == marker),
-                state["pixel_values"],
-                state["image_grid_thw"],
-                int(processor.image_processor.merge_size),
-                marker,
-            )
-        from resin.models.inkling.media import InklingMedia
-
-        return InklingMedia(
-            tokens, int(processor.image_token_id), state["pixel_values"]
-        )
-
-
-class _DeepSeekPreparer:
-    def __init__(
-        self,
-        tokenizer: Any,
-        vision_config: Mapping[str, Any] | None,
-        image_token_id: int | None,
-    ) -> None:
-        self.tokenizer = tokenizer
-        self.image_token_id = image_token_id
-        self.vision_config = dict(vision_config or {})
-
-    def prepare(
-        self, sources: Sequence[tuple[str, Any]]
-    ) -> tuple[dict[str, list[str]], tuple[Any, int, list[np.ndarray], list[int]]]:
-        from resin.models.deepseek_v41.media import (
-            IMAGE_TOKEN,
-            DeepSeekV41ImageProcessor,
-        )
-
-        if any(kind != "image" for kind, _ in sources):
-            raise ValueError("DeepSeek V4.1 supports image input only")
-        marker = _token_id(self.tokenizer, IMAGE_TOKEN)
-        if self.image_token_id is not None and marker != self.image_token_id:
-            raise ValueError(
-                "tokenizer image token does not match checkpoint image_token_id"
-            )
-        processor = DeepSeekV41ImageProcessor(
-            **{
-                key: value
-                for key, value in self.vision_config.items()
-                if key in DeepSeekV41ImageProcessor.__dataclass_fields__
-            }
-        )
-        images = [normalize_image(source) for _, source in sources]
-        counts = [
-            processor.token_count(image.shape[1], image.shape[0]) for image in images
-        ]
-        return {IMAGE_TOKEN: [IMAGE_TOKEN * count for count in counts]}, (
-            processor,
-            marker,
-            images,
-            counts,
-        )
-
-    def finalize(
-        self,
-        state: tuple[Any, int, list[np.ndarray], list[int]],
-        token_ids: list[int],
-    ) -> MediaInput:
-        from resin.models.deepseek_v41.media import DeepSeekV41Media
-
-        processor, marker, images, counts = state
-        positions = iter(
-            index for index, token in enumerate(token_ids) if token == marker
-        )
-        placed = []
-        for image, count in zip(images, counts, strict=True):
-            start = next(positions, None)
-            if start is None:
-                raise ValueError("missing expanded image token span")
-            for expected in range(start + 1, start + count):
-                if next(positions, None) != expected:
-                    raise ValueError("image token span must be contiguous")
-            placed.append(processor.prepare(image, start=start))
-        if next(positions, None) is not None:
-            raise ValueError("unexpected image placeholder outside image content")
-        return DeepSeekV41Media(tuple(token_ids), tuple(placed), image_token_id=marker)
-
-
-def make_preparer(
-    model: str,
-    tokenizer_or_processor: Any,
-    *,
-    eos_token_ids: Sequence[int] = (),
-    vision_config: Mapping[str, Any] | None = None,
-    image_token_id: int | None = None,
-) -> _ProcessorPreparer | _DeepSeekPreparer:
-    if model == "deepseek_v41":
-        return _DeepSeekPreparer(tokenizer_or_processor, vision_config, image_token_id)
-    if model not in {"gemma4", "qwen3_5", "qwen3_8", "inkling"}:
-        raise ValueError(f"no media processor for {model}")
-    return _ProcessorPreparer(model, tokenizer_or_processor)

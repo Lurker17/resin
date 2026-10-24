@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import itertools
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 from torch import Tensor
 
+import resin
 from resin._recipe_media import (
     digest_tensors,
+    normalize_image,
     owned_cpu_tensor,
     salt_token_positions,
     single_row,
+    token_id,
 )
 from resin.protocols import MediaTokenSpan
 
@@ -144,4 +148,59 @@ def _media_digest(pixel_values: Tensor, image_grid_thw: Tensor) -> str:
     )
 
 
-__all__ = ["Qwen35Media"]
+class Qwen35MediaProcessor:
+    """Prepare image tokens, pixels and prompt-relative multimodal RoPE."""
+
+    def __init__(self, processor: Any) -> None:
+        self.processor = processor
+
+    def process(
+        self,
+        media: Sequence[resin.recipe.MediaBlock],
+    ) -> resin.recipe.ProcessedMedia:
+        if any(not isinstance(item, resin.recipe.Image) for item in media):
+            raise ValueError("Qwen does not support video or audio input")
+        processor = self.processor
+        if not hasattr(processor, "tokenizer"):
+            raise ValueError("media input requires a pixel processor")
+        payload = processor.image_processor(
+            images=[normalize_image(item.source) for item in media],
+            do_rescale=False,
+            return_tensors="pt",
+        )
+        marker = token_id(processor.tokenizer, "<|image_pad|>")
+        merge = processor.image_processor.merge_size**2
+        tokens = [
+            resin.recipe.MediaTokens(
+                "<|image_pad|>", [marker] * (int(grid.prod()) // merge)
+            )
+            for grid in payload["image_grid_thw"]
+        ]
+        return resin.recipe.ProcessedMedia(tokens, payload)
+
+    def bind(
+        self,
+        processed: resin.recipe.ProcessedMedia,
+        token_ids: Sequence[int],
+        spans: Sequence[MediaTokenSpan],
+    ) -> Qwen35Media:
+        payload = processed.payload
+        return Qwen35Media(
+            tuple(token_ids),
+            tuple(
+                position
+                for span in spans
+                for position in range(span.position, span.position + span.length)
+            ),
+            payload["pixel_values"],
+            payload["image_grid_thw"],
+            int(self.processor.image_processor.merge_size),
+            token_id(self.processor.tokenizer, "<|image_pad|>"),
+        )
+
+
+def make_media_processor(processor: Any) -> Qwen35MediaProcessor:
+    return Qwen35MediaProcessor(processor)
+
+
+__all__ = ["Qwen35Media", "Qwen35MediaProcessor"]

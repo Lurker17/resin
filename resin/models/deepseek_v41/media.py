@@ -8,17 +8,22 @@ so an image's embeddings may be consumed across ordinary prefill chunks.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import torch
 from torch import Tensor
 
+import resin
 from resin._recipe_media import (
     canonical_rgb_image,
     digest_tensors,
+    normalize_image,
     owned_cpu_tensor,
     salt_token_positions,
+    token_id,
 )
 from resin.protocols import MediaTokenSpan
 
@@ -176,12 +181,15 @@ class DeepSeekV41ImageProcessor:
         return best_h // patch, best_w // patch
 
     def prepare(self, image: np.ndarray, *, start: int = 0) -> DeepSeekV41Image:
+        patches, height, width, types = self._patches(canonical_rgb_image(image))
+        return DeepSeekV41Image(start, patches, height, width, types)
+
+    def _patches(self, image: np.ndarray) -> tuple[Tensor, int, int, tuple[int, ...]]:
         from PIL import Image, ImageOps
 
-        rgb = canonical_rgb_image(image)
         # Shared data-URL decoding produces exact uint8/255 values. Round the
         # canonical float input back to RGB bytes before Pillow resampling.
-        source = Image.fromarray(np.rint(rgb * 255).astype(np.uint8))
+        source = Image.fromarray(np.rint(image * 255).astype(np.uint8))
         height, width = self.grid(source.width, source.height)
         size = width * self.patch_size, height * self.patch_size
         if (
@@ -201,12 +209,11 @@ class DeepSeekV41ImageProcessor:
             .permute(1, 3, 0, 2, 4)
             .reshape(height * width, 3, 14, 14)
         )
-        return DeepSeekV41Image(
-            start=start,
-            patches=patches,
-            n_vit_h=height,
-            n_vit_w=width,
-            types=image_token_types(math.ceil(height / 3), math.ceil(width / 3)),
+        return (
+            patches,
+            height,
+            width,
+            image_token_types(math.ceil(height / 3), math.ceil(width / 3)),
         )
 
     def token_count(self, width: int, height: int) -> int:
@@ -218,4 +225,73 @@ def _num_tokens(height: int, width: int, cell: int) -> int:
     return math.ceil(height / cell) * (math.ceil(width / cell) + 1) + 2
 
 
-__all__ = ["DeepSeekV41Image", "DeepSeekV41ImageProcessor", "DeepSeekV41Media"]
+class DeepSeekV41MediaProcessor:
+    """Prepare V4.1 image patches and their causal language-model tokens."""
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        *,
+        vision_config: Mapping[str, Any] | None = None,
+        image_token_id: int | None = None,
+    ) -> None:
+        self.marker = token_id(tokenizer, IMAGE_TOKEN)
+        if image_token_id is not None and self.marker != image_token_id:
+            raise ValueError(
+                "tokenizer image token does not match checkpoint image_token_id"
+            )
+        self.processor = DeepSeekV41ImageProcessor(
+            **{
+                key: value
+                for key, value in (vision_config or {}).items()
+                if key in DeepSeekV41ImageProcessor.__dataclass_fields__
+            }
+        )
+
+    def process(
+        self,
+        media: Sequence[resin.recipe.MediaBlock],
+    ) -> resin.recipe.ProcessedMedia:
+        if any(not isinstance(item, resin.recipe.Image) for item in media):
+            raise ValueError("DeepSeek V4.1 supports image input only")
+        patches = [
+            self.processor._patches(normalize_image(item.source)) for item in media
+        ]
+        tokens = [
+            resin.recipe.MediaTokens(IMAGE_TOKEN, [self.marker] * len(types))
+            for _, _, _, types in patches
+        ]
+        return resin.recipe.ProcessedMedia(tokens, patches)
+
+    def bind(
+        self,
+        processed: resin.recipe.ProcessedMedia,
+        token_ids: Sequence[int],
+        spans: Sequence[MediaTokenSpan],
+    ) -> DeepSeekV41Media:
+        images = tuple(
+            DeepSeekV41Image(span.position, pixels, height, width, types)
+            for (pixels, height, width, types), span in zip(
+                processed.payload, spans, strict=True
+            )
+        )
+        return DeepSeekV41Media(tuple(token_ids), images, image_token_id=self.marker)
+
+
+def make_media_processor(
+    tokenizer: Any,
+    *,
+    vision_config: Mapping[str, Any] | None = None,
+    image_token_id: int | None = None,
+) -> DeepSeekV41MediaProcessor:
+    return DeepSeekV41MediaProcessor(
+        tokenizer, vision_config=vision_config, image_token_id=image_token_id
+    )
+
+
+__all__ = [
+    "DeepSeekV41Image",
+    "DeepSeekV41ImageProcessor",
+    "DeepSeekV41Media",
+    "DeepSeekV41MediaProcessor",
+]

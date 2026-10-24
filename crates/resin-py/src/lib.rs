@@ -19,6 +19,7 @@ mod parallelism;
 mod planning;
 mod recipe;
 mod recipe_events;
+mod recipe_media;
 mod recipe_types;
 mod runner;
 
@@ -1926,6 +1927,9 @@ mod _resin {
     use crate::recipe_events::{
         ParserEvent, ReasoningDelta, TextDelta, ToolCallArgumentsDelta, ToolCallStart,
     };
+
+    #[pymodule_export]
+    use crate::recipe_media::{MediaTokens, ProcessedMedia};
 
     #[pymodule_export]
     use crate::recipe_types::{
