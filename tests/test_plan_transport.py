@@ -8,7 +8,7 @@ import pytest
 
 from resin import BatchPhase, BatchPlan, CacheGroupPlan, SamplingParams
 from resin.backend.plan_transport import PlanTransport, RequestRegistration
-from resin.models.inkling.media import InklingMedia
+from resin.recipe import InklingMedia
 
 
 def media(value=0.5):

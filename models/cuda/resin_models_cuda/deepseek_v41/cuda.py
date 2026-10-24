@@ -7,15 +7,12 @@ from tokenizers import Tokenizer
 
 from resin.backend.topology import ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
-from resin.models.deepseek_v41.media import (
-    IMAGE,
-    IMAGE_END,
-    IMAGE_NEW_LINE,
-    IMAGE_START,
-    DeepSeekV41Media,
-)
+from resin.recipe import DeepSeekV41Media
 from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 from resin_models_cuda.deepseek_v41.checkpoint import load_config, resolve_model_path
+
+# Image-kind tags in the native recipe's prepared payload.
+IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)
 
 
 class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):

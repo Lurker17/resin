@@ -94,7 +94,7 @@ def test_media_transfer_rejects_unknown_types_versions_and_malformed_buffers():
     custom: Any = SimpleNamespace(token_ids=(1,))
     with pytest.raises(TypeError, match="custom media.*local"):
         resin._resin._media_to_buffers(custom)
-    media = resin._resin.InklingMedia(
+    media = resin.recipe.InklingMedia(
         (2, 8), 8, np.ones((1, 1, 2, 2, 3), dtype=np.float32)
     )
     metadata, buffers = resin._resin._media_to_buffers(media)
@@ -123,7 +123,7 @@ def test_media_transfer_rejects_unknown_types_versions_and_malformed_buffers():
 
 
 def test_media_transfer_snapshots_receiver_and_keeps_sender_buffers_alive():
-    media = resin._resin.InklingMedia(
+    media = resin.recipe.InklingMedia(
         (2, 8), 8, np.ones((1, 1, 2, 2, 3), dtype=np.float32)
     )
     metadata, buffers = resin._resin._media_to_buffers(media)

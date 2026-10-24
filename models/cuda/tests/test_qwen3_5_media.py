@@ -12,8 +12,7 @@ from recipe_fuzz.qwen import QwenAdapter
 
 import resin
 from resin import MediaInput
-from resin.models.qwen3_5.media import Qwen35Media
-from resin.recipe import Qwen35Recipe
+from resin.recipe import Qwen35Media, Qwen35Recipe
 
 
 def _media() -> Qwen35Media:

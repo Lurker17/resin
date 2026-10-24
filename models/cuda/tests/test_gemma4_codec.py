@@ -9,8 +9,7 @@ from PIL import Image
 from recipe_fuzz.gemma import GemmaAdapter
 
 import resin
-from resin.models.gemma4.media import Gemma4Media
-from resin.recipe import Gemma4Recipe
+from resin.recipe import Gemma4Media, Gemma4Recipe
 
 
 def _data_url() -> str:

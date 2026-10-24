@@ -1,1 +1,1 @@
-"""Inkling semantic inputs and configuration."""
+"""Inkling checkpoint configuration."""

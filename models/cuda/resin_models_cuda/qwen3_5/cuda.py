@@ -43,7 +43,7 @@ from resin.backend.sampling import (
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
-from resin.models.qwen3_5.media import Qwen35Media
+from resin.recipe import Qwen35Media
 from resin_models_cuda.nvfp4 import select_nvfp4_backend
 from resin_models_cuda.qwen3_5.attention import (
     GraphAttentionSpec,

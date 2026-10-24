@@ -10,7 +10,7 @@ from test_deepseek_v41_model import implementation as implementation
 from torch import nn
 
 from resin import BatchPhase, BatchPlan
-from resin.models.deepseek_v41.media import (
+from resin.recipe import (
     DeepSeekV41Image,
     DeepSeekV41Media,
     image_token_types,

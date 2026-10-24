@@ -25,7 +25,7 @@ from resin import (
 )
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.topology import ParallelGroups
-from resin.models.inkling.media import InklingMedia
+from resin.recipe import InklingMedia
 
 TOKENS = (10, 11, 77, 12, 13, 14)
 PIXEL_SHAPE = (1, 2, 256, 256, 3)

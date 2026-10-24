@@ -1,1 +1,1 @@
-"""Gemma 4 semantic inputs and configuration."""
+"""Gemma 4 checkpoint configuration."""

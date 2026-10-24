@@ -17,16 +17,15 @@ from tokenizers import Tokenizer
 
 import resin
 from resin import Engine, MediaInput, RunnerConfig, SchedulerConfig
-from resin.models.deepseek_v41 import (
+from resin.recipe import (
     DeepSeekV41Image,
-    DeepSeekV41Media,
-)
-from resin.models.deepseek_v41.media import (
-    IMAGE_TOKEN,
     DeepSeekV41ImageProcessor,
+    DeepSeekV41Media,
+    DeepSeekV41Recipe,
     image_token_types,
 )
-from resin.recipe import DeepSeekV41Recipe
+
+IMAGE_TOKEN = "<｜deepseek_image｜>"
 
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures/deepseek_v41_images.json").read_text()

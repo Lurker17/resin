@@ -49,7 +49,6 @@ from resin.backend.sampling import (
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.models.gemma4.config import SLIDING_ATTENTION
-from resin.models.gemma4.media import Gemma4Media
 from resin.models.gemma4.plan import (
     PAGE_SIZE,
     PREFILL_CHUNK_SIZE,
@@ -61,6 +60,7 @@ from resin.models.gemma4.plan import (
     expand_gemma4_decode_batch,
     gemma4_assistant_context,
 )
+from resin.recipe import Gemma4Media
 from resin_models_cuda.gemma4.assistant_checkpoint import (
     DEFAULT_ASSISTANT,
     load_assistant,

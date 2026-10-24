@@ -1,1 +1,1 @@
-"""Qwen3.5 semantic inputs and configuration."""
+"""Qwen3.5 checkpoint configuration."""

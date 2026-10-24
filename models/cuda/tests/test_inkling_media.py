@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from resin.models.inkling.media import InklingMedia
+from resin.recipe import InklingMedia
 
 
 def test_media_owns_pixels_and_salts_only_image_placeholders() -> None:

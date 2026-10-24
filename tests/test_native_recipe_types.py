@@ -13,7 +13,7 @@ from test_http_lifecycle import post, running_server
 from test_recipe import _byte_tokenizer
 
 import resin
-from resin.models.inkling.media import InklingMedia
+from resin.recipe import InklingMedia
 
 
 def tokenizer():

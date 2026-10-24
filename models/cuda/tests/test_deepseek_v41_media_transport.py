@@ -6,7 +6,7 @@ from test_deepseek_v41_vision import media_fixture, plan_for, runner_fixture
 
 from resin import BatchPhase, BatchPlan
 from resin.backend.plan_transport import PlanTransport
-from resin.models.deepseek_v41.media import DeepSeekV41Image, DeepSeekV41Media
+from resin.recipe import DeepSeekV41Image, DeepSeekV41Media
 
 
 def test_registered_prefill_chunks_and_decode_reuse_image_features():

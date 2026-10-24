@@ -10,8 +10,7 @@ from recipe_fuzz.gemma import GemmaAdapter
 
 import resin
 from resin import Engine, MediaInput, MediaTokenSpan
-from resin.models.gemma4.media import Gemma4Media
-from resin.recipe import Gemma4Recipe
+from resin.recipe import Gemma4Media, Gemma4Recipe
 
 
 def _png_bytes() -> bytes:

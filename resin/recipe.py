@@ -1,4 +1,4 @@
-"""Typed conversations, native model recipes, and incremental response parsers."""
+"""Typed conversations, native recipes, prepared media, and response parsers."""
 
 from collections.abc import Sequence
 from typing import Protocol
@@ -6,15 +6,21 @@ from typing import Protocol
 from resin._resin import (
     Audio,
     DeepSeekV4Recipe,
+    DeepSeekV41Image,
+    DeepSeekV41ImageProcessor,
+    DeepSeekV41Media,
     DeepSeekV41Recipe,
+    Gemma4Media,
     Gemma4Recipe,
     GptOssRecipe,
     Image,
+    InklingMedia,
     InklingRecipe,
     InklingResponseParser,
     Lfm2Recipe,
     Message,
     ParserEvent,
+    Qwen35Media,
     Qwen35Recipe,
     Qwen38Recipe,
     ReasoningDelta,
@@ -31,6 +37,7 @@ from resin._resin import (
     ToolCallStart,
     ToolResult,
     Video,
+    image_token_types,
 )
 from resin._resin import RecipeTokenizer as Tokenizer
 from resin.protocols import (
@@ -73,11 +80,16 @@ __all__ = [
     "Audio",
     "ContentBlock",
     "DeepSeekV4Recipe",
+    "DeepSeekV41Image",
+    "DeepSeekV41ImageProcessor",
+    "DeepSeekV41Media",
     "DeepSeekV41Recipe",
     "FinalizingResponseParser",
+    "Gemma4Media",
     "Gemma4Recipe",
     "GptOssRecipe",
     "Image",
+    "InklingMedia",
     "InklingRecipe",
     "InklingResponseParser",
     "Lfm2Recipe",
@@ -86,6 +98,7 @@ __all__ = [
     "MediaTokenSpan",
     "Message",
     "ParserEvent",
+    "Qwen35Media",
     "Qwen35Recipe",
     "Qwen38Recipe",
     "Recipe",
@@ -106,4 +119,5 @@ __all__ = [
     "ToolCallStart",
     "ToolResult",
     "Video",
+    "image_token_types",
 ]

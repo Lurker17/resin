@@ -38,7 +38,7 @@ from resin.backend.sampling import (
 )
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
-from resin.models.inkling.media import InklingMedia
+from resin.recipe import InklingMedia
 from resin_models_cuda.inkling.cache import (
     PREFILL_CHUNK_SIZE,
     STATE_WIDTH_PER_LAYER,
