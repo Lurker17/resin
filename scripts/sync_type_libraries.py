@@ -274,7 +274,7 @@ def sync(root: Path = ROOT) -> Path:
             reports.append(
                 f"{package['name']}=={package['version']}: {count} Python/type files"
             )
-        overlays = root / "type_stubs"
+        overlays = directory / "patches"
         for overlay in sorted(overlays.rglob("*.pyi")):
             output = source / overlay.relative_to(overlays)
             output.parent.mkdir(parents=True, exist_ok=True)

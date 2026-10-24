@@ -64,7 +64,7 @@ def _lock(
 
 
 def _overlay(root: Path, contents: str) -> None:
-    overlay = root / "type_stubs" / "flashinfer" / "api_logging.pyi"
+    overlay = root / ".type-libs" / "patches" / "flashinfer" / "api_logging.pyi"
     overlay.parent.mkdir(parents=True, exist_ok=True)
     overlay.write_text(contents)
 
@@ -383,7 +383,10 @@ def test_real_decorator_overlay_preserves_direct_and_factory_signatures(tmp_path
         },
     )
     _lock(tmp_path, {"flashinfer-python": wheel})
-    stub = Path(__file__).resolve().parents[1] / "type_stubs/flashinfer/api_logging.pyi"
+    stub = (
+        Path(__file__).resolve().parents[1]
+        / ".type-libs/patches/flashinfer/api_logging.pyi"
+    )
     _overlay(tmp_path, stub.read_text())
     target = sync(tmp_path)
     probe = tmp_path / "probe.py"

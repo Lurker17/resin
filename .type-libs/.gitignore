@@ -1,3 +1,4 @@
-*
-!.gitignore
-!sources/
+/*
+!/.gitignore
+!/patches/
+!/sources/
