@@ -1,9 +1,9 @@
 """The routed session retains the ordinary actor's bounded-stream lifecycle."""
 
-import json
 from collections.abc import Sequence
 
 import pytest
+from http_packets import decoded_events, ingress
 from output_helpers import forward_output
 
 import resin
@@ -36,7 +36,7 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
             return Parser()
 
     def admission(request_id, limit):
-        return json.dumps(
+        return ingress(
             [
                 {
                     "id": request_id,
@@ -62,14 +62,14 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
     engine = Engine(Runner())
     session = _HttpSession(engine, Codec(), stream_interval=stream_interval)
     session.admit(admission("overflow", 100))
-    first = json.loads(session.process(engine.step()))
+    first = decoded_events(session.process(engine.step()))
     assert [event["type"] for _, event in first] == [
         "started",
         "reasoning_delta",
         "text_delta",
     ]
     # Forty verified tokens produce eighty noncoalescible semantic events.
-    overflow = json.loads(session.process(engine.step()))
+    overflow = decoded_events(session.process(engine.step()))
     assert len(overflow) == 65  # 64 buffered events plus the terminal error.
     assert all(request_id == "overflow" for request_id, _ in overflow)
     assert overflow[-1][1] == {
@@ -78,10 +78,10 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
     }
     assert session.active_count == 0
     assert not engine.has_work() and not engine.closed and not engine.poisoned
-    assert session.process([]) == "[]"
+    assert session.process([]).to_bytes() == b""
 
     session.admit(admission("ordinary", 1))
-    ordinary = json.loads(session.process(engine.step()))
+    ordinary = decoded_events(session.process(engine.step()))
     assert [event["type"] for _, event in ordinary] == [
         "started",
         "reasoning_delta",
@@ -90,7 +90,7 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
     ]
     assert all(request_id == "ordinary" for request_id, _ in ordinary)
     assert ordinary[-1][1]["data"]["reason"] == "length"
-    assert session.active_count == 0 and session.process([]) == "[]"
+    assert session.active_count == 0 and session.process([]).to_bytes() == b""
     session.close()
     assert not engine.closed
     engine.close()
@@ -142,7 +142,7 @@ def test_http_admission_passes_typed_messages_tools_and_render_controls():
     engine = Engine(Runner())
     session = _HttpSession(engine, Recipe())
     session.admit(
-        json.dumps(
+        ingress(
             [
                 {
                     "id": "typed",
@@ -194,7 +194,7 @@ def test_http_admission_passes_typed_messages_tools_and_render_controls():
             ]
         )
     )
-    events = json.loads(session.process(engine.step()))
+    events = decoded_events(session.process(engine.step()))
     assert not [event for _, event in events if event["type"] == "error"]
     assert len(seen) == 1
     session.close()

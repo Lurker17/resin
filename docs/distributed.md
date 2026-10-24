@@ -3,9 +3,9 @@
 `resin.Parallelism` defines rank placement in the Rust core and exposes that
 immutable configuration to Python. `resin.backend.topology.ParallelGroups` owns
 the Python process-group handles. `resin.backend.distributed` coordinates
-synchronous Engine steps. Each rank owns a model runtime; each attention-DP
-replica has one native request Engine, on its lowest global rank. The other
-ranks in that replica follow its driver.
+Engine steps and eligible decode continuations. Each rank owns a model runtime;
+each attention-DP replica has one native request Engine, on its lowest global
+rank. The other ranks in that replica follow its driver.
 
 The boundaries are:
 
@@ -449,13 +449,16 @@ cancellation continue on every step. Text and score records stay aligned.
 
 `DistributedHttpCoordinator` exchanges ingress before each coordinated step,
 including steps where a replica is idle. Native `_HttpSession` instances reuse
-the ordinary HTTP lifecycle on each driver; the frontend retains client
-channels and receives serialized semantic events. Session initialization,
+the ordinary HTTP lifecycle on each driver; the frontend retains bounded client
+channels and receives native event packets. Session initialization,
 admission infrastructure, execution, and parser errors are voted before the
 next phase. Request rendering failures remain local request errors. Frontend
 bind failure or shutdown closes waiting driver loops and model followers.
-This control transport uses Gloo object collectives and JSON event batches;
-it is a functional routing boundary, with throughput optimization still ahead.
+Ingress and events remain typed Rust packets while crossing Python. Remote
+packets use Rust's existing JSON encoding over Gloo byte buffers; local packets
+need no serialization, and empty packets carry no payload. Fixed integer votes
+exchange lengths, shutdown state, and errors before payload collectives. Python
+does not decode requests or events into dictionaries on this path.
 
 For direct engine integration, applications can continue to own local
 admission and event consumption explicitly:
@@ -482,9 +485,9 @@ runner.close_cuda_graphs()
 groups.close()
 ```
 
-Initialization, error reporting and the separate HTTP control channel still use
-object collectives; successful execution votes and plan transport use typed
-buffers. Shared-memory command transport, throughput validation, expert load
+Initialization and error diagnostics may still use object collectives;
+successful execution votes, plan transport, and HTTP rounds use typed buffers.
+Shared-memory command transport, throughput validation, expert load
 balancing and prefix-aware replica routing remain separate work.
 
 ## Source references and validation
@@ -495,8 +498,9 @@ its read-only phase vote followed by an actual-scheduling vote in
 [`scheduler.hpp`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/csrc/engine/scheduler.hpp#L299),
 and model-level empty execution in
 [`worker.py`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/worker/worker.py).
-Resin keeps synchronous execution and explicit injected groups; it does not adopt
-DeepInfer's deferred previous-step postprocessing or global process-group registry.
+Resin uses explicit injected groups. Its native Engine owns pending plans and
+cache leases, including when a decode continuation overlaps completion of the
+previous step.
 
 [`test_distributed.py`](../tests/test_distributed.py) launches eight real processes
 and checks numerical TP/CP reductions and variable-sized EP dispatch/combine,

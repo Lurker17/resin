@@ -237,7 +237,8 @@ class DistributedWorker:
                 (row[0], row[1], error, bool(row[2]), bool(row[3]))
                 for row, error in zip(records, errors)
             ]
-        # HTTP and other infrequent operations can carry arbitrary objects.
+        # Startup configuration can carry arbitrary objects; serving rounds
+        # use driver_vote and opaque byte packets instead.
         # Their fixed header must still match hot step votes before any rank
         # enters a different collective or model callback.
         self._vote(group, operation)
@@ -247,6 +248,14 @@ class DistributedWorker:
                 "drivers called collective engine operations in different orders"
             )
         return [value for _, value in results]
+
+    def driver_vote(self, operation: str, values=(), *, error: str | None = None):
+        """Exchange a small fixed integer record and optional failure on drivers.
+
+        Successful votes never serialize Python objects. Error text is gathered
+        only when a participant reports failure, after operation-order validation.
+        """
+        return self._vote(self._driver_group, operation, values, error=error)
 
     def _send(self, command):
         if self.closed:

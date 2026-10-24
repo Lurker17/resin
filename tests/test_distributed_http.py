@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -96,6 +97,7 @@ class RankRunner:
 
 
 def _serve_rank(rank, world_size, directory, port, case):
+    patch = pytest.MonkeyPatch()
     dist.init_process_group(
         "gloo",
         init_method=f"file://{directory}/rendezvous",
@@ -171,6 +173,55 @@ def _serve_rank(rank, world_size, directory, port, case):
                     else 1
                 ),
             )
+            if case == "normal":
+
+                def unexpected_object_collective(*args, **kwargs):
+                    raise AssertionError(
+                        "serving rounds must use typed buffer collectives"
+                    )
+
+                patch.setattr(
+                    dist, "broadcast_object_list", unexpected_object_collective
+                )
+                patch.setattr(dist, "all_gather_object", unexpected_object_collective)
+            if (
+                case in ("ingress_decode", "ingress_copy")
+                and groups.drivers.local_rank == 1
+            ):
+                assert server._coordinator is not None
+                wire = server._coordinator._wire
+                broadcast = wire.broadcast
+
+                def malformed_ingress(payload):
+                    encoded = broadcast(payload)
+                    if case == "ingress_copy" and encoded:
+                        raise MemoryError("injected HTTP receive copy failure")
+                    return b"invalid packet" if encoded else encoded
+
+                patch.setattr(wire, "broadcast", malformed_ingress)
+            if case == "event_encode" and groups.drivers.local_rank == 1:
+                assert server._coordinator is not None
+                session = server._coordinator.session
+                assert session is not None
+
+                def fail_encoding():
+                    raise MemoryError("injected HTTP event encoding failure")
+
+                def process(tokens):
+                    packet = session.process(tokens)
+                    return (
+                        SimpleNamespace(to_bytes=fail_encoding)
+                        if packet.to_bytes()
+                        else packet
+                    )
+
+                patch.setattr(
+                    server._coordinator,
+                    "session",
+                    SimpleNamespace(
+                        admit=session.admit, close=session.close, process=process
+                    ),
+                )
             if groups.drivers.local_rank == 0:
 
                 def stop():
@@ -183,6 +234,7 @@ def _serve_rank(rank, world_size, directory, port, case):
     except BaseException as exc:
         error = str(exc)
     finally:
+        patch.undo()
         Path(directory, f"rank-{rank}.json").write_text(
             json.dumps(
                 {
@@ -239,6 +291,9 @@ def _wait_ready(base, directory):
     [
         ("normal", 4),
         ("fatal", 2),
+        ("ingress_decode", 2),
+        ("ingress_copy", 2),
+        ("event_encode", 2),
         ("initialize", 2),
         ("bind", 2),
         ("whitespace", 2),
@@ -267,11 +322,21 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
     )
     base = f"http://127.0.0.1:{port}"
     try:
-        if case in ("normal", "fatal"):
+        if case in (
+            "normal",
+            "fatal",
+            "ingress_decode",
+            "ingress_copy",
+            "event_encode",
+        ):
             _wait_ready(base, tmp_path)
         if case == "fatal":
             with pytest.raises(urllib.error.HTTPError) as failure:
                 _post(base, 1, content="explode")
+            assert failure.value.code == 500
+        elif case in ("ingress_decode", "ingress_copy", "event_encode"):
+            with pytest.raises(urllib.error.HTTPError) as failure:
+                _post(base, 1)
             assert failure.value.code == 500
         elif case == "normal":
             for rank in (0, 1):
@@ -360,6 +425,15 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
     elif case == "bind":
         assert "bind" in records[0]["error"]
         assert records[1]["error"] is None
+    elif case in ("ingress_decode", "ingress_copy"):
+        assert all("HTTP ingress failed" in record["error"] for record in records)
+        assert all(not record["calls"] for record in records)
+        assert all(record["engine_closed"] for record in records)
+    elif case == "event_encode":
+        assert all(
+            "HTTP event encoding failure" in record["error"] for record in records
+        )
+        assert all(record["engine_closed"] for record in records)
     elif case in (
         "whitespace",
         "flags",

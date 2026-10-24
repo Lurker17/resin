@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING
 
+from resin._resin import _HttpEvents, _HttpIngress, _HttpSession
 from resin.backend.distributed import DistributedExecutionError
+from resin.server.transport import HttpTransport
 
 if TYPE_CHECKING:
     from resin.backend.distributed import DistributedEngine
@@ -30,20 +31,16 @@ class DistributedHttpCoordinator:
     ):
         self.engine = engine
         self.group = engine.worker._driver_group
-        self.distributed = engine.worker.groups.distributed
+        self._wire = HttpTransport(engine.worker)
         self.rank = self.group.local_rank
         self.routed_dp_size = self.group.size
         self.is_root = self.rank == 0
         self.closed = False
         self.running = False
         self._shutdown = False
-        self._next_rank = 0
-        self._owners: dict[str, int] = {}
         self.session = None
         error = None
         try:
-            from resin._resin import _HttpSession
-
             self.session = _HttpSession(
                 engine.local, recipe, stream_interval=stream_interval
             )
@@ -72,54 +69,25 @@ class DistributedHttpCoordinator:
         if not self.is_root:
             self.shutdown()
             return
-        self.round("[]", [], True)
+        self.round(_HttpIngress(shutdown=True))
 
     def _vote(self, stage, error):
-        errors = self.engine.worker._drivers(f"http {stage}", error)
-        return next(
-            (
-                f"HTTP {stage} failed on rank {rank}: {error}"
-                for rank, error in zip(self.group.ranks, errors, strict=True)
-                if error
-            ),
-            None,
-        )
-
-    def _ingress(self, admissions_json, canceled, shutdown):
-        """Validate before broadcast, carrying root errors to waiting peers."""
         try:
-            requests = json.loads(admissions_json)
-            if not isinstance(requests, list):
-                raise ValueError("HTTP admissions must be a JSON list")
-            for request in requests:
-                request_id = request["id"]
-                if not isinstance(request_id, str) or request_id in self._owners:
-                    raise ValueError("HTTP request IDs must be unique strings")
-                rank = request.get("routed_dp_rank")
-                if rank is None:
-                    rank = self._next_rank
-                    self._next_rank = (rank + 1) % self.routed_dp_size
-                if type(rank) is not int or not 0 <= rank < self.routed_dp_size:
-                    raise ValueError("routed_dp_rank is outside the attention-DP mesh")
-                request["routed_dp_rank"] = rank
-                self._owners[request_id] = rank
-            if not all(isinstance(request_id, str) for request_id in canceled):
-                raise ValueError("HTTP cancellations must contain request IDs")
-            return {"requests": requests, "canceled": canceled, "shutdown": shutdown}
-        except BaseException as exc:
-            return {"error": str(exc), "shutdown": True}
+            self._wire.vote(stage, error=error)
+        except DistributedExecutionError as exc:
+            return str(exc)
+        return None
 
-    def round(self, admissions_json: str, canceled: list[str], shutdown: bool) -> str:
+    def round(self, ingress: _HttpIngress) -> _HttpEvents:
         """Root actor boundary: dispatch ingress and collect one step's events."""
         if not self.is_root:
             raise ValueError("only the first replica driver owns HTTP ingress")
         if self.closed:
-            if shutdown:
-                return "[]"
+            if ingress.shutdown:
+                return _HttpEvents()
             raise RuntimeError("distributed HTTP coordinator is closed")
         self.running = True
-        command = self._ingress(admissions_json, canceled, shutdown)
-        return self._round(command)
+        return self._round(ingress)
 
     def serve(self):
         """Block on a non-root driver until the frontend closes all replicas."""
@@ -129,31 +97,35 @@ class DistributedHttpCoordinator:
         while not self.closed:
             self._round(None)
 
-    def _round(self, command):
-        messages = [command]
-        if self.group.size > 1:
-            self.distributed.broadcast_object_list(
-                messages, src=self.group.source, group=self.group.handle
+    def _round(self, ingress: _HttpIngress | None) -> _HttpEvents:
+        payload, error = b"", None
+        try:
+            if ingress is not None and self.group.size > 1:
+                payload = ingress.to_bytes()
+        except BaseException as exc:
+            error = str(exc)
+        try:
+            requested = self._wire.vote(
+                "shutdown requested",
+                (int(self._shutdown or (ingress is not None and ingress.shutdown)),),
+                error=error
+                if error is not None
+                else (None if ingress is None else ingress.error),
             )
-        command = messages[0]
-        requested = self.engine.worker._drivers(
-            "http shutdown requested", self._shutdown
-        )
-        if any(requested):
-            command["shutdown"] = True
-        if command["shutdown"]:
-            self._close(command.get("error"))
-            return "[]"
+            if any(row[0] for row in requested):
+                self._close()
+                return _HttpEvents()
+        except BaseException as exc:
+            self._close(str(exc))
+            raise
+
         error = None
         try:
+            payload = self._wire.broadcast(payload)
+            if ingress is None:
+                ingress = _HttpIngress.from_bytes(payload)
             assert self.session is not None
-            local = [
-                request
-                for request in command["requests"]
-                if request["routed_dp_rank"] == self.rank
-            ]
-            self.session.admit(json.dumps(local))
-            self.session.cancel(command["canceled"])
+            self.session.admit(ingress, rank=self.rank)
         except BaseException as exc:
             error = str(exc)
         failure = self._vote("ingress", error)
@@ -171,26 +143,33 @@ class DistributedHttpCoordinator:
         if failure:
             self._close(failure)
 
-        encoded = "[]"
-        error = None
+        packet, payload, error = None, b"", None
         try:
             assert self.session is not None
-            encoded = self.session.process(events)
+            packet = self.session.process(events)
+            if not self.is_root:
+                payload = packet.to_bytes()
         except BaseException as exc:
             error = str(exc)
-        failure = self._vote("events", error)
+        output = None
+        try:
+            gathered = self._wire.gather(payload, error=error)
+            if self.is_root:
+                assert packet is not None
+                output = (
+                    _HttpEvents.combine(
+                        [packet, *(_HttpEvents.from_bytes(data) for data in gathered)]
+                    )
+                    if gathered
+                    else packet
+                )
+            error = None
+        except BaseException as exc:
+            error = str(exc)
+        failure = self._vote("output decode", error)
         if failure:
             self._close(failure)
-        gathered = self.engine.worker._drivers("http output", encoded)
-        if not self.is_root:
-            return "[]"
-        combined = [event for payload in gathered for event in json.loads(payload)]
-        for request_id, event in combined:
-            if event["type"] in ("finished", "error"):
-                self._owners.pop(request_id, None)
-        for request_id in command["canceled"]:
-            self._owners.pop(request_id, None)
-        return json.dumps(combined)
+        return _HttpEvents() if output is None else output
 
     def _close(self, failure=None):
         """Close collectively even when native admission or parsing has failed."""
@@ -212,6 +191,5 @@ class DistributedHttpCoordinator:
         finally:
             self.closed = True
             self.running = False
-            self._owners.clear()
         if failure:
             raise DistributedExecutionError(failure)

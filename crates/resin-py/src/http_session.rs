@@ -1,4 +1,5 @@
 //! Shared request lifecycle for local serving and routed attention-DP drivers.
+use crate::http_distributed::{HttpEvents, HttpIngress};
 use crate::http_logprobs::Vocabulary;
 use crate::http_output::OutputScores;
 use crate::http_stop::StopFilter;
@@ -15,8 +16,7 @@ use pyo3::{
 };
 use pythonize::pythonize;
 use resin_http::{
-    ConversationRequest, EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob,
-    GenerationEvent, GenerationJob,
+    EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob,
 };
 use resin_recipe::{AttributedEvent, Event as ParsedEvent, FinishReason as ParserFinishReason};
 use std::{collections::HashMap, sync::Mutex, time::Instant};
@@ -655,18 +655,28 @@ impl NativeHttpSession {
             )),
         })
     }
-    fn admit(&self, requests_json: &str) -> PyResult<()> {
-        let requests: Vec<ConversationRequest> = serde_json::from_str(requests_json)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    #[pyo3(signature = (ingress, *, rank = 0))]
+    fn admit(&self, ingress: &HttpIngress, rank: usize) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let (session, outputs) = &mut *inner;
-        for request in requests {
+        for request in ingress
+            .requests
+            .iter()
+            .filter(|request| request.routed_dp_rank.unwrap_or(0) == rank)
+        {
             if outputs.contains_key(&request.id) {
                 return Err(PyValueError::new_err("duplicate HTTP request id"));
             }
             let (events, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
             outputs.insert(request.id.clone(), receiver);
-            session.admit(GenerationJob { request, events });
+            session.admit(GenerationJob {
+                request: request.clone(),
+                events,
+            });
+        }
+        session.cancel(&ingress.canceled)?;
+        for id in &ingress.canceled {
+            outputs.remove(id);
         }
         Ok(())
     }
@@ -678,7 +688,7 @@ impl NativeHttpSession {
         }
         Ok(())
     }
-    fn process(&self, py: Python<'_>, events: Vec<Py<TokenEvent>>) -> PyResult<String> {
+    fn process(&self, py: Python<'_>, events: Vec<Py<TokenEvent>>) -> PyResult<HttpEvents> {
         let events = events
             .into_iter()
             .map(|event| event.bind(py).borrow().clone())
@@ -709,7 +719,7 @@ impl NativeHttpSession {
             }
             !finished
         });
-        serde_json::to_string(&output).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        Ok(HttpEvents { events: output })
     }
     fn close(&self) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());

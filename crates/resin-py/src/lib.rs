@@ -1967,6 +1967,9 @@ mod _resin {
     use crate::http::NativeHttpServer;
 
     #[pymodule_export]
+    use crate::http_distributed::{HttpEvents, HttpIngress};
+
+    #[pymodule_export]
     use crate::http_session::NativeHttpSession;
 
     #[pymodule_export]

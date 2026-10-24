@@ -10,6 +10,7 @@ from functools import partial
 import numpy as np
 import pytest
 import test_http_lifecycle as lifecycle
+from http_packets import decoded_events, ingress
 from test_http_logprobs import collect_scores, events, request, score_bytes
 from test_recipe import _byte_tokenizer
 
@@ -91,7 +92,7 @@ class Runner:
 
 
 def admission(request_id, limit, *, stops=()):
-    return json.dumps(
+    return ingress(
         [
             {
                 "id": request_id,
@@ -134,7 +135,7 @@ def session_case(pieces, interval, *, blocks=None, eos=None, silent=()):
 
 
 def tick(session, engine):
-    return json.loads(session.process(engine.step()))
+    return decoded_events(session.process(engine.step()))
 
 
 def text_events(events):
