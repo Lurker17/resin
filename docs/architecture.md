@@ -90,12 +90,14 @@ from the completed output. A single writer lease transfers between safe decode
 continuations. Arrivals, cancellation, close and page boundaries drain before
 changing ownership. Failures after enqueue retain owners in quarantine.
 
-The initial fast path requires a stable decode cohort, no token stops or
-generated-token logprobs, sufficient remaining budget, and both write spans
-inside the same owned blocks in every cache group. Other steps use the
-synchronous path. EOS-based HTTP generation therefore currently takes that
-fallback. `overlap=False` or `step(allow_overlap=False)` selects the reference
-path. Distributed replicas vote together before enqueue or drain.
+The fast path requires a stable decode cohort, no generated-token logprobs,
+sufficient remaining budget, and both write spans inside the same owned blocks
+in every cache group. Stop tokens, including EOS, can finish a request while its
+successor step is in flight: its result is published immediately, but its row
+and cache lease remain alive until that step completes. Successor outputs for
+finished rows are discarded. Other steps use the synchronous path.
+`overlap=False` or `step(allow_overlap=False)` selects the reference path.
+Distributed replicas vote together before enqueue or drain.
 
 ## Cache geometry
 
@@ -177,7 +179,7 @@ integration are planned.
 
 ## Current limits
 
-- overlapped decode currently excludes token stops and generated-token logprobs;
+- overlapped decode currently excludes generated-token logprobs;
 - no prefill/decode disaggregation;
 - sparse graph-safe expert dispatch requires a shared NVLink domain and retains
   static receive storage; RDMA graph transport and communication overlap are pending;
