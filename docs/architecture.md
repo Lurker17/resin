@@ -1,16 +1,21 @@
 # Architecture
 
 Resin separates request and resource ownership from model-specific execution.
-The dependency-free `resin-core` crate contains the complete transactional
+The Python-independent `resin-core` crate contains the complete transactional
 `EngineCore<P>` lifecycle. `P` is opaque frontend metadata: native code schedules
 tokens without knowing about Python sampling objects or model media. Payloads
 are cloned once per dispatched row; native applications should use `Arc` for
 large shared data.
 
 `resin-py` converts Python inputs, binds the runner once, and adapts native plans,
-errors, handles, and events. Torch remains an installed dependency and the Rust
-HTTP server remains bundled; neither changes the ownership boundary. Native
-applications can use `resin-core` without Python, Torch, or HTTP.
+errors, handles, and events. The core's optional archive feature provides the
+distributed plan wire format. Native applications can use `resin-core` without
+Python, Torch, or HTTP.
+
+Shared Resin also owns native conversation rendering, incremental parsing and
+CPU media preparation in `resin-recipe`, plus serving protocols and streaming
+in `resin-http`. These components sit above the token-based Engine; they are
+part of the library, while GPU vision encoding remains in model runners.
 
 The Rust Engine owns:
 
@@ -32,6 +37,11 @@ The Python runner owns:
 The boundary is intentionally asymmetric: scheduling complexity belongs in the
 Engine, while a forward pass receives immutable token and page metadata and can
 execute straightforwardly.
+
+Separately installable model packages already use this boundary to add models
+and select kernels. The [model authoring reference](model-forward-pass.md)
+documents preparation and execution requirements. Step-by-step tutorials and
+an authoring skill are planned.
 
 ## Lifecycle
 
@@ -157,6 +167,13 @@ collectives before process-group shutdown.
 
 [Generated-token logprobs](logprobs.md) cross the Python-to-Rust boundary as
 borrowed NumPy columns.
+
+## Observability
+
+The Engine exposes prefix-cache and overlap counters, and CUDA runners expose
+capture, replay and fallback counters. [Benchmark harnesses](benchmarks.md)
+record timings and Perfetto traces. A server metrics export surface and OTLP
+integration are planned.
 
 ## Current limits
 

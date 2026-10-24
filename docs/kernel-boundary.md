@@ -22,8 +22,10 @@ the frozen native plan: `sequence_ids` is `uint64`; token, position, pointer,
 and sequence-index arrays are `uint32`. Repeated property access creates a new
 view, not a new data buffer. A runner should pass these arrays directly to its
 pinned host staging path rather than calling `list()` or `tuple()` first.
-`resin.backend.plans.PagedCachePlan` provides the shared row, packing, bounds,
-active-range, and append-ownership checks before model-specific lowering.
+Native construction and wire restoration validate structural invariants once.
+`resin.backend.plans.BatchView` retains those native arrays without rescanning
+their CSR structure. `PagedCachePlan` checks them against the runner's physical
+layout: packing, bounds, active ranges, and exact append ownership.
 
 `batch_id` is a monotonic tracing identifier for runner steps.
 `batch_key` is an optional caller-defined compatibility key; the scheduler does
@@ -73,8 +75,15 @@ bound `CacheLayout`, not parallel plan formats.
 A runner implements:
 
 ```python
-def forward(plan: BatchPlan) -> Sequence[int] | Sequence[Sequence[int]]: ...
+def forward(
+    plan: BatchPlan,
+) -> ForwardOutput | Sequence[int] | Sequence[Sequence[int]]: ...
 ```
+
+The included runners return `ForwardOutput`: flat `uint32` token IDs and row
+offsets, plus optional logprob columns. Shared `token_output` and `format_output`
+helpers materialize these arrays without boxing tensor tokens into Python
+scalars. Simple custom runners may still return integer sequences.
 
 Prefill runners return one token for each sequence, including a placeholder ID
 for unsampled continuation or replay rows. A decode runner may

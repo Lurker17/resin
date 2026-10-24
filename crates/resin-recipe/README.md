@@ -39,6 +39,18 @@ media are available as attributes. `create_parser(prompt)` binds a fresh parser
 to the actual rendered prefix and options. A native prompt belongs to the
 recipe that rendered it.
 
+`Message` holds a `Role` and ordered `Text`, `Thinking`, `Image`, `Video`, `Audio`,
+`ToolCall` or `ToolResult` blocks. Recipes validate model-specific roles, block
+orders and media support; the role enum can grow. Tool declarations and
+`RenderOptions` are separate rendering arguments. Qwen3.5 and Qwen3.8 select
+their distinct formats through explicit constructors.
+
+Pass `prompt.token_ids`, `prompt.stop_token_ids`, and `prompt.media` to the
+Engine's corresponding submission arguments. Each `create_parser(prompt)`
+call creates independent response state without retaining pixels. Custom
+Python recipes may construct `RenderedPrompt` themselves and supply their own
+parser; native recipes require a prompt rendered by the same recipe instance.
+
 These parsers use one common native handle; the HTTP actor consumes Rust events
 directly. Python callers receive immutable `ParserEvent` variants: `TextDelta`,
 `ReasoningDelta`, `ToolCallStart` and `ToolCallArgumentsDelta`. Their payload and
@@ -46,6 +58,11 @@ directly. Python callers receive immutable `ParserEvent` variants: `TextDelta`,
 with the same `render` and `create_parser` methods and parser `feed` (plus optional
 `finish`), returning these native events. HTTP wire dictionaries stay in the HTTP
 adapter, outside the native recipe API.
+
+Text and reasoning events carry `delta`; tool starts carry `index`, `id`, and
+`name`; tool argument deltas carry `index` and `delta`. Every variant exposes a
+`type` discriminator and immutable `token_spans` for source-token attribution.
+See [logprob attribution](../../docs/logprobs.md#http).
 
 Fast Hugging Face tokenizers are snapshotted once and shared across requests.
 Custom Python tokenizers can supply `encode`, `convert_tokens_to_ids` and
@@ -65,4 +82,6 @@ repertoire for deterministic rendering across deployment Python versions.
 Run `cargo test -p resin-recipe` for native invariants,
 `uv run pytest tests/test_recipe*.py -q` for integration, and
 `uv run pytest tests/recipe_fuzz -q` for shared differential fuzzing.
-See the fuzz README for budgets and oracle limitations.
+See the [fuzz README](../../tests/recipe_fuzz/README.md) for budgets and oracle
+limitations and the [Python API example](../../README.md#modal-http-endpoints)
+for native recipe construction.

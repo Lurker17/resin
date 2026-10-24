@@ -97,6 +97,17 @@ another region overwrites the shared buffer. Concurrent replay on multiple
 streams is unsupported. Each current model consumes the output into a new
 attention/residual tensor or persistent state before the next region.
 
+Graph replay always returns its device buffers. The caller consumes or copies
+them before replay can overwrite them; the graph cache does not materialize
+host token lists. Synchronous output helpers return owned `ForwardOutput`
+columns. Deferred `DeviceCompletion` stages accepted tokens and counts, records
+an event, and constructs those columns after that event completes.
+
+`PrefillTensorGraphs` owns buffer allocation, padding and replay for both
+feed-forward and projection regions. Feed-forward regions use coordinated
+capacities and valid-row counts across the execution mesh, including idle
+replicas. Projection regions select local buckets.
+
 ## Validation and statistics
 
 `runner.cuda_graph_stats` reports capture counts, replay counts, eager fallback

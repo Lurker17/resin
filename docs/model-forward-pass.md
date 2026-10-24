@@ -35,13 +35,13 @@ loaded buffers without copying, packs them once and owns the injected reduction
 policy. Checkpoint expert wrappers do not remain in the executable tree.
 
 Its call is `routed(hidden_rows, selected_experts, routing_weights)`, returning
-complete rows in the caller's order. The current implementation takes replicated
-token rows and sums rank-local expert contributions. A dispatched EP module
-would own communication buffers and its EP group behind the same layer call;
-the request scheduler and cache plan would not perform expert dispatch. Group
-participation is mandatory even when a rank has no selected local experts.
-Attention-DP serving additionally needs coordinated placeholder steps when a
-rank has no requests; that coordinator is not part of this prototype.
+complete rows in the caller's order. Prepared `ExpertParallelDispatch` owns
+communication buffers and explicit EP/expert-TP groups behind that layer call;
+the scheduler and cache plan do not perform expert dispatch. Group participation
+is mandatory even when a rank has no selected local experts. The shared
+`DistributedWorker` coordinator supplies placeholder steps when an attention-DP
+replica has no requests. See [distributed execution](distributed.md) for the
+worker lifecycle, supported transports, and idle-rank contract.
 
 This ownership follows DeepInfer's
 [`DeepseekMoE`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/models/v4_modules/mlp.py)

@@ -1,5 +1,10 @@
 # GPT-OSS: composable attention and expert parallelism
 
+The Hopper runner supports GPT-OSS 20B/120B with BF16 activations and MXFP4
+experts. Model structure and checkpoint preparation live in
+`resin_models_cuda.gpt_oss`; shared Resin owns scheduling, page allocation,
+staging, sampling, graph lifetime, recipes, and serving.
+
 The Hopper runner accepts explicit attention and expert meshes:
 
 ```python
@@ -44,6 +49,21 @@ After serving has stopped on every rank:
 runner.close_cuda_graphs()  # Release captured NCCL references first.
 groups.close()
 ```
+
+## Cache and admission
+
+One History group and one Window group share a physical slab pool. Both use
+128-token blocks. Sliding attention reads 128 tokens; physical window retention
+is `8192 + 128 - 1` tokens so an 8192-token prefill chunk preserves its earliest
+query's history. The native Engine enforces that write bound and supplies
+chronological page rows and exact append destinations.
+
+`cache_parent_capacity` caps the total parent budget across both groups. The
+default budget comes from available device memory and `gpu_memory_utilization`;
+page zero is reserved for inactive rows. `prefix_cache=True` enables aligned,
+exact-token reuse with copy-on-write as the window advances. The Modal HTTP
+deployment enables it. See [cache ownership](cache-pool.md) and the current
+[benchmark measurements](benchmarks.md).
 
 ## Preparation and execution boundaries
 

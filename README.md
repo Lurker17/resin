@@ -20,9 +20,16 @@ token IDs -> Rust Engine -> frozen BatchPlan -> Python Runner -> token IDs
                  +------- ownership and commit -----+
 ```
 
-The package is deliberately token-ID in/token-ID out. Tokenizers, chat
-templates, text streaming, and serving APIs belong above Resin. This allows
-you to _write your own code_ to control request admission.
+The Engine boundary is token-ID in/token-ID out. Shared Resin also includes
+native conversation recipes, incremental response parsing, media preprocessing,
+and HTTP serving above that boundary. You can use these components together or
+write your own request admission and frontend.
+
+Model authoring is supported through the library/model-package split and the
+runner contract. Model packages supply their weights, kernels, and forward pass
+while reusing the engine. The [authoring reference](docs/model-forward-pass.md)
+describes that contract; step-by-step tutorials and an authoring skill are still
+planned.
 
 Importing `resin` does not import PyTorch or initialize CUDA.
 
@@ -31,12 +38,12 @@ The focused contracts are:
 
 - [flat cache pool](docs/cache-pool.md)
 - [scheduler](docs/scheduler.md)
-- [code size and simplification](docs/code-size.md)
+- [production code-size report](scripts/cloc.py)
 - [runner/kernel boundary](docs/kernel-boundary.md)
 - [authoring a CUDA model runner](docs/model-forward-pass.md)
 - [CUDA graph policies and startup](docs/cuda-graphs.md)
 - [CUDA model package boundaries](models/cuda/ARCHITECTURE.md)
-- [GPT-OSS runner status](docs/gpt-oss-itl.md)
+- [GPT-OSS execution and parallelism](docs/gpt-oss-parallelism.md)
 - [persistent kernel artifacts](docs/kernel-cache.md)
 - [model recipe and streaming parser boundary](crates/resin-recipe/README.md)
 - [recipe differential fuzzing](tests/recipe_fuzz/README.md)
@@ -305,10 +312,13 @@ The native layer currently provides:
   sliding-window and recurrent-state copy-on-write;
 - retryable pre-accept failure and fail-stop post-accept quarantine.
 
-`crates/resin-core` is ordinary, dependency-free Rust containing request
+`crates/resin-core` is Python-independent Rust containing request
 lifecycle, scheduling, token-range planning, grouped cache allocation, and
-execution transactions. `crates/resin-py` converts Python inputs and adapts
-runner callbacks, plans, errors, handles, and events to that core.
+execution transactions. Its optional archive feature supplies the distributed
+plan wire format. `crates/resin-py` converts Python inputs and adapts runner
+callbacks, plans, errors, handles, and events to that core. `crates/resin-recipe`
+owns conversation formats and CPU media preparation; `crates/resin-http` owns
+the serving protocols and streaming responses.
 
 History cache grows on demand to each frozen plan. Window cache grows toward
 bounded cyclic storage whose plan row is projected into chronological order.
@@ -404,8 +414,14 @@ uv run python scripts/cloc.py
 GPU validation is model- and machine-specific; local tests use fakes or skip
 unavailable accelerator libraries.
 
+The code-size report uses Tokei to count production Rust/Python by component,
+excluding comments, blank lines, tests, deployment tools, and generated stubs.
+Use the current report instead of a checked-in line-count snapshot.
+
 For resident prefill/decode sweeps, fixed speculative acceptance, balanced
 expert routing, and throughput/latency charts, see [benchmarking](docs/benchmarks.md).
+Engine prefix-cache and overlap counters, CUDA graph counters, and benchmark
+traces are available. Server metrics export and OTLP integration are planned.
 
 ## Repository map
 
@@ -417,6 +433,8 @@ expert routing, and throughput/latency charts, see [benchmarking](docs/benchmark
 - `crates/resin-core/src/scheduler.rs` — cohort selection and queue-age policy
 - `crates/resin-core/src/planning.rs` — typed token-range planning
 - `crates/resin-core/src/resources/` — grouped cache allocation, prefix reuse, and leases
+- `crates/resin-recipe/` — native conversation formats, parsing, and CPU media preparation
+- `crates/resin-http/` — HTTP protocols, streaming, and serving lifecycle
 - `resin/backend/` — reusable execution and resource gadgets
 - `models/` — separately installable model definitions, loaders, and runners
 - `scripts/` — examples, benchmarks, and local maintenance tools
