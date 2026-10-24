@@ -1,5 +1,5 @@
 use resin_core::engine::{
-    EngineCore, ExecutionPlan, Runner, RunnerConfig, SchedulerConfig, Submission,
+    EngineCore, ExecutionPlan, OwnedTokenRows, Runner, RunnerConfig, SchedulerConfig, Submission,
 };
 use resin_core::logprobs::{LogprobView, TopLogprobView};
 use std::num::NonZeroU32;
@@ -36,7 +36,7 @@ struct Model {
     corrupt_target: bool,
 }
 impl Runner<()> for Model {
-    fn forward(&mut self, plan: ExecutionPlan<()>) -> resin_core::engine::Result<Vec<Vec<u32>>> {
+    fn forward(&mut self, plan: ExecutionPlan<()>) -> resin_core::engine::Result<OwnedTokenRows> {
         self.indptr = plan.prompt_score_indptr.clone();
         self.values = vec![-0.5; plan.prompt_score_indices.len()];
         self.top_indptr = vec![0];
@@ -52,9 +52,12 @@ impl Runner<()> for Model {
             self.target_ids[0] += 1;
         }
         self.target_values = vec![-1.0; self.target_ids.len()];
-        let output = vec![vec![99]; plan.sequence_ids.len()];
+        let output = OwnedTokenRows::new(
+            vec![99; plan.sequence_ids.len()],
+            (0..=plan.sequence_ids.len() as u32).collect(),
+        );
         self.plans.push(plan);
-        Ok(output)
+        output
     }
     fn prompt_logprobs(&self) -> Option<LogprobView<'_>> {
         if self.values.is_empty() {

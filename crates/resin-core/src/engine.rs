@@ -4,6 +4,7 @@
 //! plan and releases model-local state. Opaque payloads carry frontend metadata.
 
 pub use crate::logprobs::{LogprobView, TokenLogprobs};
+pub use crate::output::{OwnedTokenRows, TokenRows};
 use crate::resources::RequestResourceRef;
 use crate::resources::kv::{KvGroupPlan, KvLayout};
 use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
@@ -315,7 +316,7 @@ fn execution_call<T>(stage: &str, call: impl FnOnce() -> Result<T>) -> Result<T>
 }
 
 pub trait Runner<P> {
-    fn forward(&mut self, plan: ExecutionPlan<P>) -> Result<Vec<Vec<u32>>>;
+    fn forward(&mut self, plan: ExecutionPlan<P>) -> Result<OwnedTokenRows>;
     fn logprobs(&self) -> Option<LogprobView<'_>> {
         None
     }
@@ -865,6 +866,10 @@ impl<P: Clone> EngineCore<P> {
             return Ok(Vec::new());
         };
         let output = execution_call("forward", || runner.forward(plan));
+        let output = output
+            .as_ref()
+            .map(OwnedTokenRows::view)
+            .map_err(Clone::clone);
         self.complete_step_with(runner, output, make_event)
     }
 
@@ -899,7 +904,7 @@ impl<P: Clone> EngineCore<P> {
     pub fn complete_step_with<E>(
         &mut self,
         runner: &mut impl Runner<P>,
-        output: Result<Vec<Vec<u32>>>,
+        output: Result<TokenRows<'_>>,
         make_event: impl FnMut(TokenEvent) -> Result<E>,
     ) -> Result<Vec<E>> {
         self.raise_if_open()?;
@@ -1009,7 +1014,7 @@ impl<P: Clone> EngineCore<P> {
     pub fn complete_continuing_step_with<E>(
         &mut self,
         runner: &mut impl Runner<P>,
-        output: Result<Vec<Vec<u32>>>,
+        output: Result<TokenRows<'_>>,
         make_event: impl FnMut(TokenEvent) -> Result<E>,
     ) -> Result<Vec<E>> {
         self.raise_if_open()?;
@@ -1229,7 +1234,7 @@ impl<P: Clone> EngineCore<P> {
         &mut self,
         runner: &mut impl Runner<P>,
         mut batch: Batch<P>,
-        output_token_ids: Vec<Vec<u32>>,
+        output_token_ids: TokenRows<'_>,
         mut make_event: impl FnMut(TokenEvent) -> Result<E>,
         continuation: Option<ExecutionPlan<P>>,
     ) -> Result<Vec<E>> {
@@ -1240,8 +1245,8 @@ impl<P: Clone> EngineCore<P> {
             Err(error) => return self.quarantine(batch, "runner logprob access failed", error),
         };
         if let Err(error) = self
-            .validate_runner_output(&batch.rows, &output_token_ids)
-            .and_then(|()| logprobs.map_or(Ok(()), |scores| scores.validate(&output_token_ids)))
+            .validate_runner_output(&batch.rows, output_token_ids)
+            .and_then(|()| logprobs.map_or(Ok(()), |scores| scores.validate(output_token_ids)))
         {
             return self.quarantine(batch, "runner output exceeds its execution contract", error);
         }
@@ -1302,10 +1307,12 @@ impl<P: Clone> EngineCore<P> {
 
         let mut retired = Vec::with_capacity(batch.rows.len());
         let mut retired_ids = Vec::new();
-        let event_capacity = output_token_ids.iter().map(Vec::len).sum();
+        let event_capacity = output_token_ids.token_count();
         let mut events = Vec::with_capacity(event_capacity);
         let mut committed_token_ids = Vec::with_capacity(batch.rows.len());
-        for (row_index, (row, token_ids)) in batch.rows.iter().zip(&output_token_ids).enumerate() {
+        for (row_index, (row, token_ids)) in
+            batch.rows.iter().zip(output_token_ids.iter()).enumerate()
+        {
             let request = &row.request;
             if row.terminal {
                 // This physical row ran after its previous result reached a
@@ -1322,7 +1329,7 @@ impl<P: Clone> EngineCore<P> {
                 if finished {
                     retired_ids.push(request.id);
                 }
-                committed_token_ids.push(token_ids.clone());
+                committed_token_ids.push(token_ids.to_vec());
                 continue;
             }
             let remaining = request
@@ -1908,7 +1915,11 @@ impl<P: Clone> EngineCore<P> {
         }
     }
 
-    fn validate_runner_output(&self, rows: &[BatchRow<P>], token_rows: &[Vec<u32>]) -> Result<()> {
+    fn validate_runner_output(
+        &self,
+        rows: &[BatchRow<P>],
+        token_rows: TokenRows<'_>,
+    ) -> Result<()> {
         if rows.len() != token_rows.len() {
             return Err(Error::internal(format!(
                 "runner returned {} token rows for {} sequences",
@@ -1916,7 +1927,7 @@ impl<P: Clone> EngineCore<P> {
                 rows.len()
             )));
         }
-        for (row, tokens) in rows.iter().zip(token_rows) {
+        for (row, tokens) in rows.iter().zip(token_rows.iter()) {
             if tokens.is_empty() {
                 return Err(Error::internal("runner returned an empty token row"));
             }

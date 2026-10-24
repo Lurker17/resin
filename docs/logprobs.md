@@ -86,10 +86,10 @@ during that interval, including from `release()`. Tensor-backed NumPy views keep
 their CPU tensors alive through NumPy's base owner. The adapter rejects incorrect
 dtypes and noncontiguous or unaligned storage instead of silently coercing them.
 
-This removes Python scalar/tuple boxing and the additional Python-to-Rust score
-matrix copy. GPU-to-host transfers still occur; only committed scores acquire
-Rust-owned storage. Token IDs join the core's existing owned token
-row contract. Plain list-of-token outputs remain supported when scores are off.
+This removes Python scalar/tuple boxing and intermediate Python-to-Rust token
+and score copies. GPU-to-host transfers still occur; only committed history and
+events acquire Rust-owned storage. Token-only results use the same flat
+`ForwardOutput` contract; plain lists are rejected.
 
 Native Rust runners can expose the same borrowed columns through
 `Runner::logprobs() -> Option<LogprobView<'_>>`. The core validates every raw score

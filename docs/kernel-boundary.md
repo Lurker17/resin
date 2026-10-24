@@ -84,6 +84,13 @@ helpers materialize these arrays without boxing tensor tokens into Python
 scalars. This is the single output contract for token-only and scored results;
 raw integer sequences are rejected after execution and quarantine the batch.
 
+The native adapter borrows token and score columns through validation and
+commit. It does not allocate an intermediate token vector for each row; only
+committed history and events take ownership. Runners must keep the arrays
+unchanged until completion returns, including during `release()` callbacks.
+Native Rust runners use the same flat representation through `OwnedTokenRows`
+and its borrowed `TokenRows` view.
+
 Prefill runners return one token for each sequence, including a placeholder ID
 for unsampled continuation or replay rows. A decode runner may
 return multiple tokens for each sequence; this is how speculative decoding

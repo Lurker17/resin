@@ -667,7 +667,9 @@ class TestNativePolicyIntegration:
             scheduler_config=SchedulerConfig(prefill_chunk_size=1),
         )
         poisoned.submit([1, 2], 1)
-        with pytest.raises(RuntimeError, match="output CSR offsets"):
+        with pytest.raises(
+            RuntimeError, match="runner returned 0 token rows for 1 sequences"
+        ):
             poisoned.step()
         assert poisoned.poisoned
 

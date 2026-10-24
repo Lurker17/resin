@@ -3,7 +3,8 @@
 use numpy::{Element, PyArray1, PyArrayMethods, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use resin_core::logprobs::{LogprobView, TopLogprobView, validate_indptr};
+use resin_core::logprobs::{LogprobView, TopLogprobView};
+use resin_core::output::TokenRows;
 
 use crate::core_error;
 
@@ -197,9 +198,24 @@ pub struct BorrowedLogprobs<'py> {
 }
 
 pub struct BorrowedOutput<'py> {
-    pub tokens: Vec<Vec<u32>>,
+    pub tokens: BorrowedTokens<'py>,
     pub logprobs: Option<BorrowedLogprobs<'py>>,
     pub prompt_logprobs: Option<BorrowedLogprobs<'py>>,
+}
+
+pub struct BorrowedTokens<'py> {
+    token_ids: PyReadonlyArray1<'py, u32>,
+    indptr: PyReadonlyArray1<'py, u32>,
+}
+
+impl BorrowedTokens<'_> {
+    pub fn view(&self) -> PyResult<TokenRows<'_>> {
+        TokenRows::new(
+            self.token_ids.as_slice().unwrap(),
+            self.indptr.as_slice().unwrap(),
+        )
+        .map_err(core_error)
+    }
 }
 
 impl BorrowedLogprobs<'_> {
@@ -216,22 +232,11 @@ impl BorrowedLogprobs<'_> {
 }
 
 impl ForwardOutput {
-    pub fn borrow<'py>(
-        &self,
-        py: Python<'py>,
-        expected_rows: usize,
-    ) -> PyResult<BorrowedOutput<'py>> {
-        let tokens = borrow(&self.token_ids, py)?;
-        let offsets = borrow(&self.token_indptr, py)?;
-        let tokens = tokens.as_slice().unwrap();
-        let offsets = offsets.as_slice().unwrap();
-        validate_indptr(offsets, expected_rows, tokens.len()).map_err(core_error)?;
-        // Token IDs join the core's existing owned output contract. Score and
-        // alternative matrices stay in NumPy storage throughout validation/commit.
-        let rows = offsets
-            .windows(2)
-            .map(|pair| tokens[pair[0] as usize..pair[1] as usize].to_vec())
-            .collect();
+    pub fn borrow<'py>(&self, py: Python<'py>) -> PyResult<BorrowedOutput<'py>> {
+        let tokens = BorrowedTokens {
+            token_ids: borrow(&self.token_ids, py)?,
+            indptr: borrow(&self.token_indptr, py)?,
+        };
         let logprobs = self
             .logprobs
             .as_ref()
@@ -272,9 +277,37 @@ impl ForwardOutput {
             })
             .transpose()?;
         Ok(BorrowedOutput {
-            tokens: rows,
+            tokens,
             logprobs,
             prompt_logprobs,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_views_keep_numpy_storage_borrowed_until_completion_finishes() {
+        Python::attach(|py| {
+            let ids = PyArray1::from_vec(py, vec![7, u32::MAX, 9]).unbind();
+            let offsets = PyArray1::from_vec(py, vec![0, 1, 3]).unbind();
+            let borrowed = BorrowedTokens {
+                token_ids: borrow(&ids, py).unwrap(),
+                indptr: borrow(&offsets, py).unwrap(),
+            };
+            let rows = borrowed.view().unwrap();
+            assert_eq!(rows.row(1), [u32::MAX, 9]);
+            assert_eq!(
+                rows.row(0).as_ptr(),
+                borrowed.token_ids.as_slice().unwrap().as_ptr()
+            );
+            assert!(ids.bind(py).try_readwrite().is_err());
+            assert!(offsets.bind(py).try_readwrite().is_err());
+            drop(borrowed);
+            assert!(ids.bind(py).try_readwrite().is_ok());
+            assert!(offsets.bind(py).try_readwrite().is_ok());
+        });
     }
 }

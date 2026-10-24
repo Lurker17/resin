@@ -1,6 +1,7 @@
 //! Borrowed columns from one synchronous forward pass.
 
 use crate::engine::{Error, Result};
+use crate::output::TokenRows;
 
 #[derive(Clone, Debug)]
 pub struct TokenLogprobs {
@@ -122,7 +123,7 @@ impl LogprobView<'_> {
         }
         Ok(())
     }
-    pub fn validate(&self, token_rows: &[Vec<u32>]) -> Result<()> {
+    pub fn validate(&self, token_rows: TokenRows<'_>) -> Result<()> {
         validate_indptr(self.indptr, token_rows.len(), self.values.len())?;
         for (row, pair) in token_rows.iter().zip(self.indptr.windows(2)) {
             let count = (pair[1] - pair[0]) as usize;

@@ -1151,7 +1151,7 @@ impl<'py> core::Runner<RequestPayload> for PythonRunner<'_, 'py> {
     fn forward(
         &mut self,
         plan: core::ExecutionPlan<RequestPayload>,
-    ) -> core::Result<Vec<Vec<u32>>> {
+    ) -> core::Result<core::OwnedTokenRows> {
         let plan = Py::new(self.py, planning::from_core(plan))
             .map_err(|error| self.failed(error, false))?;
         let output = self
@@ -1163,11 +1163,17 @@ impl<'py> core::Runner<RequestPayload> for PythonRunner<'_, 'py> {
                 self.failed(error, accepted)
             })?;
         let plan = plan.borrow(self.py);
-        let output =
-            extract_runner_output(&output, &plan).map_err(|error| self.failed(error, true))?;
+        let output = extract_runner_output(&output).map_err(|error| self.failed(error, true))?;
+        let tokens = output
+            .tokens
+            .view()
+            .map_err(|error| self.failed(error, true))?;
+        validate_requested_logprobs(tokens, output.logprobs.as_ref(), &plan)
+            .map_err(|error| self.failed(error, true))?;
+        let tokens = tokens.to_owned();
         self.logprobs = output.logprobs;
         self.prompt_logprobs = output.prompt_logprobs;
-        Ok(output.tokens)
+        Ok(tokens)
     }
     fn logprobs(&self) -> Option<core::LogprobView<'_>> {
         self.logprobs.as_ref().map(BorrowedLogprobs::view)
@@ -1386,11 +1392,23 @@ impl Engine {
             logprobs: None,
             prompt_logprobs: None,
         };
-        let output = match extract_runner_output(output, &plan.borrow(py)) {
+        let tokens;
+        let output = match extract_runner_output(output) {
             Ok(output) => {
+                tokens = output.tokens;
                 runner.logprobs = output.logprobs;
                 runner.prompt_logprobs = output.prompt_logprobs;
-                Ok(output.tokens)
+                tokens
+                    .view()
+                    .and_then(|tokens| {
+                        validate_requested_logprobs(
+                            tokens,
+                            runner.logprobs.as_ref(),
+                            &plan.borrow(py),
+                        )?;
+                        Ok(tokens)
+                    })
+                    .map_err(|error| runner.failed(error, true))
             }
             Err(error) => Err(runner.failed(error, true)),
         };
@@ -1881,22 +1899,26 @@ fn runner_result_is_async(output: &Bound<'_, PyAny>) -> PyResult<bool> {
     }
 }
 
-fn extract_runner_output<'py>(
-    output: &Bound<'py, PyAny>,
-    plan: &BatchPlan,
-) -> PyResult<BorrowedOutput<'py>> {
+fn extract_runner_output<'py>(output: &Bound<'py, PyAny>) -> PyResult<BorrowedOutput<'py>> {
     let output = output
         .cast::<ForwardOutput>()
         .map_err(|_| PyTypeError::new_err("runner must return ForwardOutput"))?;
-    let output = output
-        .borrow()
-        .borrow(output.py(), plan.sequence_ids.len())?;
-    let BorrowedOutput {
-        tokens,
-        logprobs,
-        prompt_logprobs,
-    } = &output;
-    let view = logprobs.as_ref().map(BorrowedLogprobs::view);
+    output.borrow().borrow(output.py())
+}
+
+fn validate_requested_logprobs(
+    tokens: core::TokenRows<'_>,
+    logprobs: Option<&BorrowedLogprobs<'_>>,
+    plan: &BatchPlan,
+) -> PyResult<()> {
+    if tokens.len() != plan.sequence_ids.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "runner returned {} token rows for {} sequences",
+            tokens.len(),
+            plan.sequence_ids.len()
+        )));
+    }
+    let view = logprobs.map(BorrowedLogprobs::view);
     for (row, params) in plan.sampling_params.iter().enumerate() {
         if !params.logprobs || !plan.sampling_mask[row] {
             continue;
@@ -1906,7 +1928,7 @@ fn extract_runner_output<'py>(
         });
         if !range.as_ref().is_some_and(|range| {
             !range.is_empty()
-                && range.len() == tokens[row].len()
+                && range.len() == tokens.row(row).len()
                 && view.unwrap().values.get(range.clone()).is_some()
         }) {
             return Err(PyRuntimeError::new_err(
@@ -1929,27 +1951,7 @@ fn extract_runner_output<'py>(
             }
         }
     }
-    let prompt_view = prompt_logprobs.as_ref().map(BorrowedLogprobs::view);
-    if let Some(scores) = prompt_view {
-        let lengths = plan
-            .prompt_score_indptr
-            .windows(2)
-            .map(|pair| (pair[1] - pair[0]) as usize)
-            .collect::<Vec<_>>();
-        scores
-            .validate_prompt(
-                &lengths,
-                &plan.prompt_score_top_counts,
-                &plan.prompt_target_indptr,
-                &plan.prompt_target_token_ids,
-            )
-            .map_err(core_error)?;
-    } else if plan.needs_prompt_logprobs() {
-        return Err(PyRuntimeError::new_err(
-            "runner did not return requested prompt logprobs",
-        ));
-    }
-    Ok(output)
+    Ok(())
 }
 
 #[pymodule(name = "_resin")]
@@ -2009,7 +2011,7 @@ mod tests {
         Python::attach(|py| {
             for expression in [c"[1]", c"[[1]]", c"None", c"object()"] {
                 let value = py.eval(expression, None, None).unwrap();
-                let error = extract_runner_output(&value, &wire_plan(0))
+                let error = extract_runner_output(&value)
                     .err()
                     .expect("non-native output must be rejected");
                 assert!(error.is_instance_of::<PyTypeError>(py));

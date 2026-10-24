@@ -108,7 +108,7 @@ class TestEngine:
         assert second.take_result() == [9]
 
     @pytest.mark.parametrize(
-        "rows,error", [([], "CSR offsets"), ([[]], "empty token row")]
+        "rows,error", [([], "runner returned 0 token rows"), ([[]], "empty token row")]
     )
     def test_sampled_sequence_requires_an_output_row_and_token(self, rows, error):
         class BadRunner:

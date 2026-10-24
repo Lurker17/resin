@@ -287,20 +287,33 @@ def test_array_handoff_retains_storage_and_events_own_their_scores():
     sources = []
 
     def forward(plan):
-        local = np.array([-0.5], np.float32)
-        sources.append(weakref.ref(local))
-        return ForwardOutput(ids, np.array([0, 1], np.uint32), logprobs=local)
+        local_ids = np.array([3], np.uint32)
+        local_offsets = np.array([0, 1], np.uint32)
+        local_scores = np.array([-0.5], np.float32)
+        sources.extend(map(weakref.ref, (local_ids, local_offsets, local_scores)))
+        return ForwardOutput(local_ids, local_offsets, logprobs=local_scores)
 
     def release(sequence_ids):
-        # The ForwardOutput temporary is gone, but Rust still retains its borrows.
-        assert sources[0]() is not None
+        # Storage stays alive until the complete transaction has released the row.
+        assert all(source() is not None for source in sources)
 
     engine = Engine(OutputRunner(forward=forward, release=release))
     engine.submit([1], max_new_tokens=1, sampling_params=SamplingParams(logprobs=True))
     (event,) = engine.step()
-    assert sources[0]() is None
+    assert all(source() is None for source in sources)
     assert event.logprobs is not None
     assert event.logprobs.logprob == -0.5
+
+    engine = Engine(OutputRunner(forward=lambda plan: output))
+    request = engine.submit(
+        [1], max_new_tokens=1, sampling_params=SamplingParams(logprobs=True)
+    )
+    (event,) = engine.step()
+    ids.fill(99)
+    values.fill(-9)
+    output.token_indptr.fill(0)
+    assert request.take_result() == [3] and event.token_id == 3
+    assert event.logprobs is not None and event.logprobs.logprob == -0.125
 
 
 def test_exact_array_dtypes_and_contiguity_are_required_without_coercion():

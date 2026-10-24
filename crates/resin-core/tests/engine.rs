@@ -1,5 +1,6 @@
 use resin_core::engine::{
-    EngineCore, Error, ErrorKind, ExecutionPlan, Runner, RunnerConfig, SchedulerConfig, Submission,
+    EngineCore, Error, ErrorKind, ExecutionPlan, OwnedTokenRows, Runner, RunnerConfig,
+    SchedulerConfig, Submission, TokenRows,
 };
 use resin_core::resources::kv::{KvGroupLayout, KvLayout, KvRetention};
 use std::collections::VecDeque;
@@ -13,14 +14,17 @@ struct Model {
     release_fails: bool,
 }
 impl Runner<&'static str> for Model {
-    fn forward(&mut self, plan: ExecutionPlan<&'static str>) -> Result<Vec<Vec<u32>>, Error> {
+    fn forward(&mut self, plan: ExecutionPlan<&'static str>) -> Result<OwnedTokenRows, Error> {
         let fallback = plan
             .token_indptr
             .windows(2)
             .map(|range| vec![plan.token_ids[range[1] as usize - 1] + 1])
             .collect();
         self.plans.push(plan);
-        self.outputs.pop_front().unwrap_or(Ok(fallback))
+        self.outputs
+            .pop_front()
+            .unwrap_or(Ok(fallback))
+            .map(owned_rows)
     }
     fn release(&mut self, ids: &[u64]) -> Result<(), Error> {
         if self.release_fails {
@@ -29,6 +33,15 @@ impl Runner<&'static str> for Model {
         self.released.extend(ids);
         Ok(())
     }
+}
+fn owned_rows(rows: Vec<Vec<u32>>) -> OwnedTokenRows {
+    let mut ids = Vec::new();
+    let mut offsets = vec![0];
+    for row in rows {
+        ids.extend(row);
+        offsets.push(u32::try_from(ids.len()).unwrap());
+    }
+    OwnedTokenRows::new(ids, offsets).unwrap()
 }
 fn engine(lookahead: u32, chunk: u32) -> EngineCore<&'static str> {
     EngineCore::new(
@@ -293,9 +306,9 @@ fn a_panicking_native_runner_cannot_leave_a_healthy_engine() {
         score_access: bool,
     }
     impl Runner<&'static str> for PanickingRunner {
-        fn forward(&mut self, _plan: ExecutionPlan<&'static str>) -> Result<Vec<Vec<u32>>, Error> {
+        fn forward(&mut self, _plan: ExecutionPlan<&'static str>) -> Result<OwnedTokenRows, Error> {
             assert!(self.score_access, "model state may already have changed");
-            Ok(vec![vec![2]])
+            OwnedTokenRows::new(vec![2], vec![0, 1])
         }
         fn logprobs(&self) -> Option<resin_core::logprobs::LogprobView<'_>> {
             panic!("score storage access failed after model execution");
@@ -341,14 +354,17 @@ fn a_panicking_payload_clone_restores_the_cohort_and_releases_its_cache_access()
         ids: Vec<u64>,
     }
     impl Runner<Payload> for NativeModel {
-        fn forward(&mut self, plan: ExecutionPlan<Payload>) -> Result<Vec<Vec<u32>>, Error> {
+        fn forward(&mut self, plan: ExecutionPlan<Payload>) -> Result<OwnedTokenRows, Error> {
             self.calls += 1;
             self.ids = plan.sequence_ids;
-            Ok(plan
-                .payloads
-                .into_iter()
-                .map(|payload| vec![payload.token])
-                .collect())
+            let indptr = (0..=plan.payloads.len() as u32).collect();
+            OwnedTokenRows::new(
+                plan.payloads
+                    .into_iter()
+                    .map(|payload| payload.token)
+                    .collect(),
+                indptr,
+            )
         }
     }
 
@@ -425,12 +441,51 @@ fn enqueued_transaction_retains_requests_and_pages_until_harvest() {
     assert!(!engine.poisoned());
 
     let output = model.forward(plan);
+    let output = output
+        .as_ref()
+        .map(OwnedTokenRows::view)
+        .map_err(Clone::clone);
     let events = engine.complete_step_with(&mut model, output, Ok).unwrap();
     assert_eq!(events[0].token_id, 11);
     assert!(!engine.has_in_flight_step());
     assert_eq!(engine.ready_request_count(), 1);
     assert!(engine.cancel(&mut model, &request).unwrap());
     assert_eq!(engine.cache_free_parent_count(), Some(16));
+}
+
+#[test]
+fn borrowed_output_storage_is_reusable_after_atomic_commit() {
+    let mut engine = engine(0, 128);
+    let mut model = Model::default();
+    let request = engine.submit(input(vec![10], 1)).unwrap();
+    engine.prepare_step(&mut model, None).unwrap().unwrap();
+    let mut ids = [u32::MAX];
+    let mut offsets = [0, 1];
+    let events = engine
+        .complete_step_with(&mut model, TokenRows::new(&ids, &offsets), Ok)
+        .unwrap();
+    ids.fill(0);
+    offsets.fill(0);
+    assert_eq!(events[0].token_id, u32::MAX);
+    assert_eq!(request.take_result().unwrap(), [u32::MAX]);
+    assert_eq!(engine.cache_free_parent_count(), Some(16));
+    assert!(!engine.poisoned());
+}
+
+#[test]
+fn malformed_csr_output_quarantines_the_accepted_transaction() {
+    let mut engine = engine(0, 128);
+    let mut model = Model::default();
+    let request = engine.submit(input(vec![10], 1)).unwrap();
+    engine.prepare_step(&mut model, None).unwrap().unwrap();
+    let error = engine
+        .complete_step_with(&mut model, TokenRows::new(&[11], &[0, 2]), Ok)
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Execution);
+    assert!(engine.poisoned());
+    assert_eq!(engine.cache_free_parent_count(), Some(15));
+    assert!(model.released.is_empty());
+    assert!(!request.done());
 }
 
 #[test]
@@ -486,7 +541,7 @@ fn decode_continuation_transfers_writer_lease_and_commits_exact_feedback_depth()
     assert_eq!(next.cache_groups[0].append_block_offsets, [5]);
     let leased = engine.cache_free_parent_count();
     let events = engine
-        .complete_continuing_step_with(&mut model, Ok(vec![vec![3, 4]]), Ok)
+        .complete_continuing_step_with(&mut model, TokenRows::new(&[3, 4], &[0, 2]), Ok)
         .unwrap();
     assert_eq!(
         events
@@ -501,7 +556,7 @@ fn decode_continuation_transfers_writer_lease_and_commits_exact_feedback_depth()
     assert_eq!(following.context_lengths, [7]); // Actual 1 + 2, then maximum 4.
     assert_eq!(following.token_ids, [4]);
     engine
-        .complete_step_with(&mut model, Ok(vec![vec![5]]), Ok)
+        .complete_step_with(&mut model, TokenRows::new(&[5], &[0, 1]), Ok)
         .unwrap();
     assert!(!engine.has_in_flight_step());
     let next = engine.prepare_step(&mut model, None).unwrap().unwrap();
@@ -544,6 +599,10 @@ fn unsafe_decode_boundaries_fall_back_before_enqueuing_a_continuation() {
         assert!(!engine.retain_continuation(&plan));
         assert!(engine.continuation_plan().unwrap().is_none());
         let output = model.forward(plan);
+        let output = output
+            .as_ref()
+            .map(OwnedTokenRows::view)
+            .map_err(Clone::clone);
         engine.complete_step_with(&mut model, output, Ok).unwrap();
         engine.close(&mut model).unwrap();
     }
@@ -586,7 +645,7 @@ fn stopped_continuation_publishes_result_but_keeps_pages_until_successor_finishe
         let leased = engine.cache_free_parent_count();
 
         let events = engine
-            .complete_continuing_step_with(&mut model, Ok(vec![vec![3, 4, 5]]), Ok)
+            .complete_continuing_step_with(&mut model, TokenRows::new(&[3, 4, 5], &[0, 3]), Ok)
             .unwrap();
         assert_eq!(
             events
@@ -616,7 +675,11 @@ fn stopped_continuation_publishes_result_but_keeps_pages_until_successor_finishe
         // The device used the untruncated accepted block for feedback. Neither
         // its extra positions nor its sampled output belong to this request.
         let discarded = engine
-            .complete_step_with(&mut model, Ok(vec![vec![100, 101, 102, 103]]), Ok)
+            .complete_step_with(
+                &mut model,
+                TokenRows::new(&[100, 101, 102, 103], &[0, 4]),
+                Ok,
+            )
             .unwrap();
         assert!(discarded.is_empty());
         assert_eq!(model.released, [request.id()]);
@@ -648,7 +711,7 @@ fn stopped_middle_row_retains_dense_successor_slots_and_variable_acceptance() {
     let events = engine
         .complete_continuing_step_with(
             &mut model,
-            Ok(vec![vec![3, 4], vec![99, 100, 101], vec![22]]),
+            TokenRows::new(&[3, 4, 99, 100, 101, 22], &[0, 2, 5, 6]),
             Ok,
         )
         .unwrap();
@@ -662,7 +725,7 @@ fn stopped_middle_row_retains_dense_successor_slots_and_variable_acceptance() {
     let events = engine
         .complete_step_with(
             &mut model,
-            Ok(vec![vec![5], vec![900, 901], vec![23, 24, 25, 26]]),
+            TokenRows::new(&[5, 900, 901, 23, 24, 25, 26], &[0, 1, 3, 7]),
             Ok,
         )
         .unwrap();
@@ -709,15 +772,15 @@ fn failed_successor_quarantines_terminal_rows_without_resurrection() {
         assert!(engine.retain_continuation(&plan));
         engine.continuation_plan().unwrap().unwrap();
         engine
-            .complete_continuing_step_with(&mut model, Ok(vec![vec![3, 4]]), Ok)
+            .complete_continuing_step_with(&mut model, TokenRows::new(&[3, 4], &[0, 2]), Ok)
             .unwrap();
         assert_eq!(request.take_result().unwrap(), [2, 3]);
         let output = match failure {
             0 => Err(Error::rejected("accepted successor unavailable")),
-            1 => Ok(vec![vec![]]),
+            1 => TokenRows::new(&[], &[0, 0]),
             _ => {
                 model.release_fails = true;
-                Ok(vec![vec![5]])
+                TokenRows::new(&[5], &[0, 1])
             }
         };
         engine
@@ -737,7 +800,7 @@ fn failed_successor_quarantines_terminal_rows_without_resurrection() {
 fn failure_after_next_enqueue_keeps_transferred_lease_quarantined() {
     for output in [
         Err(Error::rejected("prior result unavailable")),
-        Ok(vec![vec![]]),
+        TokenRows::new(&[], &[0, 0]),
     ] {
         let mut engine = EngineCore::new(
             RunnerConfig {
