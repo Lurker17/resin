@@ -81,8 +81,8 @@ class CacheGeometry:
 
     def layout(self, slab_capacity: int) -> CacheLayout:
         return CacheLayout(
-            slab_capacity,
-            (
+            parent_capacity=slab_capacity,
+            groups=(
                 CacheGroupLayout(
                     PAGE_TOKENS, blocks_per_slab=self.global_blocks_per_slab
                 ),

@@ -18,7 +18,9 @@ from resin import (
 
 
 def history_layout(parent_capacity: int, block_tokens: int = 2) -> CacheLayout:
-    return CacheLayout(parent_capacity, [CacheGroupLayout(block_tokens)])
+    return CacheLayout(
+        parent_capacity=parent_capacity, groups=[CacheGroupLayout(block_tokens)]
+    )
 
 
 class RecordingRunner:

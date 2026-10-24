@@ -119,8 +119,8 @@ class TestSchedulerConfigContract:
 
     def test_window_guard_band_permits_multi_page_prefill(self) -> None:
         layout = CacheLayout(
-            8,
-            [
+            parent_capacity=8,
+            groups=[
                 CacheGroupLayout(
                     2,
                     retention=CacheRetention.WINDOW,
@@ -236,7 +236,7 @@ class TestSchedulerConfigContract:
         assert engine.scheduler_config.prefill_chunk_size == 2
         engine.close()
 
-        layout = CacheLayout(2, [CacheGroupLayout(2)])
+        layout = CacheLayout(parent_capacity=2, groups=[CacheGroupLayout(2)])
 
         class ContinuationCachedRunner(ContinuationRecordingRunner):
             runner_config = RunnerConfig(

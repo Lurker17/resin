@@ -59,8 +59,8 @@ def test_qwen_media_requires_exact_numpy_storage(field: str, invalid: Any) -> No
     arrays[field] = invalid
     with pytest.raises(TypeError):
         Qwen35Media(
-            (2, 8, 8, 8, 8, 3),
-            (1, 2, 3, 4),
+            token_ids=(2, 8, 8, 8, 8, 3),
+            image_positions=(1, 2, 3, 4),
             **arrays,
             spatial_merge_size=2,
             image_token_id=8,
@@ -72,7 +72,14 @@ def test_qwen_media_copies_strided_numpy_arrays_in_logical_order() -> None:
     grid = np.array([[1, 99, 4, 99, 4, 99]], dtype=np.int64)[:, ::2]
     expected_pixels, expected_grid = pixels.copy(), grid.copy()
     assert not pixels.flags.c_contiguous and not grid.flags.c_contiguous
-    media = Qwen35Media((2, 8, 8, 8, 8, 3), (1, 2, 3, 4), pixels, grid, 2, 8)
+    media = Qwen35Media(
+        token_ids=(2, 8, 8, 8, 8, 3),
+        image_positions=(1, 2, 3, 4),
+        pixel_values=pixels,
+        image_grid_thw=grid,
+        spatial_merge_size=2,
+        image_token_id=8,
+    )
     pixels.fill(0)
     grid.fill(0)
 
@@ -125,7 +132,7 @@ def test_qwen_recipe_normalizes_images_and_attaches_processor_payload() -> None:
         [
             resin.recipe.Message(
                 resin.recipe.Role.USER,
-                [resin.recipe.Image(_data_url()), resin.recipe.Text("describe")],
+                [resin.recipe.Image(source=_data_url()), resin.recipe.Text("describe")],
             )
         ]
     )
@@ -159,7 +166,11 @@ def test_qwen_recipe_rejects_video_instead_of_dropping_its_embeddings() -> None:
             [
                 resin.recipe.Message(
                     resin.recipe.Role.USER,
-                    [resin.recipe.Video(np.zeros((1, 2, 2, 3), dtype=np.float32))],
+                    [
+                        resin.recipe.Video(
+                            source=np.zeros((1, 2, 2, 3), dtype=np.float32)
+                        )
+                    ],
                 )
             ]
         )

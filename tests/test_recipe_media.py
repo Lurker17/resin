@@ -189,7 +189,7 @@ def test_literal_media_marker_does_not_acquire_a_pixel_slot(model_processor):
         [
             resin.recipe.Message(
                 resin.recipe.Role.USER,
-                [resin.recipe.Text(text), resin.recipe.Image(image())],
+                [resin.recipe.Text(text), resin.recipe.Image(source=image())],
             ),
         ]
     )

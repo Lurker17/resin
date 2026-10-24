@@ -68,7 +68,9 @@ def media_fixture():
         n_vit_w=4,
         types=types,
     )
-    return DeepSeekV41Media((7, 8) + (129264,) * len(types) + (9, 10), (image,))
+    return DeepSeekV41Media(
+        token_ids=(7, 8) + (129264,) * len(types) + (9, 10), images=(image,)
+    )
 
 
 def runner_fixture():
@@ -142,7 +144,9 @@ def test_image_embeddings_reuse_features_across_chunks_and_prefix_restore():
     assert len(calls) == 2
     text = plan_for(media, 10, 12)
     assert runner._media_embeddings(text, 0, torch.tensor([[9, 10]])) is None
-    changed = DeepSeekV41Media(media.token_ids[:-1] + (11,), media.images)
+    changed = DeepSeekV41Media(
+        token_ids=media.token_ids[:-1] + (11,), images=media.images
+    )
     with pytest.raises(ValueError, match="changed its media or prompt"):
         runner._validate_plan(plan_for(changed, 0, 5))
 

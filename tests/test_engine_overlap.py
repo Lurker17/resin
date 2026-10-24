@@ -40,7 +40,7 @@ class Completion:
 
 class AsyncRunner:
     runner_config = RunnerConfig(
-        cache_layout=CacheLayout(16, [CacheGroupLayout(128)]),
+        cache_layout=CacheLayout(parent_capacity=16, groups=[CacheGroupLayout(128)]),
         cache_write_lookahead_tokens=2,
     )
 

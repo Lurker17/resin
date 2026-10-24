@@ -118,7 +118,7 @@ def test_native_patches_match_reference_without_resize_and_own_input(is_video) -
             return_tensors="np",
             input_data_format="channels_last",
         )
-        block = resin.recipe.Video(image)
+        block = resin.recipe.Video(source=image)
         field = "video_processor"
     else:
         expected = Gemma4ImageProcessor(**config)(

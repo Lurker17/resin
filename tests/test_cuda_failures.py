@@ -62,7 +62,8 @@ def test_engine_quarantines_state_advanced_before_sampling_failure() -> None:
     class StatefulRunner:
         runner_config = RunnerConfig(
             cache_layout=CacheLayout(
-                4, [CacheGroupLayout(8, family=CacheGroupFamily.STATE)]
+                parent_capacity=4,
+                groups=[CacheGroupLayout(8, family=CacheGroupFamily.STATE)],
             )
         )
 

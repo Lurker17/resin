@@ -12,7 +12,7 @@ __version__: Final[str]
 
 @final
 class Audio:
-    def __new__(cls, /, source: Any) -> Audio: ...
+    def __new__(cls, /, *, source: Any) -> Audio: ...
     @property
     def source(self, /) -> Any: ...
 
@@ -251,31 +251,27 @@ class CacheGroupPlan:
     """
     Plan for one type of cache in a BatchPlan.
 
-    A model can have one or more types of cache, such as full attention,
-    sliding-window attention, or recurrent state, each described by one
-    `CacheGroupLayout`. Cache memory is organized into fungible slabs. Each
-    slab is assigned to one cache group and holds `blocks_per_slab` blocks.
+    Each `CacheGroupLayout` describes full-attention history, sliding-window
+    history, or recurrent state. This plan maps every batch sequence to that
+    group's physical blocks and token write locations.
 
-    A block is indexed by `(slab_id, slotnum)`: `block_slab_ids` contains
-    one-based slab IDs and `block_slotnums` contains zero-based slot numbers. A
-    cached token location is `(block, block_offset)`, equivalently
-    `(slab_id, slotnum, block_offset)`.
-
-    The plan covers every sequence in the batch. Adjacent `block_indptr`
-    values select each sequence's chronological block-table row.
-    `block_table_start_indices[i]` is sequence `i`'s block-table start index, so
-    row entry `j` represents block `block_table_start_indices[i] + j`; block
-    `b` begins at token position `b * CacheGroupLayout.block_tokens`. Full-
-    attention tables start at zero; sliding-window and recurrent tables advance
-    as old blocks leave their resident rings.
-
-    For flattened batch token `k`, the `append_*` arrays supply exactly that
-    cached-token location: `(append_slab_ids[k], append_slotnums[k],
-    append_block_offsets[k])`.
+    - `group_index`: Zero-based index of the matching `CacheGroupLayout`.
+    - `blocks_per_slab`: Number of this group's blocks packed into each slab.
+    - `block_indptr`: CSR row pointer selecting each sequence's chronological
+      block-table entries.
+    - `block_slab_ids`: One-based slab IDs for the flattened block table.
+    - `block_slotnums`: Zero-based block slots within those slabs.
+    - `block_table_start_indices`: Logical index of each row's first block;
+      zero for full history, advancing for window and recurrent rings. Block
+      `b` starts at token position `b * CacheGroupLayout.block_tokens`.
+    - `append_slab_ids`: Destination slab for each flattened `BatchPlan` token.
+    - `append_slotnums`: Destination block slot for each token.
+    - `append_block_offsets`: Token offset within each destination block.
     """
     def __new__(
         cls,
         /,
+        *,
         group_index: int,
         block_indptr: Sequence[int] | npt.NDArray[np.uint32],
         block_slab_ids: Sequence[int] | npt.NDArray[np.uint32],
@@ -284,7 +280,6 @@ class CacheGroupPlan:
         append_slab_ids: Sequence[int] | npt.NDArray[np.uint32],
         append_slotnums: Sequence[int] | npt.NDArray[np.uint32],
         append_block_offsets: Sequence[int] | npt.NDArray[np.uint32],
-        *,
         blocks_per_slab: int = 1,
     ) -> CacheGroupPlan: ...
     def __repr__(self, /) -> str: ...
@@ -351,18 +346,17 @@ class CacheLayout:
     """
     Immutable grouped-cache geometry owned by one Engine.
 
-    `parent_capacity` is the number of fungible physical slabs shared by every
-    group. Group order is stable and identifies each group in BatchPlan.
-    `replay_suffix_tokens` caps prefix hits so every request rebuilds that many
-    final prompt tokens. Models using this policy must not consume omitted
-    consumer prefix state: cached opaque bytes are not valid until rebuilt.
+    - `parent_capacity`: Number of physical slabs shared by all cache groups.
+    - `groups`: Cache-group layouts in the stable order used by `BatchPlan`.
+    - `replay_suffix_tokens`: Final prompt tokens rebuilt after a prefix-cache
+      hit. Models must rebuild omitted cache state before reading it.
     """
     def __new__(
         cls,
         /,
+        *,
         parent_capacity: int,
         groups: Sequence[CacheGroupLayout],
-        *,
         replay_suffix_tokens: int = 0,
     ) -> CacheLayout: ...
     def __repr__(self, /) -> str: ...
@@ -420,6 +414,7 @@ class DeepSeekV41Image:
     def __new__(
         cls,
         /,
+        *,
         start: int,
         patches: Any,
         n_vit_h: int,
@@ -442,6 +437,7 @@ class DeepSeekV41Media:
     def __new__(
         cls,
         /,
+        *,
         token_ids: Sequence[int],
         images: Sequence[DeepSeekV41Image],
         image_token_id: int = 129264,
@@ -671,6 +667,7 @@ class Gemma4Media:
     def __new__(
         cls,
         /,
+        *,
         token_ids: Sequence[int],
         mm_token_type_ids: Sequence[int],
         pixel_values: Any | None = None,
@@ -731,7 +728,7 @@ class GptOssRecipe(_NativeRecipe):
 
 @final
 class Image:
-    def __new__(cls, /, source: Any) -> Image: ...
+    def __new__(cls, /, *, source: Any) -> Image: ...
     @staticmethod
     def from_bytes(data: bytes, *, media_type: str) -> Image: ...
     @staticmethod
@@ -744,6 +741,7 @@ class InklingMedia:
     def __new__(
         cls,
         /,
+        *,
         token_ids: Sequence[int],
         image_token_id: int,
         pixel_values: Any | None = None,
@@ -890,6 +888,7 @@ class Qwen35Media:
     def __new__(
         cls,
         /,
+        *,
         token_ids: Sequence[int],
         image_positions: Sequence[int],
         pixel_values: Any,
@@ -1394,7 +1393,7 @@ class ToolResult:
 
 @final
 class Video:
-    def __new__(cls, /, source: Any) -> Video: ...
+    def __new__(cls, /, *, source: Any) -> Video: ...
     @property
     def source(self, /) -> Any: ...
 

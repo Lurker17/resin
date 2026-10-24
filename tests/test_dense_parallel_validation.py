@@ -27,7 +27,7 @@ def test_dense_validation_workload_obeys_native_scoring_and_cache_contracts():
     runner = TransitionRunner()
     runner.runner_config = RunnerConfig(
         continuation_prefill=True,
-        cache_layout=CacheLayout(128, [CacheGroupLayout(16)]),
+        cache_layout=CacheLayout(parent_capacity=128, groups=[CacheGroupLayout(16)]),
     )
     observed = _Observed(runner)
     engine = Engine(

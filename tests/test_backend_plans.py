@@ -32,14 +32,14 @@ def _plan() -> BatchPlan:
         sampling_mask=[True, True],
         cache_groups=[
             CacheGroupPlan(
-                0,
-                [0, 1, 2],
-                [1, 2],
-                [0, 1],
-                [0, 0],
-                [1, 1, 2],
-                [0, 0, 1],
-                [0, 1, 0],
+                group_index=0,
+                block_indptr=[0, 1, 2],
+                block_slab_ids=[1, 2],
+                block_slotnums=[0, 1],
+                block_table_start_indices=[0, 0],
+                append_slab_ids=[1, 1, 2],
+                append_slotnums=[0, 0, 1],
+                append_block_offsets=[0, 1, 0],
                 blocks_per_slab=2,
             )
         ],
@@ -138,21 +138,21 @@ def test_paged_attention_names_semantics_and_preserves_packed_addresses() -> Non
         token_indptr=[0, 3],
         cache_groups=[
             CacheGroupPlan(
-                0,
-                [0, 2],
-                [1, 2],
-                [0, 1],
-                [0],
-                [1, 1, 2],
-                [0, 0, 1],
-                [0, 1, 0],
+                group_index=0,
+                block_indptr=[0, 2],
+                block_slab_ids=[1, 2],
+                block_slotnums=[0, 1],
+                block_table_start_indices=[0],
+                append_slab_ids=[1, 1, 2],
+                append_slotnums=[0, 0, 1],
+                append_block_offsets=[0, 1, 0],
                 blocks_per_slab=2,
             )
         ],
     )
     batch = build_paged_attention_batch(
         plan,
-        CacheLayout(2, [CacheGroupLayout(2, blocks_per_slab=2)]),
+        CacheLayout(parent_capacity=2, groups=[CacheGroupLayout(2, blocks_per_slab=2)]),
         (PagedAttentionGroupSpec("history", 0, minimum_table_width=3),),
         max_query_tokens=3,
     )
@@ -174,31 +174,31 @@ def test_paged_attention_lowers_unequal_rows_and_window_origins():
         token_indptr=[0, 3, 4, 6],
         cache_groups=[
             CacheGroupPlan(
-                0,
-                [0, 1, 3, 8],
-                list(range(1, 9)),
-                [0, 1, 1, 0, 0, 0, 0, 0],
-                [0, 0, 0],
-                [1, 1, 1, 3, 8, 8],
-                [0, 0, 0, 1, 0, 0],
-                offsets,
+                group_index=0,
+                block_indptr=[0, 1, 3, 8],
+                block_slab_ids=list(range(1, 9)),
+                block_slotnums=[0, 1, 1, 0, 0, 0, 0, 0],
+                block_table_start_indices=[0, 0, 0],
+                append_slab_ids=[1, 1, 1, 3, 8, 8],
+                append_slotnums=[0, 0, 0, 1, 0, 0],
+                append_block_offsets=offsets,
                 blocks_per_slab=2,
             ),
             CacheGroupPlan(
-                1,
-                [0, 1, 3, 6],
-                list(range(9, 15)),
-                [0] * 6,
-                [0, 0, 2],
-                [9, 9, 9, 11, 14, 14],
-                [0] * 6,
-                offsets,
+                group_index=1,
+                block_indptr=[0, 1, 3, 6],
+                block_slab_ids=list(range(9, 15)),
+                block_slotnums=[0] * 6,
+                block_table_start_indices=[0, 0, 2],
+                append_slab_ids=[9, 9, 9, 11, 14, 14],
+                append_slotnums=[0] * 6,
+                append_block_offsets=offsets,
             ),
         ],
     )
     layout = CacheLayout(
-        14,
-        [
+        parent_capacity=14,
+        groups=[
             CacheGroupLayout(4, blocks_per_slab=2),
             CacheGroupLayout(
                 4,
@@ -233,7 +233,7 @@ def test_paged_attention_lowers_unequal_rows_and_window_origins():
 
 
 def test_paged_cache_plan_validates_exact_leased_tables() -> None:
-    layout = CacheLayout(2, [CacheGroupLayout(2)])
+    layout = CacheLayout(parent_capacity=2, groups=[CacheGroupLayout(2)])
     plan = BatchPlan(
         sequence_ids=[10],
         context_lengths=[1],
@@ -242,14 +242,14 @@ def test_paged_cache_plan_validates_exact_leased_tables() -> None:
         phase=BatchPhase.DECODE,
         cache_groups=[
             CacheGroupPlan(
-                0,
-                [0, 2],
-                [1, 2],
-                [0, 0],
-                [0],
-                [1],
-                [0],
-                [1],
+                group_index=0,
+                block_indptr=[0, 2],
+                block_slab_ids=[1, 2],
+                block_slotnums=[0, 0],
+                block_table_start_indices=[0],
+                append_slab_ids=[1],
+                append_slotnums=[0],
+                append_block_offsets=[1],
             )
         ],
     )
@@ -259,7 +259,9 @@ def test_paged_cache_plan_validates_exact_leased_tables() -> None:
 
 
 def test_paged_cache_plan_accepts_the_two_checkpoint_state_ring() -> None:
-    layout = CacheLayout(2, [CacheGroupLayout(4, family=CacheGroupFamily.STATE)])
+    layout = CacheLayout(
+        parent_capacity=2, groups=[CacheGroupLayout(4, family=CacheGroupFamily.STATE)]
+    )
     plan = BatchPlan(
         sequence_ids=[10],
         context_lengths=[11],
@@ -267,14 +269,14 @@ def test_paged_cache_plan_accepts_the_two_checkpoint_state_ring() -> None:
         token_indptr=[0, 1],
         cache_groups=[
             CacheGroupPlan(
-                0,
-                [0, 2],
-                [1, 2],
-                [0, 0],
-                [1],
-                [2],
-                [0],
-                [3],
+                group_index=0,
+                block_indptr=[0, 2],
+                block_slab_ids=[1, 2],
+                block_slotnums=[0, 0],
+                block_table_start_indices=[1],
+                append_slab_ids=[2],
+                append_slotnums=[0],
+                append_block_offsets=[3],
             )
         ],
     )
@@ -287,8 +289,8 @@ def test_source_free_window_plan_rejects_writes_that_discard_read_history(
     decode: bool,
 ) -> None:
     layout = CacheLayout(
-        8,
-        [CacheGroupLayout(2, retention=CacheRetention.WINDOW, window_tokens=4)],
+        parent_capacity=8,
+        groups=[CacheGroupLayout(2, retention=CacheRetention.WINDOW, window_tokens=4)],
     )
     token_count = 1 if decode else 6
     plan = BatchPlan(
@@ -299,14 +301,14 @@ def test_source_free_window_plan_rejects_writes_that_discard_read_history(
         phase=BatchPhase.DECODE if decode else BatchPhase.PREFILL,
         cache_groups=[
             CacheGroupPlan(
-                0,
-                [0, 3],
-                [1, 2, 3],
-                [0, 0, 0],
-                [3],
-                [1 + index // 2 for index in range(token_count)],
-                [0] * token_count,
-                [index % 2 for index in range(token_count)],
+                group_index=0,
+                block_indptr=[0, 3],
+                block_slab_ids=[1, 2, 3],
+                block_slotnums=[0, 0, 0],
+                block_table_start_indices=[3],
+                append_slab_ids=[1 + index // 2 for index in range(token_count)],
+                append_slotnums=[0] * token_count,
+                append_block_offsets=[index % 2 for index in range(token_count)],
             )
         ],
     )
@@ -318,8 +320,8 @@ def test_source_free_window_plan_rejects_writes_that_discard_read_history(
 
 def _mixed_cache_plan(*, decode: bool) -> tuple[BatchPlan, CacheLayout]:
     layout = CacheLayout(
-        64,
-        [
+        parent_capacity=64,
+        groups=[
             CacheGroupLayout(4, blocks_per_slab=2),
             CacheGroupLayout(
                 4,
@@ -358,14 +360,14 @@ def _mixed_cache_plan(*, decode: bool) -> tuple[BatchPlan, CacheLayout]:
                 offsets.append(position % 4)
         groups.append(
             CacheGroupPlan(
-                index,
-                indptr,
-                slabs,
-                slots,
-                firsts,
-                append_slabs,
-                append_slots,
-                offsets,
+                group_index=index,
+                block_indptr=indptr,
+                block_slab_ids=slabs,
+                block_slotnums=slots,
+                block_table_start_indices=firsts,
+                append_slab_ids=append_slabs,
+                append_slotnums=append_slots,
+                append_block_offsets=offsets,
                 blocks_per_slab=descriptor.blocks_per_slab,
             )
         )
@@ -461,8 +463,8 @@ def test_paged_cache_plan_preserves_row_order_for_window_write_failures(
 ) -> None:
     plan, layout = _mixed_cache_plan(decode=True)
     layout = CacheLayout(
-        layout.parent_capacity,
-        [
+        parent_capacity=layout.parent_capacity,
+        groups=[
             layout.groups[0],
             CacheGroupLayout(
                 4,
@@ -515,18 +517,22 @@ def test_paged_cache_plan_keeps_decode_leases_wider_than_u32() -> None:
         phase=BatchPhase.DECODE,
         cache_groups=[
             CacheGroupPlan(
-                0,
-                [0, 3],
-                [1, 2, 3],
-                [0, 0, 0],
-                [0],
-                [2, 2, 2],
-                [0, 0, 0],
-                [block_tokens - 3, block_tokens - 2, block_tokens - 1],
+                group_index=0,
+                block_indptr=[0, 3],
+                block_slab_ids=[1, 2, 3],
+                block_slotnums=[0, 0, 0],
+                block_table_start_indices=[0],
+                append_slab_ids=[2, 2, 2],
+                append_slotnums=[0, 0, 0],
+                append_block_offsets=[
+                    block_tokens - 3,
+                    block_tokens - 2,
+                    block_tokens - 1,
+                ],
             )
         ],
     )
-    layout = CacheLayout(3, [CacheGroupLayout(block_tokens)])
+    layout = CacheLayout(parent_capacity=3, groups=[CacheGroupLayout(block_tokens)])
     cache = PagedCachePlan.from_plan(plan, layout, decode_lookahead=3)
     assert cache.groups[0].address(0, 2) == (3, 0)
     with pytest.raises(ValueError, match="row 0 is not its exact active range"):

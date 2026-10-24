@@ -33,12 +33,16 @@ PIXEL_BYTES = int(np.prod(PIXEL_SHAPE)) * 4
 
 
 def _media() -> InklingMedia:
-    return InklingMedia(TOKENS, 77, np.full(PIXEL_SHAPE, 0.25, dtype=np.float32))
+    return InklingMedia(
+        token_ids=TOKENS,
+        image_token_id=77,
+        pixel_values=np.full(PIXEL_SHAPE, 0.25, dtype=np.float32),
+    )
 
 
 class _MediaRunner:
     runner_config = RunnerConfig(
-        cache_layout=CacheLayout(32, [CacheGroupLayout(2)]),
+        cache_layout=CacheLayout(parent_capacity=32, groups=[CacheGroupLayout(2)]),
         max_batch_tokens=2,
         prefill_chunk_size=2,
         continuation_prefill=True,

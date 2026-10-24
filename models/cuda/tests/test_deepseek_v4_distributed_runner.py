@@ -504,10 +504,10 @@ def test_managed_cache_addresses_are_validated_before_expert_rounds(
 ):
     groups = _groups(Parallelism(world_size=4, ep=4, attn_dp=4))
     runner = _runner(monkeypatch, groups)
-    runner.cache_layout = CacheLayout(4, [CacheGroupLayout(128)])
+    runner.cache_layout = CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(128)])
     del runner._cache_plan  # Exercise the production cache-plan validator.
     group = CacheGroupPlan(
-        0,
+        group_index=0,
         block_indptr=[0, 1],
         block_slab_ids=[slab],
         block_slotnums=[0],

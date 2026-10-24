@@ -227,8 +227,8 @@ class CacheGeometry:
 
     def layout(self, parent_capacity: int) -> CacheLayout:
         return CacheLayout(
-            parent_capacity,
-            (
+            parent_capacity=parent_capacity,
+            groups=(
                 CacheGroupLayout(
                     PAGE_TOKENS,
                     retention=CacheRetention.WINDOW,

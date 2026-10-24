@@ -135,7 +135,9 @@ def test_parser_does_not_retain_media_or_the_rendered_prompt():
     pixels = np.zeros((40, 40, 3), dtype=np.float32)
     source = weakref.ref(pixels)
     messages = [
-        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Image(pixels)])
+        resin.recipe.Message(
+            resin.recipe.Role.USER, [resin.recipe.Image(source=pixels)]
+        )
     ]
     prompt = native.render(messages)
     assert isinstance(prompt.media, InklingMedia)
@@ -151,7 +153,7 @@ def test_parser_does_not_retain_media_or_the_rendered_prompt():
 
 def test_native_media_accounts_for_each_source():
     native = resin.recipe.InklingRecipe(tokenizer())
-    valid = resin.recipe.Image(np.zeros((40, 40, 3), dtype=np.float32))
+    valid = resin.recipe.Image(source=np.zeros((40, 40, 3), dtype=np.float32))
     prompt = native.render(
         [resin.recipe.Message(resin.recipe.Role.USER, [valid, valid])]
     )
@@ -163,7 +165,7 @@ def test_native_media_accounts_for_each_source():
         native.render(
             [
                 resin.recipe.Message(
-                    resin.recipe.Role.USER, [valid, resin.recipe.Image(object())]
+                    resin.recipe.Role.USER, [valid, resin.recipe.Image(source=object())]
                 )
             ]
         )

@@ -58,7 +58,7 @@ def test_native_pixels_preserve_published_geometry(case, codec):
         [
             resin.recipe.Message(
                 resin.recipe.Role.USER,
-                [resin.recipe.Image(rgb.astype(np.float32) / 255)],
+                [resin.recipe.Image(source=rgb.astype(np.float32) / 255)],
             )
         ]
     ).media
@@ -90,7 +90,11 @@ def test_native_patch_order_and_normalization_are_exact_without_resizing(codec):
     source = rgb.astype(np.float32) / 255
     recipe = DeepSeekV41Recipe(codec.tokenizer, vision_config={"min_pixels": 0})
     media = recipe.render(
-        [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Image(source)])]
+        [
+            resin.recipe.Message(
+                resin.recipe.Role.USER, [resin.recipe.Image(source=source)]
+            )
+        ]
     ).media
     assert isinstance(media, DeepSeekV41Media)
     image = media.images[0]
@@ -111,9 +115,9 @@ def test_media_codec_expands_only_explicit_images_and_owns_inputs(codec):
             resin.recipe.Role.USER,
             [
                 resin.recipe.Text("literal " + IMAGE_TOKEN),
-                resin.recipe.Image(_data_url(rgb)),
+                resin.recipe.Image(source=_data_url(rgb)),
                 resin.recipe.Text("compare"),
-                resin.recipe.Image(second),
+                resin.recipe.Image(source=second),
             ],
         )
     ]
@@ -157,7 +161,9 @@ def test_image_identity_changes_only_its_media_cache_identity(codec):
                 resin.recipe.Message(
                     resin.recipe.Role.USER,
                     [
-                        resin.recipe.Image(np.full((2, 4, 3), color, dtype=np.float32)),
+                        resin.recipe.Image(
+                            source=np.full((2, 4, 3), color, dtype=np.float32)
+                        ),
                         resin.recipe.Text("describe"),
                     ],
                 )
@@ -173,18 +179,24 @@ def test_image_identity_changes_only_its_media_cache_identity(codec):
 
 def test_prepared_media_rejects_bad_layout_and_owns_patch_storage():
     patches = np.ones((1, 3, 14, 14), dtype=np.float32)
-    image = DeepSeekV41Image(1, patches, 1, 1, (0, 1, 2, 3))
+    image = DeepSeekV41Image(
+        start=1, patches=patches, n_vit_h=1, n_vit_w=1, types=(0, 1, 2, 3)
+    )
     patches.fill(0)
     assert np.all(image.patches == 1)
-    media = DeepSeekV41Media((7, 129264, 129264, 129264, 129264), (image,))
+    media = DeepSeekV41Media(
+        token_ids=(7, 129264, 129264, 129264, 129264), images=(image,)
+    )
     with pytest.raises(ValueError, match="different placeholder"):
-        DeepSeekV41Media((7, 129264, 129264, 129264, 8), (image,))
+        DeepSeekV41Media(token_ids=(7, 129264, 129264, 129264, 8), images=(image,))
     with pytest.raises(ValueError, match="outside an image span"):
-        DeepSeekV41Media((*media.token_ids, 129264), (image,))
+        DeepSeekV41Media(token_ids=(*media.token_ids, 129264), images=(image,))
     with pytest.raises(ValueError, match="3x3 aligner"):
-        DeepSeekV41Image(1, image.patches, 1, 1, (0, 1, 3))
+        DeepSeekV41Image(
+            start=1, patches=image.patches, n_vit_h=1, n_vit_w=1, types=(0, 1, 3)
+        )
     with pytest.raises(ValueError, match="ordered, disjoint"):
-        DeepSeekV41Media(media.token_ids, (image, image))
+        DeepSeekV41Media(token_ids=media.token_ids, images=(image, image))
 
 
 def test_engine_slices_causal_image_spans_across_prefill_chunks(codec):
@@ -202,7 +214,7 @@ def test_engine_slices_causal_image_spans_across_prefill_chunks(codec):
             resin.recipe.Message(
                 resin.recipe.Role.USER,
                 [
-                    resin.recipe.Image(np.zeros((2, 4, 3), dtype=np.float32)),
+                    resin.recipe.Image(source=np.zeros((2, 4, 3), dtype=np.float32)),
                     resin.recipe.Text("describe"),
                 ],
             )

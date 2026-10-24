@@ -95,7 +95,9 @@ def test_media_transfer_rejects_unknown_types_versions_and_malformed_buffers():
     with pytest.raises(TypeError, match="custom media.*local"):
         resin._resin._media_to_buffers(custom)
     media = resin.recipe.InklingMedia(
-        (2, 8), 8, np.ones((1, 1, 2, 2, 3), dtype=np.float32)
+        token_ids=(2, 8),
+        image_token_id=8,
+        pixel_values=np.ones((1, 1, 2, 2, 3), dtype=np.float32),
     )
     metadata, buffers = resin._resin._media_to_buffers(media)
     descriptor = json.loads(metadata)
@@ -124,7 +126,9 @@ def test_media_transfer_rejects_unknown_types_versions_and_malformed_buffers():
 
 def test_media_transfer_snapshots_receiver_and_keeps_sender_buffers_alive():
     media = resin.recipe.InklingMedia(
-        (2, 8), 8, np.ones((1, 1, 2, 2, 3), dtype=np.float32)
+        token_ids=(2, 8),
+        image_token_id=8,
+        pixel_values=np.ones((1, 1, 2, 2, 3), dtype=np.float32),
     )
     metadata, buffers = resin._resin._media_to_buffers(media)
     assert buffers[1] is media.pixel_values
@@ -149,7 +153,9 @@ def test_image_sources_share_one_owned_rgb_boundary() -> None:
     sources = (
         resin.recipe.Image.from_rgb(rgb),
         resin.recipe.Image.from_bytes(raw, media_type="image/png"),
-        resin.recipe.Image("data:image/png;base64," + base64.b64encode(raw).decode()),
+        resin.recipe.Image(
+            source="data:image/png;base64," + base64.b64encode(raw).decode()
+        ),
     )
     payloads = [render_media(recipe, [source]) for source in sources]
     assert_buffer_roundtrip(payloads[0], "pixel_values")
@@ -170,7 +176,7 @@ def test_image_only_recipes_reject_video(constructor) -> None:
     with pytest.raises(ValueError, match="image|video"):
         render_media(
             recipe,
-            [resin.recipe.Video(np.zeros((2, 2, 2, 3), dtype=np.float32))],
+            [resin.recipe.Video(source=np.zeros((2, 2, 2, 3), dtype=np.float32))],
         )
 
 
@@ -184,7 +190,7 @@ def test_gemma_interleaved_geometry_and_atomic_spans() -> None:
         [
             resin.recipe.Text("first"),
             resin.recipe.Image.from_rgb(first),
-            resin.recipe.Video(frames),
+            resin.recipe.Video(source=frames),
             resin.recipe.Image.from_rgb(second),
             resin.recipe.Text("last"),
         ],
@@ -345,7 +351,7 @@ def test_native_media_does_not_import_python_image_or_tensor_libraries() -> None
                 encoded = resin.recipe.Image.from_bytes({encoded.getvalue()!r}, media_type='image/png')
                 assert recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [encoded])]).media is not None
             if name == 'Gemma4Recipe':
-                video = resin.recipe.Video(np.zeros((2, *size, 3), dtype=np.float32))
+                video = resin.recipe.Video(source=np.zeros((2, *size, 3), dtype=np.float32))
                 assert recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [video])]).media is not None
         assert not {{'PIL', 'torch', 'transformers'}} & sys.modules.keys()
     """)

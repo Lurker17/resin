@@ -30,7 +30,9 @@ class Runner:
             prefill_chunk_size=3 if chunked else None,
             continuation_prefill=chunked,
             cache_write_lookahead_tokens=drafts,
-            cache_layout=CacheLayout(256, [CacheGroupLayout(2)]) if drafts else None,
+            cache_layout=CacheLayout(parent_capacity=256, groups=[CacheGroupLayout(2)])
+            if drafts
+            else None,
         )
         self.speculative_tokens = drafts
         self._speculation = SpeculativeStats(drafts)
@@ -74,7 +76,7 @@ def test_benchmark_does_not_wrap_noncallable_result_as_pending():
 
     runner = InvalidRunner()
     runner.runner_config = RunnerConfig(
-        cache_layout=CacheLayout(16, [CacheGroupLayout(128)]),
+        cache_layout=CacheLayout(parent_capacity=16, groups=[CacheGroupLayout(128)]),
         cache_write_lookahead_tokens=2,
     )
     engine = Engine(BenchmarkRunner(runner))
@@ -768,7 +770,9 @@ def test_decode_reports_when_cache_admission_only_fits_part_of_the_cohort(capsys
     import json
 
     raw = Runner()
-    raw.runner_config = RunnerConfig(cache_layout=CacheLayout(4, [CacheGroupLayout(4)]))
+    raw.runner_config = RunnerConfig(
+        cache_layout=CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(4)])
+    )
     runner = BenchmarkRunner(raw)
     engine = Engine(runner, max_running_requests=4, context_length=64)
     with pytest.raises(RuntimeError, match="scheduled_global=2, expected_global=4"):
@@ -795,7 +799,8 @@ def test_shared_prefix_is_seeded_once_and_forks_real_pages_for_private_work(phas
     raw = Runner()
     raw.runner_config = RunnerConfig(
         cache_layout=CacheLayout(
-            4 if phase == "prefill" else 64, [CacheGroupLayout(4)]
+            parent_capacity=4 if phase == "prefill" else 64,
+            groups=[CacheGroupLayout(4)],
         ),
         continuation_prefill=True,
         prefill_chunk_size=4,
@@ -845,7 +850,8 @@ def test_shared_prefix_is_seeded_once_and_forks_real_pages_for_private_work(phas
 def test_shared_prefix_requires_real_enabled_cache_and_exact_checkpoint_reuse():
     raw = Runner()
     raw.runner_config = RunnerConfig(
-        cache_layout=CacheLayout(64, [CacheGroupLayout(4)]), continuation_prefill=True
+        cache_layout=CacheLayout(parent_capacity=64, groups=[CacheGroupLayout(4)]),
+        continuation_prefill=True,
     )
     runner = BenchmarkRunner(raw)
     case = BenchCase(

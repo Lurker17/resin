@@ -398,7 +398,9 @@ def _selection_worker(rank, rendezvous):
         for lookaheads in ((0, 2), (2, 5)):
             speculative = _CpuRunner(groups)
             speculative.runner_config = RunnerConfig(
-                cache_layout=CacheLayout(64, [CacheGroupLayout(2)]),
+                cache_layout=CacheLayout(
+                    parent_capacity=64, groups=[CacheGroupLayout(2)]
+                ),
                 cache_write_lookahead_tokens=lookaheads[rank],
             )
             speculative._cuda_graph_executor.capture_all = lambda **_: launched.append(

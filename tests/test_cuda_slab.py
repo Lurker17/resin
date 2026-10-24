@@ -16,7 +16,9 @@ def test_graph_replay_pads_unused_rows_with_the_capture_scratch_parents(
 ):
     class Arena(GraphPageTableArena):
         device = torch.device("cpu")
-        layout = CacheLayout(10, [CacheGroupLayout(128, blocks_per_slab=2)] * 2)
+        layout = CacheLayout(
+            parent_capacity=10, groups=[CacheGroupLayout(128, blocks_per_slab=2)] * 2
+        )
 
         def _make_graph_cache(self, groups):
             return SimpleNamespace(groups=groups)

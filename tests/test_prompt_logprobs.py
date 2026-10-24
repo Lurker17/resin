@@ -22,7 +22,9 @@ class TransitionRunner:
     def __init__(self, *, cached=False, malformed=False):
         self.runner_config = RunnerConfig(
             continuation_prefill=True,
-            cache_layout=CacheLayout(32, [CacheGroupLayout(2)]) if cached else None,
+            cache_layout=CacheLayout(parent_capacity=32, groups=[CacheGroupLayout(2)])
+            if cached
+            else None,
         )
         self.calls = []
         self.malformed = malformed

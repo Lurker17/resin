@@ -124,7 +124,7 @@ pub(crate) struct InklingMedia {
 #[pymethods]
 impl InklingMedia {
     #[new]
-    #[pyo3(signature=(token_ids, image_token_id, pixel_values=None))]
+    #[pyo3(signature=(*, token_ids, image_token_id, pixel_values=None))]
     fn new(
         py: Python<'_>,
         token_ids: Vec<u32>,
@@ -216,6 +216,7 @@ pub(crate) struct Qwen35Media {
 #[pymethods]
 impl Qwen35Media {
     #[new]
+    #[pyo3(signature=(*, token_ids, image_positions, pixel_values, image_grid_thw, spatial_merge_size, image_token_id))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -274,7 +275,7 @@ pub(crate) struct Gemma4Media {
 #[pymethods]
 impl Gemma4Media {
     #[new]
-    #[pyo3(signature=(token_ids, mm_token_type_ids, pixel_values=None, image_position_ids=None, pixel_values_videos=None, video_position_ids=None))]
+    #[pyo3(signature=(*, token_ids, mm_token_type_ids, pixel_values=None, image_position_ids=None, pixel_values_videos=None, video_position_ids=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -461,6 +462,7 @@ pub(crate) struct DeepSeekV41Image {
 #[pymethods]
 impl DeepSeekV41Image {
     #[new]
+    #[pyo3(signature=(*, start, patches, n_vit_h, n_vit_w, types))]
     fn new(
         py: Python<'_>,
         start: usize,
@@ -519,7 +521,7 @@ pub(crate) struct DeepSeekV41Media {
 #[pymethods]
 impl DeepSeekV41Media {
     #[new]
-    #[pyo3(signature=(token_ids, images, image_token_id=129264))]
+    #[pyo3(signature=(*, token_ids, images, image_token_id=129264))]
     fn new(
         py: Python<'_>,
         token_ids: Vec<u32>,

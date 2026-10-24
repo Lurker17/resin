@@ -27,9 +27,9 @@ def native_inputs(request, *, tools_before_text=False):
                 if kind == "text":
                     content.append(resin.recipe.Text(block["text"]))
                 elif kind == "image":
-                    content.append(resin.recipe.Image(block.get("image")))
+                    content.append(resin.recipe.Image(source=block.get("image")))
                 elif kind == "video":
-                    content.append(resin.recipe.Video(block.get("video")))
+                    content.append(resin.recipe.Video(source=block.get("video")))
                 else:
                     raise AssertionError(f"unhandled oracle content: {kind}")
         for call in message.get("tool_calls", ()):

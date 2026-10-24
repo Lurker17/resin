@@ -344,7 +344,7 @@ def smoke_test(
                 resin.recipe.Message(
                     resin.recipe.Role.USER,
                     [
-                        resin.recipe.Image(_synthetic_image()),
+                        resin.recipe.Image(source=_synthetic_image()),
                         resin.recipe.Text("Describe this image briefly."),
                     ],
                 )
@@ -445,7 +445,7 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
                 resin.recipe.Message(
                     resin.recipe.Role.USER,
                     [
-                        resin.recipe.Image(_synthetic_image()),
+                        resin.recipe.Image(source=_synthetic_image()),
                         resin.recipe.Text("Name one visible color."),
                     ],
                 )

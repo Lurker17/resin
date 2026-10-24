@@ -38,7 +38,7 @@ def test_recipe_attaches_media_and_preserves_token_controls(source_kind) -> None
     )
     data_url = _data_url()
     image = {
-        "data_url": lambda: resin.recipe.Image(data_url),
+        "data_url": lambda: resin.recipe.Image(source=data_url),
         "bytes": lambda: resin.recipe.Image.from_bytes(
             base64.b64decode(data_url.split(",", 1)[1]), media_type="image/png"
         ),

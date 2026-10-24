@@ -78,7 +78,7 @@ class TestFlatCacheApi:
         coarse = CacheGroupLayout(4)
         fine = CacheGroupLayout(2, blocks_per_slab=2)
         source = [coarse, fine]
-        layout = CacheLayout(3, source)
+        layout = CacheLayout(parent_capacity=3, groups=source)
         source.reverse()
 
         assert [
@@ -124,8 +124,8 @@ class TestFlatCacheApi:
 
     def test_layout_estimates_packed_retained_cohort_without_allocating(self) -> None:
         layout = CacheLayout(
-            1,
-            [
+            parent_capacity=1,
+            groups=[
                 CacheGroupLayout(4, blocks_per_slab=2),
                 CacheGroupLayout(
                     4,
@@ -157,14 +157,14 @@ class TestFlatCacheApi:
 
     def test_manual_sparse_group_plan_is_the_only_batch_cache_metadata(self) -> None:
         group = CacheGroupPlan(
-            0,
-            [0, 2],
-            [3, 4],
-            [0, 0],
-            [0],
-            [3, 4],
-            [0, 0],
-            [1, 0],
+            group_index=0,
+            block_indptr=[0, 2],
+            block_slab_ids=[3, 4],
+            block_slotnums=[0, 0],
+            block_table_start_indices=[0],
+            append_slab_ids=[3, 4],
+            append_slotnums=[0, 0],
+            append_block_offsets=[1, 0],
         )
         plan = BatchPlan(
             sequence_ids=[11],
@@ -187,14 +187,14 @@ class TestFlatCacheApi:
 
     def test_cache_group_numeric_metadata_is_read_only_zero_copy_numpy(self) -> None:
         group = CacheGroupPlan(
-            0,
-            np.asarray([0, 2], dtype=np.uint32),
-            np.asarray([3, 4], dtype=np.uint32),
-            np.asarray([0, 0], dtype=np.uint32),
-            np.asarray([0], dtype=np.uint32),
-            np.asarray([3, 4], dtype=np.uint32),
-            np.asarray([0, 0], dtype=np.uint32),
-            np.asarray([1, 0], dtype=np.uint32),
+            group_index=0,
+            block_indptr=np.asarray([0, 2], dtype=np.uint32),
+            block_slab_ids=np.asarray([3, 4], dtype=np.uint32),
+            block_slotnums=np.asarray([0, 0], dtype=np.uint32),
+            block_table_start_indices=np.asarray([0], dtype=np.uint32),
+            append_slab_ids=np.asarray([3, 4], dtype=np.uint32),
+            append_slotnums=np.asarray([0, 0], dtype=np.uint32),
+            append_block_offsets=np.asarray([1, 0], dtype=np.uint32),
         )
         for name in (
             "block_indptr",
@@ -214,7 +214,7 @@ class TestFlatCacheApi:
                 array[0] = 0
 
     def test_binding_requires_an_exact_layout_callable_and_pool_ack(self) -> None:
-        layout = CacheLayout(2, [CacheGroupLayout(2)])
+        layout = CacheLayout(parent_capacity=2, groups=[CacheGroupLayout(2)])
 
         class MissingBinder:
             runner_config = RunnerConfig(cache_layout=layout)
@@ -279,7 +279,7 @@ class TestFlatCacheApi:
 
 class TestFlatCacheEngine:
     def test_opt_in_lru_prefix_cache_skips_the_shared_prefill(self) -> None:
-        layout = CacheLayout(4, [CacheGroupLayout(2)])
+        layout = CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(2)])
         runner = RecordingCachedRunner(layout)
         engine = Engine(runner, prefix_cache=True)
 
@@ -316,7 +316,7 @@ class TestFlatCacheEngine:
             def __init__(self, identity: list[int]) -> None:
                 self.cache_key = tuple(identity)
 
-        layout = CacheLayout(4, [CacheGroupLayout(2)])
+        layout = CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(2)])
         runner = RecordingCachedRunner(layout)
         engine = Engine(runner, prefix_cache=True)
 
@@ -347,7 +347,9 @@ class TestFlatCacheEngine:
             cache_key = (1, 20, 30, 40, 50, 6)
             token_spans = (MediaTokenSpan(1, 4),)
 
-        runner = RecordingCachedRunner(CacheLayout(4, [CacheGroupLayout(4)]))
+        runner = RecordingCachedRunner(
+            CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(4)])
+        )
         engine = Engine(runner, prefix_cache=True)
 
         engine.submit(
@@ -359,7 +361,9 @@ class TestFlatCacheEngine:
         assert runner.plans[0].context_lengths.tolist() == [0]
 
     def test_prefix_cache_is_disabled_by_default(self) -> None:
-        runner = RecordingCachedRunner(CacheLayout(2, [CacheGroupLayout(2)]))
+        runner = RecordingCachedRunner(
+            CacheLayout(parent_capacity=2, groups=[CacheGroupLayout(2)])
+        )
         engine = Engine(runner)
         engine.submit([1, 2], sampling_params=SamplingParams(max_output_tokens=1))
         engine.step()
@@ -367,7 +371,7 @@ class TestFlatCacheEngine:
         assert engine.cache_occupied_block_count == 0
 
     def test_one_history_group_uses_positive_sparse_physical_addresses(self) -> None:
-        layout = CacheLayout(3, [CacheGroupLayout(2)])
+        layout = CacheLayout(parent_capacity=3, groups=[CacheGroupLayout(2)])
         runner = RecordingCachedRunner(layout)
         engine = Engine(runner)
         request = engine.submit(
@@ -408,8 +412,8 @@ class TestFlatCacheEngine:
 
     def test_ordered_groups_share_one_parent_pool_with_group_specific_ids(self) -> None:
         layout = CacheLayout(
-            3,
-            [
+            parent_capacity=3,
+            groups=[
                 CacheGroupLayout(4),
                 CacheGroupLayout(2, blocks_per_slab=2),
             ],
@@ -446,7 +450,7 @@ class TestFlatCacheEngine:
     def test_preaccept_rejection_keeps_pages_owned_and_retry_uses_same_ids(
         self,
     ) -> None:
-        layout = CacheLayout(1, [CacheGroupLayout(2)])
+        layout = CacheLayout(parent_capacity=1, groups=[CacheGroupLayout(2)])
         runner = RecordingCachedRunner(layout, forward_failures=1)
         engine = Engine(runner)
         request = engine.submit(
@@ -472,8 +476,8 @@ class TestFlatCacheEngine:
         self,
     ) -> None:
         layout = CacheLayout(
-            4,
-            [
+            parent_capacity=4,
+            groups=[
                 CacheGroupLayout(
                     4,
                     retention=CacheRetention.WINDOW,
@@ -508,8 +512,8 @@ def test_window_attention_reads_survive_prefill_writes_and_prefix_reuse(
     window = 4
     block_tokens = 2
     layout = CacheLayout(
-        40,
-        [
+        parent_capacity=40,
+        groups=[
             CacheGroupLayout(
                 block_tokens,
                 retention=CacheRetention.WINDOW,

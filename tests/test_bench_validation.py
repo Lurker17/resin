@@ -196,7 +196,7 @@ def test_cache_preflight_rejects_decode_growth_before_prefill_or_capture(capsys)
     from resin.backend.capacity import plan_cache_capacity
     from resin.bench import BenchCase
 
-    layout = CacheLayout(4, [CacheGroupLayout(4)])
+    layout = CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(4)])
     raw = SimpleNamespace(
         cache_layout=layout,
         cache_capacity_plan=plan_cache_capacity(100, 100, 0.5, 10),
@@ -238,7 +238,7 @@ def test_cache_preflight_propagates_a_peers_capacity_failure():
         distributed=Distributed(),
     )
     raw = SimpleNamespace(
-        cache_layout=CacheLayout(4, [CacheGroupLayout(4)]),
+        cache_layout=CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(4)]),
         cache_capacity_plan=plan_cache_capacity(100, 100, 0.5, 10),
     )
     with pytest.raises(ValueError, match="rank 1 requires more cache parents"):
@@ -256,7 +256,7 @@ def test_cache_preflight_credits_only_the_configured_shared_history():
     from resin.bench import BenchCase
 
     raw = SimpleNamespace(
-        cache_layout=CacheLayout(4, [CacheGroupLayout(4)]),
+        cache_layout=CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(4)]),
         cache_capacity_plan=plan_cache_capacity(100, 100, 0.5, 10),
     )
     options = dict(warmup_steps=0, measure_steps=1, draft_tokens=0)

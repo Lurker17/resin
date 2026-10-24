@@ -226,7 +226,7 @@ def test_mixed_top_k_requests_use_packed_columns():
 class ScoredRunner:
     def __init__(self):
         self.runner_config = RunnerConfig(
-            cache_layout=CacheLayout(4, [CacheGroupLayout(2)]),
+            cache_layout=CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(2)]),
             cache_write_lookahead_tokens=2,
         )
         self.calls = 0

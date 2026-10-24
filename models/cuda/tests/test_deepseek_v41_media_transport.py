@@ -75,19 +75,21 @@ def test_registered_plans_reject_changed_media_or_prompt(change, phase):
     if change == "pixels":
         original = media.images[0]
         image = DeepSeekV41Image(
-            original.start,
-            original.patches + 1,
-            original.n_vit_h,
-            original.n_vit_w,
-            original.types,
+            start=original.start,
+            patches=original.patches + 1,
+            n_vit_h=original.n_vit_h,
+            n_vit_w=original.n_vit_w,
+            types=original.types,
         )
-        changed = DeepSeekV41Media(media.token_ids, (image,))
+        changed = DeepSeekV41Media(token_ids=media.token_ids, images=(image,))
         assert changed.token_ids == media.token_ids
         assert changed.digest != media.digest
     else:
         # The digest covers image inputs. Changing text outside the next chunk
         # must still invalidate the live sequence, even with identical images.
-        changed = DeepSeekV41Media(media.token_ids[:-1] + (11,), media.images)
+        changed = DeepSeekV41Media(
+            token_ids=media.token_ids[:-1] + (11,), images=media.images
+        )
         assert changed.digest == media.digest
     plan = (
         plan_for(changed, 5, 7)

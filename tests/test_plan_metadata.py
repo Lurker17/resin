@@ -123,7 +123,9 @@ def test_native_plans_keep_full_prefill_lengths_through_chunks():
 def test_prefix_replay_policy_caps_hits_and_preserves_shared_producer_pages(
     replay, expected_hit
 ):
-    layout = CacheLayout(20, [CacheGroupLayout(128)], replay_suffix_tokens=replay)
+    layout = CacheLayout(
+        parent_capacity=20, groups=[CacheGroupLayout(128)], replay_suffix_tokens=replay
+    )
 
     class Runner:
         runner_config = RunnerConfig(cache_layout=layout, continuation_prefill=True)
@@ -181,8 +183,8 @@ def test_prefix_replay_policy_caps_hits_and_preserves_shared_producer_pages(
 
 def test_prefix_replay_policy_is_frozen_and_part_of_replica_configuration():
     groups = [CacheGroupLayout(128)]
-    plain = CacheLayout(20, groups)
-    replay = CacheLayout(20, groups, replay_suffix_tokens=140)
+    plain = CacheLayout(parent_capacity=20, groups=groups)
+    replay = CacheLayout(parent_capacity=20, groups=groups, replay_suffix_tokens=140)
     assert plain.replay_suffix_tokens == 0
     assert replay.replay_suffix_tokens == 140
     assert "replay_suffix_tokens=140" in repr(replay)

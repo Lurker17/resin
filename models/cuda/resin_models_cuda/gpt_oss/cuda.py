@@ -387,8 +387,8 @@ class GptOssCudaRunner(CudaRunner):
             allocation_bytes=(local_capacity + 1) * capacity_plan.bytes_per_parent,
         )
         self.cache_layout = CacheLayout(
-            self.cache_parent_capacity,
-            [
+            parent_capacity=self.cache_parent_capacity,
+            groups=[
                 CacheGroupLayout(self.page_size),
                 CacheGroupLayout(
                     self.page_size,

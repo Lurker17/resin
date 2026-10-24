@@ -157,7 +157,7 @@ class CacheGeometry:
             groups.append(
                 CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.mtp_blocks_per_slab)
             )
-        return CacheLayout(slab_capacity, groups)
+        return CacheLayout(parent_capacity=slab_capacity, groups=groups)
 
 
 @dataclass(frozen=True, slots=True)

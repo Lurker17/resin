@@ -123,14 +123,14 @@ def test_plan_metadata_tracks_physical_parent_and_slot_without_dumping_page_tabl
             token_indptr=[0, 2],
             cache_groups=[
                 CacheGroupPlan(
-                    0,
-                    [0, 1],
-                    [parent],
-                    [slot],
-                    [0],
-                    [parent, parent],
-                    [slot, slot],
-                    [4, 5],
+                    group_index=0,
+                    block_indptr=[0, 1],
+                    block_slab_ids=[parent],
+                    block_slotnums=[slot],
+                    block_table_start_indices=[0],
+                    append_slab_ids=[parent, parent],
+                    append_slotnums=[slot, slot],
+                    append_block_offsets=[4, 5],
                     blocks_per_slab=2,
                 )
             ],

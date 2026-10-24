@@ -47,8 +47,8 @@ from resin_models_cuda.gpt_oss.model import SinkAttention, TopKRouter
 
 def build_attention_batches(plan, *, parent_capacity: int = 2048):
     layout = CacheLayout(
-        parent_capacity,
-        [
+        parent_capacity=parent_capacity,
+        groups=[
             CacheGroupLayout(PAGE_SIZE),
             CacheGroupLayout(
                 PAGE_SIZE,

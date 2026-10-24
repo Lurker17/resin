@@ -214,7 +214,10 @@ def _generate(engine, processor, prompt: str, max_output_tokens: int):
         [
             resin.recipe.Message(
                 resin.recipe.Role.USER,
-                [resin.recipe.Image(_synthetic_image()), resin.recipe.Text(prompt)],
+                [
+                    resin.recipe.Image(source=_synthetic_image()),
+                    resin.recipe.Text(prompt),
+                ],
             ),
         ]
     )

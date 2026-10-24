@@ -23,4 +23,4 @@ def test_image_preparation_rejects_implicit_dtype_conversion() -> None:
     image = np.zeros((2, 3, 3), dtype=np.uint8)
     recipe = InklingRecipe(Tokenizer())
     with pytest.raises((TypeError, ValueError), match="float32|dtype"):
-        render_media(recipe, [resin.recipe.Image(image)])
+        render_media(recipe, [resin.recipe.Image(source=image)])

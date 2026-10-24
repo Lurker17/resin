@@ -78,6 +78,7 @@ macro_rules! media_block {
         #[pymethods]
         impl $name {
             #[new]
+            #[pyo3(signature=(*, source))]
             fn new(source: Py<PyAny>) -> Self {
                 Self {
                     source: Arc::new(source),
@@ -100,6 +101,7 @@ pub(crate) struct Image {
 #[pymethods]
 impl Image {
     #[new]
+    #[pyo3(signature=(*, source))]
     fn new(source: Py<PyAny>) -> Self {
         Self {
             source: Arc::new(source),

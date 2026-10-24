@@ -30,8 +30,8 @@ def build_gemma4_batch_plan(
     decode_lookahead: int = 0,
 ):
     layout = CacheLayout(
-        parent_capacity,
-        [
+        parent_capacity=parent_capacity,
+        groups=[
             CacheGroupLayout(PAGE_SIZE, blocks_per_slab=history_blocks_per_parent),
             CacheGroupLayout(
                 PAGE_SIZE,
@@ -70,14 +70,14 @@ def _cache_group(
     parents, child_slots = addresses(compact_pages)
     append_parents, append_slotnums = addresses(compact_append_pages)
     return CacheGroupPlan(
-        index,
-        indptr,
-        parents,
-        child_slots,
-        first_blocks,
-        append_parents,
-        append_slotnums,
-        append_offsets,
+        group_index=index,
+        block_indptr=indptr,
+        block_slab_ids=parents,
+        block_slotnums=child_slots,
+        block_table_start_indices=first_blocks,
+        append_slab_ids=append_parents,
+        append_slotnums=append_slotnums,
+        append_block_offsets=append_offsets,
         blocks_per_slab=packing,
     )
 

@@ -345,8 +345,8 @@ class Gemma4CudaRunner(CudaRunner):
         )
 
         self.cache_layout = CacheLayout(
-            self.cache_parent_capacity,
-            [
+            parent_capacity=self.cache_parent_capacity,
+            groups=[
                 CacheGroupLayout(
                     PAGE_SIZE,
                     blocks_per_slab=self.config.history_blocks_per_parent,

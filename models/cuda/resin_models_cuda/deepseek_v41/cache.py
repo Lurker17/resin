@@ -129,8 +129,8 @@ class CacheGeometry:
             )
 
         return CacheLayout(
-            parent_capacity,
-            (
+            parent_capacity=parent_capacity,
+            groups=(
                 CacheGroupLayout(
                     PAGE_TOKENS,
                     blocks_per_slab=self.packings[WINDOW],

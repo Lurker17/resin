@@ -13,9 +13,9 @@ from resin.recipe import InklingMedia
 
 def media(value=0.5):
     return InklingMedia(
-        [7, 200054, 9],
-        200054,
-        np.full((1, 2, 2, 2, 3), value, dtype=np.float32),
+        token_ids=[7, 200054, 9],
+        image_token_id=200054,
+        pixel_values=np.full((1, 2, 2, 2, 3), value, dtype=np.float32),
     )
 
 
@@ -43,14 +43,14 @@ def rich_plan(batch_key):
         batch_key=batch_key,
         cache_groups=[
             CacheGroupPlan(
-                index,
-                [0, 2, 3],
-                [1 + index * 10, 2 + index * 10, 3 + index * 10],
-                [0, 1, 0],
-                [4, 7],
-                [2 + index * 10, 2 + index * 10, 3 + index * 10],
-                [1, 1, 0],
-                [2, 3, 1],
+                group_index=index,
+                block_indptr=[0, 2, 3],
+                block_slab_ids=[1 + index * 10, 2 + index * 10, 3 + index * 10],
+                block_slotnums=[0, 1, 0],
+                block_table_start_indices=[4, 7],
+                append_slab_ids=[2 + index * 10, 2 + index * 10, 3 + index * 10],
+                append_slotnums=[1, 1, 0],
+                append_block_offsets=[2, 3, 1],
                 blocks_per_slab=2,
             )
             for index in range(2)

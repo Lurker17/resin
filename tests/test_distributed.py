@@ -49,7 +49,7 @@ class CollectiveRunner:
         self.groups, self.case = groups, case
         self.calls, self.released, self.bindings = [], [], []
         self.runner_config = RunnerConfig(
-            cache_layout=CacheLayout(64, [CacheGroupLayout(2)]),
+            cache_layout=CacheLayout(parent_capacity=64, groups=[CacheGroupLayout(2)]),
             max_batch_tokens=4,
             prefill_chunk_size=2,
             continuation_prefill=case != "prepare_failure",
@@ -376,7 +376,7 @@ def _distributed_process(rank, world_size, rendezvous, directory):
     divergent = CollectiveRunner(groups, "normal")
     if rank == 1:
         divergent.runner_config = RunnerConfig(
-            cache_layout=CacheLayout(63, [CacheGroupLayout(2)]),
+            cache_layout=CacheLayout(parent_capacity=63, groups=[CacheGroupLayout(2)]),
             max_batch_tokens=4,
             prefill_chunk_size=2,
             continuation_prefill=True,
@@ -386,7 +386,7 @@ def _distributed_process(rank, world_size, rendezvous, directory):
     for lookaheads in ((0, 2), (2, 5)):
         divergent = CollectiveRunner(groups, "normal")
         divergent.runner_config = RunnerConfig(
-            cache_layout=CacheLayout(64, [CacheGroupLayout(2)]),
+            cache_layout=CacheLayout(parent_capacity=64, groups=[CacheGroupLayout(2)]),
             cache_write_lookahead_tokens=lookaheads[
                 groups.topology.coordinates(rank)[0]
             ],
@@ -400,7 +400,9 @@ def _distributed_process(rank, world_size, rendezvous, directory):
     independent = CollectiveRunner(groups, "normal")
     replica = groups.topology.coordinates(rank)[0]
     independent.runner_config = RunnerConfig(
-        cache_layout=CacheLayout(64 + replica, [CacheGroupLayout(2)]),
+        cache_layout=CacheLayout(
+            parent_capacity=64 + replica, groups=[CacheGroupLayout(2)]
+        ),
         max_batch_tokens=4 + replica,
         prefill_chunk_size=2 + replica,
         continuation_prefill=bool(replica),
@@ -552,7 +554,9 @@ def test_real_tp_cp_ep_and_attn_dp_processes(tmp_path):
 def test_external_failure_preserves_native_resources_and_disables_cleanup():
     releases = []
     runner = LocalRunner(
-        runner_config=RunnerConfig(cache_layout=CacheLayout(4, [CacheGroupLayout(2)])),
+        runner_config=RunnerConfig(
+            cache_layout=CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(2)])
+        ),
         bind_resources=lambda binding: None,
         forward=lambda plan: forward_output([3]),
         release=lambda ids: releases.extend(ids),
@@ -642,7 +646,9 @@ def test_control_failure_after_model_work_keeps_the_accepted_batch(monkeypatch):
     releases = []
     calls = []
     runner = LocalRunner(
-        runner_config=RunnerConfig(cache_layout=CacheLayout(4, [CacheGroupLayout(2)])),
+        runner_config=RunnerConfig(
+            cache_layout=CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(2)])
+        ),
         bind_resources=lambda binding: None,
         forward=lambda plan: calls.append(plan) or forward_output([3]),
         release=lambda ids: releases.extend(ids),

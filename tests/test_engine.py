@@ -206,7 +206,9 @@ class TestEngine:
     def test_sequence_results_quarantine_after_a_committed_step(self, invalid):
         class InvalidRunner(RecordingRunner):
             runner_config = RunnerConfig(
-                cache_layout=CacheLayout(4, [CacheGroupLayout(2)])
+                cache_layout=CacheLayout(
+                    parent_capacity=4, groups=[CacheGroupLayout(2)]
+                )
             )
 
             def bind_resources(self, binding):
@@ -289,7 +291,7 @@ class TestEngine:
         assert request.take_result() == [2, 3, 4, 5, 6, 7]
 
     def test_managed_cache_leases_declared_speculative_write_lookahead(self) -> None:
-        layout = CacheLayout(2, [CacheGroupLayout(2)])
+        layout = CacheLayout(parent_capacity=2, groups=[CacheGroupLayout(2)])
 
         class BlockRunner:
             runner_config = RunnerConfig(
@@ -400,7 +402,9 @@ class TestEngine:
     ):
         class BadRunner:
             runner_config = RunnerConfig(
-                cache_layout=CacheLayout(4, [CacheGroupLayout(2)])
+                cache_layout=CacheLayout(
+                    parent_capacity=4, groups=[CacheGroupLayout(2)]
+                )
             )
 
             def bind_resources(self, binding):
@@ -484,7 +488,7 @@ class TestEngine:
             )
 
     def test_rust_owns_flat_cache_allocation_and_sparse_group_metadata(self) -> None:
-        layout = CacheLayout(3, [CacheGroupLayout(2)])
+        layout = CacheLayout(parent_capacity=3, groups=[CacheGroupLayout(2)])
 
         class CachedRunner(RecordingRunner):
             runner_config = RunnerConfig(cache_layout=layout)
@@ -552,7 +556,7 @@ class TestEngine:
         assert engine.cache_free_parent_count == 3
 
     def test_kv_grows_on_demand_and_retracts_for_replay(self) -> None:
-        layout = CacheLayout(3, [CacheGroupLayout(1)])
+        layout = CacheLayout(parent_capacity=3, groups=[CacheGroupLayout(1)])
 
         class TinyCachedRunner(RecordingRunner):
             runner_config = RunnerConfig(
@@ -595,7 +599,7 @@ class TestEngine:
         assert engine.cache_occupied_block_count == 0
 
     def test_conservativeness_limits_initial_kv_admission(self) -> None:
-        layout = CacheLayout(3, [CacheGroupLayout(1)])
+        layout = CacheLayout(parent_capacity=3, groups=[CacheGroupLayout(1)])
 
         class TinyCachedRunner(RecordingRunner):
             runner_config = RunnerConfig(cache_layout=layout)

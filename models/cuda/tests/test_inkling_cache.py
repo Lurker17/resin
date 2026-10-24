@@ -29,14 +29,14 @@ def _group(
     packing: int,
 ) -> CacheGroupPlan:
     return CacheGroupPlan(
-        index,
-        [0, len(pages)],
-        [parent for parent, _ in pages],
-        [slot for _, slot in pages],
-        [0],
-        [parent for parent, _ in append],
-        [slot for _, slot in append],
-        offsets,
+        group_index=index,
+        block_indptr=[0, len(pages)],
+        block_slab_ids=[parent for parent, _ in pages],
+        block_slotnums=[slot for _, slot in pages],
+        block_table_start_indices=[0],
+        append_slab_ids=[parent for parent, _ in append],
+        append_slotnums=[slot for _, slot in append],
+        append_block_offsets=offsets,
         blocks_per_slab=packing,
     )
 
