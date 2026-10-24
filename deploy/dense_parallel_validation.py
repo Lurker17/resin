@@ -92,7 +92,7 @@ def _runner(model, model_path, assistant_path, rank, groups, spec, graphs):
             with patch.object(executor, "add_mode", bounded):
                 callbacks = super()._configure_prefill_graphs(operations, **kwargs)
             if graphs:
-                self._prefill_buckets = (32, 64)
+                self._prefill_tensor_graphs["prefill"].buckets = (32, 64)
             return callbacks
 
     return BoundedRunner(

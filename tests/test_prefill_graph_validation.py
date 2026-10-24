@@ -1,6 +1,6 @@
 """Checkpoint reports distinguish captured projections from ordinary FFN graphs."""
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -11,6 +11,7 @@ from deploy.graph_validation import (
     prefill_plan_metadata,
     validate_prefill_attention,
     validate_prefill_attention_regions,
+    validate_prefill_graphs,
 )
 from resin import BatchPlan, CacheGroupPlan
 
@@ -202,3 +203,92 @@ def test_projection_probe_replays_changed_inputs_and_isolates_mutating_reference
     assert next(record for record in result if record["tokens"] == 32)[
         "staging_included"
     ]
+
+
+@pytest.mark.parametrize("stale_replay", [False, True])
+def test_ffn_probe_uses_graph_owned_buckets_and_capture_context(
+    monkeypatch, stale_replay
+):
+    from deploy import graph_validation
+
+    active, entered, timed = [], [], []
+
+    @contextmanager
+    def capture_context():
+        active.append(True)
+        entered.append(True)
+        try:
+            yield
+        finally:
+            active.pop()
+
+    def operation(hidden, ids):
+        assert active == [True]
+        return hidden.float() * 2 + ids[:, None]
+
+    def unused(hidden, ids):
+        raise AssertionError("the bounded probe must select only first/last regions")
+
+    def timings(eager, live, replay, *, rounds, iterations):
+        assert (rounds, iterations) == (7, 20)
+        expected = eager()[:3]
+        torch.testing.assert_close(live(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(replay(), expected, rtol=0, atol=0)
+        timed.append(True)
+        return {"configured_policy_us": {"median": 1}}
+
+    monkeypatch.setattr(graph_validation, "_paired_timings", timings)
+    graphs = SimpleNamespace(buckets=(4, 32), capture_context=capture_context)
+    stats = {
+        "prefill": {
+            "captured_shapes": [
+                (size, region) for size in (4, 32) for region in (1, 3)
+            ],
+            "replay_count": 0,
+        }
+    }
+    seen, outputs = {}, {}
+
+    def replay(region, hidden, ids):
+        assert active == [True]
+        rows = len(hidden)
+        bucket = next(size for size in graphs.buckets if size >= rows)
+        key = (region, bucket)
+        seen.setdefault(key, []).append(hidden.clone())
+        stats["prefill"]["replay_count"] = sum(map(len, seen.values()))
+        if not stale_replay or key not in outputs:
+            padded = torch.zeros(bucket, 2, dtype=hidden.dtype)
+            padded[:rows].copy_(hidden)
+            padded_ids = torch.zeros(bucket, dtype=ids.dtype)
+            padded_ids[:rows].copy_(ids)
+            outputs[key] = operation(padded, padded_ids)
+        return outputs[key][:rows]
+
+    # Only current graph-owned state is present: no legacy bucket/context fields.
+    runner = SimpleNamespace(
+        device="cpu",
+        vocab_size=101,
+        cuda_graph_stats=stats,
+        _prefill_operations=(operation, unused, operation),
+        _prefill_hidden_size=2,
+        _prefill_token_ids=True,
+        _prefill_tensor_graphs={"prefill": graphs},
+        _prefill_graphs=nullcontext,
+        _run_prefill_region=replay,
+    )
+    if stale_replay:
+        with pytest.raises(AssertionError, match="same bucket"):
+            validate_prefill_graphs(runner)
+    else:
+        result = validate_prefill_graphs(runner)
+        assert [(item["region"], item["rows"], item["bucket"]) for item in result] == [
+            (region, rows, bucket)
+            for region in (0, 2)
+            for rows, bucket in ((3, 4), (17, 32), (32, 32))
+        ]
+        assert all(item["uses_graph"] for item in result)
+        assert all(item["same_bucket"]["max_abs_error"] == 0 for item in result)
+        assert len(timed) == 2 and stats["prefill"]["replay_count"] == 8
+    assert entered and not active
+    first, changed = seen[(0, 32)]
+    assert not torch.equal(first, changed[:17])

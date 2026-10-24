@@ -315,7 +315,8 @@ def validate_prefill_graphs(runner):
     """
     import torch
 
-    operations, buckets = runner._prefill_operations, runner._prefill_buckets
+    graphs = runner._prefill_tensor_graphs["prefill"]
+    operations, buckets = runner._prefill_operations, graphs.buckets
     if not operations or not buckets:
         return []
     records = []
@@ -363,15 +364,15 @@ def validate_prefill_graphs(runner):
                     padded_ids[:rows].copy_(ids)
 
                 def eager():
-                    with runner._prefill_capture_context():
+                    with graphs.capture_context():
                         return operation(padded, padded_ids)
 
                 def dispatch():
-                    with runner._prefill_capture_context():
+                    with graphs.capture_context():
                         return runner._run_prefill_region(region, hidden, ids)
 
                 def eager_live():
-                    with runner._prefill_capture_context():
+                    with graphs.capture_context():
                         return operation(hidden, ids)
 
                 expected = eager().clone()[:rows]
