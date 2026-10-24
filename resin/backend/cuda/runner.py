@@ -23,13 +23,17 @@ from resin.backend.cuda.graphs import (
     CudaGraphMode,
     CudaGraphProgram,
     CudaGraphStats,
-    CudaGraphStep,
     GraphShape,
 )
 from resin.backend.cuda.sampling import (
     SAMPLING_OFFSET_STRIDE,
     FlashInferSampler,
     SamplingTensors,
+)
+from resin.backend.cuda.tensor_graphs import (
+    CudaGraphTensorRegion,
+    PrefillTensorGraphs,
+    TensorSpec,
 )
 from resin.backend.resources import CachePoolBinding
 from resin.backend.topology import ParallelismCapabilities
@@ -81,7 +85,7 @@ class CudaRunner(Runner):
         self.cuda_graph_decode = cuda_graph_decode
         self._prefill_graph_active = False
         self._prefill_operations = ()
-        self._prefill_buffers = {}
+        self._prefill_tensor_graphs = {}
         cache_dtype = resolve_kv_cache_dtype(kv_cache_dtype)
         if not torch.cuda.is_available():
             raise RuntimeError(f"{label} requires CUDA")
@@ -397,32 +401,24 @@ class CudaRunner(Runner):
         self._prefill_operations = tuple(operations)
         self._prefill_hidden_size = hidden_size
         self._prefill_token_ids = token_ids
-        self._prefill_pad_up_to = pad_up_to
-        self._prefill_capture_context = capture_context
-        self._prefill_buckets = (
-            tuple(
-                sorted(
-                    {
-                        min(2**power, max_tokens)
-                        for power in range(max_tokens.bit_length() + 1)
-                    }
-                )
+        hidden = TensorSpec((hidden_size,))
+        inputs = (hidden, TensorSpec((), torch.int64)) if token_ids else (hidden,)
+        regions = tuple(
+            CudaGraphTensorRegion(
+                str(index),
+                lambda hidden, ids=None, op=operation: op(hidden, ids),
+                inputs,
+                hidden,
             )
-            if self.cuda_graph_prefill == "breakable"
-            else ()
+            for index, operation in enumerate(operations)
         )
-        self._require_cuda_graph_executor().add_mode(
-            "prefill",
-            CudaGraphMode(
-                tuple(
-                    (tokens, region + 1)
-                    for region in range(len(operations))
-                    for tokens in self._prefill_buckets
-                ),
-                self._new_prefill_graph_step,
-                lambda shape: self._prefill_graph_buffers(shape[0])[0],
-                share_pool=True,
-            ),
+        self._configure_prefill_tensor_graphs(
+            regions,
+            max_tokens=max_tokens,
+            pad_up_to=pad_up_to,
+            capture_context=capture_context,
+            mode="prefill",
+            coordinated=True,
         )
         return tuple(
             lambda hidden, ids=None, region=region: self._run_prefill_region(
@@ -431,61 +427,14 @@ class CudaRunner(Runner):
             for region in range(len(operations))
         )
 
-    def _prefill_graph_buffers(self, tokens: int):
-        # Regions execute serially and consume each result before the next
-        # region. Share their external buffers as well as their capture pool.
-        if tokens not in self._prefill_buffers:
-            hidden = torch.zeros(
-                (tokens, self._prefill_hidden_size),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            inputs = {"hidden": hidden}
-            if (
-                getattr(self, "_parallel_graph_groups", None) is not None
-                and self._parallel_graph_model is not None
-                and any(layer_collectives(self._parallel_graph_model))
-            ):
-                inputs["ep_valid_rows"] = torch.tensor(
-                    tokens, dtype=torch.int32, device=self.device
-                )
-            if self._prefill_token_ids:
-                inputs["token_ids"] = torch.zeros(
-                    tokens, dtype=torch.int64, device=self.device
-                )
-            self._prefill_buffers[tokens] = (inputs, torch.empty_like(hidden))
-        return self._prefill_buffers[tokens]
-
     def _configure_prefill_tensor_graphs(self, regions, **options):
         """Capture pure tensor regions while keeping attention metadata eager."""
-
-        from resin.backend.cuda.tensor_graphs import PrefillTensorGraphs
 
         graphs = PrefillTensorGraphs(self, tuple(regions), **options)
         if not hasattr(self, "_prefill_tensor_graphs"):
             self._prefill_tensor_graphs = {}
         self._prefill_tensor_graphs[graphs.mode] = graphs
         return graphs.callbacks
-
-    def _new_prefill_graph_step(self, shape: GraphShape) -> CudaGraphStep:
-        tokens, region = shape
-        inputs, output = self._prefill_graph_buffers(tokens)
-        operation = self._prefill_operations[region - 1]
-
-        def launch():
-            with (
-                self._parallel_graph_capacity(
-                    tokens, valid_rows=inputs.get("ep_valid_rows")
-                ),
-                self._prefill_capture_context(),
-            ):
-                output.copy_(operation(inputs["hidden"], inputs.get("token_ids")))
-
-        return CudaGraphStep(
-            inputs=inputs,
-            output=output,
-            launch=launch,
-        )
 
     @contextmanager
     def _prefill_graphs(self):
@@ -513,48 +462,11 @@ class CudaRunner(Runner):
             if token_ids is None or token_ids.ndim == 1
             else token_ids.reshape(-1)
         )
-        operation = self._prefill_operations[region]
         if not self._prefill_graph_active:
-            output = operation(flattened, ids)
-            return output if flat_input else output.view_as(hidden)
-        tokens = flattened.shape[0]
-        common_bucket = getattr(self, "_distributed_prefill_region_buckets", {}).get(
-            region, getattr(self, "_distributed_prefill_bucket", None)
-        )
-        distributed = getattr(self, "_distributed_prefill_scope", False)
-        bucket = (
-            common_bucket
-            if distributed
-            else next((size for size in self._prefill_buckets if size >= tokens), None)
-        )
-        if distributed and bucket is not None and tokens > bucket:
-            raise ValueError("prefill region exceeds its agreed graph token capacity")
-        fallback = None
-        if bucket is None or flattened.dtype != torch.bfloat16:
-            fallback = "tokens_or_dtype"
-        elif not distributed and tokens > self._prefill_pad_up_to and tokens != bucket:
-            fallback = "padding"
-        if fallback is not None:
-            self._cuda_graph_fallback("prefill", fallback)
-            output = operation(flattened, ids)
+            output = self._prefill_operations[region](flattened, ids)
         else:
-            assert bucket is not None
-            inputs, _ = self._prefill_graph_buffers(bucket)
-            if "ep_valid_rows" in inputs:
-                inputs["ep_valid_rows"].fill_(tokens)
-            if tokens == bucket:
-                inputs["hidden"].copy_(flattened)
-                if self._prefill_token_ids:
-                    inputs["token_ids"].copy_(ids)
-            else:
-                inputs["hidden"][:tokens].copy_(flattened)
-                inputs["hidden"][tokens:].zero_()
-                if self._prefill_token_ids:
-                    inputs["token_ids"][:tokens].copy_(ids)
-                    inputs["token_ids"][tokens:].zero_()
-            output = self._run_cuda_graph("prefill", (bucket, region + 1), inputs)
-            if tokens != bucket:
-                output = output[:tokens]
+            values = (flattened, ids) if self._prefill_token_ids else (flattened,)
+            output = self._prefill_tensor_graphs["prefill"].invoke(region, *values)
         return output if flat_input else output.view_as(hidden)
 
     @property
@@ -567,11 +479,16 @@ class CudaRunner(Runner):
         """Return statistics keyed by semantic graph mode."""
 
         stats = self._require_cuda_graph_executor().stats
-        if self._prefill_operations:
-            stats["prefill"]["capture_scope"] = "feed_forward_regions"
         for mode, graphs in getattr(self, "_prefill_tensor_graphs", {}).items():
-            stats[mode]["capture_scope"] = "attention_projections"
-            stats[mode]["captured_operations"] = tuple(r.name for r in graphs.regions)
+            stats[mode]["capture_scope"] = (
+                "feed_forward_regions"
+                if graphs.coordinated
+                else "attention_projections"
+            )
+            if not graphs.coordinated:
+                stats[mode]["captured_operations"] = tuple(
+                    r.name for r in graphs.regions
+                )
         return stats
 
     def _before_cuda_graph_capture(self) -> None:
@@ -595,7 +512,6 @@ class CudaRunner(Runner):
 
         if self._cuda_graph_executor is not None:
             self._cuda_graph_executor.close()
-        self._prefill_buffers.clear()
         for graphs in getattr(self, "_prefill_tensor_graphs", {}).values():
             graphs.buffers.clear()
         if (
@@ -634,7 +550,8 @@ class CudaRunner(Runner):
         if phase == BatchPhase.PREFILL:
             executor.mode("prefill").check_ready()
             for mode in getattr(self, "_prefill_tensor_graphs", {}):
-                executor.mode(mode).check_ready()
+                if mode != "prefill":
+                    executor.mode(mode).check_ready()
 
     def _select_cuda_graph(
         self,

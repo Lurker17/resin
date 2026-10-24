@@ -72,6 +72,7 @@ def test_projection_local_buckets_do_not_inherit_expert_padding(monkeypatch):
     # Expert replicas agree on their exchange shape; pure projections need
     # only agree within their own TP group and can preserve exact row counts.
     runner._distributed_prefill_bucket = 8
+    runner._distributed_prefill_scope = True
     # ty misbinds pytest's decorated helper and drops its reason parameter.
     monkeypatch.setattr(runner, "_run_cuda_graph", lambda *args: pytest.fail("replay"))  # ty: ignore[invalid-argument-type]
     hidden = torch.ones((3, 4), dtype=torch.bfloat16)
@@ -81,6 +82,52 @@ def test_projection_local_buckets_do_not_inherit_expert_padding(monkeypatch):
     assert runner.cuda_graph_stats["prefill_attention"]["fallback_counts"] == {
         "padding": 1
     }
+
+
+def test_coordinated_ffns_and_local_projections_keep_distinct_row_policies(monkeypatch):
+    runner = _runner()
+    (feed_forward,) = runner._configure_prefill_graphs(
+        (lambda hidden, ids: hidden + ids[:, None] + 5,),
+        hidden_size=4,
+        max_tokens=8,
+        token_ids=True,
+        pad_up_to=0,
+    )
+    project, _ = _regions(runner, pad_up_to=0)
+    runner._distributed_prefill_scope = True
+    runner._distributed_prefill_bucket = 8
+    runner._distributed_prefill_region_buckets = {}
+    calls = []
+
+    def replay(mode, shape, inputs):
+        step = runner._prefill_tensor_graphs[mode].build(shape)
+        assert step.inputs is inputs
+        calls.append((mode, shape))
+        step.launch()
+        return step.output
+
+    monkeypatch.setattr(runner, "_run_cuda_graph", replay)
+    with runner._prefill_graphs():
+        # An idle replica still joins all FFN work. Local projections stay eager
+        # for empty rows, and large peer buckets never affect their own rows.
+        for count in (3, 4, 0):
+            hidden = torch.arange(count * 4, dtype=torch.bfloat16).reshape(count, 4)
+            ids = torch.arange(count)
+            output = feed_forward(hidden, ids)
+            expected = hidden + ids[:, None] + 5
+            torch.testing.assert_close(output, expected)
+            qr, kv = project(output)
+            torch.testing.assert_close(qr, expected * 2)
+            torch.testing.assert_close(kv, expected[:, :2] + 1)
+
+    assert calls == [
+        ("prefill", (8, 1)),
+        ("prefill", (8, 1)),
+        ("prefill_attention", (4, 1)),
+        ("prefill", (8, 1)),
+    ]
+    inputs, _ = runner._prefill_tensor_graphs["prefill"]._buffers(8, 1)
+    assert all(torch.count_nonzero(value) == 0 for value in inputs.values())
 
 
 def test_all_projection_modes_must_be_captured_before_prefill():

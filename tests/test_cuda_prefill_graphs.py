@@ -25,7 +25,7 @@ def _runner(device="cpu", *, prefill="breakable", decode="full", decode_builder=
     runner.cuda_graph_prefill, runner.cuda_graph_decode = prefill, decode
     runner._prefill_graph_active = False
     runner._prefill_operations = ()
-    runner._prefill_buffers = {}
+    runner._prefill_tensor_graphs = {}
     runner._cuda_graph_executor = None
     setattr(runner, "_cuda_failure", lambda: torch.cuda.synchronize(runner.device))
     runner._configure_cuda_graphs(
@@ -37,7 +37,7 @@ def _runner(device="cpu", *, prefill="breakable", decode="full", decode_builder=
 def _launch_instead_of_replay(monkeypatch, runner, calls):
     def run(mode, shape, inputs):
         assert mode == "prefill"
-        step = runner._new_prefill_graph_step(shape)
+        step = runner._prefill_tensor_graphs["prefill"].build(shape)
         assert step.inputs is inputs
         calls.append((shape, {key: value.clone() for key, value in inputs.items()}))
         step.launch()
@@ -69,23 +69,29 @@ def test_prefill_pads_stateless_regions_and_restores_output_shape(
     with runner._prefill_graphs():
         output = first(hidden, ids)
         assert output.shape == hidden.shape and output.device == hidden.device
-        assert output.data_ptr() == runner._prefill_graph_buffers(4)[1].data_ptr()
+        assert (
+            output.data_ptr()
+            == runner._prefill_tensor_graphs["prefill"]._buffers(4, 1)[1].data_ptr()
+        )
         torch.testing.assert_close(output, expected.view_as(hidden))
         consumed = output.float().square()
         torch.testing.assert_close(second(output, ids), (expected + 3).view_as(hidden))
     torch.testing.assert_close(consumed, expected.view_as(hidden).float().square())
     assert [shape for shape, _ in calls] == [(4, 1), (4, 2)]
-    assert torch.count_nonzero(calls[0][1]["hidden"][3:]) == 0
+    assert torch.count_nonzero(calls[0][1]["0"][3:]) == 0
     if with_ids:
-        torch.testing.assert_close(calls[0][1]["token_ids"], torch.tensor([2, 5, 1, 0]))
-    first_step = runner._new_prefill_graph_step((4, 1))
-    second_step = runner._new_prefill_graph_step((4, 2))
-    smaller_step = runner._new_prefill_graph_step((2, 1))
+        torch.testing.assert_close(calls[0][1]["1"], torch.tensor([2, 5, 1, 0]))
+    first_step = runner._prefill_tensor_graphs["prefill"].build((4, 1))
+    second_step = runner._prefill_tensor_graphs["prefill"].build((4, 2))
+    smaller_step = runner._prefill_tensor_graphs["prefill"].build((2, 1))
     assert first_step.inputs is second_step.inputs
     assert first_step.output is second_step.output
-    assert smaller_step.inputs["hidden"].shape == (2, 4)
-    assert runner._new_prefill_graph_step((2, 2)).output is smaller_step.output
-    assert runner._prefill_buckets == (1, 2, 4, 6)
+    assert smaller_step.inputs["0"].shape == (2, 4)
+    assert (
+        runner._prefill_tensor_graphs["prefill"].build((2, 2)).output
+        is smaller_step.output
+    )
+    assert runner._prefill_tensor_graphs["prefill"].buckets == (1, 2, 4, 6)
     assert runner.cuda_graph_stats["prefill"]["capture_scope"] == "feed_forward_regions"
 
 
@@ -120,7 +126,7 @@ def test_decode_and_unsupported_prefill_inputs_keep_the_eager_operation(
         ((3, 4), torch.float32),
     ]
     assert runner.cuda_graph_stats["prefill"]["fallback_counts"] == (
-        {"tokens_or_dtype": 2} if policy == "breakable" else {}
+        {"tokens_or_layout": 2} if policy == "breakable" else {}
     )
     assert not runner._prefill_graph_active
 
@@ -206,7 +212,10 @@ def test_exact_bucket_policy_preserves_eager_tensor_identity_and_graph_buffer(
                 assert received[-1][0] is hidden and received[-1][1] is ids
                 assert output is received[-1][2]
             else:
-                assert output is runner._prefill_graph_buffers(tokens)[1]
+                assert (
+                    output
+                    is runner._prefill_tensor_graphs["prefill"]._buffers(tokens, 1)[1]
+                )
     output = invoke(hidden, ids)
     assert received[-1][0] is hidden and received[-1][1] is ids
     assert output is received[-1][2]

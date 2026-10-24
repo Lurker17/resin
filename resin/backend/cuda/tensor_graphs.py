@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import torch
 
+from resin.backend.collectives import layer_collectives
 from resin.backend.cuda.graphs import CudaGraphMode, CudaGraphStep
 
 
@@ -23,9 +24,8 @@ class TensorSpec:
 class CudaGraphTensorRegion:
     """A row-independent operation; all request metadata stays with its caller.
 
-    Regions must not exchange tokens across attention-DP replicas. Such
-    collectives use the runner's coordinated expert graph capacity instead.
-    Tensor-parallel reductions are permitted: their ranks own identical rows.
+    Regions exchanging tokens across attention-DP replicas require coordinated
+    capacities; local projections and tensor-parallel reductions use local rows.
     """
 
     name: str
@@ -40,6 +40,8 @@ class PrefillTensorGraphs:
     Matching layouts share buffers across layers. Results are views of these
     reusable buffers and must be consumed before the next matching operation.
     No page table, request count, or CP ownership is captured by this class.
+    Coordinated regions use the runner's agreed capacity and valid-row scalar;
+    local projection regions choose their own buckets and skip empty inputs.
     """
 
     def __init__(
@@ -51,9 +53,11 @@ class PrefillTensorGraphs:
         pad_up_to: int = 128,
         capture_context: Callable = nullcontext,
         mode: str = "prefill_attention",
+        coordinated: bool = False,
     ):
         self.runner, self.regions, self.mode = runner, tuple(regions), mode
         self.pad_up_to, self.capture_context = pad_up_to, capture_context
+        self.coordinated = coordinated
         self.buffers = {}
         self.buckets = (
             tuple(
@@ -87,6 +91,14 @@ class PrefillTensorGraphs:
                 )
 
             inputs = {str(i): allocate(layout) for i, layout in enumerate(spec.inputs)}
+            if (
+                self.coordinated
+                and getattr(self.runner, "_parallel_graph_groups", None) is not None
+                and any(layer_collectives(self.runner._parallel_graph_model))
+            ):
+                inputs["ep_valid_rows"] = torch.tensor(
+                    tokens, dtype=torch.int32, device=self.runner.device
+                )
             output = (
                 tuple(allocate(layout) for layout in spec.output)
                 if isinstance(spec.output, tuple)
@@ -100,8 +112,17 @@ class PrefillTensorGraphs:
         spec = self.regions[shape[1] - 1]
 
         def launch():
-            with self.capture_context():
-                result = spec.operation(*inputs.values())
+            with (
+                self.runner._parallel_graph_capacity(
+                    shape[0], valid_rows=inputs.get("ep_valid_rows")
+                )
+                if self.coordinated
+                else nullcontext(),
+                self.capture_context(),
+            ):
+                result = spec.operation(
+                    *(inputs[str(i)] for i in range(len(spec.inputs)))
+                )
                 if isinstance(spec.output, tuple):
                     for target, value in zip(output, result, strict=True):
                         target.copy_(value)
@@ -119,25 +140,44 @@ class PrefillTensorGraphs:
                 "tensor graph region input count does not match its layout"
             )
         tokens = values[0].shape[0]
-        if not tokens:
+        if not tokens and not self.coordinated:
             return spec.operation(*values)
-        bucket = next((n for n in self.buckets if n >= tokens), None)
+        distributed = self.coordinated and getattr(
+            self.runner, "_distributed_prefill_scope", False
+        )
+        bucket = (
+            self.runner._distributed_prefill_region_buckets.get(
+                region, self.runner._distributed_prefill_bucket
+            )
+            if distributed
+            else next((n for n in self.buckets if n >= tokens), None)
+        )
+        if distributed and bucket is not None and tokens > bucket:
+            raise ValueError("prefill region exceeds its agreed graph token capacity")
         reason = None
         if bucket is None or any(
             value.shape != (tokens, *layout.shape) or value.dtype != layout.dtype
             for value, layout in zip(values, spec.inputs, strict=True)
         ):
             reason = "tokens_or_layout"
-        elif tokens > self.pad_up_to and tokens != bucket:
+        elif not distributed and tokens > self.pad_up_to and tokens != bucket:
             reason = "padding"
         if reason is not None:
             self.runner._cuda_graph_fallback(self.mode, reason)
             return spec.operation(*values)
         inputs, _ = self._buffers(bucket, region + 1)
-        for target, value in zip(inputs.values(), values, strict=True):
-            target[:tokens].copy_(value)
-            target[tokens:].zero_()
+        if "ep_valid_rows" in inputs:
+            inputs["ep_valid_rows"].fill_(tokens)
+        for index, value in enumerate(values):
+            target = inputs[str(index)]
+            if tokens == bucket:
+                target.copy_(value)
+            else:
+                target[:tokens].copy_(value)
+                target[tokens:].zero_()
         output = self.runner._run_cuda_graph(self.mode, (bucket, region + 1), inputs)
+        if tokens == bucket:
+            return output
         if isinstance(spec.output, tuple):
             return tuple(value[:tokens] for value in output)
         return output[:tokens]

@@ -43,7 +43,7 @@ class _CpuRunner(CudaRunner):
         self.prefill_chunk_size = 4
         self._prefill_graph_active = False
         self._prefill_operations = ()
-        self._prefill_buffers = {}
+        self._prefill_tensor_graphs = {}
         self._cuda_failure = lambda: None
         self._cuda_graph_executor = None
         self._model = torch.nn.Module()
@@ -84,7 +84,7 @@ def _prefill_fixture(groups, *, regions=2):
         (operation,) * regions, hidden_size=2, max_tokens=4
     )
     steps = {
-        shape: runner._new_prefill_graph_step(shape)
+        shape: runner._prefill_tensor_graphs["prefill"].build(shape)
         for shape in runner._require_cuda_graph_executor().mode("prefill").shapes
     }
     replays = []
@@ -578,7 +578,7 @@ def test_prefill_region_fallback_keeps_the_other_agreed_bucket(monkeypatch):
 
     def replay(mode, shape, inputs):
         replays.append(shape)
-        step = runner._new_prefill_graph_step(shape)
+        step = runner._prefill_tensor_graphs["prefill"].build(shape)
         assert step.inputs is inputs
         step.launch()
         return step.output

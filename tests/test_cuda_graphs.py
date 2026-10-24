@@ -317,7 +317,7 @@ class TestCudaGraph:
         runner = CudaRunner.__new__(CudaRunner)
         runner.device = runner_runtime.torch.device("cuda:0")
         runner._cuda_graph_executor = None
-        runner._prefill_buffers = {}
+        runner._prefill_tensor_graphs = {}
         runner._parallel_graph_model = model
         runner._parallel_graph_groups = SimpleNamespace(
             distributed=SimpleNamespace(barrier=barrier),
@@ -837,7 +837,9 @@ class TestCudaGraph:
         )
         runner = CudaRunner.__new__(CudaRunner)
         runner._cuda_graph_executor = executor
-        runner._prefill_buffers = {"retained": object()}
+        runner._prefill_tensor_graphs = {
+            "prefill": SimpleNamespace(buffers={"retained": object()})
+        }
         runner._parallel_graph_model = None
         runner._parallel_graph_groups = None
 
@@ -846,7 +848,7 @@ class TestCudaGraph:
 
         assert synchronized == ["cuda:0"]
         assert [graph.reset_count for graph in torch.cuda.graphs] == [1, 1]
-        assert not runner._prefill_buffers
+        assert not runner._prefill_tensor_graphs["prefill"].buffers
         assert executor.stats == stats
         for operation in (
             executor.check,

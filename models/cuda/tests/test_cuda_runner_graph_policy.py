@@ -187,7 +187,7 @@ def cpu_prefill_regions(
     runner.cuda_graph_prefill = "breakable"
     runner._prefill_graph_active = False
     runner._prefill_operations = ()
-    runner._prefill_buffers = {}
+    runner._prefill_tensor_graphs = {}
     setattr(
         runner, "_cuda_graph_executor", SimpleNamespace(add_mode=lambda *_args: None)
     )
@@ -203,7 +203,7 @@ def cpu_prefill_regions(
     def replay(mode, shape, _inputs):
         assert mode == "prefill"
         if shape not in programs:
-            programs[shape] = runner._new_prefill_graph_step(shape)
+            programs[shape] = runner._prefill_tensor_graphs["prefill"].build(shape)
         program = programs[shape]
         program.launch()
         replays.append(shape)
