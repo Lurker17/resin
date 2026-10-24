@@ -94,7 +94,9 @@ class MegaMoe(nn.Module):
         collective: MegaMoeCollective,
         quantize: Callable[[Tensor], tuple[Tensor, Tensor]],
         *,
-        route: Callable[[Tensor, Tensor | None, tuple[Tensor, Tensor]], None],
+        route: Callable[
+            [Tensor, Tensor | None, Tensor | None, tuple[Tensor, Tensor]], None
+        ],
         gate_up: tuple[Tensor, Tensor],
         down: tuple[Tensor, Tensor],
         shared_gate_up: tuple[Tensor, Tensor],
@@ -166,12 +168,12 @@ class MegaMoe(nn.Module):
         with torch.cuda.device(hidden.device):
             return self._forward(hidden, input_ids, prepared=False)
 
-    def forward_prepared(self, hidden: Tensor, input_ids: Tensor):
+    def forward_prepared(self, hidden: Tensor, input_ids: Tensor | None):
         """Consume the symmetric inputs just written by fused mHC normalization."""
         with torch.cuda.device(hidden.device):
             return self._forward(hidden, input_ids, prepared=True)
 
-    def _forward(self, hidden: Tensor, input_ids: Tensor, *, prepared: bool):
+    def _forward(self, hidden: Tensor, input_ids: Tensor | None, *, prepared: bool):
         import deep_gemm
 
         shape = hidden.shape
@@ -183,7 +185,10 @@ class MegaMoe(nn.Module):
             None if valid is None else torch.arange(rows, device=hidden.device) < valid
         )
         self.route(
-            hidden, active, (workspace.topk_idx[:rows], workspace.topk_weights[:rows])
+            hidden,
+            None if input_ids is None else input_ids.reshape(-1),
+            active,
+            (workspace.topk_idx[:rows], workspace.topk_weights[:rows]),
         )
         if rows and not prepared:
             values, scales = self.quantize(hidden)

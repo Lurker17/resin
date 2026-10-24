@@ -405,7 +405,7 @@ def test_replay_keeps_full_source_and_compacts_consumer_state(
 
     model = implementation.Transformer.__new__(implementation.Transformer)
     nn.Module.__init__(model)
-    model.parallel_groups, model.engram_hash = None, None
+    model.parallel_groups, model.engram_hash, model.vision = None, None, None
     model.hc_mult, model.prefill_boundary = 1, 1
     model.target_layer_ids = {2}
     model.embed = lambda ids: ids.float()[..., None].expand(-1, -1, 2)
@@ -456,7 +456,10 @@ def test_runner_replay_policy_keeps_dspark_absolute_positions_and_full_scores(
     runner.speculative_tokens = 3
     stores = []
 
-    def forward(ids, start, *, replay_start, compact_replay, return_hidden, cache):
+    def forward(
+        ids, start, *, replay_start, compact_replay, return_hidden, cache, inputs_embeds
+    ):
+        assert inputs_embeds is None
         assert return_hidden == scored
         assert replay_start == (None if scored or mode == "off" else 130932)
         rows = retained
@@ -473,6 +476,7 @@ def test_runner_replay_policy_keeps_dspark_absolute_positions_and_full_scores(
     )
     plan = SimpleNamespace(
         needs_prompt_logprobs=scored,
+        media=[None],
         context_lengths=[context],
         prefill_lengths=[131072],
     )

@@ -71,6 +71,13 @@ class ModelArgs(V4Args):
     gate_temp: float = 1.0
     norm_topk_prob: bool = True
     image_token_id: int = 129264
+    vision_n_layers: int = 0
+    vision_dim: int = 1024
+    vision_n_heads: int = 16
+    vision_inter_dim: int = 2816
+    vision_patch_size: int = 14
+    vision_rope_theta: float = 10000.0
+    vision_downsample_ratio: int = 3
 
 
 class RoutedExperts(V4RoutedExperts):
@@ -108,13 +115,19 @@ class Gate(nn.Module):
         self.bias = nn.Parameter(
             torch.empty(args.n_routed_experts, dtype=torch.float32)
         )
+        self.bias_vl = (
+            nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
+            if args.vision_n_layers
+            else None
+        )
+        self.image_token_id = args.image_token_id
         self.temperature, self.route_scale = args.gate_temp, args.route_scale
         self.normalized, self.score_func = args.norm_topk_prob, args.score_func
         self.benchmark_balanced_experts = False
         self.benchmark_replica = 0
         self.benchmark_expert_parallel_size = 1
 
-    def forward(self, hidden, _input_ids):
+    def forward(self, hidden, input_ids):
         scores = F.linear(hidden.float(), self.weight.float()) / self.temperature
         scores = (
             scores.softmax(-1)
@@ -131,7 +144,12 @@ class Gate(nn.Module):
                 self.benchmark_expert_parallel_size,
             )
         else:
-            indices = (scores + self.bias).topk(self.topk, dim=-1).indices
+            bias = self.bias
+            if self.bias_vl is not None and input_ids is not None:
+                bias = torch.where(
+                    (input_ids == self.image_token_id)[..., None], self.bias_vl, bias
+                )
+            indices = (scores + bias).topk(self.topk, dim=-1).indices
         weights = scores.gather(-1, indices)
         if self.normalized and self.topk > 1:
             weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
@@ -559,7 +577,7 @@ class Block(nn.Module):
                 self, output, state, "ffn", prepare_ffn=prepared
             )
             output = (
-                self.ffn.forward_prepared(value, ids)
+                self.ffn.forward_prepared(value, None)
                 if prepared
                 else (self.prefill_ffn or self.ffn)(value, ids)
             )
@@ -649,6 +667,13 @@ class Transformer(nn.Module):
             ParallelHead(args.vocab_size, args.dim, tensor_parallel=tp),
         )
         self.hc_mult = args.hc_mult
+        self.vision = None
+        if args.vision_n_layers:
+            from resin_models_cuda.deepseek_v41.vision import Aligner, ViT
+
+            self.vision, self.aligner = ViT(args), Aligner(args)
+            for name in ("image_start", "image_end", "image_newline"):
+                self.register_parameter(name, nn.Parameter(torch.empty(args.dim)))
         self.dspark_block_size, self.dspark_noise_token_id = (
             args.dspark_block_size,
             args.dspark_noise_token_id,
@@ -811,16 +836,23 @@ class Transformer(nn.Module):
         prefill=False,
         replay_start=None,
         replay_indices=None,
+        inputs_embeds=None,
     ):
         metadata = cache.prepare_metadata(positions)
         positions = metadata.positions
+        text_mask = (
+            ids != self.args.image_token_id
+            if prefill and self.vision is not None
+            else None
+        )
         hashes = (
-            self.engram_hash(ids, positions, cache)
+            self.engram_hash(ids, positions, cache, text_mask)
             if self.engram_hash is not None
             else None
         )
         hooks = self.engram_runtime.fetch(hashes) if hashes is not None else {}
-        hidden = self.embed(ids).unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        hidden = self.embed(ids) if inputs_embeds is None else inputs_embeds
+        hidden = hidden.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         pre = hidden.new_zeros(*ids.shape, self.hc_mult, dtype=torch.float32)
         pre[..., 0] = 1
         runtime, collected = {"metadata": metadata}, []
@@ -854,6 +886,8 @@ class Transformer(nn.Module):
                     else pre.index_select(1, replay_indices)
                 )
                 ids = ids.index_select(1, replay_indices)
+                if text_mask is not None:
+                    text_mask = text_mask.index_select(1, replay_indices)
                 runtime = compact_runtime(
                     runtime, replay_indices, swa_start=replay_start
                 )
@@ -873,7 +907,9 @@ class Transformer(nn.Module):
                 hidden, pre = materialize(hidden, pre), pre.pre
             if layer.engram is not None:
                 assert hashes is not None
-                hidden = layer.engram(hidden, embed_hook=hooks[layer.layer_id])
+                hidden = layer.engram(
+                    hidden, token_mask=text_mask, embed_hook=hooks[layer.layer_id]
+                )
             if layer.layer_id in self.target_layer_ids:
                 collected.append(hidden.mean(-2))
             hidden, pre = layer(
@@ -901,6 +937,7 @@ class Transformer(nn.Module):
         return_hidden=False,
         replay_start=None,
         compact_replay=True,
+        inputs_embeds=None,
     ):
         positions = (
             start_position
@@ -923,6 +960,7 @@ class Transformer(nn.Module):
             cache,
             cp,
             prefill=True,
+            inputs_embeds=inputs_embeds,
             replay_start=replay_start,
             replay_indices=(
                 torch.arange(

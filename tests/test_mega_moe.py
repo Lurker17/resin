@@ -64,13 +64,18 @@ def deepgemm(monkeypatch):
     module.gates = []
 
     def route(hidden, weight, topk, shared, shared_count, scale, rank, **kwargs):
-        module.gates.append(dict(rank=rank, mask=kwargs["mask"], out=kwargs["out"]))
+        module.gates.append(dict(rank=rank, **kwargs))
         assert not shared and shared_count == 0
         scores = torch.nn.functional.softplus(hidden.float() @ weight.float().T).sqrt()
+        bias = kwargs["bias"]
+        if kwargs.get("image_token_mask") is not None:
+            bias = torch.where(
+                kwargs["image_token_mask"][:, None], kwargs["image_bias"], bias
+            )
         indices = (
             kwargs["unmapped_topk_idx"]
             if kwargs["fix_routing_mask"] is not None
-            else (scores + kwargs["bias"]).topk(topk, dim=-1).indices
+            else (scores + bias).topk(topk, dim=-1).indices
         )
         weights = scores.gather(1, indices)
         weights = weights / (weights.sum(-1, keepdim=True) + 1e-20) * scale
@@ -92,6 +97,7 @@ class Gate(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(2, 128))
         self.bias = nn.Parameter(torch.zeros(2))
+        self.bias_vl, self.image_token_id = None, 129264
         self.temperature, self.score_func, self.normalized = 1, "sqrtsoftplus", True
         self.topk, self.route_scale = 2, 1.5
         self.benchmark_balanced_experts = False
@@ -117,8 +123,8 @@ def prepared(deepgemm):
             len(hidden), 4, dtype=torch.float8_e8m0fnu
         )
 
-    def route(hidden, active, out):
-        weights, indices = Gate()(hidden, None)
+    def route(hidden, input_ids, active, out):
+        weights, indices = Gate()(hidden, input_ids)
         if active is not None:
             weights = weights.masked_fill(~active[:, None], 0)
             indices = indices.masked_fill(~active[:, None], -1)
@@ -328,7 +334,7 @@ def test_mega_gate_writes_workspace_masks_rows_and_preserves_fp32_weights(
     indices = torch.empty(4, 3, dtype=torch.long)
     weights = torch.empty(4, 3)
     active = torch.tensor([True, True, False, False])
-    mega_gate(gate, hidden, active, (indices, weights), ep_rank=1)
+    mega_gate(gate, hidden, None, active, (indices, weights), ep_rank=1)
     assert deepgemm.gates[-1]["rank"] == 1
     assert deepgemm.gates[-1]["out"][0].data_ptr() == indices.data_ptr()
     assert torch.equal(indices[:2], expected_indices[:2].long())
@@ -336,7 +342,7 @@ def test_mega_gate_writes_workspace_masks_rows_and_preserves_fp32_weights(
     assert not torch.equal(weights[:2], weights[:2].bfloat16().float())
     assert indices[2:].eq(-1).all() and weights[2:].eq(0).all()
     active[:] = torch.tensor([False, True, True, True])
-    mega_gate(gate, hidden, active, (indices, weights), ep_rank=1)
+    mega_gate(gate, hidden, None, active, (indices, weights), ep_rank=1)
     assert indices[0].eq(-1).all() and weights[0].eq(0).all()
     assert torch.equal(indices[1:], expected_indices[1:].long())
 
@@ -356,6 +362,26 @@ def test_mega_factory_rejects_unsupported_gate_before_weight_transforms(
     with pytest.raises(ValueError, match="normalized sqrtsoftplus"):
         prepare_mega_moe(SimpleNamespace(gate=gate), collective)
     assert deepgemm.transforms == []
+
+
+def test_mega_gate_uses_image_bias_only_for_image_prompt_tokens(deepgemm):
+    from resin_models_cuda.deepseek_v41.experts import mega_gate
+
+    gate = Gate()
+    gate.topk = 1
+    gate.bias = nn.Parameter(torch.tensor([2.0, 0.0]))
+    gate.bias_vl = nn.Parameter(torch.tensor([0.0, 2.0]))
+    hidden = torch.zeros(2, 128, dtype=torch.bfloat16)
+    indices, weights = torch.empty(2, 1, dtype=torch.long), torch.empty(2, 1)
+    mega_gate(
+        gate, hidden, torch.tensor([7, 129264]), None, (indices, weights), ep_rank=0
+    )
+    assert indices.tolist() == [[0], [1]]
+    assert deepgemm.gates[-1]["image_token_mask"].tolist() == [False, True]
+    mega_gate(gate, hidden, None, None, (indices, weights), ep_rank=0)
+    assert indices.tolist() == [[0], [0]]
+    assert deepgemm.gates[-1]["image_token_mask"] is None
+    assert deepgemm.gates[-1]["image_bias"] is None
 
 
 @pytest.mark.parametrize(

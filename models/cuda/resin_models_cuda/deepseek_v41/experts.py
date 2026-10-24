@@ -12,11 +12,16 @@ from resin_models_cuda.deepseek_v41.kernels import act_quant
 from resin_models_cuda.deepseek_v41.linear import weight_scale_rows
 
 
-def mega_gate(gate, hidden, active, out, *, ep_rank):
+def mega_gate(gate, hidden, input_ids, active, out, *, ep_rank):
     """Fuse the released gate into the FFN workspace, retaining BF16 weights."""
     import deep_gemm
 
     fixed = gate.benchmark_balanced_experts
+    image_mask = (
+        input_ids == gate.image_token_id
+        if input_ids is not None and gate.bias_vl is not None
+        else None
+    )
     deep_gemm.bf16_mega_gate(
         hidden,
         gate.weight,
@@ -27,6 +32,8 @@ def mega_gate(gate, hidden, active, out, *, ep_rank):
         ep_rank,
         mask=active,
         bias=gate.bias,
+        image_bias=gate.bias_vl if image_mask is not None else None,
+        image_token_mask=image_mask,
         fix_routing_mask=(
             torch.ones(len(hidden), dtype=torch.bool, device=hidden.device)
             if fixed

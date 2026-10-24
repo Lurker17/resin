@@ -7,12 +7,19 @@ from tokenizers import Tokenizer
 
 from resin.backend.topology import ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
+from resin.models.deepseek_v41.media import (
+    IMAGE,
+    IMAGE_END,
+    IMAGE_NEW_LINE,
+    IMAGE_START,
+    DeepSeekV41Media,
+)
 from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 from resin_models_cuda.deepseek_v41.checkpoint import load_config, resolve_model_path
 
 
 class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
-    """Text-only V4.1 Flash; source-owned paged KV, CED, Engram and DSpark."""
+    """V4.1 Flash with paged KV, CED, Engram, DSpark and image embeddings."""
 
     parallelism_capabilities = ParallelismCapabilities(
         attn_tp=False, attn_dp=True, cp=True, ep=True, expert_tp=True
@@ -48,7 +55,59 @@ class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
             ):
                 raise ValueError("DeepGEMM requires ADP=EP=world_size and expert_tp=1")
         self.expert_backend = expert_backend
+        self._media_features: dict[
+            int, tuple[DeepSeekV41Media, dict[int, torch.Tensor]]
+        ] = {}
         super().__init__(*args, **kwargs)
+
+    def release(self, request_ids: list[int]) -> None:
+        for request_id in request_ids:
+            self._media_features.pop(request_id, None)
+
+    def _media_embeddings(self, plan, slot, input_ids):
+        media = plan.media[slot]
+        if media is None:
+            return None
+        start = int(plan.context_lengths[slot])
+        end = start + input_ids.shape[1]
+        overlaps = [
+            (index, image)
+            for index, image in enumerate(media.images)
+            if image.start < end and start < image.start + len(image.types)
+        ]
+        if not overlaps:
+            return None
+        _, features = self._media_features.setdefault(
+            int(plan.sequence_ids[slot]), (media, {})
+        )
+        hidden = self._model.embed(input_ids)
+        for index, image in overlaps:
+            if index not in features:
+                patches = image.patches.to(self.device)
+                encoded = self._model.vision(patches, image.n_vit_h, image.n_vit_w)
+                encoded = self._model.aligner(encoded, image.n_vit_h, image.n_vit_w)
+                span = encoded.new_empty(len(image.types), encoded.shape[-1])
+                for kind, value in (
+                    (IMAGE, encoded),
+                    (IMAGE_START, self._model.image_start),
+                    (IMAGE_END, self._model.image_end),
+                    (IMAGE_NEW_LINE, self._model.image_newline),
+                ):
+                    indices = [
+                        i
+                        for i, token_type in enumerate(image.types)
+                        if token_type == kind
+                    ]
+                    span[indices] = value
+                features[index] = span
+            lower, upper = (
+                max(start, image.start),
+                min(end, image.start + len(image.types)),
+            )
+            hidden[0, lower - start : upper - start] = features[index][
+                lower - image.start : upper - image.start
+            ]
+        return hidden
 
     @staticmethod
     def _checkpoint(model):
@@ -133,6 +192,7 @@ class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
             return_hidden=plan.needs_prompt_logprobs,
             replay_start=replay_start,
             compact_replay=self._swa_replay_mode == "compact",
+            inputs_embeds=self._media_embeddings(plan, slot, input_ids),
         )
         if self.speculative_tokens:
             if main is None:
@@ -282,6 +342,33 @@ class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
         self._model.forward_experts_empty(prefill=True)
 
     def _validate_plan(self, plan):
-        if 129264 in plan.token_ids:
-            raise ValueError("DeepSeek-V4.1 image inputs require the vision runner")
-        return super()._validate_plan(plan)
+        rows = super()._validate_plan(plan)
+        image_token_id = self._model.args.image_token_id
+        for slot, (begin, end) in enumerate(rows):
+            media = plan.media[slot]
+            tokens = plan.token_ids[begin:end]
+            if media is None:
+                if image_token_id in tokens:
+                    raise ValueError("DeepSeek-V4.1 image tokens require image media")
+                continue
+            if not isinstance(media, DeepSeekV41Media):
+                raise TypeError("DeepSeekV41CudaRunner media must be DeepSeekV41Media")
+            if self._model.vision is None or media.image_token_id != image_token_id:
+                raise ValueError(
+                    "image media does not match the V4.1 vision checkpoint"
+                )
+            existing = self._media_features.get(int(plan.sequence_ids[slot]))
+            if existing is not None and existing[0] is not media:
+                raise ValueError(
+                    "a live DeepSeek V4.1 sequence changed its media object"
+                )
+            start = int(plan.context_lengths[slot])
+            prompt_tokens = min(len(tokens), max(0, len(media.token_ids) - start))
+            if (
+                tuple(tokens[:prompt_tokens])
+                != media.token_ids[start : start + prompt_tokens]
+            ):
+                raise ValueError(
+                    "scheduled token does not match DeepSeekV41Media prompt"
+                )
+        return rows
