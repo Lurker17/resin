@@ -7,6 +7,7 @@ from resin.recipe import ContentBlock
 import numpy as np
 import numpy.typing as npt
 from resin.protocols import MediaInput, MediaTokenSpan, Runner, TokenSpan
+from resin.protocols import FinalizingResponseParser
 
 __version__: Final[str]
 
@@ -1534,7 +1535,7 @@ class _NativeRecipe(Recipe):
         options: RenderOptions | None = None,
     ) -> RenderedPrompt: ...
     @property
-    def stop_token_ids(self, /) -> list[int]:
+    def stop_token_ids(self, /) -> Sequence[int]:
         """
         Static model stop tokens, returned as an owned list.
         """
@@ -1542,7 +1543,7 @@ class _NativeRecipe(Recipe):
     def tokenizer(self, /) -> RecipeTokenizer: ...
 
 @final
-class _NativeResponseParser:
+class _NativeResponseParser(FinalizingResponseParser):
     """
     Common native handle recognized directly by the HTTP actor.
     """

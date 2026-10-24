@@ -62,7 +62,7 @@ class Recipe(Protocol):
     """
 
     @property
-    def stop_token_ids(self) -> list[int]:
+    def stop_token_ids(self) -> Sequence[int]:
         """Static model stop IDs, independent of the rendered request."""
         ...
 

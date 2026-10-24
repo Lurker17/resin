@@ -7,6 +7,7 @@ import os
 import socket
 import tempfile
 import time
+from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import TypedDict, cast
@@ -847,7 +848,7 @@ def _run_prompt_rank(
     model_path: Path,
     model_cache: dict[str, object],
     prompt_ids: list[int],
-    stop_token_ids: list[int],
+    stop_token_ids: Sequence[int],
     max_output_tokens: int,
     context_length: int,
     schedule_conservativeness: float,
@@ -900,7 +901,7 @@ def _launch_tensor_parallel_prompt(
     model_path: Path,
     model_cache: dict[str, object],
     prompt_ids: list[int],
-    stop_token_ids: list[int],
+    stop_token_ids: Sequence[int],
     max_output_tokens: int,
     context_length: int,
     schedule_conservativeness: float,

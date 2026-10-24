@@ -145,6 +145,7 @@ RETURNS = {
     ("RenderOptions", "reasoning_effort"): "str | int | float | None",
     ("RenderedPrompt", "media"): "MediaInput | None",
     ("RenderedPrompt", "token_ids"): "npt.NDArray[np.uint32]",
+    ("_NativeRecipe", "stop_token_ids"): "Sequence[int]",
     ("_NativeResponseParser", "feed"): "list[ParserEvent]",
     ("_NativeResponseParser", "finish"): "list[ParserEvent]",
     ("InklingResponseParser", "feed"): "list[ParserEvent]",
@@ -197,6 +198,12 @@ RETURNS = {
 }
 
 
+BASES = {
+    "_NativeRecipe": "Recipe",
+    "_NativeResponseParser": "FinalizingResponseParser",
+}
+
+
 class Normalizer(ast.NodeVisitor):
     def __init__(self, source: bytes) -> None:
         self.source = source
@@ -209,7 +216,7 @@ class Normalizer(ast.NodeVisitor):
         self.found_parameters: set[tuple[str, str, str]] = set()
         self.found_returns: set[tuple[str, str]] = set()
         self.found_retention_default = False
-        self.found_recipe_base = False
+        self.found_bases: set[str] = set()
 
     def replace(self, node: ast.expr, replacement: str) -> None:
         if (
@@ -224,22 +231,22 @@ class Normalizer(ast.NodeVisitor):
         self.edits.append((start, end, replacement.encode()))
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        if node.name == "_NativeRecipe":
+        if base := BASES.get(node.name):
             if not node.bases and not node.keywords:
                 start = self.line_offsets[node.lineno - 1] + node.col_offset
                 header = f"class {node.name}".encode()
                 if self.source[start : start + len(header)] != header:
-                    raise ValueError("generated _NativeRecipe header changed")
+                    raise ValueError(f"generated {node.name} header changed")
                 position = start + len(header)
-                self.edits.append((position, position, b"(Recipe)"))
+                self.edits.append((position, position, f"({base})".encode()))
             elif (
                 len(node.bases) != 1
                 or not isinstance(node.bases[0], ast.Name)
-                or node.bases[0].id != "Recipe"
+                or node.bases[0].id != base
                 or node.keywords
             ):
-                raise ValueError("generated _NativeRecipe has unexpected bases")
-            self.found_recipe_base = True
+                raise ValueError(f"generated {node.name} has unexpected bases")
+            self.found_bases.add(node.name)
         previous, self.owner = self.owner, node.name
         self.generic_visit(node)
         self.owner = previous
@@ -285,17 +292,18 @@ class Normalizer(ast.NodeVisitor):
         }
         missing_parameters = expected_parameters - self.found_parameters
         missing_returns = RETURNS.keys() - self.found_returns
+        missing_bases = BASES.keys() - self.found_bases
         if (
             missing_parameters
             or missing_returns
             or not self.found_retention_default
-            or not self.found_recipe_base
+            or missing_bases
         ):
             raise ValueError(
                 "generated stub structure changed "
                 f"(parameters={sorted(missing_parameters)}, returns={sorted(missing_returns)}, "
                 f"retention_default={self.found_retention_default}, "
-                f"recipe_base={self.found_recipe_base})"
+                f"bases={sorted(missing_bases)})"
             )
 
 
@@ -358,6 +366,7 @@ def import_edits(
     if not has_numpy_typing:
         additions.append("import numpy.typing as npt")
     missing_protocols = {
+        "FinalizingResponseParser",
         "MediaInput",
         "MediaTokenSpan",
         "TokenSpan",
