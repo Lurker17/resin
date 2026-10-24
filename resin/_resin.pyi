@@ -440,22 +440,6 @@ class DeepSeekV41Image:
     def types(self, /) -> tuple[int, ...]: ...
 
 @final
-class DeepSeekV41ImageProcessor:
-    def __new__(
-        cls,
-        /,
-        *,
-        patch_size: int = 14,
-        downsample_ratio: int = 3,
-        max_image_tokens: int = 1024,
-        min_pixels: int = 295936,
-        max_wh_ratio: float | None = None,
-    ) -> DeepSeekV41ImageProcessor: ...
-    def grid(self, /, width: int, height: int) -> tuple[int, int]: ...
-    def prepare(self, /, image: Any, *, start: int = 0) -> DeepSeekV41Image: ...
-    def token_count(self, /, width: int, height: int) -> int: ...
-
-@final
 class DeepSeekV41Media:
     def __new__(
         cls,

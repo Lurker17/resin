@@ -371,59 +371,6 @@ pub(crate) fn sources(py: Python<'_>, sources: MediaSources) -> PyResult<Vec<Sou
         .collect()
 }
 
-#[pyclass(frozen, module = "resin._resin")]
-pub(crate) struct DeepSeekV41ImageProcessor {
-    config: media::deepseek::Config,
-}
-#[pymethods]
-impl DeepSeekV41ImageProcessor {
-    #[new]
-    #[pyo3(signature=(*,patch_size=14,downsample_ratio=3,max_image_tokens=1024,min_pixels=295936,max_wh_ratio=None))]
-    fn new(
-        patch_size: usize,
-        downsample_ratio: usize,
-        max_image_tokens: usize,
-        min_pixels: usize,
-        max_wh_ratio: Option<f64>,
-    ) -> PyResult<Self> {
-        let config = media::deepseek::Config {
-            patch_size,
-            downsample_ratio,
-            max_image_tokens,
-            min_pixels,
-            max_wh_ratio,
-        };
-        config.grid(1, 1).map_err(error)?;
-        Ok(Self { config })
-    }
-    fn grid(&self, width: usize, height: usize) -> PyResult<(usize, usize)> {
-        self.config.grid(width, height).map_err(error)
-    }
-    fn token_count(&self, width: usize, height: usize) -> PyResult<usize> {
-        self.config.token_count(width, height).map_err(error)
-    }
-    #[pyo3(signature=(image,*,start=0))]
-    fn prepare(
-        &self,
-        py: Python<'_>,
-        image: &Bound<'_, PyAny>,
-        start: usize,
-    ) -> PyResult<DeepSeekV41Image> {
-        let source = image_source(py, image)?;
-        let mut prepared = py
-            .detach(|| self.config.process(&[source]))
-            .map_err(error)?;
-        let image = prepared.images.remove(0);
-        DeepSeekV41Image::build(
-            py,
-            start,
-            image.patches,
-            image.n_vit_h,
-            image.n_vit_w,
-            image.types,
-        )
-    }
-}
 #[pyfunction]
 pub(crate) fn image_token_types(
     py: Python<'_>,

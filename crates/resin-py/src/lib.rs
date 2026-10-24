@@ -1991,7 +1991,7 @@ mod _resin {
     };
 
     #[pymodule_export]
-    use crate::media_preprocess::{DeepSeekV41ImageProcessor, image_token_types};
+    use crate::media_preprocess::image_token_types;
 
     #[pymodule_export]
     use crate::recipe_types::{

@@ -261,6 +261,31 @@ mod tests {
     }
 
     #[test]
+    fn geometry_matches_official_recipe_for_varied_aspect_ratios() {
+        let config = Config::default();
+        // Token counts from deepseek-recipe 0.2.0's image_token_adjustment + 1.
+        // Check large and extreme dimensions without allocating image pixels.
+        for (width, height, expected) in [
+            (1, 65536, 1024),
+            (65536, 1, 1024),
+            (65536, 65536, 994),
+            (4000, 3000, 1001),
+            (256, 4096, 786),
+            (4096, 256, 695),
+            (1920, 1080, 968),
+            (13, 43, 218),
+            (43, 13, 202),
+        ] {
+            let (h, w) = config.grid(width, height).unwrap();
+            assert_eq!(config.token_count(width, height).unwrap(), expected);
+            assert_eq!(
+                image_token_types(h.div_ceil(3), w.div_ceil(3)).len(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn patches_are_patch_major_chw_bfloat16() {
         let config = Config {
             min_pixels: 0,

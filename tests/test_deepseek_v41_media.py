@@ -3,7 +3,6 @@
 import base64
 import io
 import json
-import random
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +18,6 @@ import resin
 from resin import Engine, MediaInput, RunnerConfig, SchedulerConfig
 from resin.recipe import (
     DeepSeekV41Image,
-    DeepSeekV41ImageProcessor,
     DeepSeekV41Media,
     DeepSeekV41Recipe,
     image_token_types,
@@ -51,12 +49,31 @@ def codec():
 
 
 @pytest.mark.parametrize("case", FIXTURE["cases"])
-def test_native_pixels_preserve_published_geometry(case):
-    processor = DeepSeekV41ImageProcessor(max_wh_ratio=case["max_wh_ratio"])
+def test_native_pixels_preserve_published_geometry(case, codec):
+    recipe = DeepSeekV41Recipe(
+        codec.tokenizer, vision_config={"max_wh_ratio": case["max_wh_ratio"]}
+    )
     rgb = _pattern(case["width"], case["height"])
-    image = processor.prepare(rgb.astype(np.float32) / 255)
+    media = recipe.render(
+        [
+            resin.recipe.Message(
+                resin.recipe.Role.USER,
+                [resin.recipe.Image(rgb.astype(np.float32) / 255)],
+            )
+        ]
+    ).media
+    assert isinstance(media, DeepSeekV41Media)
+    image = media.images[0]
     assert (image.n_vit_h, image.n_vit_w) == tuple(case["grid"])
     assert image.types == image_token_types(*case["llm_grid"])
+    if case["max_wh_ratio"] is None:
+        expected_tokens = (
+            MultiModalData(
+                [ImageInfo(b"", case["width"], case["height"])]
+            ).image_token_adjustment()
+            + 1
+        )
+        assert len(image.types) == expected_tokens
     assert len(image.types) <= 1024
     assert image.patches.dtype == np.float32
     assert image.patches.flags.c_contiguous
@@ -68,10 +85,15 @@ def test_native_pixels_preserve_published_geometry(case):
     np.testing.assert_array_equal(image.patches, expected)
 
 
-def test_native_patch_order_and_normalization_are_exact_without_resizing():
+def test_native_patch_order_and_normalization_are_exact_without_resizing(codec):
     rgb = _pattern(28, 14)
     source = rgb.astype(np.float32) / 255
-    image = DeepSeekV41ImageProcessor(min_pixels=0).prepare(source)
+    recipe = DeepSeekV41Recipe(codec.tokenizer, vision_config={"min_pixels": 0})
+    media = recipe.render(
+        [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Image(source)])]
+    ).media
+    assert isinstance(media, DeepSeekV41Media)
+    image = media.images[0]
     expected = torch.from_numpy(source).permute(2, 0, 1)
     expected = ((expected - 0.5) / 0.5).to(torch.bfloat16).float()
     expected = expected.reshape(3, 1, 14, 2, 14).permute(1, 3, 0, 2, 4)
@@ -79,18 +101,6 @@ def test_native_patch_order_and_normalization_are_exact_without_resizing():
     before = image.patches.copy()
     source.fill(0)
     np.testing.assert_array_equal(image.patches, before)
-
-
-def test_geometry_matches_official_recipe_for_varied_aspect_ratios():
-    randomizer = random.Random(1729)
-    processor = DeepSeekV41ImageProcessor()
-    for _ in range(300):
-        width, height = (randomizer.randint(1, 65536) for _ in range(2))
-        h, w = processor.grid(width, height)
-        expected = (
-            MultiModalData([ImageInfo(b"", width, height)]).image_token_adjustment() + 1
-        )
-        assert len(image_token_types((h + 2) // 3, (w + 2) // 3)) == expected
 
 
 def test_media_codec_expands_only_explicit_images_and_owns_inputs(codec):
