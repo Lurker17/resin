@@ -27,6 +27,8 @@ def _runner(device="cpu", *, prefill="breakable", decode="full", decode_builder=
     runner._prefill_operations = ()
     runner._prefill_tensor_graphs = {}
     runner._cuda_graph_executor = None
+    runner._parallel_graph_model = None
+    runner._parallel_graph_groups = None
     setattr(runner, "_cuda_failure", lambda: torch.cuda.synchronize(runner.device))
     runner._configure_cuda_graphs(
         {"decode": CudaGraphMode((), decode_builder or (_unreachable), lambda _: {})}
