@@ -1,0 +1,105 @@
+{
+  "source": "deepseek-ai/DeepSeek-V4.1-Flash-1017@1bae0e1088993b9b82de08f59de5be5a34e42170/inference/image_processor.py",
+  "source_sha256": "482759e3bcc4e9bb5ee582b244cc563f5d0e163d8b48dda91ebb7106e62f9272",
+  "pattern": "uint8((17*x + 29*y + 71*channel) % 256), encoded losslessly as RGB PNG",
+  "cases": [
+    {
+      "width": 1,
+      "height": 1,
+      "max_wh_ratio": null,
+      "grid": [
+        39,
+        39
+      ],
+      "llm_grid": [
+        13,
+        13
+      ],
+      "patch_sha256": "5556c9e557afffded31c496597dfcc334bd09864fba49ab8bab15873d0b17a89"
+    },
+    {
+      "width": 17,
+      "height": 31,
+      "max_wh_ratio": null,
+      "grid": [
+        53,
+        29
+      ],
+      "llm_grid": [
+        18,
+        10
+      ],
+      "patch_sha256": "3ffa75cface265424fbacf2cc95cfd88380acb4e024dd5e76ce1d650b546186a"
+    },
+    {
+      "width": 544,
+      "height": 544,
+      "max_wh_ratio": null,
+      "grid": [
+        39,
+        39
+      ],
+      "llm_grid": [
+        13,
+        13
+      ],
+      "patch_sha256": "6fe2e391050b066f84af36f338a887319a1769d62fbe260577965093b0ebcfb8"
+    },
+    {
+      "width": 2048,
+      "height": 768,
+      "max_wh_ratio": null,
+      "grid": [
+        55,
+        147
+      ],
+      "llm_grid": [
+        19,
+        49
+      ],
+      "patch_sha256": "a818cb65073b18390481b6bad23853906d4981c8d0d5ac0c5e46766f9cea174f"
+    },
+    {
+      "width": 8,
+      "height": 4000,
+      "max_wh_ratio": null,
+      "grid": [
+        869,
+        2
+      ],
+      "llm_grid": [
+        290,
+        1
+      ],
+      "patch_sha256": "f9e939e75713c0926db89e12c442e9d91e5d3ae305b5e372b3d0ea809c50985b"
+    },
+    {
+      "width": 4000,
+      "height": 8,
+      "max_wh_ratio": null,
+      "grid": [
+        2,
+        869
+      ],
+      "llm_grid": [
+        1,
+        290
+      ],
+      "patch_sha256": "02539f4ad1723a8e84189727594ceadd8cb898cf58dfc01a6488165c29e0d0a6"
+    },
+    {
+      "width": 1000,
+      "height": 100,
+      "max_wh_ratio": 2,
+      "grid": [
+        28,
+        55
+      ],
+      "llm_grid": [
+        10,
+        19
+      ],
+      "patch_sha256": "000b195620e32af3c70a4f702502a55133002a4d1a57c41d7e90206a59cb1f1c"
+    }
+  ]
+}

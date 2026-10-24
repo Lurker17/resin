@@ -257,6 +257,39 @@ fn v41_pinned_prompt_fixtures_and_numeric_effort() {
 }
 
 #[test]
+fn v41_image_slots_keep_literal_markers_in_ordinary_text() {
+    use resin_recipe::{
+        PromptSpan,
+        deepseek::{IMAGE, Version, render_version},
+    };
+    let request = json!({"messages": [{"role": "user", "content": [
+        {"type": "text", "text": format!("literal {IMAGE}")},
+        {"type": "image"},
+        {"type": "text", "text": "then"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+    ]}]});
+    let prompt = render_version(&request, Version::V41).unwrap();
+    assert_eq!(
+        prompt.rendered_text(),
+        format!(
+            "<｜begin▁of▁sentence｜><｜User｜>literal {IMAGE}\n\n{IMAGE}\n\nthen\n\n{IMAGE}<｜Assistant｜></think>"
+        )
+    );
+    assert_eq!(
+        prompt
+            .spans
+            .iter()
+            .filter(|span| matches!(span, PromptSpan::Special(value) if value == IMAGE))
+            .count(),
+        2
+    );
+    assert!(prompt.spans.iter().any(
+        |span| matches!(span, PromptSpan::Text(value) if value.contains(&format!("literal {IMAGE}")))
+    ));
+    assert!(render_version(&request, Version::V4).is_err());
+}
+
+#[test]
 fn v41_tool_tags_share_incremental_grammar_without_accepting_old_delimiters() {
     use resin_recipe::deepseek::Version;
     let mut response = ids("reason");

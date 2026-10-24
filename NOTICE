@@ -85,6 +85,10 @@ DeepSeek-V4-Pro-0813, Copyright (c) 2023 DeepSeek, MIT License.
 The V4.1 variant also follows encoding/encoding.py in
 DeepSeek-V4.1-Flash-1017, revision 1bae0e1088993b9b82de08f59de5be5a34e42170,
 under the same copyright and MIT License.
+The image preprocessing in resin/models/deepseek_v41/media.py follows
+inference/image_processor.py from that same V4.1 checkpoint revision.
+The vision tower in models/cuda/resin_models_cuda/deepseek_v41/vision.py
+follows its inference/vision.py, under the same copyright and MIT License.
 The MIT notice is retained at crates/resin-recipe/licenses/deepseek-MIT.txt.
 
 The shared-expert scale layout in resin/backend/cuda/mega_moe.py and the

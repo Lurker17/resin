@@ -20,6 +20,7 @@ pub const EOS: &str = "<｜end▁of▁sentence｜>";
 pub const THINKING_START: &str = "<think>";
 pub const THINKING_END: &str = "</think>";
 pub const DSML: &str = "｜DSML｜";
+pub const IMAGE: &str = "<｜deepseek_image｜>";
 const USER: &str = "<｜User｜>";
 const ASSISTANT: &str = "<｜Assistant｜>";
 const SYSTEM: &str = "<｜System｜>";
@@ -84,7 +85,10 @@ impl Version {
         }
         (message["role"] == "user" || (message["role"] == "system" && index > 0))
             && message["content_blocks"].as_array().is_none_or(|blocks| {
-                blocks.is_empty() || blocks.iter().any(|b| b["type"] == "text")
+                blocks.is_empty()
+                    || blocks
+                        .iter()
+                        .any(|b| matches!(b["type"].as_str(), Some("text" | "image" | "image_url")))
             })
     }
 }
@@ -124,7 +128,7 @@ fn thinking_mode(request: &Value, configured_effort: bool) -> Result<bool, Error
     )
 }
 
-/// Render the pinned checkpoint's text format, with explicit control spans.
+/// Render the pinned checkpoint's prompt format, with explicit control spans.
 pub fn render(request: &Value) -> Result<Prompt, Error> {
     render_version(request, Version::V4)
 }
@@ -236,6 +240,9 @@ pub fn render_version(request: &Value, version: Version) -> Result<Prompt, Error
                         match block["type"].as_str() {
                             Some("text") => {
                                 prompt.text(block["text"].as_str().unwrap_or(""));
+                            }
+                            Some("image" | "image_url") if version == Version::V41 => {
+                                prompt.special(IMAGE);
                             }
                             Some("tool_result") => {
                                 prompt.text("<tool_result>");

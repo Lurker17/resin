@@ -50,7 +50,16 @@ def digest_tensors(
             digest.update(name.encode())
             digest.update(str(tensor.dtype).encode())
             digest.update(bytes(str(tuple(tensor.shape)), "ascii"))
-            digest.update(tensor.numpy().tobytes(order="C"))
+            # NumPy cannot represent BF16 (or every Torch float8 dtype). Hash
+            # storage bytes after recording dtype and shape above.
+            digest.update(
+                tensor.detach()
+                .contiguous()
+                .reshape(-1)
+                .view(torch.uint8)
+                .numpy()
+                .tobytes()
+            )
     return digest.hexdigest()
 
 
