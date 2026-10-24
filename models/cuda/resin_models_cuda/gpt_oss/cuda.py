@@ -896,7 +896,7 @@ class GptOssCudaRunner(CudaRunner):
         host: PagedAttentionBatch,
         *,
         shape: GraphShape | None = None,
-    ) -> list[int] | ForwardOutput | None:
+    ) -> ForwardOutput | None:
         if not self._cuda_graph_mode_enabled("decode"):
             return None
         rows = len(plan.sequence_ids)
@@ -957,7 +957,7 @@ class GptOssCudaRunner(CudaRunner):
         self._last_graph_logits = self._graph_logits[shape][:rows]
         return format_output(self._last_graph_logits, output, plan)
 
-    def forward(self, plan: BatchPlan) -> list[int] | ForwardOutput:
+    def forward(self, plan: BatchPlan) -> ForwardOutput:
         if getattr(self, "parallel_groups", None) is not None:
             raise RuntimeError("explicit rank groups require forward_distributed")
         return self._forward_plan(plan)
@@ -974,9 +974,7 @@ class GptOssCudaRunner(CudaRunner):
             )
         return prefill_batches, decode_batch
 
-    def _forward_plan(
-        self, plan: BatchPlan, *, use_graph=True
-    ) -> list[int] | ForwardOutput:
+    def _forward_plan(self, plan: BatchPlan, *, use_graph=True) -> ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         host_positions = plan.positions
 
@@ -1085,7 +1083,7 @@ class GptOssCudaRunner(CudaRunner):
 
     def forward_distributed(
         self, plan: BatchPlan | None, context: StepContext
-    ) -> list[int] | ForwardOutput | None:
+    ) -> ForwardOutput | None:
         """Run one packed batch, or join its expert layers without KV work."""
 
         self.validate_distributed(plan, context)

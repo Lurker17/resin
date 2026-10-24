@@ -34,7 +34,12 @@ from resin.backend.cuda.sampling import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
-from resin.backend.sampling import PromptScores, format_output, prompt_scores
+from resin.backend.sampling import (
+    PromptScores,
+    format_output,
+    prompt_scores,
+    token_output,
+)
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
@@ -613,7 +618,7 @@ class Qwen3_5CudaRunner(CudaRunner):
 
     def _graph_forward(
         self, plan: BatchPlan, cache_plan: PagedCachePlan
-    ) -> list[int] | list[list[int]] | None:
+    ) -> ForwardOutput | None:
         if plan.needs_logprobs:
             self._cuda_graph_fallback("decode", "logprobs")
             return None
@@ -646,14 +651,17 @@ class Qwen3_5CudaRunner(CudaRunner):
         )
         output = self._run_cuda_graph("decode", shape, inputs)[:batch_size]
         if not self.speculative_tokens:
-            return [int(row[0]) for row in output]
+            return token_output(output[:, 0])
+        output = output.cpu().tolist()
         drafts = [row[1 : self.speculative_tokens + 1] for row in output]
         targets = [row[self.speculative_tokens + 1 :] for row in output]
         accepted = self._speculation.accept(drafts, targets)
-        return [
-            [int(row[0]), *tokens]
-            for row, tokens in zip(output, accepted.token_rows, strict=True)
-        ]
+        return token_output(
+            [
+                [row[0], *tokens]
+                for row, tokens in zip(output, accepted.token_rows, strict=True)
+            ]
+        )
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
         return validate_hybrid_plan(
@@ -826,7 +834,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         cache: DeviceCache,
         token_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> list[int] | ForwardOutput:
+    ) -> ForwardOutput:
         final_logits = []
         prompt_rows = []
         outputs = []
@@ -915,7 +923,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         cache: DeviceCache,
         anchors: torch.Tensor,
         positions: torch.Tensor,
-    ) -> list[int] | ForwardOutput:
+    ) -> ForwardOutput:
         contexts = torch.as_tensor(
             plan.context_lengths, dtype=torch.long, device=self.device
         )
@@ -938,7 +946,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         cache: DeviceCache,
         anchors: torch.Tensor,
         positions: torch.Tensor,
-    ) -> list[list[int]] | ForwardOutput:
+    ) -> ForwardOutput:
         contexts = torch.as_tensor(
             plan.context_lengths, dtype=torch.long, device=self.device
         )
@@ -1039,9 +1047,9 @@ class Qwen3_5CudaRunner(CudaRunner):
         if plan.needs_logprobs:
             logits = torch.cat((first_logits[:, None], verify_logits), dim=1)
             return format_output(logits, rows, plan)
-        return rows
+        return token_output(rows)
 
-    def forward(self, plan: BatchPlan) -> list[int] | list[list[int]] | ForwardOutput:
+    def forward(self, plan: BatchPlan) -> ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         rows = self._validate_plan(plan)
         lookahead = (

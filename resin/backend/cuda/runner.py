@@ -485,7 +485,6 @@ class CudaRunner(Runner):
             inputs=inputs,
             output=output,
             launch=launch,
-            output_to_host=False,
         )
 
     @contextmanager

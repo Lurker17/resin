@@ -339,10 +339,13 @@ class TestGptOssCudaNativePlan:
 
         def replay(mode, shape, inputs):
             captured.append((mode, shape, inputs))
-            return list(range(1000, 1000 + shape[0]))
+            return torch.arange(1000, 1000 + shape[0])
 
         setattr(runner, "_run_cuda_graph", replay)
-        assert runner._graph_forward(plan, batch) == list(range(1000, 1000 + rows))
+        output = runner._graph_forward(plan, batch)
+        assert output is not None
+        assert output.token_ids.tolist() == list(range(1000, 1000 + rows))
+        assert output.token_indptr.tolist() == list(range(rows + 1))
         mode, shape, inputs = captured.pop()
         assert mode == "decode"
         assert shape == (expected_bucket, 4)
@@ -415,7 +418,7 @@ class TestGptOssCudaNativePlan:
                 device=lambda _name, values, dtype: torch.tensor(values, dtype=dtype)
             ),
         )
-        assert runner.forward(plan) == [1, 0]
+        assert runner.forward(plan).token_ids.tolist() == [1, 0]
         assert events == [phase == BatchPhase.PREFILL]
         assert not runner._prefill_graph_active
 

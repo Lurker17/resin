@@ -108,7 +108,7 @@ class PrefillTensorGraphs:
                 else:
                     output.copy_(result)
 
-        return CudaGraphStep(inputs, output, launch, output_to_host=False)
+        return CudaGraphStep(inputs, output, launch)
 
     def invoke(self, region, *values):
         spec = self.regions[region]

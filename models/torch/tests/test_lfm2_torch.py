@@ -220,21 +220,21 @@ class TestLfm2Torch:
             [0, 2, 3],
         )
         first = runner.forward(prefill)
-        assert isinstance(first, list)
-        assert len(first) == 2
+        assert first.token_indptr.tolist() == [0, 1, 2]
+        assert len(first.token_ids) == 2
         assert runner.live_cache_count == 2
 
         decode = BatchPlan(
             [17, 23],
             [2, 1],
-            first,
+            first.token_ids,
             [0, 1, 2],
             phase=BatchPhase.DECODE,
         )
         second = runner.forward(decode)
-        assert isinstance(second, list)
-        assert len(second) == 2
-        assert all(0 <= token < self.args.vocab_size for token in second)
+        assert second.token_indptr.tolist() == [0, 1, 2]
+        assert len(second.token_ids) == 2
+        assert all(0 <= token < self.args.vocab_size for token in second.token_ids)
         runner.release([17, 23])
         assert runner.live_cache_count == 0
 

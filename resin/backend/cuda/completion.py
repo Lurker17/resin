@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from resin.backend.cuda.staging import TensorStager
-from resin.backend.sampling import SAMPLING_OFFSET_STRIDE
+from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, token_output
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,14 +80,14 @@ class DeviceCompletion:
     def result(self):
         if self._result is None:
             self._event.synchronize()
-            counts = self._counts[: self._rows].tolist()
-            tokens = self._tokens[: self._rows].tolist()
-            self._result = [
-                row[:count] for row, count in zip(tokens, counts, strict=True)
-            ]
+            counts = self._counts[: self._rows].numpy()
+            self._result = token_output(
+                self._tokens[: self._rows].numpy(), counts=counts
+            )
             if self._stats is not None:
                 self._stats.blocks += self._rows
                 self._stats.drafts += self._rows * self._stats.draft_tokens
-                self._stats.accepted += sum(counts) - self._rows
-                self._stats.emitted += sum(counts)
+                emitted = int(counts.sum())
+                self._stats.accepted += emitted - self._rows
+                self._stats.emitted += emitted
         return self._result

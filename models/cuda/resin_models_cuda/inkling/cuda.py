@@ -30,7 +30,12 @@ from resin.backend.cuda.sampling import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
-from resin.backend.sampling import PromptScores, format_output, prompt_scores
+from resin.backend.sampling import (
+    PromptScores,
+    format_output,
+    prompt_scores,
+    token_output,
+)
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import use_default_dtype
 from resin.models.inkling.media import InklingMedia
@@ -337,12 +342,15 @@ class InklingCudaRunner(CudaRunner):
         inputs.update(
             pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding)
         )
-        output = self._run_cuda_graph("decode", shape, inputs)[:batch_size]
+        output = (
+            self._run_cuda_graph("decode", shape, inputs)[:batch_size].cpu().tolist()
+        )
         width = self.speculative_tokens
-        return self._speculation.accept(
+        accepted = self._speculation.accept(
             [row[:width] for row in output],
             [row[width:] for row in output],
         ).token_rows
+        return token_output(accepted)
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
         return validate_hybrid_plan(
@@ -384,7 +392,7 @@ class InklingCudaRunner(CudaRunner):
         cache: DeviceCache,
         token_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> list[int] | ForwardOutput:
+    ) -> ForwardOutput:
         logits = []
         prompt_rows = []
         for row, (start, end) in enumerate(rows):
@@ -488,7 +496,7 @@ class InklingCudaRunner(CudaRunner):
         cache: DeviceCache,
         anchors: torch.Tensor,
         positions: torch.Tensor,
-    ) -> list[list[int]] | ForwardOutput:
+    ) -> ForwardOutput:
         drafts, _ = self._draft.propose(
             anchors,
             positions,
@@ -547,7 +555,7 @@ class InklingCudaRunner(CudaRunner):
         self._draft.inject_target(taps, verify_positions, cache)
         return format_output(logits, acceptance.token_rows, plan)
 
-    def forward(self, plan: BatchPlan) -> list[int] | list[list[int]] | ForwardOutput:
+    def forward(self, plan: BatchPlan) -> ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         rows = self._validate_plan(plan)
         cache_plan = PagedCachePlan.from_plan(

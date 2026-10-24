@@ -159,7 +159,6 @@ class CudaGraphStep:
     launch: Callable[[], None]
     prepare: Callable[[], None] | None = None
     validate_eager_output: bool = True
-    output_to_host: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,8 +187,8 @@ class CudaGraphRegion:
 class CudaGraphProgram:
     """Fixed-address CUDA work split by zero or more explicit graph breaks.
 
-    With ``output_to_host=False``, replay returns the original device buffer.
-    Its contents remain valid until subsequent work overwrites that buffer.
+    Replay returns the original device buffers. Their contents remain valid
+    until subsequent work overwrites them; result staging belongs to the caller.
     """
 
     inputs: Mapping[str, Any]
@@ -197,7 +196,6 @@ class CudaGraphProgram:
     regions: tuple[CudaGraphRegion, ...]
     prepare: Callable[[], None] | None = None
     validate_eager_output: bool = True
-    output_to_host: bool = True
 
     def __post_init__(self) -> None:
         regions = tuple(self.regions)
@@ -223,7 +221,6 @@ def _as_program(step: CudaGraphStep | CudaGraphProgram) -> CudaGraphProgram:
             regions=(CudaGraphRegion("step", step.launch),),
             prepare=step.prepare,
             validate_eager_output=step.validate_eager_output,
-            output_to_host=step.output_to_host,
         )
     raise TypeError("CUDA graph builder must return a step or program")
 
@@ -481,18 +478,12 @@ class CudaGraphCache:
             self._pending_captures -= 1
         except BaseException as error:
             self._fail("graph capture", error)
-        return (
-            _map_output(entry.program.output, lambda tensor: tensor.tolist())
-            if entry.program.output_to_host
-            else entry.program.output
-        )
+        return entry.program.output
 
     def run(
         self,
         shape: GraphShape,
         inputs: Mapping[str, object],
-        *,
-        output_to_host: bool | None = None,
     ) -> Any:
         """Stage and replay one current batch using a pre-captured graph."""
 
@@ -516,21 +507,11 @@ class CudaGraphCache:
         try:
             with torch.cuda.device(self.device), torch.inference_mode():
                 self._replay(entry.program, entry.graphs)
-            host_output = (
-                entry.program.output_to_host
-                if output_to_host is None
-                else output_to_host
-            )
-            result = (
-                _map_output(entry.program.output, lambda tensor: tensor.tolist())
-                if host_output
-                else entry.program.output
-            )
         except BaseException as error:
             self._fail("graph replay", error)
         entry.replays += 1
         self._replay_count += 1
-        return result
+        return entry.program.output
 
     def _capture(self, entry: _GraphEntry, allocation_before: int) -> None:
         program = entry.program

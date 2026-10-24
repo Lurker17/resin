@@ -40,7 +40,12 @@ from resin.backend.cuda.sampling import (
     SamplingTensors,
 )
 from resin.backend.resources import CachePoolBinding
-from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, format_output, prompt_scores
+from resin.backend.sampling import (
+    SAMPLING_OFFSET_STRIDE,
+    format_output,
+    prompt_scores,
+    token_output,
+)
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.models.gemma4.config import SLIDING_ATTENTION
@@ -1255,7 +1260,7 @@ class Gemma4CudaRunner(CudaRunner):
 
     def _graph_forward(
         self, native: BatchPlan, batch: Gemma4BatchPlan
-    ) -> list[int] | None:
+    ) -> ForwardOutput | None:
         if native.needs_logprobs:
             self._cuda_graph_fallback("decode", "logprobs")
             return None
@@ -1304,11 +1309,11 @@ class Gemma4CudaRunner(CudaRunner):
             )
         )
         self._prepare_graph_attention(shape, inputs)
-        return self._run_cuda_graph("decode", shape, inputs)[:active_rows]
+        return token_output(self._run_cuda_graph("decode", shape, inputs)[:active_rows])
 
     def _speculative_graph_forward(
         self, native: BatchPlan, batch: Gemma4BatchPlan
-    ) -> list[list[int]] | None:
+    ) -> ForwardOutput | None:
         if native.needs_logprobs:
             self._cuda_graph_fallback("decode", "logprobs")
             return None
@@ -1389,15 +1394,18 @@ class Gemma4CudaRunner(CudaRunner):
             )
         )
         self._prepare_graph_attention(shape, inputs)
-        output = self._run_cuda_graph("decode", shape, inputs)[:active_rows]
+        output = (
+            self._run_cuda_graph("decode", shape, inputs)[:active_rows].cpu().tolist()
+        )
         drafts = [row[: self.speculative_tokens] for row in output]
         targets = [row[self.speculative_tokens :] for row in output]
-        return self._accept_speculative(
+        accepted = self._accept_speculative(
             sequence_ids,
             drafts,
             targets,
             self._graph_verify_hidden[shape][:active_rows],
         )
+        return token_output(accepted)
 
     def _eager_transformer(self, native: BatchPlan, batch: Gemma4BatchPlan) -> Tensor:
         token_ids = torch.as_tensor(
@@ -1445,7 +1453,7 @@ class Gemma4CudaRunner(CudaRunner):
 
     def _single_target_decode(
         self, native: BatchPlan, batch: Gemma4BatchPlan
-    ) -> list[int] | ForwardOutput:
+    ) -> ForwardOutput:
         rows = native.num_sequences
         target = expand_gemma4_decode_batch(batch, np.empty((rows, 0), dtype=np.int64))
         hidden = self._eager_transformer(native, target)
@@ -1471,7 +1479,7 @@ class Gemma4CudaRunner(CudaRunner):
 
     def _speculative_decode(
         self, native: BatchPlan, batch: Gemma4BatchPlan
-    ) -> list[list[int]] | list[int] | ForwardOutput:
+    ) -> ForwardOutput:
         assistant = self._assistant
         if assistant is None:
             raise RuntimeError("speculative decode requires the Gemma 4 assistant")
@@ -1539,7 +1547,7 @@ class Gemma4CudaRunner(CudaRunner):
         return format_output(verify_logits, accepted, native)
 
     @torch.inference_mode()
-    def forward(self, plan: BatchPlan) -> list[int] | list[list[int]] | ForwardOutput:
+    def forward(self, plan: BatchPlan) -> ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         batch = build_gemma4_batch_plan(
             plan,

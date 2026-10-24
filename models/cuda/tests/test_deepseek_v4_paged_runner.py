@@ -76,7 +76,7 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
 
         def run(self, shape, inputs):
             self.calls.append((shape, inputs))
-            return [11, 12, 13, 99]
+            return torch.tensor([11, 12, 13, 99])
 
     class Sampler:
         @staticmethod
@@ -125,7 +125,10 @@ def test_decode_graph_pads_to_next_batch_shape_and_stages_cache_tables() -> None
         positions=np.array([11, 12, 13]),
     )
 
-    assert runner._graph_forward(cast(BatchPlan, plan), "cache-plan") == [11, 12, 13]
+    output = runner._graph_forward(cast(BatchPlan, plan), "cache-plan")
+    assert output is not None
+    assert output.token_ids.tolist() == [11, 12, 13]
+    assert output.token_indptr.tolist() == [0, 1, 2, 3]
     shape, inputs = graphs.calls[0]
     assert shape == (4, 128)
     assert inputs["token_ids"].tolist() == [5, 6, 7, 0]

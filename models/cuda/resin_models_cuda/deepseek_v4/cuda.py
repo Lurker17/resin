@@ -45,7 +45,12 @@ from resin.backend.cuda.sampling import (
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
 from resin.backend.plans import BatchView, PagedCachePlan
-from resin.backend.sampling import PromptScores, format_output, prompt_scores
+from resin.backend.sampling import (
+    PromptScores,
+    format_output,
+    prompt_scores,
+    token_output,
+)
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
@@ -719,7 +724,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         shape: GraphShape | None = None,
         enqueue: Literal[False] = False,
         feedback=None,
-    ) -> list[int] | list[list[int]] | ForwardOutput | None: ...
+    ) -> ForwardOutput | None: ...
 
     @overload
     def _graph_forward(
@@ -740,7 +745,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         shape: GraphShape | None = None,
         enqueue: bool = False,
         feedback=None,
-    ) -> list[int] | list[list[int]] | ForwardOutput | DeviceCompletion | None:
+    ) -> ForwardOutput | DeviceCompletion | None:
         batch_size = plan.num_sequences
         positions = plan.positions
         sequence_length = int(np.max(positions)) + 1
@@ -777,11 +782,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 device_positions = torch.as_tensor(
                     inputs["positions"], device=self.device, dtype=torch.long
                 )
-            output = (
-                self._require_cuda_graph_executor()
-                .mode("decode")
-                .run(shape, inputs, output_to_host=False)
-            )
+            output = self._run_cuda_graph("decode", shape, inputs)
             tokens, counts, next_inputs = accepted_block(
                 output,
                 device_positions,
@@ -807,6 +808,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         phase_events = self._dspark_phase_events.get(shape)
         if phase_events is not None:
             start, draft_end, verify_end, step_end = phase_events
+            step_end.synchronize()
             self._last_dspark_phase_ms = {
                 "draft": start.elapsed_time(draft_end),
                 "target_verify": draft_end.elapsed_time(verify_end),
@@ -818,7 +820,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
                 return format_output(
                     self._graph_logits[shape][:batch_size], output, plan
                 )
-            return output
+            return token_output(output)
+        output = output.cpu().tolist()
         block_size = self.speculative_tokens
         drafts = [row[:block_size] for row in output]
         targets = [row[block_size:] for row in output]
@@ -830,7 +833,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         )
         if plan.needs_logprobs:
             return format_output(self._graph_logits[shape][:batch_size], accepted, plan)
-        return accepted
+        return token_output(accepted)
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
         batch = BatchView.from_plan(plan)
@@ -959,7 +962,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
 
     def _speculative_decode(
         self, plan: BatchPlan, cache, token_ids, positions
-    ) -> list[list[int]] | ForwardOutput:
+    ) -> ForwardOutput:
         """Draft greedily and verify a fixed block against target samples."""
 
         batch_size = plan.num_sequences
@@ -1054,11 +1057,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
 
                 inputs = self._decode_graph_capture_inputs(shape)
                 inputs["ep_valid_rows"] = 0
-                output = (
-                    self._require_cuda_graph_executor()
-                    .mode("decode")
-                    .run(shape, inputs, output_to_host=False)
-                )
+                output = self._run_cuda_graph("decode", shape, inputs)
                 positions = torch.ones(shape[0], device=self.device, dtype=torch.long)
                 tokens, counts, next_inputs = accepted_block(
                     output,
@@ -1075,7 +1074,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             )
         return self.forward_distributed(plan, context, prepared=prepared)
 
-    def forward(self, plan: BatchPlan) -> list[int] | list[list[int]] | ForwardOutput:
+    def forward(self, plan: BatchPlan) -> ForwardOutput:
         """Run one dynamically batched prefill or decode sampling step."""
 
         self._check_cuda_graphs(plan.phase)
@@ -1151,7 +1150,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
         context: StepContext,
         *,
         prepared: PreparedBatch | None = None,
-    ) -> list[int] | list[list[int]] | ForwardOutput | None:
+    ) -> ForwardOutput | None:
         """Join every EP layer even when this attention replica has no work.
 
         Prefill executes one sequence per model call. Replicas with shorter
@@ -1232,7 +1231,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
 
     def _distributed_decode_graph(
         self, plan: BatchPlan | None, context: StepContext, cache_plan
-    ) -> tuple[bool, list[int] | list[list[int]] | ForwardOutput | None]:
+    ) -> tuple[bool, ForwardOutput | None]:
         """Replay one common graph bucket across independent attention replicas."""
 
         shape = self._select_distributed_cuda_graph(

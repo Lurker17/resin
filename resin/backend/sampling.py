@@ -167,37 +167,88 @@ def prompt_scores(plan, hidden, project=None, *, token_start=0):
     )
 
 
+def _token_columns(token_ids, counts=None):
+    """Pack accepted tokens into native output columns without Python scalars."""
+    if isinstance(token_ids, torch.Tensor):
+        # A graph may reuse its device output immediately after this call.
+        # Preserve its dtype until host validation; narrowing on CUDA could hide
+        # invalid values and launch an otherwise unnecessary conversion kernel.
+        token_ids = token_ids.detach().to(device="cpu", copy=True).numpy()
+    if isinstance(token_ids, np.ndarray):
+        if token_ids.ndim not in (1, 2):
+            raise ValueError(
+                "output tokens must have shape [rows] or [rows, positions]"
+            )
+        rows = token_ids.shape[0]
+        width = 1 if token_ids.ndim == 1 else token_ids.shape[1]
+        if counts is None:
+            lengths = np.full(rows, width, np.uint32)
+            ids = token_ids.reshape(-1)
+        else:
+            lengths = np.asarray(counts)
+            if (
+                lengths.ndim != 1
+                or len(lengths) != rows
+                or lengths.dtype.kind not in "iu"
+            ):
+                raise ValueError(
+                    "accepted counts must contain one integer per output row"
+                )
+            if np.any(lengths < 0) or np.any(lengths > width):
+                raise ValueError("accepted counts must fit the output token width")
+            lengths = lengths.astype(np.uint32, copy=False)
+            keep = np.arange(width)[None, :] < lengths[:, None]
+            ids = token_ids.reshape(rows, width)[keep]
+        if ids.dtype.kind not in "iu":
+            raise TypeError("output token ids must be integers")
+        if ids.size and (ids.min() < 0 or ids.max() > 0xFFFFFFFF):
+            raise ValueError("output token ids must fit uint32")
+        ids = np.ascontiguousarray(ids, dtype=np.uint32)
+    else:
+        if counts is not None:
+            raise TypeError("accepted counts require a token array")
+        rows = (
+            [[token] for token in token_ids]
+            if token_ids and np.isscalar(token_ids[0])
+            else token_ids
+        )
+        lengths = np.fromiter(map(len, rows), dtype=np.uint32)
+
+        def checked_tokens():
+            for row in rows:
+                for token in row:
+                    if not isinstance(token, (int, np.integer)) or isinstance(
+                        token, (bool, np.bool_)
+                    ):
+                        raise TypeError("output token ids must be integers")
+                    if not 0 <= token <= 0xFFFFFFFF:
+                        raise ValueError("output token ids must fit uint32")
+                    yield token
+
+        ids = np.fromiter(checked_tokens(), dtype=np.uint32)
+    return ids, _offsets(lengths)
+
+
+def token_output(token_ids, *, counts=None):
+    """Materialize token-only results using the shared array-based output contract."""
+    from resin import ForwardOutput
+
+    ids, offsets = _token_columns(token_ids, counts)
+    return ForwardOutput(ids, offsets)
+
+
 def format_output(logits, token_ids, plan, *, prompt_logprobs=None):
-    """Attach raw-model logprobs to generated tokens, including verified blocks.
+    """Materialize accepted tokens and optional raw-model logprob columns.
 
     Logits have shape [rows, vocab] or [rows, verification positions, vocab].
     Scores use the untempered model distribution, before top-k/top-p filtering.
     Only accepted output positions are returned; unsampled rows carry no scores.
-    The ordinary token-only path does no scoring or extra device transfer.
+    Token-only output uses the same columns without scoring or transferring logits.
     """
-
     from resin import ForwardOutput
 
-    if not plan.needs_logprobs and not plan.needs_prompt_logprobs:
-        return token_ids.tolist() if isinstance(token_ids, torch.Tensor) else token_ids
-
-    if isinstance(token_ids, torch.Tensor):
-        ids = token_ids.detach().to(device="cpu", dtype=torch.uint32).numpy()
-        if ids.ndim not in (1, 2):
-            raise ValueError(
-                "output tokens must have shape [rows] or [rows, positions]"
-            )
-        lengths = np.full(ids.shape[0], 1 if ids.ndim == 1 else ids.shape[1], np.uint32)
-        ids = np.ascontiguousarray(ids.reshape(-1))
-    else:
-        rows = (
-            [[token] for token in token_ids]
-            if token_ids and isinstance(token_ids[0], int)
-            else token_ids
-        )
-        lengths = np.fromiter(map(len, rows), dtype=np.uint32)
-        ids = np.fromiter((token for row in rows for token in row), dtype=np.uint32)
-    offsets = np.concatenate((np.zeros(1, np.uint32), lengths.cumsum(dtype=np.uint32)))
+    ids, offsets = _token_columns(token_ids)
+    lengths = np.diff(offsets)
     prompt_columns = {}
     if plan.needs_prompt_logprobs:
         if prompt_logprobs is None:

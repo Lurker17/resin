@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
@@ -84,8 +85,16 @@ def test_completion_owns_copied_results_and_counts_stats_once(monkeypatch):
     pending = runtime.DeviceCompletion(tokens, counts, feedback, rows=3, stats=stats)
     tokens.fill_(-1)
     counts.fill_(-1)
-    assert pending.result() == [[3, 9]] * 3
-    assert pending.result() == [[3, 9]] * 3
+
+    def forbid_list(tensor):
+        raise AssertionError("completion must not box tokens into Python lists")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "tolist", forbid_list)
+        result = pending.result()
+        assert pending.result() is result
+    np.testing.assert_array_equal(result.token_ids, [3, 9] * 3)
+    np.testing.assert_array_equal(result.token_indptr, [0, 2, 4, 6])
     assert pending.positions.tolist() == [1, 1, 1]
     assert pending.feedback.positions.tolist() == [3, 3, 3, 1]
     assert isinstance(pending._event, Event)

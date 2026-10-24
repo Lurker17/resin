@@ -39,7 +39,6 @@ def _launch_instead_of_replay(monkeypatch, runner, calls):
         assert mode == "prefill"
         step = runner._new_prefill_graph_step(shape)
         assert step.inputs is inputs
-        assert not step.output_to_host
         calls.append((shape, {key: value.clone() for key, value in inputs.items()}))
         step.launch()
         return step.output

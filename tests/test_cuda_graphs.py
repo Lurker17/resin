@@ -398,7 +398,7 @@ class TestCudaGraph:
             "decode", match=lambda candidate: candidate[0] == 1
         )
         assert shape == (1, 4)
-        assert runner._run_cuda_graph("decode", shape, {"value": [3]}) == [3]
+        assert runner._run_cuda_graph("decode", shape, {"value": [3]}).tolist() == [3]
         runner._check_cuda_graphs()
 
     def test_model_runner_requires_one_nonempty_mode_configuration(self) -> None:
@@ -473,8 +473,8 @@ class TestCudaGraph:
         assert stats["prefill"]["graph_region_count"] == 2
         assert stats["prefill"]["graph_break_count"] == 1
         assert stats["decode"]["graph_region_count"] == 1
-        assert graphs.mode("prefill").run((4, 128), {"value": [3]}) == [3]
-        assert graphs.mode("decode").run((4, 4096), {"value": [4]}) == [4]
+        assert graphs.mode("prefill").run((4, 128), {"value": [3]}).tolist() == [3]
+        assert graphs.mode("decode").run((4, 4096), {"value": [4]}).tolist() == [4]
 
     def test_shared_decode_defaults_use_one_history_capacity(self) -> None:
         assert DEFAULT_MAX_NUM_SEQS == 128
@@ -578,9 +578,9 @@ class TestCudaGraph:
 
         graphs = _cache(((1, 4),), build)
 
-        assert graphs.capture((1, 4), {"value": staged}) == [7]
+        assert graphs.capture((1, 4), {"value": staged}).tolist() == [7]
         staged[:] = [8]
-        assert graphs.run((1, 4), {"value": staged}) == [8]
+        assert graphs.run((1, 4), {"value": staged}).tolist() == [8]
         assert len(allocations) == 1
         assert graphs.stats["capture_count"] == 1
         assert graphs.stats["replay_count"] == 1
@@ -607,9 +607,7 @@ class TestCudaGraph:
         )
         graphs = _cache(
             ((1, 4),),
-            lambda _: builder(
-                {"value": output}, output, operation, output_to_host=False
-            ),
+            lambda _: builder({"value": output}, output, operation),
         )
         assert graphs.capture((1, 4), {"value": _Tensor([7])}) is output
         assert graphs.run((1, 4), {"value": _Tensor([8])}) is output
@@ -699,7 +697,7 @@ class TestCudaGraph:
         ] * 4 + [second] * 4
         graphs.capture_all()
         assert len(torch.cuda.pools) == 2
-        assert graphs.mode("prefill").run((1, 4), {"value": [2]}) == [2]
+        assert graphs.mode("prefill").run((1, 4), {"value": [2]}).tolist() == [2]
 
     def test_capture_warms_stream_local_kernel_state_and_preserves_breaks_and_pool(
         self, monkeypatch
@@ -985,11 +983,11 @@ class TestCudaGraph:
             )
 
         graphs = _cache(((1, 4),), build)
-        assert graphs.capture((1, 4), {"value": [7]}) == [7]
+        assert graphs.capture((1, 4), {"value": [7]}).tolist() == [7]
         assert len(torch.cuda.graphs) == 2
         events.clear()
 
-        assert graphs.run((1, 4), {"value": [8]}) == [8]
+        assert graphs.run((1, 4), {"value": [8]}).tolist() == [8]
         assert events == ["break"]
         assert [graph.replay_count for graph in torch.cuda.graphs] == [2, 2]
         assert graphs.stats["graph_region_count"] == 2
@@ -1040,7 +1038,7 @@ class TestCudaGraph:
         graphs = _cache(((1, 4),), build)
         source = _Tensor([9])
 
-        assert graphs.capture((1, 4), {"value": source}) == [9]
+        assert graphs.capture((1, 4), {"value": source}).tolist() == [9]
 
     def test_staging_the_same_input_mapping_does_not_copy_or_allocate(self) -> None:
         tensor = _Tensor([3, 7])
@@ -1098,7 +1096,7 @@ class TestCudaGraph:
         with pytest.raises(GraphInputError):
             graphs.capture((1, 4), {})
         assert not graphs.stats["poisoned"]
-        assert graphs.capture((1, 4), {"value": [1]}) == [1]
+        assert graphs.capture((1, 4), {"value": [1]}).tolist() == [1]
         assert len(builds) == 2
 
     def test_capture_mismatch_poisons_before_future_work(self, monkeypatch) -> None:
@@ -1157,7 +1155,6 @@ class TestCudaGraph:
                 output,
                 increment,
                 validate_eager_output=validate_eager_output,
-                output_to_host=False,
             ),
         )
         with pytest.raises(PostAcceptCudaError) as caught:

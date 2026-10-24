@@ -189,12 +189,25 @@ def test_idle_speculative_replica_votes_before_replaying_scratch_graph():
     ]
 
 
-def test_speculative_graph_scores_only_accepted_verification_positions():
+@pytest.mark.parametrize("logprobs", [False, True])
+def test_speculative_graph_scores_only_accepted_verification_positions(logprobs):
     runner, _ = _runner()
     shape = (4, 128)
     runner._graph_device_caches[shape] = "graph-cache"
     logits = torch.arange(4 * 3 * 8, dtype=torch.float32).view(4, 3, 8)
     runner._graph_logits[shape] = logits
+    synchronized = []
+
+    class Event:
+        def synchronize(self):
+            synchronized.append(self)
+
+        def elapsed_time(self, _other):
+            assert synchronized == [events[-1]]
+            return 1.0
+
+    events = tuple(Event() for _ in range(4))
+    runner._dspark_phase_events[shape] = events
     runner._cache.graph_plan_inputs = lambda cache, plan: {}
     runner._speculation = SpeculativeStats(2)
     cleared = []
@@ -207,7 +220,7 @@ def test_speculative_graph_scores_only_accepted_verification_positions():
 
     def replay(mode, shape_arg, inputs):
         replayed.append((mode, shape_arg, inputs))
-        return [[2, 6, 2, 4, 7], [3, 4, 3, 4, 5], [0] * 5, [0] * 5]
+        return torch.tensor([[2, 6, 2, 4, 7], [3, 4, 3, 4, 5], [0] * 5, [0] * 5])
 
     runner._run_cuda_graph = replay
     plan = BatchPlan(
@@ -216,7 +229,7 @@ def test_speculative_graph_scores_only_accepted_verification_positions():
         [2, 3],
         [0, 1, 2],
         phase=BatchPhase.DECODE,
-        sampling_params=[SamplingParams(logprobs=True, seed=1)] * 2,
+        sampling_params=[SamplingParams(logprobs=logprobs, seed=1)] * 2,
     )
 
     output = runner._graph_forward(plan, "cache-plan", shape=shape)
@@ -224,14 +237,17 @@ def test_speculative_graph_scores_only_accepted_verification_positions():
     assert output.token_ids.tolist() == [2, 4, 3, 4, 5]
     assert output.token_indptr.tolist() == [0, 2, 5]
     scores = logits.log_softmax(-1)
-    assert output.logprobs.tolist() == pytest.approx(
-        [
-            scores[0, 0, 2],
-            scores[0, 1, 4],
-            scores[1, 0, 3],
-            scores[1, 1, 4],
-            scores[1, 2, 5],
-        ]
-    )
+    if logprobs:
+        assert output.logprobs.tolist() == pytest.approx(
+            [
+                scores[0, 0, 2],
+                scores[0, 1, 4],
+                scores[1, 0, 3],
+                scores[1, 1, 4],
+                scores[1, 2, 5],
+            ]
+        )
+    else:
+        assert output.logprobs is None
     assert replayed[0][2]["ep_valid_rows"] == 2
     assert cleared == [([14, 25], [2, 3], 3, {"cache": "graph-cache"})]

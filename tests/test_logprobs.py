@@ -16,7 +16,94 @@ from resin import (
     SamplingParams,
 )
 from resin.backend.plan_transport import PlanTransport
-from resin.backend.sampling import TorchSampler, format_output
+from resin.backend.sampling import TorchSampler, format_output, token_output
+
+
+def test_token_only_output_owns_tensor_storage_without_python_scalars(monkeypatch):
+    tokens = torch.tensor([[3, 4], [5, 6]])
+    plan = BatchPlan([1, 2], [0, 0], [0, 0], [0, 1, 2])
+
+    def forbid_list(tensor):
+        raise AssertionError("output must not box tokens into Python lists")
+
+    monkeypatch.setattr(torch.Tensor, "tolist", forbid_list)
+    output = format_output(None, tokens, plan)
+    tokens.fill_(99)  # The next graph replay can overwrite its output buffer.
+    np.testing.assert_array_equal(output.token_ids, [3, 4, 5, 6])
+    np.testing.assert_array_equal(output.token_indptr, [0, 2, 4])
+    assert output.token_ids.dtype == np.uint32
+    assert output.logprobs is None
+
+
+@pytest.mark.parametrize(
+    ("tokens", "counts", "ids", "offsets"),
+    [
+        (np.array([[3, 4, 99], [5, 99, 99]]), [2, 1], [3, 4, 5], [0, 2, 3]),
+        (np.array([[3, 99], [5, 6]]), [0, 2], [5, 6], [0, 0, 2]),
+        (np.empty((0, 4), np.int64), np.empty(0, np.uint32), [], [0]),
+        (np.array([3, 4]), None, [3, 4], [0, 1, 2]),
+        ([[3, 4], [5]], None, [3, 4, 5], [0, 2, 3]),
+    ],
+)
+def test_token_output_packs_only_accepted_positions(tokens, counts, ids, offsets):
+    output = token_output(tokens, counts=counts)
+    np.testing.assert_array_equal(output.token_ids, ids)
+    np.testing.assert_array_equal(output.token_indptr, offsets)
+
+
+@pytest.mark.parametrize("counts", [[-1, 1], [3, 1], [1], [[1, 1]], [1.5, 1]])
+def test_token_output_rejects_invalid_acceptance_counts(counts):
+    with pytest.raises(ValueError, match="accepted counts"):
+        token_output(np.array([[3, 4], [5, 6]]), counts=counts)
+
+
+@pytest.mark.parametrize(
+    "wrap",
+    [np.asarray, torch.tensor, list, lambda values: [values]],
+    ids=["numpy", "torch", "flat-list", "ragged-list"],
+)
+@pytest.mark.parametrize("token", [-1, 2**32, 2**40])
+def test_token_output_rejects_overflow_before_narrowing(wrap, token):
+    with pytest.raises(ValueError, match="token ids must fit uint32"):
+        token_output(wrap([3, token]))
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        np.array([1.0, 2.5]),
+        np.array([True, False]),
+        torch.tensor([1.0, 2.5]),
+        torch.tensor([True, False]),
+        [1, 2.5],
+        [True, 2],
+        [[1], [2.5]],
+        [[1], [np.bool_(False)]],
+    ],
+)
+def test_token_output_rejects_noninteger_tokens(tokens):
+    with pytest.raises(TypeError, match="token ids must be integers"):
+        token_output(tokens)
+
+
+@pytest.mark.parametrize("dtype", [np.int64, np.uint64, np.uint32])
+def test_token_output_preserves_full_uint32_range(dtype):
+    output = token_output(np.array([0, 2**31, 2**32 - 1], dtype=dtype))
+    np.testing.assert_array_equal(output.token_ids, [0, 2**31, 2**32 - 1])
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        np.array([[3, -1], [-1, 2**32]], np.int64),
+        np.array([[3, 2**64 - 1], [2**32, 2**64 - 1]], np.uint64),
+        torch.tensor([[3, -1], [-1, 2**32]]),
+    ],
+)
+def test_token_output_ignores_unaccepted_padding_values(tokens):
+    output = token_output(tokens, counts=[1, 0])
+    np.testing.assert_array_equal(output.token_ids, [3])
+    np.testing.assert_array_equal(output.token_indptr, [0, 1, 1])
 
 
 @dataclass

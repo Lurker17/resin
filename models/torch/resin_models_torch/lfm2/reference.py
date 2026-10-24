@@ -93,7 +93,7 @@ class Lfm2TorchRunner(Runner):
         self._cache: dict[int, Lfm2State] = {}
         self.forward_calls = 0
 
-    def forward(self, plan: BatchPlan) -> list[int] | ForwardOutput:
+    def forward(self, plan: BatchPlan) -> ForwardOutput:
         logits_rows = []
         prompt_rows = []
         self.forward_calls += 1

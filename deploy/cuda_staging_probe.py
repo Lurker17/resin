@@ -64,7 +64,6 @@ def run_probe():
             inputs=inputs,
             output=output,
             launch=launch,
-            output_to_host=False,
         ),
         synchronize_failure=lambda: torch.cuda.synchronize(device),
     )

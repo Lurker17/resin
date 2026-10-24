@@ -15,6 +15,7 @@ from resin.backend.cuda.runner import CudaRunner
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.distributed import StepContext
 from resin.backend.paged_attention import PagedAttentionBatch, PagedAttentionGroup
+from resin.backend.sampling import token_output
 from resin.backend.topology import RankGroup
 from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
 
@@ -172,7 +173,7 @@ def test_distributed_forward_packs_unequal_replica_rows_once(monkeypatch, phase)
         runner = _runner(monkeypatch, groups)
         assert runner.forward_distributed(
             plan, _context(groups, phase, sizes, plan)
-        ) == ([4, 6] if rank == 0 else [9])
+        ).token_ids.tolist() == ([4, 6] if rank == 0 else [9])
         assert runner.calls == [("batch", len(plan.token_ids), plan.positions.tolist())]
         assert runner.tensorized == [
             "prefill.0" if phase == BatchPhase.PREFILL else "decode"
@@ -240,7 +241,7 @@ def test_sample_broadcast_uses_complete_attention_replica_group(monkeypatch):
 
     assert runner.forward_distributed(
         plan, _context(groups, BatchPhase.DECODE, ((1, 1),), plan)
-    ) == [9]
+    ).token_ids.tolist() == [9]
 
     assert groups.broadcasts == [(0, groups.device_replica.handle, [9])]
 
@@ -357,12 +358,12 @@ def test_distributed_decode_replays_the_common_graph_bucket(monkeypatch):
 
     def replay(plan_arg, host, *, shape):
         replayed.append((plan_arg, host.phase, shape))
-        return [4, 6]
+        return token_output([4, 6])
 
     runner._select_distributed_cuda_graph = select
     runner._graph_forward = replay
 
-    assert runner.forward_distributed(plan, context) == [4, 6]
+    assert runner.forward_distributed(plan, context).token_ids.tolist() == [4, 6]
     assert selected == [("decode", context, {"required_shape": (2, 1)})]
     assert replayed == [(plan, BatchPhase.DECODE, (4, 2))]
     assert runner.calls == runner.tensorized == []
@@ -385,10 +386,10 @@ def test_idle_graph_replica_rejoins_with_zero_valid_expert_rows(monkeypatch):
     assert runner.calls == runner.tensorized == []
 
     plan = BatchPlan([7], [3], [9], [0, 1], phase=BatchPhase.DECODE)
-    runner._graph_forward = lambda *args, **kwargs: [9]
+    runner._graph_forward = lambda *args, **kwargs: token_output([9])
     assert runner.forward_distributed(
         plan, _context(groups, BatchPhase.DECODE, ((1, 1), (2, 2)), plan)
-    ) == [9]
+    ).token_ids.tolist() == [9]
 
 
 def test_idle_prefill_replica_joins_captured_ffns(monkeypatch):
@@ -453,7 +454,7 @@ def test_decode_graph_retains_logits_and_stages_active_row_count(monkeypatch):
 
     def replay(mode, shape_arg, inputs):
         replayed.append((mode, shape_arg, inputs))
-        return [1, 2, 0, 0]
+        return torch.tensor([1, 2, 0, 0])
 
     runner._run_cuda_graph = replay
     plan = BatchPlan(

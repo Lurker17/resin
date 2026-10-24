@@ -21,6 +21,7 @@ from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.cuda.runner import CudaRunner
 from resin.backend.cuda.sampling import FlashInferSampler
 from resin.backend.distributed import StepContext
+from resin.backend.sampling import token_output
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import RankGroup
 from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
@@ -202,9 +203,11 @@ def test_ragged_prefill_replicas_enter_the_same_expert_rounds(monkeypatch, polic
         output = runner.forward_distributed(
             plan, _context(groups, BatchPhase.PREFILL, ((2, 5), (1, 1)), plan)
         )
-        assert output == ([4, 6] if rank == 0 else [9])
+        assert output.token_ids.tolist() == ([4, 6] if rank == 0 else [9])
         assert runner._cache.plans == [plan]
-        assert groups.broadcasts == [(rank, groups.device_replica.handle, output)]
+        assert groups.broadcasts == [
+            (rank, groups.device_replica.handle, output.token_ids.tolist())
+        ]
         runners.append(runner)
 
     assert [call[0] for call in runners[0]._model.calls] == ["prefill", "prefill"]
@@ -243,7 +246,7 @@ def test_decode_keeps_the_replica_batch_and_cache_namespace(monkeypatch):
     assert runner.forward_distributed(
         plan,
         _context(groups, BatchPhase.DECODE, ((0, 0), (0, 0), (2, 2), (1, 1)), plan),
-    ) == [2, 3]
+    ).token_ids.tolist() == [2, 3]
 
     assert runner._model.calls == [("decode", [[2], [3]], [14, 25], runner._cache)]
     assert runner._cache.plans == [plan]
@@ -288,12 +291,12 @@ def test_speculative_decode_fallback_preserves_ragged_acceptance_and_state(
     output = runner.forward_distributed(plan, context)
 
     assert selections == [{"required_shape": (2, 28)}]
+    assert output.token_ids.tolist() == [4, 5, 9, 8]
+    assert output.token_indptr.tolist() == [0, 3, 4]
     if logprobs:
-        assert output.token_ids.tolist() == [4, 5, 9, 8]
-        assert output.token_indptr.tolist() == [0, 3, 4]
         assert len(output.logprobs) == 4
     else:
-        assert output == [[4, 5, 9], [8]]
+        assert output.logprobs is None
     assert [call[0] for call in runner._model.calls] == [
         "draft",
         "verify",
@@ -349,7 +352,7 @@ def test_speculative_prefill_only_joins_target_expert_rounds(monkeypatch):
     )
     context = _context(groups, BatchPhase.PREFILL, ((2, 5), (3, 7)), plan)
 
-    assert runner.forward_distributed(plan, context) == [4, 6]
+    assert runner.forward_distributed(plan, context).token_ids.tolist() == [4, 6]
 
     assert [call[0] for call in runner._model.calls] == [
         "prefill",
@@ -388,7 +391,7 @@ def test_eager_decode_preserves_fixed_row_gemm_selection(monkeypatch, phase):
     previous_dtype = torch.get_default_dtype()
     assert runner.forward_distributed(
         plan, _context(groups, phase, ((1, 1),), plan)
-    ) == [2]
+    ).token_ids.tolist() == [2]
     assert events == (
         ["enter_prefill", "forward_prefill", "leave_prefill"]
         if phase == BatchPhase.PREFILL
@@ -479,7 +482,9 @@ def test_managed_cache_addresses_are_validated_before_expert_rounds(
     if error is None:
         prepared = runner.validate_distributed(plan, context)
         assert prepared.cache_plan is not None and prepared.rows == ((0, 1),)
-        assert runner.forward_distributed(plan, context, prepared=prepared) == [2]
+        assert runner.forward_distributed(
+            plan, context, prepared=prepared
+        ).token_ids.tolist() == [2]
         assert runner._model.calls == [("prefill", [[2]], 0, "row-0")]
     else:
         with pytest.raises(ValueError, match=error):
@@ -510,9 +515,11 @@ def test_prepared_distributed_batch_is_reused_without_revalidating(monkeypatch, 
     monkeypatch.setattr(runner, "validate_distributed", revalidated)
     monkeypatch.setattr(runner, "_validate_plan", revalidated)
     monkeypatch.setattr(runner, "_cache_plan", revalidated)
-    assert runner.forward_distributed(plan, context, prepared=prepared) == (
-        None if idle else [2]
-    )
+    output = runner.forward_distributed(plan, context, prepared=prepared)
+    if idle:
+        assert output is None
+    else:
+        assert output.token_ids.tolist() == [2]
     assert runner._cache.plans == ([] if idle else [prepared.cache_plan])
 
 
@@ -598,12 +605,12 @@ def test_distributed_decode_graph_uses_the_domain_selected_bucket(monkeypatch):
 
     def replay(plan_arg, cache_plan, *, shape):
         replayed.append((plan_arg, cache_plan, shape))
-        return [12, 13]
+        return token_output([12, 13])
 
     runner._select_distributed_cuda_graph = select
     runner._graph_forward = replay
 
-    assert runner.forward_distributed(plan, context) == [12, 13]
+    assert runner.forward_distributed(plan, context).token_ids.tolist() == [12, 13]
     assert selected == [("decode", context, {"required_shape": (2, 26)})]
     assert replayed == [(plan, plan, (4, 128))]
     assert runner._cache.plans == []
@@ -661,7 +668,7 @@ def test_missing_prefill_rounds_join_the_same_captured_ffn_regions(monkeypatch):
         groups, BatchPhase.PREFILL, ((1, 2), (3, 5), (0, 0), (0, 0)), plan
     )
 
-    assert runner.forward_distributed(plan, context) == [3]
+    assert runner.forward_distributed(plan, context).token_ids.tolist() == [3]
     assert rounds == ["captured-ffns", "captured-ffns"]
     assert [call[0] for call in runner._model.calls] == ["prefill"]
 
@@ -682,7 +689,7 @@ def test_decode_graph_formats_logprobs_from_retained_graph_logits(monkeypatch):
 
     def replay(mode, shape_arg, inputs):
         replayed.append((mode, shape_arg, inputs))
-        return [1, 2, 0, 0]
+        return torch.tensor([1, 2, 0, 0])
 
     runner._run_cuda_graph = replay
     plan = BatchPlan(

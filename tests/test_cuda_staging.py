@@ -199,7 +199,6 @@ def test_graph_cache_queued_replays_preserve_each_host_input(runtime, monkeypatc
             inputs={"tokens": target},
             output=target,
             launch=lambda: None,
-            output_to_host=False,
         ),
         synchronize_failure=lambda: None,
     )
