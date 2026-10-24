@@ -117,10 +117,10 @@ def test_projection_replay_requires_changed_live_metadata(field):
 def test_plan_metadata_tracks_physical_parent_and_slot_without_dumping_page_tables():
     def plan(parent, slot):
         return BatchPlan(
-            [7],
-            [4],
-            [2, 3],
-            [0, 2],
+            sequence_ids=[7],
+            context_lengths=[4],
+            token_ids=[2, 3],
+            token_indptr=[0, 2],
             cache_groups=[
                 CacheGroupPlan(
                     0,

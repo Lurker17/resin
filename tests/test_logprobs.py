@@ -31,7 +31,12 @@ def test_forward_output_requires_keyword_arguments():
 
 def test_token_only_output_owns_tensor_storage_without_python_scalars(monkeypatch):
     tokens = torch.tensor([[3, 4], [5, 6]])
-    plan = BatchPlan([1, 2], [0, 0], [0, 0], [0, 1, 2])
+    plan = BatchPlan(
+        sequence_ids=[1, 2],
+        context_lengths=[0, 0],
+        token_ids=[0, 0],
+        token_indptr=[0, 1, 2],
+    )
 
     def forbid_list(tensor):
         raise AssertionError("output must not box tokens into Python lists")
@@ -140,10 +145,10 @@ def test_scores_use_model_distribution_and_cover_only_accepted_positions():
         ]
     )
     plan = BatchPlan(
-        [1, 2],
-        [0, 0],
-        [0, 0],
-        [0, 1, 2],
+        sequence_ids=[1, 2],
+        context_lengths=[0, 0],
+        token_ids=[0, 0],
+        token_indptr=[0, 1, 2],
         sampling_params=[
             SamplingParams(temperature=0.1, top_k=1, top_logprobs=2),
             SamplingParams(logprobs=True),
@@ -171,12 +176,23 @@ def test_scores_use_model_distribution_and_cover_only_accepted_positions():
 def test_logprob_options_survive_broadcast_and_do_not_change_sampling():
     params = SamplingParams(seed=7, top_k=2, top_logprobs=3)
     assert params.logprobs
-    plan = BatchPlan([1], [0], [0], [0, 1], sampling_params=[params])
+    plan = BatchPlan(
+        sequence_ids=[1],
+        context_lengths=[0],
+        token_ids=[0],
+        token_indptr=[0, 1],
+        sampling_params=[params],
+    )
     restored = PlanTransport().restore(PlanTransport().prepare(plan))
     assert restored.sampling_params[0].top_logprobs == 3
     assert restored.needs_logprobs
     assert not BatchPlan(
-        [1], [0], [0], [0, 1], sampling_params=[params], sampling_mask=[False]
+        sequence_ids=[1],
+        context_lengths=[0],
+        token_ids=[0],
+        token_indptr=[0, 1],
+        sampling_params=[params],
+        sampling_mask=[False],
     ).needs_logprobs
     logits = torch.tensor([[2.0, 4.0, 1.0]])
     tokens = TorchSampler()(logits, plan)
@@ -190,10 +206,10 @@ def test_logprob_options_survive_broadcast_and_do_not_change_sampling():
 def test_mixed_top_k_requests_use_packed_columns():
     logits = torch.tensor([[2.0, 4.0, 1.0], [0.0, 2.0, 3.0], [2.0, 2.0, 2.0]])
     plan = BatchPlan(
-        [1, 2, 3],
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 1, 2, 3],
+        sequence_ids=[1, 2, 3],
+        context_lengths=[0, 0, 0],
+        token_ids=[0, 0, 0],
+        token_indptr=[0, 1, 2, 3],
         sampling_params=[
             SamplingParams(top_logprobs=1),
             SamplingParams(logprobs=True),

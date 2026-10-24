@@ -23,17 +23,17 @@ def _validation_runner() -> DeepSeekV4CudaRunner:
 def test_managed_pages_allow_continuation_and_arbitrary_decode_rows() -> None:
     runner = _validation_runner()
     continuation = BatchPlan(
-        [70],
-        [128],
-        [4, 5],
-        [0, 2],
+        sequence_ids=[70],
+        context_lengths=[128],
+        token_ids=[4, 5],
+        token_indptr=[0, 2],
         phase=BatchPhase.PREFILL,
     )
     decode = BatchPlan(
-        [70, 99],
-        [130, 7],
-        [9, 10],
-        [0, 1, 2],
+        sequence_ids=[70, 99],
+        context_lengths=[130, 7],
+        token_ids=[9, 10],
+        token_indptr=[0, 1, 2],
         phase=BatchPhase.DECODE,
     )
 
@@ -44,10 +44,10 @@ def test_managed_pages_allow_continuation_and_arbitrary_decode_rows() -> None:
 def test_prefill_rejects_a_block_larger_than_its_retained_write_capacity() -> None:
     runner = _validation_runner()
     plan = BatchPlan(
-        [70],
-        [0],
-        [4] * (runner.prefill_chunk_size + 1),
-        [0, runner.prefill_chunk_size + 1],
+        sequence_ids=[70],
+        context_lengths=[0],
+        token_ids=[4] * (runner.prefill_chunk_size + 1),
+        token_indptr=[0, runner.prefill_chunk_size + 1],
         phase=BatchPhase.PREFILL,
     )
     with pytest.raises(ValueError, match="cache write capacity"):
@@ -173,10 +173,10 @@ def test_prefill_uses_one_paged_path_for_fresh_and_continuation_rows() -> None:
     setattr(runner, "_model", Model())
     cache = Cache()
     plan = BatchPlan(
-        [7, 8],
-        [0, 128],
-        [2, 3, 8, 9],
-        [0, 2, 4],
+        sequence_ids=[7, 8],
+        context_lengths=[0, 128],
+        token_ids=[2, 3, 8, 9],
+        token_indptr=[0, 2, 4],
         phase=BatchPhase.PREFILL,
     )
 

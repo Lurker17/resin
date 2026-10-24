@@ -96,10 +96,10 @@ def runner_fixture():
 
 def plan_for(media, start, end, *, request=42):
     return BatchPlan(
-        [request],
-        [start],
-        media.token_ids[start:end],
-        [0, end - start],
+        sequence_ids=[request],
+        context_lengths=[start],
+        token_ids=media.token_ids[start:end],
+        token_indptr=[0, end - start],
         phase=BatchPhase.PREFILL,
         media=[media],
     )
@@ -151,12 +151,25 @@ def test_image_validation_rejects_unbacked_or_mismatched_prompt_tokens():
     runner, _ = runner_fixture()
     with pytest.raises(ValueError, match="require image media"):
         runner._validate_plan(
-            BatchPlan([1], [0], [129264], [0, 1], phase=BatchPhase.PREFILL)
+            BatchPlan(
+                sequence_ids=[1],
+                context_lengths=[0],
+                token_ids=[129264],
+                token_indptr=[0, 1],
+                phase=BatchPhase.PREFILL,
+            )
         )
     media = media_fixture()
     with pytest.raises(ValueError, match="does not match"):
         runner._validate_plan(
-            BatchPlan([1], [0], [11], [0, 1], phase=BatchPhase.PREFILL, media=[media])
+            BatchPlan(
+                sequence_ids=[1],
+                context_lengths=[0],
+                token_ids=[11],
+                token_indptr=[0, 1],
+                phase=BatchPhase.PREFILL,
+                media=[media],
+            )
         )
 
 

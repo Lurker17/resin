@@ -179,10 +179,10 @@ class TestSamplingContract:
         params = SamplingParams()
         with pytest.raises(ValueError, match="one item per sequence"):
             BatchPlan(
-                [7, 8],
-                [0, 0],
-                [1, 2],
-                [0, 1, 2],
+                sequence_ids=[7, 8],
+                context_lengths=[0, 0],
+                token_ids=[1, 2],
+                token_indptr=[0, 1, 2],
                 sampling_params=[params],
             )
 
@@ -192,10 +192,10 @@ class TestSharedSampler:
     def _plan(params, *, sampling_mask=None):
         rows = len(params)
         return BatchPlan(
-            list(range(10, 10 + rows)),
-            [0] * rows,
-            list(range(1, rows + 1)),
-            list(range(rows + 1)),
+            sequence_ids=list(range(10, 10 + rows)),
+            context_lengths=[0] * rows,
+            token_ids=list(range(1, rows + 1)),
+            token_indptr=list(range(rows + 1)),
             sampling_params=params,
             sampling_mask=sampling_mask,
         )
@@ -250,10 +250,10 @@ class TestSharedSampler:
         monkeypatch.setattr(sampler, "_renorm", renorm, raising=False)
         monkeypatch.setattr(sampler, "_sample", sample, raising=False)
         plan = BatchPlan(
-            [10, 11],
-            [1, 2],
-            [1, 2],
-            [0, 1, 2],
+            sequence_ids=[10, 11],
+            context_lengths=[1, 2],
+            token_ids=[1, 2],
+            token_indptr=[0, 1, 2],
             sampling_params=[
                 SamplingParams(temperature=0.5, top_p=0.8, top_k=2, seed=31),
                 SamplingParams(temperature=0.0, seed=32),

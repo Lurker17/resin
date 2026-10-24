@@ -39,10 +39,10 @@ def test_registered_prefill_chunks_and_decode_reuse_image_features():
     for position in range(len(media.token_ids), len(media.token_ids) + 2):
         packet = sender.prepare(
             BatchPlan(
-                [42],
-                [position],
-                [21],
-                [0, 1],
+                sequence_ids=[42],
+                context_lengths=[position],
+                token_ids=[21],
+                token_indptr=[0, 1],
                 phase=BatchPhase.DECODE,
                 media=[media],
             )
@@ -93,10 +93,10 @@ def test_registered_plans_reject_changed_media_or_prompt(change, phase):
         plan_for(changed, 5, 7)
         if phase == BatchPhase.PREFILL
         else BatchPlan(
-            [42],
-            [len(media.token_ids)],
-            [21],
-            [0, 1],
+            sequence_ids=[42],
+            context_lengths=[len(media.token_ids)],
+            token_ids=[21],
+            token_indptr=[0, 1],
             phase=phase,
             media=[changed],
         )

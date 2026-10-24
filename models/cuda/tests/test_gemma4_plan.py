@@ -89,10 +89,10 @@ def test_gemma4_plan_preserves_positive_ids_after_graph_null_page() -> None:
     history_append, offsets = _append_metadata(history_pages, len(tokens))
     local_append, _ = _append_metadata(local_pages, len(tokens))
     plan = BatchPlan(
-        [7],
-        [0],
-        tokens,
-        [0, len(tokens)],
+        sequence_ids=[7],
+        context_lengths=[0],
+        token_ids=tokens,
+        token_indptr=[0, len(tokens)],
         cache_groups=[
             _cache_group(
                 0,
@@ -129,10 +129,10 @@ def test_gemma4_plan_preserves_positive_ids_after_graph_null_page() -> None:
 
 def test_decode_lookahead_expands_verify_but_not_assistant_context() -> None:
     plan = BatchPlan(
-        [9],
-        [64],
-        [123],
-        [0, 1],
+        sequence_ids=[9],
+        context_lengths=[64],
+        token_ids=[123],
+        token_indptr=[0, 1],
         phase=BatchPhase.DECODE,
         cache_groups=[
             _cache_group(0, [0, 2], [11, 12], [0], [12], [0], packing=10),
@@ -167,10 +167,10 @@ def test_decode_lookahead_expands_verify_but_not_assistant_context() -> None:
 def test_five_drafts_reserve_the_local_page_beyond_a_full_window() -> None:
     pages = list(range(1, 18))
     plan = BatchPlan(
-        [9],
-        [1024],
-        [123],
-        [0, 1],
+        sequence_ids=[9],
+        context_lengths=[1024],
+        token_ids=[123],
+        token_indptr=[0, 1],
         phase=BatchPhase.DECODE,
         cache_groups=[
             _cache_group(0, [0, 17], pages, [0], [17], [0], packing=10),

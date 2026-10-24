@@ -283,12 +283,26 @@ class TestSchedulerConfigContract:
         assert default.scheduler_config.max_batch_tokens is None
 
     def test_batch_plan_batch_key_defaults_and_range_validation(self) -> None:
-        default = BatchPlan([7], [0], [1], [0, 1])
-        keyed = BatchPlan([7], [0], [1], [0, 1], batch_key=9)
+        default = BatchPlan(
+            sequence_ids=[7], context_lengths=[0], token_ids=[1], token_indptr=[0, 1]
+        )
+        keyed = BatchPlan(
+            sequence_ids=[7],
+            context_lengths=[0],
+            token_ids=[1],
+            token_indptr=[0, 1],
+            batch_key=9,
+        )
         assert default.batch_key is None
         assert keyed.batch_key == 9
         with pytest.raises(OverflowError):
-            BatchPlan([7], [0], [1], [0, 1], batch_key=2**64)
+            BatchPlan(
+                sequence_ids=[7],
+                context_lengths=[0],
+                token_ids=[1],
+                token_indptr=[0, 1],
+                batch_key=2**64,
+            )
 
         engine = Engine(RecordingRunner())
         with pytest.raises(OverflowError):
@@ -304,10 +318,10 @@ class TestSchedulerConfigContract:
 
     def test_batch_plan_freezes_phase_and_sampling_mask(self) -> None:
         plan = BatchPlan(
-            [7, 8, 9],
-            [0, 4, 0],
-            [10, 20, 30],
-            [0, 1, 2, 3],
+            sequence_ids=[7, 8, 9],
+            context_lengths=[0, 4, 0],
+            token_ids=[10, 20, 30],
+            token_indptr=[0, 1, 2, 3],
             sampling_mask=[False, True, True],
         )
         assert plan.phase == BatchPhase.PREFILL
@@ -320,10 +334,10 @@ class TestSchedulerConfigContract:
     def test_opaque_media_preserves_identity(self) -> None:
         payload = object()
         plan = BatchPlan(
-            [7, 8],
-            [0, 0],
-            [10, 20],
-            [0, 1, 2],
+            sequence_ids=[7, 8],
+            context_lengths=[0, 0],
+            token_ids=[10, 20],
+            token_indptr=[0, 1, 2],
             # BatchPlan deliberately preserves opaque model-owned payloads.
             media=[payload, None],  # ty: ignore[invalid-argument-type]
         )
@@ -332,10 +346,10 @@ class TestSchedulerConfigContract:
         assert plan.media[1] is None
         with pytest.raises(ValueError, match="one item per sequence"):
             BatchPlan(
-                [7, 8],
-                [0, 0],
-                [10, 20],
-                [0, 1, 2],
+                sequence_ids=[7, 8],
+                context_lengths=[0, 0],
+                token_ids=[10, 20],
+                token_indptr=[0, 1, 2],
                 media=[payload],
             )
 
@@ -422,29 +436,29 @@ class TestSchedulerConfigContract:
 
     def test_batch_plan_phase_is_batch_homogeneous(self) -> None:
         prefill = BatchPlan(
-            [7, 8],
-            [0, 0],
-            [1, 2],
-            [0, 1, 2],
+            sequence_ids=[7, 8],
+            context_lengths=[0, 0],
+            token_ids=[1, 2],
+            token_indptr=[0, 1, 2],
         )
         assert prefill.phase == BatchPhase.PREFILL
         assert prefill.sampling_mask.tolist() == [True, True]
 
         decode = BatchPlan(
-            [7, 8],
-            [3, 5],
-            [1, 2],
-            [0, 1, 2],
+            sequence_ids=[7, 8],
+            context_lengths=[3, 5],
+            token_ids=[1, 2],
+            token_indptr=[0, 1, 2],
             phase=BatchPhase.DECODE,
         )
         assert decode.phase == BatchPhase.DECODE
 
     def test_batch_plan_numeric_metadata_is_read_only_zero_copy_numpy(self) -> None:
         plan = BatchPlan(
-            np.asarray([7, 8], dtype=np.uint64),
-            np.asarray([2, 4], dtype=np.uint32),
-            np.asarray([11, 12, 13], dtype=np.uint32),
-            np.asarray([0, 2, 3], dtype=np.uint32),
+            sequence_ids=np.asarray([7, 8], dtype=np.uint64),
+            context_lengths=np.asarray([2, 4], dtype=np.uint32),
+            token_ids=np.asarray([11, 12, 13], dtype=np.uint32),
+            token_indptr=np.asarray([0, 2, 3], dtype=np.uint32),
             sampling_mask=np.asarray([False, True], dtype=np.bool_),
         )
         expected = {
@@ -471,19 +485,19 @@ class TestSchedulerConfigContract:
         for value in ([True], [True, False, True, False]):
             with pytest.raises(ValueError, match="one item per sequence"):
                 BatchPlan(
-                    [7, 8, 9],
-                    [0, 4, 0],
-                    [10, 20, 30],
-                    [0, 1, 2, 3],
+                    sequence_ids=[7, 8, 9],
+                    context_lengths=[0, 4, 0],
+                    token_ids=[10, 20, 30],
+                    token_indptr=[0, 1, 2, 3],
                     sampling_mask=value,
                 )
 
         with pytest.raises(TypeError, match="prefill_sequence_indices"):
             BatchPlan(
-                [7],
-                [0],
-                [1],
-                [0, 1],
+                sequence_ids=[7],
+                context_lengths=[0],
+                token_ids=[1],
+                token_indptr=[0, 1],
                 # Removed constructor argument must fail at runtime.
                 prefill_sequence_indices=[0],  # ty: ignore[unknown-argument]
             )

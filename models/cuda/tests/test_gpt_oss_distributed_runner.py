@@ -160,14 +160,38 @@ def test_distributed_forward_packs_unequal_replica_rows_once(monkeypatch, phase)
     topology = Parallelism(world_size=2, ep=2, attn_dp=2)
     if phase == BatchPhase.PREFILL:
         plans = (
-            BatchPlan([7, 8], [0, 9], [2, 3, 4, 5, 6], [0, 3, 5], phase=phase),
-            BatchPlan([7], [0], [9], [0, 1], phase=phase),
+            BatchPlan(
+                sequence_ids=[7, 8],
+                context_lengths=[0, 9],
+                token_ids=[2, 3, 4, 5, 6],
+                token_indptr=[0, 3, 5],
+                phase=phase,
+            ),
+            BatchPlan(
+                sequence_ids=[7],
+                context_lengths=[0],
+                token_ids=[9],
+                token_indptr=[0, 1],
+                phase=phase,
+            ),
         )
         sizes = ((2, 5), (1, 1))
     else:
         plans = (
-            BatchPlan([7, 8], [11, 15], [4, 6], [0, 1, 2], phase=phase),
-            BatchPlan([7], [3], [9], [0, 1], phase=phase),
+            BatchPlan(
+                sequence_ids=[7, 8],
+                context_lengths=[11, 15],
+                token_ids=[4, 6],
+                token_indptr=[0, 1, 2],
+                phase=phase,
+            ),
+            BatchPlan(
+                sequence_ids=[7],
+                context_lengths=[3],
+                token_ids=[9],
+                token_indptr=[0, 1],
+                phase=phase,
+            ),
         )
         sizes = ((2, 2), (1, 1))
     for rank, plan in enumerate(plans):
@@ -198,7 +222,17 @@ def test_worker_prepared_attention_is_reused_for_every_execution_path(
 ):
     groups = _groups(Parallelism(world_size=2, ep=2, attn_dp=2))
     runner = _runner(monkeypatch, groups)
-    plan = None if idle else BatchPlan([7], [3], [9], [0, 1], phase=phase)
+    plan = (
+        None
+        if idle
+        else BatchPlan(
+            sequence_ids=[7],
+            context_lengths=[3],
+            token_ids=[9],
+            token_indptr=[0, 1],
+            phase=phase,
+        )
+    )
     context = _context(groups, phase, ((0, 0) if idle else (1, 1), (1, 1)), plan)
     prepared = runner.validate_distributed(plan, context)
     assert runner.lowered == ([] if idle else [plan])
@@ -249,10 +283,10 @@ def test_distributed_prefill_scores_all_predecessors_from_one_forward(monkeypatc
     groups = _groups(Parallelism(world_size=2, ep=2, attn_dp=2))
     runner = _runner(monkeypatch, groups)
     plan = BatchPlan(
-        [7, 8],
-        [0, 9],
-        [2, 2, 4, 5, 5],
-        [0, 3, 5],
+        sequence_ids=[7, 8],
+        context_lengths=[0, 9],
+        token_ids=[2, 2, 4, 5, 5],
+        token_indptr=[0, 3, 5],
         sampling_params=[SamplingParams(prompt_logprobs=True)] * 2,
         prompt_score_indices=[0, 1, 2, 3],
         prompt_score_token_ids=[2, 4, 9, 5],
@@ -301,7 +335,13 @@ def test_idle_replica_joins_each_expert_layer_without_attention_or_cache(
 def test_sample_broadcast_uses_complete_attention_replica_group(monkeypatch):
     groups = _groups(Parallelism(world_size=2, ep=2), rank=1)
     runner = _runner(monkeypatch, groups)
-    plan = BatchPlan([7], [3], [9], [0, 1], phase=BatchPhase.DECODE)
+    plan = BatchPlan(
+        sequence_ids=[7],
+        context_lengths=[3],
+        token_ids=[9],
+        token_indptr=[0, 1],
+        phase=BatchPhase.DECODE,
+    )
 
     assert runner.forward_distributed(
         plan, _context(groups, BatchPhase.DECODE, ((1, 1),), plan)
@@ -313,7 +353,13 @@ def test_sample_broadcast_uses_complete_attention_replica_group(monkeypatch):
 def test_distributed_metadata_mismatch_is_rejected_before_execution(monkeypatch):
     groups = _groups(Parallelism(world_size=2, ep=2, attn_dp=2))
     runner = _runner(monkeypatch, groups)
-    plan = BatchPlan([7], [0], [2], [0, 1], phase=BatchPhase.PREFILL)
+    plan = BatchPlan(
+        sequence_ids=[7],
+        context_lengths=[0],
+        token_ids=[2],
+        token_indptr=[0, 1],
+        phase=BatchPhase.PREFILL,
+    )
 
     with pytest.raises(ValueError, match="metadata"):
         runner.forward_distributed(
@@ -349,7 +395,17 @@ def test_missing_graph_capture_is_rejected_in_worker_readiness_validation(
         }
     )
     runner._check_cuda_graphs = CudaRunner._check_cuda_graphs.__get__(runner)
-    plan = None if idle else BatchPlan([7], [0], [2], [0, 1], phase=phase)
+    plan = (
+        None
+        if idle
+        else BatchPlan(
+            sequence_ids=[7],
+            context_lengths=[0],
+            token_ids=[2],
+            token_indptr=[0, 1],
+            phase=phase,
+        )
+    )
     context = _context(groups, phase, ((0, 0) if idle else (1, 1), (1, 1)), plan)
 
     with pytest.raises(RuntimeError, match="not been captured"):
@@ -412,7 +468,13 @@ def test_distributed_graph_policies_pass_topology_preparation(monkeypatch, paral
 def test_distributed_decode_replays_the_common_graph_bucket(monkeypatch):
     groups = _groups(Parallelism(world_size=2, ep=2, attn_dp=2), rank=1)
     runner = _runner(monkeypatch, groups)
-    plan = BatchPlan([7, 8], [11, 15], [4, 6], [0, 1, 2], phase=BatchPhase.DECODE)
+    plan = BatchPlan(
+        sequence_ids=[7, 8],
+        context_lengths=[11, 15],
+        token_ids=[4, 6],
+        token_indptr=[0, 1, 2],
+        phase=BatchPhase.DECODE,
+    )
     context = _context(groups, BatchPhase.DECODE, ((1, 1), (2, 2)), plan)
     selected, replayed = [], []
 
@@ -449,7 +511,13 @@ def test_idle_graph_replica_rejoins_with_zero_valid_expert_rows(monkeypatch):
     assert replayed == [{"shape": (2, 1), "ep_valid_rows": 0}]
     assert runner.calls == runner.tensorized == []
 
-    plan = BatchPlan([7], [3], [9], [0, 1], phase=BatchPhase.DECODE)
+    plan = BatchPlan(
+        sequence_ids=[7],
+        context_lengths=[3],
+        token_ids=[9],
+        token_indptr=[0, 1],
+        phase=BatchPhase.DECODE,
+    )
     runner._graph_forward = lambda *args, **kwargs: token_output([9])
     assert runner.forward_distributed(
         plan, _context(groups, BatchPhase.DECODE, ((1, 1), (2, 2)), plan)
@@ -522,10 +590,10 @@ def test_decode_graph_retains_logits_and_stages_active_row_count(monkeypatch):
 
     runner._run_cuda_graph = replay
     plan = BatchPlan(
-        [7, 8],
-        [11, 15],
-        [0, 0],
-        [0, 1, 2],
+        sequence_ids=[7, 8],
+        context_lengths=[11, 15],
+        token_ids=[0, 0],
+        token_indptr=[0, 1, 2],
         phase=BatchPhase.DECODE,
         sampling_params=[SamplingParams(logprobs=True, seed=1)] * 2,
     )

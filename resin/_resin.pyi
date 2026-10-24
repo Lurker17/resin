@@ -36,23 +36,21 @@ class BatchPlan:
     `token_indptr` is the CSR row pointer, so sequence `i` owns
     `token_ids[token_indptr[i]:token_indptr[i + 1]]`.
 
-    `context_lengths[i]` is the number of tokens processed before this step,
-    so that sequence's new tokens occupy consecutive absolute positions
-    beginning there. `cache_groups` contains one placement plan per declared
-    `CacheLayout` group, and every group plan covers every sequence.
-    `prefill_lengths` records the final endpoint of each prefill history,
-    including generated inputs being reconstructed after retraction. It stays
-    fixed across those prefill chunks and is only meaningful during prefill.
-    Public constructors that omit it infer each endpoint from its scheduled end.
+    - `context_lengths`: Tokens already processed per sequence; new token
+      positions start here.
+    - `prefill_lengths`: Prefill endpoints, fixed across chunks, including
+      retraction replay. Defaults to each row's scheduled end.
+    - `cache_groups`: One placement plan per `CacheLayout` group, covering
+      every sequence.
     """
     def __new__(
         cls,
         /,
+        *,
         sequence_ids: Sequence[int] | npt.NDArray[np.uint64],
         context_lengths: Sequence[int] | npt.NDArray[np.uint32],
         token_ids: Sequence[int] | npt.NDArray[np.uint32],
         token_indptr: Sequence[int] | npt.NDArray[np.uint32],
-        *,
         prefill_lengths: Sequence[int] | npt.NDArray[np.uint32] | None = None,
         phase: BatchPhase = ...,
         batch_id: int = 0,

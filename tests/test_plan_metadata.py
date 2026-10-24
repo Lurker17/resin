@@ -20,7 +20,13 @@ from resin.backend.plan_transport import PlanTransport
 
 def test_prefill_lengths_are_owned_readonly_views_with_legacy_endpoint_defaults():
     lengths = np.array([20, 30], dtype=np.uint32)
-    plan = BatchPlan([1, 2], [4, 8], [10, 11, 12], [0, 2, 3], prefill_lengths=lengths)
+    plan = BatchPlan(
+        sequence_ids=[1, 2],
+        context_lengths=[4, 8],
+        token_ids=[10, 11, 12],
+        token_indptr=[0, 2, 3],
+        prefill_lengths=lengths,
+    )
     lengths[:] = 99
     view = plan.prefill_lengths
     assert view.dtype == np.uint32 and not view.flags.writeable
@@ -31,24 +37,47 @@ def test_prefill_lengths_are_owned_readonly_views_with_legacy_endpoint_defaults(
     del plan
     assert view.tolist() == [20, 30]
 
-    legacy = BatchPlan([1, 2], [4, 8], [10, 11, 12], [0, 2, 3])
+    legacy = BatchPlan(
+        sequence_ids=[1, 2],
+        context_lengths=[4, 8],
+        token_ids=[10, 11, 12],
+        token_indptr=[0, 2, 3],
+    )
     assert legacy.prefill_lengths.tolist() == [6, 9]
     with pytest.raises(ValueError, match="prefill_lengths.*one item per sequence"):
-        BatchPlan([1, 2], [4, 8], [10, 11, 12], [0, 2, 3], prefill_lengths=[20])
+        BatchPlan(
+            sequence_ids=[1, 2],
+            context_lengths=[4, 8],
+            token_ids=[10, 11, 12],
+            token_indptr=[0, 2, 3],
+            prefill_lengths=[20],
+        )
     with pytest.raises(ValueError, match="prefill_lengths must cover"):
-        BatchPlan([1, 2], [4, 8], [10, 11, 12], [0, 2, 3], prefill_lengths=[5, 9])
+        BatchPlan(
+            sequence_ids=[1, 2],
+            context_lengths=[4, 8],
+            token_ids=[10, 11, 12],
+            token_indptr=[0, 2, 3],
+            prefill_lengths=[5, 9],
+        )
     edge = BatchPlan(
-        [1, 2],
-        [0, 2**32 - 2],
-        [10, 11, 12],
-        [0, 2, 3],
+        sequence_ids=[1, 2],
+        context_lengths=[0, 2**32 - 2],
+        token_ids=[10, 11, 12],
+        token_indptr=[0, 2, 3],
         prefill_lengths=[20, 2**32 - 1],
     )
     assert edge.prefill_lengths.tolist() == [20, 2**32 - 1]
 
 
 def test_prefill_lengths_survive_packed_follower_transport():
-    plan = BatchPlan([1, 2], [4, 8], [10, 11, 12], [0, 2, 3], prefill_lengths=[20, 30])
+    plan = BatchPlan(
+        sequence_ids=[1, 2],
+        context_lengths=[4, 8],
+        token_ids=[10, 11, 12],
+        token_indptr=[0, 2, 3],
+        prefill_lengths=[20, 30],
+    )
     packet = PlanTransport().prepare(plan)
     restored = PlanTransport().restore(packet)
     assert restored.prefill_lengths.tolist() == [20, 30]

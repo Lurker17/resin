@@ -167,10 +167,10 @@ class TestFlatCacheApi:
             [1, 0],
         )
         plan = BatchPlan(
-            [11],
-            [1],
-            [8, 9],
-            [0, 2],
+            sequence_ids=[11],
+            context_lengths=[1],
+            token_ids=[8, 9],
+            token_indptr=[0, 2],
             cache_groups=[group],
         )
 

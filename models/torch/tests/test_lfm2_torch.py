@@ -214,10 +214,10 @@ class TestLfm2Torch:
         runner.forward_calls = 0
 
         prefill = BatchPlan(
-            [17, 23],
-            [0, 0],
-            [1, 2, 8],
-            [0, 2, 3],
+            sequence_ids=[17, 23],
+            context_lengths=[0, 0],
+            token_ids=[1, 2, 8],
+            token_indptr=[0, 2, 3],
         )
         first = runner.forward(prefill)
         assert first.token_indptr.tolist() == [0, 1, 2]
@@ -225,10 +225,10 @@ class TestLfm2Torch:
         assert runner.live_cache_count == 2
 
         decode = BatchPlan(
-            [17, 23],
-            [2, 1],
-            first.token_ids,
-            [0, 1, 2],
+            sequence_ids=[17, 23],
+            context_lengths=[2, 1],
+            token_ids=first.token_ids,
+            token_indptr=[0, 1, 2],
             phase=BatchPhase.DECODE,
         )
         second = runner.forward(decode)

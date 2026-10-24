@@ -166,10 +166,10 @@ def _replace_group(plan, index, **changes):
     }
     groups[index] = CacheGroupPlan(**(fields | changes))
     return BatchPlan(
-        plan.sequence_ids,
-        plan.context_lengths,
-        plan.token_ids,
-        plan.token_indptr,
+        sequence_ids=plan.sequence_ids,
+        context_lengths=plan.context_lengths,
+        token_ids=plan.token_ids,
+        token_indptr=plan.token_indptr,
         phase=plan.phase,
         cache_groups=groups,
         sampling_params=plan.sampling_params,

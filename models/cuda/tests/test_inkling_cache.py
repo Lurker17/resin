@@ -65,10 +65,10 @@ def test_layer_page_ids_use_slab_units_not_combined_block_ids() -> None:
 def test_decode_lookahead_leases_the_second_attention_block() -> None:
     layout = CacheGeometry().layout(20)
     plan = BatchPlan(
-        [9],
-        [127],
-        [42],
-        [0, 1],
+        sequence_ids=[9],
+        context_lengths=[127],
+        token_ids=[42],
+        token_indptr=[0, 1],
         phase=BatchPhase.DECODE,
         cache_groups=[
             _group(

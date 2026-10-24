@@ -347,14 +347,12 @@ impl SamplingParams {
 /// `token_indptr` is the CSR row pointer, so sequence `i` owns
 /// `token_ids[token_indptr[i]:token_indptr[i + 1]]`.
 ///
-/// `context_lengths[i]` is the number of tokens processed before this step,
-/// so that sequence's new tokens occupy consecutive absolute positions
-/// beginning there. `cache_groups` contains one placement plan per declared
-/// `CacheLayout` group, and every group plan covers every sequence.
-/// `prefill_lengths` records the final endpoint of each prefill history,
-/// including generated inputs being reconstructed after retraction. It stays
-/// fixed across those prefill chunks and is only meaningful during prefill.
-/// Public constructors that omit it infer each endpoint from its scheduled end.
+/// - `context_lengths`: Tokens already processed per sequence; new token
+///   positions start here.
+/// - `prefill_lengths`: Prefill endpoints, fixed across chunks, including
+///   retraction replay. Defaults to each row's scheduled end.
+/// - `cache_groups`: One placement plan per `CacheLayout` group, covering
+///   every sequence.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct BatchPlan {
@@ -664,11 +662,11 @@ impl BatchPlan {
 
     #[new]
     #[pyo3(signature = (
+        *,
         sequence_ids,
         context_lengths,
         token_ids,
         token_indptr,
-        *,
         prefill_lengths = None,
         phase = BatchPhase::Prefill,
         batch_id = 0,

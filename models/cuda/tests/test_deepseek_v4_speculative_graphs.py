@@ -133,10 +133,10 @@ def test_distributed_speculative_graph_selection_includes_verification_lookahead
     runner, _ = _runner()
     selected, replayed = [], []
     plan = BatchPlan(
-        [7, 8],
-        [14, 25],
-        [2, 3],
-        [0, 1, 2],
+        sequence_ids=[7, 8],
+        context_lengths=[14, 25],
+        token_ids=[2, 3],
+        token_indptr=[0, 1, 2],
         phase=BatchPhase.DECODE,
         sampling_params=[SamplingParams(logprobs=needs_logprobs)] * 2,
     )
@@ -222,10 +222,10 @@ def test_speculative_graph_scores_only_accepted_verification_positions(logprobs)
 
     runner._run_cuda_graph = replay
     plan = BatchPlan(
-        [7, 8],
-        [14, 25],
-        [2, 3],
-        [0, 1, 2],
+        sequence_ids=[7, 8],
+        context_lengths=[14, 25],
+        token_ids=[2, 3],
+        token_indptr=[0, 1, 2],
         phase=BatchPhase.DECODE,
         sampling_params=[SamplingParams(logprobs=logprobs, seed=1)] * 2,
     )

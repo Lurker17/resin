@@ -151,10 +151,10 @@ def test_missing_requested_prompt_scores_poison_without_partial_progress():
 
 def test_prompt_metadata_survives_follower_transport():
     plan = BatchPlan(
-        [1],
-        [0],
-        [1, 2],
-        [0, 2],
+        sequence_ids=[1],
+        context_lengths=[0],
+        token_ids=[1, 2],
+        token_indptr=[0, 2],
         sampling_params=[SamplingParams(prompt_logprobs=True, prompt_top_logprobs=3)],
         prompt_score_indices=[0, 1],
         prompt_score_token_ids=[2, 3],
@@ -233,10 +233,10 @@ def test_invalid_prompt_columns_leave_scores_unpublished(bad_scores, monkeypatch
 def test_projection_and_normalization_are_shared_and_bounded(monkeypatch):
     count = 513
     plan = BatchPlan(
-        [1],
-        [0],
-        [0] * count,
-        [0, count],
+        sequence_ids=[1],
+        context_lengths=[0],
+        token_ids=[0] * count,
+        token_indptr=[0, count],
         prompt_score_indices=list(range(count)),
         prompt_score_token_ids=[1] * count,
         prompt_score_indptr=[0, count],
@@ -276,10 +276,10 @@ def test_projection_and_normalization_are_shared_and_bounded(monkeypatch):
 
 def test_shared_columns_join_per_sequence_rows_without_losing_empty_score_groups():
     plan = BatchPlan(
-        [1, 2],
-        [0, 0],
-        [1, 2, 3, 4],
-        [0, 2, 4],
+        sequence_ids=[1, 2],
+        context_lengths=[0, 0],
+        token_ids=[1, 2, 3, 4],
+        token_indptr=[0, 2, 4],
         sampling_params=[
             SamplingParams(prompt_logprobs=True),
             SamplingParams(prompt_top_logprobs=2),

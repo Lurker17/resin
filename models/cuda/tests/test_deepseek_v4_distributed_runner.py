@@ -192,8 +192,20 @@ def _context(groups, phase, sizes, plan):
 def test_ragged_prefill_replicas_enter_the_same_expert_rounds(monkeypatch, policy):
     parallelism = Parallelism(world_size=4, ep=4, attn_dp=2)
     plans = (
-        BatchPlan([7, 8], [0, 9], [2, 3, 4, 5, 6], [0, 3, 5], phase=BatchPhase.PREFILL),
-        BatchPlan([7], [0], [9], [0, 1], phase=BatchPhase.PREFILL),
+        BatchPlan(
+            sequence_ids=[7, 8],
+            context_lengths=[0, 9],
+            token_ids=[2, 3, 4, 5, 6],
+            token_indptr=[0, 3, 5],
+            phase=BatchPhase.PREFILL,
+        ),
+        BatchPlan(
+            sequence_ids=[7],
+            context_lengths=[0],
+            token_ids=[9],
+            token_indptr=[0, 1],
+            phase=BatchPhase.PREFILL,
+        ),
     )
     runners = []
     for rank, plan in zip((0, 2), plans, strict=True):
@@ -241,7 +253,13 @@ def test_idle_replica_joins_experts_without_staging_or_touching_cache(
 def test_decode_keeps_the_replica_batch_and_cache_namespace(monkeypatch):
     groups = _groups(Parallelism(world_size=4, ep=4, attn_dp=4), rank=2)
     runner = _runner(monkeypatch, groups)
-    plan = BatchPlan([7, 8], [14, 25], [2, 3], [0, 1, 2], phase=BatchPhase.DECODE)
+    plan = BatchPlan(
+        sequence_ids=[7, 8],
+        context_lengths=[14, 25],
+        token_ids=[2, 3],
+        token_indptr=[0, 1, 2],
+        phase=BatchPhase.DECODE,
+    )
 
     assert runner.forward_distributed(
         plan,
@@ -279,10 +297,10 @@ def test_speculative_decode_fallback_preserves_ragged_acceptance_and_state(
 
     runner._sampler = sample
     plan = BatchPlan(
-        [7, 8],
-        [14, 25],
-        [2, 3],
-        [0, 1, 2],
+        sequence_ids=[7, 8],
+        context_lengths=[14, 25],
+        token_ids=[2, 3],
+        token_indptr=[0, 1, 2],
         phase=BatchPhase.DECODE,
         sampling_params=[SamplingParams(logprobs=logprobs, seed=1)] * 2,
     )
@@ -348,7 +366,11 @@ def test_speculative_prefill_only_joins_target_expert_rounds(monkeypatch):
     runner.speculative_tokens = 2
     runner._model = _SpeculativeModel()
     plan = BatchPlan(
-        [7, 8], [0, 9], [2, 3, 4, 5, 6], [0, 3, 5], phase=BatchPhase.PREFILL
+        sequence_ids=[7, 8],
+        context_lengths=[0, 9],
+        token_ids=[2, 3, 4, 5, 6],
+        token_indptr=[0, 3, 5],
+        phase=BatchPhase.PREFILL,
     )
     context = _context(groups, BatchPhase.PREFILL, ((2, 5), (3, 7)), plan)
 
@@ -387,7 +409,13 @@ def test_eager_decode_preserves_fixed_row_gemm_selection(monkeypatch, phase):
         return original(*args, **kwargs)
 
     setattr(runner._model, method_name, execute)
-    plan = BatchPlan([7], [0], [2], [0, 1], phase=phase)
+    plan = BatchPlan(
+        sequence_ids=[7],
+        context_lengths=[0],
+        token_ids=[2],
+        token_indptr=[0, 1],
+        phase=phase,
+    )
     previous_dtype = torch.get_default_dtype()
     assert runner.forward_distributed(
         plan, _context(groups, phase, ((1, 1),), plan)
@@ -403,7 +431,13 @@ def test_eager_decode_preserves_fixed_row_gemm_selection(monkeypatch, phase):
 def test_distributed_metadata_is_validated_before_model_or_cache_work(monkeypatch):
     groups = _groups(Parallelism(world_size=4, ep=4, attn_dp=4))
     runner = _runner(monkeypatch, groups)
-    plan = BatchPlan([7], [0], [2], [0, 1], phase=BatchPhase.PREFILL)
+    plan = BatchPlan(
+        sequence_ids=[7],
+        context_lengths=[0],
+        token_ids=[2],
+        token_indptr=[0, 1],
+        phase=BatchPhase.PREFILL,
+    )
     context = _context(groups, BatchPhase.DECODE, ((1, 1),) * 4, plan)
 
     with pytest.raises(ValueError, match="metadata"):
@@ -439,7 +473,17 @@ def test_missing_graph_capture_is_rejected_in_worker_readiness_validation(
         }
     )
     runner._check_cuda_graphs = CudaRunner._check_cuda_graphs.__get__(runner)
-    plan = None if idle else BatchPlan([7], [0], [2], [0, 1], phase=phase)
+    plan = (
+        None
+        if idle
+        else BatchPlan(
+            sequence_ids=[7],
+            context_lengths=[0],
+            token_ids=[2],
+            token_indptr=[0, 1],
+            phase=phase,
+        )
+    )
     context = _context(
         groups, phase, ((0, 0) if idle else (1, 1), (1, 1), (0, 0), (0, 0)), plan
     )
@@ -473,7 +517,12 @@ def test_managed_cache_addresses_are_validated_before_expert_rounds(
         append_block_offsets=[0],
     )
     plan = BatchPlan(
-        [7], [0], [2], [0, 1], phase=BatchPhase.PREFILL, cache_groups=[group]
+        sequence_ids=[7],
+        context_lengths=[0],
+        token_ids=[2],
+        token_indptr=[0, 1],
+        phase=BatchPhase.PREFILL,
+        cache_groups=[group],
     )
     context = _context(
         groups, BatchPhase.PREFILL, ((1, 1), (0, 0), (0, 0), (0, 0)), plan
@@ -498,7 +547,17 @@ def test_managed_cache_addresses_are_validated_before_expert_rounds(
 def test_prepared_distributed_batch_is_reused_without_revalidating(monkeypatch, idle):
     groups = _groups(Parallelism(world_size=4, ep=4, attn_dp=4))
     runner = _runner(monkeypatch, groups)
-    plan = None if idle else BatchPlan([7], [0], [2], [0, 1], phase=BatchPhase.PREFILL)
+    plan = (
+        None
+        if idle
+        else BatchPlan(
+            sequence_ids=[7],
+            context_lengths=[0],
+            token_ids=[2],
+            token_indptr=[0, 1],
+            phase=BatchPhase.PREFILL,
+        )
+    )
     context = _context(
         groups,
         BatchPhase.PREFILL,
@@ -593,7 +652,13 @@ def test_distributed_graph_policies_and_composed_meshes_pass_preparation(
 def test_distributed_decode_graph_uses_the_domain_selected_bucket(monkeypatch):
     groups = _groups(Parallelism(world_size=4, ep=4, attn_dp=4), rank=2)
     runner = _runner(monkeypatch, groups)
-    plan = BatchPlan([7, 8], [14, 25], [2, 3], [0, 1, 2], phase=BatchPhase.DECODE)
+    plan = BatchPlan(
+        sequence_ids=[7, 8],
+        context_lengths=[14, 25],
+        token_ids=[2, 3],
+        token_indptr=[0, 1, 2],
+        phase=BatchPhase.DECODE,
+    )
     context = _context(
         groups, BatchPhase.DECODE, ((0, 0), (0, 0), (2, 2), (1, 1)), plan
     )
@@ -663,7 +728,13 @@ def test_missing_prefill_rounds_join_the_same_captured_ffn_regions(monkeypatch):
             runner._prefill_graph_active = False
 
     runner._distributed_prefill_graphs = captured_regions
-    plan = BatchPlan([7], [0], [2, 3], [0, 2], phase=BatchPhase.PREFILL)
+    plan = BatchPlan(
+        sequence_ids=[7],
+        context_lengths=[0],
+        token_ids=[2, 3],
+        token_indptr=[0, 2],
+        phase=BatchPhase.PREFILL,
+    )
     context = _context(
         groups, BatchPhase.PREFILL, ((1, 2), (3, 5), (0, 0), (0, 0)), plan
     )
@@ -693,10 +764,10 @@ def test_decode_graph_formats_logprobs_from_retained_graph_logits(monkeypatch):
 
     runner._run_cuda_graph = replay
     plan = BatchPlan(
-        [7, 8],
-        [14, 25],
-        [0, 0],
-        [0, 1, 2],
+        sequence_ids=[7, 8],
+        context_lengths=[14, 25],
+        token_ids=[0, 0],
+        token_indptr=[0, 1, 2],
         phase=BatchPhase.DECODE,
         sampling_params=[SamplingParams(logprobs=True, seed=1)] * 2,
     )

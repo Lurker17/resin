@@ -25,10 +25,10 @@ from resin.backend.plans import BatchView, CacheGroupView, PagedCachePlan, plan_
 
 def _plan() -> BatchPlan:
     return BatchPlan(
-        [10, 11],
-        [0, 2],
-        [1, 2, 3],
-        [0, 2, 3],
+        sequence_ids=[10, 11],
+        context_lengths=[0, 2],
+        token_ids=[1, 2, 3],
+        token_indptr=[0, 2, 3],
         sampling_mask=[True, True],
         cache_groups=[
             CacheGroupPlan(
@@ -132,10 +132,10 @@ def test_request_local_rows_check_cache_progress_and_vocabulary():
 
 def test_paged_attention_names_semantics_and_preserves_packed_addresses() -> None:
     plan = BatchPlan(
-        [10],
-        [0],
-        [1, 2, 3],
-        [0, 3],
+        sequence_ids=[10],
+        context_lengths=[0],
+        token_ids=[1, 2, 3],
+        token_indptr=[0, 3],
         cache_groups=[
             CacheGroupPlan(
                 0,
@@ -168,10 +168,10 @@ def test_paged_attention_names_semantics_and_preserves_packed_addresses() -> Non
 def test_paged_attention_lowers_unequal_rows_and_window_origins():
     offsets = [0, 1, 2, 1, 1, 2]
     plan = BatchPlan(
-        [10, 11, 12],
-        [0, 5, 17],
-        [1, 2, 3, 4, 5, 6],
-        [0, 3, 4, 6],
+        sequence_ids=[10, 11, 12],
+        context_lengths=[0, 5, 17],
+        token_ids=[1, 2, 3, 4, 5, 6],
+        token_indptr=[0, 3, 4, 6],
         cache_groups=[
             CacheGroupPlan(
                 0,
@@ -235,10 +235,10 @@ def test_paged_attention_lowers_unequal_rows_and_window_origins():
 def test_paged_cache_plan_validates_exact_leased_tables() -> None:
     layout = CacheLayout(2, [CacheGroupLayout(2)])
     plan = BatchPlan(
-        [10],
-        [1],
-        [3],
-        [0, 1],
+        sequence_ids=[10],
+        context_lengths=[1],
+        token_ids=[3],
+        token_indptr=[0, 1],
         phase=BatchPhase.DECODE,
         cache_groups=[
             CacheGroupPlan(
@@ -261,10 +261,10 @@ def test_paged_cache_plan_validates_exact_leased_tables() -> None:
 def test_paged_cache_plan_accepts_the_two_checkpoint_state_ring() -> None:
     layout = CacheLayout(2, [CacheGroupLayout(4, family=CacheGroupFamily.STATE)])
     plan = BatchPlan(
-        [10],
-        [11],
-        [3],
-        [0, 1],
+        sequence_ids=[10],
+        context_lengths=[11],
+        token_ids=[3],
+        token_indptr=[0, 1],
         cache_groups=[
             CacheGroupPlan(
                 0,
@@ -292,10 +292,10 @@ def test_source_free_window_plan_rejects_writes_that_discard_read_history(
     )
     token_count = 1 if decode else 6
     plan = BatchPlan(
-        [10],
-        [6],
-        list(range(6, 6 + token_count)),
-        [0, token_count],
+        sequence_ids=[10],
+        context_lengths=[6],
+        token_ids=list(range(6, 6 + token_count)),
+        token_indptr=[0, token_count],
         phase=BatchPhase.DECODE if decode else BatchPhase.PREFILL,
         cache_groups=[
             CacheGroupPlan(
@@ -370,10 +370,10 @@ def _mixed_cache_plan(*, decode: bool) -> tuple[BatchPlan, CacheLayout]:
             )
         )
     plan = BatchPlan(
-        [10, 11, 12],
-        contexts,
-        list(range(sum(lengths))),
-        [0, 3, 4, 9],
+        sequence_ids=[10, 11, 12],
+        context_lengths=contexts,
+        token_ids=list(range(sum(lengths))),
+        token_indptr=[0, 3, 4, 9],
         phase=BatchPhase.DECODE if decode else BatchPhase.PREFILL,
         cache_groups=groups,
     )
@@ -391,10 +391,10 @@ def _replace_plan_group(plan: BatchPlan, index: int, **fields: object) -> BatchP
     groups = list(plan.cache_groups)
     groups[index] = CacheGroupPlan(**group)
     return BatchPlan(
-        plan.sequence_ids,
-        plan.context_lengths,
-        plan.token_ids,
-        plan.token_indptr,
+        sequence_ids=plan.sequence_ids,
+        context_lengths=plan.context_lengths,
+        token_ids=plan.token_ids,
+        token_indptr=plan.token_indptr,
         prefill_lengths=plan.prefill_lengths,
         phase=plan.phase,
         cache_groups=groups,
@@ -508,10 +508,10 @@ def test_paged_cache_plan_keeps_decode_leases_wider_than_u32() -> None:
     context = 2**32 - 5
     block_tokens = 2**31 - 1
     plan = BatchPlan(
-        [10],
-        [context],
-        [1, 2, 3],
-        [0, 3],
+        sequence_ids=[10],
+        context_lengths=[context],
+        token_ids=[1, 2, 3],
+        token_indptr=[0, 3],
         phase=BatchPhase.DECODE,
         cache_groups=[
             CacheGroupPlan(

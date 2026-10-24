@@ -34,10 +34,10 @@ def rich_plan(batch_key):
         extra={"penalty": 0.1, "nested": {"tokens": [1, 2], "enabled": True}},
     )
     return BatchPlan(
-        [2**64 - 1, 2**63 + 13],
-        [6, 9],
-        [10, 11, 12],
-        [0, 2, 3],
+        sequence_ids=[2**64 - 1, 2**63 + 13],
+        context_lengths=[6, 9],
+        token_ids=[10, 11, 12],
+        token_indptr=[0, 2, 3],
         prefill_lengths=[20, 30],
         batch_id=2**64 - 1,
         batch_key=batch_key,
@@ -134,10 +134,10 @@ def test_request_registration_is_reused_across_prefill_and_decode(monkeypatch):
     payload = media()
     params = SamplingParams(temperature=0.25, extra={"unchanged": True})
     first = BatchPlan(
-        [1],
-        [0],
-        [7],
-        [0, 1],
+        sequence_ids=[1],
+        context_lengths=[0],
+        token_ids=[7],
+        token_indptr=[0, 1],
         prefill_lengths=[3],
         sampling_params=[params],
         media=[payload],
@@ -157,10 +157,10 @@ def test_request_registration_is_reused_across_prefill_and_decode(monkeypatch):
         (3, 12, BatchPhase.DECODE),
     ):
         plan = BatchPlan(
-            [1],
-            [context],
-            [token],
-            [0, 1],
+            sequence_ids=[1],
+            context_lengths=[context],
+            token_ids=[token],
+            token_indptr=[0, 1],
             phase=phase,
             sampling_params=[params],
             media=[payload],
@@ -175,7 +175,13 @@ def test_request_registration_is_reused_across_prefill_and_decode(monkeypatch):
 
 def test_restore_owns_step_arrays_and_registration_buffers():
     packet = PlanTransport().prepare(
-        BatchPlan([9], [0], [7, 200054, 9], [0, 3], media=[media()])
+        BatchPlan(
+            sequence_ids=[9],
+            context_lengths=[0],
+            token_ids=[7, 200054, 9],
+            token_indptr=[0, 3],
+            media=[media()],
+        )
     )
     packet = replace(
         packet,
@@ -203,14 +209,22 @@ def test_release_allows_new_request_with_same_id_without_invalidating_old_plan()
     sender, receiver = PlanTransport(), PlanTransport()
     original = media(0.25)
     first = receiver.restore(
-        sender.prepare(BatchPlan([4], [0], [7], [0, 1], media=[original]))
+        sender.prepare(
+            BatchPlan(
+                sequence_ids=[4],
+                context_lengths=[0],
+                token_ids=[7],
+                token_indptr=[0, 1],
+                media=[original],
+            )
+        )
     )
     replacement = media(0.75)
     second_plan = BatchPlan(
-        [4],
-        [0],
-        [7],
-        [0, 1],
+        sequence_ids=[4],
+        context_lengths=[0],
+        token_ids=[7],
+        token_indptr=[0, 1],
         media=[replacement],
         sampling_params=[SamplingParams(temperature=0)],
     )
@@ -238,11 +252,21 @@ def test_prepare_is_atomic_when_later_request_has_unsupported_media():
     sender = PlanTransport()
     payload = media()
     invalid = BatchPlan(
-        [1, 2], [0, 0], [7, 8], [0, 1, 2], media=[payload, CustomMedia()]
+        sequence_ids=[1, 2],
+        context_lengths=[0, 0],
+        token_ids=[7, 8],
+        token_indptr=[0, 1, 2],
+        media=[payload, CustomMedia()],
     )
     with pytest.raises(TypeError, match="media"):
         sender.prepare(invalid)
-    valid = BatchPlan([1, 2], [0, 0], [7, 8], [0, 1, 2], media=[payload, None])
+    valid = BatchPlan(
+        sequence_ids=[1, 2],
+        context_lengths=[0, 0],
+        token_ids=[7, 8],
+        token_indptr=[0, 1, 2],
+        media=[payload, None],
+    )
     assert len(sender.prepare(valid).registrations) == 2
 
 
@@ -261,15 +285,20 @@ def test_prepare_is_atomic_when_later_request_has_unsupported_media():
 def test_non_json_extra_is_rejected_without_registering_earlier_rows(extra):
     sender = PlanTransport()
     invalid = BatchPlan(
-        [1, 2],
-        [0, 0],
-        [7, 8],
-        [0, 1, 2],
+        sequence_ids=[1, 2],
+        context_lengths=[0, 0],
+        token_ids=[7, 8],
+        token_indptr=[0, 1, 2],
         sampling_params=[SamplingParams(), SamplingParams(extra=extra)],
     )
     with pytest.raises(TypeError, match=r"distributed SamplingParams.extra.*JSON"):
         sender.prepare(invalid)
-    valid = BatchPlan([1, 2], [0, 0], [7, 8], [0, 1, 2])
+    valid = BatchPlan(
+        sequence_ids=[1, 2],
+        context_lengths=[0, 0],
+        token_ids=[7, 8],
+        token_indptr=[0, 1, 2],
+    )
     assert len(sender.prepare(valid).registrations) == 2
 
 
@@ -284,7 +313,11 @@ def test_non_json_extra_is_rejected_without_registering_earlier_rows(extra):
 def test_json_native_extra_retains_values_and_container_types(extra, monkeypatch):
     sender, receiver = PlanTransport(), PlanTransport()
     plan = BatchPlan(
-        [1], [0], [7], [0, 1], sampling_params=[SamplingParams(extra=extra)]
+        sequence_ids=[1],
+        context_lengths=[0],
+        token_ids=[7],
+        token_indptr=[0, 1],
+        sampling_params=[SamplingParams(extra=extra)],
     )
     restored = receiver.restore(sender.prepare(plan))
     assert restored.sampling_params[0].extra == extra
@@ -305,16 +338,36 @@ def test_json_native_extra_retains_values_and_container_types(extra, monkeypatch
 def test_nonfinite_extra_remains_rejected_by_json_encoder(extra):
     sender = PlanTransport()
     plan = BatchPlan(
-        [1], [0], [7], [0, 1], sampling_params=[SamplingParams(extra=extra)]
+        sequence_ids=[1],
+        context_lengths=[0],
+        token_ids=[7],
+        token_indptr=[0, 1],
+        sampling_params=[SamplingParams(extra=extra)],
     )
     with pytest.raises(ValueError, match="JSON"):
         sender.prepare(plan)
-    assert len(sender.prepare(BatchPlan([1], [0], [7], [0, 1])).registrations) == 1
+    assert (
+        len(
+            sender.prepare(
+                BatchPlan(
+                    sequence_ids=[1],
+                    context_lengths=[0],
+                    token_ids=[7],
+                    token_indptr=[0, 1],
+                )
+            ).registrations
+        )
+        == 1
+    )
 
 
 def test_restore_is_atomic_and_requires_registration():
     sender, receiver = PlanTransport(), PlanTransport()
-    packet = sender.prepare(BatchPlan([1], [0], [7], [0, 1]))
+    packet = sender.prepare(
+        BatchPlan(
+            sequence_ids=[1], context_lengths=[0], token_ids=[7], token_indptr=[0, 1]
+        )
+    )
     with pytest.raises(ValueError, match="has not been registered"):
         receiver.restore(replace(packet, registrations=()))
     malformed = RequestRegistration(b'{"version":99}')
@@ -333,7 +386,11 @@ def test_restore_is_atomic_and_requires_registration():
     "damage", ["dtype", "strided", "magic", "version", "truncated", "trailing"]
 )
 def test_malformed_packet_cannot_commit_registrations(damage):
-    packet = PlanTransport().prepare(BatchPlan([1], [0], [7], [0, 1]))
+    packet = PlanTransport().prepare(
+        BatchPlan(
+            sequence_ids=[1], context_lengths=[0], token_ids=[7], token_indptr=[0, 1]
+        )
+    )
     receiver = PlanTransport()
     match damage:
         case "dtype":
@@ -370,7 +427,9 @@ def test_archive_accepts_unaligned_transport_storage():
 
 def test_clear_requires_registering_live_requests_again():
     sender = PlanTransport()
-    plan = BatchPlan([1], [0], [7], [0, 1])
+    plan = BatchPlan(
+        sequence_ids=[1], context_lengths=[0], token_ids=[7], token_indptr=[0, 1]
+    )
     assert len(sender.prepare(plan).registrations) == 1
     assert sender.prepare(plan).registrations == ()
     sender.clear()

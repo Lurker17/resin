@@ -18,10 +18,10 @@ def test_graph_rope_deltas_stay_on_host_and_match_eager_positions() -> None:
     # No CUDA operations are needed to prepare the graph's host metadata.
     runner.device = torch.device("cpu")
     plan = BatchPlan(
-        [1, 2],
-        [6, 9],
-        [1, 2],
-        [0, 1, 2],
+        sequence_ids=[1, 2],
+        context_lengths=[6, 9],
+        token_ids=[1, 2],
+        token_indptr=[0, 1, 2],
         phase=BatchPhase.DECODE,
         media=[_media(), None],
     )
@@ -73,19 +73,19 @@ def test_speculative_decode_capacity_includes_mtp_verification_lookahead() -> No
     runner.max_seq_len = 32
     runner.speculative_tokens = 3
     valid = BatchPlan(
-        [1],
-        [26],
-        [7],
-        [0, 1],
+        sequence_ids=[1],
+        context_lengths=[26],
+        token_ids=[7],
+        token_indptr=[0, 1],
         phase=BatchPhase.DECODE,
     )
     runner._validate_plan(valid)
 
     too_long = BatchPlan(
-        [1],
-        [28],
-        [7],
-        [0, 1],
+        sequence_ids=[1],
+        context_lengths=[28],
+        token_ids=[7],
+        token_indptr=[0, 1],
         phase=BatchPhase.DECODE,
     )
     with pytest.raises(ValueError, match="exceeds max_seq_len"):

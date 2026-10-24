@@ -477,10 +477,10 @@ class TestEngine:
     def test_public_batch_plan_validates_indptr(self) -> None:
         with pytest.raises(ValueError, match="end at the token count"):
             BatchPlan(
-                [7],
-                [0],
-                [1, 2],
-                [0, 1],
+                sequence_ids=[7],
+                context_lengths=[0],
+                token_ids=[1, 2],
+                token_indptr=[0, 1],
             )
 
     def test_rust_owns_flat_cache_allocation_and_sparse_group_metadata(self) -> None:

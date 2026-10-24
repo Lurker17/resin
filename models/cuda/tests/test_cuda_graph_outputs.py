@@ -65,7 +65,13 @@ def test_graph_output_preserves_acceptance_layout_and_owns_tokens(
     monkeypatch.setattr(
         gemma_runtime, "expand_gemma4_decode_batch", lambda batch, _: batch
     )
-    plan = BatchPlan([7, 8], [14, 25], [2, 3], [0, 1, 2], phase=BatchPhase.DECODE)
+    plan = BatchPlan(
+        sequence_ids=[7, 8],
+        context_lengths=[14, 25],
+        token_ids=[2, 3],
+        token_indptr=[0, 1, 2],
+        phase=BatchPhase.DECODE,
+    )
     pages = SimpleNamespace(kv_indptr=np.array([0, 1, 2]))
     batch = SimpleNamespace(
         token_ids=plan.token_ids, positions=plan.positions, local=pages, global_=pages
