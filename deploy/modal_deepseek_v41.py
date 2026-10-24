@@ -183,8 +183,6 @@ _http_server_processes: list[object] = []
     8000, startup_timeout=60 * 60, label="deepseek-v41", requires_proxy_auth=False
 )
 def serve_deepseek_v41() -> None:
-    import torch.multiprocessing
-
     from resin.backend.parallel import monitor_process_context
 
     model_volume.reload()
@@ -194,8 +192,11 @@ def serve_deepseek_v41() -> None:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    processes = torch.multiprocessing.spawn(
-        _serve_rank, args=(port,), nprocs=WORLD_SIZE, join=False
+    processes = resin.process.spawn(
+        _serve_rank,
+        args=(port,),
+        devices=[f"cuda:{rank}" for rank in range(WORLD_SIZE)],
+        join=False,
     )
     _http_server_processes.append(processes)
     monitor_process_context(processes, "deepseek-v41-http")

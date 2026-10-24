@@ -11,7 +11,7 @@ import time
 from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -424,12 +424,15 @@ def run_benchmark(
     expert_backend: str = "flashinfer",
     profile_graph_phases: bool = False,
     overlap: bool = True,
+    numa: Literal["auto", "off", "required"] = "auto",
     trace_dir: str | None = None,
 ) -> list[dict]:
     """One load and graph catalog for all compatible points in this sweep."""
     from resin.bench import BenchCase
 
     topology = parallelism or Parallelism()
+    if numa not in ("auto", "off", "required"):
+        raise ValueError("numa must be 'auto', 'off', or 'required'")
     if validate_model and model != "deepseek-v41":
         raise ValueError("checkpoint validation currently requires V4.1")
     if expert_backend not in ("flashinfer", "deepgemm"):
@@ -497,19 +500,28 @@ def run_benchmark(
     )
     with tempfile.TemporaryDirectory(prefix="resin-bench-") as directory:
         output = Path(directory) / "results.json"
-        if topology.world_size == 1:
-            _rank(0, 0, output, model, checkpoint, cases, topology, options)
-        else:
+        port = 0
+        if topology.world_size > 1:
             with socket.socket() as listener:
                 listener.bind(("127.0.0.1", 0))
                 port = listener.getsockname()[1]
-            torch.multiprocessing.spawn(
-                _rank,
-                args=(port, output, model, checkpoint, cases, topology, options),
-                nprocs=topology.world_size,
-                join=True,
-            )
-        return json.loads(output.read_text())
+        processes = resin.process.spawn(
+            _rank,
+            args=(port, output, model, checkpoint, cases, topology, options),
+            devices=[f"cuda:{rank}" for rank in range(topology.world_size)],
+            numa=numa,
+        )
+        records = json.loads(output.read_text())
+        placement = {
+            "mode": numa,
+            "bindings": [
+                None if binding is None else asdict(binding)
+                for binding in processes.placements
+            ],
+        }
+        for record in records:
+            record["numa"] = placement
+        return records
 
 
 def write_results(path: str | Path, records: list[dict]) -> None:

@@ -24,6 +24,7 @@ mod http_stop;
 mod media_payload;
 mod media_preprocess;
 mod metrics;
+mod numa;
 mod output;
 mod parallelism;
 mod planning;
@@ -2041,6 +2042,9 @@ mod _resin {
 
     #[pymodule_export]
     use crate::http_session::NativeHttpSession;
+
+    #[pymodule_export]
+    use crate::numa::{_numa_get_policy, _numa_set_policy};
 
     #[pymodule_export]
     use crate::recipe::{

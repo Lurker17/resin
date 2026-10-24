@@ -286,6 +286,7 @@ def main(
     expert_backend: str = "flashinfer",
     profile_graph_phases: bool = False,
     overlap: bool = True,
+    numa: str = "auto",
     trace_dir: str = "",
 ):
     from deploy.bench import write_results
@@ -366,6 +367,7 @@ def main(
         expert_backend=expert_backend,
         profile_graph_phases=profile_graph_phases,
         overlap=overlap,
+        numa=numa,
         trace_dir=remote_trace_dir or None,
         metadata={
             "git_commit": git_revision,

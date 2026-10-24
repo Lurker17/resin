@@ -1528,6 +1528,16 @@ def _media_from_buffers(
 def _media_to_buffers(
     media: MediaInput,
 ) -> tuple[bytes, tuple[npt.NDArray[Any], ...]]: ...
+def _numa_get_policy() -> tuple[int, list[int]]:
+    """
+    Read the calling thread's allocation policy without changing existing pages.
+    """
+
+def _numa_set_policy(mode: int, nodes: Sequence[int]) -> None:
+    """
+    Set the calling thread's allocation policy for subsequent allocations.
+    """
+
 def _runner_metrics_prometheus_protobuf(
     snapshot: RunnerMetrics, *, model_name: str, rank: int, attn_dp_rank: int
 ) -> bytes:

@@ -33,6 +33,7 @@ The focused contracts are:
 - [runner/kernel boundary](docs/kernel-boundary.md)
 - [authoring a CUDA model runner](docs/model-forward-pass.md)
 - [CUDA graph policies and startup](docs/cuda-graphs.md)
+- [NUMA placement before worker startup](docs/numa.md)
 - [engine metrics and Prometheus export](docs/metrics.md)
 - [CUDA model package boundaries](models/cuda/ARCHITECTURE.md)
 - [GPT-OSS execution and parallelism](docs/gpt-oss-parallelism.md)
@@ -55,6 +56,12 @@ fails.
 
 The control-plane tests do not require a GPU. Importing a concrete model module
 loads PyTorch; importing `resin` or a model package namespace does not.
+
+For one process per GPU,
+`resin.process.spawn(worker, args=(config,), devices=devices)` can apply NUMA
+placement before the child interpreter starts. Use
+`resin.numa.bind(...)` around `Process.start()` with an existing multiprocessing
+launcher. See [NUMA startup and placement limits](docs/numa.md).
 
 Install `resin-models-cuda`; it pulls in `resin[cuda]` for the shared
 accelerator runtime. Reusable device-neutral helpers live in `resin.backend`; CUDA

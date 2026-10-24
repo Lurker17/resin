@@ -4,6 +4,8 @@ Importing this module intentionally does not import an accelerator framework.
 Choose a separately installed model runner only when constructing an engine.
 """
 
+import resin.numa as numa
+import resin.process as process
 import resin.recipe as recipe
 import resin.server as server
 from resin._resin import (
@@ -60,6 +62,8 @@ __all__ = [
     "TokenLogprobs",
     "Runner",
     "__version__",
+    "numa",
+    "process",
     "recipe",
     "server",
 ]

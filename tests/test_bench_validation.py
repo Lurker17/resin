@@ -135,10 +135,26 @@ def test_adp8_validation_uses_natural_routing_and_acceptance(monkeypatch):
     monkeypatch.setattr(bench.torch.cuda, "device_count", lambda: 8)
     seen = []
 
-    def spawn(worker, *, args, nprocs, join):
+    class Listener:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def bind(self, address):
+            assert address == ("127.0.0.1", 0)
+
+        def getsockname(self):
+            return ("127.0.0.1", 12345)
+
+    monkeypatch.setattr(bench.socket, "socket", Listener)
+
+    def spawn(worker, *, args, devices, numa):
         _, output, model, checkpoint, cases, topology, options = args
         assert topology == Parallelism(world_size=8, attn_dp=8, ep=8)
-        assert nprocs == 8 and join
+        assert devices == [f"cuda:{rank}" for rank in range(8)]
+        assert numa == "auto"
         seen.append(options)
         Path(output).write_text(
             json.dumps(
@@ -150,8 +166,9 @@ def test_adp8_validation_uses_natural_routing_and_acceptance(monkeypatch):
                 ]
             )
         )
+        return SimpleNamespace(placements=[None] * 8)
 
-    monkeypatch.setattr(bench.torch.multiprocessing, "spawn", spawn)
+    monkeypatch.setattr(bench.resin.process, "spawn", spawn)
     report = bench.run_benchmark(
         "deepseek-v41",
         "unused",
@@ -164,6 +181,7 @@ def test_adp8_validation_uses_natural_routing_and_acceptance(monkeypatch):
     assert seen[0]["accepted_drafts"] is None
     assert not seen[0]["balanced_experts"]
     assert seen[0]["expert_backend"] == "deepgemm"
+    assert report[0]["numa"] == {"mode": "auto", "bindings": [None] * 8}
 
 
 def test_validation_cli_saves_all_driver_failures_before_raising(tmp_path, monkeypatch):
