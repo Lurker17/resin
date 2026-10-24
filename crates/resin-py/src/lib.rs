@@ -1376,6 +1376,7 @@ impl Engine {
 impl Engine {
     #[new]
     #[pyo3(signature = (runner, *, max_running_requests = 32, context_length = 32768, scheduler_config = None, eos_token_id = None, prefix_cache = false, overlap = true))]
+    #[allow(clippy::too_many_arguments, reason = "Python constructor exposes keyword configuration")]
     fn new(
         py: Python<'_>,
         runner: Py<PyAny>,

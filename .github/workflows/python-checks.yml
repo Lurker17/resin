@@ -1,4 +1,4 @@
-name: Python checks
+name: Checks
 
 on: push
 
@@ -6,6 +6,20 @@ permissions:
   contents: read
 
 jobs:
+  clippy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      # Rust's abi3-py311 bindings can use the runner's system Python 3.12.
+      PYO3_PYTHON: /usr/bin/python3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust and Clippy
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
   lint-and-types:
     # Match local development without installing the Linux-only CUDA runtime.
     runs-on: macos-latest
