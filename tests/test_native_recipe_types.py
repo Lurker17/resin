@@ -8,6 +8,7 @@ import weakref
 
 import numpy as np
 import pytest
+from output_helpers import forward_output
 from test_http_lifecycle import post, running_server
 from test_recipe import _byte_tokenizer
 
@@ -148,26 +149,6 @@ def test_parser_does_not_retain_media_or_the_rendered_prompt():
     assert parser.feed([]) == []
 
 
-def test_processed_media_owns_token_buffers_and_retains_only_its_payload():
-    ids = [10, 11]
-    span = resin.recipe.MediaTokens("<image>", ids, prefix="00:00 ", suffix=" ")
-    payload = object()
-    spans = [span]
-    processed = resin.recipe.ProcessedMedia(spans, payload)
-    ids.clear()
-    spans.clear()
-    span.token_ids.clear()
-    assert span.token_ids == [10, 11]
-    assert span.prefix == "00:00 " and span.suffix == " "
-    assert processed.spans[0].placeholder == "<image>"
-    assert processed.spans[0].token_ids == [10, 11]
-    assert processed.payload is payload
-    with pytest.raises(AttributeError):
-        setattr(span, "token_ids", [12])
-    with pytest.raises(AttributeError):
-        setattr(processed, "payload", None)
-
-
 def test_native_media_accounts_for_each_source():
     native = resin.recipe.InklingRecipe(tokenizer())
     valid = resin.recipe.Image(np.zeros((40, 40, 3), dtype=np.float32))
@@ -290,7 +271,7 @@ def test_native_http_lowering_matches_public_typed_messages():
     class Runner:
         def forward(self, plan):
             seen.extend(plan.token_ids.tolist())
-            return [backend.token_to_id("<eos>")]
+            return forward_output([backend.token_to_id("<eos>")])
 
     wire_messages = [
         {"role": "user", "content": "Go"},

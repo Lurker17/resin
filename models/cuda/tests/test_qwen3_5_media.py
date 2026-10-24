@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+from typing import Any
 
 import numpy as np
 import pytest
@@ -19,8 +20,8 @@ def _media() -> Qwen35Media:
     return Qwen35Media(
         token_ids=(2, 8, 8, 8, 8, 3),
         image_positions=(1, 2, 3, 4),
-        pixel_values=torch.ones(16, 12),
-        image_grid_thw=torch.tensor([[1, 4, 4]]),
+        pixel_values=np.ones((16, 12), dtype=np.float32),
+        image_grid_thw=np.array([[1, 4, 4]], dtype=np.int64),
         spatial_merge_size=2,
         image_token_id=8,
     )
@@ -40,6 +41,46 @@ def test_qwen_media_owns_pixels_cache_identity_and_mrope_positions() -> None:
     assert len(media.digest) == 64
     assert media.cache_key[0] == media.token_ids[0]
     assert media.cache_key[1] != media.token_ids[1]
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("pixel_values", torch.ones(16, 12)),
+        ("pixel_values", np.ones((16, 12), dtype=np.float64)),
+        ("image_grid_thw", torch.tensor([[1, 4, 4]])),
+        ("image_grid_thw", np.array([[1, 4, 4]], dtype=np.int32)),
+    ],
+)
+def test_qwen_media_requires_exact_numpy_storage(field: str, invalid: Any) -> None:
+    arrays: dict[str, Any] = {
+        "pixel_values": np.ones((16, 12), dtype=np.float32),
+        "image_grid_thw": np.array([[1, 4, 4]], dtype=np.int64),
+    }
+    arrays[field] = invalid
+    with pytest.raises(TypeError):
+        Qwen35Media(
+            (2, 8, 8, 8, 8, 3),
+            (1, 2, 3, 4),
+            **arrays,
+            spatial_merge_size=2,
+            image_token_id=8,
+        )
+
+
+def test_qwen_media_copies_strided_numpy_arrays_in_logical_order() -> None:
+    pixels = np.arange(16 * 24, dtype=np.float32).reshape(16, 24)[:, ::2]
+    grid = np.array([[1, 99, 4, 99, 4, 99]], dtype=np.int64)[:, ::2]
+    expected_pixels, expected_grid = pixels.copy(), grid.copy()
+    assert not pixels.flags.c_contiguous and not grid.flags.c_contiguous
+    media = Qwen35Media((2, 8, 8, 8, 8, 3), (1, 2, 3, 4), pixels, grid, 2, 8)
+    pixels.fill(0)
+    grid.fill(0)
+
+    np.testing.assert_array_equal(media.pixel_values, expected_pixels)
+    np.testing.assert_array_equal(media.image_grid_thw, expected_grid)
+    assert not np.shares_memory(media.pixel_values, pixels)
+    assert not np.shares_memory(media.image_grid_thw, grid)
 
 
 def test_qwen_media_keeps_adjacent_images_distinct_for_mrope() -> None:

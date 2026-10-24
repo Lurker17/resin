@@ -2,9 +2,9 @@
 
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
+from output_helpers import forward_output
 
 from deploy.gpt_oss_parallel_validation import (
     _Capture,
@@ -31,7 +31,7 @@ class _GraphRunner:
     def forward_distributed(self, plan, context):
         self.cuda_graph_stats["decode"]["replay_count"] += 1
         self._last_graph_logits = torch.tensor([[0.0, 1.0, 3.0], [9.0, 8.0, 7.0]])
-        return SimpleNamespace(token_ids=np.array([self.token], dtype=np.uint32))
+        return forward_output([self.token])
 
 
 def _plan():

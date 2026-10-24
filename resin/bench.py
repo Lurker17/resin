@@ -173,7 +173,7 @@ class BenchmarkRunner:
         if enqueue is None:
             return self.forward(plan)
         output = enqueue(plan, feedback=feedback)
-        if hasattr(output, "result"):
+        if callable(getattr(output, "result", None)):
             return _ObservedCompletion(self, plan, output)
         self._observe(plan)
         return output
@@ -186,7 +186,7 @@ class BenchmarkRunner:
         if prepared is not None:
             kwargs["prepared"] = prepared
         output = enqueue(plan, context, **kwargs)
-        if hasattr(output, "result"):
+        if callable(getattr(output, "result", None)):
             return _ObservedCompletion(self, plan, output)
         self._observe(plan)
         return output

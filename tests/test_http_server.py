@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from output_helpers import forward_output
 
 import resin
 from resin import Engine
@@ -12,10 +13,12 @@ from resin.server import HttpServer
 class IncrementingRunner:
     @staticmethod
     def forward(plan):
-        return [
-            plan.token_ids[end - 1] + 1
-            for _, end in map(plan.token_range, range(plan.num_sequences))
-        ]
+        return forward_output(
+            [
+                plan.token_ids[end - 1] + 1
+                for _, end in map(plan.token_range, range(plan.num_sequences))
+            ]
+        )
 
 
 class _Codec:

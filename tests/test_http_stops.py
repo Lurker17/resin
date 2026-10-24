@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 
 import pytest
+from output_helpers import forward_output
 from test_http_lifecycle import running_server
 
 import resin
@@ -40,10 +41,10 @@ class PiecesRunner:
         assert plan.num_sequences == 1
         if self.block and self.position:
             self.position = len(self.pieces)
-            return [list(range(1, len(self.pieces)))]
+            return forward_output([list(range(1, len(self.pieces)))])
         token = self.position
         self.position += 1
-        return [token]
+        return forward_output([token])
 
     def release(self, ids):
         self.released.extend(ids)

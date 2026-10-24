@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 import torch
+from output_helpers import forward_output
 
 from resin import (
     BatchPlan,
@@ -108,7 +109,7 @@ def test_token_output_ignores_unaccepted_padding_values(tokens):
 
 @dataclass
 class OutputRunner:
-    forward: Callable[[BatchPlan], ForwardOutput | list[int]]
+    forward: Callable[[BatchPlan], ForwardOutput]
     release: Callable[[list[int]], None] = lambda _: None
 
 
@@ -349,15 +350,15 @@ def test_top_alternatives_are_read_from_arrays_and_validated_even_past_eos():
 
 
 def test_requested_scores_cannot_silently_disappear():
-    engine = Engine(OutputRunner(forward=lambda plan: [3]))
+    engine = Engine(OutputRunner(forward=lambda plan: forward_output([3])))
     engine.submit([1], max_new_tokens=1, sampling_params=SamplingParams(logprobs=True))
     with pytest.raises(RuntimeError, match="requested token logprobs"):
         engine.step()
     assert engine.poisoned
 
 
-def test_plain_token_outputs_keep_the_original_contract():
-    engine = Engine(OutputRunner(forward=lambda plan: [3]))
+def test_token_only_native_outputs_need_no_logprob_columns():
+    engine = Engine(OutputRunner(forward=lambda plan: forward_output([3])))
     request = engine.submit([1], max_new_tokens=1)
     (event,) = engine.step()
     assert event.logprobs is None and request.take_result() == [3]

@@ -75,15 +75,14 @@ bound `CacheLayout`, not parallel plan formats.
 A runner implements:
 
 ```python
-def forward(
-    plan: BatchPlan,
-) -> ForwardOutput | Sequence[int] | Sequence[Sequence[int]]: ...
+def forward(plan: BatchPlan) -> ForwardOutput: ...
 ```
 
-The included runners return `ForwardOutput`: flat `uint32` token IDs and row
+Runners return `ForwardOutput`: flat `uint32` token IDs and row
 offsets, plus optional logprob columns. Shared `token_output` and `format_output`
 helpers materialize these arrays without boxing tensor tokens into Python
-scalars. Simple custom runners may still return integer sequences.
+scalars. This is the single output contract for token-only and scored results;
+raw integer sequences are rejected after execution and quarantine the batch.
 
 Prefill runners return one token for each sequence, including a placeholder ID
 for unsampled continuation or replay rows. A decode runner may

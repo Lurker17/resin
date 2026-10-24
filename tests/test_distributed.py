@@ -13,6 +13,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from output_helpers import forward_output
 
 from resin import (
     BatchPhase,
@@ -35,7 +36,7 @@ from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 
 @dataclass
 class LocalRunner:
-    forward: Callable[[BatchPlan], list[int]]
+    forward: Callable[[BatchPlan], ForwardOutput]
     runner_config: RunnerConfig = field(default_factory=RunnerConfig)
     bind_resources: Callable[[ResourceBinding], None] = lambda _: None
     release: Callable[[list[int]], None] = lambda _: None
@@ -161,6 +162,7 @@ class CollectiveRunner:
         output = (contributions[: plan.num_sequences] % 127).numpy().astype(np.uint32)
         np.testing.assert_array_equal(output, expected)
         if self.case == "malformed_output" and groups.rank == 0:
+            # Deliberately violate the native-only completed-result contract.
             return [[] for _ in output]
         # Exercise the same array handoff while coordinator metadata remains separate.
         scores = np.full(len(output), -0.25, np.float32)
@@ -226,7 +228,12 @@ def _run_case(groups, case):
                     engine.submit(
                         [7],
                         max_new_tokens=1,
-                        media=SimpleNamespace(injected=lambda: None),
+                        media=SimpleNamespace(
+                            token_ids=(7,),
+                            cache_key=(1,),
+                            token_spans=(),
+                            injected=lambda: None,
+                        ),
                     )
                 )
             steps = 0
@@ -303,7 +310,7 @@ def _tensor_only_case(groups):
             )
             values *= groups.attn_tp.local_rank + 1
             dist.all_reduce(values, group=groups.attn_tp.handle)
-            return (values % 127).tolist()
+            return forward_output((values % 127).tolist())
 
     runner = ForwardOnly()
     worker = DistributedWorker(runner, groups)
@@ -347,7 +354,7 @@ def _distributed_process(rank, world_size, rendezvous, directory):
         timeout=timedelta(seconds=20),
     )
     with pytest.raises(DistributedExecutionError, match="forward_distributed"):
-        DistributedWorker(LocalRunner(forward=lambda plan: [1]), groups)
+        DistributedWorker(LocalRunner(forward=lambda plan: forward_output([1])), groups)
     unsupported = CollectiveRunner(groups, "normal")
     setattr(unsupported, "parallelism_capabilities", ParallelismCapabilities())
     with pytest.raises(DistributedExecutionError, match="does not support attn_dp"):
@@ -533,7 +540,7 @@ def test_external_failure_preserves_native_resources_and_disables_cleanup():
     runner = LocalRunner(
         runner_config=RunnerConfig(cache_layout=CacheLayout(4, [CacheGroupLayout(2)])),
         bind_resources=lambda binding: None,
-        forward=lambda plan: [3],
+        forward=lambda plan: forward_output([3]),
         release=lambda ids: releases.extend(ids),
     )
     from resin import Engine
@@ -599,12 +606,16 @@ def test_single_rank_replica_keeps_preparation_local_and_skips_serialization(
             assert prepared[0] == context.step_id and prepared[1] is plan
             assert plan.media[0].callback() == 19
             self.calls += 1
-            return [3]
+            return forward_output([3])
 
     runner = PreparedRunner()
     engine = DistributedEngine(DistributedWorker(runner, _single_rank_groups()))
     request = engine.submit(
-        [1], max_new_tokens=1, media=SimpleNamespace(callback=lambda: 19)
+        [1],
+        max_new_tokens=1,
+        media=SimpleNamespace(
+            token_ids=(1,), cache_key=(1,), token_spans=(), callback=lambda: 19
+        ),
     )
     engine.step()
     assert request.take_result() == [3]
@@ -619,7 +630,7 @@ def test_control_failure_after_model_work_keeps_the_accepted_batch(monkeypatch):
     runner = LocalRunner(
         runner_config=RunnerConfig(cache_layout=CacheLayout(4, [CacheGroupLayout(2)])),
         bind_resources=lambda binding: None,
-        forward=lambda plan: calls.append(plan) or [3],
+        forward=lambda plan: calls.append(plan) or forward_output([3]),
         release=lambda ids: releases.extend(ids),
     )
     worker = DistributedWorker(runner, groups)

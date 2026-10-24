@@ -4,6 +4,7 @@ import json
 from collections.abc import Sequence
 
 import pytest
+from output_helpers import forward_output
 
 import resin
 from resin import BatchPhase, Engine
@@ -16,7 +17,9 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
 ):
     class Runner:
         def forward(self, plan):
-            return [1] if plan.phase == BatchPhase.PREFILL else [[2] * 40]
+            return forward_output(
+                [1] if plan.phase == BatchPhase.PREFILL else [[2] * 40]
+            )
 
     class Codec:
         def render(self, messages, *, tools=(), options=None):
@@ -134,7 +137,7 @@ def test_http_admission_passes_typed_messages_tools_and_render_controls():
 
     class Runner:
         def forward(self, plan):
-            return [3]
+            return forward_output([3])
 
     engine = Engine(Runner())
     session = _HttpSession(engine, Recipe())

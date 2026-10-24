@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from output_helpers import forward_output
 
 import resin
 from resin import BatchPlan, Engine, SamplingParams
@@ -16,7 +17,7 @@ class RecordingRunner:
 
     def forward(self, plan):
         self.plans.append(plan)
-        return [0] * plan.num_sequences
+        return forward_output([0] * plan.num_sequences)
 
 
 class TestSamplingContract:
@@ -118,10 +119,10 @@ class TestSamplingContract:
             def forward(self, plan):
                 self.plans.append(plan)
                 if plan.phase == resin.BatchPhase.PREFILL:
-                    return [1]
+                    return forward_output([1])
                 if len(self.plans) == 2:
-                    return [[2, 3, 4]]
-                return [[5]]
+                    return forward_output([[2, 3, 4]])
+                return forward_output([[5]])
 
         runner = BlockRunner()
         engine = Engine(runner)

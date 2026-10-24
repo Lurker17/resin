@@ -38,6 +38,8 @@ class MediaInput(Protocol):
     the Engine's ordinary prefix tree to distinguish equal placeholders backed
     by different media. ``token_spans`` marks ranges that must remain intact in
     one prefill row when a model uses bidirectional attention within media.
+    Both properties are required at admission; use an empty tuple for spans
+    when all prompt positions may be split across prefill chunks.
     """
 
     @property
@@ -74,9 +76,7 @@ class FinalizingResponseParser(ResponseParser, Protocol):
 class Runner(Protocol):
     """Execute one Engine-owned immutable plan synchronously."""
 
-    def forward(
-        self, plan: BatchPlan, /
-    ) -> ForwardOutput | Sequence[int] | Sequence[Sequence[int]]: ...
+    def forward(self, plan: BatchPlan, /) -> ForwardOutput: ...
 
 
 class RunnerCompletion(Protocol):
@@ -89,7 +89,7 @@ class RunnerCompletion(Protocol):
     @property
     def feedback(self) -> Any: ...
 
-    def result(self) -> ForwardOutput | Sequence[int] | Sequence[Sequence[int]]: ...
+    def result(self) -> ForwardOutput: ...
 
 
 class EnqueuingRunner(Runner, Protocol):
@@ -101,7 +101,7 @@ class EnqueuingRunner(Runner, Protocol):
 
     def enqueue(
         self, plan: BatchPlan, *, feedback: Any = None
-    ) -> RunnerCompletion | ForwardOutput | Sequence[int] | Sequence[Sequence[int]]: ...
+    ) -> RunnerCompletion | ForwardOutput: ...
 
 
 class ManagedRunner(Runner, Protocol):

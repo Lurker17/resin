@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pytest
+from output_helpers import forward_output
 
 from resin import (
     BatchPhase,
@@ -13,6 +15,7 @@ from resin import (
     CacheLayout,
     CacheRetention,
     Engine,
+    ForwardOutput,
     ResourceBinding,
     RunnerConfig,
     SchedulerConfig,
@@ -24,12 +27,14 @@ class RecordingRunner:
         self.plans: list[BatchPlan] = []
         self.released: list[int] = []
 
-    def forward(self, plan: BatchPlan) -> list[int]:
+    def forward(self, plan: BatchPlan) -> ForwardOutput:
         self.plans.append(plan)
-        return [
-            plan.token_ids[end - 1] + 1
-            for _, end in map(plan.token_range, range(plan.num_sequences))
-        ]
+        return forward_output(
+            [
+                plan.token_ids[end - 1] + 1
+                for _, end in map(plan.token_range, range(plan.num_sequences))
+            ]
+        )
 
     def release(self, request_ids: list[int]) -> None:
         self.released.extend(request_ids)
@@ -51,12 +56,12 @@ class ControlledRunner:
         self.plans: list[BatchPlan] = []
         self.released: list[int] = []
 
-    def forward(self, plan: BatchPlan) -> list[int]:
+    def forward(self, plan: BatchPlan) -> ForwardOutput:
         self.plans.append(plan)
         if self.forward_failures:
             self.forward_failures -= 1
             raise RuntimeError("forward rejected")
-        return self.results.pop(0)
+        return forward_output(self.results.pop(0))
 
     def release(self, request_ids: list[int]) -> None:
         self.released.extend(request_ids)
@@ -184,7 +189,7 @@ class TestSchedulerConfigContract:
     def test_continuation_capability_is_exact_and_only_read_when_enabled(self) -> None:
         class Missing:
             def forward(self, plan):
-                return [0] * plan.num_sequences
+                return forward_output([0] * plan.num_sequences)
 
         class FalseRunner(Missing):
             runner_config = RunnerConfig(continuation_prefill=False)
@@ -291,7 +296,7 @@ class TestSchedulerConfigContract:
         assert plan.phase == BatchPhase.PREFILL
         assert plan.sampling_mask.tolist() == [False, True, True]
         assert plan.num_sequences == 3
-        assert len(RecordingRunner().forward(plan)) == 3
+        assert len(RecordingRunner().forward(plan).token_ids) == 3
         with pytest.raises(AttributeError):
             setattr(plan, "sampling_mask", [True, False, False])
 
@@ -326,9 +331,10 @@ class TestSchedulerConfigContract:
 
         runner = ChunkedRunner()
         engine = Engine(runner)
-        payload = {"image": object()}
-        # The native plan carries opaque model-owned payloads unchanged.
-        engine.submit([1, 2, 3], max_new_tokens=2, media=payload)  # ty: ignore[invalid-argument-type]
+        payload = SimpleNamespace(
+            token_ids=(1, 2, 3), cache_key=(1, 2, 3), token_spans=(), image=object()
+        )
+        engine.submit([1, 2, 3], max_new_tokens=2, media=payload)
 
         while engine.has_work():
             engine.step()
@@ -343,13 +349,14 @@ class TestSchedulerConfigContract:
     def test_media_can_supply_its_own_token_ids(self) -> None:
         class Media:
             token_ids = [4, 5]
+            cache_key = (4, 5)
+            token_spans = ()
 
         runner = RecordingRunner()
         engine = Engine(runner)
         media = Media()
 
-        # Minimal media fixture exercises token-id duck typing.
-        engine.submit(max_new_tokens=1, media=media)  # ty: ignore[invalid-argument-type]
+        engine.submit(max_new_tokens=1, media=media)
         engine.step()
 
         assert runner.plans[0].token_ids.tolist() == [4, 5]
@@ -357,6 +364,36 @@ class TestSchedulerConfigContract:
 
         with pytest.raises(ValueError, match="only when media supplies"):
             engine.submit(max_new_tokens=1)
+
+    @pytest.mark.parametrize("missing", ["cache_key", "token_spans"])
+    @pytest.mark.parametrize("tokens", [None, [1, 2]])
+    def test_incomplete_media_is_rejected_before_admission(self, missing, tokens):
+        runner = RecordingRunner()
+        engine = Engine(runner)
+        media = SimpleNamespace(token_ids=(1, 2), cache_key=(1, 2), token_spans=())
+        delattr(media, missing)
+        with pytest.raises(AttributeError, match=missing):
+            engine.submit(tokens, max_new_tokens=1, media=media)
+        assert not engine.has_work() and not engine.poisoned
+        assert runner.plans == []
+
+    @pytest.mark.parametrize(
+        ("current", "legacy"),
+        [
+            ("cache_key", "cache_token_ids"),
+            ("token_spans", "prefill_atomic_spans"),
+        ],
+    )
+    def test_retired_media_attributes_do_not_satisfy_admission(self, current, legacy):
+        runner = RecordingRunner()
+        engine = Engine(runner)
+        media = SimpleNamespace(token_ids=(1, 2), cache_key=(1, 2), token_spans=())
+        setattr(media, legacy, getattr(media, current))
+        delattr(media, current)
+        with pytest.raises(AttributeError, match=current):
+            engine.submit(max_new_tokens=1, media=media)
+        assert not engine.has_work() and not engine.poisoned
+        assert runner.plans == []
 
     def test_batch_plan_phase_is_batch_homogeneous(self) -> None:
         prefill = BatchPlan(
@@ -630,7 +667,7 @@ class TestNativePolicyIntegration:
             scheduler_config=SchedulerConfig(prefill_chunk_size=1),
         )
         poisoned.submit([1, 2], 1)
-        with pytest.raises(RuntimeError, match="1 sequences"):
+        with pytest.raises(RuntimeError, match="output CSR offsets"):
             poisoned.step()
         assert poisoned.poisoned
 

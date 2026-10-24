@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from output_helpers import forward_output
 
 from resin import (
     BatchPhase,
@@ -82,7 +83,7 @@ def test_engine_quarantines_state_advanced_before_sampling_failure() -> None:
                 self.state += plan.num_tokens
                 if plan.phase == BatchPhase.DECODE:
                     raise ValueError("sampling failed after state update")
-                return [3]
+                return forward_output([3])
 
     runner = StatefulRunner()
     engine = Engine(runner)

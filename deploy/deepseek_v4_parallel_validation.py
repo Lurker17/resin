@@ -24,6 +24,7 @@ from deploy.graph_validation import (
 from resin import BatchPhase, Engine, Parallelism, SamplingParams, SchedulerConfig
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.backend.distributed import DistributedEngine, DistributedWorker
+from resin.backend.sampling import token_output
 from resin.backend.topology import ParallelGroups
 
 WORLD_SIZE = 4
@@ -38,10 +39,8 @@ SPECULATIVE_PROBE_TOKENS = 16
 def _output_lengths(output):
     if output is None:
         return []
-    if hasattr(output, "token_indptr"):
-        offsets = output.token_indptr
-        return [int(end - start) for start, end in zip(offsets[:-1], offsets[1:])]
-    return [len(row) for row in output]
+    offsets = output.token_indptr
+    return [int(end - start) for start, end in zip(offsets[:-1], offsets[1:])]
 
 
 class _ObservedRunner:
@@ -179,8 +178,7 @@ class _DecodeTrace:
         values = self.latest.detach().float().cpu()[:1].clone()
         if values.ndim != 2:
             raise AssertionError("decode trace requires one vocabulary row")
-        ids = getattr(output, "token_ids", output)
-        genuine = int(ids[0])
+        genuine = int(output.token_ids[0])
         advanced = genuine
         if self.forced_tokens is not None:
             if index >= len(self.forced_tokens):
@@ -195,7 +193,7 @@ class _DecodeTrace:
         self.input_token_ids.append(list(map(int, plan.token_ids)))
         self.positions.append(list(map(int, plan.positions)))
         self.graph_shapes.append(self.graph_shape)
-        return output if self.forced_tokens is None else [advanced]
+        return output if self.forced_tokens is None else token_output([advanced])
 
     def result(self):
         if not self.logits:

@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 import pytest
+from output_helpers import forward_output
 from recipe_fuzz.harness import Case, Part, normalize
 from recipe_fuzz.test_differential import ADAPTERS
 from test_http_lifecycle import post, running_server
@@ -40,7 +41,7 @@ def test_stock_recipe_http_events(recipe_adapter, stream, completion_reason):
             assert plan.num_sequences == 1
             token = output[self.step]
             self.step += 1
-            return [token]
+            return forward_output([token])
 
     with running_server(Runner(), adapter.codec) as (_, engine, _, errors, base, _):
         body = json.dumps(
@@ -144,7 +145,7 @@ def test_stock_recipe_stops_match_decoded_output(recipe_adapter, stream):
         def forward(self, plan):
             token = output[self.position]
             self.position += 1
-            return [token]
+            return forward_output([token])
 
     with running_server(Runner(), adapter.codec) as (_, engine, _, errors, base, _):
         with post(

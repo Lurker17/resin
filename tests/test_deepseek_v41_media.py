@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 from deepseek_recipe import ImageInfo, MultiModalData
+from output_helpers import forward_output
 from PIL import Image
 from recipe_fuzz.deepseek import DeepSeekV41Adapter
 from tokenizers import Tokenizer
@@ -162,9 +163,9 @@ def test_image_identity_changes_only_its_media_cache_identity(codec):
 
 
 def test_prepared_media_rejects_bad_layout_and_owns_patch_storage():
-    patches = torch.ones((1, 3, 14, 14), dtype=torch.bfloat16)
+    patches = np.ones((1, 3, 14, 14), dtype=np.float32)
     image = DeepSeekV41Image(1, patches, 1, 1, (0, 1, 2, 3))
-    patches.zero_()
+    patches.fill(0)
     assert np.all(image.patches == 1)
     media = DeepSeekV41Media((7, 129264, 129264, 129264, 129264), (image,))
     with pytest.raises(ValueError, match="different placeholder"):
@@ -185,7 +186,7 @@ def test_engine_slices_causal_image_spans_across_prefill_chunks(codec):
         @classmethod
         def forward(cls, plan):
             cls.contexts.append(plan)
-            return [7]
+            return forward_output([7])
 
     rendered = codec.render(
         [

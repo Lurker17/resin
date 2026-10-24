@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from output_helpers import forward_output
 
 from resin import BatchPhase, BatchPlan, SamplingParams
 from resin.backend.cuda.sampling import FlashInferSampler
@@ -145,12 +146,9 @@ def test_distributed_speculative_graph_selection_includes_verification_lookahead
         return (4, 128)
 
     runner._select_distributed_cuda_graph = select
+    graph_output = forward_output([[1], [2, 3]])
     runner._graph_forward = lambda *args, **kwargs: (
-        replayed.append((args, kwargs))
-        or [
-            [1],
-            [2, 3],
-        ]
+        replayed.append((args, kwargs)) or graph_output
     )
 
     used_graph, output = runner._distributed_decode_graph(plan, "context", "cache-plan")
@@ -163,7 +161,7 @@ def test_distributed_speculative_graph_selection_includes_verification_lookahead
         )
     ]
     assert used_graph
-    assert output == [[1], [2, 3]]
+    assert output is graph_output
     assert len(replayed) == 1
     assert replayed[0][0] == (plan, "cache-plan")
 

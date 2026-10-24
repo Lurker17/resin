@@ -368,17 +368,19 @@ Successful step commands do not use pickle or object collectives. Media buffers
 and JSON request descriptors are sent only on registration, never on repeated
 decode steps. Request policy and media stay unchanged until release. Distributed
 sampling `extra` values must be JSON data, and distributed media must use Resin's
-native payloads. Local execution retains support for arbitrary custom Python
-payloads.
+native payloads. Local execution accepts custom Python `MediaInput`
+implementations with the same required cache identity and token-span fields.
 
 ## Model callback
 
 A CP, EP, or attention-DP runtime implements:
 
 ```python
-def forward_distributed(self, plan: BatchPlan | None, context: StepContext):
+def forward_distributed(
+    self, plan: BatchPlan | None, context: StepContext
+) -> ForwardOutput | None:
     # Model-owned CP partitioning and expert communication, including plan=None.
-    # Return ordinary token rows or ForwardOutput on a nonempty driver.
+    # Return ForwardOutput for a local batch; idle ranks may return None.
     ...
 ```
 

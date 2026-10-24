@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from output_helpers import forward_output
 
 from resin import (
     BatchPhase,
@@ -63,7 +64,7 @@ def test_native_plans_keep_full_prefill_lengths_through_chunks():
 
         def forward(self, plan):
             self.plans.append(plan)
-            return [9] * plan.num_sequences
+            return forward_output([9] * plan.num_sequences)
 
     runner = Runner()
     engine = Engine(runner, context_length=64)
@@ -102,7 +103,7 @@ def test_prefix_replay_policy_caps_hits_and_preserves_shared_producer_pages(
 
         def forward(self, plan):
             self.plans.append(plan)
-            return [9] * plan.num_sequences
+            return forward_output([9] * plan.num_sequences)
 
     runner = Runner()
     with Engine(

@@ -12,6 +12,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from output_helpers import forward_output
 
 import resin._resin as native
 from resin import (
@@ -89,7 +90,7 @@ class _MediaRunner:
                 ],
             }
         )
-        return [7] * plan.num_sequences
+        return forward_output([7] * plan.num_sequences)
 
     def release(self, sequence_ids):
         for sequence_id in map(int, sequence_ids):

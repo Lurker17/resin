@@ -3,12 +3,14 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import pytest
+from output_helpers import forward_output
 
 from resin import (
     BatchPlan,
     CacheGroupLayout,
     CacheLayout,
     Engine,
+    ForwardOutput,
     ResourceBinding,
     RunnerConfig,
 )
@@ -21,7 +23,7 @@ def history_layout(parent_capacity: int, block_tokens: int = 2) -> CacheLayout:
 class RecordingRunner:
     def __init__(
         self,
-        results: list[list[int] | list[list[int]] | object] | None = None,
+        results: list[object] | None = None,
         *,
         failures: int = 0,
         release_error: BaseException | None = None,
@@ -49,7 +51,9 @@ class RecordingRunner:
             raise RuntimeError("forward rejected")
         if self.results:
             return self.results.pop(0)
-        return [plan.token_ids[end - 1] + 1 for end in plan.token_indptr[1:]]
+        return forward_output(
+            [plan.token_ids[end - 1] + 1 for end in plan.token_indptr[1:]]
+        )
 
     def release(self, request_ids: list[int]) -> None:
         if self.release_error is not None:
@@ -134,7 +138,7 @@ class TestEngineExecution:
 
     @pytest.mark.parametrize(
         ("malformed", "error_type"),
-        ((object(), TypeError), ([], RuntimeError)),
+        ((object(), TypeError), ([], TypeError), (forward_output([]), RuntimeError)),
     )
     def test_malformed_result_quarantines_after_forward_returns(
         self, malformed: object, error_type: type[BaseException]
@@ -159,7 +163,7 @@ class TestEngineExecution:
 
     def test_terminal_release_failure_quarantines_before_native_reuse(self) -> None:
         runner = RecordingRunner(
-            [[7]],
+            [forward_output([7])],
             release_error=RuntimeError("physical cleanup failed"),
             cache_layout=history_layout(1),
         )
@@ -226,7 +230,7 @@ class TestRunnerContractConstruction:
                 self.forward_calls = 0
 
             @property
-            def forward(self) -> Callable[[BatchPlan], list[int]]:
+            def forward(self) -> Callable[[BatchPlan], ForwardOutput]:
                 self.lookups["forward"] += 1
                 return self._forward
 
@@ -235,9 +239,9 @@ class TestRunnerContractConstruction:
                 self.lookups["release"] += 1
                 return lambda request_ids: None
 
-            def _forward(self, plan: BatchPlan) -> list[int]:
+            def _forward(self, plan: BatchPlan) -> ForwardOutput:
                 self.forward_calls += 1
-                return [2] * plan.num_sequences
+                return forward_output([2] * plan.num_sequences)
 
         runner = DescriptorRunner()
         engine = Engine(runner)
@@ -259,11 +263,11 @@ class TestRunnerContractConstruction:
             release = 7
 
             def forward(self, plan):
-                return [1]
+                return forward_output([1])
 
         class RaisingRelease:
             def forward(self, plan):
-                return [1]
+                return forward_output([1])
 
             @property
             def release(self):

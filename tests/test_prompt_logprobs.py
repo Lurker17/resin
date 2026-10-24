@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 import torch
+from output_helpers import forward_output
 
 from resin import (
     BatchPlan,
@@ -39,7 +40,7 @@ class TransitionRunner:
         last = torch.as_tensor(plan.token_indptr[1:].astype(np.int64) - 1)
         logits = hidden[last]
         if self.malformed:
-            return logits.argmax(-1).tolist()
+            return forward_output(logits.argmax(-1).tolist())
         return format_output(
             logits, logits.argmax(-1), plan, prompt_logprobs=prompt_scores(plan, hidden)
         )

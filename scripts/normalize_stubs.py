@@ -123,7 +123,6 @@ RETURNS = {
             ("Gemma4Media", "video_position_ids", "int64", True),
         )
     },
-    ("ProcessedMedia", "spans"): "tuple[MediaTokens, ...]",
     ("ParserEvent", "token_spans"): "tuple[TokenSpan, ...]",
     ("Message", "content"): "tuple[ContentBlock, ...]",
     ("RenderOptions", "reasoning_effort"): "str | int | float | None",

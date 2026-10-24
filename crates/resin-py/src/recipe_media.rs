@@ -1,22 +1,16 @@
 //! Typed media expansions and token placement, independent of model preprocessing.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
-use pyo3::{exceptions::PyValueError, prelude::*, types::PyTuple};
 use resin_recipe::{Encoder, Error, Prompt, PromptSpan};
 
 /// Explicit media IDs replacing one trusted template placeholder.
 ///
 /// Prefix and suffix are ordinary text and share BPE boundaries with nearby text.
-#[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
-#[derive(Clone)]
 pub(crate) struct MediaTokens {
-    #[pyo3(get)]
     placeholder: String,
-    token_ids: Arc<[u32]>,
-    #[pyo3(get)]
+    token_ids: Vec<u32>,
     prefix: String,
-    #[pyo3(get)]
     suffix: String,
 }
 impl MediaTokens {
@@ -28,65 +22,10 @@ impl MediaTokens {
     ) -> Self {
         Self {
             placeholder: placeholder.into(),
-            token_ids: token_ids.into(),
+            token_ids,
             prefix,
             suffix,
         }
-    }
-}
-#[pymethods]
-impl MediaTokens {
-    #[new]
-    #[pyo3(signature=(placeholder, token_ids, *, prefix=String::new(), suffix=String::new()))]
-    fn new(
-        placeholder: String,
-        token_ids: Vec<u32>,
-        prefix: String,
-        suffix: String,
-    ) -> PyResult<Self> {
-        if placeholder.is_empty() || token_ids.is_empty() {
-            return Err(PyValueError::new_err(
-                "media expansions need a placeholder and token IDs",
-            ));
-        }
-        Ok(Self {
-            placeholder,
-            token_ids: token_ids.into(),
-            prefix,
-            suffix,
-        })
-    }
-    #[getter]
-    fn token_ids(&self) -> Vec<u32> {
-        self.token_ids.to_vec()
-    }
-}
-
-/// Model-processed media expansions and an opaque payload retained until binding.
-#[pyclass(frozen, module = "resin._resin")]
-pub(crate) struct ProcessedMedia {
-    pub(crate) spans: Vec<MediaTokens>,
-    #[pyo3(get)]
-    payload: Py<PyAny>,
-}
-#[pymethods]
-impl ProcessedMedia {
-    #[new]
-    fn new(py: Python<'_>, spans: Vec<Py<MediaTokens>>, payload: Py<PyAny>) -> Self {
-        Self {
-            spans: spans.iter().map(|s| s.borrow(py).clone()).collect(),
-            payload,
-        }
-    }
-    #[getter]
-    fn spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let spans = self
-            .spans
-            .iter()
-            .cloned()
-            .map(|s| Py::new(py, s))
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(PyTuple::new(py, spans)?.unbind())
     }
 }
 
@@ -194,13 +133,12 @@ mod tests {
             .text("left ")
             .special("<image>")
             .text(" right<image>");
-        let media = [MediaTokens::new(
-            "<image>".into(),
+        let media = [MediaTokens::from_parts(
+            "<image>",
             vec![100, 101],
             "00:00 ".into(),
             "tail".into(),
-        )
-        .unwrap()];
+        )];
         let (ids, positions) = encode(prompt, &media, &TextEncoder).unwrap();
         assert_eq!(ids, [7, 100, 101, 8]);
         assert_eq!(positions, [(1, 2)]);
@@ -213,9 +151,9 @@ mod tests {
             .special("<image>")
             .special("<image>");
         let media = [
-            MediaTokens::new("<image>".into(), vec![10], String::new(), String::new()).unwrap(),
-            MediaTokens::new("<video>".into(), vec![20, 21], String::new(), String::new()).unwrap(),
-            MediaTokens::new("<image>".into(), vec![30], String::new(), String::new()).unwrap(),
+            MediaTokens::from_parts("<image>", vec![10], String::new(), String::new()),
+            MediaTokens::from_parts("<video>", vec![20, 21], String::new(), String::new()),
+            MediaTokens::from_parts("<image>", vec![30], String::new(), String::new()),
         ];
         let (ids, positions) = encode(prompt.clone(), &media, &TextEncoder).unwrap();
         assert_eq!(ids, [20, 21, 10, 30]);

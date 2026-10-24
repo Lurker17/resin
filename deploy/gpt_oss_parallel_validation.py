@@ -219,7 +219,7 @@ class _Capture:
                 )
             )
 
-    def record(self, logits, plan, tokens):
+    def record(self, logits, plan, token_ids):
         self.logits = logits.detach().float().cpu()
         if (
             self.original_sampler is not None
@@ -233,8 +233,7 @@ class _Capture:
                 if index >= len(self.expected_tokens):
                     raise RuntimeError("decode exceeded baseline history")
                 if not self.force_tokens:
-                    ids = getattr(tokens, "token_ids", tokens)
-                    actual = int(ids[0])
+                    actual = int(token_ids[0])
                     expected = self.expected_tokens[index]
                     if actual != expected:
                         raise AssertionError(
@@ -336,7 +335,7 @@ class _ObservedRunner:
         }
         logits = self.runner._last_graph_logits
         if plan is not None and logits is not None:
-            self.capture.record(logits[: plan.num_sequences], plan, result)
+            self.capture.record(logits[: plan.num_sequences], plan, result.token_ids)
         return result
 
 

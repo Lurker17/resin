@@ -16,8 +16,10 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+
 import resin
-from resin import BatchPhase, Engine, RunnerConfig
+from resin import BatchPhase, Engine, ForwardOutput, RunnerConfig
 from resin_models_cuda.deepseek_v41.cache import CacheGeometry
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,8 +44,11 @@ class DryRunner:
     def forward(self, plan):
         if self.started is not None:
             self.before_forward_ns = time.perf_counter_ns() - self.started
-        tokens = [3] * (self.accepted if plan.phase == BatchPhase.DECODE else 1)
-        return [tokens.copy() for _ in range(plan.num_sequences)]
+        width = self.accepted if plan.phase == BatchPhase.DECODE else 1
+        return ForwardOutput(
+            np.full(plan.num_sequences * width, 3, dtype=np.uint32),
+            np.arange(plan.num_sequences + 1, dtype=np.uint32) * width,
+        )
 
 
 def run_case(

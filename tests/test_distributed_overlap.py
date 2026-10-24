@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from output_helpers import forward_output
 
 from resin import CacheGroupLayout, CacheLayout, Parallelism, RunnerConfig
 from resin.backend.distributed import DistributedEngine, DistributedWorker
@@ -13,18 +14,12 @@ from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 
 
 class CpuCompletion:
-    def __init__(self, rows, positions):
-        self.rows = rows
-        self.feedback = SimpleNamespace(
-            tokens=[row[-1] for row in rows],
-            positions=[
-                position + len(row)
-                for position, row in zip(positions, rows, strict=True)
-            ],
-        )
+    def __init__(self, output, feedback):
+        self.output = output
+        self.feedback = feedback
 
     def result(self):
-        return self.rows
+        return self.output
 
 
 class ParallelRunner:
@@ -58,17 +53,30 @@ class ParallelRunner:
         self._join(context, False)
         if plan is None:
             return None
-        return [
-            [int(plan.token_ids[int(end) - 1]) + 1] for end in plan.token_indptr[1:]
-        ]
+        return forward_output(
+            [[int(plan.token_ids[int(end) - 1]) + 1] for end in plan.token_indptr[1:]]
+        )
 
     def enqueue_distributed(self, plan, context, *, feedback=None):
         self._join(context, True)
         if plan is None:
-            return CpuCompletion([], [])
-        tokens = plan.token_ids.tolist() if feedback is None else feedback.tokens
-        positions = plan.positions.tolist() if feedback is None else feedback.positions
-        return CpuCompletion([[token + 1, token + 2] for token in tokens], positions)
+            tokens, positions = [], []
+        else:
+            tokens = plan.token_ids.tolist() if feedback is None else feedback.tokens
+            positions = (
+                plan.positions.tolist() if feedback is None else feedback.positions
+            )
+        rows = [[token + 1, token + 2] for token in tokens]
+        return CpuCompletion(
+            forward_output(rows),
+            SimpleNamespace(
+                tokens=[row[-1] for row in rows],
+                positions=[
+                    position + len(row)
+                    for position, row in zip(positions, rows, strict=True)
+                ],
+            ),
+        )
 
 
 def _worker(rank, rendezvous):

@@ -2,7 +2,9 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock};
 
 use numpy::{PyArray1, PyArrayLike1, PyReadonlyArray1};
-use pyo3::exceptions::{PyAttributeError, PyMemoryError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{
+    PyAttributeError, PyMemoryError, PyRuntimeError, PyTypeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
@@ -681,7 +683,7 @@ impl BatchPlan {
         let token_ids = arrays::owned_vec(token_ids);
         let token_indptr = arrays::owned_vec(token_indptr);
         // Malformed CSR inputs are rejected by checked() below; deriving the
-        // compatibility default must not underflow before that validation.
+        // default prefill endpoint must not underflow before that validation.
         let prefill_lengths = prefill_lengths.map(arrays::owned_vec).unwrap_or_else(|| {
             context_lengths
                 .iter()
@@ -1243,7 +1245,7 @@ impl Engine {
                         return Err(error);
                     }
                 };
-                let asynchronous = match result.bind(py).hasattr("result") {
+                let asynchronous = match runner_result_is_async(result.bind(py)) {
                     Ok(asynchronous) => asynchronous,
                     Err(error) => {
                         self.failed_executions.push(result);
@@ -1325,7 +1327,7 @@ impl Engine {
             let enqueue = self.runner_enqueue.as_ref().expect("checked enqueue");
             match enqueue.bind(py).call1((&plan,)) {
                 Ok(output) => {
-                    let asynchronous = match output.hasattr("result") {
+                    let asynchronous = match runner_result_is_async(&output) {
                         Ok(asynchronous) => asynchronous,
                         Err(error) => {
                             self.failed_executions.push(output.unbind());
@@ -1563,17 +1565,7 @@ impl Engine {
             return Err(PyValueError::new_err("token_ids must be non-empty"));
         }
         let cache_prompt: Option<Vec<u32>> = match media.as_ref() {
-            Some(media) => match media.getattr(py, "cache_key") {
-                Ok(identity) => Some(identity.extract::<Vec<u32>>(py)?),
-                Err(error) if error.is_instance_of::<PyAttributeError>(py) => {
-                    match media.getattr(py, "cache_token_ids") {
-                        Ok(identity) => Some(identity.extract::<Vec<u32>>(py)?),
-                        Err(error) if error.is_instance_of::<PyAttributeError>(py) => None,
-                        Err(error) => return Err(error),
-                    }
-                }
-                Err(error) => return Err(error),
-            },
+            Some(media) => Some(media.getattr(py, "cache_key")?.extract::<Vec<u32>>(py)?),
             None => None,
         };
         if cache_prompt
@@ -1585,21 +1577,12 @@ impl Engine {
             ));
         }
         let atomic_prefill_spans = match media.as_ref() {
-            Some(media) => match media.getattr(py, "token_spans") {
-                Ok(spans) => spans
-                    .extract::<Vec<(u32, u32)>>(py)?
-                    .into_iter()
-                    .map(|(position, length)| (position, position.saturating_add(length)))
-                    .collect(),
-                Err(error) if error.is_instance_of::<PyAttributeError>(py) => {
-                    match media.getattr(py, "prefill_atomic_spans") {
-                        Ok(spans) => spans.extract::<Vec<(u32, u32)>>(py)?,
-                        Err(error) if error.is_instance_of::<PyAttributeError>(py) => Vec::new(),
-                        Err(error) => return Err(error),
-                    }
-                }
-                Err(error) => return Err(error),
-            },
+            Some(media) => media
+                .getattr(py, "token_spans")?
+                .extract::<Vec<(u32, u32)>>(py)?
+                .into_iter()
+                .map(|(position, length)| (position, position.saturating_add(length)))
+                .collect(),
             None => Vec::new(),
         };
         let mut sampling_params = sampling_params
@@ -1608,7 +1591,6 @@ impl Engine {
         sampling_params.seed.get_or_insert_with(|| {
             default_sampling_seed(self.core.id(), self.core.next_request_id())
         });
-        let cacheable = media.is_none() || cache_prompt.is_some();
         let input = core::Submission {
             prompt_logprobs: sampling_params.prompt_logprobs,
             prompt_top_logprobs: sampling_params.prompt_top_logprobs as u32,
@@ -1619,7 +1601,7 @@ impl Engine {
             batch_key,
             stop_token_ids,
             cache_key: cache_prompt,
-            cacheable,
+            cacheable: true,
             atomic_prefill_spans,
             payload: RequestPayload {
                 sampling_params,
@@ -1881,56 +1863,29 @@ impl Drop for Engine {
     }
 }
 
-fn extract_runner_token_rows(
-    output: &Bound<'_, PyAny>,
-    expected_rows: usize,
-) -> PyResult<Vec<Vec<u32>>> {
-    let flat_error = match output.extract::<Vec<u32>>() {
-        Ok(token_ids) => {
-            if token_ids.len() != expected_rows {
-                return Err(PyRuntimeError::new_err(format!(
-                    "runner returned {} token ids for {expected_rows} sequences",
-                    token_ids.len()
-                )));
-            }
-            return Ok(token_ids
-                .into_iter()
-                .map(|token_id| vec![token_id])
-                .collect());
-        }
-        Err(error) => error,
-    };
-
-    let token_rows = output.extract::<Vec<Vec<u32>>>().map_err(|_| flat_error)?;
-    if token_rows.len() != expected_rows {
-        return Err(PyRuntimeError::new_err(format!(
-            "runner returned {} token rows for {expected_rows} sequences",
-            token_rows.len()
-        )));
+fn runner_result_is_async(output: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if output.is_instance_of::<ForwardOutput>() {
+        return Ok(false);
     }
-    if let Some(row_index) = token_rows.iter().position(Vec::is_empty) {
-        return Err(PyRuntimeError::new_err(format!(
-            "runner returned an empty token row for sequence {row_index}"
-        )));
+    match output.getattr("result") {
+        Ok(method) if method.is_callable() => Ok(true),
+        Err(error) if !error.is_instance_of::<PyAttributeError>(output.py()) => Err(error),
+        _ => Err(PyTypeError::new_err(
+            "runner.enqueue() must return ForwardOutput or a completion with callable result()",
+        )),
     }
-    Ok(token_rows)
 }
 
 fn extract_runner_output<'py>(
     output: &Bound<'py, PyAny>,
     plan: &BatchPlan,
 ) -> PyResult<BorrowedOutput<'py>> {
-    let output = if let Ok(output) = output.cast::<ForwardOutput>() {
-        output
-            .borrow()
-            .borrow(output.py(), plan.sequence_ids.len())?
-    } else {
-        BorrowedOutput {
-            tokens: extract_runner_token_rows(output, plan.sequence_ids.len())?,
-            logprobs: None,
-            prompt_logprobs: None,
-        }
-    };
+    let output = output
+        .cast::<ForwardOutput>()
+        .map_err(|_| PyTypeError::new_err("runner must return ForwardOutput"))?;
+    let output = output
+        .borrow()
+        .borrow(output.py(), plan.sequence_ids.len())?;
     let BorrowedOutput {
         tokens,
         logprobs,
@@ -2020,9 +1975,6 @@ mod _resin {
     };
 
     #[pymodule_export]
-    use crate::recipe_media::{MediaTokens, ProcessedMedia};
-
-    #[pymodule_export]
     use crate::media_payload::{
         _media_from_buffers, _media_to_buffers, DeepSeekV41Image, DeepSeekV41Media, Gemma4Media,
         InklingMedia, Qwen35Media,
@@ -2045,6 +1997,51 @@ mod _resin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_results_require_native_output_or_callable_completion() {
+        Python::initialize();
+        Python::attach(|py| {
+            for expression in [c"[1]", c"[[1]]", c"None", c"object()"] {
+                let value = py.eval(expression, None, None).unwrap();
+                let error = extract_runner_output(&value, &wire_plan(0))
+                    .err()
+                    .expect("non-native output must be rejected");
+                assert!(error.is_instance_of::<PyTypeError>(py));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("runner must return ForwardOutput")
+                );
+                let error = runner_result_is_async(&value).unwrap_err();
+                assert!(error.is_instance_of::<PyTypeError>(py));
+            }
+
+            let noncallable = py
+                .eval(c"type('Invalid', (), {'result': []})()", None, None)
+                .unwrap();
+            assert!(runner_result_is_async(&noncallable).is_err());
+
+            let completion = py
+                .eval(
+                    c"type('Completion', (), {'result': lambda self: None})()",
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!(runner_result_is_async(&completion).unwrap());
+
+            let invalid_descriptor = py
+                .eval(
+                    c"type('Invalid', (), {'result': property(lambda self: 1 / 0)})()",
+                    None,
+                    None,
+                )
+                .unwrap();
+            let error = runner_result_is_async(&invalid_descriptor).unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyZeroDivisionError>(py));
+        });
+    }
 
     fn wire_plan(group_index: u32) -> BatchPlan {
         let group = CacheGroupPlan::from_parts(

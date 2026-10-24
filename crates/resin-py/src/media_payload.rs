@@ -32,34 +32,8 @@ pub(crate) fn array<T: numpy::Element>(
     )
 }
 
-// Direct constructors also accept existing CPU Torch tensors for custom runners.
-fn numpy_input<'py>(value: &Bound<'py, PyAny>, dtype: &str) -> PyResult<Bound<'py, PyAny>> {
-    if value.hasattr("detach")? {
-        if value
-            .getattr("device")?
-            .getattr("type")?
-            .extract::<String>()?
-            != "cpu"
-        {
-            return Err(error("media tensors must be CPU-resident"));
-        }
-        let value = value.call_method0("detach")?;
-        return value
-            .call_method0(if dtype == "float32" { "float" } else { "long" })?
-            .call_method0("numpy");
-    }
-    value.call_method1("astype", (dtype,))
-}
-
 pub(crate) fn f32_tensor(value: &Bound<'_, PyAny>) -> PyResult<Tensor<f32>> {
-    let converted;
-    let input = if value.extract::<PyReadonlyArrayDyn<'_, f32>>().is_ok() {
-        value
-    } else {
-        converted = numpy_input(value, "float32")?;
-        &converted
-    };
-    let array = input.extract::<PyReadonlyArrayDyn<'_, f32>>()?;
+    let array = value.extract::<PyReadonlyArrayDyn<'_, f32>>()?;
     Tensor::new(
         array.shape().to_vec(),
         array.as_array().iter().copied().collect(),
@@ -67,14 +41,7 @@ pub(crate) fn f32_tensor(value: &Bound<'_, PyAny>) -> PyResult<Tensor<f32>> {
     .map_err(error)
 }
 pub(crate) fn i64_tensor(value: &Bound<'_, PyAny>) -> PyResult<Tensor<i64>> {
-    let converted;
-    let input = if value.extract::<PyReadonlyArrayDyn<'_, i64>>().is_ok() {
-        value
-    } else {
-        converted = numpy_input(value, "int64")?;
-        &converted
-    };
-    let array = input.extract::<PyReadonlyArrayDyn<'_, i64>>()?;
+    let array = value.extract::<PyReadonlyArrayDyn<'_, i64>>()?;
     Tensor::new(
         array.shape().to_vec(),
         array.as_array().iter().copied().collect(),

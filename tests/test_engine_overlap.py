@@ -3,8 +3,10 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
+from output_helpers import forward_output
 
 from resin import CacheGroupLayout, CacheLayout, Engine, RunnerConfig
 
@@ -16,9 +18,9 @@ class Feedback:
 
 
 class Completion:
-    def __init__(self, rows, feedback, *, prior_harvest=None, submitted=None):
+    def __init__(self, output, feedback, *, prior_harvest=None, submitted=None):
         self.feedback = feedback
-        self.rows = rows
+        self.output = output
         self.prior_harvest = prior_harvest
         self.submitted = submitted
         self.future: Future | None = None
@@ -33,7 +35,7 @@ class Completion:
             )
         if self.prior_harvest is not None:
             self.prior_harvest.set()
-        return self.future.result(timeout=2) if self.future else self.rows
+        return self.future.result(timeout=2) if self.future else self.output
 
 
 class AsyncRunner:
@@ -59,9 +61,9 @@ class AsyncRunner:
 
     def forward(self, plan):
         self.plans.append(plan)
-        return [
-            [int(plan.token_ids[int(end) - 1]) + 1] for end in plan.token_indptr[1:]
-        ]
+        return forward_output(
+            [[int(plan.token_ids[int(end) - 1]) + 1] for end in plan.token_indptr[1:]]
+        )
 
     def enqueue(self, plan, *, feedback=None):
         if self.reject_enqueue:
@@ -72,7 +74,7 @@ class AsyncRunner:
         positions = plan.positions.tolist() if feedback is None else feedback.positions
         rows = [[int(token) + 1, int(token) + 2] for token in tokens]
         completion = Completion(
-            rows,
+            forward_output(rows),
             Feedback(
                 [row[-1] for row in rows], [position + 2 for position in positions]
             ),
@@ -87,7 +89,7 @@ class AsyncRunner:
                 assert self.prior_harvest.wait(2), (
                     "GPU work and previous CPU harvest must overlap"
                 )
-                return rows
+                return forward_output(rows)
 
             completion.future = self.executor.submit(device_work)
         if self.fail:
@@ -125,12 +127,12 @@ def test_next_device_submission_precedes_previous_cpu_harvest():
 
 
 @pytest.mark.parametrize("overlap", [True, False])
-def test_reference_switch_preserves_single_step_for_legacy_runners(overlap):
-    class Legacy:
+def test_overlap_switch_preserves_single_step_for_synchronous_runners(overlap):
+    class Synchronous:
         def forward(self, plan):
-            return [int(token) + 1 for token in plan.token_ids]
+            return forward_output([int(token) + 1 for token in plan.token_ids])
 
-    engine = Engine(Legacy(), overlap=overlap)
+    engine = Engine(Synchronous(), overlap=overlap)
     request = engine.submit([1], max_new_tokens=8)
     assert [event.token_id for event in engine.step()] == [2]
     assert not engine.overlap_pending
@@ -173,6 +175,86 @@ def test_async_failure_quarantines_the_original_writer_lease():
     assert engine.cache_occupied_block_count == 1
     with pytest.raises(RuntimeError, match="quarantined"):
         engine.close()
+    runner.shutdown()
+
+
+@pytest.mark.parametrize("invalid", [[3, 4], [[3, 4]]])
+@pytest.mark.parametrize("continuation", [False, True])
+def test_completion_sequence_result_quarantines_accepted_work(
+    monkeypatch, invalid, continuation
+):
+    runner = AsyncRunner()
+    original = runner.enqueue
+
+    def enqueue(plan, *, feedback=None):
+        completion = original(plan, feedback=feedback)
+        if len(runner.pending) == (2 if continuation else 1):
+            completion.output = invalid
+        return completion
+
+    monkeypatch.setattr(runner, "enqueue", enqueue)
+    engine = Engine(runner)
+    request = engine.submit([1], max_new_tokens=24)
+    assert [event.token_id for event in engine.step()] == [2]
+    assert engine.step() == []
+    if continuation:
+        assert [event.token_id for event in engine.step()] == [3, 4]
+    with pytest.raises(TypeError, match="runner must return ForwardOutput"):
+        engine.step(allow_overlap=False)
+    assert engine.poisoned and not request.done
+    assert engine.cache_occupied_block_count == 1
+    assert runner.released == []
+    with pytest.raises(RuntimeError, match="quarantined"):
+        engine.close()
+    runner.shutdown()
+
+
+@pytest.mark.parametrize("kind", ["flat", "nested", "noncallable"])
+@pytest.mark.parametrize("continuation", [False, True])
+def test_invalid_immediate_enqueue_result_quarantines_accepted_work(
+    monkeypatch, kind, continuation
+):
+    runner = AsyncRunner()
+    original = runner.enqueue
+    calls = 0
+
+    def enqueue(plan, *, feedback=None):
+        nonlocal calls
+        calls += 1
+        if calls == (2 if continuation else 1):
+            if kind == "noncallable":
+                return SimpleNamespace(result=[])
+            return [3, 4] if kind == "flat" else [[3, 4]]
+        return original(plan, feedback=feedback)
+
+    monkeypatch.setattr(runner, "enqueue", enqueue)
+    engine = Engine(runner)
+    request = engine.submit([1], max_new_tokens=24)
+    assert [event.token_id for event in engine.step()] == [2]
+    if continuation:
+        assert engine.step() == []
+    with pytest.raises(
+        TypeError, match=r"runner.enqueue\(\) must return ForwardOutput"
+    ):
+        engine.step()
+    assert engine.poisoned and not request.done
+    assert engine.cache_occupied_block_count == 1
+    assert runner.released == []
+    with pytest.raises(RuntimeError, match="quarantined"):
+        engine.close()
+    runner.shutdown()
+
+
+def test_enqueue_accepts_immediately_completed_native_output(monkeypatch):
+    runner = AsyncRunner()
+    monkeypatch.setattr(runner, "enqueue", lambda plan: forward_output([[3, 4]]))
+    engine = Engine(runner)
+    request = engine.submit([1], max_new_tokens=24)
+    assert [event.token_id for event in engine.step()] == [2]
+    assert [event.token_id for event in engine.step()] == [3, 4]
+    assert not engine.overlap_pending and not engine.poisoned
+    engine.close()
+    assert request.cancelled and request.take_result() == [2, 3, 4]
     runner.shutdown()
 
 
@@ -223,7 +305,7 @@ def test_stop_result_precedes_successor_completion_but_release_waits(
     successor = runner.pending[-1]
     assert not successor.future.done()
 
-    successor.future.set_result(successor.rows)
+    successor.future.set_result(successor.output)
     assert engine.step() == []
     assert not engine.overlap_pending and not engine.has_work()
     assert engine.cache_free_parent_count == 16
@@ -335,7 +417,7 @@ def test_feedback_descriptor_failure_cannot_leave_a_healthy_pending_engine(monke
             raise RuntimeError("feedback descriptor failed")
 
         def result(self):
-            return [[3, 4]]
+            return forward_output([[3, 4]])
 
     runner = AsyncRunner()
     monkeypatch.setattr(runner, "enqueue", lambda plan: InvalidFeedback())

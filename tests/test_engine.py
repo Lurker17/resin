@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
+from output_helpers import forward_output
 
 from resin import (
     BatchPhase,
@@ -8,9 +10,11 @@ from resin import (
     CacheGroupLayout,
     CacheLayout,
     Engine,
+    ForwardOutput,
     RequestLease,
     ResourceBinding,
     RunnerConfig,
+    SamplingParams,
     SchedulerConfig,
 )
 
@@ -20,12 +24,14 @@ class RecordingRunner:
         self.plans: list[BatchPlan] = []
         self.released: list[int] = []
 
-    def forward(self, plan: BatchPlan) -> list[int]:
+    def forward(self, plan: BatchPlan) -> ForwardOutput:
         self.plans.append(plan)
-        return [
-            plan.token_ids[end - 1] + 1
-            for _, end in map(plan.token_range, range(plan.num_sequences))
-        ]
+        return forward_output(
+            [
+                plan.token_ids[end - 1] + 1
+                for _, end in map(plan.token_range, range(plan.num_sequences))
+            ]
+        )
 
     def release(self, request_ids: list[int]) -> None:
         self.released.extend(request_ids)
@@ -101,15 +107,70 @@ class TestEngine:
         assert second.done
         assert second.take_result() == [9]
 
-    def test_runner_must_return_one_token_per_sequence(self) -> None:
+    @pytest.mark.parametrize(
+        "rows,error", [([], "CSR offsets"), ([[]], "empty token row")]
+    )
+    def test_sampled_sequence_requires_an_output_row_and_token(self, rows, error):
         class BadRunner:
             def forward(self, plan):
-                return []
+                return forward_output(rows)
 
         engine = Engine(BadRunner())
-        engine.submit([1], max_new_tokens=1)
-        with pytest.raises(RuntimeError, match="1 sequences"):
+        request = engine.submit([1], max_new_tokens=1)
+        with pytest.raises(RuntimeError, match=error):
             engine.step()
+        assert engine.poisoned and not request.done
+
+    @pytest.mark.parametrize("invalid", [[3], [[3]], (3,), ((3,),)])
+    def test_sequence_results_quarantine_after_a_committed_step(self, invalid):
+        class InvalidRunner(RecordingRunner):
+            runner_config = RunnerConfig(
+                cache_layout=CacheLayout(4, [CacheGroupLayout(2)])
+            )
+
+            def bind_resources(self, binding):
+                pass
+
+            def forward(self, plan):
+                if plan.phase == BatchPhase.PREFILL:
+                    return super().forward(plan)
+                return invalid
+
+        runner = InvalidRunner()
+        engine = Engine(runner)
+        request = engine.submit([1], max_new_tokens=3)
+        assert [event.token_id for event in engine.step()] == [2]
+        with pytest.raises(TypeError, match="runner must return ForwardOutput"):
+            engine.step()
+        assert engine.poisoned and not request.done
+        assert engine.cache_occupied_block_count == 1
+        assert runner.released == []
+        with pytest.raises(RuntimeError, match="quarantined"):
+            engine.close()
+
+    @pytest.mark.parametrize("scored", [False, True])
+    def test_native_token_only_and_scored_results_complete_normally(self, scored):
+        class NativeRunner:
+            def forward(self, plan):
+                return ForwardOutput(
+                    np.asarray([plan.token_ids[-1] + 1], np.uint32),
+                    np.asarray([0, 1], np.uint32),
+                    logprobs=np.asarray([-0.25], np.float32) if scored else None,
+                )
+
+        engine = Engine(NativeRunner())
+        request = engine.submit(
+            [1], max_new_tokens=2, sampling_params=SamplingParams(logprobs=scored)
+        )
+        events = [*engine.step(), *engine.step()]
+        assert request.take_result() == [2, 3]
+        assert not engine.poisoned
+        for event in events:
+            if scored:
+                assert event.logprobs is not None
+                assert event.logprobs.logprob == -0.25
+            else:
+                assert event.logprobs is None
 
     def test_decode_runner_can_commit_a_verified_token_block(self) -> None:
         class BlockRunner:
@@ -119,10 +180,10 @@ class TestEngine:
             def forward(self, plan: BatchPlan):
                 self.plans.append(plan)
                 if plan.phase == BatchPhase.PREFILL:
-                    return [2]
+                    return forward_output([2])
                 if len(self.plans) == 2:
-                    return [[3, 4, 5]]
-                return [[6, 7]]
+                    return forward_output([[3, 4, 5]])
+                return forward_output([[6, 7]])
 
         runner = BlockRunner()
         engine = Engine(runner)
@@ -160,7 +221,9 @@ class TestEngine:
 
             def forward(self, plan: BatchPlan):
                 self.plans.append(plan)
-                return [2] if plan.phase == BatchPhase.PREFILL else [[3, 4, 5]]
+                return forward_output(
+                    [2] if plan.phase == BatchPhase.PREFILL else [[3, 4, 5]]
+                )
 
         runner = BlockRunner()
         assert runner.runner_config.cache_write_lookahead_tokens == 2
@@ -181,8 +244,8 @@ class TestEngine:
             @staticmethod
             def forward(plan: BatchPlan):
                 if plan.phase == BatchPhase.PREFILL:
-                    return [2]
-                return [[3, 7, 8]]
+                    return forward_output([2])
+                return forward_output([[3, 7, 8]])
 
         engine = Engine(BlockRunner(), eos_token_id=7)
         request = engine.submit([1], max_new_tokens=8)
@@ -223,7 +286,7 @@ class TestEngine:
         class BadRunner:
             @staticmethod
             def forward(plan: BatchPlan):
-                return [[2, 3] for _ in range(plan.num_sequences)]
+                return forward_output([[2, 3] for _ in range(plan.num_sequences)])
 
         engine = Engine(BadRunner())
         engine.submit([1], max_new_tokens=max_new_tokens)
@@ -244,7 +307,9 @@ class TestEngine:
                 pass
 
             def forward(self, plan):
-                return [2] if plan.phase == BatchPhase.PREFILL else [[3, 4, 5]]
+                return forward_output(
+                    [2] if plan.phase == BatchPhase.PREFILL else [[3, 4, 5]]
+                )
 
         engine = Engine(BadRunner())
         request = engine.submit([1], max_new_tokens=2, stop_token_ids=stop_token_ids)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from output_helpers import forward_output
 
 import resin
 from resin import (
@@ -12,6 +13,7 @@ from resin import (
     CacheLayout,
     CacheRetention,
     Engine,
+    ForwardOutput,
     MediaTokenSpan,
     ResourceBinding,
     RunnerConfig,
@@ -41,15 +43,17 @@ class RecordingCachedRunner:
         assert binding.cache_layout is not None
         self.bindings.append((binding.cache_pool_id, binding.cache_layout))
 
-    def forward(self, plan: BatchPlan) -> list[int]:
+    def forward(self, plan: BatchPlan) -> ForwardOutput:
         self.plans.append(plan)
         if self.forward_failures:
             self.forward_failures -= 1
             raise RuntimeError("runner rejected the batch")
-        return [
-            plan.token_ids[end - 1] + 1
-            for _, end in map(plan.token_range, range(plan.num_sequences))
-        ]
+        return forward_output(
+            [
+                plan.token_ids[end - 1] + 1
+                for _, end in map(plan.token_range, range(plan.num_sequences))
+            ]
+        )
 
     def release(self, request_ids: list[int]) -> None:
         self.released.extend(request_ids)
@@ -215,8 +219,8 @@ class TestFlatCacheApi:
             runner_config = RunnerConfig(cache_layout=layout)
 
             @staticmethod
-            def forward(plan: BatchPlan) -> list[int]:
-                return [0] * plan.num_sequences
+            def forward(plan: BatchPlan) -> ForwardOutput:
+                return forward_output([0] * plan.num_sequences)
 
         with pytest.raises(TypeError, match="bind_resources"):
             Engine(MissingBinder())
@@ -262,8 +266,8 @@ class TestFlatCacheApi:
                 raise AssertionError("an unmanaged runner must not bind a cache pool")
 
             @staticmethod
-            def forward(plan: BatchPlan) -> list[int]:
-                return [0] * plan.num_sequences
+            def forward(plan: BatchPlan) -> ForwardOutput:
+                return forward_output([0] * plan.num_sequences)
 
         runner = UnmanagedRunner()
         engine = Engine(runner)
@@ -504,7 +508,7 @@ def test_window_attention_reads_survive_prefill_writes_and_prefix_reuse(
             self.storage: dict[tuple[int, int, int], int] = {}
             self.query_count = 0
 
-        def forward(self, plan: BatchPlan) -> list[int]:
+        def forward(self, plan: BatchPlan) -> ForwardOutput:
             self.plans.append(plan)
             group = plan.cache_groups[0]
             # Device kernels commonly append the entire batch before reading
@@ -539,7 +543,7 @@ def test_window_attention_reads_survive_prefill_writes_and_prefix_reuse(
                         assert self.storage[address] == position
                     self.query_count += 1
                 outputs.append(int(plan.token_ids[end - 1]) + 1)
-            return outputs
+            return forward_output(outputs)
 
     runner = WindowRunner()
     with Engine(

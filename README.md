@@ -160,10 +160,21 @@ with Engine(
 A custom synchronous runner only needs one method:
 
 ```python
+import numpy as np
+
+from resin import BatchPlan, ForwardOutput
+
+
 class Runner:
-    def forward(self, plan):
-        return [0] * len(plan.sequence_ids)
+    def forward(self, plan: BatchPlan) -> ForwardOutput:
+        return ForwardOutput(
+            np.zeros(plan.num_sequences, dtype=np.uint32),
+            np.arange(plan.num_sequences + 1, dtype=np.uint32),
+        )
 ```
+
+`ForwardOutput` carries flat token IDs and row offsets, with optional logprob
+columns. The same result type covers ordinary and speculative decoding.
 
 Managed history and recurrent state are cache groups declared through a frozen
 `RunnerConfig`. The Engine binds their one physical arena during construction.

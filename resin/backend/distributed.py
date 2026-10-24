@@ -6,7 +6,6 @@ its existing step boundary; model runtimes own partitioning and device collectiv
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Protocol
@@ -100,7 +99,7 @@ class DistributedRunner(Protocol):
 
     def forward_distributed(
         self, plan: BatchPlan | None, context: StepContext
-    ) -> ForwardOutput | Sequence[int] | Sequence[Sequence[int]] | None: ...
+    ) -> ForwardOutput | None: ...
 
 
 class DistributedWorker:
@@ -413,7 +412,9 @@ class DistributedWorker:
                     if self._forward is not None
                     else enqueue(plan, **kwargs)
                 )
-                self._completion = result if hasattr(result, "result") else None
+                self._completion = (
+                    result if callable(getattr(result, "result", None)) else None
+                )
                 # Resolve the previous copy only after current GPU submission.
                 # Followers harvest too, so their release/poison lifetime agrees.
                 if previous is not None:

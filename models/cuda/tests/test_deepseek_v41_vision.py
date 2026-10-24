@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -62,7 +63,7 @@ def media_fixture():
     types = image_token_types(2, 2)
     image = DeepSeekV41Image(
         start=2,
-        patches=torch.zeros(16, 3, 14, 14, dtype=torch.bfloat16),
+        patches=np.zeros((16, 3, 14, 14), dtype=np.float32),
         n_vit_h=4,
         n_vit_w=4,
         types=types,

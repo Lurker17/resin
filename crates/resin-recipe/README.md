@@ -20,6 +20,11 @@ binding exposes owned NumPy payload arrays and cache identities; runners execute
 the GPU vision encoder. Resize pixels can differ from HF filters; strict
 no-resize oracles check normalization, padding and patch order.
 
+Direct payload constructors accept NumPy arrays with their declared dtypes:
+`float32` pixels/patches and `int64` geometry. They copy the data into owned
+storage, including strided inputs. Runners perform any Torch/device conversion
+when preparing the vision encoder inputs.
+
 `ResponseParser::feed` consumes only new token IDs. `finish(Stop | Length)` flushes
 buffered text, including truncated UTF-8; finalization is idempotent. A shared
 `TokenizerDecoder` retains the tokenizer's rolling decode context. Control IDs,

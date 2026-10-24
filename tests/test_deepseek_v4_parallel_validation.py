@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+from output_helpers import forward_output
 
 from deploy import deepseek_v4_parallel_validation as validation
 from resin import BatchPhase, ForwardOutput
@@ -15,9 +16,10 @@ from resin import BatchPhase, ForwardOutput
 
 def test_observer_preserves_validated_preparation_through_execution():
     prepared = object()
+    output = forward_output([3])
     runner = SimpleNamespace(
         validate_distributed=Mock(return_value=prepared),
-        forward_distributed=Mock(return_value=[3]),
+        forward_distributed=Mock(return_value=output),
         cuda_graph_stats={"decode": {"replay_count": 0}},
         speculative_tokens=0,
     )
@@ -32,7 +34,7 @@ def test_observer_preserves_validated_preparation_through_execution():
     )
     observed = validation._ObservedRunner(runner)
     assert observed.validate_distributed(plan, context) is prepared
-    assert observed.forward_distributed(plan, context, prepared=prepared) == [3]
+    assert observed.forward_distributed(plan, context, prepared=prepared) is output
     runner.validate_distributed.assert_called_once_with(plan, context)
     runner.forward_distributed.assert_called_once_with(plan, context, prepared=prepared)
 
@@ -141,13 +143,13 @@ def test_decode_trace_captures_genuine_graph_output_before_engine_override():
             self._graph_logits = {shape: torch.tensor([[0.0, 3.0, 1.0]])}
 
         def _run_cuda_graph(self, mode, graph_shape, inputs):
-            return [1]
+            return torch.tensor([1])
 
         def forward(self, plan):
             if plan.phase == BatchPhase.PREFILL:
                 self._model.head(torch.tensor([[0.0, 1.0, 3.0]]))
-                return [2]
-            return self._run_cuda_graph("decode", shape, {})
+                return forward_output([2])
+            return forward_output(self._run_cuda_graph("decode", shape, {}).tolist())
 
     runner = Runner()
     observed = validation._ObservedRunner(runner)
@@ -164,8 +166,8 @@ def test_decode_trace_captures_genuine_graph_output_before_engine_override():
         )
 
     with validation._DecodeTrace(observed, forced_tokens=[0, 2]) as trace:
-        assert observed.forward(plan(BatchPhase.PREFILL)) == [0]
-        assert observed.forward(plan(BatchPhase.DECODE)) == [2]
+        assert observed.forward(plan(BatchPhase.PREFILL)).token_ids.tolist() == [0]
+        assert observed.forward(plan(BatchPhase.DECODE)).token_ids.tolist() == [2]
     result = trace.result()
     assert result["sampler_token_ids"] == [2, 1]
     assert result["advanced_token_ids"] == [0, 2]
@@ -441,13 +443,13 @@ def test_speculative_checks_reject_incomplete_execution(
         validation._validate_speculative_records(records, 2)
 
 
-def test_speculative_output_lengths_support_zero_copy_scored_blocks():
+def test_speculative_output_lengths_read_native_csr_blocks():
     output = ForwardOutput(
         np.array([1, 2, 3, 4], np.uint32),
         np.array([0, 3, 4], np.uint32),
     )
     assert validation._output_lengths(output) == [3, 1]
-    assert validation._output_lengths([[1, 2, 3], [4]]) == [3, 1]
+    assert validation._output_lengths(forward_output([1, 2])) == [1, 1]
     assert validation._output_lengths(None) == []
 
 

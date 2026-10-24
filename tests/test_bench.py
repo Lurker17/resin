@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+from output_helpers import forward_output
 
 from resin import (
     BatchPhase,
@@ -43,21 +46,44 @@ class Runner:
             targets = [[9] * (self.speculative_tokens + 1) for _ in plan.sequence_ids]
             acceptance = self._speculation.accept(drafts, targets)
             self.processed_counts.append(acceptance.processed_counts)
-            return acceptance.token_rows
-        return [0] * plan.num_sequences
+            return forward_output(acceptance.token_rows)
+        return forward_output([0] * plan.num_sequences)
 
 
 def test_distributed_benchmark_forwards_preparation_without_rebuilding_it():
     prepared, context = object(), object()
+    output = forward_output([3])
 
     class PreparedRunner(Runner):
         def forward_distributed(self, plan, step_context, *, prepared):
             assert step_context is context
-            return prepared
+            assert prepared is preparation
+            return output
 
+    preparation = prepared
     runner = BenchmarkRunner(PreparedRunner())
-    assert runner.forward_distributed(None, context, prepared=prepared) is prepared
+    assert runner.forward_distributed(None, context, prepared=prepared) is output
     assert runner._plan is None
+
+
+def test_benchmark_does_not_wrap_noncallable_result_as_pending():
+    class InvalidRunner(Runner):
+        def enqueue(self, plan, *, feedback=None):
+            return SimpleNamespace(result=[])
+
+    runner = InvalidRunner()
+    runner.runner_config = RunnerConfig(
+        cache_layout=CacheLayout(16, [CacheGroupLayout(128)]),
+        cache_write_lookahead_tokens=2,
+    )
+    engine = Engine(BenchmarkRunner(runner))
+    request = engine.submit([1], max_new_tokens=8)
+    assert [event.token_id for event in engine.step()] == [0]
+    with pytest.raises(
+        TypeError, match=r"runner.enqueue\(\) must return ForwardOutput"
+    ):
+        engine.step()
+    assert engine.poisoned and not engine.overlap_pending and not request.done
 
 
 def test_prefill_measures_actual_chunked_inputs_and_keeps_engine_resident():

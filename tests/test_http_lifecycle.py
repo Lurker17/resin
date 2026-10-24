@@ -9,6 +9,7 @@ import urllib.request
 from contextlib import ExitStack, contextmanager
 
 import pytest
+from output_helpers import forward_output
 from test_recipe import _byte_tokenizer, _FastTokenizer, _token_ids
 
 import resin
@@ -49,7 +50,7 @@ class Runner:
             ):
                 self.slow_id = int(sequence_id)
                 self.started.set()
-        return [3] * plan.num_sequences
+        return forward_output([3] * plan.num_sequences)
 
     def release(self, sequence_ids):
         if self.slow_id in sequence_ids:
@@ -395,7 +396,7 @@ def test_native_parser_flushes_partial_utf8_in_http_actor(stream):
             assert plan.num_sequences == 1
             token = output[self.step]
             self.step += 1
-            return [token]
+            return forward_output([token])
 
     with running_server(ByteRunner(), NativeCodec()) as (
         _server,

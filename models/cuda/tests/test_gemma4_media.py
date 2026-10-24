@@ -4,6 +4,7 @@ import io
 
 import numpy as np
 import pytest
+from output_helpers import forward_output
 from PIL import Image
 from recipe_fuzz.gemma import GemmaAdapter
 
@@ -174,7 +175,7 @@ def test_submit_media_uses_its_tokenized_prompt_without_engine_media_logic() -> 
         @classmethod
         def forward(cls, plan):
             cls.plans.append(plan)
-            return [7]
+            return forward_output([7])
 
     media = Gemma4Media(
         token_ids=(2, 8),
