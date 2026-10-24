@@ -15,8 +15,10 @@ from pathlib import Path
 
 import modal
 
+import resin
 from deploy.checkpoint_cache import checkpoint_is_complete
 from deploy.modal_image import build_modal_image
+from resin.recipe import DeepSeekV41Recipe
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
@@ -66,7 +68,6 @@ def _serve_rank(rank: int, port: int) -> None:
     from resin import Parallelism, SamplingParams, SchedulerConfig
     from resin.backend.distributed import DistributedEngine, DistributedWorker
     from resin.backend.topology import ParallelGroups
-    from resin.models.deepseek_v41.codec import DeepSeekV41Codec
     from resin.server import HttpServer
     from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
 
@@ -105,7 +106,7 @@ def _serve_rank(rank: int, port: int) -> None:
         flush=True,
     )
     runner.capture_cuda_graphs()
-    codec = DeepSeekV41Codec(Tokenizer.from_file(str(CHECKPOINT / "tokenizer.json")))
+    codec = DeepSeekV41Recipe(Tokenizer.from_file(str(CHECKPOINT / "tokenizer.json")))
     engine = DistributedEngine(
         DistributedWorker(runner, groups),
         max_running_requests=MAX_SEQUENCES,
@@ -123,7 +124,14 @@ def _serve_rank(rank: int, port: int) -> None:
         # ordinary EOS handling while device-feedback decode overlaps.
         warmup = (
             engine.submit(
-                codec.render_ids([{"role": "user", "content": "Count from 1 to 100."}]),
+                codec.render_ids(
+                    [
+                        resin.recipe.Message(
+                            resin.recipe.Role.USER,
+                            [resin.recipe.Text("Count from 1 to 100.")],
+                        )
+                    ]
+                ),
                 max_new_tokens=64,
                 stop_token_ids=codec.get_stop_token_ids(),
                 sampling_params=SamplingParams(temperature=0.0),
@@ -151,7 +159,7 @@ def _serve_rank(rank: int, port: int) -> None:
         if rank == 0:
             kernel_volume.commit()
         # All four drivers participate; the shared coordinator listens on rank 0.
-        HttpServer(engine, codec=codec, model=MODEL).serve(host="0.0.0.0", port=8000)
+        HttpServer(engine, recipe=codec, model=MODEL).serve(host="0.0.0.0", port=8000)
     finally:
         if not engine.closed:
             engine.close()

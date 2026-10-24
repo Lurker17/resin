@@ -8,7 +8,6 @@ from typing import (
     Any,
     Literal,
     NamedTuple,
-    NotRequired,
     Protocol,
     TypedDict,
     runtime_checkable,
@@ -46,14 +45,6 @@ class MediaInput(Protocol):
     def token_spans(self) -> tuple[MediaTokenSpan, ...]: ...
 
 
-class RenderedPrompt(TypedDict):
-    """Tokenized conversation returned by a server codec."""
-
-    token_ids: list[int]
-    stop_token_ids: list[int]
-    media: NotRequired[MediaInput]
-
-
 # (generated token index, source byte start/end, event text byte start/end).
 # Ranges are half-open u32 offsets; several tokens may share one UTF-8 character.
 TokenSpan = tuple[int, int, int, int, int]
@@ -84,16 +75,6 @@ class FinalizingResponseParser(ResponseParser, Protocol):
     """Flush buffered output before a response ends normally or at its limit."""
 
     def finish(self, reason: Literal["stop", "length"]) -> list[ParserEvent]: ...
-
-
-class ConversationCodec(Protocol):
-    """Render requests and construct their incremental response parsers."""
-
-    def render(self, request: dict[str, Any]) -> RenderedPrompt: ...
-
-    def create_parser(
-        self, request: dict[str, Any], prompt_ids: Sequence[int]
-    ) -> ResponseParser: ...
 
 
 class Runner(Protocol):
@@ -143,13 +124,11 @@ class ManagedRunner(Runner, Protocol):
 
 
 __all__ = [
-    "ConversationCodec",
     "FinalizingResponseParser",
     "ManagedRunner",
     "MediaInput",
     "MediaTokenSpan",
     "ParserEvent",
-    "RenderedPrompt",
     "ResponseParser",
     "Runner",
     "RunnerCompletion",

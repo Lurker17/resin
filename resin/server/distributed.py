@@ -9,7 +9,7 @@ from resin.backend.distributed import DistributedExecutionError
 
 if TYPE_CHECKING:
     from resin.backend.distributed import DistributedEngine
-    from resin.protocols import ConversationCodec
+    from resin.recipe import Recipe
 
 
 class DistributedHttpCoordinator:
@@ -17,14 +17,14 @@ class DistributedHttpCoordinator:
 
     Construct collectively on replica drivers. The first driver calls round()
     from its native HTTP actor, while the remaining drivers call serve().
-    Request IDs and events cross the control group; leases, KV, codecs, media,
+    Request IDs and events cross the control group; leases, KV, recipes, media,
     and parsers remain local to the selected replica.
     """
 
     def __init__(
         self,
         engine: DistributedEngine,
-        codec: ConversationCodec,
+        recipe: Recipe,
         *,
         stream_interval: int = 1,
     ):
@@ -45,7 +45,7 @@ class DistributedHttpCoordinator:
             from resin._resin import _HttpSession
 
             self.session = _HttpSession(
-                engine.local, codec, stream_interval=stream_interval
+                engine.local, recipe, stream_interval=stream_interval
             )
         except BaseException as exc:
             error = str(exc)

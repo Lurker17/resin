@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::recipe_types::{MediaSources, Message, RenderOptions, Role, Tool};
 use pyo3::{
     exceptions::{PyAttributeError, PyValueError},
     prelude::*,
@@ -16,7 +17,7 @@ use resin_recipe::{
     InklingTokens, ModelFormat, Prompt, PromptSpan, ResponseParser, Tokenizer, TokenizerDecoder,
     TokenizerEncoder,
 };
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 #[derive(Clone)]
 enum TokenizerSource {
@@ -323,113 +324,291 @@ impl NativeResponseParser {
     }
 }
 
-/// Model format and prepared tokenizer, shared by all request parsers.
+/// Rendered IDs and optional prepared media. Native parser state contains no pixels.
 #[pyclass(frozen, module = "resin._resin")]
-pub(crate) struct ModelRecipe {
-    tokenizer: RecipeTokenizer,
-    encoder: Arc<dyn Encoder>,
-    model: ModelFormat,
-    options: Value,
+pub(crate) struct RenderedPrompt {
+    pub(crate) token_ids: Vec<u32>,
+    pub(crate) stop_token_ids: Vec<u32>,
+    pub(crate) media: Option<Py<PyAny>>,
+    seed: Option<ParserSeed>,
 }
-impl ModelRecipe {
-    fn request(&self, request: &Bound<'_, PyAny>) -> PyResult<Value> {
-        let mut request: Value = depythonize(request)?;
-        let map = request
-            .as_object_mut()
-            .ok_or_else(|| PyValueError::new_err("request must be a dictionary"))?;
-        let mut extra = self.options.as_object().cloned().unwrap_or_default();
-        match map.remove("extra") {
-            Some(Value::Object(overrides)) => extra.extend(overrides),
-            None | Some(Value::Null) => (),
-            Some(_) => return Err(PyValueError::new_err("request.extra must be a dictionary")),
-        }
-        map.insert("extra".into(), Value::Object(extra));
-        Ok(request)
-    }
+struct ParserSeed {
+    recipe_id: u64,
+    request: Value,
 }
 #[pymethods]
-impl ModelRecipe {
+impl RenderedPrompt {
     #[new]
-    #[pyo3(signature = (tokenizer, *, model, options=None))]
-    fn new(
-        tokenizer: &RecipeTokenizer,
-        model: &str,
-        options: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Self> {
-        let options: Value = options
-            .map(depythonize)
-            .transpose()?
-            .unwrap_or(Value::Object(Map::new()));
-        if !options.is_object() {
-            return Err(PyValueError::new_err("options must be a dictionary"));
+    #[pyo3(signature=(token_ids, *, stop_token_ids=Vec::new(), media=None))]
+    fn new(token_ids: Vec<u32>, stop_token_ids: Vec<u32>, media: Option<Py<PyAny>>) -> Self {
+        Self {
+            token_ids,
+            stop_token_ids,
+            media,
+            seed: None,
         }
-        Ok(Self {
-            tokenizer: tokenizer.clone(),
-            encoder: tokenizer.encoder(),
-            model: ModelFormat::parse(model).map_err(recipe_error)?,
-            options,
-        })
     }
-    fn render_text(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<String> {
-        let request = self.request(request)?;
-        py.detach(|| {
-            self.model
-                .render(&request)
-                .map(|prompt| prompt.rendered_text())
-                .map_err(recipe_error)
-        })
+    #[getter]
+    fn token_ids(&self) -> Vec<u32> {
+        self.token_ids.clone()
     }
-    #[pyo3(signature = (request, *, media_replacements=None))]
-    fn render_ids(
-        &self,
-        py: Python<'_>,
-        request: &Bound<'_, PyAny>,
-        media_replacements: Option<HashMap<String, Vec<String>>>,
-    ) -> PyResult<Vec<u32>> {
-        let request = self.request(request)?;
-        py.detach(|| {
-            self.model
-                .render(&request)
-                .and_then(|prompt| {
-                    let prompt = if let Some(replacements) = &media_replacements {
-                        self.expand_media(prompt, replacements)?
-                    } else {
-                        prompt
-                    };
-                    prompt.encode(self.encoder.as_ref())
-                })
-                .map_err(recipe_error)
-        })
+    #[getter]
+    fn stop_token_ids(&self) -> Vec<u32> {
+        self.stop_token_ids.clone()
     }
-    fn get_stop_token_ids(&self) -> PyResult<Vec<u32>> {
-        self.model
-            .stop_token_ids(self.encoder.as_ref())
-            .map_err(recipe_error)
-    }
-    fn create_parser(
-        &self,
-        py: Python<'_>,
-        request: &Bound<'_, PyAny>,
-        prompt_ids: Vec<u32>,
-    ) -> PyResult<NativeResponseParser> {
-        let request = self.request(request)?;
-        let parser = py.detach(|| {
-            self.model
-                .create_parser(
-                    self.encoder.as_ref(),
-                    self.tokenizer.decoder().map_err(recipe_error)?,
-                    &request,
-                    &prompt_ids,
-                )
-                .map_err(recipe_error)
-        })?;
-        Ok(NativeResponseParser {
-            inner: Arc::new(Mutex::new(parser)),
-        })
+    #[getter]
+    fn media(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.media.as_ref().map(|m| m.clone_ref(py))
     }
 }
 
-impl ModelRecipe {
+/// Shared native implementation inherited by the concrete model recipes.
+#[pyclass(name = "_NativeRecipe", frozen, subclass, module = "resin._resin")]
+pub(crate) struct NativeRecipe {
+    tokenizer: RecipeTokenizer,
+    original_tokenizer: Arc<Py<PyAny>>,
+    encoder: Arc<dyn Encoder>,
+    model: ModelFormat,
+    name: &'static str,
+    options: Map<String, Value>,
+    id: u64,
+    stop_token_ids: Option<Vec<u32>>,
+    media_owner: Arc<Py<PyAny>>,
+    media_config: Value,
+    media_preparer: Mutex<Option<Py<PyAny>>>,
+}
+impl NativeRecipe {
+    fn new(
+        py: Python<'_>,
+        owner: &Bound<'_, PyAny>,
+        name: &'static str,
+        options: Option<&RenderOptions>,
+        stop_token_ids: Option<Vec<u32>>,
+        media_config: Value,
+    ) -> PyResult<Self> {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let original_tokenizer =
+            optional_attr(owner, "tokenizer")?.unwrap_or_else(|| owner.clone());
+        let tokenizer = RecipeTokenizer::new(&original_tokenizer)?;
+        let mut defaults = options.map(|o| o.value.clone()).unwrap_or_default();
+        if name == "gpt_oss" && !defaults.contains_key("conversation_start_date") {
+            let date: String = py
+                .import("datetime")?
+                .getattr("date")?
+                .call_method0("today")?
+                .call_method0("isoformat")?
+                .extract()?;
+            defaults.insert("conversation_start_date".into(), Value::String(date));
+        }
+        let value = Self {
+            encoder: tokenizer.encoder(),
+            tokenizer,
+            original_tokenizer: Arc::new(original_tokenizer.unbind()),
+            model: ModelFormat::parse(if name == "qwen3_8" { "qwen3_5" } else { name })
+                .map_err(recipe_error)?,
+            name,
+            options: defaults,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            stop_token_ids,
+            media_owner: Arc::new(owner.clone().unbind()),
+            media_config,
+            media_preparer: Mutex::new(None),
+        };
+        value.resolve_options(None)?;
+        Ok(value)
+    }
+    pub(crate) fn message_from_wire(&self, py: Python<'_>, value: &Value) -> PyResult<Message> {
+        let mut message = Message::from_wire(py, value)?;
+        message.lower_wire_fields(self.name);
+        Ok(message)
+    }
+    fn resolve_options(&self, options: Option<&RenderOptions>) -> PyResult<Map<String, Value>> {
+        let mut resolved = self.options.clone();
+        if let Some(options) = options {
+            resolved.extend(options.value.clone());
+        }
+        for key in resolved.keys() {
+            let supported = key == "add_generation_prompt"
+                || match self.name {
+                    "gpt_oss" => matches!(
+                        key.as_str(),
+                        "reasoning_effort"
+                            | "use_system_prompt"
+                            | "model_identity"
+                            | "knowledge_cutoff"
+                            | "conversation_start_date"
+                            | "auto_drop_analysis"
+                    ),
+                    "qwen3_5" | "qwen3_8" => matches!(
+                        key.as_str(),
+                        "reasoning_effort"
+                            | "enable_thinking"
+                            | "preserve_thinking"
+                            | "add_vision_id"
+                    ),
+                    "deepseek_v4" | "deepseek_v41" => matches!(
+                        key.as_str(),
+                        "reasoning_effort"
+                            | "thinking_mode"
+                            | "enable_thinking"
+                            | "response_format"
+                    ),
+                    "gemma4" => key == "enable_thinking",
+                    "inkling" => key == "reasoning_effort",
+                    "lfm2" => key == "preserve_thinking",
+                    _ => false,
+                };
+            if !supported {
+                return Err(PyValueError::new_err(format!(
+                    "{} does not support rendering option {key}",
+                    self.name
+                )));
+            }
+        }
+        if self.name.starts_with("qwen3_") {
+            resolved.insert("recipe_variant".into(), json!(self.name));
+        }
+        if self.name.starts_with("deepseek_")
+            && let Some(enabled) = resolved.remove("enable_thinking")
+        {
+            let mode = if enabled == true { "thinking" } else { "chat" };
+            if resolved.get("thinking_mode").is_some_and(|v| v != mode) {
+                return Err(PyValueError::new_err(
+                    "conflicting enable_thinking and thinking_mode",
+                ));
+            }
+            resolved.insert("thinking_mode".into(), json!(mode));
+        }
+        Ok(resolved)
+    }
+    fn request(
+        &self,
+        py: Python<'_>,
+        messages: &[Py<Message>],
+        tools: &[Py<Tool>],
+        options: Option<&RenderOptions>,
+    ) -> PyResult<(Value, MediaSources)> {
+        let mut values = Vec::new();
+        let mut sources = Vec::new();
+        let mut definitions = tools
+            .iter()
+            .map(|t| t.borrow(py).declaration())
+            .collect::<Vec<_>>();
+        for (index, message) in messages.iter().enumerate() {
+            let message = message.borrow(py);
+            message.validate_for(self.name)?;
+            if self.name == "deepseek_v41" && message.has_media() && message.role != Role::USER {
+                return Err(PyValueError::new_err(
+                    "DeepSeek V4.1 images belong in user messages",
+                ));
+            }
+            let mut rendered = message.render_values(py, &mut sources)?;
+            if !message.tools.is_empty() {
+                if !matches!(message.role, Role::SYSTEM | Role::DEVELOPER) {
+                    return Err(PyValueError::new_err(
+                        "tool declarations belong to instruction messages",
+                    ));
+                }
+                if !self.name.starts_with("deepseek_") {
+                    if index != 0 {
+                        return Err(PyValueError::new_err(format!(
+                            "{} supports tool declarations only in the initial instruction message",
+                            self.name
+                        )));
+                    }
+                    if !definitions.is_empty() {
+                        return Err(PyValueError::new_err(
+                            "pass tools either on the initial message or to render, not both",
+                        ));
+                    }
+                    definitions = message.tools.iter().map(Tool::declaration).collect();
+                    for item in &mut rendered {
+                        item.as_object_mut().unwrap().remove("tools");
+                    }
+                }
+            }
+            values.extend(rendered);
+        }
+        Ok((
+            json!({"messages":values,"tools":definitions,"extra":self.resolve_options(options)?}),
+            sources,
+        ))
+    }
+    fn preparer(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let mut stored = self
+            .media_preparer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(preparer) = stored.as_ref() {
+            return Ok(preparer.clone_ref(py));
+        }
+        let kwargs = PyDict::new(py);
+        kwargs.set_item(
+            "eos_token_ids",
+            self.stop_token_ids.as_deref().unwrap_or(&[]),
+        )?;
+        kwargs.set_item(
+            "vision_config",
+            pythonize(py, &self.media_config["vision_config"])?,
+        )?;
+        kwargs.set_item(
+            "image_token_id",
+            pythonize(py, &self.media_config["image_token_id"])?,
+        )?;
+        let preparer = py
+            .import("resin._recipe_media")?
+            .getattr("make_preparer")?
+            .call((self.name, self.media_owner.bind(py)), Some(&kwargs))?
+            .unbind();
+        *stored = Some(preparer.clone_ref(py));
+        Ok(preparer)
+    }
+    fn render_request(
+        &self,
+        py: Python<'_>,
+        request: Value,
+        sources: MediaSources,
+        prepare: bool,
+    ) -> PyResult<RenderedPrompt> {
+        let mut preparation = None;
+        let mut replacements = None;
+        if prepare && !sources.is_empty() {
+            let preparer = self.preparer(py)?;
+            let result = preparer.bind(py).call_method1("prepare", (sources,))?;
+            let (markers, state): (HashMap<String, Vec<String>>, Py<PyAny>) = result.extract()?;
+            replacements = Some(markers);
+            preparation = Some((preparer, state));
+        }
+        let token_ids = py.detach(|| {
+            let prompt = self.model.render(&request).map_err(recipe_error)?;
+            let prompt = if let Some(replacements) = &replacements {
+                self.expand_media(prompt, replacements)
+                    .map_err(recipe_error)?
+            } else {
+                prompt
+            };
+            prompt.encode(self.encoder.as_ref()).map_err(recipe_error)
+        })?;
+        let media = if let Some((preparer, state)) = preparation {
+            let media = preparer
+                .bind(py)
+                .call_method1("finalize", (state, &token_ids))?;
+            (!media.is_none()).then(|| media.unbind())
+        } else {
+            None
+        };
+        // Parser creation needs controls, schemas and IDs, never images or conversation history.
+        let seed = ParserSeed {
+            recipe_id: self.id,
+            request: json!({"tools":request["tools"],"extra":request["extra"]}),
+        };
+        Ok(RenderedPrompt {
+            token_ids,
+            stop_token_ids: self.get_stop_token_ids()?,
+            media,
+            seed: Some(seed),
+        })
+    }
     fn expand_media(
         &self,
         prompt: Prompt,
@@ -473,5 +652,218 @@ impl ModelRecipe {
             }
         }
         Ok(expanded)
+    }
+}
+#[pymethods]
+impl NativeRecipe {
+    #[getter]
+    fn tokenizer(&self, py: Python<'_>) -> Py<PyAny> {
+        self.original_tokenizer.clone_ref(py)
+    }
+    #[pyo3(signature=(messages, *, tools=Vec::new(), options=None))]
+    pub(crate) fn render(
+        &self,
+        py: Python<'_>,
+        messages: Vec<Py<Message>>,
+        tools: Vec<Py<Tool>>,
+        options: Option<&RenderOptions>,
+    ) -> PyResult<RenderedPrompt> {
+        let (request, sources) = self.request(py, &messages, &tools, options)?;
+        self.render_request(py, request, sources, true)
+    }
+    #[pyo3(signature=(messages, *, tools=Vec::new(), options=None))]
+    fn render_text(
+        &self,
+        py: Python<'_>,
+        messages: Vec<Py<Message>>,
+        tools: Vec<Py<Tool>>,
+        options: Option<&RenderOptions>,
+    ) -> PyResult<String> {
+        let (request, _) = self.request(py, &messages, &tools, options)?;
+        py.detach(|| {
+            self.model
+                .render(&request)
+                .map(|prompt| prompt.rendered_text())
+                .map_err(recipe_error)
+        })
+    }
+    #[pyo3(signature=(messages, *, tools=Vec::new(), options=None))]
+    fn render_ids(
+        &self,
+        py: Python<'_>,
+        messages: Vec<Py<Message>>,
+        tools: Vec<Py<Tool>>,
+        options: Option<&RenderOptions>,
+    ) -> PyResult<Vec<u32>> {
+        let (request, sources) = self.request(py, &messages, &tools, options)?;
+        let prepare = sources.iter().any(|(_, source)| !source.is_none(py));
+        Ok(self
+            .render_request(py, request, sources, prepare)?
+            .token_ids)
+    }
+    pub(crate) fn get_stop_token_ids(&self) -> PyResult<Vec<u32>> {
+        if let Some(ids) = &self.stop_token_ids {
+            return Ok(ids.clone());
+        }
+        self.model
+            .stop_token_ids(self.encoder.as_ref())
+            .map_err(recipe_error)
+    }
+    pub(crate) fn create_parser(
+        &self,
+        py: Python<'_>,
+        prompt: &RenderedPrompt,
+    ) -> PyResult<NativeResponseParser> {
+        let seed = prompt
+            .seed
+            .as_ref()
+            .filter(|seed| seed.recipe_id == self.id)
+            .ok_or_else(|| {
+                PyValueError::new_err("prompt must have been rendered by this recipe instance")
+            })?;
+        let parser = py.detach(|| {
+            self.model
+                .create_parser(
+                    self.encoder.as_ref(),
+                    self.tokenizer.decoder().map_err(recipe_error)?,
+                    &seed.request,
+                    &prompt.token_ids,
+                )
+                .map_err(recipe_error)
+        })?;
+        Ok(NativeResponseParser {
+            inner: Arc::new(Mutex::new(parser)),
+        })
+    }
+    #[pyo3(signature=(token_ids, *, prompt))]
+    fn parse_response(
+        &self,
+        py: Python<'_>,
+        token_ids: Vec<u32>,
+        prompt: &RenderedPrompt,
+    ) -> PyResult<Py<PyAny>> {
+        let parser = self.create_parser(py, prompt)?;
+        let events = py.detach(|| {
+            let mut events = feed(&parser.inner, &token_ids)?;
+            events.extend(finish(&parser.inner, FinishReason::Stop)?);
+            Ok::<_, PyErr>(events)
+        })?;
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut calls = Vec::<Value>::new();
+        let mut indices = HashMap::new();
+        for event in events {
+            let value = serde_json::to_value(event)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            match value["type"].as_str() {
+                Some("text_delta") => content.push_str(value["delta"].as_str().unwrap_or("")),
+                Some("reasoning_delta") => {
+                    reasoning.push_str(value["delta"].as_str().unwrap_or(""))
+                }
+                Some("tool_call_start") => {
+                    indices.insert(value["index"].as_u64().unwrap_or(0), calls.len());
+                    calls.push(json!({"id":value["id"],"name":value["name"],"arguments":""}));
+                }
+                Some("tool_call_arguments_delta") => {
+                    if let Some(index) = indices.get(&value["index"].as_u64().unwrap_or(0)) {
+                        let previous = calls[*index]["arguments"].as_str().unwrap_or("");
+                        calls[*index]["arguments"] = json!(format!(
+                            "{previous}{}",
+                            value["delta"].as_str().unwrap_or("")
+                        ));
+                    }
+                }
+                _ => (),
+            }
+        }
+        Ok(pythonize(
+            py,
+            &json!({"content":content,"reasoning_content":reasoning,"tool_calls":calls}),
+        )?
+        .unbind())
+    }
+}
+
+macro_rules! recipe_class {
+    ($class:ident,$model:literal) => {
+        #[pyclass(extends=NativeRecipe, frozen, module="resin._resin")]
+        pub(crate) struct $class;
+        #[pymethods]
+        impl $class {
+            #[new]
+            #[pyo3(signature=(tokenizer, *, options=None))]
+            fn new(
+                py: Python<'_>,
+                tokenizer: &Bound<'_, PyAny>,
+                options: Option<&RenderOptions>,
+            ) -> PyResult<PyClassInitializer<Self>> {
+                Ok(PyClassInitializer::from(NativeRecipe::new(
+                    py,
+                    tokenizer,
+                    $model,
+                    options,
+                    None,
+                    Value::Null,
+                )?)
+                .add_subclass(Self))
+            }
+        }
+    };
+}
+recipe_class!(GptOssRecipe, "gpt_oss");
+recipe_class!(DeepSeekV4Recipe, "deepseek_v4");
+recipe_class!(Qwen35Recipe, "qwen3_5");
+recipe_class!(Qwen38Recipe, "qwen3_8");
+recipe_class!(InklingRecipe, "inkling");
+recipe_class!(Lfm2Recipe, "lfm2");
+#[pyclass(extends=NativeRecipe, frozen, module="resin._resin")]
+pub(crate) struct Gemma4Recipe;
+#[pymethods]
+impl Gemma4Recipe {
+    #[new]
+    #[pyo3(signature=(tokenizer, *, options=None, eos_token_ids=Vec::new()))]
+    fn new(
+        py: Python<'_>,
+        tokenizer: &Bound<'_, PyAny>,
+        options: Option<&RenderOptions>,
+        eos_token_ids: Vec<u32>,
+    ) -> PyResult<PyClassInitializer<Self>> {
+        Ok(PyClassInitializer::from(NativeRecipe::new(
+            py,
+            tokenizer,
+            "gemma4",
+            options,
+            (!eos_token_ids.is_empty()).then_some(eos_token_ids),
+            Value::Null,
+        )?)
+        .add_subclass(Self))
+    }
+}
+#[pyclass(extends=NativeRecipe, frozen, module="resin._resin")]
+pub(crate) struct DeepSeekV41Recipe;
+#[pymethods]
+impl DeepSeekV41Recipe {
+    #[new]
+    #[pyo3(signature=(tokenizer, *, options=None, vision_config=None, image_token_id=None))]
+    fn new(
+        py: Python<'_>,
+        tokenizer: &Bound<'_, PyAny>,
+        options: Option<&RenderOptions>,
+        vision_config: Option<&Bound<'_, PyAny>>,
+        image_token_id: Option<u32>,
+    ) -> PyResult<PyClassInitializer<Self>> {
+        let vision_config = vision_config
+            .map(depythonize::<Value>)
+            .transpose()?
+            .unwrap_or(Value::Null);
+        Ok(PyClassInitializer::from(NativeRecipe::new(
+            py,
+            tokenizer,
+            "deepseek_v41",
+            options,
+            None,
+            json!({"vision_config":vision_config,"image_token_id":image_token_id}),
+        )?)
+        .add_subclass(Self))
     }
 }

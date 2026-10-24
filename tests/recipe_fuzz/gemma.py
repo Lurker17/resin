@@ -10,8 +10,9 @@ from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
+import resin
 from recipe_fuzz.harness import Case, Part, normalize
-from resin.recipe import Recipe
+from resin.recipe import Gemma4Recipe
 
 MARKERS = (
     "<bos>",
@@ -80,7 +81,7 @@ class GemmaAdapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.codec = Recipe(backend, model="gemma4")
+        self.codec = Gemma4Recipe(backend)
         self.template = _compile_jinja_template(
             (Path(__file__).with_name("templates") / "gemma4.jinja").read_text()
         )
@@ -150,7 +151,15 @@ class GemmaAdapter:
         return normalize(case.parts)
 
     def parser(self):
-        return self.codec.create_parser({}, [])
+        return self.codec.create_parser(
+            self.codec.render(
+                [
+                    resin.recipe.Message(
+                        resin.recipe.Role.USER, [resin.recipe.Text("hi")]
+                    )
+                ]
+            )
+        )
 
     def text_parser(self):
         return self.parser()

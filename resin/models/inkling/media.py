@@ -7,15 +7,13 @@ from typing import Any
 
 from torch import Tensor
 
-from resin.protocols import MediaTokenSpan
-from resin.recipe import Recipe
-from resin.server.media import prepare_recipe_inputs
-from resin.server.media_inputs import (
+from resin._recipe_media import (
     digest_tensors,
     owned_cpu_tensor,
     salt_token_positions,
     single_row,
 )
+from resin.protocols import MediaTokenSpan
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -79,26 +77,6 @@ class InklingMedia:
             image_token_id=int(processor.image_token_id),
             pixel_values=output.get("pixel_values"),
         )
-
-    @classmethod
-    def from_messages(
-        cls,
-        processor: Any,
-        messages: list[dict[str, Any]],
-        *,
-        tools: list[dict[str, Any]] | None = None,
-        reasoning_effort: str | None = None,
-        recipe: Recipe | None = None,
-    ) -> InklingMedia:
-        request: dict[str, Any] = {"messages": messages, "tools": tools}
-        if reasoning_effort is not None:
-            request["reasoning_effort"] = reasoning_effort
-        output = prepare_recipe_inputs(
-            processor,
-            recipe or Recipe(processor.tokenizer, model="inkling"),
-            request,
-        )
-        return cls.from_processor_output(processor, output)
 
 
 __all__ = ["InklingMedia"]

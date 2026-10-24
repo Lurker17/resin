@@ -9,13 +9,13 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from resin.protocols import MediaTokenSpan
-from resin.server.media_inputs import (
+from resin._recipe_media import (
     digest_tensors,
     owned_cpu_tensor,
     salt_token_positions,
     single_row,
 )
+from resin.protocols import MediaTokenSpan
 
 
 def _mrope_positions(

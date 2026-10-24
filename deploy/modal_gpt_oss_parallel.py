@@ -12,6 +12,7 @@ from pathlib import Path
 
 import modal
 
+import resin
 from deploy.jit_cache import (
     KERNEL_CACHE_ENV,
     KERNEL_CACHE_MOUNT,
@@ -20,6 +21,7 @@ from deploy.jit_cache import (
     prepare_kernel_cache,
 )
 from deploy.modal_image import build_modal_image
+from resin.recipe import GptOssRecipe
 
 ROOT = Path(
     os.environ.get("RESIN_MODAL_SOURCE_ROOT", Path(__file__).resolve().parents[1])
@@ -157,7 +159,6 @@ def validate_parallel(
     from transformers import AutoTokenizer
 
     from deploy.gpt_oss_parallel_validation import run_validation
-    from resin.recipe import Recipe
 
     if torch.cuda.device_count() != world_size or any(
         torch.cuda.get_device_capability(rank) != (9, 0) for rank in range(world_size)
@@ -196,7 +197,9 @@ def validate_parallel(
     )
     if tokenizer is None:
         raise RuntimeError("the GPT-OSS checkpoint did not load a tokenizer")
-    recipe = Recipe(tokenizer, model="gpt_oss", options={"reasoning_effort": "medium"})
+    recipe = GptOssRecipe(
+        tokenizer, options=resin.recipe.RenderOptions(reasoning_effort="medium")
+    )
     texts = {
         "short": "Continue the sequence with the next number: 2, 4, 6,",
         "long": (
@@ -213,8 +216,12 @@ def validate_parallel(
             map(
                 int,
                 recipe.render_ids(
-                    [{"role": "user", "content": text}],
-                    add_generation_prompt=True,
+                    [
+                        resin.recipe.Message(
+                            resin.recipe.Role.USER, [resin.recipe.Text(text)]
+                        )
+                    ],
+                    options=resin.recipe.RenderOptions(add_generation_prompt=True),
                 ),
             )
         )
@@ -333,20 +340,22 @@ def probe_prompt_scores(attention_oracle: bool = False):
         _score_prompt,
     )
     from resin import Engine
-    from resin.recipe import Recipe
 
     model_volume.reload()
     _checkpoint_inventory()
     prepare_kernel_cache(kernel_volume)
     tokenizer = AutoTokenizer.from_pretrained(str(MODEL_PATH), local_files_only=True)
-    recipe = Recipe(tokenizer, model="gpt_oss", options={"reasoning_effort": "medium"})
+    recipe = GptOssRecipe(
+        tokenizer, options=resin.recipe.RenderOptions(reasoning_effort="medium")
+    )
     text = (
         "Every request owns its cache pages. Expert workers may process tokens "
         "from independent request replicas. "
     ) * 6 + "Explain why cache namespaces must remain independent."
     prompt = list(
         recipe.render_ids(
-            [{"role": "user", "content": text}], add_generation_prompt=True
+            [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(text)])],
+            options=resin.recipe.RenderOptions(add_generation_prompt=True),
         )
     )
     with socket.socket() as listener:

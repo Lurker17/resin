@@ -14,13 +14,13 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from resin.protocols import MediaTokenSpan
-from resin.server.media import canonical_rgb_image
-from resin.server.media_inputs import (
+from resin._recipe_media import (
+    canonical_rgb_image,
     digest_tensors,
     owned_cpu_tensor,
     salt_token_positions,
 )
+from resin.protocols import MediaTokenSpan
 
 IMAGE_TOKEN = "<｜deepseek_image｜>"
 IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)

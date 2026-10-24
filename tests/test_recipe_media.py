@@ -9,9 +9,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import torch
+from recipe_fuzz.inputs import native_inputs
 
-from resin.recipe import Recipe
-from resin.server.media import prepare_recipe_inputs
+import resin
+from resin.recipe import Gemma4Recipe, InklingRecipe, Qwen38Recipe
 
 MODELS = (
     (
@@ -43,7 +44,12 @@ def model_processor(request):
         )
     except OSError:
         pytest.skip(f"pinned processor {repo}@{revision} is not cached")  # ty: ignore[too-many-positional-arguments]
-    return model, processor, Recipe(processor.tokenizer, model=model)
+    constructor = {
+        "inkling": InklingRecipe,
+        "qwen3_5": Qwen38Recipe,
+        "gemma4": Gemma4Recipe,
+    }[model]
+    return model, processor, constructor(processor)
 
 
 def image():
@@ -61,11 +67,17 @@ def assert_reference_tensors(processor, recipe, messages, *, tools=None):
         return_tensors="pt",
         processor_kwargs={"do_rescale": False},
     )
-    actual = prepare_recipe_inputs(processor, recipe, request)
+    actual = recipe.render(**native_inputs(request))
+    assert actual.token_ids == expected["input_ids"][0].tolist()
+    assert actual.media is not None
     for key, value in expected.items():
-        if isinstance(value, torch.Tensor):
-            assert key in actual, key
-            assert torch.equal(value, actual[key]), key
+        # The engine stores the prepared payload, without HF's batch/mask shell.
+        if isinstance(value, torch.Tensor) and hasattr(actual.media, key):
+            prepared = getattr(actual.media, key)
+            if key == "mm_token_type_ids":
+                assert tuple(value[0].tolist()) == prepared
+            else:
+                assert torch.equal(value, prepared), key
     return actual
 
 
@@ -102,8 +114,10 @@ def test_native_recipe_preserves_real_image_geometry_and_tools(model_processor):
 def test_literal_media_marker_does_not_acquire_a_pixel_slot(model_processor):
     _, processor, recipe = model_processor
     text = f"The literal spelling {processor.image_token} is ordinary text."
-    plain = recipe.render({"messages": [{"role": "user", "content": text}]})
-    assert processor.image_token_id not in plain["token_ids"]
+    plain = recipe.render(
+        [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(text)])]
+    )
+    assert processor.image_token_id not in plain.token_ids
     pixels = processor.image_processor(
         images=[image()], return_tensors="pt", do_rescale=False
     )
@@ -111,25 +125,16 @@ def test_literal_media_marker_does_not_acquire_a_pixel_slot(model_processor):
     expected_slots = processor.tokenizer.encode(
         expansion, add_special_tokens=False
     ).count(processor.image_token_id)
-    actual = prepare_recipe_inputs(
-        processor,
-        recipe,
-        {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": text},
-                        {"type": "image", "image": image()},
-                    ],
-                }
-            ]
-        },
+    actual = recipe.render(
+        [
+            resin.recipe.Message(
+                resin.recipe.Role.USER,
+                [resin.recipe.Text(text), resin.recipe.Image(image())],
+            ),
+        ]
     )
-    assert (
-        actual["input_ids"][0].tolist().count(processor.image_token_id)
-        == expected_slots
-    )
+
+    assert actual.token_ids.count(processor.image_token_id) == expected_slots
 
 
 def test_native_recipe_preserves_gemma_video_timestamps_and_geometry(model_processor):

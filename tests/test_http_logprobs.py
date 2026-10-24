@@ -13,8 +13,9 @@ from recipe_fuzz.test_differential import ADAPTERS
 from test_http_lifecycle import running_server
 from test_recipe import _byte_tokenizer
 
+import resin
 from resin import ForwardOutput, RunnerConfig
-from resin.recipe import Recipe
+from resin.recipe import InklingRecipe, Qwen38Recipe
 
 
 @pytest.fixture(scope="module", params=ADAPTERS)
@@ -57,10 +58,10 @@ def test_byte_fallback_scores_preserve_raw_bytes_and_literal_metaspace(metaspace
     class Codec:
         tokenizer = backend
 
-        def render(self, _request):
-            return {"token_ids": [0], "stop_token_ids": []}
+        def render(self, messages, *, tools=(), options=None):
+            return resin.recipe.RenderedPrompt([0], stop_token_ids=[])
 
-        def create_parser(self, _request, _prompt_ids):
+        def create_parser(self, prompt):
             class Parser:
                 def feed(self, _ids):
                     return []
@@ -431,7 +432,11 @@ def piece_recipe(name, pieces, *, terminal=True):
         if ids[index : index + len(text_ids)] == text_ids
     )
     tail = ids[at + len(text_ids) :] if terminal else []
-    return Recipe(backend, model=name), ids[:at] + piece_ids + tail, piece_ids
+    return (
+        {"inkling": InklingRecipe, "qwen3_5": Qwen38Recipe}[name](backend),
+        ids[:at] + piece_ids + tail,
+        piece_ids,
+    )
 
 
 @pytest.mark.parametrize("api", ["chat/completions", "responses"])
@@ -494,9 +499,15 @@ def test_prompt_scores_allow_zero_output_tokens(api, stream):
             "<|content_xml|>",
         ]
     )
-    codec = Recipe(backend, model="inkling")
+    codec = InklingRecipe(backend)
     request_input = {"messages": [{"role": "user", "content": "score this"}]}
-    prompt_ids = codec.render(request_input)["token_ids"]
+    prompt_ids = codec.render(
+        [
+            resin.recipe.Message(
+                role=resin.recipe.Role.USER, content=[resin.recipe.Text("score this")]
+            )
+        ]
+    ).token_ids
 
     class Runner:
         runner_config = RunnerConfig(continuation_prefill=True)
@@ -558,10 +569,10 @@ def custom_scored_codec(*, with_spans, calls, invalid=None):
         tokenizer = backend
         invalid_spans = invalid
 
-        def render(self, _request):
-            return {"token_ids": [0], "stop_token_ids": []}
+        def render(self, messages, *, tools=(), options=None):
+            return resin.recipe.RenderedPrompt([0], stop_token_ids=[])
 
-        def create_parser(self, _request, _prompt_ids):
+        def create_parser(self, prompt):
             malformed = self.invalid_spans
 
             class Parser:

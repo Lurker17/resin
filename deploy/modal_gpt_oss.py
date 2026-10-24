@@ -17,6 +17,7 @@ import torch.distributed as dist
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+import resin
 from deploy.graph_validation import capture_cuda_graphs
 from deploy.jit_cache import (
     KERNEL_CACHE_ENV,
@@ -44,7 +45,7 @@ from resin.backend.parallel import (
     follow_tensor_parallel_runner,
     monitor_process_context,
 )
-from resin.recipe import Recipe
+from resin.recipe import GptOssRecipe
 from resin.server import HttpServer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -242,7 +243,9 @@ def _require_cached_model(model_key: str) -> tuple[Path, dict[str, object]]:
     }
 
 
-def _load_recipe(model_path: Path) -> tuple[PreTrainedTokenizerBase, Recipe]:
+def _load_recipe(
+    model_path: Path,
+) -> tuple[PreTrainedTokenizerBase, GptOssRecipe]:
     tokenizer_path = model_path / "tokenizer.json"
     if not tokenizer_path.is_file():
         raise RuntimeError(
@@ -254,19 +257,25 @@ def _load_recipe(model_path: Path) -> tuple[PreTrainedTokenizerBase, Recipe]:
             str(model_path), local_files_only=True, trust_remote_code=False
         ),
     )
-    recipe = Recipe(tokenizer, model="gpt_oss", options={"reasoning_effort": "medium"})
+    recipe = GptOssRecipe(
+        tokenizer, options=resin.recipe.RenderOptions(reasoning_effort="medium")
+    )
     return tokenizer, recipe
 
 
-def _encode_prompt(recipe: Recipe, prompt: str) -> list[int]:
-    messages: list[dict[str, str]] = [{"role": "user", "content": prompt}]
-    token_ids = recipe.render_ids(messages, add_generation_prompt=True)
+def _encode_prompt(recipe: GptOssRecipe, prompt: str) -> list[int]:
+    messages: list[resin.recipe.Message] = [
+        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])
+    ]
+    token_ids = recipe.render_ids(
+        messages, options=resin.recipe.RenderOptions(add_generation_prompt=True)
+    )
     if not token_ids:
         raise ValueError("prompt produced no tokens")
     return [int(token_id) for token_id in token_ids]
 
 
-def _generation_prefix_ids(recipe: Recipe, prompt: str) -> list[int]:
+def _generation_prefix_ids(recipe: GptOssRecipe, prompt: str) -> list[int]:
     """Return the harmony scaffolding the model continues from.
 
     The Engine returns sampled completion IDs only.  GPT-OSS starts its
@@ -277,14 +286,20 @@ def _generation_prefix_ids(recipe: Recipe, prompt: str) -> list[int]:
     generated tokens.
     """
 
-    messages: list[dict[str, str]] = [{"role": "user", "content": prompt}]
+    messages: list[resin.recipe.Message] = [
+        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])
+    ]
     conversation_ids = [
         int(token_id)
-        for token_id in recipe.render_ids(messages, add_generation_prompt=False)
+        for token_id in recipe.render_ids(
+            messages, options=resin.recipe.RenderOptions(add_generation_prompt=False)
+        )
     ]
     prompt_ids = [
         int(token_id)
-        for token_id in recipe.render_ids(messages, add_generation_prompt=True)
+        for token_id in recipe.render_ids(
+            messages, options=resin.recipe.RenderOptions(add_generation_prompt=True)
+        )
     ]
     if prompt_ids[: len(conversation_ids)] != conversation_ids:
         raise RuntimeError("recipe generation prompt is not a conversation suffix")
@@ -515,13 +530,14 @@ def _run_prompt(
 def _render_prompt_report(
     report: dict[str, object],
     tokenizer: PreTrainedTokenizerBase,
-    recipe: Recipe,
+    recipe: GptOssRecipe,
     generation_prefix_ids: list[int],
+    prompt: resin.recipe.RenderedPrompt,
 ) -> dict[str, object]:
     raw_output_ids = report.pop("_output_ids", None)
     output_ids = cast(list[int], raw_output_ids)
     rendered_output_ids = generation_prefix_ids + output_ids
-    parsed = recipe.parse_response(output_ids, prompt_ids=generation_prefix_ids)
+    parsed = recipe.parse_response(output_ids, prompt=prompt)
     report.update(
         {
             "text": tokenizer.decode(
@@ -1192,7 +1208,7 @@ def _serve_http_rank(
     torch.cuda.synchronize(runner.device)
     print("[http-startup] warmup complete; starting HTTP server", flush=True)
     codec = recipe
-    server = HttpServer(engine, codec=codec, model=MODEL_SPECS[model_key]["repo_id"])
+    server = HttpServer(engine, recipe=codec, model=MODEL_SPECS[model_key]["repo_id"])
     try:
         server.serve(host="0.0.0.0", port=8000)
     finally:
@@ -1288,7 +1304,10 @@ def _run_model(
         # can load the cached shared library directly instead of rebuilding it.
         model_path, model_cache = _require_cached_model(model_key)
         tokenizer, recipe = _load_recipe(model_path)
-        prompt_ids = _encode_prompt(recipe, prompt)
+        rendered = recipe.render(
+            [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])]
+        )
+        prompt_ids = rendered.token_ids
         generation_prefix_ids = _generation_prefix_ids(recipe, prompt)
         report = _launch_tensor_parallel_prompt(
             2,
@@ -1309,6 +1328,7 @@ def _run_model(
             tokenizer,
             recipe,
             generation_prefix_ids,
+            rendered,
         )
 
     return run_cached_workload(kernel_cache_volume, workload)

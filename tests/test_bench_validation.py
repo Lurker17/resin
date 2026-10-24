@@ -13,15 +13,14 @@ from deploy import bench
 from deploy import deepseek_v41_validation as validation
 from resin import Parallelism
 from resin.backend.topology import RankGroup
-from resin.models.deepseek_v41 import codec
 
 
 @pytest.fixture
 def checkpoint(tmp_path, monkeypatch):
     Tokenizer(models.WordLevel({"token": 0})).save(str(tmp_path / "tokenizer.json"))
     monkeypatch.setattr(
-        codec,
-        "DeepSeekV41Codec",
+        bench,
+        "DeepSeekV41Recipe",
         lambda tokenizer: SimpleNamespace(render_ids=lambda messages: [2, 3]),
     )
     return tmp_path

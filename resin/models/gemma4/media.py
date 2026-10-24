@@ -9,15 +9,13 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from resin.protocols import MediaTokenSpan
-from resin.recipe import Recipe
-from resin.server.media import canonical_rgb_image, decode_image, prepare_recipe_inputs
-from resin.server.media_inputs import (
+from resin._recipe_media import (
     digest_tensors,
     owned_cpu_tensor,
     salt_token_positions,
     single_row,
 )
+from resin.protocols import MediaTokenSpan
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -177,71 +175,6 @@ class Gemma4Media:
             video_position_ids=output.get("video_position_ids"),
         )
 
-    @classmethod
-    def from_messages(
-        cls,
-        processor: Any,
-        messages: list[dict[str, Any]],
-        *,
-        tools: list[dict[str, Any]] | None = None,
-        processor_kwargs: dict[str, Any] | None = None,
-        recipe: Recipe | None = None,
-    ) -> Gemma4Media:
-        output = prepare_recipe_inputs(
-            processor,
-            recipe or Recipe(processor.tokenizer, model="gemma4"),
-            {"messages": messages, "tools": tools},
-            processor_kwargs=processor_kwargs,
-        )
-        return cls.from_processor_output(output)
-
-    @classmethod
-    def from_images(
-        cls,
-        processor: Any,
-        images: list[np.ndarray],
-        *,
-        prompt: str,
-    ) -> Gemma4Media:
-        """Build media from canonical RGB/HWC float32 arrays in ``[0, 1]``."""
-
-        owned = [
-            canonical_rgb_image(image, index=index)
-            for index, image in enumerate(images)
-        ]
-        if not owned:
-            raise ValueError("images must not be empty")
-        content = [{"type": "image", "image": image} for image in owned]
-        content.append({"type": "text", "text": prompt})
-        return cls.from_messages(
-            processor,
-            [{"role": "user", "content": content}],
-            processor_kwargs={"do_rescale": False},
-        )
-
-    @classmethod
-    def from_bytes(
-        cls,
-        processor: Any,
-        data: bytes,
-        *,
-        media_type: str,
-        prompt: str,
-    ) -> Gemma4Media:
-        image = decode_image(data, media_type)
-        return cls.from_messages(
-            processor,
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ],
-        )
-
 
 def _media_digest(media: Gemma4Media) -> str:
     """SHA-256 of canonical model inputs, independent of file codecs."""
@@ -266,4 +199,4 @@ def _cache_identity(media: Gemma4Media, digest: str) -> tuple[int, ...]:
     return salt_token_positions(media.token_ids, media_positions, digest)
 
 
-__all__ = ["Gemma4Media", "canonical_rgb_image", "decode_image"]
+__all__ = ["Gemma4Media"]

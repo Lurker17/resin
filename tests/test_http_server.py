@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import resin
 from resin import BatchPhase, BatchPlan, CacheGroupPlan, Engine, SamplingParams
 from resin.backend.parallel import (
     TensorParallelRunner,
@@ -24,10 +25,10 @@ class IncrementingRunner:
 
 
 class _Codec:
-    def render(self, request):
-        return {"token_ids": [1], "stop_token_ids": []}
+    def render(self, messages, *, tools=(), options=None):
+        return resin.recipe.RenderedPrompt([1], stop_token_ids=[])
 
-    def create_parser(self, request, prompt_ids):
+    def create_parser(self, prompt):
         return SimpleNamespace(feed=lambda ids: [])
 
 
@@ -145,7 +146,7 @@ def test_http_server_validates_route_configuration() -> None:
     with pytest.raises(ValueError, match="requires enable_openai"):
         HttpServer(
             Engine(IncrementingRunner()),
-            codec=_Codec(),
+            recipe=_Codec(),
             model="test",
             enable_openai=False,
             enable_demo=True,
@@ -157,7 +158,7 @@ def test_http_server_validates_route_configuration() -> None:
 def test_http_server_requires_positive_integer_settings(setting, value) -> None:
     engine = Engine(IncrementingRunner())
     with pytest.raises(ValueError, match=f"{setting}.*positive integer"):
-        HttpServer(engine, codec=_Codec(), model="test", **{setting: value})
+        HttpServer(engine, recipe=_Codec(), model="test", **{setting: value})
     assert not engine.closed
     engine.close()
 
@@ -180,7 +181,7 @@ def test_http_server_forwards_default_and_custom_settings(
     monkeypatch.setattr(serving, "_HttpServer", native)
     engine = Engine(IncrementingRunner())
     options = {} if value is None else {setting: value}
-    server = HttpServer(engine, codec=_Codec(), model="test", **options)
+    server = HttpServer(engine, recipe=_Codec(), model="test", **options)
     assert server.model == "test"
     assert created[0][setting] == (default if value is None else value)
     engine.close()

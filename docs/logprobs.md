@@ -122,7 +122,7 @@ semantic `channel`, and `top_logprobs`. Alternatives include their IDs, display
 text, bytes, and scores. Byte-level and byte-fallback tokenizers retain the actual
 bytes, including incomplete UTF-8; concatenating display strings can introduce
 replacement characters, so use `bytes` to reconstruct text. Unsupported decoder
-formats and custom codecs without a serialized tokenizer report `bytes: null`.
+formats and custom recipes without a serialized tokenizer report `bytes: null`.
 JSON represents a valid negative-infinite logprob as `null`.
 
 The complete raw list includes reasoning, tool markup, headers, and model

@@ -3,7 +3,46 @@
 The engine stays token-based. `resin-recipe` owns stock conversation formatting,
 token encoding, model-output parsing, and semantic response events. Python model
 adapters prepare image/video tensors; the HTTP crate owns wire protocols.
-Applications can still pass any structural `ConversationCodec` to `HttpServer`.
+Applications can pass any structural `resin.recipe.Recipe` to `HttpServer(recipe=...)`.
+The public recipe interface accepts typed messages, tools and render options.
+
+## Python API
+
+```python
+import resin
+from resin.recipe import GptOssRecipe
+
+recipe = GptOssRecipe(tokenizer)
+prompt = recipe.render(
+    [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("Hello")])],
+    options=resin.recipe.RenderOptions(reasoning_effort="medium"),
+)
+parser = recipe.create_parser(prompt)
+request = engine.submit(
+    prompt.token_ids,
+    max_new_tokens=128,
+    stop_token_ids=prompt.stop_token_ids,
+)
+```
+
+Use an explicit native constructor: `GptOssRecipe`, `DeepSeekV4Recipe`,
+`DeepSeekV41Recipe`, `Qwen35Recipe`, `Qwen38Recipe`, `Gemma4Recipe`,
+`InklingRecipe`, or `Lfm2Recipe`. Qwen versions select different formats explicitly.
+`resin.recipe.Recipe` is a structural protocol, not a model factory.
+
+`Message` contains a `Role` and typed `Text`, `Thinking`, `Image`, `Video`, `Audio`,
+`ToolCall` or `ToolResult` blocks. Tool declarations and `RenderOptions` are
+separate rendering arguments. Supported media depends on the model recipe.
+Image/video recipes accept a processor; V4.1 prepares its checkpoint's pixels
+internally. `prompt.media` carries the prepared model payload for
+`engine.submit(media=prompt.media, ...)`.
+
+`RenderedPrompt` exposes `token_ids`, `stop_token_ids` and `media`. Native prompts
+also retain the parser context. Pass the actual prompt back to the same recipe;
+`create_parser(prompt)` creates independent state for each response. A custom
+Python recipe may construct `RenderedPrompt` and supply its own parser.
+HTTP request dictionaries are converted at the serving boundary; they are not
+accepted as native recipe inputs.
 
 ## Contracts
 
@@ -26,6 +65,7 @@ Applications can still pass any structural `ConversationCodec` to `HttpServer`.
 | --- | --- | --- |
 | GPT-OSS 20B/120B | Harmony / pinned tokenizer | channels and JSON tools |
 | DeepSeek V4 Flash-0731/Pro-0813 | pinned checkpoint encoder | reasoning and DSML |
+| DeepSeek V4.1 Flash-1017 | released DeepSeek Recipe / checkpoint processor | revised DSML and image slots |
 | Inkling-Small | pinned HF template / TML v0 | typed content blocks |
 | Qwen3.5/3.8 | pinned HF template / TML | reasoning and XML tools |
 | Gemma4 | pinned HF template | model turns and tools |
@@ -42,7 +82,7 @@ Applications can still pass any structural `ConversationCodec` to `HttpServer`.
    TML as an additional oracle where formats overlap. Keep default fuzz work
    around one second per model, with opt-in longer runs and minimized failures.
 5. Verify native streaming/complete HTTP behavior for every family, custom
-   codec compatibility, real pinned tokenizers/templates, multimodal admission,
+   recipe compatibility, real pinned tokenizers/templates, multimodal admission,
    type checking, formatting, Rust checks, and the full CPU suite.
 
 Completion requires evidence for every row and every stock entrypoint. A native
@@ -52,8 +92,8 @@ still used at runtime does not complete this migration.
 ## Verification recorded at migration
 
 All six stock families use the native renderer/parser boundary. Stock deployment
-warmups, reports, HTTP codecs and local LFM scripts no longer interpret reference
-templates or execute checkpoint encoders. Custom structural codecs retain their
+warmups, reports, HTTP recipes and local LFM scripts no longer interpret reference
+templates or execute checkpoint encoders. Custom structural recipes retain their
 Python protocol, including parsers without finalization.
 
 The shared suite runs 40 deterministic examples per style/model, including

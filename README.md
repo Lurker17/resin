@@ -173,8 +173,9 @@ fallback. Use `overlap=False` for reference execution. See
 The built-in native server exposes one Engine through OpenAI Chat Completions and
 Responses, Anthropic Messages, and a small streaming chat page. Model-specific
 prompt rendering and incremental response parsing live in the independent
-`resin-recipe` Rust crate. Python prepares media tensors and may supply custom
-protocol-compatible codecs.
+`resin-recipe` Rust crate. Native model recipes implement the same `Recipe`
+protocol as application-provided recipes. Python pixel processors remain an
+internal preparation step for models that need them.
 
 The bridge bounds queued jobs with `HttpServer(request_queue_capacity=1024)`.
 This shared intake queue absorbs bursts while requests await engine admission;
@@ -233,23 +234,39 @@ Because `requires_proxy_auth=False`, anyone with a URL can submit inference
 requests and incur GPU usage; remove the deployment when it is no longer
 needed.
 
-Stock model codecs use the native `resin-recipe` conversation formats and
-incremental response parsers. Image/video processors prepare media arrays and
-placeholder geometry after the recipe renders the conversation.
-
-For a custom model-format adapter, pass any protocol-compatible `codec=`:
+Construct a native recipe directly from its tokenizer or multimodal processor.
+Messages and content blocks are Rust-owned typed objects:
 
 ```python
+import resin
+from resin.recipe import GptOssRecipe
 from resin.server import HttpServer
 
-HttpServer(engine, codec=my_codec, model="my-model", stream_interval=4).serve()
+recipe = GptOssRecipe(tokenizer)
+prompt = recipe.render(
+    [
+        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("Hello!")]),
+    ]
+)
+parser = recipe.create_parser(prompt)
+
+HttpServer(engine, recipe=recipe, model="my-model", stream_interval=4).serve()
 ```
 
-`ConversationCodec.render()` returns prompt and stop token IDs;
-`create_parser()` returns a per-request incremental parser that emits text,
-reasoning, and tool-call deltas. An optional `finish("stop" | "length")` flushes
-buffered output before the server sends the final response. Custom codecs do
-not need to inherit a Resin class or use the native tokenizer/parser.
+`Recipe.render(messages, *, tools=(), options=None)` returns a `RenderedPrompt`
+owning token IDs, stop IDs, optional prepared media, and an internal parser seed.
+`create_parser(prompt)` creates a fresh incremental parser with the same resolved
+formatting options. It emits text, reasoning, and tool-call deltas; an optional
+`finish("stop" | "length")` flushes buffered output before completion.
+Applications can pass their own structural `Recipe` implementation without
+inheriting a Resin class or using the native tokenizer/parser.
+
+For images, put `resin.recipe.Image.from_rgb(array)` or
+`resin.recipe.Image.from_bytes(data, media_type="image/png")` in a message and pass
+the model's processor to its recipe, for example `resin.recipe.Gemma4Recipe(processor)`. Shared internal
+preparation normalizes the sources and expands explicit media slots. Model
+processors retain their own patch geometry, rotary positions, and cache identity.
+Literal marker spellings in ordinary text cannot acquire media slots.
 
 `stream_interval` is an integer from 1 through `2**32 - 1`, set once per server,
 and defaults to 1.
@@ -259,10 +276,9 @@ produce larger chunks, while completion or a bounded buffer can flush earlier.
 Text and its logprobs stay aligned. Inference, stop matching, and cancellation
 still run on every step. The setting applies to all requests and HTTP APIs.
 
-`resin.server.media` provides optional image decoding and OpenAI-style message
-normalization helpers for model bring-up, demos, and tests. Codecs do not have
-to use them. Security-sensitive servers should enforce their own input-size,
-MIME, codec, and fetching policy before constructing model media.
+Image data URLs are decoded locally; remote image fetching remains an application
+concern. Prepared media owns its pixel tensors through request execution and
+does not become part of response parser state.
 
 ## Current shape
 

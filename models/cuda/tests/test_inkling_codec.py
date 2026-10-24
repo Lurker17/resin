@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 import pytest
 
-import resin.models.inkling.codec as codec_module
-from resin.models.inkling.codec import InklingCodec
-from resin.protocols import ConversationCodec, FinalizingResponseParser
+import resin
+from resin.protocols import FinalizingResponseParser
+from resin.recipe import InklingRecipe
 
 SPECIAL_TOKENS = {
     "<|message_model|>": 200001,
@@ -17,6 +17,7 @@ SPECIAL_TOKENS = {
     "<|content_model_end_sampling|>": 200006,
     "<|content_thinking|>": 200008,
     "<|end_message|>": 200010,
+    "<|content_xml|>": 200011,
     "<|content_tool_error|>": 200022,
     "<|content_invoke_tool_json|>": 200049,
     "<|content_invoke_tool_text|>": 200057,
@@ -45,78 +46,72 @@ def _text_ids(text: str) -> list[int]:
     return [ord(character) for character in text]
 
 
-def test_render_forwards_request_to_native_recipe(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    seen: dict[str, Any] = {}
-
-    class RecordingRecipe:
-        def __init__(self, tokenizer, *, model):
-            seen.update(tokenizer=tokenizer, model=model)
-
-        def render(self, request):
-            seen["request"] = request
-            return {"token_ids": [4, 5], "stop_token_ids": [200006, 33]}
-
-    monkeypatch.setattr(codec_module, "Recipe", RecordingRecipe)
-    tokenizer = FakeTokenizer()
-    codec = InklingCodec(tokenizer)
-    request = {
-        "messages": [{"role": "user", "content": "hello"}],
-        "tools": [{"type": "function", "function": {"name": "weather"}}],
-        "reasoning_effort": "low",
-        "stop": ["!"],
-    }
-    assert codec.render(request) == {
-        "token_ids": [4, 5],
-        "stop_token_ids": [200006, 33],
-    }
-    assert seen == {"tokenizer": tokenizer, "model": "inkling", "request": request}
+def test_native_recipe_renders_typed_messages_and_tools() -> None:
+    model_recipe = InklingRecipe(FakeTokenizer())
+    messages = [
+        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hello")])
+    ]
+    rendered = model_recipe.render(
+        messages,
+        tools=[resin.recipe.Tool("weather")],
+        options=resin.recipe.RenderOptions(reasoning_effort="low"),
+    )
+    assert isinstance(rendered, resin.recipe.RenderedPrompt)
+    assert rendered.token_ids
+    assert rendered.stop_token_ids == [200006]
+    assert model_recipe.render_ids(messages) == model_recipe.render(messages).token_ids
 
 
 def test_render_maps_openai_xhigh_to_inkling_max() -> None:
-    codec = InklingCodec(FakeTokenizer())
-    request = {"messages": [{"role": "user", "content": "hello"}]}
-    assert codec.render({**request, "reasoning_effort": "xhigh"}) == codec.render(
-        {**request, "reasoning_effort": "max"}
+    model_recipe = InklingRecipe(FakeTokenizer())
+    messages = [
+        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hello")])
+    ]
+    assert model_recipe.render_ids(
+        messages, options=resin.recipe.RenderOptions(reasoning_effort="xhigh")
+    ) == model_recipe.render_ids(
+        messages, options=resin.recipe.RenderOptions(reasoning_effort="max")
     )
 
 
-def test_processor_recipe_receives_all_format_controls(monkeypatch: pytest.MonkeyPatch):
+def test_processor_recipe_preserves_explicit_format_controls():
     class Processor:
         tokenizer = FakeTokenizer()
         image_token_id = 200054
 
-    seen = []
-
-    def prepare(processor, recipe, request):
-        seen.append(request)
-        return {"input_ids": [[1, 2]]}
-
-    monkeypatch.setattr(codec_module, "prepare_recipe_inputs", prepare)
-    request = {
-        "messages": [{"role": "user", "content": "hello"}],
-        "reasoning_effort": None,
-        "extra": {"reasoning_effort": "low"},
-    }
-    assert InklingCodec(Processor()).render(request)["token_ids"] == [1, 2]
-    assert seen == [request]
+    messages = [
+        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hello")])
+    ]
+    options = resin.recipe.RenderOptions(reasoning_effort="low")
+    expected = InklingRecipe(Processor.tokenizer).render_ids(messages, options=options)
+    assert InklingRecipe(Processor()).render_ids(messages, options=options) == expected
 
 
 def test_render_rejects_unknown_reasoning_effort() -> None:
-    codec = InklingCodec(FakeTokenizer())
+    model_recipe = InklingRecipe(FakeTokenizer())
     with pytest.raises(ValueError, match="reasoning_effort"):
-        codec.render(
-            {
-                "messages": [{"role": "user", "content": "hello"}],
-                "reasoning_effort": "turbo",
-            }
+        model_recipe.render(
+            [
+                resin.recipe.Message(
+                    resin.recipe.Role.USER, [resin.recipe.Text("hello")]
+                )
+            ],
+            options=resin.recipe.RenderOptions(reasoning_effort="turbo"),
         )
 
 
+def _parser(model_recipe, *prefix):
+    prompt = model_recipe.render(
+        [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])]
+    )
+    parser = model_recipe.create_parser(prompt)
+    assert parser.feed(prefix) == []
+    return parser
+
+
 def test_parser_separates_repeated_reasoning_and_visible_text_blocks() -> None:
-    codec = InklingCodec(FakeTokenizer())
-    parser = codec.create_parser({}, [200001])
+    codec = InklingRecipe(FakeTokenizer())
+    parser = _parser(codec)
 
     assert parser.feed([200008, *_text_ids("think")]) == [
         {"type": "reasoning_delta", "delta": "think"}
@@ -144,8 +139,8 @@ def test_parser_separates_repeated_reasoning_and_visible_text_blocks() -> None:
 
 
 def test_parser_uses_prompt_tail_to_continue_reasoning() -> None:
-    codec = InklingCodec(FakeTokenizer())
-    parser = codec.create_parser({}, [200001, 200008])
+    codec = InklingRecipe(FakeTokenizer())
+    parser = _parser(codec, 200008)
 
     assert parser.feed(_text_ids("continued")) == [
         {"type": "reasoning_delta", "delta": "continued"}
@@ -153,8 +148,8 @@ def test_parser_uses_prompt_tail_to_continue_reasoning() -> None:
 
 
 def test_parser_extracts_json_tool_call_and_hides_header_metadata() -> None:
-    codec = InklingCodec(FakeTokenizer())
-    parser = codec.create_parser({}, [200001])
+    codec = InklingRecipe(FakeTokenizer())
+    parser = _parser(codec)
     payload = '{"name":"weather","args":{"city":"SF"}}'
 
     assert parser.feed(
@@ -181,8 +176,8 @@ def test_parser_extracts_json_tool_call_and_hides_header_metadata() -> None:
 
 
 def test_raw_tool_and_tool_error_blocks_remain_visible() -> None:
-    codec = InklingCodec(FakeTokenizer())
-    parser = codec.create_parser({}, [200001])
+    codec = InklingRecipe(FakeTokenizer())
+    parser = _parser(codec)
 
     assert parser.feed([200057, *_text_ids("raw"), 200010]) == [
         {"type": "text_delta", "delta": "raw"}
@@ -193,32 +188,29 @@ def test_raw_tool_and_tool_error_blocks_remain_visible() -> None:
 
 
 def test_native_codec_implements_python_protocols() -> None:
-    codec = InklingCodec(FakeTokenizer())
-    compatible_codec: ConversationCodec = codec
-    parser: FinalizingResponseParser = codec.create_parser({}, [200001, 200004])
+    codec = InklingRecipe(FakeTokenizer())
+    compatible_codec: resin.recipe.Recipe = codec
+    parser: FinalizingResponseParser = _parser(codec, 200004)
 
     assert compatible_codec is codec
     assert parser.feed(_text_ids("hello")) == [{"type": "text_delta", "delta": "hello"}]
     assert parser.finish("stop") == []
 
 
-def test_codec_prepares_one_native_tokenizer_for_multiple_requests(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    prepare = codec_module.Recipe
-    calls: list[Any] = []
+def test_recipe_prepares_one_tokenizer_for_independent_parsers() -> None:
+    class CountingTokenizer(FakeTokenizer):
+        reads = 0
 
-    def prepare_recipe(tokenizer, *, model):
-        calls.append(tokenizer)
-        return prepare(tokenizer, model=model)
+        @property
+        def decode(self):
+            self.reads += 1
+            return super().decode
 
-    monkeypatch.setattr(codec_module, "Recipe", prepare_recipe)
-    tokenizer = FakeTokenizer()
-    codec = InklingCodec(tokenizer)
-    first = codec.create_parser({}, [200001, 200004])
-    second = codec.create_parser({}, [200001, 200008])
-
-    assert calls == [tokenizer]
+    tokenizer = CountingTokenizer()
+    model_recipe = InklingRecipe(tokenizer)
+    first = _parser(model_recipe, 200004)
+    second = _parser(model_recipe, 200008)
+    assert tokenizer.reads == 1
     assert first.feed(_text_ids("visible")) == [
         {"type": "text_delta", "delta": "visible"}
     ]
@@ -231,7 +223,7 @@ def test_codec_prepares_one_native_tokenizer_for_multiple_requests(
 def test_parser_discards_unterminated_tool_at_finish(
     reason: Literal["stop", "length"],
 ) -> None:
-    parser = InklingCodec(FakeTokenizer()).create_parser({}, [200001])
+    parser = _parser(InklingRecipe(FakeTokenizer()))
 
     assert parser.feed([200049, *_text_ids('{"name":"weather","args":')]) == []
     assert parser.finish(reason) == []
@@ -245,7 +237,7 @@ def test_parser_discards_unterminated_tool_at_finish(
     ["{bad json", "[]", '{"args":{}}', '{"name":"weather","args":"SF"}'],
 )
 def test_parser_rejects_invalid_closed_tool_block(payload: str) -> None:
-    parser = InklingCodec(FakeTokenizer()).create_parser({}, [200001])
+    parser = _parser(InklingRecipe(FakeTokenizer()))
 
     with pytest.raises(ValueError):
         parser.feed([200049, *_text_ids(payload), 200010])

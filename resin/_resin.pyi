@@ -2,11 +2,19 @@ from collections.abc import Sequence
 from typing import Any, Final, final
 from collections.abc import Mapping
 from typing import Literal
+from resin.recipe import Recipe
+from resin.recipe import ContentBlock
 import numpy as np
 import numpy.typing as npt
-from resin.protocols import ConversationCodec, MediaInput, ParserEvent, Runner
+from resin.protocols import MediaInput, ParserEvent, Runner
 
 __version__: Final[str]
+
+@final
+class Audio:
+    def __new__(cls, /, source: Any) -> Audio: ...
+    @property
+    def source(self, /) -> Any: ...
 
 @final
 class BatchPhase:
@@ -405,6 +413,24 @@ class CacheRetention:
     def __repr__(self, /) -> str: ...
 
 @final
+class DeepSeekV41Recipe(_NativeRecipe):
+    def __new__(
+        cls,
+        /,
+        tokenizer: Any,
+        *,
+        options: RenderOptions | None = None,
+        vision_config: Any | None = None,
+        image_token_id: int | None = None,
+    ) -> DeepSeekV41Recipe: ...
+
+@final
+class DeepSeekV4Recipe(_NativeRecipe):
+    def __new__(
+        cls, /, tokenizer: Any, *, options: RenderOptions | None = None
+    ) -> DeepSeekV4Recipe: ...
+
+@final
 class Engine:
     def __enter__(self, /) -> Engine: ...
     def __exit__(self, /, _exc_type: Any, _exc_value: Any, _traceback: Any) -> bool: ...
@@ -559,6 +585,39 @@ class ForwardOutput:
     def top_token_ids(self, /) -> npt.NDArray[np.uint32] | None: ...
 
 @final
+class Gemma4Recipe(_NativeRecipe):
+    def __new__(
+        cls,
+        /,
+        tokenizer: Any,
+        *,
+        options: RenderOptions | None = None,
+        eos_token_ids: Sequence[int] = ...,
+    ) -> Gemma4Recipe: ...
+
+@final
+class GptOssRecipe(_NativeRecipe):
+    def __new__(
+        cls, /, tokenizer: Any, *, options: RenderOptions | None = None
+    ) -> GptOssRecipe: ...
+
+@final
+class Image:
+    def __new__(cls, /, source: Any) -> Image: ...
+    @staticmethod
+    def from_bytes(data: bytes, *, media_type: str) -> Image: ...
+    @staticmethod
+    def from_rgb(array: npt.NDArray[np.float32]) -> Image: ...
+    @property
+    def source(self, /) -> Any: ...
+
+@final
+class InklingRecipe(_NativeRecipe):
+    def __new__(
+        cls, /, tokenizer: Any, *, options: RenderOptions | None = None
+    ) -> InklingRecipe: ...
+
+@final
 class InklingResponseParser:
     """
     Parse Inkling response blocks into the events accepted by HttpServer.
@@ -575,25 +634,36 @@ class InklingResponseParser:
     def finish(self, /, reason: Literal["stop", "length"]) -> list[ParserEvent]: ...
 
 @final
-class ModelRecipe:
-    """
-    Model format and prepared tokenizer, shared by all request parsers.
-    """
+class Lfm2Recipe(_NativeRecipe):
     def __new__(
-        cls, /, tokenizer: RecipeTokenizer, *, model: str, options: Any | None = None
-    ) -> ModelRecipe: ...
-    def create_parser(
-        self, /, request: Any, prompt_ids: Sequence[int]
-    ) -> RecipeResponseParser: ...
-    def get_stop_token_ids(self, /) -> list[int]: ...
-    def render_ids(
-        self,
+        cls, /, tokenizer: Any, *, options: RenderOptions | None = None
+    ) -> Lfm2Recipe: ...
+
+@final
+class Message:
+    def __new__(
+        cls,
         /,
-        request: Any,
+        role: Role,
+        content: Sequence[ContentBlock],
         *,
-        media_replacements: Mapping[str, Sequence[str]] | None = None,
-    ) -> list[int]: ...
-    def render_text(self, /, request: Any) -> str: ...
+        tools: Sequence[Tool] = ...,
+        task: str | None = None,
+        continuation: bool = False,
+        response_format: Any | None = None,
+    ) -> Message: ...
+    @property
+    def content(self, /) -> tuple[ContentBlock, ...]: ...
+    @property
+    def continuation(self, /) -> bool: ...
+    @property
+    def response_format(self, /) -> Any: ...
+    @property
+    def role(self, /) -> Role: ...
+    @property
+    def task(self, /) -> str | None: ...
+    @property
+    def tools(self, /) -> list[Tool]: ...
 
 @final
 class Parallelism:
@@ -640,6 +710,18 @@ class Parallelism:
     def world_size(self, /) -> int: ...
 
 @final
+class Qwen35Recipe(_NativeRecipe):
+    def __new__(
+        cls, /, tokenizer: Any, *, options: RenderOptions | None = None
+    ) -> Qwen35Recipe: ...
+
+@final
+class Qwen38Recipe(_NativeRecipe):
+    def __new__(
+        cls, /, tokenizer: Any, *, options: RenderOptions | None = None
+    ) -> Qwen38Recipe: ...
+
+@final
 class RecipeResponseParser:
     """
     Common native handle recognized directly by the HTTP actor.
@@ -658,6 +740,74 @@ class RecipeTokenizer:
     def __new__(cls, /, tokenizer: Any) -> RecipeTokenizer: ...
     @property
     def is_native(self, /) -> bool: ...
+
+@final
+class RenderOptions:
+    """
+    Explicit rendering controls; absent fields inherit recipe defaults.
+    """
+    def __new__(
+        cls,
+        /,
+        *,
+        reasoning_effort: str | int | float | None = None,
+        enable_thinking: bool | None = None,
+        preserve_thinking: bool | None = None,
+        add_generation_prompt: bool | None = None,
+        add_vision_id: bool | None = None,
+        use_system_prompt: bool | None = None,
+        model_identity: str | None = None,
+        knowledge_cutoff: str | None = None,
+        conversation_start_date: str | None = None,
+        auto_drop_analysis: bool | None = None,
+        thinking_mode: str | None = None,
+        response_format: Any | None = None,
+    ) -> RenderOptions: ...
+    def __repr__(self, /) -> str: ...
+    @property
+    def add_generation_prompt(self, /) -> bool | None: ...
+    @property
+    def add_vision_id(self, /) -> bool | None: ...
+    @property
+    def auto_drop_analysis(self, /) -> bool | None: ...
+    @property
+    def conversation_start_date(self, /) -> str | None: ...
+    @property
+    def enable_thinking(self, /) -> bool | None: ...
+    @property
+    def knowledge_cutoff(self, /) -> str | None: ...
+    @property
+    def model_identity(self, /) -> str | None: ...
+    @property
+    def preserve_thinking(self, /) -> bool | None: ...
+    @property
+    def reasoning_effort(self, /) -> str | int | float | None: ...
+    @property
+    def response_format(self, /) -> Any: ...
+    @property
+    def thinking_mode(self, /) -> str | None: ...
+    @property
+    def use_system_prompt(self, /) -> bool | None: ...
+
+@final
+class RenderedPrompt:
+    """
+    Rendered IDs and optional prepared media. Native parser state contains no pixels.
+    """
+    def __new__(
+        cls,
+        /,
+        token_ids: Sequence[int],
+        *,
+        stop_token_ids: Sequence[int] = ...,
+        media: MediaInput | None = None,
+    ) -> RenderedPrompt: ...
+    @property
+    def media(self, /) -> MediaInput | None: ...
+    @property
+    def stop_token_ids(self, /) -> list[int]: ...
+    @property
+    def token_ids(self, /) -> list[int]: ...
 
 @final
 class RequestLease:
@@ -706,6 +856,25 @@ class ResourceBinding:
     def cache_layout(self, /) -> CacheLayout | None: ...
     @property
     def cache_pool_id(self, /) -> int | None: ...
+
+@final
+class Role:
+    """
+    Conversation role. This enum is extensible: new roles may be added.
+    Code matching roles should include a fallback for unsupported roles.
+    Some roles are model-specific; recipes validate supported roles.
+    """
+
+    ASSISTANT: Final[Role]
+    DEVELOPER: Final[Role]
+    LATEST_REMINDER: Final[Role]
+    SYSTEM: Final[Role]
+    TOOL: Final[Role]
+    USER: Final[Role]
+    def __eq__(self, value: object, /) -> bool: ...
+    def __int__(self, /) -> int: ...
+    def __ne__(self, value: object, /) -> bool: ...
+    def __repr__(self, /) -> str: ...
 
 @final
 class RunnerConfig:
@@ -800,6 +969,18 @@ class SchedulerConfig:
     def schedule_conservativeness(self, /) -> float: ...
 
 @final
+class Text:
+    def __new__(cls, /, text: str) -> Text: ...
+    @property
+    def text(self, /) -> str: ...
+
+@final
+class Thinking:
+    def __new__(cls, /, text: str) -> Thinking: ...
+    @property
+    def text(self, /) -> str: ...
+
+@final
 class TokenEvent:
     def __repr__(self, /) -> str: ...
     @property
@@ -832,12 +1013,73 @@ class TokenLogprobs:
     def top_logprobs(self, /) -> list[tuple[int, float]]: ...
 
 @final
+class Tool:
+    def __new__(
+        cls,
+        /,
+        name: str,
+        *,
+        description: str | None = None,
+        parameters: Any | None = None,
+        response: Any | None = None,
+        namespace: Any | None = None,
+    ) -> Tool: ...
+    @property
+    def description(self, /) -> str | None: ...
+    @property
+    def name(self, /) -> str: ...
+    @property
+    def namespace(self, /) -> Any: ...
+    @property
+    def parameters(self, /) -> Any: ...
+    @property
+    def response(self, /) -> Any: ...
+
+@final
+class ToolCall:
+    def __new__(
+        cls,
+        /,
+        name: str,
+        arguments: Any,
+        *,
+        id: str | None = None,
+        namespace: Any | None = None,
+    ) -> ToolCall: ...
+    @property
+    def arguments(self, /) -> Any: ...
+    @property
+    def id(self, /) -> str | None: ...
+    @property
+    def name(self, /) -> str: ...
+    @property
+    def namespace(self, /) -> Any: ...
+
+@final
+class ToolResult:
+    def __new__(
+        cls, /, content: Any, *, call_id: str | None = None, name: str | None = None
+    ) -> ToolResult: ...
+    @property
+    def call_id(self, /) -> str | None: ...
+    @property
+    def content(self, /) -> Any: ...
+    @property
+    def name(self, /) -> str | None: ...
+
+@final
+class Video:
+    def __new__(cls, /, source: Any) -> Video: ...
+    @property
+    def source(self, /) -> Any: ...
+
+@final
 class _HttpServer:
     def __new__(
         cls,
         /,
         engine: Engine,
-        codec: ConversationCodec,
+        recipe: Recipe,
         *,
         model: str,
         stream_interval: int = 1,
@@ -865,7 +1107,7 @@ class _HttpSession:
     The same native lifecycle used by the ordinary actor, attached to one DP driver.
     """
     def __new__(
-        cls, /, engine: Engine, codec: Any, *, stream_interval: int = 1
+        cls, /, engine: Engine, recipe: Recipe, *, stream_interval: int = 1
     ) -> _HttpSession: ...
     @property
     def active_count(self, /) -> int: ...
@@ -873,3 +1115,39 @@ class _HttpSession:
     def cancel(self, /, ids: Sequence[str]) -> None: ...
     def close(self, /) -> None: ...
     def process(self, /, events: Sequence[TokenEvent]) -> str: ...
+
+class _NativeRecipe:
+    """
+    Shared native implementation inherited by the concrete model recipes.
+    """
+    def create_parser(self, /, prompt: RenderedPrompt) -> RecipeResponseParser: ...
+    def get_stop_token_ids(self, /) -> list[int]: ...
+    def parse_response(
+        self, /, token_ids: Sequence[int], *, prompt: RenderedPrompt
+    ) -> Any: ...
+    def render(
+        self,
+        /,
+        messages: Sequence[Message],
+        *,
+        tools: Sequence[Tool] = ...,
+        options: RenderOptions | None = None,
+    ) -> RenderedPrompt: ...
+    def render_ids(
+        self,
+        /,
+        messages: Sequence[Message],
+        *,
+        tools: Sequence[Tool] = ...,
+        options: RenderOptions | None = None,
+    ) -> list[int]: ...
+    def render_text(
+        self,
+        /,
+        messages: Sequence[Message],
+        *,
+        tools: Sequence[Tool] = ...,
+        options: RenderOptions | None = None,
+    ) -> str: ...
+    @property
+    def tokenizer(self, /) -> Any: ...

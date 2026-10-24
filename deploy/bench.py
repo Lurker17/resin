@@ -16,10 +16,12 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+import resin
 from deploy.bench_trace import decode_trace
 from resin import Engine, Parallelism, SchedulerConfig
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.topology import ParallelGroups
+from resin.recipe import DeepSeekV41Recipe
 
 
 def _runner(model, checkpoint, *, device, groups, cases, options, context_capacity):
@@ -156,7 +158,6 @@ def _checkpoint_validation(raw, engine, checkpoint, metadata, groups):
     from tokenizers import Tokenizer
 
     from deploy.deepseek_v41_validation import _validation_stage, validate_model
-    from resin.models.deepseek_v41.codec import DeepSeekV41Codec
 
     drivers = None if groups is None else groups.drivers
     rank = 0 if groups is None else groups.rank
@@ -188,18 +189,19 @@ def _checkpoint_validation(raw, engine, checkpoint, metadata, groups):
 
     try:
         with _validation_stage("prompt", coordinate):
-            recipe = DeepSeekV41Codec(
+            recipe = DeepSeekV41Recipe(
                 Tokenizer.from_file(str(Path(checkpoint) / "tokenizer.json"))
             )
             prompt = recipe.render_ids(
                 [
-                    {
-                        "role": "user",
-                        "content": (
-                            "Count from 1 to 20, putting each number on its own line. "
-                            "Do not add an introduction."
-                        ),
-                    }
+                    resin.recipe.Message(
+                        resin.recipe.Role.USER,
+                        [
+                            resin.recipe.Text(
+                                "Count from 1 to 20, putting each number on its own line. Do not add an introduction."
+                            )
+                        ],
+                    )
                 ]
             )
         local = {

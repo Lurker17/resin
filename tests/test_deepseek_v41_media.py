@@ -15,9 +15,10 @@ from PIL import Image
 from recipe_fuzz.deepseek import DeepSeekV41Adapter
 from tokenizers import Tokenizer
 
+import resin
 from resin import Engine, MediaInput, RunnerConfig, SchedulerConfig
+from resin._recipe_media import digest_tensors
 from resin.models.deepseek_v41 import (
-    DeepSeekV41Codec,
     DeepSeekV41Image,
     DeepSeekV41Media,
 )
@@ -26,7 +27,7 @@ from resin.models.deepseek_v41.media import (
     DeepSeekV41ImageProcessor,
     image_token_types,
 )
-from resin.server.media_inputs import digest_tensors
+from resin.recipe import DeepSeekV41Recipe
 
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures/deepseek_v41_images.json").read_text()
@@ -48,7 +49,7 @@ def _data_url(rgb):
 def codec():
     tokenizer = Tokenizer.from_str(DeepSeekV41Adapter().codec.tokenizer.to_str())
     tokenizer.add_special_tokens([IMAGE_TOKEN])
-    return DeepSeekV41Codec(tokenizer)
+    return DeepSeekV41Recipe(tokenizer)
 
 
 @pytest.mark.parametrize("case", FIXTURE["cases"])
@@ -81,34 +82,37 @@ def test_geometry_matches_official_recipe_for_varied_aspect_ratios():
 
 def test_media_codec_expands_only_explicit_images_and_owns_inputs(codec):
     rgb = _pattern(17, 31)
-    request = {
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "literal " + IMAGE_TOKEN},
-                    {"type": "image_url", "image_url": {"url": _data_url(rgb)}},
-                    {"type": "text", "text": "compare"},
-                    {"type": "image", "image": np.zeros((2, 4, 3), dtype=np.float32)},
-                ],
-            },
-        ],
-        "extra": {"thinking_mode": "thinking", "reasoning_effort": 37},
-    }
-    rendered = codec.render(request)
-    media = rendered["media"]
+    second = np.zeros((2, 4, 3), dtype=np.float32)
+    messages = [
+        resin.recipe.Message(
+            resin.recipe.Role.USER,
+            [
+                resin.recipe.Text("literal " + IMAGE_TOKEN),
+                resin.recipe.Image(_data_url(rgb)),
+                resin.recipe.Text("compare"),
+                resin.recipe.Image(second),
+            ],
+        )
+    ]
+    rendered = codec.render(
+        messages,
+        options=resin.recipe.RenderOptions(
+            thinking_mode="thinking", reasoning_effort=37
+        ),
+    )
+    media = rendered.media
     assert isinstance(media, MediaInput)
     assert isinstance(media, DeepSeekV41Media)
     assert len(media.images) == 2
-    assert media.token_ids == tuple(rendered["token_ids"])
-    assert rendered["stop_token_ids"] == codec.get_stop_token_ids()
+    assert media.token_ids == tuple(rendered.token_ids)
+    assert rendered.stop_token_ids == codec.get_stop_token_ids()
     assert media.token_spans == ()
     positions = {
         position
         for image in media.images
         for position in range(image.start, image.start + len(image.types))
     }
-    assert rendered["token_ids"].count(media.image_token_id) == len(positions)
+    assert rendered.token_ids.count(media.image_token_id) == len(positions)
     assert all(
         (token != key) == (index in positions)
         for index, (token, key) in enumerate(
@@ -116,36 +120,26 @@ def test_media_codec_expands_only_explicit_images_and_owns_inputs(codec):
         )
     )
     assert IMAGE_TOKEN in codec.tokenizer.decode(
-        rendered["token_ids"][: media.images[0].start], skip_special_tokens=False
+        rendered.token_ids[: media.images[0].start], skip_special_tokens=False
     )
-    assert (
-        codec.render_ids(request["messages"])
-        == codec.render({"messages": request["messages"]})["token_ids"]
-    )
-    # The caller's arrays and records remain untouched.
-    assert request["messages"][0]["content"][1]["type"] == "image_url"
-    request["messages"][0]["content"][3]["image"].fill(1)
+    assert codec.render_ids(messages) == codec.render(messages).token_ids
+    second.fill(1)
     assert media.images[1].patches.max().item() < 0
 
 
 def test_image_identity_changes_only_its_media_cache_identity(codec):
     def render(color):
         return codec.render(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "image": np.full((2, 4, 3), color, dtype=np.float32),
-                            },
-                            {"type": "text", "text": "describe"},
-                        ],
-                    }
-                ]
-            }
-        )["media"]
+            [
+                resin.recipe.Message(
+                    resin.recipe.Role.USER,
+                    [
+                        resin.recipe.Image(np.full((2, 4, 3), color, dtype=np.float32)),
+                        resin.recipe.Text("describe"),
+                    ],
+                )
+            ]
+        ).media
 
     black, white, black_again = render(0), render(1), render(0)
     assert black.token_ids == white.token_ids
@@ -197,27 +191,20 @@ def test_engine_slices_causal_image_spans_across_prefill_chunks(codec):
             return [7]
 
     rendered = codec.render(
-        {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "image": np.zeros((2, 4, 3), dtype=np.float32),
-                        },
-                        {"type": "text", "text": "describe"},
-                    ],
-                }
-            ]
-        }
+        [
+            resin.recipe.Message(
+                resin.recipe.Role.USER,
+                [
+                    resin.recipe.Image(np.zeros((2, 4, 3), dtype=np.float32)),
+                    resin.recipe.Text("describe"),
+                ],
+            )
+        ]
     )
     engine = Engine(Runner(), scheduler_config=SchedulerConfig(prefill_chunk_size=32))
-    engine.submit(media=rendered["media"], max_new_tokens=1)
+    engine.submit(media=rendered.media, max_new_tokens=1)
     while engine.has_work():
         engine.step()
     assert len(Runner.contexts) > 1
-    assert all(plan.media == (rendered["media"],) for plan in Runner.contexts)
-    assert sum(plan.num_tokens for plan in Runner.contexts) == len(
-        rendered["token_ids"]
-    )
+    assert all(plan.media == (rendered.media,) for plan in Runner.contexts)
+    assert sum(plan.num_tokens for plan in Runner.contexts) == len(rendered.token_ids)

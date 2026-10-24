@@ -6,11 +6,13 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
+from recipe_fuzz.gemma import GemmaAdapter
 
-import resin.models.gemma4.media as media_module
+import resin
 from resin import Engine, MediaInput, MediaTokenSpan
+from resin._recipe_media import decode_image
 from resin.models.gemma4.media import Gemma4Media
-from resin.server.media import decode_image
+from resin.recipe import Gemma4Recipe
 
 
 def _png_bytes() -> bytes:
@@ -61,15 +63,9 @@ def test_media_owns_processor_tensors_and_absolute_placeholder_mapping() -> None
     assert media.cache_key[1] != media.token_ids[1]
 
 
-def test_canonical_normalized_arrays_are_copied_before_processing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Recipe:
-        def __init__(self, tokenizer, *, model):
-            assert model == "gemma4"
-
-        def render_media_ids(self, request, replacements):
-            return [2, 8]
+def test_canonical_normalized_arrays_are_copied_before_processing() -> None:
+    tokenizer = GemmaAdapter().codec.tokenizer
+    image_id = tokenizer.token_to_id("<|image|>")
 
     class ImageProcessor:
         seen = None
@@ -82,27 +78,35 @@ def test_canonical_normalized_arrays_are_copied_before_processing(
             }
 
     class Processor:
-        tokenizer = object()
         image_token = "<|image|>"
         image_processor = ImageProcessor()
+
+        def __init__(self):
+            self.tokenizer = tokenizer
 
         def replace_image_token(self, output, image_idx):
             return self.image_token
 
         def create_mm_token_type_ids(self, ids):
-            return [[int(token == 8) for token in row] for row in ids]
+            return [[int(token == image_id) for token in row] for row in ids]
 
-    monkeypatch.setattr(media_module, "Recipe", Recipe)
     image = np.ones((3, 4, 3), dtype=np.float32)
     processor = Processor()
-    media = Gemma4Media.from_images(processor, [image], prompt="describe")
+    prompt = Gemma4Recipe(processor).render(
+        [
+            resin.recipe.Message(
+                resin.recipe.Role.USER,
+                [resin.recipe.Image(image), resin.recipe.Text("describe")],
+            )
+        ]
+    )
     image.fill(0)
-
     assert processor.image_processor.seen is not None
     passed = processor.image_processor.seen["images"][0]
     assert passed.sum() == 36
     assert processor.image_processor.seen["do_rescale"] is False
-    assert media.image_positions == (1,)
+    assert isinstance(prompt.media, Gemma4Media)
+    assert len(prompt.media.image_positions) == 1
 
 
 def test_submit_media_uses_its_tokenized_prompt_without_engine_media_logic() -> None:

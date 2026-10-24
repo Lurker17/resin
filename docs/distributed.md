@@ -397,7 +397,7 @@ calls `serve()`. Non-driver ranks stay in the existing worker loop:
 worker = DistributedWorker(runner, groups)
 if groups.is_driver:
     engine = DistributedEngine(worker, max_running_requests=256)
-    HttpServer(engine, codec=codec, model=model_name).serve(host="0.0.0.0", port=8000)
+    HttpServer(engine, recipe=recipe, model=model_name).serve(host="0.0.0.0", port=8000)
 else:
     worker.serve()
 ```
@@ -406,7 +406,7 @@ Only the first driver binds a listener. Requests select an attention-DP replica
 using `routed_dp_rank` in JSON or the `resin-routed-dp-rank` header. The header takes
 precedence; invalid or out-of-range ranks return HTTP 400. Unassigned requests
 use round robin. Each selected driver owns the actual native request lease,
-codec, media preprocessing, incremental parser, scheduler, and cache. Client
+recipe, media preprocessing, incremental parser, scheduler, and cache. Client
 disconnects and stalled response channels cancel the request on its owner.
 Generated and prompt logprobs travel through the same response bridge.
 

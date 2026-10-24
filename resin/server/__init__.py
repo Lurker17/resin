@@ -1,7 +1,7 @@
 """HTTP serving for a token-native Resin engine.
 
 The networking, scheduling bridge, wire protocols, and streaming adapters run
-in Rust. Stock model formats run in resin-recipe; custom codecs implement the same
+in Rust. Stock model formats run in resin-recipe; custom recipes implement the same
 structural Python protocol.
 """
 
@@ -10,12 +10,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from resin._resin import Engine, _HttpServer
-from resin.protocols import (
-    ConversationCodec,
-    ParserEvent,
-    RenderedPrompt,
-    ResponseParser,
-)
+from resin.protocols import ParserEvent, ResponseParser
+from resin.recipe import Recipe, RenderedPrompt
 
 if TYPE_CHECKING:
     from resin.backend.distributed import DistributedEngine
@@ -43,7 +39,7 @@ class HttpServer:
         self,
         engine: Engine | DistributedEngine,
         *,
-        codec: ConversationCodec,
+        recipe: Recipe,
         model: str | None = None,
         stream_interval: int = 1,
         request_queue_capacity: int = 1024,
@@ -73,10 +69,12 @@ class HttpServer:
                     "request_queue_capacity must be a positive integer fitting u32"
                 )
             if model is None:
-                model = getattr(getattr(codec, "tokenizer", None), "name_or_path", None)
+                model = getattr(
+                    getattr(recipe, "tokenizer", None), "name_or_path", None
+                )
             if not isinstance(model, str) or not model.strip():
                 raise ValueError(
-                    "model is required when it cannot be inferred from the codec"
+                    "model is required when it cannot be inferred from the recipe"
                 )
             if any(
                 type(flag) is not bool
@@ -89,7 +87,7 @@ class HttpServer:
             error = exc
         if isinstance(engine, DistributedEngine):
             # No driver may return before its peers have validated startup.
-            # Inference of a codec's model name can itself run user code.
+            # Inference of a recipe's model name can itself run user code.
             config = (
                 None
                 if error is not None
@@ -130,7 +128,7 @@ class HttpServer:
             from resin.server.distributed import DistributedHttpCoordinator
 
             self._coordinator = DistributedHttpCoordinator(
-                engine, codec, stream_interval=stream_interval
+                engine, recipe, stream_interval=stream_interval
             )
         self._native = None
         error = None
@@ -138,7 +136,7 @@ class HttpServer:
             if self._coordinator is None or self._coordinator.is_frontend:
                 self._native = _HttpServer(
                     engine.local if isinstance(engine, DistributedEngine) else engine,
-                    codec,
+                    recipe,
                     model=model,
                     stream_interval=stream_interval,
                     request_queue_capacity=request_queue_capacity,
@@ -194,7 +192,7 @@ class HttpServer:
 
 
 __all__ = [
-    "ConversationCodec",
+    "Recipe",
     "HttpServer",
     "ParserEvent",
     "RenderedPrompt",

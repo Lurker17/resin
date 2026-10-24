@@ -12,8 +12,9 @@ from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
+import resin
 from recipe_fuzz.harness import Case, Part, normalize
-from resin.recipe import Recipe
+from resin.recipe import Qwen38Recipe
 
 MARKERS = (
     "<|im_start|>",
@@ -41,7 +42,7 @@ class QwenAdapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.codec = Recipe(backend, model="qwen3_5")
+        self.codec = Qwen38Recipe(backend)
         self.reference = renderers.Qwen35()
         _, self.reference_parser = self.reference.render_for_completion(
             chat.OpenAIMessage.from_oss_messages([{"role": "user", "content": "hi"}])
@@ -148,10 +149,28 @@ class QwenAdapter:
         return normalize(parts)
 
     def parser(self):
-        return self.codec.create_parser({}, [self.ids["<think>"]])
+        return self.codec.create_parser(
+            self.codec.render(
+                [
+                    resin.recipe.Message(
+                        resin.recipe.Role.USER, [resin.recipe.Text("hi")]
+                    )
+                ],
+                options=resin.recipe.RenderOptions(enable_thinking=True),
+            )
+        )
 
     def text_parser(self):
-        return self.codec.create_parser({}, [self.ids["<think>"], self.ids["</think>"]])
+        return self.codec.create_parser(
+            self.codec.render(
+                [
+                    resin.recipe.Message(
+                        resin.recipe.Role.USER, [resin.recipe.Text("hi")]
+                    )
+                ],
+                options=resin.recipe.RenderOptions(enable_thinking=False),
+            )
+        )
 
     @staticmethod
     def normalize_text(text):
@@ -189,7 +208,7 @@ class QwenAdapter:
                     {"role": "tool", "content": "done"},
                 ]
             )
-        return {"messages": messages, "extra": {"recipe_variant": "qwen3_8"}}
+        return {"messages": messages}
 
     def prompt_oracle(self, request):
         options = request.get("extra", {})

@@ -11,6 +11,7 @@ from typing import Any
 
 import modal
 
+import resin
 from deploy.graph_validation import capture_cuda_graphs, validate_prefill_graphs
 from deploy.modal_image import build_modal_image
 from resin.backend.cuda.graphs import (
@@ -18,6 +19,7 @@ from resin.backend.cuda.graphs import (
     default_decode_graph_shapes,
 )
 from resin.backend.parallel import monitor_process_context
+from resin.recipe import InklingRecipe
 from resin_models_cuda.inkling.checkpoint import MODEL_SPEC
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -162,7 +164,6 @@ def _build_runtime(
     from transformers import AutoProcessor
 
     from resin import Engine, SchedulerConfig
-    from resin.recipe import Recipe
     from resin_models_cuda.inkling.cuda import InklingCudaRunner
 
     inventory = _require_models()
@@ -188,7 +189,7 @@ def _build_runtime(
         TARGET_PATH, local_files_only=True, trust_remote_code=False
     )
     tokenizer = processor.tokenizer
-    recipe = Recipe(tokenizer, model="inkling")
+    recipe = InklingRecipe(tokenizer)
     engine = Engine(
         runner,
         max_running_requests=DEFAULT_MAX_NUM_SEQS,
@@ -213,7 +214,8 @@ def _build_runtime(
 
 def _prompt_ids(recipe: Any, prompt: str) -> list[int]:
     token_ids = recipe.render_ids(
-        [{"role": "user", "content": prompt}], add_generation_prompt=True
+        [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])],
+        options=resin.recipe.RenderOptions(add_generation_prompt=True),
     )
     if not token_ids:
         raise ValueError("Inkling chat template produced no tokens")
@@ -281,7 +283,6 @@ def _serve(_: int) -> None:
     import torch
 
     from resin import SamplingParams
-    from resin.models.inkling.codec import InklingCodec
     from resin.server import HttpServer
 
     runner, processor, recipe, engine, _ = _build_runtime()
@@ -298,7 +299,7 @@ def _serve(_: int) -> None:
         torch.cuda.synchronize(runner.device)
         HttpServer(
             engine,
-            codec=InklingCodec(processor),
+            recipe=InklingRecipe(processor),
             model=MODEL_SPEC.target_repo,
             enable_anthropic=False,
         ).serve(host="0.0.0.0", port=8000)

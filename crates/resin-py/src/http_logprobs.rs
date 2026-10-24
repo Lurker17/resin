@@ -9,8 +9,8 @@ pub(crate) struct Vocabulary {
 }
 
 impl Vocabulary {
-    pub fn from_codec(py: Python<'_>, codec: &Py<PyAny>) -> PyResult<Self> {
-        let tokenizer = match codec.bind(py).getattr("tokenizer") {
+    pub fn from_recipe(py: Python<'_>, recipe: &Py<PyAny>) -> PyResult<Self> {
+        let tokenizer = match recipe.bind(py).getattr("tokenizer") {
             Ok(tokenizer) => {
                 let backend = tokenizer.getattr("backend_tokenizer").unwrap_or(tokenizer);
                 match backend.getattr("to_str") {

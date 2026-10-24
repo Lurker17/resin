@@ -19,6 +19,7 @@ import torch.distributed as dist
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+import resin
 from deploy.checkpoint_cache import (
     checkpoint_inventory,
     checkpoint_is_complete,
@@ -37,8 +38,7 @@ from resin.backend.parallel import (
     follow_tensor_parallel_runner,
     monitor_process_context,
 )
-from resin.models.deepseek_v4.codec import DeepSeekV4Codec
-from resin.recipe import Recipe
+from resin.recipe import DeepSeekV4Recipe, DeepSeekV41Recipe
 from resin.server import HttpServer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -178,13 +178,12 @@ def _implementation(model_path: Path):
     """Select the native architecture from checkpoint data, without remote code."""
     values = json.loads((model_path / "config.json").read_text())
     if values.get("model_type") == "deepseek_v41":
-        from resin.models.deepseek_v41.codec import DeepSeekV41Codec
         from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
 
-        return DeepSeekV41CudaRunner, DeepSeekV41Codec
+        return DeepSeekV41CudaRunner, DeepSeekV41Recipe
     from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 
-    return DeepSeekV4CudaRunner, DeepSeekV4Codec
+    return DeepSeekV4CudaRunner, DeepSeekV4Recipe
 
 
 def _checkpoint_inventory(model: ModelSpec) -> dict[str, int]:
@@ -244,18 +243,17 @@ def _require_checkpoint(model: ModelSpec) -> tuple[Path, dict[str, object]]:
 
 
 def _encode_prompt(
-    recipe: Recipe,
+    recipe: resin.recipe.Recipe,
     prompt: str,
     thinking_mode: str,
     reasoning_effort: str,
 ) -> list[int]:
     return recipe.render(
-        {
-            "messages": [{"role": "user", "content": prompt}],
-            "extra": {"thinking_mode": thinking_mode},
-            "reasoning_effort": reasoning_effort,
-        }
-    )["token_ids"]
+        [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])],
+        options=resin.recipe.RenderOptions(
+            thinking_mode=thinking_mode, reasoning_effort=reasoning_effort
+        ),
+    ).token_ids
 
 
 def _real_prompt_ids(
@@ -1122,7 +1120,7 @@ def _serve_http_rank(
     try:
         HttpServer(
             engine,
-            codec=recipe,
+            recipe=recipe,
             model=model_name,
         ).serve(host="0.0.0.0", port=8000)
     finally:
@@ -1353,7 +1351,7 @@ def _validate_parallel(
             str(model_path), local_files_only=True, trust_remote_code=False
         ),
     )
-    recipe = DeepSeekV4Codec(tokenizer)
+    recipe = DeepSeekV4Recipe(tokenizer)
     texts = {
         "short": "Continue the sequence with the next number: 2, 4, 6,",
         "long": (
@@ -1526,16 +1524,17 @@ def run_model_tp4(
     )
     _, codec_type = _implementation(model_path)
     recipe = codec_type(tokenizer)
-    prompt_ids = (
-        _real_prompt_ids(tokenizer, profile_input_tokens)
-        if profile_input_tokens is not None
-        else _encode_prompt(
-            recipe,
-            prompt,
-            thinking_mode,
-            reasoning_effort,
+    if profile_input_tokens is None:
+        rendered = recipe.render(
+            [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])],
+            options=resin.recipe.RenderOptions(
+                thinking_mode=thinking_mode, reasoning_effort=reasoning_effort
+            ),
         )
-    )
+        prompt_ids = rendered.token_ids
+    else:
+        rendered = None
+        prompt_ids = _real_prompt_ids(tokenizer, profile_input_tokens)
     prompt_rows = [prompt_ids.copy() for _ in range(batch_size)]
     if max(map(len, prompt_rows)) + max_new_tokens - 1 > context_length:
         raise ValueError("prompt plus max_new_tokens exceeds context_length")
@@ -1567,17 +1566,9 @@ def run_model_tp4(
     ]
     report["text"] = completions[0] if batch_size == 1 else completions
     report["thinking_mode"] = thinking_mode
-    if batch_size == 1:
+    if batch_size == 1 and rendered is not None:
         try:
-            report["message"] = recipe.parse_response(
-                output_rows[0],
-                request={
-                    "messages": [{"role": "user", "content": prompt}],
-                    "extra": {"thinking_mode": thinking_mode},
-                    "reasoning_effort": reasoning_effort,
-                },
-                prompt_ids=prompt_ids,
-            )
+            report["message"] = recipe.parse_response(output_rows[0], prompt=rendered)
         except (AssertionError, ValueError) as error:
             report["parse_error"] = str(error)
     kernel_cache_volume.commit()

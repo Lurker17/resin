@@ -20,7 +20,8 @@ from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 
 from recipe_fuzz.deepseek import MARKERS
-from resin.recipe import Recipe
+from recipe_fuzz.inputs import native_inputs
+from resin.recipe import DeepSeekV41Recipe
 
 IMAGE = "<｜deepseek_image｜>"
 BLOCKS = st.one_of(
@@ -44,7 +45,7 @@ def encoders():
         .with_tokenizer(DeepSeekTokenizer.from_str(tokenizer.to_str()))
     )
     return (
-        Recipe(tokenizer, model="deepseek_v41"),
+        DeepSeekV41Recipe(tokenizer),
         reference,
         ConversionOptions().with_special_tokens(specials),
     )
@@ -98,7 +99,7 @@ def test_v41_image_blocks_match_reference_text_and_token_ids(encoders, turns, th
         "extra": {"thinking_mode": "thinking" if thinking else "chat"},
     }
     expected = reference.render_conversation(converted.conversation)
-    assert native.render_text(request) == expected.prompt
-    assert native.render(request)["token_ids"] == reference.encode(
+    assert native.render_text(**native_inputs(request)) == expected.prompt
+    assert native.render_ids(**native_inputs(request)) == reference.encode(
         converted.conversation
     )

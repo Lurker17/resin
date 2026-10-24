@@ -27,10 +27,10 @@ OUTPUT_COLUMNS = {
 }
 
 PARAMETERS = {
-    ("ModelRecipe", "create_parser"): {"prompt_ids": "Sequence[int]"},
-    ("ModelRecipe", "render_ids"): {
-        "media_replacements": "Mapping[str, Sequence[str]] | None"
-    },
+    ("Message", "__new__"): {"content": "Sequence[ContentBlock]"},
+    ("RenderOptions", "__new__"): {"reasoning_effort": "str | int | float | None"},
+    ("RenderedPrompt", "__new__"): {"media": "MediaInput | None"},
+    ("Image", "from_rgb"): {"array": "npt.NDArray[np.float32]"},
     ("RecipeResponseParser", "feed"): {"token_ids": "Sequence[int]"},
     ("RecipeResponseParser", "finish"): {"reason": 'Literal["stop", "length"]'},
     ("BatchPlan", "__new__"): {
@@ -64,7 +64,8 @@ PARAMETERS = {
     ("Engine", "cancel"): {"request": "RequestLease"},
     ("Engine", "submit"): {"media": "MediaInput | None"},
     ("ForwardOutput", "__new__"): OUTPUT_COLUMNS,
-    ("_HttpServer", "__new__"): {"codec": "ConversationCodec"},
+    ("_HttpServer", "__new__"): {"recipe": "Recipe"},
+    ("_HttpSession", "__new__"): {"recipe": "Recipe"},
     ("InklingResponseParser", "__new__"): {
         "token_ids": "Mapping[str, int]",
         "prompt_ids": "Sequence[int]",
@@ -74,6 +75,9 @@ PARAMETERS = {
 }
 
 RETURNS = {
+    ("Message", "content"): "tuple[ContentBlock, ...]",
+    ("RenderOptions", "reasoning_effort"): "str | int | float | None",
+    ("RenderedPrompt", "media"): "MediaInput | None",
     ("RecipeResponseParser", "feed"): "list[ParserEvent]",
     ("RecipeResponseParser", "finish"): "list[ParserEvent]",
     ("InklingResponseParser", "feed"): "list[ParserEvent]",
@@ -250,7 +254,12 @@ def import_edits(
         if isinstance(node, ast.ImportFrom)
         for alias in node.names
     }
-    for module, name in (("collections.abc", "Mapping"), ("typing", "Literal")):
+    for module, name in (
+        ("collections.abc", "Mapping"),
+        ("typing", "Literal"),
+        ("resin.recipe", "Recipe"),
+        ("resin.recipe", "ContentBlock"),
+    ):
         if (module, name) not in existing_imports:
             additions.append(f"from {module} import {name}")
     if not has_numpy:
@@ -258,7 +267,6 @@ def import_edits(
     if not has_numpy_typing:
         additions.append("import numpy.typing as npt")
     missing_protocols = {
-        "ConversationCodec",
         "MediaInput",
         "ParserEvent",
         "Runner",

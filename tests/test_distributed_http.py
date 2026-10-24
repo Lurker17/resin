@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+import resin
 from resin import Parallelism, RunnerConfig
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.sampling import format_output, prompt_scores
@@ -28,18 +29,18 @@ class RankCodec:
         if case == "initialize" and rank == 1:
             raise RuntimeError("injected codec initialization")
 
-    def render(self, request):
-        content = request["messages"][0]["content"]
+    def render(self, messages, *, tools=(), options=None):
+        content = messages[0].content[0].text
         if content == "bad-render":
             raise ValueError("injected request rendering")
-        return {
-            "token_ids": [99]
+        return resin.recipe.RenderedPrompt(
+            [99]
             if content == "explode"
             else ([4] if content == "cancelme" else [1, 2, 3]),
-            "stop_token_ids": [],
-        }
+            stop_token_ids=[],
+        )
 
-    def create_parser(self, request, prompt_ids):
+    def create_parser(self, prompt):
         class Parser:
             def feed(self, ids):
                 return [
@@ -150,7 +151,7 @@ def _serve_rank(rank, world_size, directory, port, case):
                 setattr(serving, "_HttpServer", fail)
             server = HttpServer(
                 engine,
-                codec=codec,
+                recipe=codec,
                 model=model,
                 enable_openai=not (case == "flags" and groups.drivers.local_rank == 0),
                 request_queue_capacity=(

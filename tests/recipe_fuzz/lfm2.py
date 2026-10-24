@@ -11,8 +11,9 @@ from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 
+import resin
 from recipe_fuzz.harness import Case, Part, normalize
-from resin.recipe import Recipe
+from resin.recipe import Lfm2Recipe
 
 MARKERS = (
     "<|startoftext|>",
@@ -34,7 +35,7 @@ class Lfm2Adapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.codec = Recipe(backend, model="lfm2")
+        self.codec = Lfm2Recipe(backend)
         self.oracles = (("python-literal-ast", self.oracle),)
 
     @staticmethod
@@ -75,7 +76,15 @@ class Lfm2Adapter:
         return ids
 
     def parser(self):
-        return self.codec.create_parser({}, [])
+        return self.codec.create_parser(
+            self.codec.render(
+                [
+                    resin.recipe.Message(
+                        resin.recipe.Role.USER, [resin.recipe.Text("hi")]
+                    )
+                ]
+            )
+        )
 
     def text_parser(self):
         return self.parser()
@@ -112,7 +121,14 @@ class Lfm2Adapter:
         messages.append({"role": "user", "content": "Continue."})
         return {
             "messages": messages,
-            "tools": [{"name": "f", "parameters": {"type": "object"}}],
+            # LFM prints declarations verbatim. Match the canonical function
+            # envelope represented by a typed Tool on both sides of the oracle.
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "f", "parameters": {"type": "object"}},
+                }
+            ],
             "extra": {"preserve_thinking": len(case.parts) % 2 == 0},
         }
 

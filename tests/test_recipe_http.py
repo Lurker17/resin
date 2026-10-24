@@ -10,6 +10,8 @@ from recipe_fuzz.harness import Case, Part, normalize
 from recipe_fuzz.test_differential import ADAPTERS
 from test_http_lifecycle import post, running_server
 
+import resin
+
 
 @pytest.fixture(scope="module", params=ADAPTERS)
 def recipe_adapter(request):
@@ -110,23 +112,14 @@ def test_native_prompt_provenance_and_stop_encoding(recipe_adapter):
     _, adapter = recipe_adapter
     marker, marker_id = next(iter(adapter.ids.items()))
     baseline = adapter.codec.render(
-        {"messages": [{"role": "user", "content": "hello"}]}
+        [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hello")])]
     )
     rendered = adapter.codec.render(
-        {"messages": [{"role": "user", "content": marker}], "stop": ["!", "!"]}
+        [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(marker)])]
     )
-    assert rendered["token_ids"].count(marker_id) == baseline["token_ids"].count(
-        marker_id
-    )
-    # Conversation formats supply model terminators. User stop strings belong
-    # to serving and must not depend on how the tokenizer splits the marker.
-    assert rendered["stop_token_ids"] == adapter.codec.get_stop_token_ids()
-    assert (
-        adapter.codec.render(
-            {"messages": [{"role": "user", "content": "hello"}], "stop": ["long stop"]}
-        )["stop_token_ids"]
-        == rendered["stop_token_ids"]
-    )
+    assert rendered.token_ids.count(marker_id) == baseline.token_ids.count(marker_id)
+    # Stop strings belong to HTTP serving; native recipes supply model stops.
+    assert rendered.stop_token_ids == adapter.codec.get_stop_token_ids()
 
 
 @pytest.mark.parametrize("stream", [False, True])

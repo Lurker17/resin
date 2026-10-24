@@ -4,6 +4,7 @@ Importing this module intentionally does not import an accelerator framework.
 Choose a separately installed model runner only when constructing an engine.
 """
 
+import resin.recipe as recipe
 import resin.server as server
 from resin._resin import (
     BatchPhase,
@@ -26,7 +27,6 @@ from resin._resin import (
     __version__,
 )
 from resin.protocols import (
-    ConversationCodec,
     ManagedRunner,
     MediaInput,
     MediaTokenSpan,
@@ -41,7 +41,6 @@ __all__ = [
     "CacheGroupPlan",
     "CacheLayout",
     "CacheRetention",
-    "ConversationCodec",
     "Engine",
     "ForwardOutput",
     "ManagedRunner",
@@ -57,5 +56,6 @@ __all__ = [
     "TokenLogprobs",
     "Runner",
     "__version__",
+    "recipe",
     "server",
 ]

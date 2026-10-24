@@ -11,9 +11,11 @@ from typing import Any
 
 import modal
 
+import resin
 from deploy.graph_validation import capture_cuda_graphs, validate_prefill_graphs
 from deploy.modal_image import build_modal_image
 from resin.backend.parallel import monitor_process_context
+from resin.recipe import Qwen38Recipe
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_ID = "RadixArk/Qwen3.8-27B-NVFP4"
@@ -177,7 +179,6 @@ def _build_runtime(
     from transformers import AutoProcessor
 
     from resin import Engine, SchedulerConfig
-    from resin.recipe import Recipe
     from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
 
     inventory = _require_model()
@@ -199,7 +200,7 @@ def _build_runtime(
         MODEL_PATH, local_files_only=True, trust_remote_code=False
     )
     tokenizer = processor.tokenizer
-    recipe = Recipe(tokenizer, model="qwen3_5")
+    recipe = Qwen38Recipe(tokenizer)
     graph_started = time.perf_counter()
     graph_stats = capture_cuda_graphs(runner)
     graph_capture_s = time.perf_counter() - graph_started
@@ -256,7 +257,8 @@ def _build_runtime(
 
 def _prompt_ids(recipe: Any, prompt: str) -> list[int]:
     token_ids = recipe.render_ids(
-        [{"role": "user", "content": prompt}], add_generation_prompt=True
+        [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])],
+        options=resin.recipe.RenderOptions(add_generation_prompt=True),
     )
     if not token_ids:
         raise ValueError("Qwen3.8 chat template produced no tokens")
@@ -334,26 +336,23 @@ def smoke_test(
         first_token_s = event_times[0] - started if event_times else None
         timed_tokens = max(0, len(event_times) - 1)
         steady_s = event_times[-1] - event_times[0] if timed_tokens else 0.0
-        from resin.models.qwen3_5.codec import Qwen35Codec
 
-        codec = Qwen35Codec(processor)
+        codec = Qwen38Recipe(processor)
         image_prompt = codec.render(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": _synthetic_image()},
-                            {"type": "text", "text": "Describe this image briefly."},
-                        ],
-                    }
-                ]
-            }
+            [
+                resin.recipe.Message(
+                    resin.recipe.Role.USER,
+                    [
+                        resin.recipe.Image(_synthetic_image()),
+                        resin.recipe.Text("Describe this image briefly."),
+                    ],
+                )
+            ]
         )
         image_request = engine.submit(
-            media=image_prompt["media"],
+            media=image_prompt.media,
             max_new_tokens=16,
-            stop_token_ids=image_prompt["stop_token_ids"],
+            stop_token_ids=image_prompt.stop_token_ids,
             sampling_params=SamplingParams(temperature=0.0),
         )
         image_started = time.perf_counter()
@@ -390,7 +389,7 @@ def smoke_test(
                 "speculative": runner.speculative_stats,
                 "cuda_graphs": runner.cuda_graph_stats,
                 "image": {
-                    "prompt_tokens": len(image_prompt["token_ids"]),
+                    "prompt_tokens": len(image_prompt.token_ids),
                     "output_tokens": len(image_output_ids),
                     "ttft_s": (
                         image_events[0] - image_started if image_events else None
@@ -411,44 +410,46 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
     import torch
 
     from resin import SamplingParams
-    from resin.models.qwen3_5.codec import Qwen35Codec
     from resin.server import HttpServer
 
     runner, processor, recipe, engine, report, kernels_before_warmup = _build_runtime(
         context_length=context_length,
         speculative_tokens=speculative_tokens,
     )
-    codec = Qwen35Codec(processor)
+    codec = Qwen38Recipe(processor)
     try:
         text_prompt = codec.render(
-            {"messages": [{"role": "user", "content": "Reply with the word ready."}]}
+            [
+                resin.recipe.Message(
+                    resin.recipe.Role.USER,
+                    [resin.recipe.Text("Reply with the word ready.")],
+                )
+            ]
         )
         text_request = engine.submit(
-            text_prompt["token_ids"],
+            text_prompt.token_ids,
             max_new_tokens=4,
-            stop_token_ids=text_prompt["stop_token_ids"],
+            stop_token_ids=text_prompt.stop_token_ids,
             sampling_params=SamplingParams(temperature=0.0),
         )
         _drain(engine)
         text_request.take_result()
 
         image_prompt = codec.render(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": _synthetic_image()},
-                            {"type": "text", "text": "Name one visible color."},
-                        ],
-                    }
-                ]
-            }
+            [
+                resin.recipe.Message(
+                    resin.recipe.Role.USER,
+                    [
+                        resin.recipe.Image(_synthetic_image()),
+                        resin.recipe.Text("Name one visible color."),
+                    ],
+                )
+            ]
         )
         image_request = engine.submit(
-            media=image_prompt["media"],
+            media=image_prompt.media,
             max_new_tokens=2,
-            stop_token_ids=image_prompt["stop_token_ids"],
+            stop_token_ids=image_prompt.stop_token_ids,
             sampling_params=SamplingParams(temperature=0.0),
         )
         _drain(engine)
@@ -471,7 +472,7 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
         print(f"[startup] {json.dumps(report, sort_keys=True)}", flush=True)
         HttpServer(
             engine,
-            codec=codec,
+            recipe=codec,
             model=MODEL_ID,
         ).serve(host="0.0.0.0", port=8000)
     finally:

@@ -8,11 +8,12 @@ import tokenizers
 import torch
 import torch.distributed as dist
 
+import resin
 from deploy import modal_deepseek_v41 as deployment
 from resin import Engine
 from resin.backend import distributed
 from resin.backend.topology import ParallelGroups
-from resin.models.deepseek_v41 import codec as codec_module
+from resin.recipe import DeepSeekV41Recipe
 from resin.server import HttpServer
 from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 from resin_models_cuda.deepseek_v41 import cuda as runner_module
@@ -22,8 +23,8 @@ from resin_models_cuda.deepseek_v41 import cuda as runner_module
 def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail):
     calls = []
     groups = SimpleNamespace(rank=rank)
-    render = codec_module.DeepSeekV41Codec.render_ids
-    stops = codec_module.DeepSeekV41Codec.get_stop_token_ids
+    render = DeepSeekV41Recipe.render_ids
+    stops = DeepSeekV41Recipe.get_stop_token_ids
 
     def initialize(backend, **options):
         assert backend == "nccl"
@@ -64,7 +65,7 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
 
         def render_ids(self, messages):
             signature(render).bind(self, messages)
-            assert messages[0]["role"] == "user"
+            assert messages[0].role == resin.recipe.Role.USER
             return [4, 5]
 
         def get_stop_token_ids(self):
@@ -112,9 +113,11 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
             calls.append("close")
 
     class Server:
-        def __init__(self, engine, *, codec, model):
-            signature(HttpServer.__init__).bind(self, engine, codec=codec, model=model)
-            assert isinstance(engine, RequestEngine) and isinstance(codec, Codec)
+        def __init__(self, engine, *, recipe, model):
+            signature(HttpServer.__init__).bind(
+                self, engine, recipe=recipe, model=model
+            )
+            assert isinstance(engine, RequestEngine) and isinstance(recipe, Codec)
             assert model == deployment.MODEL
             assert engine.remaining == 0
             self.engine = engine
@@ -139,7 +142,7 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
     monkeypatch.setattr(dist, "init_process_group", initialize)
     monkeypatch.setattr(ParallelGroups, "create", make_groups)
     monkeypatch.setattr(runner_module, "DeepSeekV41CudaRunner", Runner)
-    monkeypatch.setattr(codec_module, "DeepSeekV41Codec", Codec)
+    monkeypatch.setattr(deployment, "DeepSeekV41Recipe", Codec)
     monkeypatch.setattr(tokenizers, "Tokenizer", SimpleNamespace(from_file=tokenizer))
     monkeypatch.setattr(distributed, "DistributedEngine", RequestEngine)
     monkeypatch.setattr(distributed, "DistributedWorker", Worker)

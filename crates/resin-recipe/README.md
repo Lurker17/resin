@@ -2,7 +2,7 @@
 
 Stock model conversation formats, independent of Python, HTTP and GPU execution.
 `ModelFormat` selects a matching renderer, incremental parser and stop markers
-for GPT-OSS, DeepSeek V4, Inkling, Qwen3.5/3.8, Gemma4 or LFM2.5.
+for GPT-OSS, DeepSeek V4/V4.1, Inkling, Qwen3.5/3.8, Gemma4 or LFM2.5.
 
 Model code describes format rules. Shared `Parser<G>` owns token batching,
 decoder boundaries, EOS handling and finalization; each grammar handles only
@@ -25,11 +25,20 @@ Inkling/Harmony/Qwen/Gemma/LFM commit validated calls at their closing marker;
 DeepSeek streams DSML calls and argument deltas as they arrive. Finalization does
 not invent complete arguments for an unfinished call.
 
-Python's `resin.recipe.Recipe(tokenizer, model=..., options=...)` implements the
-`ConversationCodec` protocol. Its parsers use one common native handle; the HTTP
-actor consumes Rust events directly. Python callers receive identical event
-dictionaries. Applications can instead pass any protocol-compatible codec with
-`render`, `create_parser`, and parser `feed` (plus optional `finish`).
+Python callers import concrete native classes such as
+`from resin.recipe import GptOssRecipe, Gemma4Recipe` and instantiate
+`GptOssRecipe(tokenizer)` or `Gemma4Recipe(processor)`. `resin.recipe.Recipe` is a structural
+protocol. `render(messages, *, tools=(), options=None)` accepts typed `Message`
+content and returns `RenderedPrompt`; its token IDs, model stops and prepared
+media are available as attributes. `create_parser(prompt)` binds a fresh parser
+to the actual rendered prefix and options. A native prompt belongs to the
+recipe that rendered it.
+
+These parsers use one common native handle; the HTTP actor consumes Rust events
+directly. Python callers receive identical event dictionaries. Applications can
+supply a custom recipe with the same `render` and `create_parser` methods and
+parser `feed` (plus optional `finish`). HTTP wire dictionaries stay in the HTTP
+adapter, outside the native recipe API.
 
 Fast Hugging Face tokenizers are snapshotted once and shared across requests.
 Custom Python tokenizers can supply `encode`, `convert_tokens_to_ids` and
@@ -42,7 +51,7 @@ additional `clean_up_tokenization_spaces` postprocessing.
 References are pinned checkpoint templates/encoders for prompt parity. Harmony
 and DeepSeek Recipe are primary parser oracles; TML supplies secondary checks
 where available. All reference libraries and templates are development-only.
-DeepSeek V4.1 is a different grammar and is not covered by the V4 recipe. LFM's
+DeepSeek V4.1 has its own recipe for the revised DSML grammar and image slots. LFM's
 nested Python-literal strings use a fixed Python 3.13 / Unicode 15.1 printable
 repertoire for deterministic rendering across deployment Python versions.
 

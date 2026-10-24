@@ -9,16 +9,18 @@ import urllib.request
 import pytest
 from test_http_lifecycle import running_server
 
+import resin
+
 
 class TextCodec:
     def __init__(self, pieces, *, lane="text_delta"):
         self.pieces = pieces
         self.lane = lane
 
-    def render(self, request):
-        return {"token_ids": [1], "stop_token_ids": []}
+    def render(self, messages, *, tools=(), options=None):
+        return resin.recipe.RenderedPrompt([1], stop_token_ids=[])
 
-    def create_parser(self, request, prompt_ids):
+    def create_parser(self, prompt):
         pieces, lane = self.pieces, self.lane
 
         class Parser:

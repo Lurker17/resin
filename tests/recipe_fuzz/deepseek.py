@@ -26,8 +26,9 @@ from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 
+import resin
 from recipe_fuzz.harness import Case, Part, normalize
-from resin.recipe import Recipe
+from resin.recipe import DeepSeekV4Recipe, DeepSeekV41Recipe
 
 MARKERS = (
     "<｜User｜>",
@@ -78,7 +79,9 @@ class DeepSeekAdapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.codec = Recipe(backend, model=self.model)
+        self.codec = (
+            DeepSeekV41Recipe if self.model == "deepseek_v41" else DeepSeekV4Recipe
+        )(backend)
         self.reference = DeepSeekTokenizer.from_str(backend.to_str())
         self.oracles = (("deepseek-recipe", self.oracle),)
         if self.model == "deepseek_v4":
@@ -156,10 +159,28 @@ class DeepSeekAdapter:
         return result
 
     def parser(self):
-        return self.codec.create_parser({"extra": {"thinking_mode": "thinking"}}, [])
+        return self.codec.create_parser(
+            self.codec.render(
+                [
+                    resin.recipe.Message(
+                        resin.recipe.Role.USER, [resin.recipe.Text("hi")]
+                    )
+                ],
+                options=resin.recipe.RenderOptions(thinking_mode="thinking"),
+            )
+        )
 
     def text_parser(self):
-        return self.codec.create_parser({}, [])
+        return self.codec.create_parser(
+            self.codec.render(
+                [
+                    resin.recipe.Message(
+                        resin.recipe.Role.USER, [resin.recipe.Text("hi")]
+                    )
+                ],
+                options=resin.recipe.RenderOptions(thinking_mode="chat"),
+            )
+        )
 
     @staticmethod
     def prompt_case(case):

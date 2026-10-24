@@ -25,7 +25,7 @@ DeepSelect `bfa4507d`, and TileKernels 1.0.0; full revisions live in
 | `cuda.py` | Adapt the shared V4 serving runtime and prepare graph regions. |
 | Shared Resin runtime | Scheduling, cache admission, graph lifecycle, sampling, scores and distributed steps. |
 
-`DeepSeekV41Codec` prepares image content through the shared HTTP media adapter.
+`resin.recipe.DeepSeekV41Recipe` prepares typed image content independently of HTTP.
 Its resize, padding, normalization and patch order follow the pinned checkpoint's
 image processor. The Rust recipe expands trusted image slots; `DeepSeekV41Media`
 owns the CPU patches and includes their identity in prefix-cache keys. The runner

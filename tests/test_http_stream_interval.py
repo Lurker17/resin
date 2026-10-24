@@ -13,6 +13,7 @@ import test_http_lifecycle as lifecycle
 from test_http_logprobs import collect_scores, events, request, score_bytes
 from test_recipe import _byte_tokenizer
 
+import resin
 from resin import Engine, ForwardOutput
 from resin._resin import _HttpSession
 from resin.server import HttpServer
@@ -27,13 +28,12 @@ class Codec:
         self.eos = self.tokenizer.token_to_id(eos) if eos else None
         self.silent = silent
 
-    def render(self, _request):
-        return {
-            "token_ids": [0],
-            "stop_token_ids": [] if self.eos is None else [self.eos],
-        }
+    def render(self, messages, *, tools=(), options=None):
+        return resin.recipe.RenderedPrompt(
+            [0], stop_token_ids=[] if self.eos is None else [self.eos]
+        )
 
-    def create_parser(self, _request, _prompt_ids):
+    def create_parser(self, prompt):
         pieces, eos, silent = self.pieces, self.eos, self.silent
 
         class Parser:

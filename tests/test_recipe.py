@@ -9,8 +9,15 @@ from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 
+import resin
 from resin.protocols import FinalizingResponseParser, ParserEvent
-from resin.recipe import InklingResponseParser, Recipe, Tokenizer
+from resin.recipe import (
+    DeepSeekV4Recipe,
+    GptOssRecipe,
+    InklingRecipe,
+    InklingResponseParser,
+    Tokenizer,
+)
 
 MARKERS = (
     "<|message_model|>",
@@ -84,26 +91,23 @@ def test_complete_response_uses_actual_generation_prefix() -> None:
             "<|constrain|>",
         ]
     )
-    recipe = Recipe(backend, model="gpt_oss", options={"use_system_prompt": False})
-    request = {"messages": [{"role": "user", "content": "hi"}]}
-    prompt_ids = recipe.render(request)["token_ids"]
+    model_recipe = GptOssRecipe(
+        backend, options=resin.recipe.RenderOptions(use_system_prompt=False)
+    )
+    messages = [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])]
+    prompt = model_recipe.render(messages)
     output = backend.encode(
         "think<|end|><|start|>assistant<|channel|>final<|message|>answer<|return|>",
         add_special_tokens=False,
     ).ids
     expected = {"content": "answer", "reasoning_content": "think", "tool_calls": []}
-    assert recipe.parse_response(output, request=request) == expected
-    assert recipe.parse_response(output, prompt_ids=prompt_ids) == expected
-    # Supplied tokens describe the real continuation even when re-rendering
-    # the caller's request would produce a different generation prefix.
-    assert (
-        recipe.parse_response(
-            output,
-            request={**request, "add_generation_prompt": False},
-            prompt_ids=prompt_ids,
+    assert model_recipe.parse_response(output, prompt=prompt) == expected
+    with pytest.raises(ValueError, match="prompt"):
+        model_recipe.parse_response(
+            output, prompt=resin.recipe.RenderedPrompt(prompt.token_ids)
         )
-        == expected
-    )
+    # Parsing uses the actual prompt, without re-rendering a request.
+    assert model_recipe.create_parser(prompt) is not model_recipe.create_parser(prompt)
 
 
 def test_native_decode_is_equivalent_for_every_chunk_boundary() -> None:
@@ -290,15 +294,14 @@ class _CallbackTokenizer:
 
 def test_callback_tokenizer_keeps_ordinary_encoding_and_serving_stops_separate():
     tokenizer = _CallbackTokenizer()
-    recipe = Recipe(tokenizer, model="inkling")
+    model_recipe = InklingRecipe(tokenizer)
     marker = "<|content_model_end_sampling|>"
-    request = {"messages": [{"role": "user", "content": marker}]}
-    rendered = recipe.render(request)
-    assert tokenizer.markers[marker] not in rendered["token_ids"]
-    assert tokenizer.raw_encodes == []
-    assert recipe.render({**request, "stop": [marker]})["stop_token_ids"] == [
-        tokenizer.markers[marker]
+    messages = [
+        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(marker)])
     ]
+    rendered = model_recipe.render(messages)
+    assert tokenizer.markers[marker] not in rendered.token_ids
+    assert rendered.stop_token_ids == [tokenizer.markers[marker]]
     assert tokenizer.raw_encodes == []
 
 
@@ -308,9 +311,9 @@ def test_callback_tokenizer_rejects_unknown_or_boolean_control_ids(
 ):
     tokenizer = _CallbackTokenizer()
     monkeypatch.setattr(tokenizer, "convert_tokens_to_ids", lambda _: invalid_id)
-    recipe = Recipe(tokenizer, model="inkling")
+    model_recipe = InklingRecipe(tokenizer)
     with pytest.raises(ValueError, match="control token"):
-        recipe.get_stop_token_ids()
+        model_recipe.get_stop_token_ids()
 
 
 def test_callback_decoder_is_captured_once_instead_of_refetched():
@@ -325,8 +328,13 @@ def test_callback_decoder_is_captured_once_instead_of_refetched():
             return super().decode
 
     tokenizer = TokenizerWithProperty()
-    recipe = Recipe(tokenizer, model="inkling")
-    parser = recipe.create_parser({}, [tokenizer.markers["<|content_text|>"]])
+    model_recipe = InklingRecipe(tokenizer)
+    parser = model_recipe.create_parser(
+        model_recipe.render(
+            [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])]
+        )
+    )
+    assert parser.feed([tokenizer.markers["<|content_text|>"]]) == []
     assert parser.feed([ord("x")]) == [{"type": "text_delta", "delta": "x"}]
     assert parser.finish("stop") == []
     assert tokenizer.reads == 1
@@ -334,17 +342,24 @@ def test_callback_decoder_is_captured_once_instead_of_refetched():
 
 def test_deepseek_constructor_effort_matches_per_request_effort():
     backend = _byte_tokenizer()
-    request = {"messages": [{"role": "user", "content": "hi"}]}
-    configured = Recipe(
-        backend, model="deepseek_v4", options={"reasoning_effort": "high"}
+    messages = [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])]
+    configured = DeepSeekV4Recipe(
+        backend, options=resin.recipe.RenderOptions(reasoning_effort="high")
     )
-    per_request = Recipe(backend, model="deepseek_v4")
-    expected = per_request.render_text({**request, "reasoning_effort": "high"})
-    assert configured.render_text(request) == expected
-    assert configured.render_text({**request, "reasoning_effort": None}) == expected
+    per_request = DeepSeekV4Recipe(backend)
+    expected = per_request.render_text(
+        messages, options=resin.recipe.RenderOptions(reasoning_effort="high")
+    )
+    assert configured.render_text(messages) == expected
+    assert (
+        configured.render_text(messages, options=resin.recipe.RenderOptions())
+        == expected
+    )
     assert configured.render_text(
-        {**request, "reasoning_effort": "low"}
-    ) == per_request.render_text({**request, "reasoning_effort": "low"})
+        messages, options=resin.recipe.RenderOptions(reasoning_effort="low")
+    ) == per_request.render_text(
+        messages, options=resin.recipe.RenderOptions(reasoning_effort="low")
+    )
 
 
 def test_inkling_tool_float_preserves_original_value() -> None:

@@ -22,8 +22,9 @@ from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 
+import resin
 from recipe_fuzz.harness import Case, Part, normalize
-from resin.recipe import Recipe
+from resin.recipe import GptOssRecipe
 
 MARKERS = (
     "<|start|>",
@@ -45,7 +46,7 @@ class GptOssAdapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.codec = Recipe(backend, model="gpt_oss")
+        self.codec = GptOssRecipe(backend)
         self.reference = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
         self.tml = renderers.GptOss()
         _, self.tml_parser = self.tml.render_for_completion(
@@ -160,7 +161,15 @@ class GptOssAdapter:
         return normalize(parts)
 
     def parser(self):
-        return self.codec.create_parser({}, [])
+        return self.codec.create_parser(
+            self.codec.render(
+                [
+                    resin.recipe.Message(
+                        resin.recipe.Role.USER, [resin.recipe.Text("hi")]
+                    )
+                ]
+            )
+        )
 
     def tool_truncation(self, case):
         prefix = Case(case.parts[:-1])
@@ -176,12 +185,15 @@ class GptOssAdapter:
         return ids, prefix_length + header_length, len(ids) - 1
 
     def text_parser(self):
-        prompt = [self.ids["<|start|>"]]
-        prompt.extend(self.ordinary.encode("assistant").ids)
-        prompt.append(self.ids["<|channel|>"])
-        prompt.extend(self.ordinary.encode("final").ids)
-        prompt.append(self.ids["<|message|>"])
-        return self.codec.create_parser({}, prompt)
+        parser = self.parser()
+        # Complete the generated channel header before testing arbitrary text.
+        prefix = [self.ids["<|end|>"], self.ids["<|start|>"]]
+        prefix.extend(self.ordinary.encode("assistant").ids)
+        prefix.append(self.ids["<|channel|>"])
+        prefix.extend(self.ordinary.encode("final").ids)
+        prefix.append(self.ids["<|message|>"])
+        assert parser.feed(prefix) == []
+        return parser
 
     @staticmethod
     def prompt_case(case):

@@ -21,8 +21,10 @@ from pathlib import Path
 
 import torch
 
+import resin
 from deploy.deepseek_v41_validation import _validation_stage
 from resin import SamplingParams
+from resin.recipe import DeepSeekV41Recipe
 from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
 
 
@@ -627,8 +629,6 @@ def run_validation(
     """deploy.bench._rank callback; each attention-DP driver joins each stage."""
     from tokenizers import Tokenizer
 
-    from resin.models.deepseek_v41.codec import DeepSeekV41Codec
-
     rank = 0 if groups is None else groups.rank
     drivers = None if groups is None else groups.drivers
     kernel_configuration = dict(raw._yoco_kernel_configuration)
@@ -652,11 +652,16 @@ def run_validation(
             raise RuntimeError(f"YOCO validation {stage}: {errors}")
 
     try:
-        recipe = DeepSeekV41Codec(
+        recipe = DeepSeekV41Recipe(
             Tokenizer.from_file(str(Path(checkpoint) / "tokenizer.json"))
         )
         prompt = recipe.render_ids(
-            [dict(role="user", content="Count from1 to20, one number per line.")]
+            [
+                resin.recipe.Message(
+                    resin.recipe.Role.USER,
+                    [resin.recipe.Text("Count from1 to20, one number per line.")],
+                )
+            ]
         )
         modes = (
             None

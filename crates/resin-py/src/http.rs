@@ -25,7 +25,7 @@ pub(crate) const ADMISSIONS_PER_STEP: usize = 4;
 pub(crate) struct NativeHttpServer {
     engine: Py<Engine>,
     distributed: Option<Py<PyAny>>,
-    codec: Py<PyAny>,
+    recipe: Py<PyAny>,
     model: String,
     stream_interval: u32,
     request_queue_capacity: u32,
@@ -39,7 +39,7 @@ impl NativeHttpServer {
     #[new]
     #[pyo3(signature = (
         engine,
-        codec,
+        recipe,
         *,
         model,
         stream_interval = 1,
@@ -52,7 +52,7 @@ impl NativeHttpServer {
     #[allow(clippy::too_many_arguments)]
     fn new(
         engine: Py<Engine>,
-        codec: Py<PyAny>,
+        recipe: Py<PyAny>,
         model: String,
         stream_interval: u32,
         request_queue_capacity: u32,
@@ -90,7 +90,7 @@ impl NativeHttpServer {
         Ok(Self {
             engine,
             distributed,
-            codec,
+            recipe,
             model,
             stream_interval,
             request_queue_capacity,
@@ -123,7 +123,7 @@ impl NativeHttpServer {
         }
         let engine = self.engine.clone_ref(py);
         let distributed = self.distributed.as_ref().map(|value| value.clone_ref(py));
-        let codec = self.codec.clone_ref(py);
+        let recipe = self.recipe.clone_ref(py);
         let model = self.model.clone();
         let routes = self.routes;
         let stream_interval = self.stream_interval;
@@ -132,7 +132,7 @@ impl NativeHttpServer {
             run_server(
                 engine,
                 distributed,
-                codec,
+                recipe,
                 model,
                 routes,
                 stream_interval,
@@ -192,7 +192,7 @@ impl NativeHttpServer {
 fn run_server(
     engine: Py<Engine>,
     distributed: Option<Py<PyAny>>,
-    codec: Py<PyAny>,
+    recipe: Py<PyAny>,
     model: String,
     routes: RouteConfig,
     stream_interval: u32,
@@ -221,7 +221,7 @@ fn run_server(
                     routes.routed_dp_size,
                 )
             } else {
-                engine_actor(engine, codec, receiver, actor_shutdown, stream_interval)
+                engine_actor(engine, recipe, receiver, actor_shutdown, stream_interval)
             };
             if let Err(error) = &result {
                 eprintln!("[resin-http] inference actor failed: {error}");
@@ -259,13 +259,13 @@ fn run_server(
 
 fn engine_actor(
     engine: Py<Engine>,
-    codec: Py<PyAny>,
+    recipe: Py<PyAny>,
     mut jobs: mpsc::Receiver<GenerationJob>,
     shutdown: watch::Receiver<bool>,
     stream_interval: u32,
 ) -> Result<(), String> {
     let mut session =
-        Python::attach(|py| Session::new(py, engine.clone_ref(py), codec, stream_interval))
+        Python::attach(|py| Session::new(py, engine.clone_ref(py), recipe, stream_interval))
             .map_err(|error| format_python_error("HTTP session preparation failed", error))?;
     let mut disconnected = false;
     loop {

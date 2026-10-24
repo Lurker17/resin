@@ -23,8 +23,8 @@ def test_checkpoint_specs_keep_old_identity_and_pin_1017():
 @pytest.mark.parametrize(
     "model_type,runner_name,codec_name",
     [
-        ("deepseek_v4", "DeepSeekV4CudaRunner", "DeepSeekV4Codec"),
-        ("deepseek_v41", "DeepSeekV41CudaRunner", "DeepSeekV41Codec"),
+        ("deepseek_v4", "DeepSeekV4CudaRunner", "DeepSeekV4Recipe"),
+        ("deepseek_v41", "DeepSeekV41CudaRunner", "DeepSeekV41Recipe"),
     ],
 )
 def test_runner_and_codec_follow_checkpoint_architecture(

@@ -11,6 +11,7 @@ from typing import Any
 
 import modal
 
+import resin
 from deploy.graph_validation import capture_cuda_graphs, validate_prefill_graphs
 from deploy.modal_image import build_modal_image
 from resin.backend.cuda.graphs import (
@@ -18,6 +19,7 @@ from resin.backend.cuda.graphs import (
     default_decode_graph_shapes,
 )
 from resin.backend.parallel import monitor_process_context
+from resin.recipe import Gemma4Recipe
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_ID = "nvidia/Gemma-4-31B-IT-NVFP4"
@@ -208,13 +210,16 @@ def _synthetic_image(size: int = 96):
 
 def _generate(engine, processor, prompt: str, max_new_tokens: int):
     from resin import SamplingParams
-    from resin.models.gemma4.media import Gemma4Media
 
-    media = Gemma4Media.from_images(
-        processor,
-        [_synthetic_image()],
-        prompt=prompt,
+    prepared = Gemma4Recipe(processor, eos_token_ids=(1, 106)).render(
+        [
+            resin.recipe.Message(
+                resin.recipe.Role.USER,
+                [resin.recipe.Image(_synthetic_image()), resin.recipe.Text(prompt)],
+            ),
+        ]
     )
+    media = prepared.media
     lease = engine.submit(
         media=media,
         max_new_tokens=max_new_tokens,
@@ -236,14 +241,16 @@ def _generate(engine, processor, prompt: str, max_new_tokens: int):
 
 def _warmup_text(engine, processor) -> None:
     from resin import SamplingParams
-    from resin.models.gemma4.media import Gemma4Media
 
-    media = Gemma4Media.from_messages(
-        processor,
-        [{"role": "user", "content": "Reply with the number 1."}],
+    prepared = Gemma4Recipe(processor, eos_token_ids=(1, 106)).render(
+        [
+            resin.recipe.Message(
+                resin.recipe.Role.USER, [resin.recipe.Text("Reply with the number 1.")]
+            ),
+        ]
     )
     lease = engine.submit(
-        media=media,
+        prepared.token_ids,
         max_new_tokens=3,
         stop_token_ids=(1, 106),
         sampling_params=SamplingParams(temperature=0.0),
@@ -325,7 +332,6 @@ def smoke_test(
 def _serve(_: int) -> None:
     import torch
 
-    from resin.models.gemma4.codec import Gemma4Codec
     from resin.server import HttpServer
 
     runner, processor, engine, _ = _build_runtime(
@@ -339,7 +345,7 @@ def _serve(_: int) -> None:
         torch.cuda.synchronize(runner.device)
         HttpServer(
             engine,
-            codec=Gemma4Codec(processor, eos_token_ids=runner.config.eos_token_ids),
+            recipe=Gemma4Recipe(processor, eos_token_ids=runner.config.eos_token_ids),
             model=MODEL_ID,
             enable_anthropic=False,
         ).serve(host="0.0.0.0", port=8000)

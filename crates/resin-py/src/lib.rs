@@ -18,6 +18,7 @@ mod output;
 mod parallelism;
 mod planning;
 mod recipe;
+mod recipe_types;
 mod runner;
 
 use cache::{CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention};
@@ -1914,7 +1915,17 @@ mod _resin {
     use crate::http_session::NativeHttpSession;
 
     #[pymodule_export]
-    use crate::recipe::{ModelRecipe, NativeInklingParser, NativeResponseParser, RecipeTokenizer};
+    use crate::recipe::{
+        DeepSeekV4Recipe, DeepSeekV41Recipe, Gemma4Recipe, GptOssRecipe, InklingRecipe, Lfm2Recipe,
+        NativeInklingParser, NativeRecipe, NativeResponseParser, Qwen35Recipe, Qwen38Recipe,
+        RecipeTokenizer, RenderedPrompt,
+    };
+
+    #[pymodule_export]
+    use crate::recipe_types::{
+        Audio, Image, Message, RenderOptions, Role, Text, Thinking, Tool, ToolCall, ToolResult,
+        Video,
+    };
 
     #[pymodule_export]
     #[allow(non_upper_case_globals)]

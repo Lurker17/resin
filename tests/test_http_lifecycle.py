@@ -13,17 +13,17 @@ from test_recipe import _byte_tokenizer, _FastTokenizer, _token_ids
 
 from resin import BatchPhase, Engine
 from resin.backend.cuda.failures import PostAcceptCudaError
-from resin.recipe import InklingResponseParser, Tokenizer
+from resin.recipe import InklingResponseParser, RenderedPrompt, Tokenizer
 from resin.server import HttpServer
 
 
 class Codec:
-    def render(self, request):
-        slow = request["messages"][0]["content"] == "slow"
-        return {"token_ids": [1 if slow else 2], "stop_token_ids": []}
+    def render(self, messages, *, tools=(), options=None):
+        slow = messages[0].content[0].text == "slow"
+        return RenderedPrompt([1 if slow else 2], stop_token_ids=[])
 
-    def create_parser(self, request, prompt_ids):
-        delta = "x" * 65_536 if prompt_ids == [1] else "ok"
+    def create_parser(self, prompt):
+        delta = "x" * 65_536 if prompt.token_ids == [1] else "ok"
 
         class Parser:
             def feed(self, token_ids):
@@ -67,12 +67,12 @@ def request_body(content="fast", *, stream=False, max_tokens=2):
 
 
 @contextmanager
-def running_server(runner, codec=None, **options):
+def running_server(runner, recipe=None, **options):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     engine = Engine(runner)
-    server = HttpServer(engine, codec=codec or Codec(), model="test", **options)
+    server = HttpServer(engine, recipe=recipe or Codec(), model="test", **options)
     errors = []
 
     def serve():
@@ -133,11 +133,11 @@ def test_configured_intake_queue_rejects_overflow_then_drains_and_recovers():
     resume = threading.Event()
 
     class BlockingCodec(Codec):
-        def render(self, request):
+        def render(self, messages, *, tools=(), options=None):
             if not rendering.is_set():
                 rendering.set()
                 assert resume.wait(timeout=5), "test did not release the first render"
-            return super().render(request)
+            return super().render(messages, tools=tools, options=options)
 
     with running_server(Runner(), BlockingCodec(), request_queue_capacity=2) as (
         _server,
@@ -220,13 +220,13 @@ def test_parser_finalization_deltas_precede_completion(stream, completion_reason
     finished = []
 
     class FinalizingCodec(Codec):
-        def render(self, request):
-            rendered = super().render(request)
+        def render(self, messages, *, tools=(), options=None):
+            rendered = super().render(messages, tools=tools, options=options)
             if completion_reason == "stop":
-                rendered["stop_token_ids"] = [3]
+                rendered = RenderedPrompt(rendered.token_ids, stop_token_ids=[3])
             return rendered
 
-        def create_parser(self, request, prompt_ids):
+        def create_parser(self, prompt):
             class Parser:
                 def feed(self, token_ids):
                     return [{"type": "text_delta", "delta": "before"}]
@@ -293,17 +293,19 @@ def test_native_parser_flushes_partial_utf8_in_http_actor(stream):
     assert tokenizer.is_native
 
     class NativeCodec:
-        def render(self, request):
-            return {
-                "token_ids": [
+        def render(self, messages, *, tools=(), options=None):
+            return RenderedPrompt(
+                [
                     markers["<|message_model|>"],
                     markers["<|content_text|>"],
                 ],
-                "stop_token_ids": [],
-            }
+                stop_token_ids=[],
+            )
 
-        def create_parser(self, request, prompt_ids):
-            return InklingResponseParser(tokenizer, markers, prompt_ids=prompt_ids)
+        def create_parser(self, prompt):
+            return InklingResponseParser(
+                tokenizer, markers, prompt_ids=prompt.token_ids
+            )
 
     class ByteRunner:
         def __init__(self):
@@ -354,8 +356,11 @@ def test_native_parser_flushes_partial_utf8_in_http_actor(stream):
 @pytest.mark.parametrize("stream", [False, True])
 def test_parser_finalization_failure_does_not_poison_other_requests(stream):
     class FinalizingCodec(Codec):
-        def create_parser(self, request, prompt_ids):
-            fail = request["messages"][0]["content"] == "fail"
+        def render(self, messages, *, tools=(), options=None):
+            return RenderedPrompt([99 if messages[0].content[0].text == "fail" else 2])
+
+        def create_parser(self, prompt):
+            fail = prompt.token_ids == [99]
 
             class Parser:
                 def feed(self, token_ids):
@@ -427,12 +432,12 @@ def test_admission_burst_yields_to_inference_before_draining_queue():
             self.resume = threading.Event()
             self.admitted = 0
 
-        def render(self, request):
+        def render(self, messages, *, tools=(), options=None):
             if not self.admitted:
                 self.rendering.set()
                 assert self.resume.wait(timeout=3)
             self.admitted += 1
-            return super().render(request)
+            return super().render(messages, tools=tools, options=options)
 
     codec = GatedCodec()
     first_step = threading.Event()

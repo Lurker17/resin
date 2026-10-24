@@ -2,7 +2,10 @@
 use crate::http_logprobs::Vocabulary;
 use crate::http_output::OutputScores;
 use crate::http_stop::StopFilter;
-use crate::recipe::{self, NativeInklingParser, NativeResponseParser, SharedParser};
+use crate::recipe::{
+    self, NativeInklingParser, NativeRecipe, NativeResponseParser, RenderedPrompt, SharedParser,
+};
+use crate::recipe_types::{Message, RenderOptions, Tool};
 use crate::{CompletionReason, Engine, RequestLease, SamplingParams, TokenEvent};
 use pyo3::{
     exceptions::{PyAttributeError, PyRuntimeError, PyValueError},
@@ -15,16 +18,8 @@ use resin_http::{
     GenerationEvent, GenerationJob,
 };
 use resin_recipe::{AttributedEvent, Event as ParsedEvent, FinishReason as ParserFinishReason};
-use serde::Deserialize;
 use std::{collections::HashMap, sync::Mutex, time::Instant};
 use tokio::sync::mpsc;
-
-#[derive(Debug, Deserialize)]
-struct RenderedPrompt {
-    token_ids: Vec<u32>,
-    #[serde(default)]
-    stop_token_ids: Vec<u32>,
-}
 
 fn into_http(event: ParsedEvent) -> GenerationEvent {
     match event {
@@ -218,7 +213,7 @@ impl ActiveRequest {
 
 pub(crate) struct Session {
     engine: Py<Engine>,
-    codec: Py<PyAny>,
+    recipe: Py<PyAny>,
     vocabulary: Vocabulary,
     active: HashMap<u64, ActiveRequest>,
     stream_interval: u32,
@@ -227,7 +222,7 @@ impl Session {
     pub fn new(
         py: Python<'_>,
         engine: Py<Engine>,
-        codec: Py<PyAny>,
+        recipe: Py<PyAny>,
         stream_interval: u32,
     ) -> PyResult<Self> {
         if stream_interval == 0 {
@@ -242,10 +237,10 @@ impl Session {
             ));
         }
         drop(state);
-        let vocabulary = Vocabulary::from_codec(py, &codec)?;
+        let vocabulary = Vocabulary::from_recipe(py, &recipe)?;
         Ok(Self {
             engine,
-            codec,
+            recipe,
             vocabulary,
             active: HashMap::new(),
             stream_interval,
@@ -255,7 +250,7 @@ impl Session {
         self.active.len()
     }
     pub fn admit(&mut self, job: GenerationJob) {
-        admit(&self.engine, &self.codec, job, &mut self.active);
+        admit(&self.engine, &self.recipe, job, &mut self.active);
     }
     pub fn cancel_disconnected(&mut self) -> Result<(), String> {
         cancel_disconnected(&self.engine, &mut self.active)
@@ -464,7 +459,7 @@ fn process(
 
 fn admit(
     engine: &Py<Engine>,
-    codec: &Py<PyAny>,
+    recipe: &Py<PyAny>,
     job: GenerationJob,
     active: &mut HashMap<u64, ActiveRequest>,
 ) {
@@ -472,28 +467,73 @@ fn admit(
         return;
     }
     let result = Python::attach(|py| {
-        let request = pythonize(py, &job.request)?;
-        let rendered = codec.bind(py).call_method1("render", (&request,))?;
-        let media = rendered
-            .cast::<PyDict>()?
-            .get_item("media")?
-            .filter(|value| !value.is_none())
-            .map(Bound::unbind);
-        let rendered: RenderedPrompt = depythonize(&rendered)?;
-        if rendered.token_ids.is_empty() {
+        // JSON is an HTTP concern; both native and custom recipes receive the
+        // same typed conversation. Native recipes stay inside Rust here.
+        let messages = job
+            .request
+            .messages
+            .iter()
+            .map(|value| {
+                let message = if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
+                    native.borrow().message_from_wire(py, value)?
+                } else {
+                    Message::from_wire(py, value)?
+                };
+                Py::new(py, message)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let tools = job
+            .request
+            .tools
+            .iter()
+            .map(|value| Py::new(py, Tool::from_wire(value)?))
+            .collect::<PyResult<Vec<_>>>()?;
+        let options = RenderOptions::from_wire(&serde_json::json!({
+            "reasoning_effort": job.request.reasoning_effort,
+            "extra": job.request.extra,
+        }))?;
+        let (token_ids, stop_token_ids, media, parser) =
+            if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
+                let native = native.borrow();
+                let rendered = native.render(py, messages, tools, Some(&options))?;
+                let parser = Py::new(py, native.create_parser(py, &rendered)?)?.into_any();
+                (
+                    rendered.token_ids,
+                    rendered.stop_token_ids,
+                    rendered.media,
+                    parser,
+                )
+            } else {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("tools", tools)?;
+                kwargs.set_item("options", Py::new(py, options)?)?;
+                let rendered = recipe
+                    .bind(py)
+                    .call_method("render", (messages,), Some(&kwargs))?;
+                let parser = recipe
+                    .bind(py)
+                    .call_method1("create_parser", (&rendered,))?
+                    .unbind();
+                let prompt = rendered.cast::<RenderedPrompt>()?.borrow();
+                // Custom recipes also return the native prompt container, so media
+                // and token ownership cross one well-defined admission boundary.
+                (
+                    prompt.token_ids.clone(),
+                    prompt.stop_token_ids.clone(),
+                    prompt.media.as_ref().map(|value| value.clone_ref(py)),
+                    parser,
+                )
+            };
+        if token_ids.is_empty() {
             return Err(PyValueError::new_err(
-                "codec.render returned an empty token_ids sequence",
+                "recipe.render returned an empty token_ids sequence",
             ));
         }
-        let parser = codec
-            .bind(py)
-            .call_method1("create_parser", (&request, rendered.token_ids.clone()))?
-            .unbind();
         let parser = Parser::new(py, parser)?;
         let scores = job.request.logprobs.then(OutputScores::default);
         let extra = pythonize(py, &job.request.extra)?.unbind();
         let stops = StopFilter::new(job.request.stop.clone())?;
-        let prompt_ids = rendered.token_ids.clone();
+        let prompt_ids = token_ids.clone();
         let sampling_params = Py::new(
             py,
             SamplingParams::new(
@@ -508,15 +548,15 @@ fn admit(
                 Some(extra),
             )?,
         )?;
-        let input_tokens = rendered.token_ids.len();
+        let input_tokens = token_ids.len();
         let lease = engine.bind(py).borrow_mut().submit(
             py,
-            Some(rendered.token_ids),
+            Some(token_ids),
             Some(job.request.max_output_tokens),
             0,
             None,
             Some(sampling_params),
-            Some(rendered.stop_token_ids),
+            Some(stop_token_ids),
             media,
             None,
         )?;
@@ -600,16 +640,16 @@ pub(crate) struct NativeHttpSession {
 #[pymethods]
 impl NativeHttpSession {
     #[new]
-    #[pyo3(signature = (engine, codec, *, stream_interval = 1))]
+    #[pyo3(signature = (engine, recipe, *, stream_interval = 1))]
     fn new(
         py: Python<'_>,
         engine: Py<Engine>,
-        codec: Py<PyAny>,
+        recipe: Py<PyAny>,
         stream_interval: u32,
     ) -> PyResult<Self> {
         Ok(Self {
             inner: Mutex::new((
-                Session::new(py, engine, codec, stream_interval)?,
+                Session::new(py, engine, recipe, stream_interval)?,
                 HashMap::new(),
             )),
         })
