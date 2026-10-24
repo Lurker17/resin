@@ -106,7 +106,7 @@ def _serve_rank(rank: int, port: int) -> None:
         flush=True,
     )
     runner.capture_cuda_graphs()
-    codec = DeepSeekV41Recipe(Tokenizer.from_file(str(CHECKPOINT / "tokenizer.json")))
+    recipe = DeepSeekV41Recipe(Tokenizer.from_file(str(CHECKPOINT / "tokenizer.json")))
     engine = DistributedEngine(
         DistributedWorker(runner, groups),
         max_running_requests=MAX_SEQUENCES,
@@ -123,17 +123,17 @@ def _serve_rank(rank: int, port: int) -> None:
         # ordinary EOS handling while device-feedback decode overlaps.
         warmup = (
             engine.submit(
-                codec.render_ids(
+                recipe.render(
                     [
                         resin.recipe.Message(
                             resin.recipe.Role.USER,
                             [resin.recipe.Text("Count from 1 to 100.")],
                         )
                     ]
-                ),
+                ).token_ids,
                 sampling_params=SamplingParams(
                     max_output_tokens=64,
-                    stop_token_ids=codec.get_stop_token_ids(),
+                    stop_token_ids=recipe.stop_token_ids,
                     temperature=0.0,
                 ),
             )
@@ -160,7 +160,7 @@ def _serve_rank(rank: int, port: int) -> None:
         if rank == 0:
             kernel_volume.commit()
         # All four drivers participate; the shared coordinator listens on rank 0.
-        HttpServer(engine, recipe=codec, model=MODEL).serve(host="0.0.0.0", port=8000)
+        HttpServer(engine, recipe=recipe, model=MODEL).serve(host="0.0.0.0", port=8000)
     finally:
         if not engine.closed:
             engine.close()

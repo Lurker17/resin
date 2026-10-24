@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use crate::media_preprocess::{self, Kind as MediaKind, Processor as MediaProcessor};
@@ -11,6 +11,7 @@ use crate::recipe_media;
 use crate::recipe_types::{
     BlockKind, MediaSources, Message, MessagePolicy, RenderOptions, Role, Tool, ToolScope,
 };
+use numpy::PyArray1;
 use pyo3::{
     exceptions::{PyAttributeError, PyValueError},
     prelude::*,
@@ -32,7 +33,7 @@ enum TokenizerSource {
     },
 }
 
-/// A tokenizer prepared once for a model's response parsers.
+/// A tokenizer shared by rendering, response parsing, and token metadata.
 ///
 /// Fast Hugging Face tokenizers are snapshotted into Rust. Custom Python
 /// tokenizers remain supported through their decode method.
@@ -40,12 +41,18 @@ enum TokenizerSource {
 #[derive(Clone)]
 pub(crate) struct RecipeTokenizer {
     source: TokenizerSource,
+    name_or_path: Option<String>,
 }
 
 #[pymethods]
 impl RecipeTokenizer {
     #[new]
-    fn new(tokenizer: &Bound<'_, PyAny>) -> PyResult<Self> {
+    pub(crate) fn new(tokenizer: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(prepared) = tokenizer.cast::<Self>() {
+            return Ok(prepared.borrow().clone());
+        }
+        let name_or_path = optional_attr(tokenizer, "name_or_path")?
+            .and_then(|value| value.extract::<String>().ok());
         let backend =
             optional_attr(tokenizer, "backend_tokenizer")?.unwrap_or_else(|| tokenizer.clone());
         let serialize = optional_attr(&backend, "to_str")?.filter(|method| method.is_callable());
@@ -69,12 +76,92 @@ impl RecipeTokenizer {
                 decode: Arc::new(decode.unbind()),
             }
         };
-        Ok(Self { source })
+        Ok(Self {
+            source,
+            name_or_path,
+        })
     }
 
     #[getter]
     fn is_native(&self) -> bool {
         matches!(self.source, TokenizerSource::Native(..))
+    }
+
+    #[getter]
+    fn name_or_path(&self) -> Option<&str> {
+        self.name_or_path.as_deref()
+    }
+
+    #[pyo3(signature = (text, *, add_special_tokens = false))]
+    fn encode(&self, text: &str, add_special_tokens: bool) -> PyResult<Vec<u32>> {
+        match &self.source {
+            TokenizerSource::Native(tokenizer, _) => tokenizer
+                .encode(text, add_special_tokens)
+                .map(|encoding| encoding.get_ids().to_vec())
+                .map_err(|error| PyValueError::new_err(error.to_string())),
+            TokenizerSource::Python { object, .. } => Python::attach(|py| {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("add_special_tokens", add_special_tokens)?;
+                object
+                    .bind(py)
+                    .call_method("encode", (text,), Some(&kwargs))?
+                    .extract()
+            }),
+        }
+    }
+
+    #[pyo3(signature = (token_ids, *, skip_special_tokens = false))]
+    fn decode(&self, token_ids: Vec<u32>, skip_special_tokens: bool) -> PyResult<String> {
+        match &self.source {
+            TokenizerSource::Native(tokenizer, _) => tokenizer
+                .decode(&token_ids, skip_special_tokens)
+                .map_err(|error| PyValueError::new_err(error.to_string())),
+            TokenizerSource::Python { decode, .. } => Python::attach(|py| {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("skip_special_tokens", skip_special_tokens)?;
+                decode.bind(py).call((token_ids,), Some(&kwargs))?.extract()
+            }),
+        }
+    }
+
+    fn token_to_id(&self, token: &str) -> PyResult<Option<u32>> {
+        match &self.source {
+            TokenizerSource::Native(tokenizer, _) => Ok(tokenizer.token_to_id(token)),
+            TokenizerSource::Python { object, .. } => Python::attach(|py| {
+                let tokenizer = object.bind(py);
+                let method = match optional_attr(tokenizer, "convert_tokens_to_ids")? {
+                    Some(method) => method,
+                    None => tokenizer.getattr("token_to_id")?,
+                };
+                method.call1((token,))?.extract()
+            }),
+        }
+    }
+
+    fn id_to_token(&self, token_id: u32) -> PyResult<Option<String>> {
+        match &self.source {
+            TokenizerSource::Native(tokenizer, _) => Ok(tokenizer.id_to_token(token_id)),
+            TokenizerSource::Python { object, .. } => Python::attach(|py| {
+                let tokenizer = object.bind(py);
+                let method = match optional_attr(tokenizer, "convert_ids_to_tokens")? {
+                    Some(method) => method,
+                    None => tokenizer.getattr("id_to_token")?,
+                };
+                method.call1((token_id,))?.extract()
+            }),
+        }
+    }
+
+    /// Serialize the prepared native snapshot, for external tokenizer tools.
+    fn to_str(&self) -> PyResult<String> {
+        match &self.source {
+            TokenizerSource::Native(tokenizer, _) => tokenizer
+                .to_string(false)
+                .map_err(|error| PyValueError::new_err(error.to_string())),
+            TokenizerSource::Python { .. } => Err(PyValueError::new_err(
+                "custom Python tokenizer has no serialized backend",
+            )),
+        }
     }
 }
 
@@ -90,6 +177,13 @@ pub(crate) fn optional_attr<'py>(
 }
 
 impl RecipeTokenizer {
+    pub(crate) fn native(&self) -> Option<Arc<Tokenizer>> {
+        match &self.source {
+            TokenizerSource::Native(tokenizer, _) => Some(tokenizer.clone()),
+            TokenizerSource::Python { .. } => None,
+        }
+    }
+
     fn decoder(&self) -> Result<Box<dyn Decoder>, Error> {
         match &self.source {
             TokenizerSource::Native(tokenizer, _) => {
@@ -310,7 +404,7 @@ impl Encoder for PythonEncoder {
 }
 
 /// Common native handle recognized directly by the HTTP actor.
-#[pyclass(name = "RecipeResponseParser", frozen, module = "resin._resin")]
+#[pyclass(name = "_NativeResponseParser", frozen, module = "resin._resin")]
 pub(crate) struct NativeResponseParser {
     pub(crate) inner: SharedParser,
 }
@@ -332,7 +426,6 @@ impl NativeResponseParser {
 #[pyclass(frozen, module = "resin._resin")]
 pub(crate) struct RenderedPrompt {
     pub(crate) token_ids: Vec<u32>,
-    pub(crate) stop_token_ids: Vec<u32>,
     pub(crate) media: Option<Py<PyAny>>,
     seed: Option<ParserSeed>,
 }
@@ -343,22 +436,17 @@ struct ParserSeed {
 #[pymethods]
 impl RenderedPrompt {
     #[new]
-    #[pyo3(signature=(token_ids, *, stop_token_ids=Vec::new(), media=None))]
-    fn new(token_ids: Vec<u32>, stop_token_ids: Vec<u32>, media: Option<Py<PyAny>>) -> Self {
+    #[pyo3(signature=(token_ids, *, media=None))]
+    fn new(token_ids: Vec<u32>, media: Option<Py<PyAny>>) -> Self {
         Self {
             token_ids,
-            stop_token_ids,
             media,
             seed: None,
         }
     }
     #[getter]
-    fn token_ids(&self) -> Vec<u32> {
-        self.token_ids.clone()
-    }
-    #[getter]
-    fn stop_token_ids(&self) -> Vec<u32> {
-        self.stop_token_ids.clone()
+    fn token_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(this.clone().into_any(), &this.get().token_ids)
     }
     #[getter]
     fn media(&self, py: Python<'_>) -> Option<Py<PyAny>> {
@@ -402,12 +490,11 @@ impl RecipeDefinition {
 #[pyclass(name = "_NativeRecipe", frozen, subclass, module = "resin._resin")]
 pub(crate) struct NativeRecipe {
     tokenizer: RecipeTokenizer,
-    original_tokenizer: Arc<Py<PyAny>>,
     encoder: Arc<dyn Encoder>,
     definition: &'static RecipeDefinition,
     options: Map<String, Value>,
     id: u64,
-    stop_token_ids: Option<Vec<u32>>,
+    stop_token_ids: OnceLock<Vec<u32>>,
     media_processor: Option<MediaProcessor>,
 }
 impl NativeRecipe {
@@ -435,11 +522,10 @@ impl NativeRecipe {
         let value = Self {
             encoder: tokenizer.encoder(),
             tokenizer,
-            original_tokenizer: Arc::new(original_tokenizer.unbind()),
             definition,
             options: defaults,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            stop_token_ids,
+            stop_token_ids: stop_token_ids.map(OnceLock::from).unwrap_or_default(),
             media_processor: definition
                 .media_kind
                 .map(|kind| MediaProcessor::new(kind, owner, media_config))
@@ -447,6 +533,20 @@ impl NativeRecipe {
         };
         value.resolve_options(None)?;
         Ok(value)
+    }
+    pub(crate) fn resolved_stop_token_ids(&self) -> PyResult<&[u32]> {
+        if let Some(ids) = self.stop_token_ids.get() {
+            return Ok(ids);
+        }
+        let ids = self
+            .definition
+            .format
+            .stop_token_ids(self.encoder.as_ref())
+            .map_err(recipe_error)?;
+        // Resolve lazily so template inspection does not require a complete
+        // tokenizer. Once published, the backing vector never changes.
+        let _ = self.stop_token_ids.set(ids);
+        Ok(self.stop_token_ids.get().unwrap())
     }
     pub(crate) fn message_from_wire(&self, py: Python<'_>, value: &Value) -> PyResult<Message> {
         let mut message = Message::from_wire(py, value)?;
@@ -527,13 +627,8 @@ impl NativeRecipe {
         py: Python<'_>,
         request: Value,
         sources: MediaSources,
-        prepare: bool,
     ) -> PyResult<RenderedPrompt> {
-        let sources = if prepare {
-            media_preprocess::sources(py, sources)?
-        } else {
-            Vec::new()
-        };
+        let sources = media_preprocess::sources(py, sources)?;
         let (token_ids, preparation, placements) = py.detach(|| -> PyResult<_> {
             let preparation = if sources.is_empty() {
                 None
@@ -571,7 +666,6 @@ impl NativeRecipe {
         };
         Ok(RenderedPrompt {
             token_ids,
-            stop_token_ids: self.get_stop_token_ids()?,
             media,
             seed: Some(seed),
         })
@@ -580,8 +674,8 @@ impl NativeRecipe {
 #[pymethods]
 impl NativeRecipe {
     #[getter]
-    fn tokenizer(&self, py: Python<'_>) -> Py<PyAny> {
-        self.original_tokenizer.clone_ref(py)
+    fn tokenizer(&self) -> RecipeTokenizer {
+        self.tokenizer.clone()
     }
     #[pyo3(signature=(messages, *, tools=Vec::new(), options=None))]
     pub(crate) fn render(
@@ -592,10 +686,11 @@ impl NativeRecipe {
         options: Option<&RenderOptions>,
     ) -> PyResult<RenderedPrompt> {
         let (request, sources) = self.request(py, &messages, &tools, options)?;
-        self.render_request(py, request, sources, true)
+        self.render_request(py, request, sources)
     }
     #[pyo3(signature=(messages, *, tools=Vec::new(), options=None))]
-    fn render_text(
+    /// Inspect the template before tokenization and media expansion.
+    fn debug_render_text(
         &self,
         py: Python<'_>,
         messages: Vec<Py<Message>>,
@@ -611,28 +706,10 @@ impl NativeRecipe {
                 .map_err(recipe_error)
         })
     }
-    #[pyo3(signature=(messages, *, tools=Vec::new(), options=None))]
-    fn render_ids(
-        &self,
-        py: Python<'_>,
-        messages: Vec<Py<Message>>,
-        tools: Vec<Py<Tool>>,
-        options: Option<&RenderOptions>,
-    ) -> PyResult<Vec<u32>> {
-        let (request, sources) = self.request(py, &messages, &tools, options)?;
-        let prepare = sources.iter().any(|(_, source)| !source.is_none(py));
-        Ok(self
-            .render_request(py, request, sources, prepare)?
-            .token_ids)
-    }
-    pub(crate) fn get_stop_token_ids(&self) -> PyResult<Vec<u32>> {
-        if let Some(ids) = &self.stop_token_ids {
-            return Ok(ids.clone());
-        }
-        self.definition
-            .format
-            .stop_token_ids(self.encoder.as_ref())
-            .map_err(recipe_error)
+    /// Static model stop tokens, returned as an owned list.
+    #[getter]
+    fn stop_token_ids(&self) -> PyResult<Vec<u32>> {
+        Ok(self.resolved_stop_token_ids()?.to_vec())
     }
     pub(crate) fn create_parser(
         &self,
@@ -720,11 +797,12 @@ macro_rules! recipe_class {
         #[pymethods]
         impl $class {
             #[new]
-            #[pyo3(signature=(tokenizer, *, options=None, media_config=None))]
+            #[pyo3(signature=(tokenizer, *, options=None, stop_token_ids=None, media_config=None))]
             fn new(
                 py: Python<'_>,
                 tokenizer: &Bound<'_, PyAny>,
                 options: Option<&RenderOptions>,
+                stop_token_ids: Option<Vec<u32>>,
                 media_config: Option<&Bound<'_, PyAny>>,
             ) -> PyResult<PyClassInitializer<Self>> {
                 Ok(PyClassInitializer::from(NativeRecipe::new(
@@ -732,7 +810,7 @@ macro_rules! recipe_class {
                     tokenizer,
                     &Self::DEFINITION,
                     options,
-                    None,
+                    stop_token_ids,
                     media_config.map(depythonize::<Value>).transpose()?,
                 )?)
                 .add_subclass(Self))
@@ -875,12 +953,12 @@ impl Gemma4Recipe {
 #[pymethods]
 impl Gemma4Recipe {
     #[new]
-    #[pyo3(signature=(tokenizer, *, options=None, eos_token_ids=Vec::new(), media_config=None))]
+    #[pyo3(signature=(tokenizer, *, options=None, stop_token_ids=None, media_config=None))]
     fn new(
         py: Python<'_>,
         tokenizer: &Bound<'_, PyAny>,
         options: Option<&RenderOptions>,
-        eos_token_ids: Vec<u32>,
+        stop_token_ids: Option<Vec<u32>>,
         media_config: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyClassInitializer<Self>> {
         Ok(PyClassInitializer::from(NativeRecipe::new(
@@ -888,7 +966,7 @@ impl Gemma4Recipe {
             tokenizer,
             &Self::DEFINITION,
             options,
-            (!eos_token_ids.is_empty()).then_some(eos_token_ids),
+            stop_token_ids,
             media_config.map(depythonize::<Value>).transpose()?,
         )?)
         .add_subclass(Self))
@@ -911,11 +989,12 @@ impl DeepSeekV41Recipe {
 #[pymethods]
 impl DeepSeekV41Recipe {
     #[new]
-    #[pyo3(signature=(tokenizer, *, options=None, vision_config=None, image_token_id=None))]
+    #[pyo3(signature=(tokenizer, *, options=None, stop_token_ids=None, vision_config=None, image_token_id=None))]
     fn new(
         py: Python<'_>,
         tokenizer: &Bound<'_, PyAny>,
         options: Option<&RenderOptions>,
+        stop_token_ids: Option<Vec<u32>>,
         vision_config: Option<&Bound<'_, PyAny>>,
         image_token_id: Option<u32>,
     ) -> PyResult<PyClassInitializer<Self>> {
@@ -928,7 +1007,7 @@ impl DeepSeekV41Recipe {
             tokenizer,
             &Self::DEFINITION,
             options,
-            None,
+            stop_token_ids,
             Some(json!({"vision_config":vision_config,"image_token_id":image_token_id})),
         )?)
         .add_subclass(Self))

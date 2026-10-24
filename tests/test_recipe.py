@@ -301,7 +301,7 @@ def test_callback_tokenizer_keeps_ordinary_encoding_and_serving_stops_separate()
     ]
     rendered = model_recipe.render(messages)
     assert tokenizer.markers[marker] not in rendered.token_ids
-    assert rendered.stop_token_ids == [tokenizer.markers[marker]]
+    assert model_recipe.stop_token_ids == [tokenizer.markers[marker]]
     assert tokenizer.raw_encodes == []
 
 
@@ -313,7 +313,7 @@ def test_callback_tokenizer_rejects_unknown_or_boolean_control_ids(
     monkeypatch.setattr(tokenizer, "convert_tokens_to_ids", lambda _: invalid_id)
     model_recipe = InklingRecipe(tokenizer)
     with pytest.raises(ValueError, match="control token"):
-        model_recipe.get_stop_token_ids()
+        model_recipe.stop_token_ids
 
 
 def test_callback_decoder_is_captured_once_instead_of_refetched():
@@ -347,17 +347,17 @@ def test_deepseek_constructor_effort_matches_per_request_effort():
         backend, options=resin.recipe.RenderOptions(reasoning_effort="high")
     )
     per_request = DeepSeekV4Recipe(backend)
-    expected = per_request.render_text(
+    expected = per_request.debug_render_text(
         messages, options=resin.recipe.RenderOptions(reasoning_effort="high")
     )
-    assert configured.render_text(messages) == expected
+    assert configured.debug_render_text(messages) == expected
     assert (
-        configured.render_text(messages, options=resin.recipe.RenderOptions())
+        configured.debug_render_text(messages, options=resin.recipe.RenderOptions())
         == expected
     )
-    assert configured.render_text(
+    assert configured.debug_render_text(
         messages, options=resin.recipe.RenderOptions(reasoning_effort="low")
-    ) == per_request.render_text(
+    ) == per_request.debug_render_text(
         messages, options=resin.recipe.RenderOptions(reasoning_effort="low")
     )
 
@@ -375,3 +375,14 @@ def test_inkling_tool_float_preserves_original_value() -> None:
     events = parser.feed(ids)
     assert isinstance(events[-1], resin.recipe.ToolCallArgumentsDelta)
     assert json.loads(events[-1].delta) == {"": 0.9999899864196777}
+
+
+def test_callback_recipe_stop_ids_are_static_after_first_resolution():
+    tokenizer = _CallbackTokenizer()
+    tokenizer.markers = dict(tokenizer.markers)
+    marker = "<|content_model_end_sampling|>"
+    expected = tokenizer.markers[marker]
+    recipe = InklingRecipe(tokenizer)
+    assert recipe.stop_token_ids == [expected]
+    tokenizer.markers[marker] = expected + 1
+    assert recipe.stop_token_ids == [expected]

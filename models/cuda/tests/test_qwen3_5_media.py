@@ -113,7 +113,7 @@ def _data_url() -> str:
 
 
 def test_qwen_recipe_normalizes_images_and_attaches_processor_payload() -> None:
-    tokenizer = QwenAdapter().codec.tokenizer
+    tokenizer = QwenAdapter().recipe.tokenizer
     image_id = tokenizer.token_to_id("<|image_pad|>")
 
     model_recipe = Qwen35Recipe(
@@ -136,9 +136,9 @@ def test_qwen_recipe_normalizes_images_and_attaches_processor_payload() -> None:
             )
         ]
     )
-    assert output.stop_token_ids == model_recipe.get_stop_token_ids()
+    assert model_recipe.stop_token_ids
     assert isinstance(output.media, Qwen35Media)
-    assert output.token_ids.count(image_id) == 4
+    assert output.token_ids.tolist().count(image_id) == 4
     assert output.media.pixel_values.shape == (4, 12)
     assert output.media.pixel_values.dtype == np.float32
     assert output.media.image_grid_thw.tolist() == [[1, 2, 2]]
@@ -160,7 +160,7 @@ def test_native_qwen_rotary_positions_cover_prompt_and_decode_continuation():
 
 
 def test_qwen_recipe_rejects_video_instead_of_dropping_its_embeddings() -> None:
-    model_recipe = Qwen35Recipe(QwenAdapter().codec.tokenizer)
+    model_recipe = Qwen35Recipe(QwenAdapter().recipe.tokenizer)
     with pytest.raises(ValueError, match="does not support video"):
         model_recipe.render(
             [

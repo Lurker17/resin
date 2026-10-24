@@ -1,7 +1,7 @@
 # CUDA model package boundaries
 
 CUDA model families are deliberately small accelerator frontends. Backend-
-neutral configuration, prompt codecs, prepared media, and scheduler lowering
+neutral configuration, prompt recipes, prepared media, and scheduler lowering
 live in `resin.models.<family>` so CUDA and AMD implementations can share them.
 A CUDA family owns its runner, optimized model, physical cache geometry,
 checkpoint materialization, draft implementation, and concrete kernels. All

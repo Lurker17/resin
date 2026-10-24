@@ -67,11 +67,10 @@ def test_native_prompt_is_owned_bound_to_one_recipe_and_parsers_are_fresh():
         [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])]
     )
     original = prompt.token_ids
-    changed = prompt.token_ids
-    changed[0] = 99
-    prompt.stop_token_ids.clear()
-    assert prompt.token_ids == original
-    assert prompt.stop_token_ids
+    assert np.shares_memory(prompt.token_ids, original)
+    with pytest.raises(ValueError, match="read-only"):
+        original[0] = 99
+    assert first.stop_token_ids
     with pytest.raises(ValueError, match="this recipe"):
         second.create_parser(prompt)
     with pytest.raises(ValueError, match="this recipe"):
@@ -183,9 +182,9 @@ def test_public_order_and_per_message_controls_are_not_silently_dropped():
         )
     ]
     with pytest.raises(ValueError, match="block order"):
-        native.render_text(messages)
+        native.debug_render_text(messages)
     with pytest.raises(ValueError, match="per-message"):
-        native.render_text(
+        native.debug_render_text(
             [
                 resin.recipe.Message(
                     resin.recipe.Role.USER, [resin.recipe.Text("hi")], task="action"
@@ -193,7 +192,7 @@ def test_public_order_and_per_message_controls_are_not_silently_dropped():
             ]
         )
     with pytest.raises(ValueError, match="initial"):
-        native.render_text(
+        native.debug_render_text(
             [
                 resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")]),
                 resin.recipe.Message(
@@ -202,12 +201,12 @@ def test_public_order_and_per_message_controls_are_not_silently_dropped():
             ]
         )
     with pytest.raises(ValueError, match="does not support rendering option"):
-        native.render_text(
+        native.debug_render_text(
             [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])],
             options=resin.recipe.RenderOptions(add_vision_id=True),
         )
     with pytest.raises(ValueError, match="latest_reminder"):
-        native.render_text(
+        native.debug_render_text(
             [
                 resin.recipe.Message(
                     resin.recipe.Role.LATEST_REMINDER, [resin.recipe.Text("Remember")]
@@ -221,7 +220,7 @@ def test_raw_tool_arguments_survive_without_json_reserialization():
         tokenizer(), options=resin.recipe.RenderOptions(use_system_prompt=False)
     )
     raw = '{ "n": 1.00, "nested": [true, null] }'
-    text = native.render_text(
+    text = native.debug_render_text(
         [
             resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("run")]),
             resin.recipe.Message(
@@ -267,7 +266,7 @@ def test_native_http_lowering_matches_public_typed_messages():
         resin.recipe.Message(message.role, message.content) for message in messages
     ]
     expected = native.render(messages).token_ids
-    assert native.render(reconstructed).token_ids == expected
+    np.testing.assert_array_equal(native.render(reconstructed).token_ids, expected)
     seen = []
 
     class Runner:
@@ -301,4 +300,61 @@ def test_native_http_lowering_matches_public_typed_messages():
         ) as response:
             assert response.status == 200
         assert not errors
-    assert seen == expected
+    np.testing.assert_array_equal(seen, expected)
+
+
+def test_rendered_prompt_token_view_is_owned_readonly_and_outlives_prompt():
+    source = np.asarray([11, 22, 33], dtype=np.uint32)
+    prompt = resin.recipe.RenderedPrompt(source)
+    source[0] = 99
+    tokens = prompt.token_ids
+    assert tokens.dtype == np.uint32 and tokens.ndim == 1
+    assert tokens.flags.c_contiguous and not tokens.flags.writeable
+    assert tokens.base is prompt
+    assert np.shares_memory(tokens, prompt.token_ids)
+    np.testing.assert_array_equal(tokens, [11, 22, 33])
+    with pytest.raises(ValueError, match="read-only"):
+        tokens[0] = 7
+    with pytest.raises(ValueError, match="WRITEABLE"):
+        tokens.flags.writeable = True
+    del prompt
+    gc.collect()
+    np.testing.assert_array_equal(tokens, [11, 22, 33])
+    empty = resin.recipe.RenderedPrompt([]).token_ids
+    assert empty.dtype == np.uint32 and empty.shape == (0,)
+    assert not empty.flags.writeable
+
+
+@pytest.mark.parametrize(
+    ("constructor", "default_markers"),
+    [
+        (resin.recipe.GptOssRecipe, ["<|return|>", "<|call|>"]),
+        (resin.recipe.DeepSeekV4Recipe, ["<｜end▁of▁sentence｜>"]),
+        (resin.recipe.DeepSeekV41Recipe, ["<｜end▁of▁sentence｜>"]),
+        (resin.recipe.InklingRecipe, ["<|content_model_end_sampling|>"]),
+        (resin.recipe.Qwen35Recipe, ["<|im_end|>", "<|endoftext|>"]),
+        (resin.recipe.Qwen38Recipe, ["<|im_end|>", "<|endoftext|>"]),
+        (resin.recipe.Gemma4Recipe, ["<turn|>", "<eos>"]),
+        (resin.recipe.Lfm2Recipe, ["<|im_end|>"]),
+    ],
+)
+def test_native_recipe_stop_defaults_and_overrides_share_one_contract(
+    constructor, default_markers
+):
+    backend = tokenizer()
+    backend.add_special_tokens(default_markers)
+    expected = [backend.token_to_id(marker) for marker in default_markers]
+    default = constructor(backend)
+    assert isinstance(default.stop_token_ids, list)
+    assert default.stop_token_ids == expected
+    assert constructor(backend, stop_token_ids=None).stop_token_ids == expected
+    assert constructor(backend, stop_token_ids=[]).stop_token_ids == []
+
+    source = [901, 902]
+    recipe = constructor(backend, stop_token_ids=source)
+    source[0] = 999
+    stops = recipe.stop_token_ids
+    assert stops == [901, 902]
+    stops[0] = 0
+    stops.append(903)
+    assert recipe.stop_token_ids == [901, 902]

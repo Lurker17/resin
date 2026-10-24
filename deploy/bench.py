@@ -192,7 +192,7 @@ def _checkpoint_validation(raw, engine, checkpoint, metadata, groups):
             recipe = DeepSeekV41Recipe(
                 Tokenizer.from_file(str(Path(checkpoint) / "tokenizer.json"))
             )
-            prompt = recipe.render_ids(
+            prompt = recipe.render(
                 [
                     resin.recipe.Message(
                         resin.recipe.Role.USER,
@@ -203,13 +203,14 @@ def _checkpoint_validation(raw, engine, checkpoint, metadata, groups):
                         ],
                     )
                 ]
-            )
+            ).token_ids
         local = {
             "rank": rank,
             **validate_model(
                 raw,
                 engine,
                 prompt_tokens=prompt,
+                stop_token_ids=recipe.stop_token_ids,
                 synchronize=torch.cuda.synchronize,
                 coordinate=coordinate,
             ),

@@ -212,13 +212,13 @@ def _build_runtime(
 
 
 def _prompt_ids(recipe: Any, prompt: str) -> list[int]:
-    token_ids = recipe.render_ids(
+    token_ids = recipe.render(
         [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])],
         options=resin.recipe.RenderOptions(add_generation_prompt=True),
-    )
-    if not token_ids:
+    ).token_ids
+    if not len(token_ids):
         raise ValueError("Inkling chat template produced no tokens")
-    return [int(token_id) for token_id in token_ids]
+    return token_ids.tolist()
 
 
 @app.function(
@@ -250,7 +250,7 @@ def smoke_test(
             prompt_ids,
             sampling_params=SamplingParams(
                 max_output_tokens=max_output_tokens,
-                stop_token_ids=recipe.get_stop_token_ids(),
+                stop_token_ids=recipe.stop_token_ids,
                 temperature=1.0,
                 top_p=0.95,
                 seed=7,
@@ -290,7 +290,7 @@ def _serve(_: int) -> None:
             _prompt_ids(recipe, "Reply with one word."),
             sampling_params=SamplingParams(
                 max_output_tokens=2,
-                stop_token_ids=recipe.get_stop_token_ids(),
+                stop_token_ids=recipe.stop_token_ids,
                 temperature=0.0,
             ),
         )

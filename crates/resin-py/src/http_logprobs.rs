@@ -1,33 +1,35 @@
 //! Token representations prepared once, independently of semantic parsing.
-use pyo3::{exceptions::PyAttributeError, prelude::*};
+use std::sync::Arc;
+
+use crate::recipe::{RecipeTokenizer, optional_attr};
+use pyo3::{exceptions::PyTypeError, prelude::*};
 use resin_http::{GeneratedTokenLogprob, TokenLogprob};
 use resin_recipe::{TokenBytes, Tokenizer};
 
 pub(crate) struct Vocabulary {
-    tokenizer: Option<Tokenizer>,
+    tokenizer: Option<Arc<Tokenizer>>,
     bytes: Option<TokenBytes>,
 }
 
 impl Vocabulary {
     pub fn from_recipe(py: Python<'_>, recipe: &Py<PyAny>) -> PyResult<Self> {
-        let tokenizer = match recipe.bind(py).getattr("tokenizer") {
-            Ok(tokenizer) => {
-                let backend = tokenizer.getattr("backend_tokenizer").unwrap_or(tokenizer);
-                match backend.getattr("to_str") {
-                    Ok(serialize) => {
-                        let json: String = serialize.call0()?.extract()?;
-                        Some(Tokenizer::from_bytes(json.as_bytes()).map_err(|error| {
-                            pyo3::exceptions::PyValueError::new_err(error.to_string())
-                        })?)
-                    }
-                    Err(error) if error.is_instance_of::<PyAttributeError>(py) => None,
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(error) if error.is_instance_of::<PyAttributeError>(py) => None,
-            Err(error) => return Err(error),
-        };
-        let bytes = tokenizer.as_ref().map(TokenBytes::new);
+        let tokenizer = optional_attr(recipe.bind(py), "tokenizer")?
+            .filter(|tokenizer| !tokenizer.is_none())
+            .map(|tokenizer| {
+                tokenizer
+                    .cast::<RecipeTokenizer>()
+                    .map(|tokenizer| tokenizer.borrow().native())
+                    .map_err(|_| {
+                        PyTypeError::new_err(
+                            "recipe.tokenizer must be resin.recipe.Tokenizer or None",
+                        )
+                    })
+            })
+            .transpose()?
+            .flatten();
+        let bytes = tokenizer
+            .as_ref()
+            .map(|tokenizer| TokenBytes::new(tokenizer));
         Ok(Self { tokenizer, bytes })
     }
 

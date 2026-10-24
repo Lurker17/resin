@@ -77,7 +77,7 @@ fn tools_section(tools: &[Value]) -> String {
 /// Render the stock GPT-OSS Harmony scaffold without a Python renderer.
 ///
 /// Ordinary text and explicit control markers remain distinct until encoding.
-/// Options are accepted at the request root or in `extra`; a codec supplies its
+/// Options are accepted at the request root or in `extra`; a recipe supplies its
 /// construction-time date through `conversation_start_date`.
 pub fn render(request: &Value) -> Result<Prompt, Error> {
     let messages = messages(request, "GPT-OSS")?;

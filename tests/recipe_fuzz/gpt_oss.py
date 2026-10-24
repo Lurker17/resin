@@ -46,7 +46,7 @@ class GptOssAdapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.codec = GptOssRecipe(backend)
+        self.recipe = GptOssRecipe(backend)
         self.reference = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
         self.tml = renderers.GptOss()
         _, self.tml_parser = self.tml.render_for_completion(
@@ -161,8 +161,8 @@ class GptOssAdapter:
         return normalize(parts)
 
     def parser(self):
-        return self.codec.create_parser(
-            self.codec.render(
+        return self.recipe.create_parser(
+            self.recipe.render(
                 [
                     resin.recipe.Message(
                         resin.recipe.Role.USER, [resin.recipe.Text("hi")]

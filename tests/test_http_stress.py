@@ -190,7 +190,7 @@ def test_routes_cover_every_rank_in_both_forms():
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_client_against_real_resin_http_listener(stream):
-    from test_http_lifecycle import Codec, Runner, running_server
+    from test_http_lifecycle import Recipe, Runner, running_server
 
     async def run(base):
         async with httpx.AsyncClient(base_url=base + "/v1/") as client:
@@ -209,7 +209,7 @@ def test_client_against_real_resin_http_listener(stream):
                 5,
             )
 
-    with running_server(Runner(), Codec()) as (_, _, _, errors, base, _):
+    with running_server(Runner(), Recipe()) as (_, _, _, errors, base, _):
         result = asyncio.run(run(base))
         assert result["ok"], result
         assert result["completion_tokens"] == 2

@@ -1,4 +1,4 @@
-"""Image codec equivalence, cache identity and scheduler-neutral ownership."""
+"""Image recipe equivalence, cache identity and scheduler-neutral ownership."""
 
 import base64
 import io
@@ -42,16 +42,16 @@ def _data_url(rgb):
 
 
 @pytest.fixture(scope="module")
-def codec():
-    tokenizer = Tokenizer.from_str(DeepSeekV41Adapter().codec.tokenizer.to_str())
+def recipe():
+    tokenizer = Tokenizer.from_str(DeepSeekV41Adapter().recipe.tokenizer.to_str())
     tokenizer.add_special_tokens([IMAGE_TOKEN])
     return DeepSeekV41Recipe(tokenizer)
 
 
 @pytest.mark.parametrize("case", FIXTURE["cases"])
-def test_native_pixels_preserve_published_geometry(case, codec):
+def test_native_pixels_preserve_published_geometry(case, recipe):
     recipe = DeepSeekV41Recipe(
-        codec.tokenizer, vision_config={"max_wh_ratio": case["max_wh_ratio"]}
+        recipe.tokenizer, vision_config={"max_wh_ratio": case["max_wh_ratio"]}
     )
     rgb = _pattern(case["width"], case["height"])
     media = recipe.render(
@@ -85,10 +85,10 @@ def test_native_pixels_preserve_published_geometry(case, codec):
     np.testing.assert_array_equal(image.patches, expected)
 
 
-def test_native_patch_order_and_normalization_are_exact_without_resizing(codec):
+def test_native_patch_order_and_normalization_are_exact_without_resizing(recipe):
     rgb = _pattern(28, 14)
     source = rgb.astype(np.float32) / 255
-    recipe = DeepSeekV41Recipe(codec.tokenizer, vision_config={"min_pixels": 0})
+    recipe = DeepSeekV41Recipe(recipe.tokenizer, vision_config={"min_pixels": 0})
     media = recipe.render(
         [
             resin.recipe.Message(
@@ -107,7 +107,7 @@ def test_native_patch_order_and_normalization_are_exact_without_resizing(codec):
     np.testing.assert_array_equal(image.patches, before)
 
 
-def test_media_codec_expands_only_explicit_images_and_owns_inputs(codec):
+def test_media_recipe_expands_only_explicit_images_and_owns_inputs(recipe):
     rgb = _pattern(17, 31)
     second = np.zeros((2, 4, 3), dtype=np.float32)
     messages = [
@@ -121,7 +121,7 @@ def test_media_codec_expands_only_explicit_images_and_owns_inputs(codec):
             ],
         )
     ]
-    rendered = codec.render(
+    rendered = recipe.render(
         messages,
         options=resin.recipe.RenderOptions(
             thinking_mode="thinking", reasoning_effort=37
@@ -132,31 +132,30 @@ def test_media_codec_expands_only_explicit_images_and_owns_inputs(codec):
     assert isinstance(media, DeepSeekV41Media)
     assert len(media.images) == 2
     assert media.token_ids == tuple(rendered.token_ids)
-    assert rendered.stop_token_ids == codec.get_stop_token_ids()
+    assert recipe.stop_token_ids
     assert media.token_spans == ()
     positions = {
         position
         for image in media.images
         for position in range(image.start, image.start + len(image.types))
     }
-    assert rendered.token_ids.count(media.image_token_id) == len(positions)
+    assert rendered.token_ids.tolist().count(media.image_token_id) == len(positions)
     assert all(
         (token != key) == (index in positions)
         for index, (token, key) in enumerate(
             zip(media.token_ids, media.cache_key, strict=True)
         )
     )
-    assert IMAGE_TOKEN in codec.tokenizer.decode(
+    assert IMAGE_TOKEN in recipe.tokenizer.decode(
         rendered.token_ids[: media.images[0].start], skip_special_tokens=False
     )
-    assert codec.render_ids(messages) == codec.render(messages).token_ids
     second.fill(1)
     assert np.all(media.images[1].patches < 0)
 
 
-def test_image_identity_changes_only_its_media_cache_identity(codec):
+def test_image_identity_changes_only_its_media_cache_identity(recipe):
     def render(color):
-        return codec.render(
+        return recipe.render(
             [
                 resin.recipe.Message(
                     resin.recipe.Role.USER,
@@ -199,7 +198,7 @@ def test_prepared_media_rejects_bad_layout_and_owns_patch_storage():
         DeepSeekV41Media(token_ids=media.token_ids, images=(image, image))
 
 
-def test_engine_slices_causal_image_spans_across_prefill_chunks(codec):
+def test_engine_slices_causal_image_spans_across_prefill_chunks(recipe):
     class Runner:
         runner_config = RunnerConfig(continuation_prefill=True)
         contexts = []
@@ -209,7 +208,7 @@ def test_engine_slices_causal_image_spans_across_prefill_chunks(codec):
             cls.contexts.append(plan)
             return forward_output([7])
 
-    rendered = codec.render(
+    rendered = recipe.render(
         [
             resin.recipe.Message(
                 resin.recipe.Role.USER,

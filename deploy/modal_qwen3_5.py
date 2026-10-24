@@ -199,8 +199,7 @@ def _build_runtime(
     processor = AutoProcessor.from_pretrained(
         MODEL_PATH, local_files_only=True, trust_remote_code=False
     )
-    tokenizer = processor.tokenizer
-    recipe = Qwen38Recipe(tokenizer)
+    recipe = Qwen38Recipe(processor)
     graph_started = time.perf_counter()
     graph_stats = capture_cuda_graphs(runner)
     graph_capture_s = time.perf_counter() - graph_started
@@ -255,13 +254,13 @@ def _build_runtime(
 
 
 def _prompt_ids(recipe: Any, prompt: str) -> list[int]:
-    token_ids = recipe.render_ids(
+    token_ids = recipe.render(
         [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])],
         options=resin.recipe.RenderOptions(add_generation_prompt=True),
-    )
-    if not token_ids:
+    ).token_ids
+    if not len(token_ids):
         raise ValueError("Qwen3.8 chat template produced no tokens")
-    return [int(token_id) for token_id in token_ids]
+    return token_ids.tolist()
 
 
 def _synthetic_image(size: int = 64):
@@ -325,7 +324,7 @@ def smoke_test(
             prompt_ids,
             sampling_params=SamplingParams(
                 max_output_tokens=max_output_tokens,
-                stop_token_ids=recipe.get_stop_token_ids(),
+                stop_token_ids=recipe.stop_token_ids,
                 temperature=0.0,
             ),
         )
@@ -338,8 +337,7 @@ def smoke_test(
         timed_tokens = max(0, len(event_times) - 1)
         steady_s = event_times[-1] - event_times[0] if timed_tokens else 0.0
 
-        codec = Qwen38Recipe(processor)
-        image_prompt = codec.render(
+        image_prompt = recipe.render(
             [
                 resin.recipe.Message(
                     resin.recipe.Role.USER,
@@ -354,7 +352,7 @@ def smoke_test(
             media=image_prompt.media,
             sampling_params=SamplingParams(
                 max_output_tokens=16,
-                stop_token_ids=image_prompt.stop_token_ids,
+                stop_token_ids=recipe.stop_token_ids,
                 temperature=0.0,
             ),
         )
@@ -419,9 +417,8 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
         context_length=context_length,
         speculative_tokens=speculative_tokens,
     )
-    codec = Qwen38Recipe(processor)
     try:
-        text_prompt = codec.render(
+        text_prompt = recipe.render(
             [
                 resin.recipe.Message(
                     resin.recipe.Role.USER,
@@ -433,14 +430,14 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
             text_prompt.token_ids,
             sampling_params=SamplingParams(
                 max_output_tokens=4,
-                stop_token_ids=text_prompt.stop_token_ids,
+                stop_token_ids=recipe.stop_token_ids,
                 temperature=0.0,
             ),
         )
         _drain(engine)
         text_request.take_result()
 
-        image_prompt = codec.render(
+        image_prompt = recipe.render(
             [
                 resin.recipe.Message(
                     resin.recipe.Role.USER,
@@ -455,7 +452,7 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
             media=image_prompt.media,
             sampling_params=SamplingParams(
                 max_output_tokens=2,
-                stop_token_ids=image_prompt.stop_token_ids,
+                stop_token_ids=recipe.stop_token_ids,
                 temperature=0.0,
             ),
         )
@@ -479,7 +476,7 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
         print(f"[startup] {json.dumps(report, sort_keys=True)}", flush=True)
         HttpServer(
             engine,
-            recipe=codec,
+            recipe=recipe,
             model=MODEL_ID,
         ).serve(host="0.0.0.0", port=8000)
     finally:

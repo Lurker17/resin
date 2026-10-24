@@ -21,9 +21,12 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
                 [1] if plan.phase == BatchPhase.PREFILL else [[2] * 40]
             )
 
-    class Codec:
+    class Recipe:
+        tokenizer = None
+        stop_token_ids = []
+
         def render(self, messages, *, tools=(), options=None):
-            return resin.recipe.RenderedPrompt([0], stop_token_ids=[])
+            return resin.recipe.RenderedPrompt([0])
 
         def create_parser(self, prompt):
             class Parser:
@@ -60,7 +63,7 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
         )
 
     engine = Engine(Runner())
-    session = _HttpSession(engine, Codec(), stream_interval=stream_interval)
+    session = _HttpSession(engine, Recipe(), stream_interval=stream_interval)
     session.admit(admission("overflow", 100))
     first = decoded_events(session.process(engine.step()))
     assert [event["type"] for _, event in first] == [
@@ -101,6 +104,9 @@ def test_http_admission_passes_typed_messages_tools_and_render_controls():
     expected_prompt = resin.recipe.RenderedPrompt([1, 2])
 
     class Recipe:
+        tokenizer = None
+        stop_token_ids = []
+
         def render(
             self,
             messages: Sequence[resin.recipe.Message],
@@ -199,3 +205,74 @@ def test_http_admission_passes_typed_messages_tools_and_render_controls():
     assert len(seen) == 1
     session.close()
     engine.close()
+
+
+def test_http_session_snapshots_recipe_stops_before_rendering():
+    class Recipe:
+        tokenizer = None
+
+        def __init__(self):
+            self.stops = [3]
+            self.stop_reads = 0
+
+        @property
+        def stop_token_ids(self):
+            self.stop_reads += 1
+            return self.stops
+
+        def render(self, messages, *, tools=(), options=None):
+            return resin.recipe.RenderedPrompt([1])
+
+        def create_parser(self, prompt):
+            class Parser:
+                def feed(self, ids):
+                    return [resin.recipe.TextDelta("".join(map(str, ids)))]
+
+            return Parser()
+
+    class Runner:
+        def forward(self, plan):
+            return forward_output([3] * plan.num_sequences)
+
+    recipe = Recipe()
+    engine = Engine(Runner())
+    session = _HttpSession(engine, recipe)
+    assert recipe.stop_reads == 1
+    recipe.stops[:] = [4]
+    recipe.stops = [5]
+    try:
+        for request_id in ("first", "second"):
+            session.admit(
+                ingress(
+                    [
+                        {
+                            "id": request_id,
+                            "model": "test",
+                            "messages": [],
+                            "tools": [],
+                            "max_output_tokens": 3,
+                            "temperature": 0,
+                            "top_p": 1,
+                            "top_k": None,
+                            "seed": None,
+                            "logprobs": False,
+                            "top_logprobs": 0,
+                            "prompt_logprobs": False,
+                            "routed_dp_rank": None,
+                            "stop": [],
+                            "reasoning_effort": None,
+                            "extra": {},
+                        }
+                    ]
+                )
+            )
+            output = decoded_events(session.process(engine.step()))
+            finished = [event for _, event in output if event["type"] == "finished"]
+            assert len(finished) == 1
+            assert finished[0]["data"]["reason"] == "stop"
+            assert finished[0]["data"]["output_tokens"] == 1
+            assert session.active_count == 0 and not engine.has_work()
+        assert recipe.stop_reads == 1
+    finally:
+        session.close()
+        engine.close()

@@ -79,7 +79,7 @@ class DeepSeekAdapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.codec = (
+        self.recipe = (
             DeepSeekV41Recipe if self.model == "deepseek_v41" else DeepSeekV4Recipe
         )(backend)
         self.reference = DeepSeekTokenizer.from_str(backend.to_str())
@@ -159,8 +159,8 @@ class DeepSeekAdapter:
         return result
 
     def parser(self):
-        return self.codec.create_parser(
-            self.codec.render(
+        return self.recipe.create_parser(
+            self.recipe.render(
                 [
                     resin.recipe.Message(
                         resin.recipe.Role.USER, [resin.recipe.Text("hi")]
@@ -171,8 +171,8 @@ class DeepSeekAdapter:
         )
 
     def text_parser(self):
-        return self.codec.create_parser(
-            self.codec.render(
+        return self.recipe.create_parser(
+            self.recipe.render(
                 [
                     resin.recipe.Message(
                         resin.recipe.Role.USER, [resin.recipe.Text("hi")]

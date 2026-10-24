@@ -265,12 +265,12 @@ def _encode_prompt(recipe: GptOssRecipe, prompt: str) -> list[int]:
     messages: list[resin.recipe.Message] = [
         resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])
     ]
-    token_ids = recipe.render_ids(
+    token_ids = recipe.render(
         messages, options=resin.recipe.RenderOptions(add_generation_prompt=True)
-    )
-    if not token_ids:
+    ).token_ids
+    if not len(token_ids):
         raise ValueError("prompt produced no tokens")
-    return [int(token_id) for token_id in token_ids]
+    return token_ids.tolist()
 
 
 def _generation_prefix_ids(recipe: GptOssRecipe, prompt: str) -> list[int]:
@@ -287,18 +287,12 @@ def _generation_prefix_ids(recipe: GptOssRecipe, prompt: str) -> list[int]:
     messages: list[resin.recipe.Message] = [
         resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])
     ]
-    conversation_ids = [
-        int(token_id)
-        for token_id in recipe.render_ids(
-            messages, options=resin.recipe.RenderOptions(add_generation_prompt=False)
-        )
-    ]
-    prompt_ids = [
-        int(token_id)
-        for token_id in recipe.render_ids(
-            messages, options=resin.recipe.RenderOptions(add_generation_prompt=True)
-        )
-    ]
+    conversation_ids = recipe.render(
+        messages, options=resin.recipe.RenderOptions(add_generation_prompt=False)
+    ).token_ids.tolist()
+    prompt_ids = recipe.render(
+        messages, options=resin.recipe.RenderOptions(add_generation_prompt=True)
+    ).token_ids.tolist()
     if prompt_ids[: len(conversation_ids)] != conversation_ids:
         raise RuntimeError("recipe generation prompt is not a conversation suffix")
     return prompt_ids[len(conversation_ids) :]
@@ -1235,7 +1229,7 @@ def _serve_http_rank(
             _encode_prompt(recipe, "Reply with one word."),
             sampling_params=SamplingParams(
                 max_output_tokens=2,
-                stop_token_ids=recipe.get_stop_token_ids(),
+                stop_token_ids=recipe.stop_token_ids,
                 temperature=0.0,
             ),
         )
@@ -1244,9 +1238,8 @@ def _serve_http_rank(
         warmup.take_result()
         torch.cuda.synchronize(runner.device)
         print("[http-startup] warmup complete; starting HTTP server", flush=True)
-        codec = recipe
         server = HttpServer(
-            engine, recipe=codec, model=MODEL_SPECS[model_key]["repo_id"]
+            engine, recipe=recipe, model=MODEL_SPECS[model_key]["repo_id"]
         )
         server.serve(host="0.0.0.0", port=8000)
     finally:
@@ -1343,7 +1336,7 @@ def _run_model(
         rendered = recipe.render(
             [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])]
         )
-        prompt_ids = rendered.token_ids
+        prompt_ids = rendered.token_ids.tolist()
         generation_prefix_ids = _generation_prefix_ids(recipe, prompt)
         report = _launch_tensor_parallel_prompt(
             2,
@@ -1351,7 +1344,7 @@ def _run_model(
             model_path,
             model_cache,
             prompt_ids,
-            rendered.stop_token_ids,
+            recipe.stop_token_ids,
             max_output_tokens,
             context_length,
             schedule_conservativeness,

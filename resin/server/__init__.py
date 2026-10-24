@@ -69,9 +69,8 @@ class HttpServer:
                     "request_queue_capacity must be a positive integer fitting u32"
                 )
             if model is None:
-                model = getattr(
-                    getattr(recipe, "tokenizer", None), "name_or_path", None
-                )
+                tokenizer = recipe.tokenizer
+                model = None if tokenizer is None else tokenizer.name_or_path
             if not isinstance(model, str) or not model.strip():
                 raise ValueError(
                     "model is required when it cannot be inferred from the recipe"

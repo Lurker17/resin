@@ -35,7 +35,7 @@ class Lfm2Adapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.codec = Lfm2Recipe(backend)
+        self.recipe = Lfm2Recipe(backend)
         self.oracles = (("python-literal-ast", self.oracle),)
 
     @staticmethod
@@ -76,8 +76,8 @@ class Lfm2Adapter:
         return ids
 
     def parser(self):
-        return self.codec.create_parser(
-            self.codec.render(
+        return self.recipe.create_parser(
+            self.recipe.render(
                 [
                     resin.recipe.Message(
                         resin.recipe.Role.USER, [resin.recipe.Text("hi")]

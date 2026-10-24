@@ -140,7 +140,7 @@ with Engine(runner, context_length=32768) as engine:
 ```
 
 `SamplingParams` is the frozen request policy for generation limits, stop token
-IDs, sampling, and logprob options. Use a rendered recipe prompt's `stop_token_ids`
+IDs, sampling, and logprob options. Use the recipe's `stop_token_ids`
 for chat requests, or supply the model's stop tokens explicitly for raw token
 requests. `Engine` has no default EOS token.
 
@@ -261,12 +261,23 @@ HttpServer(engine, recipe=recipe, model="my-model", stream_interval=4).serve()
 ```
 
 `Recipe.render(messages, *, tools=(), options=None)` returns a `RenderedPrompt`
-owning token IDs, stop IDs, optional prepared media, and an internal parser seed.
+owning token IDs, optional prepared media, and an internal parser seed.
+`prompt.token_ids` is a read-only NumPy `uint32` array, and
+`recipe.stop_token_ids` returns a list of integers. Pass the recipe's stops to
+`SamplingParams(stop_token_ids=...)` when
+submitting a rendered prompt to an Engine; HTTP serving uses them automatically.
+Native recipes infer model stops by default. Their `stop_token_ids` constructor
+argument accepts a replacement sequence, with `None` selecting the defaults and
+`[]` disabling token stopping.
 `create_parser(prompt)` creates a fresh incremental parser with the same resolved
 formatting options. It emits text, reasoning, and tool-call deltas; an optional
 `finish("stop" | "length")` flushes buffered output before completion.
 Applications can pass their own structural `Recipe` implementation without
-inheriting a Resin class or using the native tokenizer/parser.
+inheriting a Resin class or using the native parser. The protocol also exposes
+`stop_token_ids` and `tokenizer`, a normalized Resin `Tokenizer` snapshot or
+`None` when token vocabulary metadata is unavailable. Native recipes provide
+`debug_render_text(...)` for inspecting formatting without preparing media;
+use `render(...)` for generation.
 
 For images, put `resin.recipe.Image.from_rgb(array)` or
 `resin.recipe.Image.from_bytes(data, media_type="image/png")` in a message and pass

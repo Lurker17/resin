@@ -281,6 +281,7 @@ def validate_model(
     engine,
     *,
     prompt_tokens,
+    stop_token_ids=None,
     synchronize=torch.cuda.synchronize,
     coordinate=None,
 ):
@@ -291,7 +292,8 @@ def validate_model(
     execution when a driver disables graphs. Kernels and catalogs stay intact.
     Both runs use the Engine's actual chunk size, fresh scored prefixes, greedy
     target sampling, normal expert routes, and natural speculative acceptance.
-    EOS is honored; the prompt must elicit at least three decode steps.
+    Recipe stops are honored when supplied; raw prompts use the runner's EOS.
+    The prompt must elicit at least three decode steps.
     """
     with _validation_stage("setup", coordinate):
         import math
@@ -301,7 +303,10 @@ def validate_model(
 
         from resin import BatchPhase, SamplingParams
 
-        prompt = list(prompt_tokens)
+        prompt = [int(token) for token in prompt_tokens]
+        stops = (
+            [runner.eos_token_id] if stop_token_ids is None else list(stop_token_ids)
+        )
         local = getattr(engine, "local", engine)
         if len(prompt) < 2 or local.has_work():
             raise ValueError(
@@ -353,7 +358,7 @@ def validate_model(
                 prompt,
                 sampling_params=SamplingParams(
                     max_output_tokens=generated,
-                    stop_token_ids=[runner.eos_token_id],
+                    stop_token_ids=stops,
                     temperature=0,
                     seed=41,
                     logprobs=True,
@@ -398,7 +403,7 @@ def validate_model(
                             )
                         tops.append(rows)
             with _validation_stage(stage + " result", coordinate):
-                ended_at_eos = bool(tokens) and tokens[-1] == runner.eos_token_id
+                ended_at_eos = bool(tokens) and tokens[-1] in stops
                 if request.take_result() != tokens or (
                     len(tokens) != generated and not ended_at_eos
                 ):

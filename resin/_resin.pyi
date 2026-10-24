@@ -463,6 +463,7 @@ class DeepSeekV41Recipe(_NativeRecipe):
         tokenizer: Any,
         *,
         options: RenderOptions | None = None,
+        stop_token_ids: Sequence[int] | None = None,
         vision_config: Any | None = None,
         image_token_id: int | None = None,
     ) -> DeepSeekV41Recipe: ...
@@ -475,6 +476,7 @@ class DeepSeekV4Recipe(_NativeRecipe):
         tokenizer: Any,
         *,
         options: RenderOptions | None = None,
+        stop_token_ids: Sequence[int] | None = None,
         media_config: Any | None = None,
     ) -> DeepSeekV4Recipe: ...
 
@@ -576,7 +578,7 @@ class Engine:
     def submit(
         self,
         /,
-        token_ids: Sequence[int] | None = None,
+        token_ids: Sequence[int] | npt.NDArray[np.uint32] | None = None,
         *,
         priority: int = 0,
         batch_key: int | None = None,
@@ -711,7 +713,7 @@ class Gemma4Recipe(_NativeRecipe):
         tokenizer: Any,
         *,
         options: RenderOptions | None = None,
-        eos_token_ids: Sequence[int] = ...,
+        stop_token_ids: Sequence[int] | None = None,
         media_config: Any | None = None,
     ) -> Gemma4Recipe: ...
 
@@ -723,6 +725,7 @@ class GptOssRecipe(_NativeRecipe):
         tokenizer: Any,
         *,
         options: RenderOptions | None = None,
+        stop_token_ids: Sequence[int] | None = None,
         media_config: Any | None = None,
     ) -> GptOssRecipe: ...
 
@@ -769,6 +772,7 @@ class InklingRecipe(_NativeRecipe):
         tokenizer: Any,
         *,
         options: RenderOptions | None = None,
+        stop_token_ids: Sequence[int] | None = None,
         media_config: Any | None = None,
     ) -> InklingRecipe: ...
 
@@ -783,9 +787,11 @@ class InklingResponseParser:
         tokenizer: RecipeTokenizer,
         token_ids: Mapping[str, int],
         *,
-        prompt_ids: Sequence[int] = ...,
+        prompt_ids: Sequence[int] | npt.NDArray[np.uint32] = ...,
     ) -> InklingResponseParser: ...
-    def feed(self, /, token_ids: Sequence[int]) -> list[ParserEvent]: ...
+    def feed(
+        self, /, token_ids: Sequence[int] | npt.NDArray[np.uint32]
+    ) -> list[ParserEvent]: ...
     def finish(self, /, reason: Literal["stop", "length"]) -> list[ParserEvent]: ...
 
 @final
@@ -796,6 +802,7 @@ class Lfm2Recipe(_NativeRecipe):
         tokenizer: Any,
         *,
         options: RenderOptions | None = None,
+        stop_token_ids: Sequence[int] | None = None,
         media_config: Any | None = None,
     ) -> Lfm2Recipe: ...
 
@@ -927,6 +934,7 @@ class Qwen35Recipe(_NativeRecipe):
         tokenizer: Any,
         *,
         options: RenderOptions | None = None,
+        stop_token_ids: Sequence[int] | None = None,
         media_config: Any | None = None,
     ) -> Qwen35Recipe: ...
 
@@ -938,6 +946,7 @@ class Qwen38Recipe(_NativeRecipe):
         tokenizer: Any,
         *,
         options: RenderOptions | None = None,
+        stop_token_ids: Sequence[int] | None = None,
         media_config: Any | None = None,
     ) -> Qwen38Recipe: ...
 
@@ -954,24 +963,34 @@ class ReasoningDelta(ParserEvent):
     def delta(self, /) -> str: ...
 
 @final
-class RecipeResponseParser:
-    """
-    Common native handle recognized directly by the HTTP actor.
-    """
-    def feed(self, /, token_ids: Sequence[int]) -> list[ParserEvent]: ...
-    def finish(self, /, reason: Literal["stop", "length"]) -> list[ParserEvent]: ...
-
-@final
 class RecipeTokenizer:
     """
-    A tokenizer prepared once for a model's response parsers.
+    A tokenizer shared by rendering, response parsing, and token metadata.
 
     Fast Hugging Face tokenizers are snapshotted into Rust. Custom Python
     tokenizers remain supported through their decode method.
     """
     def __new__(cls, /, tokenizer: Any) -> RecipeTokenizer: ...
+    def decode(
+        self,
+        /,
+        token_ids: Sequence[int] | npt.NDArray[np.uint32],
+        *,
+        skip_special_tokens: bool = False,
+    ) -> str: ...
+    def encode(
+        self, /, text: str, *, add_special_tokens: bool = False
+    ) -> list[int]: ...
+    def id_to_token(self, /, token_id: int) -> str | None: ...
     @property
     def is_native(self, /) -> bool: ...
+    @property
+    def name_or_path(self, /) -> str | None: ...
+    def to_str(self, /) -> str:
+        """
+        Serialize the prepared native snapshot, for external tokenizer tools.
+        """
+    def token_to_id(self, /, token: str) -> int | None: ...
 
 @final
 class RenderOptions:
@@ -1029,17 +1048,14 @@ class RenderedPrompt:
     def __new__(
         cls,
         /,
-        token_ids: Sequence[int],
+        token_ids: Sequence[int] | npt.NDArray[np.uint32],
         *,
-        stop_token_ids: Sequence[int] = ...,
         media: MediaInput | None = None,
     ) -> RenderedPrompt: ...
     @property
     def media(self, /) -> MediaInput | None: ...
     @property
-    def stop_token_ids(self, /) -> list[int]: ...
-    @property
-    def token_ids(self, /) -> list[int]: ...
+    def token_ids(self, /) -> npt.NDArray[np.uint32]: ...
 
 @final
 class RequestLease:
@@ -1184,7 +1200,7 @@ class SamplingParams:
     A zero temperature selects the maximum-logit token. Positive temperatures
     enable stochastic sampling after optional top-k and top-p filtering.
     An omitted `max_output_tokens` uses the remaining context budget. Stop tokens
-    are explicit: pass a rendered prompt's `stop_token_ids` for recipe stopping.
+    are explicit: pass a recipe's `stop_token_ids` for recipe stopping.
     """
     def __new__(
         cls,
@@ -1486,14 +1502,28 @@ class _HttpSession:
     def close(self, /) -> None: ...
     def process(self, /, events: Sequence[TokenEvent]) -> _HttpEvents: ...
 
-class _NativeRecipe:
+class _NativeRecipe(Recipe):
     """
     Shared native implementation inherited by the concrete model recipes.
     """
-    def create_parser(self, /, prompt: RenderedPrompt) -> RecipeResponseParser: ...
-    def get_stop_token_ids(self, /) -> list[int]: ...
+    def create_parser(self, /, prompt: RenderedPrompt) -> _NativeResponseParser: ...
+    def debug_render_text(
+        self,
+        /,
+        messages: Sequence[Message],
+        *,
+        tools: Sequence[Tool] = ...,
+        options: RenderOptions | None = None,
+    ) -> str:
+        """
+        Inspect the template before tokenization and media expansion.
+        """
     def parse_response(
-        self, /, token_ids: Sequence[int], *, prompt: RenderedPrompt
+        self,
+        /,
+        token_ids: Sequence[int] | npt.NDArray[np.uint32],
+        *,
+        prompt: RenderedPrompt,
     ) -> Any: ...
     def render(
         self,
@@ -1503,24 +1533,23 @@ class _NativeRecipe:
         tools: Sequence[Tool] = ...,
         options: RenderOptions | None = None,
     ) -> RenderedPrompt: ...
-    def render_ids(
-        self,
-        /,
-        messages: Sequence[Message],
-        *,
-        tools: Sequence[Tool] = ...,
-        options: RenderOptions | None = None,
-    ) -> list[int]: ...
-    def render_text(
-        self,
-        /,
-        messages: Sequence[Message],
-        *,
-        tools: Sequence[Tool] = ...,
-        options: RenderOptions | None = None,
-    ) -> str: ...
     @property
-    def tokenizer(self, /) -> Any: ...
+    def stop_token_ids(self, /) -> list[int]:
+        """
+        Static model stop tokens, returned as an owned list.
+        """
+    @property
+    def tokenizer(self, /) -> RecipeTokenizer: ...
+
+@final
+class _NativeResponseParser:
+    """
+    Common native handle recognized directly by the HTTP actor.
+    """
+    def feed(
+        self, /, token_ids: Sequence[int] | npt.NDArray[np.uint32]
+    ) -> list[ParserEvent]: ...
+    def finish(self, /, reason: Literal["stop", "length"]) -> list[ParserEvent]: ...
 
 def _media_from_buffers(
     metadata: bytes, buffers: Sequence[npt.NDArray[Any]]

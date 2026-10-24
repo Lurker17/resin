@@ -21,19 +21,19 @@ def test_checkpoint_specs_keep_old_identity_and_pin_1017():
 
 
 @pytest.mark.parametrize(
-    "model_type,runner_name,codec_name",
+    "model_type,runner_name,recipe_name",
     [
         ("deepseek_v4", "DeepSeekV4CudaRunner", "DeepSeekV4Recipe"),
         ("deepseek_v41", "DeepSeekV41CudaRunner", "DeepSeekV41Recipe"),
     ],
 )
-def test_runner_and_codec_follow_checkpoint_architecture(
-    tmp_path, model_type, runner_name, codec_name
+def test_runner_and_recipe_follow_checkpoint_architecture(
+    tmp_path, model_type, runner_name, recipe_name
 ):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
-    runner, codec = deployment._implementation(tmp_path)
+    runner, recipe = deployment._implementation(tmp_path)
     assert runner.__name__ == runner_name
-    assert codec.__name__ == codec_name
+    assert recipe.__name__ == recipe_name
 
 
 @pytest.mark.parametrize("tp", [2, 4])

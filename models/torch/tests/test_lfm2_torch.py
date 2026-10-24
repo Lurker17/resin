@@ -278,7 +278,7 @@ class TestLfm2Torch:
         (path / "config.json").write_text(json.dumps(config))
         save_file(self.model.state_dict(), path / "model.safetensors")
         loaded, loaded_config = load_model(path, device="cpu")
-        # Codec tests can import these libraries earlier in this process.
+        # Recipe tests can import these libraries earlier in this process.
         # Check the loader's import boundary in a fresh interpreter.
         subprocess.run(
             [

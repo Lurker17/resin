@@ -57,9 +57,8 @@ def test_native_recipe_renders_typed_messages_and_tools() -> None:
         options=resin.recipe.RenderOptions(reasoning_effort="low"),
     )
     assert isinstance(rendered, resin.recipe.RenderedPrompt)
-    assert rendered.token_ids
-    assert rendered.stop_token_ids == [200006]
-    assert model_recipe.render_ids(messages) == model_recipe.render(messages).token_ids
+    assert rendered.token_ids.size > 0
+    assert model_recipe.stop_token_ids == [200006]
 
 
 def test_render_maps_openai_xhigh_to_inkling_max() -> None:
@@ -67,10 +66,13 @@ def test_render_maps_openai_xhigh_to_inkling_max() -> None:
     messages = [
         resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hello")])
     ]
-    assert model_recipe.render_ids(
-        messages, options=resin.recipe.RenderOptions(reasoning_effort="xhigh")
-    ) == model_recipe.render_ids(
-        messages, options=resin.recipe.RenderOptions(reasoning_effort="max")
+    assert (
+        model_recipe.render(
+            messages, options=resin.recipe.RenderOptions(reasoning_effort="xhigh")
+        ).token_ids.tolist()
+        == model_recipe.render(
+            messages, options=resin.recipe.RenderOptions(reasoning_effort="max")
+        ).token_ids.tolist()
     )
 
 
@@ -83,8 +85,15 @@ def test_processor_recipe_preserves_explicit_format_controls():
         resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hello")])
     ]
     options = resin.recipe.RenderOptions(reasoning_effort="low")
-    expected = InklingRecipe(Processor.tokenizer).render_ids(messages, options=options)
-    assert InklingRecipe(Processor()).render_ids(messages, options=options) == expected
+    expected = (
+        InklingRecipe(Processor.tokenizer)
+        .render(messages, options=options)
+        .token_ids.tolist()
+    )
+    assert (
+        InklingRecipe(Processor()).render(messages, options=options).token_ids.tolist()
+        == expected
+    )
 
 
 def test_render_rejects_unknown_reasoning_effort() -> None:
@@ -110,8 +119,8 @@ def _parser(model_recipe, *prefix):
 
 
 def test_parser_separates_repeated_reasoning_and_visible_text_blocks() -> None:
-    codec = InklingRecipe(FakeTokenizer())
-    parser = _parser(codec)
+    recipe = InklingRecipe(FakeTokenizer())
+    parser = _parser(recipe)
 
     assert parser.feed([200008, *_text_ids("think")]) == [
         resin.recipe.ReasoningDelta("think")
@@ -139,8 +148,8 @@ def test_parser_separates_repeated_reasoning_and_visible_text_blocks() -> None:
 
 
 def test_parser_uses_prompt_tail_to_continue_reasoning() -> None:
-    codec = InklingRecipe(FakeTokenizer())
-    parser = _parser(codec, 200008)
+    recipe = InklingRecipe(FakeTokenizer())
+    parser = _parser(recipe, 200008)
 
     assert parser.feed(_text_ids("continued")) == [
         resin.recipe.ReasoningDelta("continued")
@@ -148,8 +157,8 @@ def test_parser_uses_prompt_tail_to_continue_reasoning() -> None:
 
 
 def test_parser_extracts_json_tool_call_and_hides_header_metadata() -> None:
-    codec = InklingRecipe(FakeTokenizer())
-    parser = _parser(codec)
+    recipe = InklingRecipe(FakeTokenizer())
+    parser = _parser(recipe)
     payload = '{"name":"weather","args":{"city":"SF"}}'
 
     assert parser.feed(
@@ -167,8 +176,8 @@ def test_parser_extracts_json_tool_call_and_hides_header_metadata() -> None:
 
 
 def test_raw_tool_and_tool_error_blocks_remain_visible() -> None:
-    codec = InklingRecipe(FakeTokenizer())
-    parser = _parser(codec)
+    recipe = InklingRecipe(FakeTokenizer())
+    parser = _parser(recipe)
 
     assert parser.feed([200057, *_text_ids("raw"), 200010]) == [
         resin.recipe.TextDelta("raw")
@@ -178,12 +187,12 @@ def test_raw_tool_and_tool_error_blocks_remain_visible() -> None:
     ]
 
 
-def test_native_codec_implements_python_protocols() -> None:
-    codec = InklingRecipe(FakeTokenizer())
-    compatible_codec: resin.recipe.Recipe = codec
-    parser: FinalizingResponseParser = _parser(codec, 200004)
+def test_native_recipe_implements_python_protocols() -> None:
+    recipe = InklingRecipe(FakeTokenizer())
+    compatible_recipe: resin.recipe.Recipe = recipe
+    parser: FinalizingResponseParser = _parser(recipe, 200004)
 
-    assert compatible_codec is codec
+    assert compatible_recipe is recipe
     assert parser.feed(_text_ids("hello")) == [resin.recipe.TextDelta("hello")]
     assert parser.finish("stop") == []
 

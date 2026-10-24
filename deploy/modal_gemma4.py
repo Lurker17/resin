@@ -207,10 +207,10 @@ def _synthetic_image(size: int = 96):
     return np.stack((horizontal, vertical, 1.0 - horizontal), axis=-1).copy()
 
 
-def _generate(engine, processor, prompt: str, max_output_tokens: int):
+def _generate(engine, recipe: Gemma4Recipe, prompt: str, max_output_tokens: int):
     from resin import SamplingParams
 
-    prepared = Gemma4Recipe(processor, eos_token_ids=(1, 106)).render(
+    prepared = recipe.render(
         [
             resin.recipe.Message(
                 resin.recipe.Role.USER,
@@ -226,7 +226,7 @@ def _generate(engine, processor, prompt: str, max_output_tokens: int):
         media=media,
         sampling_params=SamplingParams(
             max_output_tokens=max_output_tokens,
-            stop_token_ids=prepared.stop_token_ids,
+            stop_token_ids=recipe.stop_token_ids,
             temperature=0.0,
         ),
     )
@@ -243,10 +243,10 @@ def _generate(engine, processor, prompt: str, max_output_tokens: int):
     return media, lease.take_result(), steps
 
 
-def _warmup_text(engine, processor) -> None:
+def _warmup_text(engine, recipe: Gemma4Recipe) -> None:
     from resin import SamplingParams
 
-    prepared = Gemma4Recipe(processor, eos_token_ids=(1, 106)).render(
+    prepared = recipe.render(
         [
             resin.recipe.Message(
                 resin.recipe.Role.USER, [resin.recipe.Text("Reply with the number 1.")]
@@ -256,7 +256,7 @@ def _warmup_text(engine, processor) -> None:
     lease = engine.submit(
         prepared.token_ids,
         sampling_params=SamplingParams(
-            max_output_tokens=3, stop_token_ids=prepared.stop_token_ids, temperature=0.0
+            max_output_tokens=3, stop_token_ids=recipe.stop_token_ids, temperature=0.0
         ),
     )
     while engine.has_work():
@@ -282,10 +282,11 @@ def smoke_test(
         speculative_tokens=speculative_tokens, validate_graphs=True
     )
     try:
+        recipe = Gemma4Recipe(processor, stop_token_ids=runner.config.eos_token_ids)
         warmup_started = time.perf_counter()
         _, _, warmup_steps = _generate(
             engine,
-            processor,
+            recipe,
             "Name the main colors.",
             2,
         )
@@ -296,7 +297,7 @@ def smoke_test(
         torch.cuda.reset_peak_memory_stats()
         media, token_ids, steps = _generate(
             engine,
-            processor,
+            recipe,
             "Describe this image briefly and mention its dominant visual pattern.",
             max_output_tokens,
         )
@@ -342,14 +343,15 @@ def _serve(_: int) -> None:
         speculative_tokens=PRODUCTION_SPECULATIVE_TOKENS
     )
     try:
+        recipe = Gemma4Recipe(processor, stop_token_ids=runner.config.eos_token_ids)
         # Compile/load every exact kernel geometry before opening the socket.
-        warmup, _, _ = _generate(engine, processor, "Name the main colors.", 2)
+        warmup, _, _ = _generate(engine, recipe, "Name the main colors.", 2)
         del warmup
-        _warmup_text(engine, processor)
+        _warmup_text(engine, recipe)
         torch.cuda.synchronize(runner.device)
         HttpServer(
             engine,
-            recipe=Gemma4Recipe(processor, eos_token_ids=runner.config.eos_token_ids),
+            recipe=recipe,
             model=MODEL_ID,
             enable_anthropic=False,
         ).serve(host="0.0.0.0", port=8000)

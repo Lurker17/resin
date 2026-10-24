@@ -21,7 +21,10 @@ def checkpoint(tmp_path, monkeypatch):
     monkeypatch.setattr(
         bench,
         "DeepSeekV41Recipe",
-        lambda tokenizer: SimpleNamespace(render_ids=lambda messages: [2, 3]),
+        lambda tokenizer: SimpleNamespace(
+            render=lambda messages: SimpleNamespace(token_ids=[2, 3]),
+            stop_token_ids=[7],
+        ),
     )
     return tmp_path
 

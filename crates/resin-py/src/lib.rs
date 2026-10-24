@@ -168,7 +168,7 @@ impl BatchPhase {
 /// A zero temperature selects the maximum-logit token. Positive temperatures
 /// enable stochastic sampling after optional top-k and top-p filtering.
 /// An omitted `max_output_tokens` uses the remaining context budget. Stop tokens
-/// are explicit: pass a rendered prompt's `stop_token_ids` for recipe stopping.
+/// are explicit: pass a recipe's `stop_token_ids` for recipe stopping.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug)]
 struct SamplingParams {

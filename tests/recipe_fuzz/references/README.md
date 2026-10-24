@@ -36,4 +36,4 @@ middle-system headers and tool-only history semantics against
 That checkpoint skips tool-result-only blocks when finding the last user turn;
 the package's conversation conversion differs there, so this case has an
 explicit stock-format fixture. Numeric budgets 1–100 are supported by the
-native codec and `extra.reasoning_effort`; HTTP aliases are low/high/max.
+native recipe and `extra.reasoning_effort`; HTTP aliases are low/high/max.

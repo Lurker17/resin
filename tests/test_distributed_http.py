@@ -27,10 +27,13 @@ from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.server import HttpServer
 
 
-class RankCodec:
+class RankRecipe:
+    tokenizer = None
+    stop_token_ids = []
+
     def __init__(self, rank, case):
         if case == "initialize" and rank == 1:
-            raise RuntimeError("injected codec initialization")
+            raise RuntimeError("injected recipe initialization")
 
     def render(self, messages, *, tools=(), options=None):
         content = messages[0].content[0].text
@@ -40,7 +43,6 @@ class RankCodec:
             [99]
             if content == "explode"
             else ([4] if content == "cancelme" else [1, 2, 3]),
-            stop_token_ids=[],
         )
 
     def create_parser(self, prompt):
@@ -142,26 +144,26 @@ def _serve_rank(rank, world_size, directory, port, case):
                 context_length=2048,
                 enable_metrics=case in ("normal", "metrics_failure"),
             )
-            codec = RankCodec(rank, "normal")
+            recipe = RankRecipe(rank, "normal")
             if case == "initialize" and groups.drivers.local_rank == 1:
                 # Native session initialization snapshots an optional tokenizer.
-                class BrokenCodec(RankCodec):
+                class BrokenRecipe(RankRecipe):
                     @property
                     def tokenizer(self):
-                        raise RuntimeError("injected codec initialization")
+                        raise RuntimeError("injected recipe initialization")
 
-                codec = BrokenCodec(rank, "normal")
+                recipe = BrokenRecipe(rank, "normal")
             model = "rank-test"
             if case == "whitespace" and groups.drivers.local_rank == 0:
                 model = " "
             if case == "infer" and groups.drivers.local_rank == 1:
 
-                class InferenceFailureCodec(RankCodec):
+                class InferenceFailureRecipe(RankRecipe):
                     @property
                     def tokenizer(self):
                         raise RuntimeError("injected model inference")
 
-                codec = InferenceFailureCodec(rank, "normal")
+                recipe = InferenceFailureRecipe(rank, "normal")
                 model = None
             if case == "frontend" and groups.drivers.local_rank == 0:
                 import resin.server as serving
@@ -172,7 +174,7 @@ def _serve_rank(rank, world_size, directory, port, case):
                 setattr(serving, "_HttpServer", fail)
             server = HttpServer(
                 engine,
-                recipe=codec,
+                recipe=recipe,
                 model=model,
                 enable_openai=not (case == "flags" and groups.drivers.local_rank == 0),
                 request_queue_capacity=(

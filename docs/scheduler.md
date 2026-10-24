@@ -23,7 +23,7 @@ request = engine.submit(
     batch_key=7,
     sampling_params=SamplingParams(
         max_output_tokens=64,  # optional hard stop, not a KV reservation
-        stop_token_ids=prompt.stop_token_ids,
+        stop_token_ids=recipe.stop_token_ids,
         temperature=1.0,
         top_p=0.95,
         top_k=40,
@@ -144,8 +144,8 @@ block within the runner's declared speculative capacity.
 `SamplingParams` is a frozen per-request policy that holds generation limits,
 stop token IDs, sampling settings, and logprob options. `stop_token_ids` defaults
 to an empty tuple, so raw token requests must supply any desired model stop
-tokens explicitly. For recipe requests, pass the rendered prompt's
-`stop_token_ids`. There is no Engine-level EOS fallback. Stop IDs are copied into
+tokens explicitly. For recipe requests, pass `recipe.stop_token_ids`; HTTP
+serving does this automatically. There is no Engine-level EOS fallback. Stop IDs are copied into
 an immutable tuple at construction. Reuse a policy for requests with the same
 settings, or construct a new one to change the limit or stops.
 

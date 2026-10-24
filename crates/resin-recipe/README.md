@@ -39,8 +39,15 @@ Python callers import concrete native classes such as
 processor configuration once; callers may instead supply a tokenizer and
 `media_config` mapping. Video inputs are decoded frames. `resin.recipe.Recipe`
 is a structural protocol. `render(messages, *, tools=(), options=None)` accepts typed `Message`
-content and returns `RenderedPrompt`; its token IDs, model stops and prepared
-media are available as attributes. `create_parser(prompt)` binds a fresh parser
+content and returns `RenderedPrompt`, which exposes token IDs and prepared
+media. The recipe exposes its model stops as `recipe.stop_token_ids`.
+`prompt.token_ids` is a read-only NumPy `uint32` array; `recipe.stop_token_ids`
+returns a list of integers. Native recipe
+constructors accept `stop_token_ids=None` to infer model defaults, a sequence
+to replace them, or `[]` to disable token stopping. The protocol's `tokenizer`
+property is a normalized Resin `Tokenizer` snapshot, or `None` if vocabulary
+metadata is unavailable. Native recipes also offer `debug_render_text(...)`
+to inspect formatting without preparing media. `create_parser(prompt)` binds a fresh parser
 to the actual rendered prefix and options. A native prompt belongs to the
 recipe that rendered it.
 
@@ -50,8 +57,9 @@ orders and media support; the role enum can grow. Tool declarations and
 `RenderOptions` are separate rendering arguments. Qwen3.5 and Qwen3.8 select
 their distinct formats through explicit constructors.
 
-Pass `prompt.token_ids`, `prompt.stop_token_ids`, and `prompt.media` to the
-Engine's corresponding submission arguments. Each `create_parser(prompt)`
+Pass `prompt.token_ids` and `prompt.media` to `Engine.submit`, and
+`recipe.stop_token_ids` to `SamplingParams`. HTTP serving uses the recipe's stops
+automatically. Each `create_parser(prompt)`
 call creates independent response state without retaining pixels. Custom
 Python recipes may construct `RenderedPrompt` themselves and supply their own
 parser; native recipes require a prompt rendered by the same recipe instance.

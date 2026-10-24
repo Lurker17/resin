@@ -21,12 +21,12 @@ def _data_url() -> str:
 
 @pytest.mark.parametrize("source_kind", ["data_url", "bytes", "rgb"])
 def test_recipe_attaches_media_and_preserves_token_controls(source_kind) -> None:
-    tokenizer = GemmaAdapter().codec.tokenizer
+    tokenizer = GemmaAdapter().recipe.tokenizer
     image_id = tokenizer.token_to_id("<|image|>")
 
     model_recipe = Gemma4Recipe(
         tokenizer,
-        eos_token_ids=(1, 106),
+        stop_token_ids=(1, 106),
         media_config={
             "image_processor": {
                 "patch_size": 1,
@@ -56,8 +56,8 @@ def test_recipe_attaches_media_and_preserves_token_controls(source_kind) -> None
         options=resin.recipe.RenderOptions(enable_thinking=True),
     )
     assert isinstance(rendered.media, Gemma4Media)
-    assert rendered.token_ids.count(image_id) == 2
-    assert rendered.stop_token_ids == [1, 106]
+    assert rendered.token_ids.tolist().count(image_id) == 2
+    assert model_recipe.stop_token_ids == [1, 106]
     pixels = rendered.media.pixel_values
     assert pixels is not None
     assert pixels.dtype == np.float32

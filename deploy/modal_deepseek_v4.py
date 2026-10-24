@@ -244,7 +244,7 @@ def _encode_prompt(
         options=resin.recipe.RenderOptions(
             thinking_mode=thinking_mode, reasoning_effort=reasoning_effort
         ),
-    ).token_ids
+    ).token_ids.tolist()
 
 
 def _real_prompt_ids(
@@ -1001,8 +1001,8 @@ def _benchmark_remote(
             str(model_path), local_files_only=True, trust_remote_code=False
         ),
     )
-    _, codec_type = _implementation(model_path)
-    recipe = codec_type(tokenizer)
+    _, recipe_type = _implementation(model_path)
+    recipe = recipe_type(tokenizer)
     seed_prompt = _encode_prompt(
         recipe,
         "Measure inference throughput with a stable synthetic prompt.",
@@ -1410,8 +1410,8 @@ def run_model_tp4(
             str(model_path), local_files_only=True, trust_remote_code=False
         ),
     )
-    _, codec_type = _implementation(model_path)
-    recipe = codec_type(tokenizer)
+    _, recipe_type = _implementation(model_path)
+    recipe = recipe_type(tokenizer)
     if profile_input_tokens is None:
         rendered = recipe.render(
             [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])],
@@ -1419,7 +1419,7 @@ def run_model_tp4(
                 thinking_mode=thinking_mode, reasoning_effort=reasoning_effort
             ),
         )
-        prompt_ids = rendered.token_ids
+        prompt_ids = rendered.token_ids.tolist()
     else:
         rendered = None
         prompt_ids = _real_prompt_ids(tokenizer, profile_input_tokens)
@@ -1437,7 +1437,7 @@ def run_model_tp4(
         model_path,
         checkpoint,
         prompt_rows,
-        None if rendered is None else rendered.stop_token_ids,
+        None if rendered is None else recipe.stop_token_ids,
         max_output_tokens,
         context_length,
         temperature,

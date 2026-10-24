@@ -37,7 +37,7 @@ def wait_for_sample(base, name, expected):
 
 
 def test_http_metrics_include_rendering_and_ignore_parser_stream_buffering():
-    class SlowRecipe(lifecycle.Codec):
+    class SlowRecipe(lifecycle.Recipe):
         def render(self, messages, *, tools=(), options=None):
             time.sleep(0.12)
             return super().render(messages, tools=tools, options=options)

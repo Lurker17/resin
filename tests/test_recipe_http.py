@@ -43,7 +43,7 @@ def test_stock_recipe_http_events(recipe_adapter, stream, completion_reason):
             self.step += 1
             return forward_output([token])
 
-    with running_server(Runner(), adapter.codec) as (_, engine, _, errors, base, _):
+    with running_server(Runner(), adapter.recipe) as (_, engine, _, errors, base, _):
         body = json.dumps(
             {
                 **request,
@@ -112,15 +112,17 @@ def test_stock_recipe_http_events(recipe_adapter, stream, completion_reason):
 def test_native_prompt_provenance_and_stop_encoding(recipe_adapter):
     _, adapter = recipe_adapter
     marker, marker_id = next(iter(adapter.ids.items()))
-    baseline = adapter.codec.render(
+    baseline = adapter.recipe.render(
         [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hello")])]
     )
-    rendered = adapter.codec.render(
+    rendered = adapter.recipe.render(
         [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(marker)])]
     )
-    assert rendered.token_ids.count(marker_id) == baseline.token_ids.count(marker_id)
+    assert rendered.token_ids.tolist().count(
+        marker_id
+    ) == baseline.token_ids.tolist().count(marker_id)
     # Stop strings belong to HTTP serving; native recipes supply model stops.
-    assert rendered.stop_token_ids == adapter.codec.get_stop_token_ids()
+    assert adapter.recipe.stop_token_ids
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -147,7 +149,7 @@ def test_stock_recipe_stops_match_decoded_output(recipe_adapter, stream):
             self.position += 1
             return forward_output([token])
 
-    with running_server(Runner(), adapter.codec) as (_, engine, _, errors, base, _):
+    with running_server(Runner(), adapter.recipe) as (_, engine, _, errors, base, _):
         with post(
             base,
             json.dumps(

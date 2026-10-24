@@ -19,13 +19,16 @@ from resin.recipe import InklingResponseParser, RenderedPrompt, Tokenizer
 from resin.server import HttpServer
 
 
-class Codec:
+class Recipe:
+    tokenizer = None
+    stop_token_ids = []
+
     def render(self, messages, *, tools=(), options=None):
         slow = messages[0].content[0].text == "slow"
-        return RenderedPrompt([1 if slow else 2], stop_token_ids=[])
+        return RenderedPrompt([1 if slow else 2])
 
     def create_parser(self, prompt):
-        delta = "x" * 65_536 if prompt.token_ids == [1] else "ok"
+        delta = "x" * 65_536 if prompt.token_ids.tolist() == [1] else "ok"
 
         class Parser:
             def feed(self, token_ids):
@@ -74,7 +77,7 @@ def running_server(runner, recipe=None, **options):
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     engine = Engine(runner)
-    server = HttpServer(engine, recipe=recipe or Codec(), model="test", **options)
+    server = HttpServer(engine, recipe=recipe or Recipe(), model="test", **options)
     errors = []
 
     def serve():
@@ -134,14 +137,14 @@ def test_configured_intake_queue_rejects_overflow_then_drains_and_recovers():
     rendering = threading.Event()
     resume = threading.Event()
 
-    class BlockingCodec(Codec):
+    class BlockingRecipe(Recipe):
         def render(self, messages, *, tools=(), options=None):
             if not rendering.is_set():
                 rendering.set()
                 assert resume.wait(timeout=5), "test did not release the first render"
             return super().render(messages, tools=tools, options=options)
 
-    with running_server(Runner(), BlockingCodec(), request_queue_capacity=2) as (
+    with running_server(Runner(), BlockingRecipe(), request_queue_capacity=2) as (
         _server,
         engine,
         _thread,
@@ -221,12 +224,8 @@ def test_actor_failure_stops_listener_and_propagates_from_serve():
 def test_parser_finalization_deltas_precede_completion(stream, completion_reason):
     finished = []
 
-    class FinalizingCodec(Codec):
-        def render(self, messages, *, tools=(), options=None):
-            rendered = super().render(messages, tools=tools, options=options)
-            if completion_reason == "stop":
-                rendered = RenderedPrompt(rendered.token_ids, stop_token_ids=[3])
-            return rendered
+    class FinalizingRecipe(Recipe):
+        stop_token_ids = [3] if completion_reason == "stop" else []
 
         def create_parser(self, prompt):
             class Parser:
@@ -239,7 +238,7 @@ def test_parser_finalization_deltas_precede_completion(stream, completion_reason
 
             return Parser()
 
-    with running_server(Runner(), FinalizingCodec()) as (
+    with running_server(Runner(), FinalizingRecipe()) as (
         _server,
         _engine,
         _thread,
@@ -286,7 +285,7 @@ def test_parser_without_finalization_remains_supported():
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_custom_native_tool_events_preserve_arguments_and_identity(stream):
-    class ToolRecipe(Codec):
+    class ToolRecipe(Recipe):
         def create_parser(self, prompt):
             class Parser:
                 def feed(self, token_ids):
@@ -337,7 +336,7 @@ def test_custom_native_tool_events_preserve_arguments_and_identity(stream):
 
 
 def test_dictionary_parser_events_are_rejected_without_poisoning_engine():
-    class InvalidRecipe(Codec):
+    class InvalidRecipe(Recipe):
         invalid = True
 
         def create_parser(self, prompt):
@@ -373,14 +372,16 @@ def test_native_parser_flushes_partial_utf8_in_http_actor(stream):
     tokenizer = Tokenizer(_FastTokenizer(backend))
     assert tokenizer.is_native
 
-    class NativeCodec:
+    class NativeRecipe:
+        tokenizer = None
+        stop_token_ids = []
+
         def render(self, messages, *, tools=(), options=None):
             return RenderedPrompt(
                 [
                     markers["<|message_model|>"],
                     markers["<|content_text|>"],
                 ],
-                stop_token_ids=[],
             )
 
         def create_parser(self, prompt):
@@ -398,7 +399,7 @@ def test_native_parser_flushes_partial_utf8_in_http_actor(stream):
             self.step += 1
             return forward_output([token])
 
-    with running_server(ByteRunner(), NativeCodec()) as (
+    with running_server(ByteRunner(), NativeRecipe()) as (
         _server,
         engine,
         _thread,
@@ -436,12 +437,12 @@ def test_native_parser_flushes_partial_utf8_in_http_actor(stream):
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_parser_finalization_failure_does_not_poison_other_requests(stream):
-    class FinalizingCodec(Codec):
+    class FinalizingRecipe(Recipe):
         def render(self, messages, *, tools=(), options=None):
             return RenderedPrompt([99 if messages[0].content[0].text == "fail" else 2])
 
         def create_parser(self, prompt):
-            fail = prompt.token_ids == [99]
+            fail = prompt.token_ids.tolist() == [99]
 
             class Parser:
                 def feed(self, token_ids):
@@ -454,7 +455,7 @@ def test_parser_finalization_failure_does_not_poison_other_requests(stream):
 
             return Parser()
 
-    with running_server(Runner(), FinalizingCodec()) as (
+    with running_server(Runner(), FinalizingRecipe()) as (
         server,
         engine,
         thread,
@@ -507,7 +508,7 @@ def test_slow_client_is_cancelled_without_blocking_other_clients():
 
 
 def test_admission_burst_yields_to_inference_before_draining_queue():
-    class GatedCodec(Codec):
+    class GatedRecipe(Recipe):
         def __init__(self):
             self.rendering = threading.Event()
             self.resume = threading.Event()
@@ -520,18 +521,18 @@ def test_admission_burst_yields_to_inference_before_draining_queue():
             self.admitted += 1
             return super().render(messages, tools=tools, options=options)
 
-    codec = GatedCodec()
+    recipe = GatedRecipe()
     first_step = threading.Event()
     counts_at_step = []
 
     class ObservingRunner(Runner):
         def forward(self, plan):
-            counts_at_step.append(codec.admitted)
+            counts_at_step.append(recipe.admitted)
             first_step.set()
             return super().forward(plan)
 
     connections = []
-    with running_server(ObservingRunner(), codec) as (
+    with running_server(ObservingRunner(), recipe) as (
         _server,
         _engine,
         _thread,
@@ -550,15 +551,15 @@ def test_admission_burst_yields_to_inference_before_draining_queue():
                 connections.append(connection)
                 connection.sendall(wire)
                 if index == 0:
-                    assert codec.rendering.wait(timeout=2)
+                    assert recipe.rendering.wait(timeout=2)
                 # A response header acknowledges the request was queued, even
-                # while its codec has not yet been admitted by the actor.
+                # while its recipe has not yet been admitted by the actor.
                 assert connection.recv(1024).startswith(b"HTTP/1.1 200")
-            codec.resume.set()
+            recipe.resume.set()
             assert first_step.wait(timeout=3)
             assert counts_at_step[0] == 4
             assert errors == []
         finally:
-            codec.resume.set()
+            recipe.resume.set()
             for connection in connections:
                 connection.close()

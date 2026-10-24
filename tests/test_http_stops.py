@@ -13,12 +13,15 @@ from test_http_lifecycle import running_server
 import resin
 
 
-class TextCodec:
+class TextRecipe:
+    tokenizer = None
+    stop_token_ids = []
+
     def __init__(self, pieces):
         self.pieces = pieces
 
     def render(self, messages, *, tools=(), options=None):
-        return resin.recipe.RenderedPrompt([1], stop_token_ids=[])
+        return resin.recipe.RenderedPrompt([1])
 
     def create_parser(self, prompt):
         pieces = self.pieces
@@ -85,7 +88,7 @@ def test_chat_stops_inside_tokens_across_tokens_and_at_length_limit(
     stream, pieces, stops, expected, reason
 ):
     runner = PiecesRunner(pieces)
-    with running_server(runner, TextCodec(pieces)) as (_, engine, _, errors, base, _):
+    with running_server(runner, TextRecipe(pieces)) as (_, engine, _, errors, base, _):
         with send(
             base,
             "/v1/chat/completions",
@@ -115,7 +118,7 @@ def test_chat_stops_inside_tokens_across_tokens_and_at_length_limit(
 @pytest.mark.parametrize("stream", [False, True])
 def test_anthropic_stop_reports_matching_marker(stream):
     pieces = ["answer EN", "Dtail", "ignored"]
-    with running_server(PiecesRunner(pieces), TextCodec(pieces)) as (
+    with running_server(PiecesRunner(pieces), TextRecipe(pieces)) as (
         _,
         _,
         _,
@@ -155,7 +158,14 @@ def test_anthropic_stop_reports_matching_marker(stream):
 
 def test_empty_stop_is_rejected_before_inference():
     runner = PiecesRunner(["ignored"])
-    with running_server(runner, TextCodec(runner.pieces)) as (_, _, _, errors, base, _):
+    with running_server(runner, TextRecipe(runner.pieces)) as (
+        _,
+        _,
+        _,
+        errors,
+        base,
+        _,
+    ):
         with pytest.raises(urllib.error.HTTPError) as caught:
             send(
                 base,
@@ -174,7 +184,7 @@ def test_empty_stop_is_rejected_before_inference():
 @pytest.mark.parametrize("stream", [False, True])
 def test_stop_discards_remaining_verified_block_and_reports_consumed_tokens(stream):
     pieces = ["hello S", "T", "OP tail", "ignored"]
-    with running_server(PiecesRunner(pieces, block=True), TextCodec(pieces)) as (
+    with running_server(PiecesRunner(pieces, block=True), TextRecipe(pieces)) as (
         _,
         _,
         _,
@@ -214,7 +224,7 @@ def test_stop_discards_remaining_verified_block_and_reports_consumed_tokens(stre
 @pytest.mark.parametrize("stream", [False, True])
 def test_responses_stop_marker_is_hidden(stream):
     pieces = ["answer EN", "Dtail", "ignored"]
-    with running_server(PiecesRunner(pieces), TextCodec(pieces)) as (
+    with running_server(PiecesRunner(pieces), TextRecipe(pieces)) as (
         _,
         _,
         _,

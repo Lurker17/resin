@@ -31,7 +31,7 @@ def test_http_rank_uses_shared_worker_and_closes_after_warmup_or_server_failure(
             memory_utilization=0.9,
         ),
     )
-    recipe = SimpleNamespace(get_stop_token_ids=lambda: [97, 98])
+    recipe = SimpleNamespace(stop_token_ids=[97, 98])
 
     def initialize(actual_rank, actual_size, port):
         assert (actual_rank, actual_size, port) == (rank, size, 12345)

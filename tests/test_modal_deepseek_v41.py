@@ -23,8 +23,7 @@ from resin_models_cuda.deepseek_v41 import cuda as runner_module
 def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail):
     calls = []
     groups = SimpleNamespace(rank=rank)
-    render = DeepSeekV41Recipe.render_ids
-    stops = DeepSeekV41Recipe.get_stop_token_ids
+    render = DeepSeekV41Recipe.render
 
     def initialize(backend, **options):
         assert backend == "nccl"
@@ -59,18 +58,16 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
         def capture_cuda_graphs(self):
             calls.append("capture")
 
-    class Codec:
+    class Recipe:
         def __init__(self, tokenizer):
             assert tokenizer == "tokenizer"
 
-        def render_ids(self, messages):
+        stop_token_ids = [7, 8]
+
+        def render(self, messages):
             signature(render).bind(self, messages)
             assert messages[0].role == resin.recipe.Role.USER
-            return [4, 5]
-
-        def get_stop_token_ids(self):
-            signature(stops).bind(self)
-            return [7, 8]
+            return SimpleNamespace(token_ids=[4, 5])
 
     class Worker:
         def __init__(self, runner, rank_groups):
@@ -120,7 +117,7 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
             signature(HttpServer.__init__).bind(
                 self, engine, recipe=recipe, model=model
             )
-            assert isinstance(engine, RequestEngine) and isinstance(recipe, Codec)
+            assert isinstance(engine, RequestEngine) and isinstance(recipe, Recipe)
             assert model == deployment.MODEL
             assert engine.remaining == 0
             self.engine = engine
@@ -145,7 +142,7 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
     monkeypatch.setattr(dist, "init_process_group", initialize)
     monkeypatch.setattr(ParallelGroups, "create", make_groups)
     monkeypatch.setattr(runner_module, "DeepSeekV41CudaRunner", Runner)
-    monkeypatch.setattr(deployment, "DeepSeekV41Recipe", Codec)
+    monkeypatch.setattr(deployment, "DeepSeekV41Recipe", Recipe)
     monkeypatch.setattr(tokenizers, "Tokenizer", SimpleNamespace(from_file=tokenizer))
     monkeypatch.setattr(distributed, "DistributedEngine", RequestEngine)
     monkeypatch.setattr(distributed, "DistributedWorker", Worker)

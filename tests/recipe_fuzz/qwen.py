@@ -42,7 +42,7 @@ class QwenAdapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.codec = Qwen38Recipe(backend)
+        self.recipe = Qwen38Recipe(backend)
         self.reference = renderers.Qwen35()
         _, self.reference_parser = self.reference.render_for_completion(
             chat.OpenAIMessage.from_oss_messages([{"role": "user", "content": "hi"}])
@@ -149,8 +149,8 @@ class QwenAdapter:
         return normalize(parts)
 
     def parser(self):
-        return self.codec.create_parser(
-            self.codec.render(
+        return self.recipe.create_parser(
+            self.recipe.render(
                 [
                     resin.recipe.Message(
                         resin.recipe.Role.USER, [resin.recipe.Text("hi")]
@@ -161,8 +161,8 @@ class QwenAdapter:
         )
 
     def text_parser(self):
-        return self.codec.create_parser(
-            self.codec.render(
+        return self.recipe.create_parser(
+            self.recipe.render(
                 [
                     resin.recipe.Message(
                         resin.recipe.Role.USER, [resin.recipe.Text("hi")]

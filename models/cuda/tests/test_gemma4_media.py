@@ -21,7 +21,7 @@ def _png_bytes() -> bytes:
 
 def test_encoded_image_boundary_is_bytes_plus_explicit_mime() -> None:
     recipe = Gemma4Recipe(
-        GemmaAdapter().codec.tokenizer,
+        GemmaAdapter().recipe.tokenizer,
         media_config={
             "image_processor": {
                 "patch_size": 1,
@@ -131,7 +131,7 @@ def test_native_patches_match_reference_without_resize_and_own_input(is_video) -
         field = "image_processor"
     native_config = {**config, "do_sample_frames": False} if is_video else config
     recipe = Gemma4Recipe(
-        GemmaAdapter().codec.tokenizer, media_config={field: native_config}
+        GemmaAdapter().recipe.tokenizer, media_config={field: native_config}
     )
     messages = [
         resin.recipe.Message(
@@ -142,10 +142,9 @@ def test_native_patches_match_reference_without_resize_and_own_input(is_video) -
     marker = "<|video|>" if is_video else "<|image|>"
     frame = "<|image>" + marker * 2 + "<image|>"
     expansion = " ".join(["00:00 " + frame] * 2) if is_video else frame
-    expected_text = recipe.render_text(messages).replace(marker, expansion)
-    assert (
-        prompt.token_ids
-        == recipe.tokenizer.encode(expected_text, add_special_tokens=False).ids
+    expected_text = recipe.debug_render_text(messages).replace(marker, expansion)
+    assert prompt.token_ids.tolist() == recipe.tokenizer.encode(
+        expected_text, add_special_tokens=False
     )
     image.fill(0)
     assert isinstance(prompt.media, Gemma4Media)

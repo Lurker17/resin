@@ -31,10 +31,14 @@ PARAMETERS = {
     ("", "_media_from_buffers"): {"buffers": "Sequence[npt.NDArray[Any]]"},
     ("Message", "__new__"): {"content": "Sequence[ContentBlock]"},
     ("RenderOptions", "__new__"): {"reasoning_effort": "str | int | float | None"},
-    ("RenderedPrompt", "__new__"): {"media": "MediaInput | None"},
+    ("RenderedPrompt", "__new__"): {
+        "token_ids": U32_INPUT,
+        "media": "MediaInput | None",
+    },
+    ("RecipeTokenizer", "decode"): {"token_ids": U32_INPUT},
     ("Image", "from_rgb"): {"array": "npt.NDArray[np.float32]"},
-    ("RecipeResponseParser", "feed"): {"token_ids": "Sequence[int]"},
-    ("RecipeResponseParser", "finish"): {"reason": 'Literal["stop", "length"]'},
+    ("_NativeResponseParser", "feed"): {"token_ids": U32_INPUT},
+    ("_NativeResponseParser", "finish"): {"reason": 'Literal["stop", "length"]'},
     ("BatchPlan", "__new__"): {
         "sequence_ids": "Sequence[int] | npt.NDArray[np.uint64]",
         "context_lengths": U32_INPUT,
@@ -69,7 +73,10 @@ PARAMETERS = {
     },
     ("Engine", "__new__"): {"runner": "Runner"},
     ("Engine", "cancel"): {"request": "RequestLease"},
-    ("Engine", "submit"): {"media": "MediaInput | None"},
+    ("Engine", "submit"): {
+        "token_ids": f"{U32_INPUT} | None",
+        "media": "MediaInput | None",
+    },
     ("RunnerMetrics", "__new__"): {
         "dp_attention_sync_wait_seconds": "dict[str, Any] | None"
     },
@@ -78,9 +85,10 @@ PARAMETERS = {
     ("_HttpSession", "__new__"): {"recipe": "Recipe"},
     ("InklingResponseParser", "__new__"): {
         "token_ids": "Mapping[str, int]",
-        "prompt_ids": "Sequence[int]",
+        "prompt_ids": U32_INPUT,
     },
-    ("InklingResponseParser", "feed"): {"token_ids": "Sequence[int]"},
+    ("InklingResponseParser", "feed"): {"token_ids": U32_INPUT},
+    ("_NativeRecipe", "parse_response"): {"token_ids": U32_INPUT},
     ("InklingResponseParser", "finish"): {"reason": 'Literal["stop", "length"]'},
 }
 
@@ -136,8 +144,9 @@ RETURNS = {
     ("Message", "content"): "tuple[ContentBlock, ...]",
     ("RenderOptions", "reasoning_effort"): "str | int | float | None",
     ("RenderedPrompt", "media"): "MediaInput | None",
-    ("RecipeResponseParser", "feed"): "list[ParserEvent]",
-    ("RecipeResponseParser", "finish"): "list[ParserEvent]",
+    ("RenderedPrompt", "token_ids"): "npt.NDArray[np.uint32]",
+    ("_NativeResponseParser", "feed"): "list[ParserEvent]",
+    ("_NativeResponseParser", "finish"): "list[ParserEvent]",
     ("InklingResponseParser", "feed"): "list[ParserEvent]",
     ("InklingResponseParser", "finish"): "list[ParserEvent]",
     ("BatchPlan", "sequence_ids"): "npt.NDArray[np.uint64]",
@@ -200,6 +209,7 @@ class Normalizer(ast.NodeVisitor):
         self.found_parameters: set[tuple[str, str, str]] = set()
         self.found_returns: set[tuple[str, str]] = set()
         self.found_retention_default = False
+        self.found_recipe_base = False
 
     def replace(self, node: ast.expr, replacement: str) -> None:
         if (
@@ -214,6 +224,22 @@ class Normalizer(ast.NodeVisitor):
         self.edits.append((start, end, replacement.encode()))
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        if node.name == "_NativeRecipe":
+            if not node.bases and not node.keywords:
+                start = self.line_offsets[node.lineno - 1] + node.col_offset
+                header = f"class {node.name}".encode()
+                if self.source[start : start + len(header)] != header:
+                    raise ValueError("generated _NativeRecipe header changed")
+                position = start + len(header)
+                self.edits.append((position, position, b"(Recipe)"))
+            elif (
+                len(node.bases) != 1
+                or not isinstance(node.bases[0], ast.Name)
+                or node.bases[0].id != "Recipe"
+                or node.keywords
+            ):
+                raise ValueError("generated _NativeRecipe has unexpected bases")
+            self.found_recipe_base = True
         previous, self.owner = self.owner, node.name
         self.generic_visit(node)
         self.owner = previous
@@ -259,11 +285,17 @@ class Normalizer(ast.NodeVisitor):
         }
         missing_parameters = expected_parameters - self.found_parameters
         missing_returns = RETURNS.keys() - self.found_returns
-        if missing_parameters or missing_returns or not self.found_retention_default:
+        if (
+            missing_parameters
+            or missing_returns
+            or not self.found_retention_default
+            or not self.found_recipe_base
+        ):
             raise ValueError(
                 "generated stub structure changed "
                 f"(parameters={sorted(missing_parameters)}, returns={sorted(missing_returns)}, "
-                f"retention_default={self.found_retention_default})"
+                f"retention_default={self.found_retention_default}, "
+                f"recipe_base={self.found_recipe_base})"
             )
 
 

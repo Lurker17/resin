@@ -18,12 +18,12 @@ def main() -> None:
 
     model = DEFAULT_MODEL
     tokenizer = AutoTokenizer.from_pretrained(model, revision=DEFAULT_REVISION)
-    codec = Lfm2Recipe(tokenizer)
+    recipe = Lfm2Recipe(tokenizer)
     runner = Lfm2TorchRunner(model, device="cpu")
     engine = Engine(runner)
 
     print(f"Serving {model} at http://127.0.0.1:8000")
-    HttpServer(engine, recipe=codec, model=model).serve()
+    HttpServer(engine, recipe=recipe, model=model).serve()
 
 
 if __name__ == "__main__":

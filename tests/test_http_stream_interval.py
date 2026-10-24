@@ -20,19 +20,22 @@ from resin._resin import _HttpSession
 from resin.server import HttpServer
 
 
-class Codec:
+class Recipe:
+    tokenizer = None
+    stop_token_ids = []
+
     def __init__(self, pieces, *, eos=None, silent=()):
-        self.tokenizer = _byte_tokenizer()
-        self.tokenizer.add_tokens(pieces)
+        backend = _byte_tokenizer()
+        backend.add_tokens(pieces)
+        self.tokenizer = resin.recipe.Tokenizer(backend)
         self.ids = [self.tokenizer.token_to_id(piece) for piece in pieces]
         self.pieces = dict(zip(self.ids, pieces, strict=True))
         self.eos = self.tokenizer.token_to_id(eos) if eos else None
+        self.stop_token_ids = [] if self.eos is None else [self.eos]
         self.silent = silent
 
     def render(self, messages, *, tools=(), options=None):
-        return resin.recipe.RenderedPrompt(
-            [0], stop_token_ids=[] if self.eos is None else [self.eos]
-        )
+        return resin.recipe.RenderedPrompt([0])
 
     def create_parser(self, prompt):
         pieces, eos, silent = self.pieces, self.eos, self.silent
@@ -118,17 +121,17 @@ def admission(request_id, limit, *, stops=()):
 
 @contextmanager
 def session_case(pieces, interval, *, blocks=None, eos=None, silent=()):
-    codec = Codec(pieces, eos=eos, silent=silent)
+    recipe = Recipe(pieces, eos=eos, silent=silent)
     script = (
-        [[token] for token in codec.ids]
+        [[token] for token in recipe.ids]
         if blocks is None
-        else [[codec.ids[index] for index in block] for block in blocks]
+        else [[recipe.ids[index] for index in block] for block in blocks]
     )
     runner = Runner(script)
     engine = Engine(runner)
-    session = _HttpSession(engine, codec, stream_interval=interval)
+    session = _HttpSession(engine, recipe, stream_interval=interval)
     try:
-        yield session, engine, runner, codec
+        yield session, engine, runner, recipe
     finally:
         session.close()
         engine.close()
@@ -169,7 +172,7 @@ def assert_scores(events, expected_ids):
 def test_first_output_is_immediate_then_token_interval_and_final_residual(
     interval, expected
 ):
-    with session_case(list("abcdef"), interval) as (session, engine, _, codec):
+    with session_case(list("abcdef"), interval) as (session, engine, _, recipe):
         session.admit(admission("one", 6))
         output = []
         for delta in expected:
@@ -178,7 +181,7 @@ def test_first_output_is_immediate_then_token_interval_and_final_residual(
             output.extend(step)
         assert output[-1][1]["type"] == "finished"
         assert output[-1][1]["data"]["reason"] == "length"
-        assert_scores(output, codec.ids)
+        assert_scores(output, recipe.ids)
         assert session.active_count == 0 and not engine.has_work()
 
 
@@ -187,7 +190,7 @@ def test_verified_blocks_count_tokens_and_coalesce_without_waiting_for_more_step
         session,
         engine,
         _,
-        codec,
+        recipe,
     ):
         session.admit(admission("block", 7))
         output = []
@@ -197,7 +200,7 @@ def test_verified_blocks_count_tokens_and_coalesce_without_waiting_for_more_step
                 [expected] if expected else []
             )
             output.extend(step)
-        assert_scores(output, codec.ids)
+        assert_scores(output, recipe.ids)
 
 
 def test_raw_only_flushes_never_consume_the_first_semantic_output():
@@ -205,7 +208,7 @@ def test_raw_only_flushes_never_consume_the_first_semantic_output():
         session,
         engine,
         _,
-        codec,
+        recipe,
     ):
         session.admit(admission("headers", 4))
         output = []
@@ -222,15 +225,15 @@ def test_raw_only_flushes_never_consume_the_first_semantic_output():
                     == 2
                 )
             output.extend(step)
-        assert_scores(output, codec.ids)
+        assert_scores(output, recipe.ids)
 
 
 def test_native_session_rejects_zero_interval():
-    codec = Codec(["a"])
-    engine = Engine(Runner([[codec.ids[0]]]))
+    recipe = Recipe(["a"])
+    engine = Engine(Runner([[recipe.ids[0]]]))
     try:
         with pytest.raises(ValueError, match="stream_interval"):
-            _HttpSession(engine, codec, stream_interval=0)
+            _HttpSession(engine, recipe, stream_interval=0)
     finally:
         engine.close()
 
@@ -248,7 +251,7 @@ def test_terminal_paths_flush_residual_and_stops_still_parse_every_step(
     ending, pieces, limit, stops, expected, reason, consumed
 ):
     eos = pieces[-1] if ending == "eos" else None
-    with session_case(pieces, 8, eos=eos) as (session, engine, runner, codec):
+    with session_case(pieces, 8, eos=eos) as (session, engine, runner, recipe):
         session.admit(admission("terminal", limit, stops=stops))
         first = tick(session, engine)
         assert [data["delta"] for _, data in text_events(first)] == ["a"]
@@ -260,13 +263,13 @@ def test_terminal_paths_flush_residual_and_stops_still_parse_every_step(
             output.extend(step)
         assert "".join(data["delta"] for _, data in text_events(output)) == expected
         assert output[-1][1]["data"]["reason"] == reason
-        assert_scores(output, codec.ids[:consumed])
+        assert_scores(output, recipe.ids[:consumed])
         assert runner.released and session.active_count == 0
         assert not engine.has_work() and not engine.poisoned
 
 
 def test_intervals_belong_to_each_request_and_cancel_discards_only_its_pending_output():
-    with session_case(list("abcdef"), 3) as (session, engine, runner, codec):
+    with session_case(list("abcdef"), 3) as (session, engine, runner, recipe):
         output = []
 
         def next_text():
@@ -297,15 +300,15 @@ def test_intervals_belong_to_each_request_and_cancel_discards_only_its_pending_o
             ("first", "ef")
         ]
         assert session.active_count == 0
-        assert_scores([event for event in output if event[0] == "first"], codec.ids)
+        assert_scores([event for event in output if event[0] == "first"], recipe.ids)
         assert_scores(
-            [event for event in output if event[0] == "second"], codec.ids[:1]
+            [event for event in output if event[0] == "second"], recipe.ids[:1]
         )
 
 
 @pytest.mark.parametrize("api", ["chat/completions", "responses", "messages"])
 def test_actual_sse_delivery_batches_text_and_preserves_full_response(api, monkeypatch):
-    codec = Codec(list("abcdef"))
+    recipe = Recipe(list("abcdef"))
     body = {
         "model": "test",
         "messages": [{"role": "user", "content": "hi"}],
@@ -322,8 +325,8 @@ def test_actual_sse_delivery_batches_text_and_preserves_full_response(api, monke
             lifecycle, "HttpServer", partial(HttpServer, stream_interval=interval)
         )
         for stream in (False, True):
-            runner = Runner([[token] for token in codec.ids])
-            with lifecycle.running_server(runner, codec) as (
+            runner = Runner([[token] for token in recipe.ids])
+            with lifecycle.running_server(runner, recipe) as (
                 _,
                 engine,
                 _,

@@ -83,7 +83,7 @@ def assert_reference_tensors(
         processor_kwargs={"do_rescale": False},
     )
     actual = recipe.render(**native_inputs(request))
-    assert actual.token_ids == expected["input_ids"][0].tolist()
+    assert actual.token_ids.tolist() == expected["input_ids"][0].tolist()
     assert actual.media is not None
     for key, value in expected.items():
         # The engine stores the prepared payload, without HF's batch/mask shell.
@@ -194,7 +194,7 @@ def test_literal_media_marker_does_not_acquire_a_pixel_slot(model_processor):
         ]
     )
 
-    assert actual.token_ids.count(processor.image_token_id) == expected_slots
+    assert actual.token_ids.tolist().count(processor.image_token_id) == expected_slots
 
 
 @pytest.mark.parametrize(

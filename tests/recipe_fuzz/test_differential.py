@@ -84,7 +84,7 @@ class InklingAdapter:
             f"<|{name}|>": backend.token_to_id(f"<|{name}|>") for name in MARKERS
         }
         assert all(token_id is not None for token_id in self.ids.values())
-        self.codec = InklingRecipe(backend)
+        self.recipe = InklingRecipe(backend)
         self.tokenizer = Tokenizer(backend)
         assert self.tokenizer.is_native
         self.reference = tokenizers.O200kBaseChatTokenizer()
@@ -279,7 +279,7 @@ def test_reference_semantics_and_truncated_tools(adapter, parts, tool, cuts, dat
         assert_chunk_invariance(adapter.parser, ids[:cut], cuts)
     if hasattr(adapter, "prompt_oracle"):
         request = adapter.prompt_case(case)
-        assert adapter.codec.render_text(
+        assert adapter.recipe.debug_render_text(
             **native_inputs(
                 request, tools_before_text=isinstance(adapter, GemmaAdapter)
             )

@@ -215,6 +215,7 @@ impl ActiveRequest {
 pub(crate) struct Session {
     engine: Py<Engine>,
     recipe: Py<PyAny>,
+    stop_token_ids: Vec<u32>,
     vocabulary: Vocabulary,
     active: HashMap<u64, ActiveRequest>,
     stream_interval: u32,
@@ -241,9 +242,15 @@ impl Session {
         }
         drop(state);
         let vocabulary = Vocabulary::from_recipe(py, &recipe)?;
+        let stop_token_ids = if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
+            native.borrow().resolved_stop_token_ids()?.to_vec()
+        } else {
+            recipe.bind(py).getattr("stop_token_ids")?.extract()?
+        };
         Ok(Self {
             engine,
             recipe,
+            stop_token_ids,
             vocabulary,
             active: HashMap::new(),
             stream_interval,
@@ -258,7 +265,13 @@ impl Session {
         if let Some(metrics) = &self.metrics {
             metrics.observe_queue_time(job.enqueued_at.elapsed().as_secs_f64());
         }
-        admit(&self.engine, &self.recipe, job, &mut self.active);
+        admit(
+            &self.engine,
+            &self.recipe,
+            &self.stop_token_ids,
+            job,
+            &mut self.active,
+        );
     }
     pub fn cancel_disconnected(&mut self) -> Result<(), String> {
         cancel_disconnected(&self.engine, &mut self.active)
@@ -480,6 +493,7 @@ fn process(
 fn admit(
     engine: &Py<Engine>,
     recipe: &Py<PyAny>,
+    stop_token_ids: &[u32],
     job: GenerationJob,
     active: &mut HashMap<u64, ActiveRequest>,
 ) {
@@ -512,38 +526,32 @@ fn admit(
             "reasoning_effort": job.request.reasoning_effort,
             "extra": job.request.extra,
         }))?;
-        let (token_ids, stop_token_ids, media, parser) =
-            if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
-                let native = native.borrow();
-                let rendered = native.render(py, messages, tools, Some(&options))?;
-                let parser = Py::new(py, native.create_parser(py, &rendered)?)?.into_any();
-                (
-                    rendered.token_ids,
-                    rendered.stop_token_ids,
-                    rendered.media,
-                    parser,
-                )
-            } else {
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("tools", tools)?;
-                kwargs.set_item("options", Py::new(py, options)?)?;
-                let rendered = recipe
-                    .bind(py)
-                    .call_method("render", (messages,), Some(&kwargs))?;
-                let parser = recipe
-                    .bind(py)
-                    .call_method1("create_parser", (&rendered,))?
-                    .unbind();
-                let prompt = rendered.cast::<RenderedPrompt>()?.borrow();
-                // Custom recipes also return the native prompt container, so media
-                // and token ownership cross one well-defined admission boundary.
-                (
-                    prompt.token_ids.clone(),
-                    prompt.stop_token_ids.clone(),
-                    prompt.media.as_ref().map(|value| value.clone_ref(py)),
-                    parser,
-                )
-            };
+        let (token_ids, media, parser) = if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>()
+        {
+            let native = native.borrow();
+            let rendered = native.render(py, messages, tools, Some(&options))?;
+            let parser = Py::new(py, native.create_parser(py, &rendered)?)?.into_any();
+            (rendered.token_ids, rendered.media, parser)
+        } else {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("tools", tools)?;
+            kwargs.set_item("options", Py::new(py, options)?)?;
+            let rendered = recipe
+                .bind(py)
+                .call_method("render", (messages,), Some(&kwargs))?;
+            let parser = recipe
+                .bind(py)
+                .call_method1("create_parser", (&rendered,))?
+                .unbind();
+            let prompt = rendered.cast::<RenderedPrompt>()?.borrow();
+            // Custom recipes also return the native prompt container, so media
+            // and token ownership cross one well-defined admission boundary.
+            (
+                prompt.token_ids.clone(),
+                prompt.media.as_ref().map(|value| value.clone_ref(py)),
+                parser,
+            )
+        };
         if token_ids.is_empty() {
             return Err(PyValueError::new_err(
                 "recipe.render returned an empty token_ids sequence",
@@ -560,7 +568,7 @@ fn admit(
                 Some(u32::try_from(job.request.max_output_tokens).map_err(|_| {
                     PyValueError::new_err("max_output_tokens must fit in a uint32")
                 })?),
-                stop_token_ids,
+                stop_token_ids.to_vec(),
                 job.request.temperature,
                 job.request.top_p,
                 job.request.top_k,

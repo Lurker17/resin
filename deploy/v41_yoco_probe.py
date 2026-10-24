@@ -655,14 +655,14 @@ def run_validation(
         recipe = DeepSeekV41Recipe(
             Tokenizer.from_file(str(Path(checkpoint) / "tokenizer.json"))
         )
-        prompt = recipe.render_ids(
+        prompt = recipe.render(
             [
                 resin.recipe.Message(
                     resin.recipe.Role.USER,
                     [resin.recipe.Text("Count from1 to20, one number per line.")],
                 )
             ]
-        )
+        ).token_ids.tolist()
         modes = (
             None
             if groups is None or groups.drivers.size == groups.topology.world_size

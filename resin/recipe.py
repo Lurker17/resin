@@ -23,7 +23,6 @@ from resin._resin import (
     Qwen35Recipe,
     Qwen38Recipe,
     ReasoningDelta,
-    RecipeResponseParser,
     RenderedPrompt,
     RenderOptions,
     Role,
@@ -61,6 +60,16 @@ class Recipe(Protocol):
     We recommend using one of the recipes in the `resin-recipe` crate, which
     includes optimized incremental parsers in Rust.
     """
+
+    @property
+    def stop_token_ids(self) -> list[int]:
+        """Static model stop IDs, independent of the rendered request."""
+        ...
+
+    @property
+    def tokenizer(self) -> Tokenizer | None:
+        """Prepared tokenizer for vocabulary metadata, or None when unavailable."""
+        ...
 
     def render(
         self,
@@ -101,7 +110,6 @@ __all__ = [
     "Qwen38Recipe",
     "Recipe",
     "ReasoningDelta",
-    "RecipeResponseParser",
     "RenderedPrompt",
     "RenderOptions",
     "ResponseParser",

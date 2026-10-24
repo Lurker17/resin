@@ -21,9 +21,12 @@ class IncrementingRunner:
         )
 
 
-class _Codec:
+class _Recipe:
+    tokenizer = None
+    stop_token_ids = []
+
     def render(self, messages, *, tools=(), options=None):
-        return resin.recipe.RenderedPrompt([1], stop_token_ids=[])
+        return resin.recipe.RenderedPrompt([1])
 
     def create_parser(self, prompt):
         return SimpleNamespace(feed=lambda ids: [])
@@ -33,7 +36,7 @@ def test_http_server_validates_route_configuration() -> None:
     with pytest.raises(ValueError, match="requires enable_openai"):
         HttpServer(
             Engine(IncrementingRunner()),
-            recipe=_Codec(),
+            recipe=_Recipe(),
             model="test",
             enable_openai=False,
             enable_demo=True,
@@ -45,7 +48,7 @@ def test_http_server_validates_route_configuration() -> None:
 def test_http_server_requires_positive_integer_settings(setting, value) -> None:
     engine = Engine(IncrementingRunner())
     with pytest.raises(ValueError, match=f"{setting}.*positive integer"):
-        HttpServer(engine, recipe=_Codec(), model="test", **{setting: value})
+        HttpServer(engine, recipe=_Recipe(), model="test", **{setting: value})
     assert not engine.closed
     engine.close()
 
@@ -68,7 +71,7 @@ def test_http_server_forwards_default_and_custom_settings(
     monkeypatch.setattr(serving, "_HttpServer", native)
     engine = Engine(IncrementingRunner())
     options = {} if value is None else {setting: value}
-    server = HttpServer(engine, recipe=_Codec(), model="test", **options)
+    server = HttpServer(engine, recipe=_Recipe(), model="test", **options)
     assert server.model == "test"
     assert created[0][setting] == (default if value is None else value)
     engine.close()
@@ -82,7 +85,7 @@ def test_native_http_server_rejects_zero_settings(setting):
     with pytest.raises(ValueError, match=f"{setting}.*positive"):
         _HttpServer(
             engine,
-            _Codec(),
+            _Recipe(),
             model="test",
             stream_interval=0 if setting == "stream_interval" else 1,
             request_queue_capacity=0 if setting == "request_queue_capacity" else 1024,

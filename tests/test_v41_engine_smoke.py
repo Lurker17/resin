@@ -30,12 +30,17 @@ def test_engine_smoke_runs_both_natural_widths_with_checkpoint_geometry(monkeypa
         assert config.moe_intermediate_size == 2304 and not config.engram_layer_ids
         assert config.dspark_noise_token_id < config.vocab_size
         tokenizer = Tokenizer.from_file(str(checkpoint / "tokenizer.json"))
-        prompt = DeepSeekV41Recipe(tokenizer).render_ids(
-            [
-                resin.recipe.Message(
-                    resin.recipe.Role.USER, [resin.recipe.Text("Count from 1 to 20.")]
-                )
-            ]
+        prompt = (
+            DeepSeekV41Recipe(tokenizer)
+            .render(
+                [
+                    resin.recipe.Message(
+                        resin.recipe.Role.USER,
+                        [resin.recipe.Text("Count from 1 to 20.")],
+                    )
+                ]
+            )
+            .token_ids
         )
         assert len(prompt) > 8 and all(
             0 <= token < config.vocab_size for token in prompt

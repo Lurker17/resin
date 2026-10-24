@@ -212,19 +212,10 @@ def validate_parallel(
         "probe": "What is the next integer after 41? Answer briefly.",
     }
     prompts = {
-        name: list(
-            map(
-                int,
-                recipe.render_ids(
-                    [
-                        resin.recipe.Message(
-                            resin.recipe.Role.USER, [resin.recipe.Text(text)]
-                        )
-                    ],
-                    options=resin.recipe.RenderOptions(add_generation_prompt=True),
-                ),
-            )
-        )
+        name: recipe.render(
+            [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(text)])],
+            options=resin.recipe.RenderOptions(add_generation_prompt=True),
+        ).token_ids.tolist()
         for name, text in texts.items()
     }
     prefix = (
@@ -352,12 +343,10 @@ def probe_prompt_scores(attention_oracle: bool = False):
         "Every request owns its cache pages. Expert workers may process tokens "
         "from independent request replicas. "
     ) * 6 + "Explain why cache namespaces must remain independent."
-    prompt = list(
-        recipe.render_ids(
-            [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(text)])],
-            options=resin.recipe.RenderOptions(add_generation_prompt=True),
-        )
-    )
+    prompt = recipe.render(
+        [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(text)])],
+        options=resin.recipe.RenderOptions(add_generation_prompt=True),
+    ).token_ids.tolist()
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]

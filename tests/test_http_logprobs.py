@@ -55,11 +55,13 @@ def test_byte_fallback_scores_preserve_raw_bytes_and_literal_metaspace(metaspace
         ([Replace("▁", " ")] if metaspace else []) + [ByteFallback(), Fuse()]
     )
 
-    class Codec:
-        tokenizer = backend
+    class Recipe:
+        stop_token_ids = []
+
+        tokenizer = resin.recipe.Tokenizer(backend)
 
         def render(self, messages, *, tools=(), options=None):
-            return resin.recipe.RenderedPrompt([0], stop_token_ids=[])
+            return resin.recipe.RenderedPrompt([0])
 
         def create_parser(self, prompt):
             class Parser:
@@ -80,7 +82,7 @@ def test_byte_fallback_scores_preserve_raw_bytes_and_literal_metaspace(metaspace
                 logprobs=np.asarray([-np.inf] * len(row), np.float32),
             )
 
-    with running_server(Runner(), Codec()) as (_, _, _, errors, base, _):
+    with running_server(Runner(), Recipe()) as (_, _, _, errors, base, _):
         with request(
             base,
             "/v1/chat/completions",
@@ -244,7 +246,7 @@ def scored_result(value: dict[str, Any], raw, api):
 
 
 def scored_exchange(
-    codec, ids, alternative, *, api, block, controls=None, partial_tokens=False
+    recipe, ids, alternative, *, api, block, controls=None, partial_tokens=False
 ):
     class Runner:
         offset = 0
@@ -291,7 +293,7 @@ def scored_exchange(
     )
     results = []
     for stream in (False, True):
-        with running_server(Runner(), codec) as (_, engine, _, errors, base, _):
+        with running_server(Runner(), recipe) as (_, engine, _, errors, base, _):
             with request(base, "/v1/" + api, {**body, "stream": stream}) as response:
                 result = collect_scores(
                     response, api=api, stream=stream, partial_tokens=partial_tokens
@@ -329,7 +331,7 @@ def recipe_controls(name):
 
 @pytest.mark.parametrize("api", ["chat/completions", "responses"])
 @pytest.mark.parametrize("block", [False, True])
-def test_generation_scores_travel_with_text_for_every_stock_codec(
+def test_generation_scores_travel_with_text_for_every_stock_recipe(
     scored_recipe, api, block
 ):
     name, adapter = scored_recipe
@@ -345,7 +347,7 @@ def test_generation_scores_travel_with_text_for_every_stock_codec(
     ids = adapter.encode(case)
     expected = normalize(adapter.oracles[0][1](case))
     result = scored_exchange(
-        adapter.codec,
+        adapter.recipe,
         ids,
         adapter.ordinary.encode("z").ids[0],
         api=api,
@@ -370,7 +372,7 @@ def test_generation_scores_travel_with_text_for_every_stock_codec(
 
 @pytest.mark.parametrize("api", ["chat/completions", "responses"])
 @pytest.mark.parametrize("stop_case", ["match", "mismatch", "length_prefix"])
-def test_stock_codec_stop_buffer_preserves_whole_token_scores(
+def test_stock_recipe_stop_buffer_preserves_whole_token_scores(
     scored_recipe, api, stop_case
 ):
     name, adapter = scored_recipe
@@ -399,7 +401,7 @@ def test_stock_codec_stop_buffer_preserves_whole_token_scores(
     elif stop_case == "match":
         expected = expected.split("STOP")[0]
     result = scored_exchange(
-        adapter.codec,
+        adapter.recipe,
         ids,
         adapter.ordinary.encode("z").ids[0],
         api=api,
@@ -423,7 +425,7 @@ def piece_recipe(name, pieces, *, terminal=True):
     from tokenizers import Tokenizer
 
     adapter = ADAPTERS[name]()
-    backend = Tokenizer.from_str(adapter.codec.tokenizer.to_str())
+    backend = Tokenizer.from_str(adapter.recipe.tokenizer.to_str())
     backend.add_tokens(pieces)
     piece_ids = [backend.token_to_id(piece) for piece in pieces]
     text_ids = adapter.ordinary.encode("".join(pieces)).ids
@@ -453,11 +455,11 @@ def piece_recipe(name, pieces, *, terminal=True):
 def test_stop_cutting_one_token_keeps_other_whole_token_scores(
     api, pieces, expected, whole, terminal
 ):
-    codec, ids, piece_ids = piece_recipe("inkling", pieces, terminal=terminal)
+    recipe, ids, piece_ids = piece_recipe("inkling", pieces, terminal=terminal)
     result = scored_exchange(
-        codec,
+        recipe,
         ids,
-        codec.tokenizer.encode("z").ids[0],
+        recipe.tokenizer.encode("z")[0],
         api=api,
         block=True,
         controls={"stop": ["STOP"]},
@@ -475,11 +477,11 @@ def test_stop_cutting_one_token_keeps_other_whole_token_scores(
 @pytest.mark.parametrize("api", ["chat/completions", "responses"])
 def test_qwen_trim_only_excludes_scores_for_partially_visible_tokens(api):
     pieces = ["  leading", " middle ", "trailing  "]
-    codec, ids, piece_ids = piece_recipe("qwen3_5", pieces)
+    recipe, ids, piece_ids = piece_recipe("qwen3_5", pieces)
     result = scored_exchange(
-        codec,
+        recipe,
         ids,
-        codec.tokenizer.encode("z").ids[0],
+        recipe.tokenizer.encode("z")[0],
         api=api,
         block=False,
         partial_tokens=True,
@@ -501,9 +503,9 @@ def test_prompt_scores_allow_zero_output_tokens(api, stream):
             "<|content_xml|>",
         ]
     )
-    codec = InklingRecipe(backend)
+    recipe = InklingRecipe(backend)
     request_input = {"messages": [{"role": "user", "content": "score this"}]}
-    prompt_ids = codec.render(
+    prompt_ids = recipe.render(
         [
             resin.recipe.Message(
                 role=resin.recipe.Role.USER, content=[resin.recipe.Text("score this")]
@@ -537,7 +539,7 @@ def test_prompt_scores_allow_zero_output_tokens(api, stream):
         "prompt_logprobs": True,
         "stream": stream,
     }
-    with running_server(Runner(), codec) as (_, engine, _, errors, base, _):
+    with running_server(Runner(), recipe) as (_, engine, _, errors, base, _):
         with request(base, "/v1/" + api, body) as response:
             if stream:
                 chunks = events(response)
@@ -557,22 +559,26 @@ def test_prompt_scores_allow_zero_output_tokens(api, stream):
                 scores = json.load(response)["resin"]["prompt_logprobs"]
         assert errors == [] and not engine.poisoned
     assert scores[0] is None
-    assert [score["token_id"] for score in scores[1:]] == prompt_ids[1:]
+    np.testing.assert_array_equal(
+        [score["token_id"] for score in scores[1:]], prompt_ids[1:]
+    )
     assert [score["logprob"] for score in scores[1:]] == pytest.approx(
         [-index / 100 for index in range(1, len(prompt_ids))]
     )
 
 
-def custom_scored_codec(*, with_spans, calls, invalid=None):
+def custom_scored_recipe(*, with_spans, calls, invalid=None):
     backend = _byte_tokenizer()
     ids = backend.encode("ab").ids
 
-    class Codec:
-        tokenizer = backend
+    class Recipe:
+        stop_token_ids = []
+
+        tokenizer = resin.recipe.Tokenizer(backend)
         invalid_spans = invalid
 
         def render(self, messages, *, tools=(), options=None):
-            return resin.recipe.RenderedPrompt([0], stop_token_ids=[])
+            return resin.recipe.RenderedPrompt([0])
 
         def create_parser(self, prompt):
             malformed = self.invalid_spans
@@ -639,7 +645,7 @@ def custom_scored_codec(*, with_spans, calls, invalid=None):
                 ),
             )
 
-    return Codec(), Runner(), ids
+    return Recipe(), Runner(), ids
 
 
 @pytest.mark.parametrize("with_spans", [False, True])
@@ -649,8 +655,8 @@ def test_custom_parser_ordinary_feed_preserves_provenance_for_all_requests(
     with_spans, scored, stream
 ):
     calls = []
-    codec, runner, ids = custom_scored_codec(with_spans=with_spans, calls=calls)
-    with running_server(runner, codec) as (_, engine, _, errors, base, _):
+    recipe, runner, ids = custom_scored_recipe(with_spans=with_spans, calls=calls)
+    with running_server(runner, recipe) as (_, engine, _, errors, base, _):
         with request(
             base,
             "/v1/chat/completions",
@@ -715,7 +721,7 @@ def test_invalid_source_spans_fail_every_request_without_poisoning_engine(
     from urllib.error import HTTPError
 
     calls = []
-    codec, runner, _ = custom_scored_codec(
+    recipe, runner, _ = custom_scored_recipe(
         with_spans=True, calls=calls, invalid=invalid
     )
     body = {
@@ -724,12 +730,12 @@ def test_invalid_source_spans_fail_every_request_without_poisoning_engine(
         "max_tokens": 2,
         "logprobs": scored,
     }
-    with running_server(runner, codec) as (_, engine, _, errors, base, _):
+    with running_server(runner, recipe) as (_, engine, _, errors, base, _):
         with pytest.raises(HTTPError) as caught:
             request(base, "/v1/chat/completions", body)
         assert caught.value.code == 500
         assert "parser" in caught.value.read().decode()
-        codec.invalid_spans = None
+        recipe.invalid_spans = None
         with request(base, "/v1/chat/completions", body) as response:
             assert json.load(response)["choices"][0]["message"]["content"] == "ab"
         assert not engine.poisoned and not engine.has_work() and errors == []
