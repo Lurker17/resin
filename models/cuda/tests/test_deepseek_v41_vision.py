@@ -141,8 +141,9 @@ def test_image_embeddings_reuse_features_across_chunks_and_prefix_restore():
     assert len(calls) == 2
     text = plan_for(media, 10, 12)
     assert runner._media_embeddings(text, 0, torch.tensor([[9, 10]])) is None
-    with pytest.raises(ValueError, match="changed its media object"):
-        runner._validate_plan(plan_for(media_fixture(), 0, 5))
+    changed = DeepSeekV41Media(media.token_ids[:-1] + (11,), media.images)
+    with pytest.raises(ValueError, match="changed its media or prompt"):
+        runner._validate_plan(plan_for(changed, 0, 5))
 
 
 def test_image_validation_rejects_unbacked_or_mismatched_prompt_tokens():

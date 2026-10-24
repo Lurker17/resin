@@ -358,10 +358,18 @@ class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
                     "image media does not match the V4.1 vision checkpoint"
                 )
             existing = self._media_features.get(int(plan.sequence_ids[slot]))
-            if existing is not None and existing[0] is not media:
-                raise ValueError(
-                    "a live DeepSeek V4.1 sequence changed its media object"
-                )
+            if existing is not None:
+                cached_media = existing[0]
+                # Follower ranks unpickle a fresh object on each plan. Compare
+                # its prepared identity without rehashing image tensors.
+                if cached_media is not media and (
+                    cached_media.digest != media.digest
+                    or cached_media.token_ids != media.token_ids
+                    or cached_media.image_token_id != media.image_token_id
+                ):
+                    raise ValueError(
+                        "a live DeepSeek V4.1 sequence changed its media or prompt"
+                    )
             start = int(plan.context_lengths[slot])
             prompt_tokens = min(len(tokens), max(0, len(media.token_ids) - start))
             if (
