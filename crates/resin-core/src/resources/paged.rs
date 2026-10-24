@@ -744,7 +744,7 @@ impl CachePool {
             return Err(CachePoolError::TooManyGroups);
         }
         let id = NEXT_POOL_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| CachePoolError::PoolIdExhausted)?;

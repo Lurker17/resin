@@ -107,7 +107,7 @@ impl From<PlanningError> for Error {
 static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
 fn mint_engine_id() -> Result<u64> {
     NEXT_ENGINE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
         })
         .map_err(|_| Error::internal("engine id space is exhausted"))
