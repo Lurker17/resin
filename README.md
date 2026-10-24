@@ -164,7 +164,7 @@ Pass `prefix_cache=True` to reuse aligned prefixes across requests.
 
 `Engine(overlap=True)` enables device submission/completion overlap when the
 runner provides it. The initial DeepSeek CUDA path covers stable decode cohorts;
-token stops, generated-token logprobs and ownership changes take a synchronous
+generated-token logprobs and ownership changes take a synchronous
 fallback. Use `overlap=False` for reference execution. See
 [Engine overlap](docs/architecture.md#engine-overlap).
 
@@ -176,8 +176,11 @@ prompt rendering and incremental response parsing live in the independent
 `resin-recipe` Rust crate. Python prepares media tensors and may supply custom
 protocol-compatible codecs.
 
-The bridge bounds queued jobs (32), active requests (128), admissions before
-an inference step (4), and buffered events per client (64). A full admission
+The bridge bounds queued jobs with `HttpServer(request_queue_capacity=1024)`.
+This shared intake queue absorbs bursts while requests await engine admission;
+it does not reserve GPU cache or change the engine's active batch size. Active
+HTTP sessions (128 per replica), admissions before an inference step (4 per
+replica), and buffered events per client (64) remain bounded. A full intake
 queue returns HTTP 429; slow or disconnected clients are cancelled without
 blocking other requests. Actor failure stops the listener, and
 `HttpServer.shutdown()` requests shutdown after the current model step.

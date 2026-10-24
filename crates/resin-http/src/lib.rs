@@ -25,7 +25,6 @@ pub use protocol::{
     TokenLogprob,
 };
 
-pub const JOB_QUEUE_CAPACITY: usize = 32;
 pub const EVENT_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy, Debug)]

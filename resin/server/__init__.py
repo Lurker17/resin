@@ -33,6 +33,10 @@ class HttpServer:
     accumulated, checked at step boundaries. The first semantic output is sent
     immediately, and completion flushes the remainder. Stop matching and
     cancellation still run on every step.
+
+    request_queue_capacity bounds requests waiting for engine admission across
+    all replicas. It does not change the engine's active batch size. A full
+    queue returns HTTP 429 so clients can retry with backoff.
     """
 
     def __init__(
@@ -42,6 +46,7 @@ class HttpServer:
         codec: ConversationCodec,
         model: str | None = None,
         stream_interval: int = 1,
+        request_queue_capacity: int = 1024,
         enable_openai: bool = True,
         enable_anthropic: bool = True,
         enable_demo: bool = True,
@@ -59,6 +64,13 @@ class HttpServer:
             ):
                 raise ValueError(
                     "stream_interval must be a positive integer fitting u32"
+                )
+            if (
+                type(request_queue_capacity) is not int
+                or not 1 <= request_queue_capacity <= 2**32 - 1
+            ):
+                raise ValueError(
+                    "request_queue_capacity must be a positive integer fitting u32"
                 )
             if model is None:
                 model = getattr(getattr(codec, "tokenizer", None), "name_or_path", None)
@@ -87,6 +99,7 @@ class HttpServer:
                     enable_anthropic,
                     enable_demo,
                     stream_interval,
+                    request_queue_capacity,
                 )
             )
             states = engine.worker._drivers(
@@ -128,6 +141,7 @@ class HttpServer:
                     codec,
                     model=model,
                     stream_interval=stream_interval,
+                    request_queue_capacity=request_queue_capacity,
                     enable_openai=enable_openai,
                     enable_anthropic=enable_anthropic,
                     enable_demo=enable_demo,

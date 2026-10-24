@@ -841,6 +841,7 @@ class _HttpServer:
         *,
         model: str,
         stream_interval: int = 1,
+        request_queue_capacity: int = 1024,
         enable_openai: bool = True,
         enable_anthropic: bool = True,
         enable_demo: bool = True,

@@ -12,7 +12,7 @@ use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
 };
-use resin_http::{GenerationJob, JOB_QUEUE_CAPACITY, RouteConfig};
+use resin_http::{GenerationJob, RouteConfig};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::Engine;
@@ -28,6 +28,7 @@ pub(crate) struct NativeHttpServer {
     codec: Py<PyAny>,
     model: String,
     stream_interval: u32,
+    request_queue_capacity: u32,
     routes: RouteConfig,
     running: AtomicBool,
     shutdown: Mutex<Option<watch::Sender<bool>>>,
@@ -42,6 +43,7 @@ impl NativeHttpServer {
         *,
         model,
         stream_interval = 1,
+        request_queue_capacity = 1024,
         enable_openai = true,
         enable_anthropic = true,
         enable_demo = true,
@@ -53,6 +55,7 @@ impl NativeHttpServer {
         codec: Py<PyAny>,
         model: String,
         stream_interval: u32,
+        request_queue_capacity: u32,
         enable_openai: bool,
         enable_anthropic: bool,
         enable_demo: bool,
@@ -60,6 +63,11 @@ impl NativeHttpServer {
     ) -> PyResult<Self> {
         if stream_interval == 0 {
             return Err(PyValueError::new_err("stream_interval must be positive"));
+        }
+        if request_queue_capacity == 0 {
+            return Err(PyValueError::new_err(
+                "request_queue_capacity must be positive",
+            ));
         }
         let routed_dp_size = distributed
             .as_ref()
@@ -85,6 +93,7 @@ impl NativeHttpServer {
             codec,
             model,
             stream_interval,
+            request_queue_capacity,
             routes: RouteConfig {
                 enable_openai,
                 enable_anthropic,
@@ -118,6 +127,7 @@ impl NativeHttpServer {
         let model = self.model.clone();
         let routes = self.routes;
         let stream_interval = self.stream_interval;
+        let request_queue_capacity = self.request_queue_capacity;
         let result = py.detach(move || {
             run_server(
                 engine,
@@ -126,6 +136,7 @@ impl NativeHttpServer {
                 model,
                 routes,
                 stream_interval,
+                request_queue_capacity,
                 SocketAddr::new(host, port),
                 shutdown,
             )
@@ -165,9 +176,10 @@ impl NativeHttpServer {
 
     fn __repr__(&self) -> String {
         format!(
-            "_HttpServer(model={:?}, stream_interval={}, enable_openai={}, enable_anthropic={}, enable_demo={}, running={})",
+            "_HttpServer(model={:?}, stream_interval={}, request_queue_capacity={}, enable_openai={}, enable_anthropic={}, enable_demo={}, running={})",
             self.model,
             self.stream_interval,
+            self.request_queue_capacity,
             self.routes.enable_openai,
             self.routes.enable_anthropic,
             self.routes.enable_demo,
@@ -184,6 +196,7 @@ fn run_server(
     model: String,
     routes: RouteConfig,
     stream_interval: u32,
+    request_queue_capacity: u32,
     address: SocketAddr,
     shutdown: watch::Sender<bool>,
 ) -> Result<(), String> {
@@ -194,7 +207,7 @@ fn run_server(
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind(address))
         .map_err(|error| format!("failed to bind {address}: {error}"))?;
-    let (jobs, receiver) = mpsc::channel(JOB_QUEUE_CAPACITY);
+    let (jobs, receiver) = mpsc::channel(request_queue_capacity as usize);
     let actor_shutdown = shutdown.subscribe();
     let (actor_finished, actor_done) = oneshot::channel();
     let actor = thread::Builder::new()
