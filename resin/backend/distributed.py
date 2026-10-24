@@ -6,15 +6,15 @@ its existing step boundary; model runtimes own partitioning and device collectiv
 
 from __future__ import annotations
 
-import pickle
 from collections.abc import Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Protocol
+from typing import Protocol
 
 from resin import BatchPhase, BatchPlan, Engine, ForwardOutput, Runner, RunnerConfig
+from resin.backend.command_transport import CommandTransport
 from resin.backend.control_plane import ControlOperation, ControlPlane
-from resin.backend.parallel import batch_plan_from_payload, batch_plan_payload
+from resin.backend.plan_transport import PlanTransport
 from resin.backend.topology import ParallelGroups, RankGroup
 
 
@@ -127,6 +127,10 @@ class DistributedWorker:
         self._forward, self._validate, self._enqueue = None, None, None
         self._completion = None
         self._control = ControlPlane(groups.distributed)
+        self._plans = PlanTransport()
+        self._wire = CommandTransport(
+            groups.distributed, groups.replica.handle, source=groups.replica.source
+        )
         lookahead = None
         error = None
         try:
@@ -250,11 +254,7 @@ class DistributedWorker:
             raise DistributedExecutionError("workers are closed")
         if self.groups.replica.size > 1:
             try:
-                self.groups.distributed.broadcast_object_list(
-                    [command],
-                    src=self.groups.replica.source,
-                    group=self.groups.replica.handle,
-                )
+                self._wire.send(command)
             except BaseException as exc:
                 self.failure = _message(exc)
                 raise DistributedExecutionError(self.failure) from exc
@@ -277,6 +277,7 @@ class DistributedWorker:
                 release = getattr(self.runner, "release", None)
                 if release is not None:
                     release(command["ids"])
+                self._plans.release(command["ids"])
             else:
                 raise ValueError(f"unknown worker operation: {operation}")
         except BaseException as exc:
@@ -330,9 +331,7 @@ class DistributedWorker:
                 if plan.phase != self._phase:
                     raise ValueError("local plan disagrees with the coordinated phase")
                 if self.groups.replica.size > 1:
-                    payload = pickle.dumps(
-                        batch_plan_payload(plan), protocol=pickle.HIGHEST_PROTOCOL
-                    )
+                    payload = self._plans.prepare(plan)
         except BaseException as exc:
             error = _message(exc)
         descriptors = self._drivers(
@@ -372,7 +371,7 @@ class DistributedWorker:
         error, context, prepared = None, None, None
         try:
             if plan is None and command["payload"] is not None:
-                plan = batch_plan_from_payload(pickle.loads(command["payload"]))
+                plan = self._plans.restore(command["payload"])
             context = StepContext(
                 self.groups,
                 command["step_id"],
@@ -437,13 +436,7 @@ class DistributedWorker:
         if self.groups.is_driver:
             raise ValueError("replica drivers construct DistributedEngine instead")
         while True:
-            commands: list[dict[str, Any]] = [{}]
-            self.groups.distributed.broadcast_object_list(
-                commands,
-                src=self.groups.replica.source,
-                group=self.groups.replica.handle,
-            )
-            command = commands[0]
+            command = self._wire.receive()
             operation = command["operation"]
             if operation == "close":
                 if self._completion is not None and not command["error"]:
@@ -452,6 +445,7 @@ class DistributedWorker:
                 self.closed = True
                 if command["error"]:
                     raise DistributedExecutionError(command["error"])
+                self._plans.clear()
                 return
             try:
                 if operation == "forward":
@@ -636,6 +630,7 @@ class DistributedEngine:
         self.worker.closed = self.closed = True
         if failure:
             raise DistributedExecutionError(failure)
+        self.worker._plans.clear()
 
 
 __all__ = [

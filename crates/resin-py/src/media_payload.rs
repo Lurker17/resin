@@ -3,8 +3,13 @@
 use numpy::{
     IntoPyArray, PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn, PyUntypedArrayMethods, ndarray,
 };
-use pyo3::{exceptions::PyValueError, prelude::*, types::PyTuple};
+use pyo3::{
+    exceptions::{PyTypeError, PyValueError},
+    prelude::*,
+    types::{PyBytes, PyTuple},
+};
 use resin_recipe::media::{Tensor, qwen};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sha3::{
     Shake256,
@@ -151,20 +156,6 @@ pub(crate) struct InklingMedia {
 }
 #[pymethods]
 impl InklingMedia {
-    fn __reduce__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok((
-            py.get_type::<Self>(),
-            (
-                self.token_ids(py)?,
-                self.marker,
-                self.pixels.as_ref().map(|p| p.clone_ref(py)),
-            ),
-        )
-            .into_pyobject(py)?
-            .into_any()
-            .unbind())
-    }
-
     #[new]
     #[pyo3(signature=(token_ids, image_token_id, pixel_values=None))]
     fn new(
@@ -257,23 +248,6 @@ pub(crate) struct Qwen35Media {
 }
 #[pymethods]
 impl Qwen35Media {
-    fn __reduce__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok((
-            py.get_type::<Self>(),
-            (
-                self.token_ids(py)?,
-                self.image_positions(py)?,
-                self.pixels.clone_ref(py),
-                self.grids.clone_ref(py),
-                self.merge,
-                self.marker,
-            ),
-        )
-            .into_pyobject(py)?
-            .into_any()
-            .unbind())
-    }
-
     #[new]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -332,23 +306,6 @@ pub(crate) struct Gemma4Media {
 }
 #[pymethods]
 impl Gemma4Media {
-    fn __reduce__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok((
-            py.get_type::<Self>(),
-            (
-                self.token_ids(py)?,
-                self.mm_token_type_ids(py)?,
-                self.pixels.as_ref().map(|p| p.clone_ref(py)),
-                self.positions.as_ref().map(|p| p.clone_ref(py)),
-                self.video_pixels.as_ref().map(|p| p.clone_ref(py)),
-                self.video_positions.as_ref().map(|p| p.clone_ref(py)),
-            ),
-        )
-            .into_pyobject(py)?
-            .into_any()
-            .unbind())
-    }
-
     #[new]
     #[pyo3(signature=(token_ids, mm_token_type_ids, pixel_values=None, image_position_ids=None, pixel_values_videos=None, video_position_ids=None))]
     #[allow(clippy::too_many_arguments)]
@@ -536,22 +493,6 @@ pub(crate) struct DeepSeekV41Image {
 }
 #[pymethods]
 impl DeepSeekV41Image {
-    fn __reduce__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok((
-            py.get_type::<Self>(),
-            (
-                self.start,
-                self.patches.clone_ref(py),
-                self.height,
-                self.width,
-                self.types.clone(),
-            ),
-        )
-            .into_pyobject(py)?
-            .into_any()
-            .unbind())
-    }
-
     #[new]
     fn new(
         py: Python<'_>,
@@ -610,16 +551,6 @@ pub(crate) struct DeepSeekV41Media {
 }
 #[pymethods]
 impl DeepSeekV41Media {
-    fn __reduce__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok((
-            py.get_type::<Self>(),
-            (self.token_ids(py)?, self.images(py)?, self.marker),
-        )
-            .into_pyobject(py)?
-            .into_any()
-            .unbind())
-    }
-
     #[new]
     #[pyo3(signature=(token_ids, images, image_token_id=129264))]
     fn new(
@@ -796,4 +727,239 @@ pub(crate) fn contiguous_ranges(positions: &[usize]) -> Vec<(usize, usize)> {
         result.push((position, 1));
     }
     result
+}
+
+/// Request registration metadata. Tensor storage travels separately, without
+/// serialization into Python objects or bytes. Tags identify fixed native types.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MediaTransfer {
+    version: u8,
+    media: MediaDescriptor,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum MediaDescriptor {
+    Inkling {
+        marker: u32,
+        pixels: bool,
+    },
+    Qwen {
+        positions: Vec<usize>,
+        merge: usize,
+        marker: u32,
+    },
+    Gemma {
+        images: bool,
+        videos: bool,
+    },
+    DeepSeek {
+        marker: u32,
+        images: Vec<ImageDescriptor>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageDescriptor {
+    start: usize,
+    height: usize,
+    width: usize,
+    types: Vec<u32>,
+}
+
+fn push_buffer<T: numpy::Element>(
+    py: Python<'_>,
+    buffers: &mut Vec<Py<PyAny>>,
+    value: &Py<PyArrayDyn<T>>,
+) {
+    buffers.push(value.clone_ref(py).into_any());
+}
+
+fn push_values<T: numpy::Element>(
+    owner: &Bound<'_, PyAny>,
+    buffers: &mut Vec<Py<PyAny>>,
+    values: &[T],
+) {
+    buffers.push(
+        crate::arrays::readonly_view(owner.clone(), values)
+            .into_any()
+            .unbind(),
+    );
+}
+
+#[pyfunction]
+pub(crate) fn _media_to_buffers(
+    py: Python<'_>,
+    media: &Bound<'_, PyAny>,
+) -> PyResult<(Py<PyBytes>, Py<PyTuple>)> {
+    let mut buffers = Vec::new();
+    let descriptor = if let Ok(value) = media.cast::<InklingMedia>() {
+        let value = value.borrow();
+        push_values(media, &mut buffers, &value.identity.tokens);
+        if let Some(pixels) = &value.pixels {
+            push_buffer(py, &mut buffers, pixels);
+        }
+        MediaDescriptor::Inkling {
+            marker: value.marker,
+            pixels: value.pixels.is_some(),
+        }
+    } else if let Ok(value) = media.cast::<Qwen35Media>() {
+        let value = value.borrow();
+        push_values(media, &mut buffers, &value.identity.tokens);
+        push_buffer(py, &mut buffers, &value.pixels);
+        push_buffer(py, &mut buffers, &value.grids);
+        MediaDescriptor::Qwen {
+            positions: value.positions.clone(),
+            merge: value.merge,
+            marker: value.marker,
+        }
+    } else if let Ok(value) = media.cast::<Gemma4Media>() {
+        let value = value.borrow();
+        push_values(media, &mut buffers, &value.identity.tokens);
+        push_values(media, &mut buffers, &value.types);
+        if let (Some(pixels), Some(positions)) = (&value.pixels, &value.positions) {
+            push_buffer(py, &mut buffers, pixels);
+            push_buffer(py, &mut buffers, positions);
+        }
+        if let (Some(pixels), Some(positions)) = (&value.video_pixels, &value.video_positions) {
+            push_buffer(py, &mut buffers, pixels);
+            push_buffer(py, &mut buffers, positions);
+        }
+        MediaDescriptor::Gemma {
+            images: value.pixels.is_some(),
+            videos: value.video_pixels.is_some(),
+        }
+    } else if let Ok(value) = media.cast::<DeepSeekV41Media>() {
+        let value = value.borrow();
+        push_values(media, &mut buffers, &value.identity.tokens);
+        let images = value
+            .images
+            .iter()
+            .map(|image| {
+                let image = image.borrow(py);
+                push_buffer(py, &mut buffers, &image.patches);
+                ImageDescriptor {
+                    start: image.start,
+                    height: image.height,
+                    width: image.width,
+                    types: image.types.clone(),
+                }
+            })
+            .collect();
+        MediaDescriptor::DeepSeek {
+            marker: value.marker,
+            images,
+        }
+    } else {
+        return Err(PyTypeError::new_err(
+            "distributed media must be a native Resin media payload; custom media is supported only for local execution",
+        ));
+    };
+    let metadata = serde_json::to_vec(&MediaTransfer {
+        version: 1,
+        media: descriptor,
+    })
+    .map_err(error)?;
+    Ok((PyBytes::new(py, &metadata).unbind(), tuple(py, buffers)?))
+}
+
+fn take_buffer<T: numpy::Element + Copy>(
+    py: Python<'_>,
+    buffers: &mut impl Iterator<Item = Py<PyAny>>,
+) -> PyResult<Tensor<T>> {
+    let value = buffers
+        .next()
+        .ok_or_else(|| error("media transfer is missing a tensor buffer"))?;
+    let array = value.bind(py).extract::<PyReadonlyArrayDyn<'_, T>>()?;
+    Tensor::new(
+        array.shape().to_vec(),
+        array.as_array().iter().copied().collect(),
+    )
+    .map_err(error)
+}
+
+#[pyfunction]
+pub(crate) fn _media_from_buffers(
+    py: Python<'_>,
+    metadata: &[u8],
+    buffers: Vec<Py<PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    let descriptor: MediaTransfer = serde_json::from_slice(metadata).map_err(error)?;
+    if descriptor.version != 1 {
+        return Err(error("unsupported media transfer version"));
+    }
+    let mut buffers = buffers.into_iter();
+    let tokens = take_buffer::<u32>(py, &mut buffers)?;
+    if tokens.shape.len() != 1 {
+        return Err(error("media transfer token IDs must have rank 1"));
+    }
+    let tokens = tokens.data;
+    let media = match descriptor.media {
+        MediaDescriptor::Inkling { marker, pixels } => {
+            let pixels = pixels.then(|| take_buffer(py, &mut buffers)).transpose()?;
+            Py::new(py, InklingMedia::build(py, tokens, marker, pixels)?)?.into_any()
+        }
+        MediaDescriptor::Qwen {
+            positions,
+            merge,
+            marker,
+        } => {
+            let pixels = take_buffer(py, &mut buffers)?;
+            let grids = take_buffer(py, &mut buffers)?;
+            Py::new(
+                py,
+                Qwen35Media::build(py, tokens, positions, pixels, grids, merge, marker)?,
+            )?
+            .into_any()
+        }
+        MediaDescriptor::Gemma { images, videos } => {
+            let types = take_buffer::<u8>(py, &mut buffers)?;
+            if types.shape.len() != 1 {
+                return Err(error("media transfer token types must have rank 1"));
+            }
+            let pixels = images.then(|| take_buffer(py, &mut buffers)).transpose()?;
+            let positions = images.then(|| take_buffer(py, &mut buffers)).transpose()?;
+            let video_pixels = videos.then(|| take_buffer(py, &mut buffers)).transpose()?;
+            let video_positions = videos.then(|| take_buffer(py, &mut buffers)).transpose()?;
+            Py::new(
+                py,
+                Gemma4Media::build(
+                    py,
+                    tokens,
+                    types.data,
+                    pixels,
+                    positions,
+                    video_pixels,
+                    video_positions,
+                )?,
+            )?
+            .into_any()
+        }
+        MediaDescriptor::DeepSeek { marker, images } => {
+            let images = images
+                .into_iter()
+                .map(|image| {
+                    let patches = take_buffer(py, &mut buffers)?;
+                    Py::new(
+                        py,
+                        DeepSeekV41Image::build(
+                            py,
+                            image.start,
+                            patches,
+                            image.height,
+                            image.width,
+                            image.types,
+                        )?,
+                    )
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            Py::new(py, DeepSeekV41Media::build(py, tokens, images, marker)?)?.into_any()
+        }
+    };
+    if buffers.next().is_some() {
+        return Err(error("media transfer has unexpected tensor buffers"));
+    }
+    Ok(media)
 }

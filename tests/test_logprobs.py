@@ -15,7 +15,7 @@ from resin import (
     RunnerConfig,
     SamplingParams,
 )
-from resin.backend.parallel import batch_plan_from_payload, batch_plan_payload
+from resin.backend.plan_transport import PlanTransport
 from resin.backend.sampling import TorchSampler, format_output
 
 
@@ -75,7 +75,7 @@ def test_logprob_options_survive_broadcast_and_do_not_change_sampling():
     params = SamplingParams(seed=7, top_k=2, top_logprobs=3)
     assert params.logprobs
     plan = BatchPlan([1], [0], [0], [0, 1], sampling_params=[params])
-    restored = batch_plan_from_payload(batch_plan_payload(plan))
+    restored = PlanTransport().restore(PlanTransport().prepare(plan))
     assert restored.sampling_params[0].top_logprobs == 3
     assert restored.needs_logprobs
     assert not BatchPlan(

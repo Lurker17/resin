@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import pickle
 from types import SimpleNamespace
 from typing import Any
@@ -63,8 +64,18 @@ def render_media(recipe, blocks):
     return prompt.media
 
 
-def assert_pickle_roundtrip(media, *array_fields):
-    restored = pickle.loads(pickle.dumps(media))
+def assert_buffer_roundtrip(media, *array_fields) -> Any:
+    metadata, buffers = resin._resin._media_to_buffers(media)
+    assert json.loads(metadata)["version"] == 1
+    assert isinstance(buffers, tuple)
+    assert buffers[0].dtype == np.uint32
+    assert not buffers[0].flags.writeable
+    assert tuple(buffers[0]) == media.token_ids
+    assert all(value.flags.c_contiguous for value in buffers)
+    assert "__reduce__" not in type(media).__dict__
+    with pytest.raises(TypeError):
+        pickle.dumps(media)
+    restored: Any = resin._resin._media_from_buffers(metadata, buffers)
     assert type(restored) is type(media)
     assert restored.token_ids == media.token_ids
     assert restored.token_spans == media.token_spans
@@ -72,9 +83,58 @@ def assert_pickle_roundtrip(media, *array_fields):
     assert restored.cache_key == media.cache_key
     for name in array_fields:
         original, copied = getattr(media, name), getattr(restored, name)
+        if name != "position_ids":  # Qwen derives mRoPE on registration.
+            assert any(value is original for value in buffers), name
         assert np.array_equal(original, copied), name
         assert not np.shares_memory(original, copied), name
     return restored
+
+
+def test_media_transfer_rejects_unknown_types_versions_and_malformed_buffers():
+    custom: Any = SimpleNamespace(token_ids=(1,))
+    with pytest.raises(TypeError, match="custom media.*local"):
+        resin._resin._media_to_buffers(custom)
+    media = resin._resin.InklingMedia(
+        (2, 8), 8, np.ones((1, 1, 2, 2, 3), dtype=np.float32)
+    )
+    metadata, buffers = resin._resin._media_to_buffers(media)
+    descriptor = json.loads(metadata)
+    descriptor["version"] = 99
+    with pytest.raises(ValueError, match="version"):
+        resin._resin._media_from_buffers(json.dumps(descriptor).encode(), buffers)
+    descriptor = json.loads(metadata)
+    descriptor["media"]["type"] = "builtins.eval"
+    with pytest.raises(ValueError, match="unknown variant"):
+        resin._resin._media_from_buffers(json.dumps(descriptor).encode(), buffers)
+    with pytest.raises(ValueError, match="missing.*buffer"):
+        resin._resin._media_from_buffers(metadata, buffers[:-1])
+    with pytest.raises(ValueError, match="unexpected.*buffer"):
+        resin._resin._media_from_buffers(metadata, (*buffers, buffers[-1]))
+    with pytest.raises(TypeError):
+        resin._resin._media_from_buffers(
+            metadata, (buffers[0].astype(np.int64), *buffers[1:])
+        )
+    with pytest.raises(ValueError, match="rank 1"):
+        resin._resin._media_from_buffers(metadata, (buffers[0][None], *buffers[1:]))
+    with pytest.raises(ValueError, match="placeholder count"):
+        resin._resin._media_from_buffers(
+            metadata, (buffers[0], np.ones((2, 1, 2, 2, 3), dtype=np.float32))
+        )
+
+
+def test_media_transfer_snapshots_receiver_and_keeps_sender_buffers_alive():
+    media = resin._resin.InklingMedia(
+        (2, 8), 8, np.ones((1, 1, 2, 2, 3), dtype=np.float32)
+    )
+    metadata, buffers = resin._resin._media_to_buffers(media)
+    assert buffers[1] is media.pixel_values
+    del media
+    # The token view owns its frozen native payload, including its other arrays.
+    assert buffers[0].tolist() == [2, 8]
+    restored: Any = resin._resin._media_from_buffers(metadata, buffers)
+    before = restored.pixel_values.copy()
+    buffers[1].fill(0)
+    np.testing.assert_array_equal(restored.pixel_values, before)
 
 
 def test_image_sources_share_one_owned_rgb_boundary() -> None:
@@ -92,7 +152,7 @@ def test_image_sources_share_one_owned_rgb_boundary() -> None:
         resin.recipe.Image("data:image/png;base64," + base64.b64encode(raw).decode()),
     )
     payloads = [render_media(recipe, [source]) for source in sources]
-    assert_pickle_roundtrip(payloads[0], "pixel_values")
+    assert_buffer_roundtrip(payloads[0], "pixel_values")
     for payload in payloads:
         assert np.array_equal(payload.pixel_values, payloads[0].pixel_values)
         assert payload.pixel_values.flags.c_contiguous
@@ -155,7 +215,7 @@ def test_gemma_interleaved_geometry_and_atomic_spans() -> None:
     frames.fill(0)
     assert media.pixel_values[0, 0].sum() == 3
     assert media.pixel_values_videos[0, :, 0].sum() == 18
-    restored = assert_pickle_roundtrip(
+    restored = assert_buffer_roundtrip(
         media,
         "pixel_values",
         "image_position_ids",
@@ -185,7 +245,7 @@ def test_qwen_and_inkling_native_patch_counts_and_layout() -> None:
     assert media.pixel_values.shape == (8, 24)
     assert np.count_nonzero(media.pixel_values) == 0
     assert media.token_spans == ()
-    restored = assert_pickle_roundtrip(
+    restored = assert_buffer_roundtrip(
         media, "pixel_values", "image_grid_thw", "position_ids"
     )
     assert restored.rope_delta == media.rope_delta
@@ -219,8 +279,11 @@ def test_deepseek_geometry_positions_and_cache_identity() -> None:
     assert media.cache_key == repeated.cache_key
     source.fill(0)
     assert np.all(media.images[0].patches == 1)
-    restored = assert_pickle_roundtrip(media)
+    restored = assert_buffer_roundtrip(media)
     for actual, expected in zip(restored.images, media.images, strict=True):
+        assert "__reduce__" not in type(actual).__dict__
+        with pytest.raises(TypeError):
+            pickle.dumps(actual)
         assert actual.start == expected.start
         assert actual.n_vit_h == expected.n_vit_h
         assert actual.n_vit_w == expected.n_vit_w
@@ -251,9 +314,7 @@ def test_native_media_does_not_import_python_image_or_tensor_libraries() -> None
 
     encoded = io.BytesIO()
     Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8)).save(encoded, format="PNG")
-    script = "import resin\nimport numpy as np\nimport pickle\n" + inspect.getsource(
-        Tokenizer
-    )
+    script = "import resin\nimport numpy as np\n" + inspect.getsource(Tokenizer)
     script += textwrap.dedent(f"""
         import importlib.abc
         import sys
@@ -279,7 +340,7 @@ def test_native_media_does_not_import_python_image_or_tensor_libraries() -> None
             prompt = recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [image])])
             assert prompt.media is not None
             assert isinstance(prompt.media.token_ids, tuple)
-            assert pickle.loads(pickle.dumps(prompt.media)).cache_key == prompt.media.cache_key
+            assert resin._resin._media_from_buffers(*resin._resin._media_to_buffers(prompt.media)).cache_key == prompt.media.cache_key
             if name == 'InklingRecipe':
                 encoded = resin.recipe.Image.from_bytes({encoded.getvalue()!r}, media_type='image/png')
                 assert recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [encoded])]).media is not None

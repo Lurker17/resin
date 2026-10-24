@@ -9,7 +9,9 @@ from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
 
-from resin import BatchPhase, BatchPlan, CacheGroupPlan, SamplingParams
+from resin import BatchPlan
+from resin.backend.command_transport import CommandTransport
+from resin.backend.plan_transport import PlanTransport
 
 
 def monitor_process_context(process_context: Any, label: str) -> None:
@@ -32,108 +34,26 @@ def monitor_process_context(process_context: Any, label: str) -> None:
     ).start()
 
 
-def batch_plan_payload(plan: BatchPlan) -> dict[str, Any]:
-    """Serialize the Python-visible parts of a plan for follower ranks."""
-
-    phase = "prefill" if plan.phase == BatchPhase.PREFILL else "decode"
-    return {
-        "phase": phase,
-        "batch_id": plan.batch_id,
-        "batch_key": plan.batch_key,
-        "token_ids": plan.token_ids,
-        "sequence_ids": plan.sequence_ids,
-        "token_indptr": plan.token_indptr,
-        "context_lengths": plan.context_lengths,
-        "prefill_lengths": plan.prefill_lengths,
-        "sampling_params": [
-            {
-                "temperature": params.temperature,
-                "top_p": params.top_p,
-                "top_k": params.top_k,
-                "seed": params.seed,
-                "logprobs": params.logprobs,
-                "top_logprobs": params.top_logprobs,
-                "prompt_logprobs": params.prompt_logprobs,
-                "prompt_top_logprobs": params.prompt_top_logprobs,
-                "extra": params.extra,
-            }
-            for params in plan.sampling_params
-        ],
-        "sampling_mask": plan.sampling_mask,
-        "prompt_score_indices": plan.prompt_score_indices,
-        "prompt_score_token_ids": plan.prompt_score_token_ids,
-        "prompt_score_indptr": plan.prompt_score_indptr,
-        "prompt_score_top_counts": plan.prompt_score_top_counts,
-        "prompt_target_indptr": plan.prompt_target_indptr,
-        "prompt_target_token_ids": plan.prompt_target_token_ids,
-        "media": plan.media,
-        "cache_groups": [
-            {
-                "group_index": group.group_index,
-                "blocks_per_slab": group.blocks_per_slab,
-                "block_indptr": group.block_indptr,
-                "block_slab_ids": group.block_slab_ids,
-                "block_slotnums": group.block_slotnums,
-                "block_table_start_indices": group.block_table_start_indices,
-                "append_slab_ids": group.append_slab_ids,
-                "append_slotnums": group.append_slotnums,
-                "append_block_offsets": group.append_block_offsets,
-            }
-            for group in plan.cache_groups
-        ],
-    }
-
-
-def batch_plan_from_payload(payload: dict[str, Any]) -> BatchPlan:
-    """Rebuild a frozen plan on a tensor-parallel follower rank."""
-
-    phase = BatchPhase.PREFILL if payload["phase"] == "prefill" else BatchPhase.DECODE
-    sampling_params = [
-        SamplingParams(**values) for values in payload["sampling_params"]
-    ]
-    cache_groups = [CacheGroupPlan(**values) for values in payload["cache_groups"]]
-    return BatchPlan(
-        payload["sequence_ids"],
-        payload["context_lengths"],
-        payload["token_ids"],
-        payload["token_indptr"],
-        prefill_lengths=payload.get("prefill_lengths"),
-        phase=phase,
-        batch_id=payload["batch_id"],
-        batch_key=payload["batch_key"],
-        cache_groups=cache_groups,
-        sampling_mask=payload["sampling_mask"],
-        sampling_params=sampling_params,
-        media=payload["media"],
-        prompt_score_indices=payload.get("prompt_score_indices"),
-        prompt_score_token_ids=payload.get("prompt_score_token_ids"),
-        prompt_score_indptr=payload.get("prompt_score_indptr"),
-        prompt_score_top_counts=payload.get("prompt_score_top_counts"),
-        prompt_target_indptr=payload.get("prompt_target_indptr"),
-        prompt_target_token_ids=payload.get("prompt_target_token_ids"),
-    )
-
-
 class TensorParallelRunner:
     """Drive identical runner calls on follower ranks from rank zero."""
 
     def __init__(self, runner: Any, control_group: Any, distributed: Any) -> None:
         self._runner = runner
-        self._control_group = control_group
-        self._distributed = distributed
         self._followers_closed = False
+        self._plans = PlanTransport()
+        self._wire = CommandTransport(distributed, control_group)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._runner, name)
 
     def forward(self, plan: BatchPlan):
-        self._broadcast({"operation": "forward", "plan": batch_plan_payload(plan)})
+        self._broadcast({"operation": "forward", "payload": self._plans.prepare(plan)})
         return self._runner.forward(plan)
 
     def bind_resources(self, binding: Any):
         self._broadcast(
             {
-                "operation": "bind_resources",
+                "operation": "bind",
                 "cache_pool_id": binding.cache_pool_id,
             }
         )
@@ -141,18 +61,18 @@ class TensorParallelRunner:
 
     def release(self, sequence_ids: Sequence[int]) -> None:
         ids = list(sequence_ids)
-        self._broadcast({"operation": "release", "sequence_ids": ids})
+        self._broadcast({"operation": "release", "ids": ids})
         self._runner.release(ids)
+        self._plans.release(ids)
 
     def close_followers(self) -> None:
         if not self._followers_closed:
             self._broadcast({"operation": "close"})
             self._followers_closed = True
+            self._plans.clear()
 
     def _broadcast(self, command: dict[str, Any]) -> None:
-        self._distributed.broadcast_object_list(
-            [command], src=0, group=self._control_group
-        )
+        self._wire.send(command)
 
 
 def follow_tensor_parallel_runner(
@@ -160,16 +80,18 @@ def follow_tensor_parallel_runner(
 ) -> None:
     """Execute rank-zero runner commands until the leader shuts down."""
 
+    plans = PlanTransport()
+    wire = CommandTransport(distributed, control_group)
     while True:
-        commands: list[Any] = [None]
-        distributed.broadcast_object_list(commands, src=0, group=control_group)
-        command = commands[0]
+        command = wire.receive()
         operation = command["operation"]
         if operation == "close":
+            plans.clear()
             return
         if operation == "release":
-            runner.release(command["sequence_ids"])
-        elif operation == "bind_resources":
+            runner.release(command["ids"])
+            plans.release(command["ids"])
+        elif operation == "bind":
             runner.bind_resources(
                 SimpleNamespace(
                     cache_pool_id=command["cache_pool_id"],
@@ -177,15 +99,13 @@ def follow_tensor_parallel_runner(
                 )
             )
         elif operation == "forward":
-            runner.forward(batch_plan_from_payload(command["plan"]))
+            runner.forward(plans.restore(command["payload"]))
         else:
             raise RuntimeError(f"unknown tensor-parallel operation: {operation!r}")
 
 
 __all__ = [
     "TensorParallelRunner",
-    "batch_plan_from_payload",
-    "batch_plan_payload",
     "follow_tensor_parallel_runner",
     "monitor_process_context",
 ]

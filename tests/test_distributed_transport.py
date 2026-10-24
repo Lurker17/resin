@@ -1,0 +1,242 @@
+"""Real Gloo transport keeps large immutable request inputs off the step path."""
+
+from __future__ import annotations
+
+import json
+import time
+from datetime import timedelta
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+import resin._resin as native
+from resin import (
+    BatchPhase,
+    CacheGroupLayout,
+    CacheLayout,
+    Parallelism,
+    RunnerConfig,
+    SamplingParams,
+)
+from resin.backend.distributed import DistributedEngine, DistributedWorker
+from resin.backend.topology import ParallelGroups
+from resin.models.inkling.media import InklingMedia
+
+TOKENS = (10, 11, 77, 12, 13, 14)
+PIXEL_SHAPE = (1, 2, 256, 256, 3)
+PIXEL_BYTES = int(np.prod(PIXEL_SHAPE)) * 4
+
+
+def _media() -> InklingMedia:
+    return InklingMedia(TOKENS, 77, np.full(PIXEL_SHAPE, 0.25, dtype=np.float32))
+
+
+class _MediaRunner:
+    runner_config = RunnerConfig(
+        cache_layout=CacheLayout(32, [CacheGroupLayout(2)]),
+        max_batch_tokens=2,
+        prefill_chunk_size=2,
+        continuation_prefill=True,
+    )
+
+    def __init__(self):
+        self.active = {}
+        self.released = []
+        self.calls = []
+
+    def bind_resources(self, binding):
+        assert binding.cache_pool_id is not None
+
+    def forward(self, plan):
+        for raw_id, media, sampling in zip(
+            plan.sequence_ids, plan.media, plan.sampling_params, strict=True
+        ):
+            sequence_id = int(raw_id)
+            assert isinstance(media, InklingMedia)
+            if sequence_id in self.active:
+                assert self.active[sequence_id] is media
+            else:
+                assert media.token_ids == TOKENS
+                assert media.pixel_values is not None
+                assert media.pixel_values.shape == PIXEL_SHAPE
+                assert np.all(media.pixel_values == 0.25)
+                self.active[sequence_id] = media
+            assert sampling.temperature == 0.75
+            assert sampling.top_p == 0.875
+            assert sampling.top_k == 13
+            assert sampling.seed == 123
+            assert sampling.extra == {"nested": {"scale": 0.125}}
+        self.calls.append(
+            {
+                "phase": "prefill" if plan.phase == BatchPhase.PREFILL else "decode",
+                "ids": plan.sequence_ids.tolist(),
+                "tokens": plan.token_ids.tolist(),
+                "context": plan.context_lengths.tolist(),
+                "cache": [
+                    {
+                        "slabs": group.block_slab_ids.tolist(),
+                        "slots": group.block_slotnums.tolist(),
+                        "append": group.append_block_offsets.tolist(),
+                    }
+                    for group in plan.cache_groups
+                ],
+            }
+        )
+        return [7] * plan.num_sequences
+
+    def release(self, sequence_ids):
+        for sequence_id in map(int, sequence_ids):
+            self.active.pop(sequence_id, None)
+            self.released.append(sequence_id)
+
+
+def _transport_process(rank, rendezvous, directory):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=25),
+    )
+    groups = ParallelGroups.create(
+        Parallelism(world_size=2, attn_tp=2), device_backend="gloo"
+    )
+    runner = _MediaRunner()
+    worker = DistributedWorker(runner, groups)
+    encodings = []
+    large_broadcasts = []
+    original_encode = native._media_to_buffers
+    original_broadcast = dist.broadcast
+
+    def encode(media):
+        encodings.append(media)
+        return original_encode(media)
+
+    def broadcast(tensor, *args, **kwargs):
+        assert not torch.is_inference(tensor)
+        size = tensor.numel() * tensor.element_size()
+        if size >= PIXEL_BYTES:
+            large_broadcasts.append(size)
+        return original_broadcast(tensor, *args, **kwargs)
+
+    def object_collective(*_args, **_kwargs):
+        raise AssertionError("object collectives are forbidden after worker setup")
+
+    try:
+        with pytest.MonkeyPatch.context() as patch, torch.inference_mode():
+            patch.setattr(native, "_media_to_buffers", encode)
+            patch.setattr(dist, "broadcast", broadcast)
+            patch.setattr(dist, "broadcast_object_list", object_collective)
+            patch.setattr(dist, "all_gather_object", object_collective)
+            if groups.is_driver:
+                engine = DistributedEngine(worker)
+                media = _media()
+                sampling = SamplingParams(
+                    temperature=0.75,
+                    top_p=0.875,
+                    top_k=13,
+                    seed=123,
+                    extra={"nested": {"scale": 0.125}},
+                )
+
+                def submit():
+                    return engine.submit(
+                        media=media, max_new_tokens=3, sampling_params=sampling
+                    )
+
+                completed = submit()
+                never_started = submit()
+                assert engine.cancel(never_started)
+                assert never_started.take_result() == []
+                assert not worker._plans._requests
+                while engine.has_work():
+                    engine.step()
+                assert completed.take_result() == [7, 7, 7]
+                assert len(encodings) == 1
+                assert not worker._plans._requests
+
+                cancelled = submit()
+                engine.step()
+                assert len(worker._plans._requests) == 1
+                assert engine.cancel(cancelled)
+                assert len(encodings) == 2
+                assert not worker._plans._requests
+
+                closed = submit()
+                engine.step()
+                assert len(worker._plans._requests) == 1
+                engine.close()
+                assert closed.done
+                assert len(encodings) == 3
+                assert never_started.id not in {
+                    sequence for call in runner.calls for sequence in call["ids"]
+                }
+            else:
+                worker.serve()
+            assert worker.closed
+            assert not worker._plans._requests
+            assert not runner.active
+        Path(directory, f"{rank}.json").write_text(
+            json.dumps(
+                {
+                    "calls": runner.calls,
+                    "released": runner.released,
+                    "encodings": len(encodings),
+                    "large_broadcasts": large_broadcasts,
+                }
+            )
+        )
+    finally:
+        groups.close()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(), reason="Gloo is required"
+)
+def test_gloo_registers_media_once_and_reuses_it_until_release(tmp_path):
+    processes = mp.start_processes(
+        _transport_process,
+        args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path)),
+        nprocs=2,
+        join=False,
+        start_method="spawn",
+    )
+    deadline = time.monotonic() + 60
+    try:
+        while not processes.join(timeout=1):
+            if time.monotonic() > deadline:
+                raise AssertionError(
+                    "two-rank typed transport failed to finish within 60s"
+                )
+    finally:
+        for child in processes.processes:
+            if child.is_alive():
+                child.terminate()
+        for child in processes.processes:
+            child.join(timeout=5)
+    driver, follower = [
+        json.loads((tmp_path / f"{rank}.json").read_text()) for rank in range(2)
+    ]
+    assert driver["calls"] == follower["calls"]
+    assert driver["released"] == follower["released"]
+    assert [call["phase"] for call in follower["calls"]] == [
+        "prefill",
+        "prefill",
+        "prefill",
+        "decode",
+        "decode",
+        "prefill",
+        "prefill",
+    ]
+    assert (driver["encodings"], follower["encodings"]) == (3, 0)
+    # Repeated prefill/decode vectors are small. Pixels cross ranks once for
+    # each admitted request, including after a prior request used the same media.
+    assert (
+        driver["large_broadcasts"] == follower["large_broadcasts"] == [PIXEL_BYTES] * 3
+    )

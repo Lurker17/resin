@@ -346,6 +346,21 @@ the request replica; cross-replica device metadata must preserve that namespace.
 Bind and release callbacks are replica-local commands and must not issue
 collectives spanning other drivers. Cross-replica collectives belong in forward.
 
+Replica transport retains request state by sequence ID. The first scheduled plan
+registers each request's sampling policy and prepared media on the followers.
+Native media uses a versioned descriptor and separate numeric buffers; subsequent
+prefill chunks and decode steps reuse the exact same follower object. Completion,
+cancellation and retraction release that state after outstanding work has drained.
+Plans already in flight retain their own references and array storage.
+
+Successful step commands use typed Gloo broadcasts: a fixed integer header and
+packed token, sequence, scoring and page-table arrays. They do not use pickle or
+object collectives. Media buffers and JSON request descriptors are sent only on
+registration, never on repeated decode steps. Request policy and media stay
+unchanged until release. Distributed sampling `extra` values
+must be JSON data, and distributed media must use Resin's native payloads. Local
+execution retains support for arbitrary custom Python payloads.
+
 ## Model callback
 
 A CP, EP, or attention-DP runtime implements:
@@ -453,11 +468,10 @@ runner.close_cuda_graphs()
 groups.close()
 ```
 
-The prototype uses object collectives for control metadata. It establishes the
-ownership and execution contract; it does not claim DeepInfer's control-path
-performance. Shared-memory command transport, communication overlap,
-throughput validation, expert load balancing, and
-prefix-aware replica routing remain separate work.
+Initialization, error reporting and the separate HTTP control channel still use
+object collectives; successful execution votes and plan transport use typed
+buffers. Shared-memory command transport, throughput validation, expert load
+balancing and prefix-aware replica routing remain separate work.
 
 ## Source references and validation
 

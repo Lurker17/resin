@@ -581,7 +581,9 @@ def test_single_rank_replica_keeps_preparation_local_and_skips_serialization(
     def unexpected_serialization(*args, **kwargs):
         raise AssertionError("a single-rank replica has no plan consumer")
 
-    monkeypatch.setattr(implementation.pickle, "dumps", unexpected_serialization)
+    monkeypatch.setattr(
+        implementation.PlanTransport, "prepare", unexpected_serialization
+    )
 
     class PreparedRunner:
         runner_config = RunnerConfig()

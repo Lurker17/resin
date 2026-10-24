@@ -27,6 +27,8 @@ OUTPUT_COLUMNS = {
 }
 
 PARAMETERS = {
+    ("", "_media_to_buffers"): {"media": "MediaInput"},
+    ("", "_media_from_buffers"): {"buffers": "Sequence[npt.NDArray[Any]]"},
     ("Message", "__new__"): {"content": "Sequence[ContentBlock]"},
     ("RenderOptions", "__new__"): {"reasoning_effort": "str | int | float | None"},
     ("RenderedPrompt", "__new__"): {"media": "MediaInput | None"},
@@ -75,6 +77,8 @@ PARAMETERS = {
 }
 
 RETURNS = {
+    ("", "_media_to_buffers"): "tuple[bytes, tuple[npt.NDArray[Any], ...]]",
+    ("", "_media_from_buffers"): "MediaInput",
     ("", "image_token_types"): "tuple[int, ...]",
     ("DeepSeekV41Image", "types"): "tuple[int, ...]",
     ("DeepSeekV41Image", "patches"): "npt.NDArray[np.float32]",

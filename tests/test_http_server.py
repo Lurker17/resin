@@ -6,12 +6,12 @@ import pytest
 
 import resin
 from resin import BatchPhase, BatchPlan, CacheGroupPlan, Engine, SamplingParams
+from resin.backend.command_transport import CommandTransport
 from resin.backend.parallel import (
     TensorParallelRunner,
-    batch_plan_from_payload,
-    batch_plan_payload,
     follow_tensor_parallel_runner,
 )
+from resin.backend.plan_transport import PlanTransport
 from resin.server import HttpServer
 
 
@@ -37,13 +37,13 @@ class RecordingDistributed:
         self.commands = [] if incoming is None else list(incoming)
         self.broadcasts = []
 
-    def broadcast_object_list(self, objects, *, src, group) -> None:
+    def broadcast(self, tensor, *, src, group) -> None:
         assert src == 0
         assert group == "control"
         if self.commands:
-            objects[0] = self.commands.pop(0)
+            tensor.copy_(self.commands.pop(0))
         else:
-            self.broadcasts.append(objects[0])
+            self.broadcasts.append(tensor.clone())
 
 
 def test_tensor_parallel_server_broadcasts_resource_binding() -> None:
@@ -62,12 +62,11 @@ def test_tensor_parallel_server_broadcasts_resource_binding() -> None:
     runner = TensorParallelRunner(Runner(), "control", distributed)
 
     assert runner.bind_resources(binding) is None
-    assert distributed.broadcasts == [
-        {
-            "operation": "bind_resources",
-            "cache_pool_id": 41,
-        }
-    ]
+    received = CommandTransport(
+        RecordingDistributed(distributed.broadcasts), "control"
+    ).receive()
+    assert received["operation"] == "bind"
+    assert received["cache_pool_id"] == 41
 
 
 def test_tensor_parallel_follower_applies_resource_binding() -> None:
@@ -81,15 +80,11 @@ def test_tensor_parallel_follower_applies_resource_binding() -> None:
         def bind_resources(cls, binding):
             cls.calls.append(binding)
 
-    distributed = RecordingDistributed(
-        [
-            {
-                "operation": "bind_resources",
-                "cache_pool_id": 41,
-            },
-            {"operation": "close"},
-        ]
-    )
+    sender = RecordingDistributed()
+    wire = CommandTransport(sender, "control")
+    wire.send({"operation": "bind", "cache_pool_id": 41})
+    wire.send({"operation": "close"})
+    distributed = RecordingDistributed(sender.broadcasts)
 
     follow_tensor_parallel_runner(Runner(), "control", distributed)
 
@@ -126,7 +121,7 @@ def test_tensor_parallel_plan_round_trip_preserves_native_contract() -> None:
         ],
     )
 
-    restored = batch_plan_from_payload(batch_plan_payload(plan))
+    restored = PlanTransport().restore(PlanTransport().prepare(plan))
 
     assert restored.sequence_ids.tolist() == plan.sequence_ids.tolist()
     assert restored.context_lengths.tolist() == plan.context_lengths.tolist()

@@ -362,8 +362,8 @@ class DeepSeekV41CudaRunner(DeepSeekV4CudaRunner):
             existing = self._media_features.get(int(plan.sequence_ids[slot]))
             if existing is not None:
                 cached_media = existing[0]
-                # Follower ranks unpickle a fresh object on each plan. Compare
-                # its prepared identity without rehashing image tensors.
+                # Registered follower payloads keep their identity across plans.
+                # Direct callers may provide an equivalent owned payload.
                 if cached_media is not media and (
                     cached_media.digest != media.digest
                     or cached_media.token_ids != media.token_ids

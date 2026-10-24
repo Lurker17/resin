@@ -13,7 +13,7 @@ from resin import (
     SamplingParams,
     SchedulerConfig,
 )
-from resin.backend.parallel import batch_plan_from_payload, batch_plan_payload
+from resin.backend.plan_transport import PlanTransport
 from resin.backend.sampling import PromptScores, format_output, prompt_scores
 
 
@@ -161,7 +161,7 @@ def test_prompt_metadata_survives_follower_transport():
         prompt_target_indptr=[0, 2, 3],
         prompt_target_token_ids=[7, 2, 4],
     )
-    restored = batch_plan_from_payload(batch_plan_payload(plan))
+    restored = PlanTransport().restore(PlanTransport().prepare(plan))
     assert restored.sampling_params[0].prompt_logprobs
     assert restored.sampling_params[0].prompt_top_logprobs == 3
     assert restored.needs_prompt_logprobs

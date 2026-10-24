@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pickle
-
 import numpy as np
 import pytest
 
@@ -16,7 +14,7 @@ from resin import (
     SchedulerConfig,
 )
 from resin.backend.distributed import _runner_signature
-from resin.backend.parallel import batch_plan_from_payload, batch_plan_payload
+from resin.backend.plan_transport import PlanTransport
 
 
 def test_prefill_lengths_are_owned_readonly_views_with_legacy_endpoint_defaults():
@@ -48,14 +46,12 @@ def test_prefill_lengths_are_owned_readonly_views_with_legacy_endpoint_defaults(
     assert edge.prefill_lengths.tolist() == [20, 2**32 - 1]
 
 
-def test_prefill_lengths_survive_pickled_follower_transport_and_legacy_payloads():
+def test_prefill_lengths_survive_packed_follower_transport():
     plan = BatchPlan([1, 2], [4, 8], [10, 11, 12], [0, 2, 3], prefill_lengths=[20, 30])
-    payload = pickle.loads(pickle.dumps(batch_plan_payload(plan)))
-    restored = batch_plan_from_payload(payload)
+    packet = PlanTransport().prepare(plan)
+    restored = PlanTransport().restore(packet)
     assert restored.prefill_lengths.tolist() == [20, 30]
     assert not restored.prefill_lengths.flags.writeable
-    del payload["prefill_lengths"]
-    assert batch_plan_from_payload(payload).prefill_lengths.tolist() == [6, 9]
 
 
 def test_native_plans_keep_full_prefill_lengths_through_chunks():

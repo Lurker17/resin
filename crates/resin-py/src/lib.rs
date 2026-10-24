@@ -1935,7 +1935,10 @@ mod _resin {
     use crate::recipe_media::{MediaTokens, ProcessedMedia};
 
     #[pymodule_export]
-    use crate::media_payload::{DeepSeekV41Image, DeepSeekV41Media, Gemma4Media, InklingMedia, Qwen35Media};
+    use crate::media_payload::{
+        DeepSeekV41Image, DeepSeekV41Media, Gemma4Media, InklingMedia, Qwen35Media,
+        _media_from_buffers, _media_to_buffers,
+    };
 
     #[pymodule_export]
     use crate::media_preprocess::{DeepSeekV41ImageProcessor, image_token_types};
