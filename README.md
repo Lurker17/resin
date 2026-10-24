@@ -223,6 +223,8 @@ draft tokens with natural acceptance. Requests are routed round-robin unless
 `routed_dp_rank` in the JSON body or `resin-routed-dp-rank` in the header selects
 a replica (0–3). Both MLA families have one KV head and require `attn_tp=1`.
 The older `modal_deepseek_v4.py` retains TP-only diagnostics, not this endpoint.
+GPT-OSS 120B uses the same distributed worker/engine coordinator with attention
+TP2 and expert TP2; the 20B endpoint keeps a single local Engine.
 
 Each deployed URL serves `/`, `/health`, `/v1/models`,
 `/v1/chat/completions`, `/v1/responses`, and `/v1/messages`. The functions

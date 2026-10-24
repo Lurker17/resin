@@ -30,16 +30,9 @@ from deploy.modal_image import build_modal_image
 from resin import Engine, SamplingParams, SchedulerConfig
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
-    default_decode_graph_shapes,
 )
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
-from resin.backend.parallel import (
-    TensorParallelRunner,
-    follow_tensor_parallel_runner,
-    monitor_process_context,
-)
 from resin.recipe import DeepSeekV4Recipe, DeepSeekV41Recipe
-from resin.server import HttpServer
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_CACHE_MOUNT = "/models/resin-deepseek-v4"
@@ -149,8 +142,6 @@ app = modal.App(
         PROFILE_MOUNT: profile_volume,
     },
 )
-
-_http_server_processes: list[object] = []
 
 
 def _model_spec(model_key: str) -> ModelSpec:
@@ -1013,123 +1004,6 @@ def cache_checkpoint(model_key: str = DEFAULT_MODEL_KEY) -> dict[str, object]:
     return _download_checkpoint(_model_spec(model_key))
 
 
-def _serve_http_rank(
-    rank: int,
-    master_port: int,
-    model_path: Path,
-    model_name: str,
-) -> None:
-    """Run one TP rank; rank zero additionally owns the public HTTP listener."""
-
-    tensor_parallel = _initialize_tensor_parallel(rank, master_port, DEFAULT_TP_SIZE)
-    control_group = dist.new_group(backend="gloo", timeout=timedelta(minutes=30))
-    runner_type, codec_type = _implementation(model_path)
-    runner = runner_type(
-        model_path,
-        max_seq_len=32768,
-        max_batch_size=DEFAULT_MAX_NUM_SEQS,
-        tensor_parallel=tensor_parallel,
-        device=f"cuda:{rank}",
-        cuda_graph_decode_shapes=default_decode_graph_shapes(
-            32768 + DSPARK_TOKENS + 1,
-            speculative=True,
-            max_batch_size=DEFAULT_MAX_NUM_SEQS,
-        ),
-        speculative_tokens=DSPARK_TOKENS,
-    )
-    if rank == 0:
-        _log_cache_capacity(runner)
-    torch.cuda.synchronize(runner.device)
-    tensor_parallel.barrier()
-    capture_cuda_graphs(runner)
-    tensor_parallel.barrier()
-
-    if rank != 0:
-        follow_tensor_parallel_runner(runner, control_group, dist)
-        os._exit(0)
-
-    tokenizer = cast(
-        PreTrainedTokenizerBase,
-        AutoTokenizer.from_pretrained(
-            str(model_path), local_files_only=True, trust_remote_code=False
-        ),
-    )
-    recipe = codec_type(tokenizer)
-    coordinated_runner = TensorParallelRunner(runner, control_group, dist)
-    engine = Engine(
-        coordinated_runner,
-        max_running_requests=DEFAULT_MAX_NUM_SEQS,
-        context_length=32768,
-        prefix_cache=True,
-        scheduler_config=SchedulerConfig(
-            max_batch_tokens=DEFAULT_MAX_NUM_SEQS * 32768,
-            prefill_chunk_size=32768,
-        ),
-        eos_token_id=runner.eos_token_id,
-    )
-    warmups = (
-        # Exercise the precompiled large-prefill GEMM and dynamic sparse
-        # attention once. Exact prompt lengths must not need their own warmup.
-        ("word " * 4096, "chat", "low"),
-        ("Reply with one word.", "thinking", "high"),
-    )
-    for prompt, thinking_mode, reasoning_effort in warmups:
-        prompt_ids = _encode_prompt(
-            recipe,
-            prompt,
-            thinking_mode,
-            reasoning_effort,
-        )
-        warmup_started = time.perf_counter()
-        warmup = engine.submit(
-            prompt_ids,
-            max_new_tokens=2,
-            sampling_params=SamplingParams(temperature=0.0),
-        )
-        while engine.has_work():
-            engine.step()
-        warmup.take_result()
-        print(
-            f"[prefill-warmup] {len(prompt_ids)} tokens ({thinking_mode}, "
-            f"{reasoning_effort}) in {time.perf_counter() - warmup_started:.2f}s",
-            flush=True,
-        )
-    continuation_prompt = "word " * 4096 + "continue briefly"
-    continuation_ids = _encode_prompt(
-        recipe,
-        continuation_prompt,
-        "chat",
-        "low",
-    )
-    warmup_started = time.perf_counter()
-    warmup = engine.submit(
-        continuation_ids,
-        max_new_tokens=2,
-        sampling_params=SamplingParams(temperature=0.0),
-    )
-    while engine.has_work():
-        engine.step()
-    warmup.take_result()
-    print(
-        f"[continuation-warmup] {len(continuation_ids)} tokens in "
-        f"{time.perf_counter() - warmup_started:.2f}s",
-        flush=True,
-    )
-    torch.cuda.synchronize(runner.device)
-    kernel_cache_volume.commit()
-    try:
-        HttpServer(
-            engine,
-            recipe=recipe,
-            model=model_name,
-        ).serve(host="0.0.0.0", port=8000)
-    finally:
-        if not engine.closed:
-            engine.close()
-        coordinated_runner.close_followers()
-    os._exit(0)
-
-
 @app.function(
     gpu="B300:4",
     cpu=32,
@@ -1150,19 +1024,10 @@ def _serve_http_rank(
     requires_proxy_auth=False,
 )
 def serve_deepseek_v4() -> None:
-    """The legacy TP-only HTTP route requires an attention-DP coordinator migration."""
+    """Reject the retired query-head-only TP endpoint before loading a model."""
     model = _model_spec(os.environ.get("RESIN_DEEPSEEK_MODEL", DEFAULT_MODEL_KEY))
     _check_legacy_topology(model, DEFAULT_TP_SIZE)
-    model_path, _ = _require_checkpoint(model)
-    kernel_cache_volume.reload()
-    process_context = torch.multiprocessing.spawn(
-        _serve_http_rank,
-        args=(_free_local_port(), model_path, model.repo_id),
-        nprocs=DEFAULT_TP_SIZE,
-        join=False,
-    )
-    _http_server_processes.append(process_context)
-    monitor_process_context(process_context, "deepseek-v4-http")
+    raise ValueError("This HTTP endpoint is retired; use deploy/modal_deepseek_v41.py")
 
 
 @app.function(

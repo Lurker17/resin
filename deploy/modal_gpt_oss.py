@@ -33,18 +33,16 @@ from deploy.jit_cache import (
     run_cached_workload,
 )
 from deploy.modal_image import build_modal_image
-from resin import Engine, SamplingParams, SchedulerConfig, TokenEvent
+from resin import Engine, Parallelism, SamplingParams, SchedulerConfig, TokenEvent
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
     GraphShape,
     default_decode_graph_shapes,
 )
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
-from resin.backend.parallel import (
-    TensorParallelRunner,
-    follow_tensor_parallel_runner,
-    monitor_process_context,
-)
+from resin.backend.distributed import DistributedEngine, DistributedWorker
+from resin.backend.parallel import monitor_process_context
+from resin.backend.topology import ParallelGroups
 from resin.recipe import GptOssRecipe
 from resin.server import HttpServer
 
@@ -365,6 +363,8 @@ def _new_cuda_runner(
     cache_parent_capacity: int | None,
     tensor_parallel: TensorParallelContext,
     cuda_graph_decode_shapes: tuple[GraphShape, ...] | None = None,
+    *,
+    parallel_groups: ParallelGroups | None = None,
 ) -> GptOssCudaRunner:
     kernel_moe = FlashInferSM90MXFP4Kernel()
     if tensor_parallel.rank == 0:
@@ -380,7 +380,8 @@ def _new_cuda_runner(
         device=f"cuda:{tensor_parallel.rank}",
         kernel_moe=kernel_moe,
         cuda_graph_decode_shapes=cuda_graph_decode_shapes,
-        tensor_parallel=tensor_parallel,
+        tensor_parallel=tensor_parallel if parallel_groups is None else None,
+        parallel_groups=parallel_groups,
     )
     torch.cuda.synchronize(runner.device)
     tensor_parallel.barrier()
@@ -1145,8 +1146,11 @@ def _serve_http_rank(
     tensor_parallel = _initialize_tensor_parallel(
         rank, tensor_parallel_size, master_port
     )
-    control_group = (
-        dist.new_group(backend="gloo", timeout=timedelta(minutes=30))
+    groups = (
+        ParallelGroups.create(
+            Parallelism(world_size=tensor_parallel_size, attn_tp=tensor_parallel_size),
+            timeout=timedelta(minutes=30),
+        )
         if tensor_parallel.enabled
         else None
     )
@@ -1155,6 +1159,7 @@ def _serve_http_rank(
         model_path,
         None,
         tensor_parallel,
+        parallel_groups=groups,
         cuda_graph_decode_shapes=default_decode_graph_shapes(
             _required_history_width(131072, 1),
             speculative=False,
@@ -1173,49 +1178,53 @@ def _serve_http_rank(
         )
     capture_cuda_graphs(runner)
 
-    if rank != 0:
-        assert control_group is not None
+    worker = DistributedWorker(runner, groups) if groups is not None else None
+    if worker is not None and not worker.groups.is_driver:
         print("[http-startup] follower ready for rank-zero commands", flush=True)
-        follow_tensor_parallel_runner(runner, control_group, dist)
+        worker.serve()
         os._exit(0)
 
     print("[http-startup] loading tokenizer and recipe...", flush=True)
     tokenizer, recipe = _load_recipe(model_path)
     print("[http-startup] tokenizer and recipe loaded", flush=True)
-    coordinated_runner = (
-        TensorParallelRunner(runner, control_group, dist)
-        if control_group is not None
-        else None
-    )
-    engine_runner = coordinated_runner or runner
     print("[http-startup] creating engine and binding shared cache...", flush=True)
-    engine = Engine(
-        engine_runner,
-        max_running_requests=DEFAULT_MAX_NUM_SEQS,
-        context_length=131072,
-        eos_token_id=runner.eos_token_id,
-        prefix_cache=True,
+    engine = (
+        DistributedEngine(
+            worker,
+            max_running_requests=DEFAULT_MAX_NUM_SEQS,
+            context_length=131072,
+            eos_token_id=runner.eos_token_id,
+            prefix_cache=True,
+        )
+        if worker is not None
+        else Engine(
+            runner,
+            max_running_requests=DEFAULT_MAX_NUM_SEQS,
+            context_length=131072,
+            eos_token_id=runner.eos_token_id,
+            prefix_cache=True,
+        )
     )
-    print("[http-startup] engine created; running warmup...", flush=True)
-    warmup = engine.submit(
-        _encode_prompt(recipe, "Reply with one word."),
-        max_new_tokens=2,
-        sampling_params=SamplingParams(temperature=0.0),
-    )
-    while engine.has_work():
-        engine.step()
-    warmup.take_result()
-    torch.cuda.synchronize(runner.device)
-    print("[http-startup] warmup complete; starting HTTP server", flush=True)
-    codec = recipe
-    server = HttpServer(engine, recipe=codec, model=MODEL_SPECS[model_key]["repo_id"])
     try:
+        print("[http-startup] engine created; running warmup...", flush=True)
+        warmup = engine.submit(
+            _encode_prompt(recipe, "Reply with one word."),
+            max_new_tokens=2,
+            sampling_params=SamplingParams(temperature=0.0),
+        )
+        while engine.has_work():
+            engine.step()
+        warmup.take_result()
+        torch.cuda.synchronize(runner.device)
+        print("[http-startup] warmup complete; starting HTTP server", flush=True)
+        codec = recipe
+        server = HttpServer(
+            engine, recipe=codec, model=MODEL_SPECS[model_key]["repo_id"]
+        )
         server.serve(host="0.0.0.0", port=8000)
     finally:
         if not engine.closed:
             engine.close()
-        if coordinated_runner is not None:
-            coordinated_runner.close_followers()
     os._exit(0)
 
 

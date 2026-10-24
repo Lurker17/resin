@@ -44,12 +44,15 @@ class _MediaRunner:
     )
 
     def __init__(self):
+        self.bindings = []
         self.active = {}
         self.released = []
         self.calls = []
 
     def bind_resources(self, binding):
         assert binding.cache_pool_id is not None
+        assert binding.cache_layout is self.runner_config.cache_layout
+        self.bindings.append(binding.cache_pool_id)
 
     def forward(self, plan):
         for raw_id, media, sampling in zip(
@@ -184,6 +187,7 @@ def _transport_process(rank, rendezvous, directory):
         Path(directory, f"{rank}.json").write_text(
             json.dumps(
                 {
+                    "bindings": runner.bindings,
                     "calls": runner.calls,
                     "released": runner.released,
                     "encodings": len(encodings),
@@ -223,6 +227,8 @@ def test_gloo_registers_media_once_and_reuses_it_until_release(tmp_path):
     driver, follower = [
         json.loads((tmp_path / f"{rank}.json").read_text()) for rank in range(2)
     ]
+    assert driver["bindings"] == follower["bindings"]
+    assert len(driver["bindings"]) == 1
     assert driver["calls"] == follower["calls"]
     assert driver["released"] == follower["released"]
     assert [call["phase"] for call in follower["calls"]] == [

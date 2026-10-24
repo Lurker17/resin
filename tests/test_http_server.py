@@ -5,13 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import resin
-from resin import BatchPhase, BatchPlan, CacheGroupPlan, Engine, SamplingParams
-from resin.backend.command_transport import CommandTransport
-from resin.backend.parallel import (
-    TensorParallelRunner,
-    follow_tensor_parallel_runner,
-)
-from resin.backend.plan_transport import PlanTransport
+from resin import Engine
 from resin.server import HttpServer
 
 
@@ -30,111 +24,6 @@ class _Codec:
 
     def create_parser(self, prompt):
         return SimpleNamespace(feed=lambda ids: [])
-
-
-class RecordingDistributed:
-    def __init__(self, incoming=None) -> None:
-        self.commands = [] if incoming is None else list(incoming)
-        self.broadcasts = []
-
-    def broadcast(self, tensor, *, src, group) -> None:
-        assert src == 0
-        assert group == "control"
-        if self.commands:
-            tensor.copy_(self.commands.pop(0))
-        else:
-            self.broadcasts.append(tensor.clone())
-
-
-def test_tensor_parallel_server_broadcasts_resource_binding() -> None:
-    layout = object()
-    binding = SimpleNamespace(
-        cache_pool_id=41,
-        cache_layout=layout,
-    )
-
-    class Runner:
-        @staticmethod
-        def bind_resources(bound):
-            assert bound is binding
-
-    distributed = RecordingDistributed()
-    runner = TensorParallelRunner(Runner(), "control", distributed)
-
-    assert runner.bind_resources(binding) is None
-    received = CommandTransport(
-        RecordingDistributed(distributed.broadcasts), "control"
-    ).receive()
-    assert received["operation"] == "bind"
-    assert received["cache_pool_id"] == 41
-
-
-def test_tensor_parallel_follower_applies_resource_binding() -> None:
-    layout = object()
-
-    class Runner:
-        runner_config = SimpleNamespace(cache_layout=layout, state_mapping=None)
-        calls = []
-
-        @classmethod
-        def bind_resources(cls, binding):
-            cls.calls.append(binding)
-
-    sender = RecordingDistributed()
-    wire = CommandTransport(sender, "control")
-    wire.send({"operation": "bind", "cache_pool_id": 41})
-    wire.send({"operation": "close"})
-    distributed = RecordingDistributed(sender.broadcasts)
-
-    follow_tensor_parallel_runner(Runner(), "control", distributed)
-
-    assert len(Runner.calls) == 1
-    assert Runner.calls[0].cache_pool_id == 41
-    assert Runner.calls[0].cache_layout is layout
-
-
-def test_tensor_parallel_plan_round_trip_preserves_native_contract() -> None:
-    plan = BatchPlan(
-        [11, 22],
-        [0, 32],
-        [1, 2, 3],
-        [0, 2, 3],
-        phase=BatchPhase.PREFILL,
-        batch_id=7,
-        batch_key=9,
-        cache_groups=[
-            CacheGroupPlan(
-                0,
-                [0, 1, 2],
-                [3, 4],
-                [0, 0],
-                [0, 2],
-                [3, 3, 4],
-                [0, 0, 0],
-                [0, 1, 0],
-            )
-        ],
-        sampling_mask=[False, True],
-        sampling_params=[
-            SamplingParams(temperature=0.5, seed=31),
-            SamplingParams(top_p=0.9, seed=32),
-        ],
-    )
-
-    restored = PlanTransport().restore(PlanTransport().prepare(plan))
-
-    assert restored.sequence_ids.tolist() == plan.sequence_ids.tolist()
-    assert restored.context_lengths.tolist() == plan.context_lengths.tolist()
-    assert restored.token_ids.tolist() == plan.token_ids.tolist()
-    assert restored.token_indptr.tolist() == plan.token_indptr.tolist()
-    assert restored.phase == plan.phase
-    assert restored.batch_id == plan.batch_id
-    assert restored.batch_key == plan.batch_key
-    assert restored.sampling_mask.tolist() == [False, True]
-    assert restored.cache_groups[0].block_slab_ids.tolist() == [3, 4]
-    assert restored.cache_groups[0].block_slotnums.tolist() == [0, 0]
-    assert restored.sampling_params[0].temperature == 0.5
-    assert restored.sampling_params[1].top_p == 0.9
 
 
 def test_http_server_validates_route_configuration() -> None:
