@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -19,7 +20,7 @@ from resin.backend.paged_attention import (
     PagedAttentionGroupSpec,
     build_paged_attention_batch,
 )
-from resin.backend.plans import BatchView, CacheGroupView, PagedCachePlan
+from resin.backend.plans import BatchView, CacheGroupView, PagedCachePlan, plan_rows
 
 
 def _plan() -> BatchPlan:
@@ -46,33 +47,43 @@ def _plan() -> BatchPlan:
 
 
 def test_batch_view_derives_canonical_row_geometry() -> None:
-    batch = BatchView.from_plan(_plan())
+    native = _plan()
+    batch = BatchView.from_plan(native)
     assert batch.num_sequences == 2
     assert batch.num_tokens == 3
     assert batch.query_lengths.tolist() == [2, 1]
     assert batch.post_lengths.tolist() == [2, 3]
     assert batch.last_token_indices.tolist() == [1, 2]
     assert batch.token_ids[batch.token_slice(1)].tolist() == [3]
+    assert np.shares_memory(batch.token_ids, native.token_ids)
+    assert np.shares_memory(batch.positions, native.positions)
+    assert not batch.token_ids.flags.writeable
+    with pytest.raises(TypeError, match="init=False"):
+        replace(batch, positions=np.zeros(3, dtype=np.uint32))
+    with pytest.raises(FrozenInstanceError):
+        setattr(batch, "positions", np.zeros(3, dtype=np.uint32))
+    del native
+    assert batch.positions.tolist() == [0, 1, 2]
 
 
-def test_batch_view_rejects_noncontiguous_positions_after_a_row_boundary() -> None:
+@pytest.mark.parametrize("construct", [BatchView, BatchView.from_plan])
+def test_batch_view_requires_a_native_plan_owner(construct) -> None:
     native = _plan()
     plan = SimpleNamespace(
-        **{name: getattr(native, name) for name in BatchView.__dataclass_fields__}
+        **{
+            name: getattr(native, name)
+            for name in BatchView.__dataclass_fields__
+            if name != "_plan"
+        }
     )
-    plan.positions = native.positions.copy()
-    plan.positions[2] = 3
-    with pytest.raises(
-        ValueError, match="positions are not contiguous within each row"
-    ):
-        BatchView.from_plan(cast(BatchPlan, plan))
+    with pytest.raises(TypeError, match="native BatchPlan"):
+        construct(cast(BatchPlan, plan))
 
 
 def test_cache_group_view_preserves_structured_and_packed_addresses() -> None:
     plan = _plan()
     batch = BatchView.from_plan(plan)
     group = CacheGroupView.from_plan(
-        plan.cache_groups[0],
         batch,
         group_index=0,
         blocks_per_slab=2,
@@ -84,6 +95,39 @@ def test_cache_group_view_preserves_structured_and_packed_addresses() -> None:
     assert group.packed_block_ids.tolist() == [2, 5]
     assert group.packed_append_ids.tolist() == [2, 2, 5]
     assert group.append_block_offsets.dtype == np.uint32
+
+
+@pytest.mark.parametrize(
+    "options,message",
+    [
+        ({"group_index": 1}, "outside the native plan"),
+        ({"group_index": 0, "blocks_per_slab": 1}, "wrong slab packing"),
+        ({"group_index": 0, "parent_capacity": 1}, "outside its layout"),
+        ({"group_index": 0, "block_tokens": 1}, "outside its layout"),
+    ],
+)
+def test_cache_group_view_keeps_layout_specific_bounds(options, message):
+    with pytest.raises(ValueError, match=message):
+        CacheGroupView.from_plan(BatchView.from_plan(_plan()), **options)
+
+
+def test_cache_group_view_cannot_select_from_forged_batch_arrays():
+    fake = SimpleNamespace(cache_groups=_plan().cache_groups)
+    with pytest.raises(TypeError, match="native-backed BatchView"):
+        CacheGroupView.from_plan(cast(BatchView, fake), group_index=0)
+
+
+def test_request_local_rows_check_cache_progress_and_vocabulary():
+    plan = _plan()
+    caches = {11: SimpleNamespace(length=2)}
+    rows = plan_rows(plan, caches, vocab_size=4)
+    assert rows[1].cache is caches[11]
+    assert rows[0].token_ids.tolist() == [1, 2]
+    assert rows[1].positions.tolist() == [2]
+    with pytest.raises(ValueError, match="non-contiguous positions for request 11"):
+        plan_rows(plan, {}, vocab_size=4)
+    with pytest.raises(ValueError, match="token id is out of range for request 11"):
+        plan_rows(plan, caches, vocab_size=3)
 
 
 def test_paged_attention_names_semantics_and_preserves_packed_addresses() -> None:
@@ -119,6 +163,73 @@ def test_paged_attention_names_semantics_and_preserves_packed_addresses() -> Non
     assert history.page_table.tolist() == [2, 5, 2]
     assert history.lengths == (3,)
     assert history.append_slots.tolist() == [4, 5, 10]
+
+
+def test_paged_attention_lowers_unequal_rows_and_window_origins():
+    offsets = [0, 1, 2, 1, 1, 2]
+    plan = BatchPlan(
+        [10, 11, 12],
+        [0, 5, 17],
+        [1, 2, 3, 4, 5, 6],
+        [0, 3, 4, 6],
+        cache_groups=[
+            CacheGroupPlan(
+                0,
+                [0, 1, 3, 8],
+                list(range(1, 9)),
+                [0, 1, 1, 0, 0, 0, 0, 0],
+                [0, 0, 0],
+                [1, 1, 1, 3, 8, 8],
+                [0, 0, 0, 1, 0, 0],
+                offsets,
+                blocks_per_slab=2,
+            ),
+            CacheGroupPlan(
+                1,
+                [0, 1, 3, 6],
+                list(range(9, 15)),
+                [0] * 6,
+                [0, 0, 2],
+                [9, 9, 9, 11, 14, 14],
+                [0] * 6,
+                offsets,
+            ),
+        ],
+    )
+    layout = CacheLayout(
+        14,
+        [
+            CacheGroupLayout(4, blocks_per_slab=2),
+            CacheGroupLayout(
+                4,
+                retention=CacheRetention.WINDOW,
+                window_tokens=8,
+                read_window_tokens=4,
+            ),
+        ],
+    )
+    batch = build_paged_attention_batch(
+        plan,
+        layout,
+        (PagedAttentionGroupSpec("history", 0), PagedAttentionGroupSpec("window", 1)),
+        max_query_tokens=3,
+    )
+    assert batch.query_lengths == (3, 1, 2)
+    history, window = batch.group("history"), batch.group("window")
+    assert history.page_table.reshape(3, -1).tolist() == [
+        [2, 2, 2, 2, 2],
+        [5, 7, 5, 5, 5],
+        [8, 10, 12, 14, 16],
+    ]
+    assert window.page_table.reshape(3, -1).tolist() == [
+        [9, 9, 9],
+        [10, 11, 10],
+        [12, 13, 14],
+    ]
+    assert history.lengths == (3, 6, 19)
+    assert window.lengths == (3, 6, 11)
+    assert history.append_slots.tolist() == [8, 9, 10, 29, 65, 66]
+    assert window.append_slots.tolist() == [36, 37, 38, 45, 57, 58]
 
 
 def test_paged_cache_plan_validates_exact_leased_tables() -> None:
@@ -270,25 +381,24 @@ def _mixed_cache_plan(*, decode: bool) -> tuple[BatchPlan, CacheLayout]:
 
 
 def _replace_plan_group(plan: BatchPlan, index: int, **fields: object) -> BatchPlan:
-    """Corrupt native views to exercise validation after the Rust boundary."""
+    """Build native metadata changes; layout-specific validity is checked later."""
 
-    group = SimpleNamespace(
-        **{
-            name: getattr(plan.cache_groups[index], name)
-            for name in CacheGroupView.__dataclass_fields__
-        }
-    )
-    vars(group).update(fields)
+    group: dict[str, Any] = {
+        name: getattr(plan.cache_groups[index], name)
+        for name in CacheGroupView.__dataclass_fields__
+    }
+    group.update(fields)
     groups = list(plan.cache_groups)
-    groups[index] = cast(CacheGroupPlan, group)
-    return cast(
-        BatchPlan,
-        SimpleNamespace(
-            **{
-                name: groups if name == "cache_groups" else getattr(plan, name)
-                for name in BatchView.__dataclass_fields__
-            }
-        ),
+    groups[index] = CacheGroupPlan(**group)
+    return BatchPlan(
+        plan.sequence_ids,
+        plan.context_lengths,
+        plan.token_ids,
+        plan.token_indptr,
+        prefill_lengths=plan.prefill_lengths,
+        phase=plan.phase,
+        cache_groups=groups,
+        sampling_mask=plan.sampling_mask,
     )
 
 
@@ -311,13 +421,23 @@ def test_paged_cache_plan_validates_heterogeneous_rows_across_retention_groups(
 
 
 @pytest.mark.parametrize("field", ["append_slab_ids", "append_slotnums"])
-def test_paged_cache_plan_rejects_cross_row_append_targets(field: str) -> None:
-    plan, layout = _mixed_cache_plan(decode=True)
+def test_native_plan_rejects_cross_row_append_targets(field: str) -> None:
+    plan, _ = _mixed_cache_plan(decode=True)
     group = plan.cache_groups[0]
     values = getattr(group, field).copy()
     values[3] = values[4]  # Row 1 writes into row 2's valid physical address.
-    mutated = _replace_plan_group(plan, 0, **{field: values})
-    with pytest.raises(ValueError, match="cache group 0 row 1 append target"):
+    with pytest.raises(ValueError, match="append targets must belong"):
+        _replace_plan_group(plan, 0, **{field: values})
+
+
+def test_paged_cache_plan_rejects_a_row_owned_append_to_the_wrong_logical_block():
+    plan, layout = _mixed_cache_plan(decode=True)
+    group = plan.cache_groups[0]
+    slabs = group.append_slab_ids.copy()
+    # Row 2 owns both physical blocks, but position 14 must use logical block 3.
+    slabs[4] = group.block_slab_ids[group.block_indptr[2]]
+    mutated = _replace_plan_group(plan, 0, append_slab_ids=slabs)
+    with pytest.raises(ValueError, match="cache group 0 row 2 append target"):
         PagedCachePlan.from_plan(mutated, layout, decode_lookahead=3)
 
 
@@ -376,15 +496,12 @@ def test_paged_cache_plan_skips_discarded_checkpoint_append_targets() -> None:
     PagedCachePlan.from_plan(mutated, layout, decode_lookahead=3)
 
 
-def test_paged_cache_plan_reports_empty_row_extents_without_indexing_them() -> None:
-    plan, layout = _mixed_cache_plan(decode=True)
+def test_native_plan_rejects_empty_cache_rows_before_adapter_indexing() -> None:
+    plan, _ = _mixed_cache_plan(decode=True)
     indptr = plan.cache_groups[0].block_indptr.copy()
     indptr[1] = 0
-    mutated = _replace_plan_group(plan, 0, block_indptr=indptr)
-    with pytest.raises(
-        ValueError, match="cache group 0 row 0 is not its exact active range"
-    ):
-        PagedCachePlan.from_plan(mutated, layout, decode_lookahead=3)
+    with pytest.raises(ValueError, match="append targets must belong"):
+        _replace_plan_group(plan, 0, block_indptr=indptr)
 
 
 def test_paged_cache_plan_keeps_decode_leases_wider_than_u32() -> None:

@@ -11,7 +11,9 @@ import torch
 
 from resin import (
     BatchPhase,
+    BatchPlan,
     CacheGroupLayout,
+    CacheGroupPlan,
     CacheLayout,
     CacheRetention,
     SamplingParams,
@@ -72,7 +74,7 @@ def _group_plan(group_index, rows, block_table_start_indices, positions, indptr)
         for position in positions[token_start:token_end]:
             append_slab_ids.append(row[position // 128 - first])
             append_block_offsets.append(position % 128)
-    return SimpleNamespace(
+    return CacheGroupPlan(
         group_index=group_index,
         blocks_per_slab=1,
         block_indptr=block_indptr,
@@ -90,7 +92,7 @@ def _flat_plan(
     query_lengths,
     *,
     phase=BatchPhase.PREFILL,
-    cache_pool_id=41,
+    sampling_params=None,
 ):
     sequence_count = len(context_lengths)
     assert len(query_lengths) == sequence_count
@@ -135,20 +137,42 @@ def _flat_plan(
         positions,
         token_indptr,
     )
-    return SimpleNamespace(
-        needs_prompt_logprobs=False,
-        cache_pool_id=cache_pool_id,
-        cache_groups=(history, window),
-        token_ids=list(range(1, len(positions) + 1)),
-        positions=positions,
+    return BatchPlan(
         sequence_ids=list(range(100, 100 + sequence_count)),
-        num_sequences=sequence_count,
-        token_indptr=token_indptr,
         context_lengths=list(context_lengths),
+        token_ids=list(range(1, len(positions) + 1)),
+        token_indptr=token_indptr,
         phase=phase,
-        sampling_mask=[True] * sequence_count,
-        needs_logprobs=False,
-        sampling_params=[SamplingParams() for _ in range(sequence_count)],
+        cache_groups=(history, window),
+        sampling_params=sampling_params,
+    )
+
+
+def _replace_group(plan, index, **changes):
+    groups = list(plan.cache_groups)
+    fields = {
+        name: getattr(groups[index], name)
+        for name in (
+            "group_index",
+            "blocks_per_slab",
+            "block_indptr",
+            "block_slab_ids",
+            "block_slotnums",
+            "block_table_start_indices",
+            "append_slab_ids",
+            "append_slotnums",
+            "append_block_offsets",
+        )
+    }
+    groups[index] = CacheGroupPlan(**(fields | changes))
+    return BatchPlan(
+        plan.sequence_ids,
+        plan.context_lengths,
+        plan.token_ids,
+        plan.token_indptr,
+        phase=plan.phase,
+        cache_groups=groups,
+        sampling_params=plan.sampling_params,
     )
 
 
@@ -290,12 +314,14 @@ class TestGptOssCudaNativePlan:
         self, rows, expected_bucket
     ) -> None:
         plan = _flat_plan(
-            [130 + 10 * row for row in range(rows)], [1] * rows, phase=BatchPhase.DECODE
+            [130 + 10 * row for row in range(rows)],
+            [1] * rows,
+            phase=BatchPhase.DECODE,
+            sampling_params=[
+                SamplingParams(temperature=0.7, top_p=0.9, top_k=5, seed=100 + row)
+                for row in range(rows)
+            ],
         )
-        plan.sampling_params = [
-            SamplingParams(temperature=0.7, top_p=0.9, top_k=5, seed=100 + row)
-            for row in range(rows)
-        ]
         _, batch = build_attention_batches(plan)
         runner = object.__new__(GptOssCudaRunner)
         runner.parallel_groups = None
@@ -541,28 +567,27 @@ class TestGptOssCudaNativePlan:
 
     def test_frozen_append_destinations_are_a_validation_oracle(self) -> None:
         plan = _prefill_plan()
-        plan.cache_groups[1].append_slab_ids[0] += 1
+        append = plan.cache_groups[1].append_slab_ids.copy()
+        append[0] += 1
         with pytest.raises(ValueError, match="append target"):
-            build_attention_batches(plan)
+            build_attention_batches(_replace_group(plan, 1, append_slab_ids=append))
 
     def test_group_order_suffix_and_parent_ownership_fail_closed(self) -> None:
-        plan = _prefill_plan()
-        plan.cache_groups[0].group_index = 1
         with pytest.raises(ValueError, match="ordered"):
-            build_attention_batches(plan)
+            _replace_group(_prefill_plan(), 0, group_index=1)
 
         plan = _flat_plan([9000], [1])
-        plan.cache_groups[1].block_table_start_indices[0] = 0
         with pytest.raises(ValueError, match="active range"):
-            build_attention_batches(plan)
+            build_attention_batches(
+                _replace_group(plan, 1, block_table_start_indices=[0])
+            )
 
         plan = _flat_plan([0], [1])
-        plan.cache_groups[1].block_slab_ids[0] = plan.cache_groups[0].block_slab_ids[0]
-        plan.cache_groups[1].append_slab_ids[0] = plan.cache_groups[0].block_slab_ids[0]
         with pytest.raises(ValueError, match="cannot address"):
-            build_attention_batches(plan)
+            build_attention_batches(
+                _replace_group(plan, 1, block_slab_ids=[1], append_slab_ids=[1])
+            )
 
-        plan = _flat_plan([0], [1])
         with pytest.raises(ValueError, match="outside"):
             build_attention_batches(plan, parent_capacity=128)
 

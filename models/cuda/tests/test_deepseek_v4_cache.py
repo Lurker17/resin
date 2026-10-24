@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import math
-from types import SimpleNamespace
-from typing import cast
 
 import numpy as np
 import torch
 
-from resin import BatchPhase, BatchPlan, CacheRetention
+from resin import BatchPhase, BatchPlan, CacheGroupPlan, CacheRetention
 from resin.backend.plans import PagedCachePlan
 from resin_models_cuda.deepseek_v4.cache import (
     C4_STATE_GROUP,
@@ -161,7 +159,7 @@ def test_graph_capture_uses_group_private_scratch_parents() -> None:
 def test_plan_preserves_structured_parent_and_child_addresses() -> None:
     layout = _geometry().layout(10)
     cache_groups = tuple(
-        SimpleNamespace(
+        CacheGroupPlan(
             group_index=index,
             blocks_per_slab=descriptor.blocks_per_slab,
             block_indptr=np.array([0, 1], dtype=np.uint32),
@@ -178,21 +176,17 @@ def test_plan_preserves_structured_parent_and_child_addresses() -> None:
         )
         for index, descriptor in enumerate(layout.groups)
     )
-    plan = SimpleNamespace(
-        num_sequences=1,
+    plan = BatchPlan(
         sequence_ids=np.array([1], dtype=np.uint64),
         token_ids=np.array([7], dtype=np.uint32),
         token_indptr=np.array([0, 1], dtype=np.uint32),
-        positions=np.array([0], dtype=np.uint32),
         context_lengths=np.array([0], dtype=np.uint32),
         sampling_mask=np.array([True]),
         cache_groups=cache_groups,
         phase=BatchPhase.PREFILL,
     )
 
-    cache_plan = PagedCachePlan.from_plan(
-        cast(BatchPlan, plan), layout, decode_lookahead=5
-    )
+    cache_plan = PagedCachePlan.from_plan(plan, layout, decode_lookahead=5)
 
     for index, (group, descriptor) in enumerate(
         zip(cache_plan.groups, layout.groups, strict=True)

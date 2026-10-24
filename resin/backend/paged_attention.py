@@ -165,16 +165,16 @@ def build_paged_attention_batch(
 
     rows = tuple(range(native.num_sequences))
     token_indices = np.arange(native.num_tokens, dtype=np.int64)
+    post_lengths = native.post_lengths
     lowered = []
     for spec, group in zip(specs, selected, strict=True):
         descriptor = cache_layout.groups[spec.group_index]
         page_size = int(descriptor.block_tokens)
-        page_rows = tuple(
-            group.packed_block_ids[group.block_slice(row)] for row in rows
-        )
+        packed_blocks = group.packed_block_ids
+        page_rows = tuple(packed_blocks[group.block_slice(row)] for row in rows)
         width, page_table = _page_table(page_rows, spec.minimum_table_width)
         lengths = tuple(
-            int(native.post_lengths[row])
+            int(post_lengths[row])
             - int(group.block_table_start_indices[row]) * page_size
             for row in rows
         )

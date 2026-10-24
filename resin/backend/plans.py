@@ -2,73 +2,49 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 
-if TYPE_CHECKING:
-    from resin._resin import BatchPlan, CacheGroupPlan, CacheLayout
+from resin._resin import BatchPhase, BatchPlan, CacheGroupPlan, CacheLayout
 
 
 @dataclass(frozen=True, slots=True)
 class BatchView:
-    """Validated NumPy view of the framework-neutral ``BatchPlan`` fields."""
+    """Cached NumPy views owned by an immutable, validated native plan."""
 
-    phase: Any
-    sequence_ids: npt.NDArray[np.uint64]
-    context_lengths: npt.NDArray[np.uint32]
-    token_ids: npt.NDArray[np.uint32]
-    token_indptr: npt.NDArray[np.uint32]
-    positions: npt.NDArray[np.uint32]
-    sampling_mask: npt.NDArray[np.bool_]
-    cache_groups: tuple[CacheGroupPlan, ...]
+    _plan: BatchPlan
+    phase: BatchPhase = field(init=False)
+    sequence_ids: npt.NDArray[np.uint64] = field(init=False)
+    context_lengths: npt.NDArray[np.uint32] = field(init=False)
+    token_ids: npt.NDArray[np.uint32] = field(init=False)
+    token_indptr: npt.NDArray[np.uint32] = field(init=False)
+    positions: npt.NDArray[np.uint32] = field(init=False)
+    sampling_mask: npt.NDArray[np.bool_] = field(init=False)
+    cache_groups: tuple[CacheGroupPlan, ...] = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self._plan, BatchPlan):
+            raise TypeError("BatchView requires a native BatchPlan")
+        # Native construction and archive restore validate these fields. Keeping
+        # their owner prevents callers from mixing unrelated arrays into a view.
+        for name in (
+            "phase",
+            "sequence_ids",
+            "context_lengths",
+            "token_ids",
+            "token_indptr",
+            "positions",
+            "sampling_mask",
+            "cache_groups",
+        ):
+            object.__setattr__(self, name, getattr(self._plan, name))
 
     @classmethod
     def from_plan(cls, plan: BatchPlan) -> BatchView:
-        """Read and validate the generic portion of one native plan."""
-
-        sequence_ids = np.asarray(plan.sequence_ids, dtype=np.uint64)
-        context_lengths = np.asarray(plan.context_lengths, dtype=np.uint32)
-        token_ids = np.asarray(plan.token_ids, dtype=np.uint32)
-        token_indptr = np.asarray(plan.token_indptr, dtype=np.uint32)
-        positions = np.asarray(plan.positions, dtype=np.uint32)
-        sampling_mask = np.asarray(plan.sampling_mask, dtype=np.bool_)
-        rows = len(sequence_ids)
-        tokens = len(token_ids)
-        if (
-            rows == 0
-            or tokens == 0
-            or len(context_lengths) != rows
-            or len(sampling_mask) != rows
-            or len(token_indptr) != rows + 1
-            or int(token_indptr[0]) != 0
-            or int(token_indptr[-1]) != tokens
-            or np.any(token_indptr[1:] <= token_indptr[:-1])
-            or len(positions) != tokens
-        ):
-            raise ValueError("BatchPlan does not describe nonempty token rows")
-        query_lengths = np.diff(token_indptr)
-        expected = np.arange(tokens, dtype=np.int64) + np.repeat(
-            context_lengths.astype(np.int64) - token_indptr[:-1], query_lengths
-        )
-        if not np.array_equal(positions, expected):
-            raise ValueError("BatchPlan positions are not contiguous within each row")
-        try:
-            cache_groups = tuple(plan.cache_groups)
-        except (AttributeError, TypeError) as error:
-            raise ValueError("BatchPlan cache_groups must be iterable") from error
-        return cls(
-            plan.phase,
-            sequence_ids,
-            context_lengths,
-            token_ids,
-            token_indptr,
-            positions,
-            sampling_mask,
-            cache_groups,
-        )
+        return cls(plan)
 
     @property
     def num_sequences(self) -> int:
@@ -91,8 +67,7 @@ class BatchView:
         return self.token_indptr[1:] - 1
 
     def token_slice(self, row: int) -> slice:
-        start, end = map(int, self.token_indptr[row : row + 2])
-        return slice(start, end)
+        return slice(*self._plan.token_range(row))
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +87,6 @@ class CacheGroupView:
     @classmethod
     def from_plan(
         cls,
-        native: CacheGroupPlan,
         batch: BatchView,
         *,
         group_index: int,
@@ -120,50 +94,24 @@ class CacheGroupView:
         parent_capacity: int | None = None,
         block_tokens: int | None = None,
     ) -> CacheGroupView:
-        """Validate generic CSR shape, packing, bounds, and append coverage."""
+        """Check the batch's native group against the physical cache layout."""
 
-        packing = int(native.blocks_per_slab)
-        expected_packing = packing if blocks_per_slab is None else blocks_per_slab
-        block_indptr = np.asarray(native.block_indptr, dtype=np.uint32)
-        block_slab_ids = np.asarray(native.block_slab_ids, dtype=np.uint32)
-        block_slotnums = np.asarray(native.block_slotnums, dtype=np.uint32)
-        first_blocks = np.asarray(native.block_table_start_indices, dtype=np.uint32)
-        append_slab_ids = np.asarray(native.append_slab_ids, dtype=np.uint32)
-        append_slotnums = np.asarray(native.append_slotnums, dtype=np.uint32)
-        append_offsets = np.asarray(native.append_block_offsets, dtype=np.uint32)
-        if int(native.group_index) != group_index:
-            raise ValueError(f"cache groups are not ordered at group {group_index}")
-        if packing != expected_packing or packing <= 0:
+        if not isinstance(batch, BatchView):
+            raise TypeError("cache group views require a native-backed BatchView")
+        if not 0 <= group_index < len(batch.cache_groups):
+            raise ValueError(f"cache group {group_index} is outside the native plan")
+        native = batch.cache_groups[group_index]
+        packing = native.blocks_per_slab
+        block_slab_ids = native.block_slab_ids
+        append_slab_ids = native.append_slab_ids
+        append_offsets = native.append_block_offsets
+        if blocks_per_slab is not None and packing != blocks_per_slab:
             raise ValueError(f"cache group {group_index} has the wrong slab packing")
-        if (
-            len(block_indptr) != batch.num_sequences + 1
-            or int(block_indptr[0]) != 0
-            or int(block_indptr[-1]) != len(block_slab_ids)
-            or np.any(block_indptr[1:] < block_indptr[:-1])
-            or len(block_slotnums) != len(block_slab_ids)
-            or len(first_blocks) != batch.num_sequences
-        ):
-            raise ValueError(f"cache group {group_index} has malformed CSR metadata")
-        if (
-            len(append_slab_ids) != batch.num_tokens
-            or len(append_slotnums) != batch.num_tokens
-            or len(append_offsets) != batch.num_tokens
-        ):
-            raise ValueError(
-                f"cache group {group_index} append metadata does not cover every token"
-            )
-        if (
-            np.any(block_slab_ids == 0)
-            or np.any(append_slab_ids == 0)
-            or np.any(block_slotnums >= packing)
-            or np.any(append_slotnums >= packing)
-            or (block_tokens is not None and np.any(append_offsets >= block_tokens))
-            or (
-                parent_capacity is not None
-                and (
-                    np.any(block_slab_ids > parent_capacity)
-                    or np.any(append_slab_ids > parent_capacity)
-                )
+        if (block_tokens is not None and np.any(append_offsets >= block_tokens)) or (
+            parent_capacity is not None
+            and (
+                np.any(block_slab_ids > parent_capacity)
+                or np.any(append_slab_ids > parent_capacity)
             )
         ):
             raise ValueError(
@@ -172,12 +120,12 @@ class CacheGroupView:
         return cls(
             group_index,
             packing,
-            block_indptr,
+            native.block_indptr,
             block_slab_ids,
-            block_slotnums,
-            first_blocks,
+            native.block_slotnums,
+            native.block_table_start_indices,
             append_slab_ids,
-            append_slotnums,
+            native.append_slotnums,
             append_offsets,
         )
 
@@ -243,13 +191,13 @@ class PagedCachePlan:
     ) -> PagedCachePlan:
         """Validate group order, physical bounds, extents, and append ownership."""
 
-        from resin._resin import BatchPhase, CacheGroupFamily
+        from resin._resin import CacheGroupFamily
 
         if decode_lookahead < 0:
             raise ValueError("decode_lookahead cannot be negative")
+        if not isinstance(layout, CacheLayout):
+            raise TypeError("paged cache plans require a native CacheLayout")
         batch = BatchView.from_plan(plan)
-        if batch.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
-            raise ValueError("BatchPlan phase must be prefill or decode")
         if len(batch.cache_groups) != len(layout.groups):
             raise ValueError("BatchPlan cache groups do not match CacheLayout")
 
@@ -269,12 +217,9 @@ class PagedCachePlan:
         leased = batch.context_lengths.astype(arithmetic) + write_tokens
 
         groups = []
-        for index, (native, descriptor) in enumerate(
-            zip(batch.cache_groups, layout.groups, strict=True)
-        ):
+        for index, descriptor in enumerate(layout.groups):
             block_tokens = descriptor.block_tokens
             group = CacheGroupView.from_plan(
-                native,
                 batch,
                 group_index=index,
                 blocks_per_slab=descriptor.blocks_per_slab,
@@ -301,7 +246,7 @@ class PagedCachePlan:
             )
 
             logical_blocks = positions // block_tokens
-            # Malformed extents, including empty rows, cannot be indexed safely.
+            # Layout-inconsistent extents must be rejected before indexing.
             retained = (logical_blocks >= expected_first[row_ids]) & ~invalid_range[
                 row_ids
             ]
@@ -341,7 +286,7 @@ class PagedCachePlan:
         return cls(batch, layout, tuple(groups))
 
     @property
-    def phase(self) -> Any:
+    def phase(self) -> BatchPhase:
         return self.batch.phase
 
     @property
@@ -386,8 +331,8 @@ def plan_rows(
         cache = caches.get(sequence_id)
         offset = 0 if cache is None else cache.length
         positions = batch.positions[token_slice]
-        expected = np.arange(offset, offset + len(positions), dtype=np.uint32)
-        if not np.array_equal(positions, expected):
+        if int(batch.context_lengths[index]) != offset:
+            expected = np.arange(offset, offset + len(positions), dtype=np.uint32)
             raise ValueError(
                 f"non-contiguous positions for request {sequence_id}: "
                 f"expected {expected.tolist()}, got {positions.tolist()}"
