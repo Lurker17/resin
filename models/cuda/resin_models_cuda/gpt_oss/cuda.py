@@ -87,6 +87,7 @@ if TYPE_CHECKING:
 
 _BF16_BYTES = 2
 _TINYGEMM_MAX_TOKENS = 128
+_AttentionBatches = tuple[tuple[PagedAttentionBatch, ...], PagedAttentionBatch | None]
 
 
 class _EmptyFa4AuxData:
@@ -962,7 +963,7 @@ class GptOssCudaRunner(CudaRunner):
             raise RuntimeError("explicit rank groups require forward_distributed")
         return self._forward_plan(plan)
 
-    def _attention_batches(self, plan: BatchPlan):
+    def _attention_batches(self, plan: BatchPlan) -> _AttentionBatches:
         prefill_batches, decode_batch = build_attention_batches(plan, self.cache_layout)
         host_batches = prefill_batches + (
             () if decode_batch is None else (decode_batch,)
@@ -974,11 +975,19 @@ class GptOssCudaRunner(CudaRunner):
             )
         return prefill_batches, decode_batch
 
-    def _forward_plan(self, plan: BatchPlan, *, use_graph=True) -> ForwardOutput:
+    def _forward_plan(
+        self,
+        plan: BatchPlan,
+        *,
+        use_graph=True,
+        prepared: _AttentionBatches | None = None,
+    ) -> ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         host_positions = plan.positions
 
-        prefill_batches, decode_batch = self._attention_batches(plan)
+        prefill_batches, decode_batch = (
+            self._attention_batches(plan) if prepared is None else prepared
+        )
 
         with self._cuda_failure:
             if use_graph and not prefill_batches and decode_batch is not None:
@@ -1055,11 +1064,14 @@ class GptOssCudaRunner(CudaRunner):
 
     def validate_distributed(
         self, plan: BatchPlan | None, context: StepContext
-    ) -> None:
+    ) -> _AttentionBatches:
+        """Prepare rank-local attention metadata before the readiness vote."""
+
         if self.parallel_groups is None or context.groups is not self.parallel_groups:
             raise ValueError("distributed step groups do not match this runner")
         if context.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
             raise ValueError("GPT-OSS plan phase must be prefill or decode")
+        prepared: _AttentionBatches = ((), None)
         if plan is None:
             if context.num_sequences or context.num_tokens:
                 raise ValueError("a nonempty replica requires a batch plan")
@@ -1070,7 +1082,8 @@ class GptOssCudaRunner(CudaRunner):
                 or len(plan.token_ids) != context.num_tokens
             ):
                 raise ValueError("distributed step metadata does not match the plan")
-            prefills, decode = self._attention_batches(plan)
+            prepared = self._attention_batches(plan)
+            prefills, decode = prepared
             if len(prefills) + (decode is not None) != 1:
                 raise ValueError(
                     "distributed GPT-OSS requires one packed attention batch"
@@ -1080,17 +1093,24 @@ class GptOssCudaRunner(CudaRunner):
         self._check_cuda_graphs(context.phase)
         if context.phase == BatchPhase.DECODE and self.cuda_graph_decode != "disabled":
             self._require_cuda_graph_executor().mode("decode").check_ready()
+        return prepared
 
     def forward_distributed(
-        self, plan: BatchPlan | None, context: StepContext
+        self,
+        plan: BatchPlan | None,
+        context: StepContext,
+        *,
+        prepared: _AttentionBatches | None = None,
     ) -> ForwardOutput | None:
         """Run one packed batch, or join its expert layers without KV work."""
 
-        self.validate_distributed(plan, context)
+        prepared = (
+            self.validate_distributed(plan, context) if prepared is None else prepared
+        )
         self._last_graph_logits = None
         with self._cuda_failure:
             if context.phase == BatchPhase.DECODE:
-                host = None if plan is None else self._attention_batches(plan)[1]
+                host = prepared[1]
                 shape = self._select_distributed_cuda_graph(
                     "decode",
                     context,
@@ -1110,14 +1130,14 @@ class GptOssCudaRunner(CudaRunner):
             if context.phase == BatchPhase.PREFILL:
                 with self._distributed_prefill_graphs(context):
                     if plan is not None:
-                        return self._forward_plan(plan)
+                        return self._forward_plan(plan, prepared=prepared)
                     with torch.inference_mode():
                         if self._prefill_graph_active:
                             self._empty_prefill_regions()
                         else:
                             self._forward_experts_empty()
             elif plan is not None:
-                return self._forward_plan(plan, use_graph=False)
+                return self._forward_plan(plan, use_graph=False, prepared=prepared)
             else:
                 with torch.inference_mode():
                     self._forward_experts_empty()

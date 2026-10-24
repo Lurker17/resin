@@ -840,8 +840,6 @@ class DeepSeekV4CudaRunner(CudaRunner):
         row_count = batch.num_sequences
         if row_count > self.max_batch_size:
             raise ValueError("DeepSeek-V4 batch size is outside runner capacity")
-        if len(set(batch.sequence_ids)) != row_count:
-            raise ValueError("DeepSeek-V4 sequence IDs must be unique within a batch")
         rows = tuple(
             (int(start), int(end))
             for start, end in zip(batch.token_indptr, batch.token_indptr[1:])

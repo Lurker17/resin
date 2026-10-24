@@ -6,10 +6,9 @@ from collections.abc import Callable, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 
-import numpy as np
 import torch
 
-from resin import BatchPhase, ResourceBinding, RunnerConfig
+from resin import BatchPhase, BatchPlan, ResourceBinding, RunnerConfig
 from resin.backend.collectives import (
     close_layer_collectives,
     fixed_layer_capacity,
@@ -642,38 +641,29 @@ def graph_sample(sampler, logits, sampling: SamplingTensors, step: int):
 
 
 def validate_hybrid_plan(
-    plan, *, label: str, max_batch_size: int, max_seq_len: int, decode_lookahead: int
-):
+    plan: BatchPlan,
+    *,
+    label: str,
+    max_batch_size: int,
+    max_seq_len: int,
+    decode_lookahead: int,
+) -> tuple[tuple[int, int], ...]:
+    """Check runner limits; native construction already validates plan metadata."""
+
     rows = plan.num_sequences
-    indptr = np.asarray(plan.token_indptr)
-    if rows == 0 or rows > max_batch_size:
+    if rows > max_batch_size:
         raise ValueError(f"{label} batch size is outside runner capacity")
-    if (
-        len(indptr) != rows + 1
-        or indptr[0] != 0
-        or indptr[-1] != len(plan.token_ids)
-        or np.any(indptr[1:] <= indptr[:-1])
-    ):
-        raise ValueError(f"{label} sequence metadata is malformed")
-    if len(plan.context_lengths) != rows or len(plan.sampling_mask) != rows:
-        raise ValueError(f"{label} row metadata is malformed")
-    slices = tuple(map(tuple, np.stack((indptr[:-1], indptr[1:]), axis=1).tolist()))
-    for row, (start, end) in enumerate(slices):
-        context = int(plan.context_lengths[row])
-        if not np.array_equal(
-            plan.positions[start:end], np.arange(context, context + end - start)
-        ):
-            raise ValueError(f"{label} positions must continue their context")
-        extra = decode_lookahead if plan.phase == BatchPhase.DECODE else 0
-        if context + end - start + extra > max_seq_len:
+    slices = tuple(plan.token_range(row) for row in range(rows))
+    contexts = plan.context_lengths
+    extra = decode_lookahead if plan.phase == BatchPhase.DECODE else 0
+    for context, (start, end) in zip(contexts, slices, strict=True):
+        if int(context) + end - start + extra > max_seq_len:
             raise ValueError(f"{label} sequence exceeds max_seq_len")
     if plan.phase == BatchPhase.DECODE:
         if any(end - start != 1 for start, end in slices):
             raise ValueError(f"{label} decode rows must contain one anchor token")
-        if any(int(context) == 0 for context in plan.context_lengths):
+        if any(int(context) == 0 for context in contexts):
             raise ValueError(f"{label} decode requires a cached prefix")
-    elif plan.phase != BatchPhase.PREFILL:
-        raise ValueError(f"{label} plan phase must be prefill or decode")
     return slices
 
 

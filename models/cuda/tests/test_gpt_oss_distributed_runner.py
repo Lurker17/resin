@@ -71,9 +71,10 @@ def _runner(monkeypatch, groups):
     setattr(runner, "_select_distributed_cuda_graph", lambda *args, **kwargs: None)
     setattr(runner, "_distributed_prefill_graphs", lambda context: nullcontext())
     setattr(runner, "_sampler", lambda logits, plan: logits.argmax(dim=-1))
-    calls, tensorized = [], []
+    calls, tensorized, lowered = [], [], []
     setattr(runner, "calls", calls)
     setattr(runner, "tensorized", tensorized)
+    setattr(runner, "lowered", lowered)
     setattr(
         runner,
         "_model",
@@ -98,6 +99,7 @@ def _runner(monkeypatch, groups):
 
     def batches(plan, cache_layout):
         assert cache_layout is runner.cache_layout
+        lowered.append(plan)
         batch = SimpleNamespace(
             token_indices=torch.arange(len(plan.token_ids)),
             sequence_indices=tuple(range(plan.num_sequences)),
@@ -179,6 +181,68 @@ def test_distributed_forward_packs_unequal_replica_rows_once(monkeypatch, phase)
             "prefill.0" if phase == BatchPhase.PREFILL else "decode"
         ]
         assert groups.broadcasts == []
+        assert runner.lowered == [plan]
+
+
+@pytest.mark.parametrize(
+    "phase,captured",
+    [
+        (BatchPhase.PREFILL, False),
+        (BatchPhase.DECODE, False),
+        (BatchPhase.DECODE, True),
+    ],
+)
+@pytest.mark.parametrize("idle", [False, True])
+def test_worker_prepared_attention_is_reused_for_every_execution_path(
+    monkeypatch, phase, captured, idle
+):
+    groups = _groups(Parallelism(world_size=2, ep=2, attn_dp=2))
+    runner = _runner(monkeypatch, groups)
+    plan = None if idle else BatchPlan([7], [3], [9], [0, 1], phase=phase)
+    context = _context(groups, phase, ((0, 0) if idle else (1, 1), (1, 1)), plan)
+    prepared = runner.validate_distributed(plan, context)
+    assert runner.lowered == ([] if idle else [plan])
+
+    def repeated(*args, **kwargs) -> NoReturn:
+        raise AssertionError("worker-prepared host metadata must be reused")
+
+    monkeypatch.setattr(runner, "validate_distributed", repeated)
+    monkeypatch.setattr(runner, "_attention_batches", repeated)
+    replayed = []
+    if captured:
+        monkeypatch.setattr(
+            runner, "_select_distributed_cuda_graph", lambda *args, **kwargs: (2, 1)
+        )
+
+        def replay(plan_arg, host, *, shape):
+            assert plan_arg is plan and host is prepared[1]
+            replayed.append(shape)
+            return token_output([9])
+
+        monkeypatch.setattr(runner, "_graph_forward", replay)
+        monkeypatch.setattr(
+            runner, "_decode_graph_capture_inputs", lambda shape: {"ep_valid_rows": 2}
+        )
+
+        def empty_replay(mode, shape, inputs):
+            assert mode == "decode" and inputs["ep_valid_rows"] == 0
+            replayed.append(shape)
+
+        monkeypatch.setattr(runner, "_run_cuda_graph", empty_replay)
+
+    output = runner.forward_distributed(plan, context, prepared=prepared)
+    if idle:
+        assert output is None
+    else:
+        assert isinstance(output, ForwardOutput)
+        assert output.token_ids.tolist() == [9]
+    assert runner.lowered == ([] if idle else [plan])
+    assert replayed == ([(2, 1)] if captured else [])
+    assert runner.tensorized == (
+        []
+        if idle or captured
+        else ["prefill.0" if phase == BatchPhase.PREFILL else "decode"]
+    )
 
 
 def test_distributed_prefill_scores_all_predecessors_from_one_forward(monkeypatch):
