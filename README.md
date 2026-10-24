@@ -1,7 +1,7 @@
 # Resin
 
-Resin is an inference engine _shell_. It provides modular, low-level building
-blocks for making your own LLM inference engine.
+Resin is an inference engine _shell_. It provides modular building blocks for
+making your own LLM inference engine.
 
 At its core is the `Engine` class: a Rust scheduler and KV cache allocator,
 which hands off to a `Runner` – **you write the model's forward pass, on any
