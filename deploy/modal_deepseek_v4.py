@@ -338,7 +338,11 @@ def _run_rank_workload(
     prompt_rows: list[list[int]],
     max_new_tokens: int,
     context_length: int,
-    sampling_params: SamplingParams,
+    temperature: float,
+    top_p: float,
+    top_k: int | None,
+    seed: int | None,
+    stop_token_ids: list[int] | None,
     tensor_parallel: TensorParallelContext,
     profile: bool,
     profile_run_id: str | None,
@@ -401,7 +405,16 @@ def _run_rank_workload(
             max_batch_tokens=batch_size * context_length,
             prefill_chunk_size=context_length,
         ),
-        eos_token_id=runner.eos_token_id,
+    )
+    sampling_params = SamplingParams(
+        max_new_tokens=max_new_tokens,
+        stop_token_ids=[runner.eos_token_id]
+        if stop_token_ids is None
+        else stop_token_ids,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        seed=seed,
     )
     first_token_time: float | None = None
     generated_steps = 0
@@ -421,7 +434,6 @@ def _run_rank_workload(
             profile_requests = [
                 engine.submit(
                     row,
-                    max_new_tokens=max_new_tokens,
                     sampling_params=sampling_params,
                 )
                 for row in prompt_rows
@@ -492,8 +504,11 @@ def _run_rank_workload(
             probes = [
                 engine.submit(
                     row,
-                    max_new_tokens=1,
-                    sampling_params=SamplingParams(temperature=0.0),
+                    sampling_params=SamplingParams(
+                        max_new_tokens=1,
+                        stop_token_ids=sampling_params.stop_token_ids,
+                        temperature=0.0,
+                    ),
                 )
                 for row in continuation_rows
             ]
@@ -511,8 +526,11 @@ def _run_rank_workload(
             fresh_probes = [
                 engine.submit(
                     row,
-                    max_new_tokens=1,
-                    sampling_params=SamplingParams(temperature=0.0),
+                    sampling_params=SamplingParams(
+                        max_new_tokens=1,
+                        stop_token_ids=sampling_params.stop_token_ids,
+                        temperature=0.0,
+                    ),
                 )
                 for row in continuation_rows
             ]
@@ -544,7 +562,6 @@ def _run_rank_workload(
         requests = [
             engine.submit(
                 row,
-                max_new_tokens=max_new_tokens,
                 sampling_params=sampling_params,
             )
             for row in prompt_rows
@@ -656,6 +673,7 @@ def _run_rank(
     model_path: Path,
     checkpoint: dict[str, object],
     prompt_rows: list[list[int]],
+    stop_token_ids: list[int] | None,
     max_new_tokens: int,
     context_length: int,
     temperature: float,
@@ -669,12 +687,6 @@ def _run_rank(
     tensor_parallel = _initialize_tensor_parallel(
         rank, master_port, tensor_parallel_size
     )
-    sampling_params = SamplingParams(
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        seed=seed,
-    )
     report = _run_rank_workload(
         rank,
         model_path,
@@ -682,7 +694,11 @@ def _run_rank(
         prompt_rows,
         max_new_tokens,
         context_length,
-        sampling_params,
+        temperature,
+        top_p,
+        top_k,
+        seed,
+        stop_token_ids,
         tensor_parallel,
         profile,
         profile_run_id,
@@ -699,6 +715,7 @@ def _launch_tensor_parallel(
     model_path: Path,
     checkpoint: dict[str, object],
     prompt_rows: list[list[int]],
+    stop_token_ids: list[int] | None,
     max_new_tokens: int,
     context_length: int,
     temperature: float,
@@ -723,6 +740,7 @@ def _launch_tensor_parallel(
                 model_path,
                 checkpoint,
                 prompt_rows,
+                stop_token_ids,
                 max_new_tokens,
                 context_length,
                 temperature,
@@ -758,8 +776,6 @@ def _benchmark_point(
             max_batch_tokens=batch_size * len(prompt_ids),
             prefill_chunk_size=len(prompt_ids),
         ),
-        # Force exactly max_new_tokens so every point has the same denominator.
-        eos_token_id=None,
     )
     first_token_time: float | None = None
     try:
@@ -768,7 +784,6 @@ def _benchmark_point(
         requests = [
             engine.submit(
                 prompt_ids,
-                max_new_tokens=max_new_tokens,
                 sampling_params=sampling_params,
             )
             for _ in range(batch_size)
@@ -866,7 +881,10 @@ def _run_rank_benchmark(
         capture_cuda_graphs(runner)
         capture_elapsed = time.perf_counter() - capture_start
         validate_prefill_graphs(runner)
+    # Force exactly max_new_tokens so every benchmark has the same denominator.
     sampling_params = SamplingParams(
+        max_new_tokens=max_new_tokens,
+        stop_token_ids=(),
         temperature=1.0,
         top_p=0.95,
         top_k=None,
@@ -1414,6 +1432,7 @@ def run_model_tp4(
         model_path,
         checkpoint,
         prompt_rows,
+        None if rendered is None else rendered.stop_token_ids,
         max_new_tokens,
         context_length,
         temperature,

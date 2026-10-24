@@ -404,12 +404,15 @@ def _run_prompt(
     model_path: Path,
     model_cache: dict[str, object],
     prompt_ids: list[int],
-    max_new_tokens: int,
     context_length: int,
     schedule_conservativeness: float,
     sampling_params: SamplingParams,
+    warmup_sampling_params: SamplingParams,
     tensor_parallel: TensorParallelContext,
 ) -> dict[str, object]:
+    max_new_tokens = sampling_params.max_new_tokens
+    if max_new_tokens is None:
+        raise ValueError("timed prompts require a max_new_tokens limit")
     if len(prompt_ids) + max_new_tokens - 1 > context_length:
         raise ValueError("prompt plus max_new_tokens exceeds context_length")
     cache_parent_capacity = _required_parent_capacity(len(prompt_ids), max_new_tokens)
@@ -429,7 +432,6 @@ def _run_prompt(
         scheduler_config=SchedulerConfig(
             schedule_conservativeness=schedule_conservativeness
         ),
-        eos_token_id=runner.eos_token_id,
     )
     output_events: list[TokenEvent] = []
     first_token_time: float | None = None
@@ -437,8 +439,7 @@ def _run_prompt(
         # Warm the real prefill path before timing request execution.
         warmup = engine.submit(
             prompt_ids,
-            max_new_tokens=2,
-            sampling_params=sampling_params,
+            sampling_params=warmup_sampling_params,
         )
         while engine.has_work():
             engine.step()
@@ -449,7 +450,6 @@ def _run_prompt(
         start = time.perf_counter()
         request = engine.submit(
             prompt_ids,
-            max_new_tokens=max_new_tokens,
             sampling_params=sampling_params,
         )
         while engine.has_work():
@@ -564,10 +564,13 @@ def _validate_decode_padding(engine, runner, prompt_ids, max_new_tokens):
         requests = [
             engine.submit(
                 prompt,
-                max_new_tokens=output_tokens,
                 batch_key=len(prompt),
-                sampling_params=SamplingParams(temperature=0.0, seed=173 + row),
-                stop_token_ids=(),
+                sampling_params=SamplingParams(
+                    max_new_tokens=output_tokens,
+                    stop_token_ids=(),
+                    temperature=0.0,
+                    seed=173 + row,
+                ),
             )
             for row in range(batch_size)
         ]
@@ -638,15 +641,19 @@ def _bench_cuda(
         scheduler_config=SchedulerConfig(
             schedule_conservativeness=schedule_conservativeness
         ),
-        eos_token_id=runner.eos_token_id,
     )
 
     def execute_batch(batch_size: int) -> dict[str, object]:
         requests = [
             engine.submit(
                 prompt_ids,
-                max_new_tokens=max_new_tokens,
                 batch_key=prompt_tokens,
+                sampling_params=SamplingParams(
+                    max_new_tokens=max_new_tokens,
+                    stop_token_ids=()
+                    if runner.eos_token_id is None
+                    else (runner.eos_token_id,),
+                ),
             )
             for _ in range(batch_size)
         ]
@@ -688,8 +695,13 @@ def _bench_cuda(
         requests = [
             engine.submit(
                 prompt_ids,
-                max_new_tokens=max_new_tokens,
                 batch_key=prompt_tokens,
+                sampling_params=SamplingParams(
+                    max_new_tokens=max_new_tokens,
+                    stop_token_ids=()
+                    if runner.eos_token_id is None
+                    else (runner.eos_token_id,),
+                ),
             )
             for _ in range(batch_size)
         ]
@@ -839,6 +851,7 @@ def _run_prompt_rank(
     model_path: Path,
     model_cache: dict[str, object],
     prompt_ids: list[int],
+    stop_token_ids: list[int],
     max_new_tokens: int,
     context_length: int,
     schedule_conservativeness: float,
@@ -856,10 +869,19 @@ def _run_prompt_rank(
         model_path,
         model_cache,
         prompt_ids,
-        max_new_tokens,
         context_length,
         schedule_conservativeness,
         SamplingParams(
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=stop_token_ids,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+        ),
+        SamplingParams(
+            max_new_tokens=2,
+            stop_token_ids=stop_token_ids,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -882,6 +904,7 @@ def _launch_tensor_parallel_prompt(
     model_path: Path,
     model_cache: dict[str, object],
     prompt_ids: list[int],
+    stop_token_ids: list[int],
     max_new_tokens: int,
     context_length: int,
     schedule_conservativeness: float,
@@ -903,6 +926,7 @@ def _launch_tensor_parallel_prompt(
                 model_path,
                 model_cache,
                 prompt_ids,
+                stop_token_ids,
                 max_new_tokens,
                 context_length,
                 schedule_conservativeness,
@@ -1193,7 +1217,6 @@ def _serve_http_rank(
             worker,
             max_running_requests=DEFAULT_MAX_NUM_SEQS,
             context_length=131072,
-            eos_token_id=runner.eos_token_id,
             prefix_cache=True,
         )
         if worker is not None
@@ -1201,7 +1224,6 @@ def _serve_http_rank(
             runner,
             max_running_requests=DEFAULT_MAX_NUM_SEQS,
             context_length=131072,
-            eos_token_id=runner.eos_token_id,
             prefix_cache=True,
         )
     )
@@ -1209,8 +1231,11 @@ def _serve_http_rank(
         print("[http-startup] engine created; running warmup...", flush=True)
         warmup = engine.submit(
             _encode_prompt(recipe, "Reply with one word."),
-            max_new_tokens=2,
-            sampling_params=SamplingParams(temperature=0.0),
+            sampling_params=SamplingParams(
+                max_new_tokens=2,
+                stop_token_ids=recipe.get_stop_token_ids(),
+                temperature=0.0,
+            ),
         )
         while engine.has_work():
             engine.step()
@@ -1324,6 +1349,7 @@ def _run_model(
             model_path,
             model_cache,
             prompt_ids,
+            rendered.stop_token_ids,
             max_new_tokens,
             context_length,
             schedule_conservativeness,

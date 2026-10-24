@@ -15,6 +15,8 @@ from resin.protocols import MediaInput
 
 _VERSION = 1
 _SAMPLING_FIELDS = (
+    "max_new_tokens",
+    "stop_token_ids",
     "temperature",
     "top_p",
     "top_k",

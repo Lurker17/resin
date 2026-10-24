@@ -210,16 +210,19 @@ def _run_case(groups, case):
                     requests = [
                         engine.submit(
                             [1, 2, 3, 4, 5],
-                            max_new_tokens=3,
-                            sampling_params=SamplingParams(top_logprobs=2),
+                            sampling_params=SamplingParams(
+                                max_new_tokens=3, top_logprobs=2
+                            ),
                         ),
-                        engine.submit([6], max_new_tokens=2),
+                        engine.submit(
+                            [6], sampling_params=SamplingParams(max_new_tokens=2)
+                        ),
                     ]
             else:
                 requests = [
                     engine.submit(
                         [1, 2, 3] if case == "prepare_failure" and dp == 0 else [7],
-                        max_new_tokens=1,
+                        sampling_params=SamplingParams(max_new_tokens=1),
                     )
                 ]
             if case == "serialize_failure" and dp == 0:
@@ -227,7 +230,7 @@ def _run_case(groups, case):
                 requests.append(
                     engine.submit(
                         [7],
-                        max_new_tokens=1,
+                        sampling_params=SamplingParams(max_new_tokens=1),
                         media=SimpleNamespace(
                             token_ids=(7,),
                             cache_key=(1,),
@@ -246,9 +249,15 @@ def _run_case(groups, case):
                         if event.logprobs is not None:
                             assert event.logprobs.logprob == -0.25
                     if case == "normal" and steps == 1 and dp == 1:
-                        requests.append(engine.submit([11], max_new_tokens=3))
+                        requests.append(
+                            engine.submit(
+                                [11], sampling_params=SamplingParams(max_new_tokens=3)
+                            )
+                        )
                     if case == "normal" and steps == 2 and dp == 0:
-                        cancelled = engine.submit([21], max_new_tokens=2)
+                        cancelled = engine.submit(
+                            [21], sampling_params=SamplingParams(max_new_tokens=2)
+                        )
                         assert (
                             engine.cancel(cancelled) and cancelled.take_result() == []
                         )
@@ -288,7 +297,9 @@ def _shared_experts_case(groups):
     if groups.is_driver:
         engine = DistributedEngine(worker)
         dp = groups.topology.coordinates(groups.rank)[0]
-        request = engine.submit([7], max_new_tokens=dp * 3 + 1)
+        request = engine.submit(
+            [7], sampling_params=SamplingParams(max_new_tokens=dp * 3 + 1)
+        )
         while engine.has_work():
             engine.step()
         assert len(request.take_result()) == dp * 3 + 1
@@ -316,7 +327,7 @@ def _tensor_only_case(groups):
     worker = DistributedWorker(runner, groups)
     if groups.is_driver:
         engine = DistributedEngine(worker)
-        request = engine.submit([2], max_new_tokens=3)
+        request = engine.submit([2], sampling_params=SamplingParams(max_new_tokens=3))
         while engine.has_work():
             engine.step()
         expected, value = [], 2
@@ -546,7 +557,7 @@ def test_external_failure_preserves_native_resources_and_disables_cleanup():
     from resin import Engine
 
     engine = Engine(runner)
-    request = engine.submit([1, 2], max_new_tokens=3)
+    request = engine.submit([1, 2], sampling_params=SamplingParams(max_new_tokens=3))
     engine.step()
     before = engine.cache_occupied_block_count
     engine.poison("peer execution failed")
@@ -612,7 +623,7 @@ def test_single_rank_replica_keeps_preparation_local_and_skips_serialization(
     engine = DistributedEngine(DistributedWorker(runner, _single_rank_groups()))
     request = engine.submit(
         [1],
-        max_new_tokens=1,
+        sampling_params=SamplingParams(max_new_tokens=1),
         media=SimpleNamespace(
             token_ids=(1,), cache_key=(1,), token_spans=(), callback=lambda: 19
         ),
@@ -635,7 +646,7 @@ def test_control_failure_after_model_work_keeps_the_accepted_batch(monkeypatch):
     )
     worker = DistributedWorker(runner, groups)
     engine = DistributedEngine(worker)
-    request = engine.submit([1, 2], max_new_tokens=2)
+    request = engine.submit([1, 2], sampling_params=SamplingParams(max_new_tokens=2))
     consensus_calls = 0
     original = worker._consensus
 

@@ -161,13 +161,17 @@ impl BatchPhase {
     }
 }
 
-/// Per-request output-token sampling policy.
+/// Per-request generation policy, including sampling, length, and stop tokens.
 ///
 /// A zero temperature selects the maximum-logit token. Positive temperatures
 /// enable stochastic sampling after optional top-k and top-p filtering.
+/// An omitted `max_new_tokens` uses the remaining context budget. Stop tokens
+/// are explicit: pass a rendered prompt's `stop_token_ids` for recipe stopping.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug)]
 struct SamplingParams {
+    max_new_tokens: Option<u32>,
+    stop_token_ids: Arc<[u32]>,
     temperature: f64,
     top_p: f64,
     top_k: Option<u32>,
@@ -182,6 +186,8 @@ struct SamplingParams {
 impl Default for SamplingParams {
     fn default() -> Self {
         Self {
+            max_new_tokens: None,
+            stop_token_ids: Arc::default(),
             temperature: 1.0,
             top_p: 1.0,
             top_k: None,
@@ -198,9 +204,11 @@ impl Default for SamplingParams {
 #[pymethods]
 impl SamplingParams {
     #[new]
-    #[pyo3(signature = (*, temperature = 1.0, top_p = 1.0, top_k = None, seed = None, logprobs = false, top_logprobs = 0, prompt_logprobs = false, prompt_top_logprobs = 0, extra = None))]
+    #[pyo3(signature = (*, max_new_tokens = None, stop_token_ids = Vec::new(), temperature = 1.0, top_p = 1.0, top_k = None, seed = None, logprobs = false, top_logprobs = 0, prompt_logprobs = false, prompt_top_logprobs = 0, extra = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        max_new_tokens: Option<u32>,
+        stop_token_ids: Vec<u32>,
         temperature: f64,
         top_p: f64,
         top_k: Option<u32>,
@@ -242,6 +250,8 @@ impl SamplingParams {
             ));
         }
         Ok(Self {
+            max_new_tokens,
+            stop_token_ids: stop_token_ids.into(),
             temperature,
             top_p,
             top_k,
@@ -252,6 +262,16 @@ impl SamplingParams {
             prompt_top_logprobs,
             extra: extra.map(Arc::new),
         })
+    }
+
+    #[getter]
+    fn max_new_tokens(&self) -> Option<u32> {
+        self.max_new_tokens
+    }
+
+    #[getter]
+    fn stop_token_ids(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        Ok(PyTuple::new(py, self.stop_token_ids.iter().copied())?.unbind())
     }
 
     #[getter]
@@ -301,7 +321,9 @@ impl SamplingParams {
 
     fn __repr__(&self) -> String {
         format!(
-            "SamplingParams(temperature={:?}, top_p={:?}, top_k={:?}, seed={:?}, logprobs={}, top_logprobs={}, extra={})",
+            "SamplingParams(max_new_tokens={:?}, stop_token_ids={:?}, temperature={:?}, top_p={:?}, top_k={:?}, seed={:?}, logprobs={}, top_logprobs={}, extra={})",
+            self.max_new_tokens,
+            self.stop_token_ids,
             self.temperature,
             self.top_p,
             self.top_k,
@@ -1487,7 +1509,7 @@ impl Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner, *, max_running_requests = 32, context_length = 32768, scheduler_config = None, eos_token_id = None, prefix_cache = false, overlap = true))]
+    #[pyo3(signature = (runner, *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, overlap = true))]
     #[allow(
         clippy::too_many_arguments,
         reason = "Python constructor exposes keyword configuration"
@@ -1498,7 +1520,6 @@ impl Engine {
         max_running_requests: usize,
         context_length: u32,
         scheduler_config: Option<Py<SchedulerConfig>>,
-        eos_token_id: Option<u32>,
         prefix_cache: bool,
         overlap: bool,
     ) -> PyResult<Self> {
@@ -1528,7 +1549,6 @@ impl Engine {
                 prefill_chunk_size: scheduler.prefill_chunk_size,
                 schedule_conservativeness: scheduler.schedule_conservativeness,
             },
-            eos_token_id,
             prefix_cache,
         )
         .map_err(core_error)?;
@@ -1549,12 +1569,10 @@ impl Engine {
     }
     #[pyo3(signature = (
         token_ids = None,
-        max_new_tokens = None,
         *,
         priority = 0,
         batch_key = None,
         sampling_params = None,
-        stop_token_ids = None,
         media = None,
         prompt_target_logprobs = None
     ))]
@@ -1563,11 +1581,9 @@ impl Engine {
         &mut self,
         py: Python<'_>,
         token_ids: Option<Vec<u32>>,
-        max_new_tokens: Option<usize>,
         priority: i32,
         batch_key: Option<u64>,
         sampling_params: Option<Py<SamplingParams>>,
-        stop_token_ids: Option<Vec<u32>>,
         media: Option<Py<PyAny>>,
         prompt_target_logprobs: Option<Vec<Vec<u32>>>,
     ) -> PyResult<Py<RequestLease>> {
@@ -1619,10 +1635,10 @@ impl Engine {
             prompt_top_logprobs: sampling_params.prompt_top_logprobs as u32,
             prompt_target_logprobs,
             token_ids,
-            max_new_tokens,
+            max_new_tokens: sampling_params.max_new_tokens.map(|value| value as usize),
             priority,
             batch_key,
-            stop_token_ids,
+            stop_token_ids: sampling_params.stop_token_ids.to_vec(),
             cache_key: cache_prompt,
             cacheable: true,
             atomic_prefill_spans,

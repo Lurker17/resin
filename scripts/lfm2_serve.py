@@ -20,7 +20,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(model, revision=DEFAULT_REVISION)
     codec = Lfm2Recipe(tokenizer)
     runner = Lfm2TorchRunner(model, device="cpu")
-    engine = Engine(runner, eos_token_id=runner.eos_token_id)
+    engine = Engine(runner)
 
     print(f"Serving {model} at http://127.0.0.1:8000")
     HttpServer(engine, recipe=codec, model=model).serve()

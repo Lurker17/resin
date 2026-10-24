@@ -112,7 +112,6 @@ def _serve_rank(rank: int, port: int) -> None:
         max_running_requests=MAX_SEQUENCES,
         context_length=CONTEXT_LENGTH,
         prefix_cache=True,
-        eos_token_id=runner.eos_token_id,
         overlap=True,
         scheduler_config=SchedulerConfig(
             max_batch_tokens=MAX_SEQUENCES * PREFILL_CHUNK_SIZE,
@@ -132,9 +131,11 @@ def _serve_rank(rank: int, port: int) -> None:
                         )
                     ]
                 ),
-                max_new_tokens=64,
-                stop_token_ids=codec.get_stop_token_ids(),
-                sampling_params=SamplingParams(temperature=0.0),
+                sampling_params=SamplingParams(
+                    max_new_tokens=64,
+                    stop_token_ids=codec.get_stop_token_ids(),
+                    temperature=0.0,
+                ),
             )
             if rank == 0
             else None

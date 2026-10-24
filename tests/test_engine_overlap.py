@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from output_helpers import forward_output
 
-from resin import CacheGroupLayout, CacheLayout, Engine, RunnerConfig
+from resin import CacheGroupLayout, CacheLayout, Engine, RunnerConfig, SamplingParams
 
 
 @dataclass
@@ -111,7 +111,7 @@ def test_next_device_submission_precedes_previous_cpu_harvest():
     runner = AsyncRunner()
     runner.require_overlap = True
     engine = Engine(runner)
-    request = engine.submit([1], max_new_tokens=24)
+    request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=24))
     assert [event.token_id for event in engine.step()] == [2]
     assert engine.step() == []
     assert engine.overlap_pending
@@ -133,7 +133,7 @@ def test_overlap_switch_preserves_single_step_for_synchronous_runners(overlap):
             return forward_output([int(token) + 1 for token in plan.token_ids])
 
     engine = Engine(Synchronous(), overlap=overlap)
-    request = engine.submit([1], max_new_tokens=8)
+    request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=8))
     assert [event.token_id for event in engine.step()] == [2]
     assert not engine.overlap_pending
     while engine.has_work():
@@ -144,8 +144,8 @@ def test_overlap_switch_preserves_single_step_for_synchronous_runners(overlap):
 def test_cancel_drains_accepted_work_and_preserves_other_request_events():
     runner = AsyncRunner()
     engine = Engine(runner)
-    first = engine.submit([1], max_new_tokens=24)
-    second = engine.submit([10], max_new_tokens=24)
+    first = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=24))
+    second = engine.submit([10], sampling_params=SamplingParams(max_new_tokens=24))
     engine.step()
     assert engine.step() == []
     assert engine.cancel(first)
@@ -164,7 +164,7 @@ def test_cancel_drains_accepted_work_and_preserves_other_request_events():
 def test_async_failure_quarantines_the_original_writer_lease():
     runner = AsyncRunner()
     engine = Engine(runner)
-    request = engine.submit([1], max_new_tokens=24)
+    request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=24))
     engine.step()
     runner.fail = True
     engine.step()
@@ -194,7 +194,7 @@ def test_completion_sequence_result_quarantines_accepted_work(
 
     monkeypatch.setattr(runner, "enqueue", enqueue)
     engine = Engine(runner)
-    request = engine.submit([1], max_new_tokens=24)
+    request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=24))
     assert [event.token_id for event in engine.step()] == [2]
     assert engine.step() == []
     if continuation:
@@ -229,7 +229,7 @@ def test_invalid_immediate_enqueue_result_quarantines_accepted_work(
 
     monkeypatch.setattr(runner, "enqueue", enqueue)
     engine = Engine(runner)
-    request = engine.submit([1], max_new_tokens=24)
+    request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=24))
     assert [event.token_id for event in engine.step()] == [2]
     if continuation:
         assert engine.step() == []
@@ -249,7 +249,7 @@ def test_enqueue_accepts_immediately_completed_native_output(monkeypatch):
     runner = AsyncRunner()
     monkeypatch.setattr(runner, "enqueue", lambda plan: forward_output([[3, 4]]))
     engine = Engine(runner)
-    request = engine.submit([1], max_new_tokens=24)
+    request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=24))
     assert [event.token_id for event in engine.step()] == [2]
     assert [event.token_id for event in engine.step()] == [3, 4]
     assert not engine.overlap_pending and not engine.poisoned
@@ -261,7 +261,7 @@ def test_enqueue_accepts_immediately_completed_native_output(monkeypatch):
 def test_short_budgets_use_synchronous_reference():
     runner = AsyncRunner()
     engine = Engine(runner)
-    request = engine.submit([1], max_new_tokens=4)
+    request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=4))
     engine.step()
     assert engine.step()
     assert not runner.pending and not engine.overlap_pending
@@ -270,10 +270,8 @@ def test_short_budgets_use_synchronous_reference():
     runner.shutdown()
 
 
-@pytest.mark.parametrize("stop,engine_eos", [(3, None), (4, None), (3, 3)])
-def test_stop_result_precedes_successor_completion_but_release_waits(
-    monkeypatch, stop, engine_eos
-):
+@pytest.mark.parametrize("stop", [3, 4])
+def test_stop_result_precedes_successor_completion_but_release_waits(monkeypatch, stop):
     runner = AsyncRunner()
     original = runner.enqueue
 
@@ -284,11 +282,9 @@ def test_stop_result_precedes_successor_completion_but_release_waits(
         return completion
 
     monkeypatch.setattr(runner, "enqueue", enqueue)
-    engine = Engine(runner, eos_token_id=engine_eos)
+    engine = Engine(runner)
     request = engine.submit(
-        [1],
-        max_new_tokens=24,
-        stop_token_ids=None if engine_eos is not None else [stop],
+        [1], sampling_params=SamplingParams(max_new_tokens=24, stop_token_ids=[stop])
     )
     assert [event.token_id for event in engine.step()] == [2]
     assert engine.step() == []
@@ -322,9 +318,15 @@ def test_stop_result_precedes_successor_completion_but_release_waits(
 def test_cancel_survivor_drains_terminal_peer_without_losing_other_events():
     runner = AsyncRunner()
     engine = Engine(runner)
-    stopped = engine.submit([1], max_new_tokens=24, stop_token_ids=[3])
-    canceled = engine.submit([10], max_new_tokens=24, stop_token_ids=[999])
-    survivor = engine.submit([20], max_new_tokens=24, stop_token_ids=[999])
+    stopped = engine.submit(
+        [1], sampling_params=SamplingParams(max_new_tokens=24, stop_token_ids=[3])
+    )
+    canceled = engine.submit(
+        [10], sampling_params=SamplingParams(max_new_tokens=24, stop_token_ids=[999])
+    )
+    survivor = engine.submit(
+        [20], sampling_params=SamplingParams(max_new_tokens=24, stop_token_ids=[999])
+    )
     engine.step()
     assert engine.step() == []
     events = engine.step()
@@ -353,7 +355,9 @@ def test_gpu_feedback_matches_reference_across_page_and_budget_drains():
     for overlap in (False, True):
         runner = AsyncRunner()
         engine = Engine(runner, overlap=overlap, context_length=1024)
-        request = engine.submit([1] * 123, max_new_tokens=270)
+        request = engine.submit(
+            [1] * 123, sampling_params=SamplingParams(max_new_tokens=270)
+        )
         events = []
         while engine.has_work():
             events.extend(engine.step())
@@ -396,7 +400,7 @@ def test_completion_inspection_failure_quarantines_accepted_work(
 
     monkeypatch.setattr(runner, "enqueue", enqueue)
     engine = Engine(runner)
-    request = engine.submit([1], max_new_tokens=24)
+    request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=24))
     engine.step()
     if second_enqueue:
         assert engine.step() == []
@@ -422,7 +426,7 @@ def test_feedback_descriptor_failure_cannot_leave_a_healthy_pending_engine(monke
     runner = AsyncRunner()
     monkeypatch.setattr(runner, "enqueue", lambda plan: InvalidFeedback())
     engine = Engine(runner)
-    request = engine.submit([1], max_new_tokens=24)
+    request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=24))
     engine.step()
     assert engine.step() == []
     with pytest.raises(RuntimeError, match="feedback descriptor failed"):
@@ -436,8 +440,8 @@ def test_feedback_descriptor_failure_cannot_leave_a_healthy_pending_engine(monke
 def test_retryable_rejection_keeps_unrelated_already_committed_stream_events():
     runner = AsyncRunner()
     engine = Engine(runner)
-    first = engine.submit([1], max_new_tokens=24)
-    second = engine.submit([10], max_new_tokens=24)
+    first = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=24))
+    second = engine.submit([10], sampling_params=SamplingParams(max_new_tokens=24))
     engine.step()
     assert engine.step() == []
     assert engine.cancel(first)
@@ -457,11 +461,13 @@ def test_retryable_rejection_keeps_unrelated_already_committed_stream_events():
 def test_arriving_work_drains_the_pending_cohort_before_scheduler_admission():
     runner = AsyncRunner()
     engine = Engine(runner, max_running_requests=2)
-    first = engine.submit([1], max_new_tokens=40)
+    first = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=40))
     engine.step()
     assert engine.step() == []
     enqueued = len(runner.pending)
-    added = engine.submit([20], max_new_tokens=1, priority=100)
+    added = engine.submit(
+        [20], sampling_params=SamplingParams(max_new_tokens=1), priority=100
+    )
     assert not engine.overlap_ready
     assert [event.token_id for event in engine.step()] == [3, 4]
     assert not engine.overlap_pending

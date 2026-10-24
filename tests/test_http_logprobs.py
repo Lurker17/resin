@@ -114,6 +114,8 @@ def collect_scores(response, *, api, stream, partial_tokens):
         raw = value["resin"]["generation_logprobs"]
     else:
         chunks = events(response)
+        stream_errors = [chunk for chunk in chunks if "error" in chunk]
+        assert not stream_errors, stream_errors
         if api == "chat/completions":
             choices = [chunk["choices"][0] for chunk in chunks if chunk["choices"]]
             raw = [

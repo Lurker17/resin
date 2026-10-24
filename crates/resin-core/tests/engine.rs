@@ -63,7 +63,6 @@ fn engine(lookahead: u32, chunk: u32) -> EngineCore<&'static str> {
             prefill_chunk_size: NonZeroU32::new(chunk).unwrap(),
             ..Default::default()
         },
-        None,
         false,
     )
     .unwrap()
@@ -96,7 +95,6 @@ fn admission_credits_restored_physical_prefix_pages_only() {
                 prefill_chunk_size: NonZeroU32::new(32).unwrap(),
                 ..Default::default()
             },
-            None,
             true,
         )
         .unwrap();
@@ -214,12 +212,42 @@ fn rejected_execution_restores_requests_and_releases_batch_access() {
 }
 
 #[test]
+fn stop_tokens_are_request_local_and_empty_stops_generate_to_the_limit() {
+    let mut engine = engine(0, 8);
+    let mut model = Model::default();
+    let unbounded = engine.submit(input(vec![1], 3)).unwrap();
+    let mut stopping_input = input(vec![1], 3);
+    stopping_input.stop_token_ids = vec![99, 2, 99];
+    let stopping = engine.submit(stopping_input).unwrap();
+    let first = engine.step(&mut model).unwrap();
+    let stopped = first
+        .iter()
+        .find(|event| event.request_id == stopping.id())
+        .unwrap();
+    assert_eq!(
+        stopped.finish_reason,
+        Some(resin_core::engine::CompletionReason::Stop)
+    );
+    assert!(!unbounded.done());
+    assert_eq!(stopping.take_result().unwrap(), [2]);
+
+    engine.step(&mut model).unwrap();
+    let last = engine.step(&mut model).unwrap();
+    assert_eq!(
+        last[0].finish_reason,
+        Some(resin_core::engine::CompletionReason::Length)
+    );
+    assert_eq!(unbounded.take_result().unwrap(), [2, 3, 4]);
+    assert!(!engine.has_work());
+}
+
+#[test]
 fn terminal_limits_do_not_hide_unleased_runner_output() {
-    for eos in [None, Some(3)] {
+    for stops in [vec![], vec![3]] {
         let mut engine = engine(0, 8);
         let mut model = Model::default();
         let mut request_input = input(vec![1], 2);
-        request_input.stop_token_ids = eos.map(|token| vec![token]);
+        request_input.stop_token_ids = stops;
         let request = engine.submit(request_input).unwrap();
         engine.step(&mut model).unwrap();
         model.outputs.push_back(Ok(vec![vec![3, 4, 5]]));
@@ -382,7 +410,6 @@ fn a_panicking_payload_clone_restores_the_cohort_and_releases_its_cache_access()
         4,
         128,
         SchedulerConfig::default(),
-        None,
         false,
     )
     .unwrap();
@@ -526,7 +553,6 @@ fn decode_continuation_transfers_writer_lease_and_commits_exact_feedback_depth()
         4,
         512,
         SchedulerConfig::default(),
-        None,
         true,
     )
     .unwrap();
@@ -588,7 +614,6 @@ fn unsafe_decode_boundaries_fall_back_before_enqueuing_a_continuation() {
             4,
             512,
             SchedulerConfig::default(),
-            None,
             false,
         )
         .unwrap();
@@ -624,7 +649,6 @@ fn stop_overlap_engine() -> EngineCore<&'static str> {
         4,
         512,
         SchedulerConfig::default(),
-        None,
         true,
     )
     .unwrap()
@@ -636,7 +660,7 @@ fn stopped_continuation_publishes_result_but_keeps_pages_until_successor_finishe
         let mut engine = stop_overlap_engine();
         let mut model = Model::default();
         let mut submission = input(vec![1], 40);
-        submission.stop_token_ids = Some(vec![stop]);
+        submission.stop_token_ids = vec![stop];
         let request = engine.submit(submission).unwrap();
         engine.step(&mut model).unwrap();
         let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
@@ -700,7 +724,7 @@ fn stopped_middle_row_retains_dense_successor_slots_and_variable_acceptance() {
         .into_iter()
         .map(|token| {
             let mut submission = input(vec![token], 40);
-            submission.stop_token_ids = Some(vec![99]);
+            submission.stop_token_ids = vec![99];
             engine.submit(submission).unwrap()
         })
         .collect();
@@ -765,7 +789,7 @@ fn failed_successor_quarantines_terminal_rows_without_resurrection() {
         let mut engine = stop_overlap_engine();
         let mut model = Model::default();
         let mut submission = input(vec![1], 40);
-        submission.stop_token_ids = Some(vec![3]);
+        submission.stop_token_ids = vec![3];
         let request = engine.submit(submission).unwrap();
         engine.step(&mut model).unwrap();
         let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
@@ -817,7 +841,6 @@ fn failure_after_next_enqueue_keeps_transferred_lease_quarantined() {
             4,
             512,
             SchedulerConfig::default(),
-            None,
             false,
         )
         .unwrap();

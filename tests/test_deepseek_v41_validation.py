@@ -99,7 +99,9 @@ def validation(tmp_path):
             assert runner.cuda_graph_decode == "full"
             if engine.request is not None:
                 assert engine.request.done
-        assert all(row["stop_token_ids"] == [1] for row in engine.submissions)
+        assert all(
+            row["sampling_params"].stop_token_ids == (1,) for row in engine.submissions
+        )
         return result
 
     return run

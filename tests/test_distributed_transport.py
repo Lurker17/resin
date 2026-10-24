@@ -141,6 +141,7 @@ def _transport_process(rank, rendezvous, directory):
                 engine = DistributedEngine(worker)
                 media = _media()
                 sampling = SamplingParams(
+                    max_new_tokens=3,
                     temperature=0.75,
                     top_p=0.875,
                     top_k=13,
@@ -149,9 +150,7 @@ def _transport_process(rank, rendezvous, directory):
                 )
 
                 def submit():
-                    return engine.submit(
-                        media=media, max_new_tokens=3, sampling_params=sampling
-                    )
+                    return engine.submit(media=media, sampling_params=sampling)
 
                 completed = submit()
                 never_started = submit()

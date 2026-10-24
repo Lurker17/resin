@@ -15,7 +15,7 @@ from recipe_fuzz.deepseek import DeepSeekV41Adapter
 from tokenizers import Tokenizer
 
 import resin
-from resin import Engine, MediaInput, RunnerConfig, SchedulerConfig
+from resin import Engine, MediaInput, RunnerConfig, SamplingParams, SchedulerConfig
 from resin.recipe import (
     DeepSeekV41Image,
     DeepSeekV41Media,
@@ -209,7 +209,9 @@ def test_engine_slices_causal_image_spans_across_prefill_chunks(codec):
         ]
     )
     engine = Engine(Runner(), scheduler_config=SchedulerConfig(prefill_chunk_size=32))
-    engine.submit(media=rendered.media, max_new_tokens=1)
+    engine.submit(
+        media=rendered.media, sampling_params=SamplingParams(max_new_tokens=1)
+    )
     while engine.has_work():
         engine.step()
     assert len(Runner.contexts) > 1

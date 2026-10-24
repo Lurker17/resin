@@ -336,7 +336,6 @@ def _rank(
         max_running_requests=max(case.batch_size for case in cases),
         context_length=capacity,
         prefix_cache=any(case.shared_prefix_tokens for case in cases),
-        eos_token_id=None,
         overlap=options.get("overlap", True),
         scheduler_config=SchedulerConfig(
             max_batch_tokens=prefill_budget,

@@ -575,9 +575,9 @@ def test_legacy_dspark_reference_scores_and_replays_all_tokens(
             self.requests = []
             self.close = Mock()
 
-        def submit(self, prompt, *, max_new_tokens, sampling_params):
+        def submit(self, prompt, *, sampling_params):
             assert sampling_params.logprobs and sampling_params.top_logprobs == 3
-            assert max_new_tokens == 16
+            assert sampling_params.max_new_tokens == 16
             ids = [2 if failure == "changed" and self.requests else 1] * 16
             request = SimpleNamespace(take_result=lambda: ids)
             self.requests.append(request)

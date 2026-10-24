@@ -94,9 +94,12 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
 
         def submit(self, prompt, **options):
             signature(Engine.submit).bind(self, prompt, **options)
-            assert prompt == [4, 5] and options["stop_token_ids"] == [7, 8]
+            assert prompt == [4, 5] and options["sampling_params"].stop_token_ids == (
+                7,
+                8,
+            )
             assert options["sampling_params"].temperature == 0
-            assert options["max_new_tokens"] == 64 and rank == 0
+            assert options["sampling_params"].max_new_tokens == 64 and rank == 0
             calls.append("submit")
             return SimpleNamespace(take_result=lambda: calls.append("warmup_done"))
 

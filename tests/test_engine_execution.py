@@ -13,6 +13,7 @@ from resin import (
     ForwardOutput,
     ResourceBinding,
     RunnerConfig,
+    SamplingParams,
 )
 
 
@@ -65,8 +66,8 @@ class TestEngineExecution:
     def test_step_executes_and_commits_one_batch(self) -> None:
         runner = RecordingRunner()
         engine = Engine(runner, max_running_requests=1)
-        first = engine.submit([1], max_new_tokens=2)
-        second = engine.submit([10], max_new_tokens=1)
+        first = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=2))
+        second = engine.submit([10], sampling_params=SamplingParams(max_new_tokens=1))
 
         first_events = engine.step()
         assert [event.request_id for event in first_events] == [first]
@@ -93,7 +94,9 @@ class TestEngineExecution:
 
         runner = PostAcceptRunner(cache_layout=history_layout(2))
         engine = Engine(runner)
-        request = engine.submit([1, 2], max_new_tokens=1)
+        request = engine.submit(
+            [1, 2], sampling_params=SamplingParams(max_new_tokens=1)
+        )
 
         with pytest.raises(PostAcceptError, match="quiescence failed"):
             engine.step()
@@ -114,8 +117,8 @@ class TestEngineExecution:
     def test_unmarked_failure_is_retryable_and_preserves_the_cohort(self) -> None:
         runner = RecordingRunner(failures=1, cache_layout=history_layout(2))
         engine = Engine(runner, max_running_requests=2)
-        first = engine.submit([10], max_new_tokens=1)
-        second = engine.submit([20], max_new_tokens=1)
+        first = engine.submit([10], sampling_params=SamplingParams(max_new_tokens=1))
+        second = engine.submit([20], sampling_params=SamplingParams(max_new_tokens=1))
 
         with pytest.raises(RuntimeError, match="forward rejected"):
             engine.step()
@@ -145,7 +148,9 @@ class TestEngineExecution:
     ) -> None:
         runner = RecordingRunner([malformed], cache_layout=history_layout(2))
         engine = Engine(runner)
-        request = engine.submit([1, 2], max_new_tokens=1)
+        request = engine.submit(
+            [1, 2], sampling_params=SamplingParams(max_new_tokens=1)
+        )
 
         with pytest.raises(error_type):
             engine.step()
@@ -168,7 +173,7 @@ class TestEngineExecution:
             cache_layout=history_layout(1),
         )
         engine = Engine(runner)
-        request = engine.submit([1], max_new_tokens=1)
+        request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1))
 
         with pytest.raises(RuntimeError, match="physical cleanup failed"):
             engine.step()
@@ -184,7 +189,7 @@ class TestEngineExecution:
     def test_close_retires_ready_requests_and_is_idempotent(self) -> None:
         runner = RecordingRunner(cache_layout=history_layout(2))
         engine = Engine(runner)
-        request = engine.submit([1], max_new_tokens=2)
+        request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=2))
 
         engine.close()
 
@@ -202,7 +207,9 @@ class TestEngineExecution:
         engine.close()
         assert runner.released == [request]
         for operation in (
-            lambda: engine.submit([3], max_new_tokens=1),
+            lambda: engine.submit(
+                [3], sampling_params=SamplingParams(max_new_tokens=1)
+            ),
             engine.step,
             lambda: engine.cancel(request),
         ):
@@ -213,7 +220,9 @@ class TestEngineExecution:
         runner = RecordingRunner()
         with pytest.raises(ValueError, match="body failed"):
             with Engine(runner) as engine:
-                request = engine.submit([1], max_new_tokens=1)
+                request = engine.submit(
+                    [1], sampling_params=SamplingParams(max_new_tokens=1)
+                )
                 raise ValueError("body failed")
 
         assert engine.closed
@@ -245,7 +254,7 @@ class TestRunnerContractConstruction:
 
         runner = DescriptorRunner()
         engine = Engine(runner)
-        request = engine.submit([1], max_new_tokens=1)
+        request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1))
         events = engine.step()
         assert [event.request_id for event in events] == [request]
         assert runner.forward_calls == 1
@@ -292,7 +301,9 @@ class TestPhaseCoordination:
         runner = RecordingRunner(cache_layout=history_layout(4))
         engine = Engine(runner)
         assert engine.next_phase() is None
-        request = engine.submit([1, 2], max_new_tokens=2)
+        request = engine.submit(
+            [1, 2], sampling_params=SamplingParams(max_new_tokens=2)
+        )
         before = engine.cache_occupied_block_count
         assert engine.next_phase() == BatchPhase.PREFILL
         assert engine.next_phase() == BatchPhase.PREFILL
@@ -310,9 +321,9 @@ class TestPhaseCoordination:
         from resin import BatchPhase
 
         engine = Engine(RecordingRunner(), max_running_requests=1)
-        first = engine.submit([1], max_new_tokens=2)
+        first = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=2))
         engine.step()
-        second = engine.submit([10], max_new_tokens=1)
+        second = engine.submit([10], sampling_params=SamplingParams(max_new_tokens=1))
         assert engine.next_phase() == BatchPhase.DECODE
         engine.step(phase=BatchPhase.DECODE)
         assert first.done and not second.done

@@ -412,9 +412,11 @@ def run_sweep(
                     nonce += 1
                 lease = engine.submit(
                     request_tokens,
-                    max_new_tokens,
-                    stop_token_ids=[],
-                    sampling_params=SamplingParams(temperature=0.0),
+                    sampling_params=SamplingParams(
+                        max_new_tokens=max_new_tokens,
+                        stop_token_ids=[],
+                        temperature=0.0,
+                    ),
                 )
                 leases.append(lease)
                 cached_tokens.append(lease.cached_tokens)
@@ -434,9 +436,9 @@ def run_sweep(
                 leases.append(
                     engine.submit(
                         tokens[:shared],
-                        1,
-                        stop_token_ids=[],
-                        sampling_params=SamplingParams(temperature=0.0),
+                        sampling_params=SamplingParams(
+                            max_new_tokens=1, stop_token_ids=[], temperature=0.0
+                        ),
                     )
                 )
                 while not leases[0].done:

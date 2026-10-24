@@ -82,6 +82,7 @@ PARAMETERS = {
 }
 
 RETURNS = {
+    ("SamplingParams", "stop_token_ids"): "tuple[int, ...]",
     ("", "_media_to_buffers"): "tuple[bytes, tuple[npt.NDArray[Any], ...]]",
     ("", "_media_from_buffers"): "MediaInput",
     ("", "image_token_types"): "tuple[int, ...]",

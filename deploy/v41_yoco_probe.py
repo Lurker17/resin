@@ -424,9 +424,9 @@ def run_probe(
             for length in chosen:
                 request = engine.submit(
                     prompts[length],
-                    max_new_tokens=generated,
-                    stop_token_ids=[],
                     sampling_params=SamplingParams(
+                        max_new_tokens=generated,
+                        stop_token_ids=[],
                         temperature=0,
                         seed=583,
                         logprobs=not overlap,

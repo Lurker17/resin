@@ -496,7 +496,6 @@ class Engine:
         max_running_requests: int = 32,
         context_length: int = 32768,
         scheduler_config: SchedulerConfig | None = None,
-        eos_token_id: int | None = None,
         prefix_cache: bool = False,
         overlap: bool = True,
     ) -> Engine: ...
@@ -564,12 +563,10 @@ class Engine:
         self,
         /,
         token_ids: Sequence[int] | None = None,
-        max_new_tokens: int | None = None,
         *,
         priority: int = 0,
         batch_key: int | None = None,
         sampling_params: SamplingParams | None = None,
-        stop_token_ids: Sequence[int] | None = None,
         media: MediaInput | None = None,
         prompt_target_logprobs: Sequence[Sequence[int]] | None = None,
     ) -> RequestLease: ...
@@ -1113,15 +1110,19 @@ class RunnerConfig:
 @final
 class SamplingParams:
     """
-    Per-request output-token sampling policy.
+    Per-request generation policy, including sampling, length, and stop tokens.
 
     A zero temperature selects the maximum-logit token. Positive temperatures
     enable stochastic sampling after optional top-k and top-p filtering.
+    An omitted `max_new_tokens` uses the remaining context budget. Stop tokens
+    are explicit: pass a rendered prompt's `stop_token_ids` for recipe stopping.
     """
     def __new__(
         cls,
         /,
         *,
+        max_new_tokens: int | None = None,
+        stop_token_ids: Sequence[int] = ...,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int | None = None,
@@ -1138,11 +1139,15 @@ class SamplingParams:
     @property
     def logprobs(self, /) -> bool: ...
     @property
+    def max_new_tokens(self, /) -> int | None: ...
+    @property
     def prompt_logprobs(self, /) -> bool: ...
     @property
     def prompt_top_logprobs(self, /) -> int: ...
     @property
     def seed(self, /) -> int | None: ...
+    @property
+    def stop_token_ids(self, /) -> tuple[int, ...]: ...
     @property
     def temperature(self, /) -> float: ...
     @property

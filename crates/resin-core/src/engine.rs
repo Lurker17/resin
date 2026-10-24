@@ -258,7 +258,7 @@ pub struct Submission<P> {
     pub max_new_tokens: Option<usize>,
     pub priority: i32,
     pub batch_key: Option<u64>,
-    pub stop_token_ids: Option<Vec<u32>>,
+    pub stop_token_ids: Vec<u32>,
     pub cache_key: Option<Vec<u32>>,
     pub cacheable: bool,
     pub atomic_prefill_spans: Vec<(u32, u32)>,
@@ -275,7 +275,7 @@ impl<P> Submission<P> {
             max_new_tokens: None,
             priority: 0,
             batch_key: None,
-            stop_token_ids: None,
+            stop_token_ids: Vec::new(),
             cache_key: None,
             cacheable: true,
             atomic_prefill_spans: Vec::new(),
@@ -501,7 +501,6 @@ pub struct EngineCore<P> {
     minimum_new_token_ratio: f64,
     new_token_ratio_decay: f64,
     context_length: NonZeroU32,
-    eos_token_id: Option<u32>,
     engine_id: u64,
     next_request_id: u64,
     next_batch_id: u64,
@@ -516,7 +515,6 @@ impl<P: Clone> EngineCore<P> {
         max_running_requests: usize,
         context_length: u32,
         scheduler_config: SchedulerConfig,
-        eos_token_id: Option<u32>,
         prefix_cache: bool,
     ) -> Result<Self> {
         let max_running_requests = NonZeroUsize::new(max_running_requests)
@@ -570,7 +568,6 @@ impl<P: Clone> EngineCore<P> {
             minimum_new_token_ratio,
             new_token_ratio_decay,
             context_length,
-            eos_token_id,
             engine_id: mint_engine_id()?,
             next_request_id: 1,
             next_batch_id: 1,
@@ -690,7 +687,7 @@ impl<P: Clone> EngineCore<P> {
             max_new_tokens,
             priority,
             batch_key,
-            stop_token_ids,
+            mut stop_token_ids,
             cache_key: cache_prompt,
             cacheable,
             atomic_prefill_spans,
@@ -774,8 +771,6 @@ impl<P: Clone> EngineCore<P> {
         let next_request_id = request_id
             .checked_add(1)
             .ok_or_else(|| Error::internal("request id space is exhausted"))?;
-        let mut stop_token_ids =
-            stop_token_ids.unwrap_or_else(|| self.eos_token_id.into_iter().collect::<Vec<_>>());
         stop_token_ids.sort_unstable();
         stop_token_ids.dedup();
         // Create the caller-owned lease before any native admission side

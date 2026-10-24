@@ -13,8 +13,7 @@ Use `prompt_top_logprobs` for top alternatives at each prompt position, or pass
 ```python
 lease = engine.submit(
     [10, 20, 30],
-    max_new_tokens=0,
-    sampling_params=SamplingParams(prompt_top_logprobs=3),
+    sampling_params=SamplingParams(max_new_tokens=0, prompt_top_logprobs=3),
     prompt_target_logprobs=[[], [42, 43], [7, 7]],
 )
 ```
@@ -32,7 +31,8 @@ after the predecessor token's prefill chunk commits. Unprocessed entries remain
 `top_logprobs`, and requested `target_logprobs`; both alternative lists contain
 `(token_id, logprob)` pairs. Any of the three prompt options enables input
 scoring. `top_logprobs` and `prompt_top_logprobs` are independent. Set
-`max_new_tokens=0` to score only the input and complete without output events.
+`SamplingParams(max_new_tokens=0, prompt_logprobs=True)` to score only the input
+and complete without output events.
 All stock runners reuse the same prefill hidden states and project scores in
 bounded chunks, with no second transformer pass. Cross-chunk targets are part
 of the execution plan, so the final predecessor in a chunk scores the first

@@ -68,8 +68,12 @@ def test_native_plans_keep_full_prefill_lengths_through_chunks():
 
     runner = Runner()
     engine = Engine(runner, context_length=64)
-    first = engine.submit([1, 2, 3, 4, 5, 6, 7], max_new_tokens=3)
-    second = engine.submit([10, 11, 12], max_new_tokens=2)
+    first = engine.submit(
+        [1, 2, 3, 4, 5, 6, 7], sampling_params=SamplingParams(max_new_tokens=3)
+    )
+    second = engine.submit(
+        [10, 11, 12], sampling_params=SamplingParams(max_new_tokens=2)
+    )
     expected = {first.id: 7, second.id: 3}
     while engine.has_work():
         engine.step()
@@ -113,7 +117,7 @@ def test_prefix_replay_policy_caps_hits_and_preserves_shared_producer_pages(
         scheduler_config=SchedulerConfig(prefill_chunk_size=128),
     ) as engine:
         prompt = list(range(512))
-        seed = engine.submit(prompt, max_new_tokens=1)
+        seed = engine.submit(prompt, sampling_params=SamplingParams(max_new_tokens=1))
         while engine.has_work():
             engine.step()
         assert seed.done
@@ -121,7 +125,7 @@ def test_prefix_replay_policy_caps_hits_and_preserves_shared_producer_pages(
         stats = engine.prefix_cache_stats
         assert stats is not None
         cached_entries = stats[0]
-        second = engine.submit(prompt, max_new_tokens=1)
+        second = engine.submit(prompt, sampling_params=SamplingParams(max_new_tokens=1))
         assert second.cached_tokens == expected_hit
         engine.step()
         restored = runner.plans[-1]
@@ -136,8 +140,7 @@ def test_prefix_replay_policy_caps_hits_and_preserves_shared_producer_pages(
             engine.step()
         scored = engine.submit(
             prompt,
-            max_new_tokens=1,
-            sampling_params=SamplingParams(prompt_logprobs=True),
+            sampling_params=SamplingParams(max_new_tokens=1, prompt_logprobs=True),
         )
         assert scored.cached_tokens == 0
         engine.cancel(scored)

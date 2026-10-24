@@ -538,6 +538,10 @@ fn admit(
         let sampling_params = Py::new(
             py,
             SamplingParams::new(
+                Some(u32::try_from(job.request.max_output_tokens).map_err(|_| {
+                    PyValueError::new_err("max_output_tokens must fit in a uint32")
+                })?),
+                stop_token_ids,
                 job.request.temperature,
                 job.request.top_p,
                 job.request.top_k,
@@ -553,11 +557,9 @@ fn admit(
         let lease = engine.bind(py).borrow_mut().submit(
             py,
             Some(token_ids),
-            Some(job.request.max_output_tokens),
             0,
             None,
             Some(sampling_params),
-            Some(stop_token_ids),
             media,
             None,
         )?;

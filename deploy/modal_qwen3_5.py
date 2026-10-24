@@ -214,7 +214,6 @@ def _build_runtime(
             max_batch_tokens=runner.prefill_chunk_size,
             prefill_chunk_size=runner.prefill_chunk_size,
         ),
-        eos_token_id=runner.eos_token_id,
         prefix_cache=True,
     )
     torch.cuda.synchronize(runner.device)
@@ -324,9 +323,11 @@ def smoke_test(
         )
         request = engine.submit(
             prompt_ids,
-            max_new_tokens=max_new_tokens,
-            stop_token_ids=recipe.get_stop_token_ids(),
-            sampling_params=SamplingParams(temperature=0.0),
+            sampling_params=SamplingParams(
+                max_new_tokens=max_new_tokens,
+                stop_token_ids=recipe.get_stop_token_ids(),
+                temperature=0.0,
+            ),
         )
         started = time.perf_counter()
         step_durations, event_times = _drain(engine)
@@ -351,9 +352,11 @@ def smoke_test(
         )
         image_request = engine.submit(
             media=image_prompt.media,
-            max_new_tokens=16,
-            stop_token_ids=image_prompt.stop_token_ids,
-            sampling_params=SamplingParams(temperature=0.0),
+            sampling_params=SamplingParams(
+                max_new_tokens=16,
+                stop_token_ids=image_prompt.stop_token_ids,
+                temperature=0.0,
+            ),
         )
         image_started = time.perf_counter()
         _, image_events = _drain(engine)
@@ -428,9 +431,11 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
         )
         text_request = engine.submit(
             text_prompt.token_ids,
-            max_new_tokens=4,
-            stop_token_ids=text_prompt.stop_token_ids,
-            sampling_params=SamplingParams(temperature=0.0),
+            sampling_params=SamplingParams(
+                max_new_tokens=4,
+                stop_token_ids=text_prompt.stop_token_ids,
+                temperature=0.0,
+            ),
         )
         _drain(engine)
         text_request.take_result()
@@ -448,9 +453,11 @@ def _serve(_: int, context_length: int, speculative_tokens: int) -> None:
         )
         image_request = engine.submit(
             media=image_prompt.media,
-            max_new_tokens=2,
-            stop_token_ids=image_prompt.stop_token_ids,
-            sampling_params=SamplingParams(temperature=0.0),
+            sampling_params=SamplingParams(
+                max_new_tokens=2,
+                stop_token_ids=image_prompt.stop_token_ids,
+                temperature=0.0,
+            ),
         )
         _drain(engine)
         image_request.take_result()

@@ -16,7 +16,6 @@ fn engine(chunk: u32) -> EngineCore<()> {
             prefill_chunk_size: NonZeroU32::new(chunk).unwrap(),
             ..Default::default()
         },
-        None,
         false,
     )
     .unwrap()

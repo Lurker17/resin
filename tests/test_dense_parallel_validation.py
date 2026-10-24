@@ -34,7 +34,6 @@ def test_dense_validation_workload_obeys_native_scoring_and_cache_contracts():
         observed,
         max_running_requests=2,
         context_length=512,
-        eos_token_id=None,
         prefix_cache=False,
         scheduler_config=SchedulerConfig(max_batch_tokens=64, prefill_chunk_size=32),
     )

@@ -225,9 +225,9 @@ def test_native_events_keep_speculative_scores_aligned_through_eos():
     engine = Engine(runner)
     request = engine.submit(
         [1],
-        max_new_tokens=5,
-        stop_token_ids=[99],
-        sampling_params=SamplingParams(logprobs=True),
+        sampling_params=SamplingParams(
+            max_new_tokens=5, stop_token_ids=[99], logprobs=True
+        ),
     )
     events = engine.step() + engine.step()
     assert [event.token_id for event in events] == [2, 7, 99]
@@ -255,9 +255,9 @@ def test_invalid_scores_after_stop_still_quarantine_the_whole_batch(scores):
     engine = Engine(runner)
     request = engine.submit(
         [1],
-        max_new_tokens=5,
-        stop_token_ids=[99],
-        sampling_params=SamplingParams(logprobs=True),
+        sampling_params=SamplingParams(
+            max_new_tokens=5, stop_token_ids=[99], logprobs=True
+        ),
     )
     engine.step()
     with pytest.raises(RuntimeError):
@@ -272,7 +272,7 @@ def test_invalid_scores_after_stop_still_quarantine_the_whole_batch(scores):
 def test_invalid_output_offsets_fail_before_commit(offsets):
     output = ForwardOutput(np.array([3, 4, 5], np.uint32), np.array(offsets, np.uint32))
     engine = Engine(OutputRunner(forward=lambda plan: output))
-    request = engine.submit([1], max_new_tokens=1)
+    request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1))
     with pytest.raises(RuntimeError):
         engine.step()
     assert engine.poisoned and not request.done
@@ -298,7 +298,7 @@ def test_array_handoff_retains_storage_and_events_own_their_scores():
         assert all(source() is not None for source in sources)
 
     engine = Engine(OutputRunner(forward=forward, release=release))
-    engine.submit([1], max_new_tokens=1, sampling_params=SamplingParams(logprobs=True))
+    engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1, logprobs=True))
     (event,) = engine.step()
     assert all(source() is None for source in sources)
     assert event.logprobs is not None
@@ -306,7 +306,7 @@ def test_array_handoff_retains_storage_and_events_own_their_scores():
 
     engine = Engine(OutputRunner(forward=lambda plan: output))
     request = engine.submit(
-        [1], max_new_tokens=1, sampling_params=SamplingParams(logprobs=True)
+        [1], sampling_params=SamplingParams(max_new_tokens=1, logprobs=True)
     )
     (event,) = engine.step()
     ids.fill(99)
@@ -326,7 +326,7 @@ def test_exact_array_dtypes_and_contiguity_are_required_without_coercion():
         logprobs=np.zeros(4, np.float32)[::2],
     )
     engine = Engine(OutputRunner(forward=lambda plan: output))
-    engine.submit([1], max_new_tokens=1)
+    engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1))
     with pytest.raises(ValueError, match="contiguous"):
         engine.step()
     assert engine.poisoned
@@ -341,7 +341,7 @@ def test_top_alternatives_are_read_from_arrays_and_validated_even_past_eos():
         top_logprobs=np.array([-0.1, -2.0], np.float32),
     )
     engine = Engine(OutputRunner(forward=lambda plan: good))
-    engine.submit([1], max_new_tokens=1, sampling_params=SamplingParams(top_logprobs=2))
+    engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1, top_logprobs=2))
     (event,) = engine.step()
     assert event.logprobs is not None
     assert np.array(event.logprobs.top_logprobs) == pytest.approx(
@@ -356,7 +356,7 @@ def test_top_alternatives_are_read_from_arrays_and_validated_even_past_eos():
         top_logprobs=np.array([-0.1, float("nan")], np.float32),
     )
     engine = Engine(OutputRunner(forward=lambda plan: bad))
-    engine.submit([1], max_new_tokens=1, sampling_params=SamplingParams(top_logprobs=2))
+    engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1, top_logprobs=2))
     with pytest.raises(RuntimeError):
         engine.step()
     assert engine.poisoned
@@ -364,7 +364,7 @@ def test_top_alternatives_are_read_from_arrays_and_validated_even_past_eos():
 
 def test_requested_scores_cannot_silently_disappear():
     engine = Engine(OutputRunner(forward=lambda plan: forward_output([3])))
-    engine.submit([1], max_new_tokens=1, sampling_params=SamplingParams(logprobs=True))
+    engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1, logprobs=True))
     with pytest.raises(RuntimeError, match="requested token logprobs"):
         engine.step()
     assert engine.poisoned
@@ -372,6 +372,6 @@ def test_requested_scores_cannot_silently_disappear():
 
 def test_token_only_native_outputs_need_no_logprob_columns():
     engine = Engine(OutputRunner(forward=lambda plan: forward_output([3])))
-    request = engine.submit([1], max_new_tokens=1)
+    request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=1))
     (event,) = engine.step()
     assert event.logprobs is None and request.take_result() == [3]

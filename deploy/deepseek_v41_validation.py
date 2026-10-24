@@ -227,9 +227,9 @@ def validate_overlap(runner, engine, prompt, *, coordinate=None, generated=160):
             before = local.overlap_stats
             request = engine.submit(
                 prompt,
-                max_new_tokens=generated,
-                stop_token_ids=[],
-                sampling_params=SamplingParams(temperature=0, seed=41),
+                sampling_params=SamplingParams(
+                    max_new_tokens=generated, stop_token_ids=[], temperature=0, seed=41
+                ),
             )
         tokens, steps = [], 0
         try:
@@ -348,9 +348,9 @@ def validate_model(
             accepted = runner._speculation.snapshot()
             request = engine.submit(
                 prompt,
-                max_new_tokens=generated,
-                stop_token_ids=[runner.eos_token_id],
                 sampling_params=SamplingParams(
+                    max_new_tokens=generated,
+                    stop_token_ids=[runner.eos_token_id],
                     temperature=0,
                     seed=41,
                     logprobs=True,

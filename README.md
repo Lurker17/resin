@@ -141,21 +141,26 @@ from resin_models_torch.lfm2 import Lfm2TorchRunner
 
 runner = Lfm2TorchRunner(device="cpu")
 
-with Engine(
-    runner,
-    context_length=32768,
-    eos_token_id=runner.eos_token_id,
-) as engine:
+with Engine(runner, context_length=32768) as engine:
     request = engine.submit(
         [1, 6, 24131],
-        max_new_tokens=8,
-        sampling_params=SamplingParams(temperature=1.0, top_p=0.95),
+        sampling_params=SamplingParams(
+            max_new_tokens=8,
+            stop_token_ids=[runner.eos_token_id],
+            temperature=1.0,
+            top_p=0.95,
+        ),
     )
     while engine.has_work():
         for event in engine.step():
             print(event)
     generated_ids = request.take_result()
 ```
+
+`SamplingParams` is the frozen request policy for generation limits, stop token
+IDs, sampling, and logprob options. Use a rendered recipe prompt's `stop_token_ids`
+for chat requests, or supply the model's stop tokens explicitly for raw token
+requests. `Engine` has no default EOS token.
 
 A custom synchronous runner only needs one method:
 

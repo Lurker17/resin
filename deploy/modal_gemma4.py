@@ -177,7 +177,6 @@ def _build_runtime(*, speculative_tokens: int, validate_graphs: bool = False):
             max_batch_tokens=runner.prefill_chunk_size,
             prefill_chunk_size=runner.prefill_chunk_size,
         ),
-        eos_token_id=runner.config.eos_token_ids[0],
         prefix_cache=True,
     )
     torch.cuda.synchronize()
@@ -222,9 +221,11 @@ def _generate(engine, processor, prompt: str, max_new_tokens: int):
     media = prepared.media
     lease = engine.submit(
         media=media,
-        max_new_tokens=max_new_tokens,
-        stop_token_ids=(1, 106),
-        sampling_params=SamplingParams(temperature=0.0),
+        sampling_params=SamplingParams(
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=prepared.stop_token_ids,
+            temperature=0.0,
+        ),
     )
     steps = []
     while engine.has_work():
@@ -251,9 +252,9 @@ def _warmup_text(engine, processor) -> None:
     )
     lease = engine.submit(
         prepared.token_ids,
-        max_new_tokens=3,
-        stop_token_ids=(1, 106),
-        sampling_params=SamplingParams(temperature=0.0),
+        sampling_params=SamplingParams(
+            max_new_tokens=3, stop_token_ids=prepared.stop_token_ids, temperature=0.0
+        ),
     )
     while engine.has_work():
         engine.step()

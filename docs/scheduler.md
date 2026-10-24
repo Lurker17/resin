@@ -18,11 +18,12 @@ engine = Engine(
 )
 
 request = engine.submit(
-    token_ids,
-    max_new_tokens=64,  # optional hard stop, not a KV reservation
+    prompt.token_ids,
     priority=5,
     batch_key=7,
     sampling_params=SamplingParams(
+        max_new_tokens=64,  # optional hard stop, not a KV reservation
+        stop_token_ids=prompt.stop_token_ids,
         temperature=1.0,
         top_p=0.95,
         top_k=40,
@@ -33,9 +34,9 @@ request = engine.submit(
 
 `context_length` is an Engine-level model limit, not a batching preference. It
 defaults to 32768 and rejects requests whose requested sequence would exceed
-that bound. If `max_new_tokens` is omitted, generation may use the remaining
-model context. The value is always a terminal generation cap; Resin never
-reserves that entire lifetime at submission.
+that bound. If `SamplingParams.max_new_tokens` is `None` (the default), generation
+may use the remaining model context. The value is always a terminal generation
+cap; Resin never reserves that entire lifetime at submission.
 
 `prefill_chunk_size` defaults to 8192 tokens and is the scheduler's execution
 unit for prompt or replay work. A runner may declare a smaller hard
@@ -140,10 +141,18 @@ mask explicit. Prefill returns one token ID per row, including an ignored ID
 for an unsampled continuation or replay row. Decode may return a verified token
 block within the runner's declared speculative capacity.
 
-`SamplingParams` is per request and defaults to temperature `1.0`, top-p `1.0`,
-and no top-k limit. Temperature `0` requests deterministic argmax. The frozen
-plan carries one policy and effective seed per row; the runner derives random
-offsets from absolute sequence progress so requests can share a batch without
+`SamplingParams` is a frozen per-request policy that holds generation limits,
+stop token IDs, sampling settings, and logprob options. `stop_token_ids` defaults
+to an empty tuple, so raw token requests must supply any desired model stop
+tokens explicitly. For recipe requests, pass the rendered prompt's
+`stop_token_ids`. There is no Engine-level EOS fallback. Stop IDs are copied into
+an immutable tuple at construction. Reuse a policy for requests with the same
+settings, or construct a new one to change the limit or stops.
+
+Sampling defaults to temperature `1.0`, top-p `1.0`, and no top-k limit.
+Temperature `0` requests deterministic argmax. The frozen plan carries one policy
+and effective seed per row; the runner derives random offsets from absolute
+sequence progress so requests can share a batch without
 sharing a random stream. The optional
 `extra` value is an opaque Python object for custom runner code; Resin preserves
 it but does not inspect it. Shared Torch and FlashInfer backend samplers consume
@@ -165,8 +174,8 @@ On successful completion Resin:
 6. returns survivors to the sticky admitted set;
 7. emits events for sampled rows.
 
-EOS and `max_new_tokens` are terminal conditions. Cancellation completes a ready
-request without running another model step.
+Stop token IDs and `SamplingParams.max_new_tokens` are terminal conditions.
+Cancellation completes a ready request without running another model step.
 
 ## Failure semantics
 

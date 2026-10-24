@@ -4,7 +4,7 @@ import torch
 from tokenizers import Tokenizer
 
 import resin
-from resin import Engine
+from resin import Engine, SamplingParams
 from resin.recipe import Lfm2Recipe
 from resin_models_torch.lfm2 import DEFAULT_MODEL, DEFAULT_REVISION, Lfm2TorchRunner
 
@@ -29,11 +29,12 @@ def main() -> None:
     parser = recipe.create_parser(prompt)
 
     runner = Lfm2TorchRunner(model, device="cpu")
-    with Engine(runner, eos_token_id=runner.eos_token_id) as engine:
+    with Engine(runner) as engine:
         request = engine.submit(
             prompt.token_ids,
-            max_new_tokens=256,
-            stop_token_ids=prompt.stop_token_ids,
+            sampling_params=SamplingParams(
+                max_new_tokens=256, stop_token_ids=prompt.stop_token_ids
+            ),
         )
         while engine.has_work():
             for token in engine.step():

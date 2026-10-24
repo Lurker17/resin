@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import numpy as np
 
 import resin
-from resin import BatchPhase, Engine, ForwardOutput, RunnerConfig
+from resin import BatchPhase, Engine, ForwardOutput, RunnerConfig, SamplingParams
 from resin_models_cuda.deepseek_v41.cache import CacheGeometry
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -82,13 +82,21 @@ def run_case(
     cached = []
     try:
         if shared:
-            seed = engine.submit([2] * shared, 1, stop_token_ids=[])
+            seed = engine.submit(
+                [2] * shared,
+                sampling_params=SamplingParams(max_new_tokens=1, stop_token_ids=[]),
+            )
             while not seed.done:
                 engine.step()
         for index in range(batch):
             prompt = [2] * context
             prompt[shared] = 100 + index
-            lease = engine.submit(prompt, maximum, stop_token_ids=[])
+            lease = engine.submit(
+                prompt,
+                sampling_params=SamplingParams(
+                    max_new_tokens=maximum, stop_token_ids=[]
+                ),
+            )
             cached.append(lease.cached_tokens)
         if cached != [shared] * batch:
             raise RuntimeError(

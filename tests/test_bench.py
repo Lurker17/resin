@@ -13,6 +13,7 @@ from resin import (
     Engine,
     Parallelism,
     RunnerConfig,
+    SamplingParams,
     SchedulerConfig,
 )
 from resin.backend.speculative import SpeculativeStats
@@ -77,7 +78,7 @@ def test_benchmark_does_not_wrap_noncallable_result_as_pending():
         cache_write_lookahead_tokens=2,
     )
     engine = Engine(BenchmarkRunner(runner))
-    request = engine.submit([1], max_new_tokens=8)
+    request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=8))
     assert [event.token_id for event in engine.step()] == [0]
     with pytest.raises(
         TypeError, match=r"runner.enqueue\(\) must return ForwardOutput"
@@ -113,7 +114,12 @@ def test_prefill_measures_actual_chunked_inputs_and_keeps_engine_resident():
     assert record["metadata"] == {"model": "test"}
     assert not engine.has_work()
     # run_sweep never closes a caller-owned resident engine.
-    assert engine.submit([1], 1).cached_tokens == 0
+    assert (
+        engine.submit(
+            [1], sampling_params=SamplingParams(max_new_tokens=1)
+        ).cached_tokens
+        == 0
+    )
 
 
 @pytest.mark.parametrize("budget,actual_batch", [(4, 1), (16, 4)])
@@ -201,9 +207,9 @@ def test_gpt_single_gpu_prefill_budget_respects_normal_kernel_capacity(
         )
 
 
-def test_decode_counts_real_steps_and_disables_eos_without_retiring_cohort():
+def test_decode_counts_real_steps_and_keeps_cohort_until_window_completes():
     runner = BenchmarkRunner(Runner())
-    engine = Engine(runner, eos_token_id=0, max_running_requests=2, context_length=64)
+    engine = Engine(runner, max_running_requests=2, context_length=64)
     record = run_sweep(
         engine,
         [BenchCase(phase="decode", context_length=4, batch_size=2)],

@@ -31,7 +31,7 @@ def test_http_rank_uses_shared_worker_and_closes_after_warmup_or_server_failure(
             memory_utilization=0.9,
         ),
     )
-    recipe = object()
+    recipe = SimpleNamespace(get_stop_token_ids=lambda: [97, 98])
 
     def initialize(actual_rank, actual_size, port):
         assert (actual_rank, actual_size, port) == (rank, size, 12345)
@@ -65,14 +65,15 @@ def test_http_rank_uses_shared_worker_and_closes_after_warmup_or_server_failure(
             assert isinstance(owner, Worker) if size > 1 else owner is runner
             assert options["context_length"] == 131072
             assert options["max_running_requests"] == deployment.DEFAULT_MAX_NUM_SEQS
-            assert options["eos_token_id"] == 99 and options["prefix_cache"]
+            assert options["prefix_cache"]
             self.closed = False
             self.remaining = 2
             calls.append("engine")
 
         def submit(self, tokens, **options):
-            assert tokens == [1, 2] and options["max_new_tokens"] == 2
+            assert tokens == [1, 2] and options["sampling_params"].max_new_tokens == 2
             assert options["sampling_params"].temperature == 0
+            assert options["sampling_params"].stop_token_ids == (97, 98)
             calls.append("submit")
             return SimpleNamespace(take_result=lambda: calls.append("warmup_done"))
 

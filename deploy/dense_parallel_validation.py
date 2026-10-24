@@ -138,14 +138,19 @@ def _drain(engine, events, *, after_step=None):
 
 def _workload(engine, prompts):
     events, requests, requested_scores = {}, {}, {}
-    sampling = SamplingParams(temperature=0.0, logprobs=True, top_logprobs=3)
-    unscored = SamplingParams(temperature=0.0)
+    sampling = SamplingParams(
+        max_new_tokens=8, temperature=0.0, logprobs=True, top_logprobs=3
+    )
 
     def submit(name, prompt, tokens=8, *, scored=True, **kwargs):
         request = engine.submit(
             prompt,
-            max_new_tokens=tokens,
-            sampling_params=sampling if scored else unscored,
+            sampling_params=SamplingParams(
+                max_new_tokens=tokens,
+                temperature=0.0,
+                logprobs=scored,
+                top_logprobs=3 if scored else 0,
+            ),
             **kwargs,
         )
         requests[name] = request
@@ -158,7 +163,7 @@ def _workload(engine, prompts):
 
     submit("short", prompts["short"])
     submit("long", prompts["long"])
-    queued = engine.submit(prompts["long"], max_new_tokens=8, sampling_params=sampling)
+    queued = engine.submit(prompts["long"], sampling_params=sampling)
     cancel(queued)
     _drain(engine, events)
 
@@ -171,15 +176,17 @@ def _workload(engine, prompts):
     submit("graph_short", prompts["short"], scored=False)
     submit("graph_long", prompts["long"], scored=False)
     _drain(engine, events)
-    active = engine.submit(prompts["long"], max_new_tokens=8, sampling_params=sampling)
+    active = engine.submit(prompts["long"], sampling_params=sampling)
     _drain(
         engine, events, after_step=lambda step: cancel(active) if step == 1 else None
     )
     scored = engine.submit(
         prompts["long"],
-        max_new_tokens=0,
         sampling_params=SamplingParams(
-            temperature=0.0, prompt_logprobs=True, prompt_top_logprobs=3
+            max_new_tokens=0,
+            temperature=0.0,
+            prompt_logprobs=True,
+            prompt_top_logprobs=3,
         ),
         prompt_target_logprobs=[[], *[[token, 0] for token in prompts["long"][1:]]],
     )
@@ -258,7 +265,6 @@ def _rank(rank, port, directory, model, model_path, assistant_path, prompts, cas
         options: dict[str, Any] = dict(
             max_running_requests=2,
             context_length=512,
-            eos_token_id=None,
             prefix_cache=False,
             scheduler_config=SchedulerConfig(
                 max_batch_tokens=64, prefill_chunk_size=32

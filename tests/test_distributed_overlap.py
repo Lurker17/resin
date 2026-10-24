@@ -8,7 +8,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from output_helpers import forward_output
 
-from resin import CacheGroupLayout, CacheLayout, Parallelism, RunnerConfig
+from resin import (
+    CacheGroupLayout,
+    CacheLayout,
+    Parallelism,
+    RunnerConfig,
+    SamplingParams,
+)
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 
@@ -96,7 +102,9 @@ def _worker(rank, rendezvous):
         if groups.is_driver:
             engine = DistributedEngine(worker, overlap=overlap)
             start = 1 + groups.attn_dp.local_rank * 20
-            request = engine.submit([start], max_new_tokens=34)
+            request = engine.submit(
+                [start], sampling_params=SamplingParams(max_new_tokens=34)
+            )
             events = []
             steps = 0
             while engine.has_work():
@@ -124,14 +132,16 @@ def _worker(rank, rendezvous):
     worker = DistributedWorker(runner, groups)
     if groups.is_driver:
         engine = DistributedEngine(worker)
-        request = engine.submit([1], max_new_tokens=40)
+        request = engine.submit([1], sampling_params=SamplingParams(max_new_tokens=40))
         events = []
         for _ in range(3):
             events.extend(engine.step())
         assert engine.local.overlap_pending
         if groups.attn_dp.local_rank == 0:
             engine.cancel(request)
-            added = engine.submit([20] * 5, max_new_tokens=9)
+            added = engine.submit(
+                [20] * 5, sampling_params=SamplingParams(max_new_tokens=9)
+            )
         else:
             added = None
         steps = 0
@@ -155,9 +165,11 @@ def _worker(rank, rendezvous):
             engine = DistributedEngine(worker)
             dp = groups.attn_dp.local_rank
             limit = 12 if scenario == "unequal_budget" and dp == 0 else 34
-            request = engine.submit([1], max_new_tokens=limit)
+            request = engine.submit(
+                [1], sampling_params=SamplingParams(max_new_tokens=limit)
+            )
             survivor = (
-                engine.submit([20], max_new_tokens=34)
+                engine.submit([20], sampling_params=SamplingParams(max_new_tokens=34))
                 if scenario == "partial_cancel"
                 else None
             )
@@ -192,7 +204,10 @@ def _worker(rank, rendezvous):
         engine = DistributedEngine(worker)
         dp = groups.attn_dp.local_rank
         request = (
-            engine.submit([1], max_new_tokens=60, stop_token_ids=[48])
+            engine.submit(
+                [1],
+                sampling_params=SamplingParams(max_new_tokens=60, stop_token_ids=[48]),
+            )
             if dp == 0
             else None
         )
@@ -202,7 +217,10 @@ def _worker(rank, rendezvous):
             assert engine.local.overlap_stats[1] > 0
         else:
             assert any(async_ and idle for _, async_, idle in runner.calls)
-            request = engine.submit([20] * 5, max_new_tokens=30, stop_token_ids=[29])
+            request = engine.submit(
+                [20] * 5,
+                sampling_params=SamplingParams(max_new_tokens=30, stop_token_ids=[29]),
+            )
         steps = 0
         events = []
         while engine.has_work():

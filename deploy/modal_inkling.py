@@ -194,7 +194,6 @@ def _build_runtime(
         runner,
         max_running_requests=DEFAULT_MAX_NUM_SEQS,
         context_length=context_length,
-        eos_token_id=runner.eos_token_id,
         prefix_cache=True,
         scheduler_config=SchedulerConfig(
             max_batch_tokens=runner.prefill_chunk_size,
@@ -249,9 +248,9 @@ def smoke_test(
         )
         lease = engine.submit(
             prompt_ids,
-            max_new_tokens=max_new_tokens,
-            stop_token_ids=recipe.get_stop_token_ids(),
             sampling_params=SamplingParams(
+                max_new_tokens=max_new_tokens,
+                stop_token_ids=recipe.get_stop_token_ids(),
                 temperature=1.0,
                 top_p=0.95,
                 seed=7,
@@ -289,9 +288,11 @@ def _serve(_: int) -> None:
     try:
         warmup = engine.submit(
             _prompt_ids(recipe, "Reply with one word."),
-            max_new_tokens=2,
-            stop_token_ids=recipe.get_stop_token_ids(),
-            sampling_params=SamplingParams(temperature=0.0),
+            sampling_params=SamplingParams(
+                max_new_tokens=2,
+                stop_token_ids=recipe.get_stop_token_ids(),
+                temperature=0.0,
+            ),
         )
         while engine.has_work():
             engine.step()
