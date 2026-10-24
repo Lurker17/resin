@@ -13,19 +13,18 @@ import resin
 
 
 class TextCodec:
-    def __init__(self, pieces, *, lane="text_delta"):
+    def __init__(self, pieces):
         self.pieces = pieces
-        self.lane = lane
 
     def render(self, messages, *, tools=(), options=None):
         return resin.recipe.RenderedPrompt([1], stop_token_ids=[])
 
     def create_parser(self, prompt):
-        pieces, lane = self.pieces, self.lane
+        pieces = self.pieces
 
         class Parser:
             def feed(self, ids):
-                return [{"type": lane, "delta": pieces[token]} for token in ids]
+                return [resin.recipe.TextDelta(pieces[token]) for token in ids]
 
         return Parser()
 

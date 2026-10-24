@@ -148,10 +148,13 @@ non-streaming response, independently of semantic parser chunk boundaries.
 Every recipe parser returns provenance from its ordinary `feed` and `finish`
 methods, for scored and unscored requests. Custom parsers use the same
 `ResponseParser`/`FinalizingResponseParser` protocols from `resin.protocols`.
-Each `ParserEvent.token_spans` entry is a five-integer tuple:
+They return native `resin.recipe.ParserEvent` objects: `TextDelta`,
+`ReasoningDelta`, `ToolCallStart`, or `ToolCallArgumentsDelta`. Fields are read
+as attributes; parser events do not use dictionaries. Each `token_spans` entry
+is a five-integer tuple:
 
 ```python
-{"type": "text_delta", "delta": "ab", "token_spans": [(0, 0, 1, 0, 1), (1, 0, 1, 1, 2)]}
+resin.recipe.TextDelta("ab", token_spans=[(0, 0, 1, 0, 1), (1, 0, 1, 1, 2)])
 ```
 
 The fields are `(token_index, source_start, source_end, text_start, text_end)`.
@@ -164,11 +167,11 @@ these compact spans in source-token order through buffering; the native represen
 values rather than six machine-sized offsets. Full-token byte lengths come from
 the tokenizer vocabulary instead of being repeated in each span.
 
-Missing or empty spans explicitly mean synthetic text or unknown provenance.
+Empty spans, the constructor default, mean synthetic text or unknown provenance.
 They still allow raw scores, with no guessed canonical association. Custom Python
 tokenizers without a serialized backend can use this fallback; native parser
-creation rejects unsupported serialized decoder chains. `token_spans` is reserved
-metadata: malformed values, unseen or out-of-order source indices, empty/reversed
+creation rejects unsupported serialized decoder chains. Malformed span values,
+unseen or out-of-order source indices, empty/reversed
 ranges, and invalid text bounds fail the request even when scores are off,
 without poisoning the engine. Scored requests also check source byte extents
 against the raw vocabulary bytes when those bytes are available.

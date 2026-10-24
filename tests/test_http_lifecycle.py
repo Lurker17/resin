@@ -11,6 +11,7 @@ from contextlib import ExitStack, contextmanager
 import pytest
 from test_recipe import _byte_tokenizer, _FastTokenizer, _token_ids
 
+import resin
 from resin import BatchPhase, Engine
 from resin.backend.cuda.failures import PostAcceptCudaError
 from resin.recipe import InklingResponseParser, RenderedPrompt, Tokenizer
@@ -27,7 +28,7 @@ class Codec:
 
         class Parser:
             def feed(self, token_ids):
-                return [{"type": "text_delta", "delta": delta}]
+                return [resin.recipe.TextDelta(delta)]
 
         return Parser()
 
@@ -229,11 +230,11 @@ def test_parser_finalization_deltas_precede_completion(stream, completion_reason
         def create_parser(self, prompt):
             class Parser:
                 def feed(self, token_ids):
-                    return [{"type": "text_delta", "delta": "before"}]
+                    return [resin.recipe.TextDelta("before")]
 
                 def finish(self, reason):
                     finished.append(reason)
-                    return [{"type": "text_delta", "delta": "-after"}]
+                    return [resin.recipe.TextDelta("-after")]
 
             return Parser()
 
@@ -280,6 +281,85 @@ def test_parser_without_finalization_remains_supported():
             assert choice["finish_reason"] == "length"
         assert not engine.poisoned
         assert errors == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_custom_native_tool_events_preserve_arguments_and_identity(stream):
+    class ToolRecipe(Codec):
+        def create_parser(self, prompt):
+            class Parser:
+                def feed(self, token_ids):
+                    return [
+                        resin.recipe.ReasoningDelta("Looking it up."),
+                        resin.recipe.ToolCallStart(0, "call-1", "lookup"),
+                        resin.recipe.ToolCallArgumentsDelta(0, '{"city":"Paris"}'),
+                    ]
+
+            return Parser()
+
+    with running_server(Runner(), ToolRecipe()) as (_, engine, _, errors, base, _):
+        with post(base, request_body(stream=stream, max_tokens=1)) as response:
+            if stream:
+                chunks = [
+                    json.loads(line[6:])
+                    for line in response.read().decode().splitlines()
+                    if line.startswith("data: ") and line != "data: [DONE]"
+                ]
+                deltas = [
+                    choice["delta"] for chunk in chunks for choice in chunk["choices"]
+                ]
+                assert (
+                    "".join(delta.get("reasoning_content", "") for delta in deltas)
+                    == "Looking it up."
+                )
+                calls = [
+                    call for delta in deltas for call in delta.get("tool_calls", [])
+                ]
+                assert calls[0]["id"] == "call-1"
+                assert calls[0]["function"]["name"] == "lookup"
+                assert all(call["index"] == 0 for call in calls)
+                assert (
+                    "".join(call["function"].get("arguments", "") for call in calls)
+                    == '{"city":"Paris"}'
+                )
+            else:
+                message = json.load(response)["choices"][0]["message"]
+                assert message["reasoning_content"] == "Looking it up."
+                assert message["tool_calls"] == [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"city":"Paris"}'},
+                    },
+                ]
+        assert not engine.poisoned and errors == []
+
+
+def test_dictionary_parser_events_are_rejected_without_poisoning_engine():
+    class InvalidRecipe(Codec):
+        invalid = True
+
+        def create_parser(self, prompt):
+            owner = self
+
+            class Parser:
+                def feed(self, token_ids):
+                    if owner.invalid:
+                        return [{"type": "text_delta", "delta": "legacy"}]
+                    return [resin.recipe.TextDelta("healthy")]
+
+            return Parser()
+
+    recipe = InvalidRecipe()
+    with running_server(Runner(), recipe) as (_, engine, _, errors, base, _):
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            post(base, request_body(max_tokens=1))
+        assert caught.value.code == 500
+        assert "parser" in caught.value.read().decode()
+        recipe.invalid = False
+        with post(base, request_body(max_tokens=1)) as response:
+            assert json.load(response)["choices"][0]["message"]["content"] == "healthy"
+        assert not engine.poisoned and not engine.has_work() and errors == []
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -369,7 +449,7 @@ def test_parser_finalization_failure_does_not_poison_other_requests(stream):
                 def finish(self, reason):
                     if fail:
                         raise ValueError("intentional finalization failure")
-                    return [{"type": "text_delta", "delta": "success"}]
+                    return [resin.recipe.TextDelta("success")]
 
             return Parser()
 

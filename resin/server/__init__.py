@@ -10,8 +10,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from resin._resin import Engine, _HttpServer
-from resin.protocols import ParserEvent, ResponseParser
-from resin.recipe import Recipe, RenderedPrompt
+from resin.protocols import ResponseParser
+from resin.recipe import ParserEvent, Recipe, RenderedPrompt
 
 if TYPE_CHECKING:
     from resin.backend.distributed import DistributedEngine

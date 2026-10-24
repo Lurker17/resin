@@ -26,8 +26,8 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
             class Parser:
                 def feed(self, ids):
                     return [
-                        {"type": "reasoning_delta", "delta": "a"},
-                        {"type": "text_delta", "delta": "b"},
+                        resin.recipe.ReasoningDelta("a"),
+                        resin.recipe.TextDelta("b"),
                     ]
 
             return Parser()

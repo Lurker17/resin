@@ -35,9 +35,11 @@ to the actual rendered prefix and options. A native prompt belongs to the
 recipe that rendered it.
 
 These parsers use one common native handle; the HTTP actor consumes Rust events
-directly. Python callers receive identical event dictionaries. Applications can
-supply a custom recipe with the same `render` and `create_parser` methods and
-parser `feed` (plus optional `finish`). HTTP wire dictionaries stay in the HTTP
+directly. Python callers receive immutable `ParserEvent` variants: `TextDelta`,
+`ReasoningDelta`, `ToolCallStart` and `ToolCallArgumentsDelta`. Their payload and
+`token_spans` provenance are attributes. Applications can supply a custom recipe
+with the same `render` and `create_parser` methods and parser `feed` (plus optional
+`finish`), returning these native events. HTTP wire dictionaries stay in the HTTP
 adapter, outside the native recipe API.
 
 Fast Hugging Face tokenizers are snapshotted once and shared across requests.

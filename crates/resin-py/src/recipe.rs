@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::recipe_events::{self, ParserEvent};
 use crate::recipe_types::{MediaSources, Message, RenderOptions, Role, Tool};
 use pyo3::{
     exceptions::{PyAttributeError, PyValueError},
@@ -200,15 +201,15 @@ impl NativeInklingParser {
         })
     }
 
-    fn feed(&self, py: Python<'_>, token_ids: Vec<u32>) -> PyResult<Py<PyAny>> {
+    fn feed(&self, py: Python<'_>, token_ids: Vec<u32>) -> PyResult<Vec<Py<ParserEvent>>> {
         let events = py.detach(|| feed(&self.inner, &token_ids))?;
-        Ok(pythonize(py, &events)?.unbind())
+        recipe_events::to_python(py, events)
     }
 
-    fn finish(&self, py: Python<'_>, reason: &str) -> PyResult<Py<PyAny>> {
+    fn finish(&self, py: Python<'_>, reason: &str) -> PyResult<Vec<Py<ParserEvent>>> {
         let reason = parse_finish_reason(reason)?;
         let events = py.detach(|| finish(&self.inner, reason))?;
-        Ok(pythonize(py, &events)?.unbind())
+        recipe_events::to_python(py, events)
     }
 }
 
@@ -312,15 +313,15 @@ pub(crate) struct NativeResponseParser {
 }
 #[pymethods]
 impl NativeResponseParser {
-    fn feed(&self, py: Python<'_>, token_ids: Vec<u32>) -> PyResult<Py<PyAny>> {
+    fn feed(&self, py: Python<'_>, token_ids: Vec<u32>) -> PyResult<Vec<Py<ParserEvent>>> {
         let events = py.detach(|| feed(&self.inner, &token_ids))?;
-        Ok(pythonize(py, &events)?.unbind())
+        recipe_events::to_python(py, events)
     }
 
-    fn finish(&self, py: Python<'_>, reason: &str) -> PyResult<Py<PyAny>> {
+    fn finish(&self, py: Python<'_>, reason: &str) -> PyResult<Vec<Py<ParserEvent>>> {
         let reason = parse_finish_reason(reason)?;
         let events = py.detach(|| finish(&self.inner, reason))?;
-        Ok(pythonize(py, &events)?.unbind())
+        recipe_events::to_python(py, events)
     }
 }
 

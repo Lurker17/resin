@@ -18,6 +18,7 @@ mod output;
 mod parallelism;
 mod planning;
 mod recipe;
+mod recipe_events;
 mod recipe_types;
 mod runner;
 
@@ -1919,6 +1920,11 @@ mod _resin {
         DeepSeekV4Recipe, DeepSeekV41Recipe, Gemma4Recipe, GptOssRecipe, InklingRecipe, Lfm2Recipe,
         NativeInklingParser, NativeRecipe, NativeResponseParser, Qwen35Recipe, Qwen38Recipe,
         RecipeTokenizer, RenderedPrompt,
+    };
+
+    #[pymodule_export]
+    use crate::recipe_events::{
+        ParserEvent, ReasoningDelta, TextDelta, ToolCallArgumentsDelta, ToolCallStart,
     };
 
     #[pymodule_export]

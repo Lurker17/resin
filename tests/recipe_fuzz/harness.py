@@ -8,7 +8,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from resin.protocols import FinalizingResponseParser, ParserEvent
+import resin
+from resin.protocols import FinalizingResponseParser
+from resin.recipe import ParserEvent
 
 
 @dataclass(frozen=True)
@@ -43,17 +45,18 @@ def semantic_events(
     parts: list[Part] = []
     tools: dict[int, dict[str, Any]] = {}
     for event in events:
-        match event["type"]:
-            case "text_delta" | "reasoning_delta":
-                kind = "text" if event["type"] == "text_delta" else "reasoning"
-                parts.append(Part(kind, event["delta"]))
-            case "tool_call_start":
-                tool = {"name": event["name"], "args": ""}
-                assert event["index"] not in tools
-                tools[event["index"]] = tool
+        match event:
+            case resin.recipe.TextDelta(delta=delta):
+                parts.append(Part("text", delta))
+            case resin.recipe.ReasoningDelta(delta=delta):
+                parts.append(Part("reasoning", delta))
+            case resin.recipe.ToolCallStart(index=index, name=name):
+                tool = {"name": name, "args": ""}
+                assert index not in tools
+                tools[index] = tool
                 parts.append(Part("tool", tool))
-            case "tool_call_arguments_delta":
-                tools[event["index"]]["args"] += event["delta"]
+            case resin.recipe.ToolCallArgumentsDelta(index=index, delta=delta):
+                tools[index]["args"] += delta
             case _:
                 raise AssertionError(f"unexpected parser event: {event}")
     if parse_arguments:
@@ -74,7 +77,7 @@ def assert_streams(
     """Compare whole, token-at-a-time, and generated chunking to one oracle."""
     for schedule in ([len(token_ids)], range(len(token_ids) + 1), cuts):
         parser = create_parser()
-        events = parser.feed([])
+        events = list(parser.feed([]))
         previous = 0
         for end in sorted({*schedule, len(token_ids)}):
             end = min(max(end, previous), len(token_ids))

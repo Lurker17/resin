@@ -75,6 +75,7 @@ PARAMETERS = {
 }
 
 RETURNS = {
+    ("ParserEvent", "token_spans"): "tuple[TokenSpan, ...]",
     ("Message", "content"): "tuple[ContentBlock, ...]",
     ("RenderOptions", "reasoning_effort"): "str | int | float | None",
     ("RenderedPrompt", "media"): "MediaInput | None",
@@ -268,7 +269,7 @@ def import_edits(
         additions.append("import numpy.typing as npt")
     missing_protocols = {
         "MediaInput",
-        "ParserEvent",
+        "TokenSpan",
         "Runner",
     } - protocol_names
     if missing_protocols:

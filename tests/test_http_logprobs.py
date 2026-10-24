@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import urllib.request
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -587,25 +587,12 @@ def custom_scored_codec(*, with_spans, calls, invalid=None):
                         return []
                     if malformed == "event_order":
                         return [
-                            {
-                                "type": "text_delta",
-                                "delta": "b",
-                                "token_spans": [(1, 0, 1, 0, 1)],
-                            },
-                            {
-                                "type": "text_delta",
-                                "delta": "a",
-                                "token_spans": [(0, 0, 1, 0, 1)],
-                            },
+                            resin.recipe.TextDelta("b", token_spans=[(1, 0, 1, 0, 1)]),
+                            resin.recipe.TextDelta("a", token_spans=[(0, 0, 1, 0, 1)]),
                         ]
-                    event = {
-                        "type": "text_delta",
-                        "delta": "ab" if with_spans else "ab"[self.count - 1],
-                        "extra_metadata": "unreserved fields remain harmless",
-                    }
                     spans: Any = [(index, 0, 1, index, index + 1) for index in range(2)]
                     if malformed == "payload":
-                        spans = "reserved token_spans must not be ignored"
+                        spans = "token_spans must be a sequence of five-integer tuples"
                     elif malformed == "arity":
                         spans[-1] = (1, 0, 1, 1)
                     elif malformed == "negative":
@@ -622,9 +609,14 @@ def custom_scored_codec(*, with_spans, calls, invalid=None):
                         spans[-1] = (1, 0, 0, 1, 2)
                     elif malformed == "order":
                         spans.reverse()
-                    if with_spans or malformed:
-                        event["token_spans"] = spans
-                    return [event]
+                    return [
+                        resin.recipe.TextDelta(
+                            "ab" if with_spans else "ab"[self.count - 1],
+                            token_spans=cast(
+                                Any, spans if with_spans or malformed else ()
+                            ),
+                        )
+                    ]
 
                 def finish(self, _reason):
                     calls.append("finish")
@@ -715,7 +707,7 @@ def test_custom_parser_ordinary_feed_preserves_provenance_for_all_requests(
         if scored or invalid != "source"
     ],
 )
-def test_invalid_reserved_source_spans_fail_every_request_without_poisoning_engine(
+def test_invalid_source_spans_fail_every_request_without_poisoning_engine(
     scored, invalid
 ):
     from urllib.error import HTTPError

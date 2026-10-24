@@ -114,10 +114,10 @@ def test_parser_separates_repeated_reasoning_and_visible_text_blocks() -> None:
     parser = _parser(codec)
 
     assert parser.feed([200008, *_text_ids("think")]) == [
-        {"type": "reasoning_delta", "delta": "think"}
+        resin.recipe.ReasoningDelta("think")
     ]
     assert parser.feed([200010, 200001, 200004, *_text_ids("Hello")]) == [
-        {"type": "text_delta", "delta": "Hello"}
+        resin.recipe.TextDelta("Hello")
     ]
     assert parser.feed(
         [
@@ -133,8 +133,8 @@ def test_parser_separates_repeated_reasoning_and_visible_text_blocks() -> None:
             200006,
         ]
     ) == [
-        {"type": "reasoning_delta", "delta": " again"},
-        {"type": "text_delta", "delta": "!"},
+        resin.recipe.ReasoningDelta(" again"),
+        resin.recipe.TextDelta("!"),
     ]
 
 
@@ -143,7 +143,7 @@ def test_parser_uses_prompt_tail_to_continue_reasoning() -> None:
     parser = _parser(codec, 200008)
 
     assert parser.feed(_text_ids("continued")) == [
-        {"type": "reasoning_delta", "delta": "continued"}
+        resin.recipe.ReasoningDelta("continued")
     ]
 
 
@@ -161,17 +161,8 @@ def test_parser_extracts_json_tool_call_and_hides_header_metadata() -> None:
             200006,
         ]
     ) == [
-        {
-            "type": "tool_call_start",
-            "index": 0,
-            "id": "call_0",
-            "name": "weather",
-        },
-        {
-            "type": "tool_call_arguments_delta",
-            "index": 0,
-            "delta": '{"city":"SF"}',
-        },
+        resin.recipe.ToolCallStart(0, "call_0", "weather"),
+        resin.recipe.ToolCallArgumentsDelta(0, '{"city":"SF"}'),
     ]
 
 
@@ -180,10 +171,10 @@ def test_raw_tool_and_tool_error_blocks_remain_visible() -> None:
     parser = _parser(codec)
 
     assert parser.feed([200057, *_text_ids("raw"), 200010]) == [
-        {"type": "text_delta", "delta": "raw"}
+        resin.recipe.TextDelta("raw")
     ]
     assert parser.feed([200001, 200022, *_text_ids("error"), 200010]) == [
-        {"type": "text_delta", "delta": "error"}
+        resin.recipe.TextDelta("error")
     ]
 
 
@@ -193,7 +184,7 @@ def test_native_codec_implements_python_protocols() -> None:
     parser: FinalizingResponseParser = _parser(codec, 200004)
 
     assert compatible_codec is codec
-    assert parser.feed(_text_ids("hello")) == [{"type": "text_delta", "delta": "hello"}]
+    assert parser.feed(_text_ids("hello")) == [resin.recipe.TextDelta("hello")]
     assert parser.finish("stop") == []
 
 
@@ -211,12 +202,8 @@ def test_recipe_prepares_one_tokenizer_for_independent_parsers() -> None:
     first = _parser(model_recipe, 200004)
     second = _parser(model_recipe, 200008)
     assert tokenizer.reads == 1
-    assert first.feed(_text_ids("visible")) == [
-        {"type": "text_delta", "delta": "visible"}
-    ]
-    assert second.feed(_text_ids("private")) == [
-        {"type": "reasoning_delta", "delta": "private"}
-    ]
+    assert first.feed(_text_ids("visible")) == [resin.recipe.TextDelta("visible")]
+    assert second.feed(_text_ids("private")) == [resin.recipe.ReasoningDelta("private")]
 
 
 @pytest.mark.parametrize("reason", ["stop", "length"])

@@ -10,12 +10,13 @@ from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 
 import resin
-from resin.protocols import FinalizingResponseParser, ParserEvent
+from resin.protocols import FinalizingResponseParser
 from resin.recipe import (
     DeepSeekV4Recipe,
     GptOssRecipe,
     InklingRecipe,
     InklingResponseParser,
+    ParserEvent,
     Tokenizer,
 )
 
@@ -62,19 +63,23 @@ def _token_ids(tokenizer: HuggingFaceTokenizer) -> dict[str, int]:
 
 
 def _coalesce(events: list[ParserEvent]) -> list[ParserEvent]:
-    """Ignore event chunk boundaries when comparing semantic output."""
+    """Ignore chunk boundaries and provenance for this semantic comparison."""
     result: list[ParserEvent] = []
     for event in events:
-        event = event.copy()
-        event.pop("token_spans", None)
-        if (
-            result
-            and event["type"] in ("text_delta", "reasoning_delta")
-            and result[-1]["type"] == event["type"]
-        ):
-            result[-1]["delta"] += event["delta"]
+        if isinstance(event, (resin.recipe.TextDelta, resin.recipe.ReasoningDelta)):
+            previous = result[-1] if result else None
+            if isinstance(
+                previous, (resin.recipe.TextDelta, resin.recipe.ReasoningDelta)
+            ) and type(previous) is type(event):
+                result[-1] = type(event)(previous.delta + event.delta)
+            else:
+                result.append(type(event)(event.delta))
+        elif isinstance(event, resin.recipe.ToolCallStart):
+            result.append(resin.recipe.ToolCallStart(event.index, event.id, event.name))
+        elif isinstance(event, resin.recipe.ToolCallArgumentsDelta):
+            result.append(resin.recipe.ToolCallArgumentsDelta(event.index, event.delta))
         else:
-            result.append(event)
+            raise AssertionError(f"unexpected parser event: {event}")
     return result
 
 
@@ -134,10 +139,10 @@ def test_native_decode_is_equivalent_for_every_chunk_boundary() -> None:
         return _coalesce(events)
 
     expected: list[ParserEvent] = [
-        {"type": "reasoning_delta", "delta": "想一想 🧠"},
-        {"type": "text_delta", "delta": "Hi café! \ufffd"},
-        {"type": "tool_call_start", "index": 0, "id": "call_0", "name": "weather"},
-        {"type": "tool_call_arguments_delta", "index": 0, "delta": '{"city":"東京"}'},
+        resin.recipe.ReasoningDelta("想一想 🧠"),
+        resin.recipe.TextDelta("Hi café! \ufffd"),
+        resin.recipe.ToolCallStart(0, "call_0", "weather"),
+        resin.recipe.ToolCallArgumentsDelta(0, '{"city":"東京"}'),
     ]
     assert parse([ids]) == expected
     assert parse([[token_id] for token_id in ids]) == expected
@@ -160,11 +165,9 @@ def test_native_decoder_buffers_partial_utf8_between_feeds() -> None:
     for token_id in ids[:-1]:
         assert parser.feed([token_id]) == []
     assert parser.feed(ids[-1:]) == [
-        {
-            "type": "text_delta",
-            "delta": "🦀",
-            "token_spans": [(index, 0, 1, 0, 4) for index in range(1, 5)],
-        }
+        resin.recipe.TextDelta(
+            "🦀", token_spans=[(index, 0, 1, 0, 4) for index in range(1, 5)]
+        )
     ]
     assert not hasattr(parser, "feed_attributed")
     assert not hasattr(parser, "finish_attributed")
@@ -183,11 +186,9 @@ def test_native_decoder_flushes_incomplete_utf8_at_finish() -> None:
 
     assert parser.feed(incomplete) == []
     assert parser.finish("length") == [
-        {
-            "type": "text_delta",
-            "delta": "\ufffd",
-            "token_spans": [(index, 0, 1, 0, 3) for index in range(2)],
-        }
+        resin.recipe.TextDelta(
+            "�", token_spans=[(index, 0, 1, 0, 3) for index in range(2)]
+        )
     ]
     assert parser.finish("length") == []
 
@@ -207,17 +208,16 @@ def test_native_tokenizer_is_a_snapshot_and_parsers_have_independent_state() -> 
 
     def expected(offset: int) -> list[ParserEvent]:
         return [
-            {
-                "type": "text_delta",
-                "delta": "café",
-                "token_spans": [
+            resin.recipe.TextDelta(
+                "café",
+                token_spans=[
                     (offset, 0, 1, 0, 1),
                     (offset + 1, 0, 1, 1, 2),
                     (offset + 2, 0, 1, 2, 3),
                     (offset + 3, 0, 1, 3, 5),
                     (offset + 4, 0, 1, 3, 5),
                 ],
-            }
+            )
         ]
 
     assert parsers[0].feed(ids) == expected(0)
@@ -254,7 +254,7 @@ def test_custom_tokenizer_with_no_native_backend_uses_decode() -> None:
         tokenizer, markers, prompt_ids=[markers["<|content_text|>"]]
     )
 
-    assert parser.feed([ord("x")]) == [{"type": "text_delta", "delta": "x"}]
+    assert parser.feed([ord("x")]) == [resin.recipe.TextDelta("x")]
     assert calls == [[ord("x")]]
     assert parser.finish("stop") == []
 
@@ -335,7 +335,7 @@ def test_callback_decoder_is_captured_once_instead_of_refetched():
         )
     )
     assert parser.feed([tokenizer.markers["<|content_text|>"]]) == []
-    assert parser.feed([ord("x")]) == [{"type": "text_delta", "delta": "x"}]
+    assert parser.feed([ord("x")]) == [resin.recipe.TextDelta("x")]
     assert parser.finish("stop") == []
     assert tokenizer.reads == 1
 
@@ -373,4 +373,5 @@ def test_inkling_tool_float_preserves_original_value() -> None:
         '<|content_invoke_tool_json|>{"name":"weather","args":{"":0.9999899864196777}}<|end_message|>'
     ).ids
     events = parser.feed(ids)
-    assert json.loads(events[-1]["delta"]) == {"": 0.9999899864196777}
+    assert isinstance(events[-1], resin.recipe.ToolCallArgumentsDelta)
+    assert json.loads(events[-1].delta) == {"": 0.9999899864196777}

@@ -594,6 +594,11 @@ impl Message {
         }
     }
     pub(crate) fn validate_for(&self, model: &str) -> PyResult<()> {
+        if self.role == Role::LATEST_REMINDER && !model.starts_with("deepseek_") {
+            return Err(PyValueError::new_err(format!(
+                "{model} does not support the latest_reminder role"
+            )));
+        }
         if !model.starts_with("deepseek_")
             && ["task", "wo_eos", "response_format"].iter().any(|key| {
                 self.metadata

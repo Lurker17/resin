@@ -44,10 +44,7 @@ class RankCodec:
         class Parser:
             def feed(self, ids):
                 return [
-                    {
-                        "type": "text_delta",
-                        "delta": "".join(str(token - 10) for token in ids),
-                    }
+                    resin.recipe.TextDelta("".join(str(token - 10) for token in ids))
                 ]
 
         return Parser()

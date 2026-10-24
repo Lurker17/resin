@@ -6,7 +6,7 @@ from resin.recipe import Recipe
 from resin.recipe import ContentBlock
 import numpy as np
 import numpy.typing as npt
-from resin.protocols import MediaInput, ParserEvent, Runner
+from resin.protocols import MediaInput, Runner, TokenSpan
 
 __version__: Final[str]
 
@@ -709,6 +709,20 @@ class Parallelism:
     @property
     def world_size(self, /) -> int: ...
 
+class ParserEvent:
+    """
+    A semantic parser event with token-to-text byte provenance.
+
+    Empty token_spans identify synthetic text or unknown provenance.
+    """
+    def __eq__(self, value: object, /) -> bool: ...
+    def __ne__(self, value: object, /) -> bool: ...
+    def __repr__(self, /) -> str: ...
+    @property
+    def token_spans(self, /) -> tuple[TokenSpan, ...]: ...
+    @property
+    def type(self, /) -> str: ...
+
 @final
 class Qwen35Recipe(_NativeRecipe):
     def __new__(
@@ -720,6 +734,18 @@ class Qwen38Recipe(_NativeRecipe):
     def __new__(
         cls, /, tokenizer: Any, *, options: RenderOptions | None = None
     ) -> Qwen38Recipe: ...
+
+@final
+class ReasoningDelta(ParserEvent):
+    def __new__(
+        cls,
+        /,
+        delta: str,
+        *,
+        token_spans: Sequence[tuple[int, int, int, int, int]] = ...,
+    ) -> ReasoningDelta: ...
+    @property
+    def delta(self, /) -> str: ...
 
 @final
 class RecipeResponseParser:
@@ -975,6 +1001,18 @@ class Text:
     def text(self, /) -> str: ...
 
 @final
+class TextDelta(ParserEvent):
+    def __new__(
+        cls,
+        /,
+        delta: str,
+        *,
+        token_spans: Sequence[tuple[int, int, int, int, int]] = ...,
+    ) -> TextDelta: ...
+    @property
+    def delta(self, /) -> str: ...
+
+@final
 class Thinking:
     def __new__(cls, /, text: str) -> Thinking: ...
     @property
@@ -1054,6 +1092,39 @@ class ToolCall:
     def name(self, /) -> str: ...
     @property
     def namespace(self, /) -> Any: ...
+
+@final
+class ToolCallArgumentsDelta(ParserEvent):
+    def __new__(
+        cls,
+        /,
+        index: int,
+        delta: str,
+        *,
+        token_spans: Sequence[tuple[int, int, int, int, int]] = ...,
+    ) -> ToolCallArgumentsDelta: ...
+    @property
+    def delta(self, /) -> str: ...
+    @property
+    def index(self, /) -> int: ...
+
+@final
+class ToolCallStart(ParserEvent):
+    def __new__(
+        cls,
+        /,
+        index: int,
+        id: str,
+        name: str,
+        *,
+        token_spans: Sequence[tuple[int, int, int, int, int]] = ...,
+    ) -> ToolCallStart: ...
+    @property
+    def id(self, /) -> str: ...
+    @property
+    def index(self, /) -> int: ...
+    @property
+    def name(self, /) -> str: ...
 
 @final
 class ToolResult:

@@ -9,12 +9,17 @@ from typing import (
     Literal,
     NamedTuple,
     Protocol,
-    TypedDict,
     runtime_checkable,
 )
 
 if TYPE_CHECKING:
-    from resin._resin import BatchPlan, ForwardOutput, ResourceBinding, RunnerConfig
+    from resin._resin import (
+        BatchPlan,
+        ForwardOutput,
+        ParserEvent,
+        ResourceBinding,
+        RunnerConfig,
+    )
 
 
 class MediaTokenSpan(NamedTuple):
@@ -50,31 +55,20 @@ class MediaInput(Protocol):
 TokenSpan = tuple[int, int, int, int, int]
 
 
-class ParserEvent(TypedDict, total=False):
-    """One incremental semantic event produced by a response parser."""
-
-    type: str
-    delta: str
-    index: int
-    id: str
-    name: str
-    token_spans: list[TokenSpan]
-
-
 class ResponseParser(Protocol):
     """Turn generated IDs into semantic deltas carrying source-byte spans.
 
-    Preserve ``token_spans`` through buffering. Missing or empty spans identify
-    synthetic text or unknown provenance; they never imply a guessed token map.
+    Preserve ``token_spans`` through buffering. Empty spans identify synthetic
+    text or unknown provenance; they never imply a guessed token map.
     """
 
-    def feed(self, token_ids: Sequence[int]) -> list[ParserEvent]: ...
+    def feed(self, token_ids: Sequence[int]) -> Sequence[ParserEvent]: ...
 
 
 class FinalizingResponseParser(ResponseParser, Protocol):
     """Flush buffered output before a response ends normally or at its limit."""
 
-    def finish(self, reason: Literal["stop", "length"]) -> list[ParserEvent]: ...
+    def finish(self, reason: Literal["stop", "length"]) -> Sequence[ParserEvent]: ...
 
 
 class Runner(Protocol):
@@ -128,7 +122,6 @@ __all__ = [
     "ManagedRunner",
     "MediaInput",
     "MediaTokenSpan",
-    "ParserEvent",
     "ResponseParser",
     "Runner",
     "RunnerCompletion",

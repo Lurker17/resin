@@ -76,9 +76,56 @@ def test_native_prompt_is_owned_bound_to_one_recipe_and_parsers_are_fresh():
         first.create_parser(resin.recipe.RenderedPrompt(original))
     ids = backend.encode("thought", add_special_tokens=False).ids
     a, b = first.create_parser(prompt), first.create_parser(prompt)
-    assert a.feed(ids) == b.feed(ids)
+    events = a.feed(ids)
+    assert events == b.feed(ids)
+    assert events
+    assert all(isinstance(event, resin.recipe.ReasoningDelta) for event in events)
+    assert all(isinstance(event, resin.recipe.ParserEvent) for event in events)
     assert a is not b
     assert first.parse_response(ids, prompt=prompt)["reasoning_content"] == "thought"
+
+
+def test_native_events_preserve_variants_values_and_owned_provenance():
+    spans = [(0, 0, 2, 0, 2)]
+    text = resin.recipe.TextDelta("é", token_spans=spans)
+    reasoning = resin.recipe.ReasoningDelta("é", token_spans=spans)
+    start = resin.recipe.ToolCallStart(2, "call-2", "lookup", token_spans=spans)
+    arguments = resin.recipe.ToolCallArgumentsDelta(2, '{"x":', token_spans=spans)
+    spans.clear()
+    assert text.type == "text_delta" and text.delta == "é"
+    assert reasoning.type == "reasoning_delta" and reasoning.delta == "é"
+    assert start.type == "tool_call_start"
+    assert (start.index, start.id, start.name) == (2, "call-2", "lookup")
+    assert arguments.type == "tool_call_arguments_delta"
+    assert (arguments.index, arguments.delta) == (2, '{"x":')
+    assert text == resin.recipe.TextDelta("é", token_spans=[(0, 0, 2, 0, 2)])
+    assert text != reasoning
+    assert text != resin.recipe.TextDelta("é")
+    assert text != {"type": "text_delta", "delta": "é"}
+    for event in (text, reasoning, start, arguments):
+        assert isinstance(event, resin.recipe.ParserEvent)
+        assert event.token_spans == ((0, 0, 2, 0, 2),)
+        assert isinstance(event.token_spans, tuple)
+        with pytest.raises(AttributeError):
+            setattr(event, "token_spans", ())
+    with pytest.raises(AttributeError):
+        setattr(text, "delta", "changed")
+    with pytest.raises(AttributeError):
+        setattr(start, "index", 0)
+    assert resin.recipe.TextDelta("synthetic").token_spans == ()
+
+
+@pytest.mark.parametrize(
+    ("spans", "error"),
+    [
+        ([(0, 0, 1, 0)], ValueError),
+        ([(-1, 0, 1, 0, 1)], OverflowError),
+        ([(1 << 32, 0, 1, 0, 1)], OverflowError),
+    ],
+)
+def test_native_event_constructor_validates_span_storage(spans, error):
+    with pytest.raises(error):
+        resin.recipe.TextDelta("x", token_spans=spans)
 
 
 def test_parser_does_not_retain_media_or_the_rendered_prompt(monkeypatch):
@@ -143,6 +190,14 @@ def test_public_order_and_per_message_controls_are_not_silently_dropped():
         native.render_text(
             [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])],
             options=resin.recipe.RenderOptions(add_vision_id=True),
+        )
+    with pytest.raises(ValueError, match="latest_reminder"):
+        native.render_text(
+            [
+                resin.recipe.Message(
+                    resin.recipe.Role.LATEST_REMINDER, [resin.recipe.Text("Remember")]
+                )
+            ]
         )
 
 

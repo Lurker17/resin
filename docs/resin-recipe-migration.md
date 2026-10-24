@@ -44,6 +44,21 @@ Python recipe may construct `RenderedPrompt` and supply its own parser.
 HTTP request dictionaries are converted at the serving boundary; they are not
 accepted as native recipe inputs.
 
+Parsers return immutable native `ParserEvent` objects. Use the concrete variants
+to read text, reasoning and tool-call payloads:
+
+```python
+for event in parser.feed(generated_token_ids):
+    if isinstance(event, resin.recipe.TextDelta):
+        print(event.delta, end="", flush=True)
+```
+
+`ReasoningDelta` also carries `delta`; `ToolCallStart` carries `index`, `id` and
+`name`; `ToolCallArgumentsDelta` carries `index` and `delta`. All variants expose
+`type` and immutable `token_spans` for source-token attribution. Custom Python
+parsers construct the same native variants. Native parsers feed the Rust HTTP
+actor directly, without converting events through Python or JSON.
+
 ## Contracts
 
 - A `Prompt` records ordinary text separately from explicit control tokens.

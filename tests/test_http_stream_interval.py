@@ -47,11 +47,9 @@ class Codec:
                         text = pieces[token]
                         length = len(text.encode())
                         output.append(
-                            {
-                                "type": "text_delta",
-                                "delta": text,
-                                "token_spans": [(position, 0, length, 0, length)],
-                            }
+                            resin.recipe.TextDelta(
+                                text, token_spans=[(position, 0, length, 0, length)]
+                            )
                         )
                 return output
 

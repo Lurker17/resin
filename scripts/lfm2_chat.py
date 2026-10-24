@@ -47,8 +47,8 @@ def main() -> None:
                     else:
                         raise RuntimeError(f"unexpected completion reason: {reason!r}")
                 for event in events:
-                    if event["type"] == "text_delta":
-                        print(event["delta"], end="", flush=True)
+                    if isinstance(event, resin.recipe.TextDelta):
+                        print(event.delta, end="", flush=True)
         request.take_result()
     print()
 

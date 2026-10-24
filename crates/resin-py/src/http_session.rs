@@ -5,6 +5,7 @@ use crate::http_stop::StopFilter;
 use crate::recipe::{
     self, NativeInklingParser, NativeRecipe, NativeResponseParser, RenderedPrompt, SharedParser,
 };
+use crate::recipe_events;
 use crate::recipe_types::{Message, RenderOptions, Tool};
 use crate::{CompletionReason, Engine, RequestLease, SamplingParams, TokenEvent};
 use pyo3::{
@@ -12,7 +13,7 @@ use pyo3::{
     prelude::*,
     types::PyDict,
 };
-use pythonize::{depythonize, pythonize};
+use pythonize::pythonize;
 use resin_http::{
     ConversationRequest, EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob,
     GenerationEvent, GenerationJob,
@@ -71,7 +72,7 @@ impl Parser {
         match self {
             Self::Native(parser) => recipe::feed(parser, ids),
             Self::Python { object, .. } => Python::attach(|py| {
-                depythonize(&object.bind(py).call_method1("feed", (ids,))?).map_err(Into::into)
+                recipe_events::from_python(&object.bind(py).call_method1("feed", (ids,))?)
             }),
         }
     }
@@ -87,7 +88,7 @@ impl Parser {
                     ParserFinishReason::Stop => "stop",
                     ParserFinishReason::Length => "length",
                 };
-                depythonize(&method.bind(py).call1((reason,))?).map_err(Into::into)
+                recipe_events::from_python(&method.bind(py).call1((reason,))?)
             }),
         }
     }
