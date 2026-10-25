@@ -333,6 +333,81 @@ def test_evaluation_reasoning_effort_is_independent_of_protocol_checks(
             assert body["reasoning_effort"] == "high"
 
 
+@pytest.mark.parametrize("concurrency,failed_index", [(None, None), (3, 7), (1, None)])
+def test_evaluation_bounds_concurrency_preserves_order_and_keeps_failures(
+    tmp_path, concurrency, failed_index
+):
+    source = tmp_path / "questions.jsonl"
+    source.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "question": f"Question {index}",
+                    "choices": ["first", "second", "third", "fourth"],
+                    "answer": index % 4,
+                }
+            )
+            + "\n"
+            for index in range(101)
+        )
+    )
+    extra = [] if concurrency is None else ["--eval-concurrency", str(concurrency)]
+    args = options(tmp_path, "--context-lengths", "--eval-file", str(source), *extra)
+    expected_concurrency = 32 if concurrency is None else concurrency
+
+    class EvaluationServer(Server):
+        def __init__(self):
+            super().__init__()
+            self.eval_active = self.eval_peak = 0
+            self.completed = []
+            self.second_finished = asyncio.Event()
+
+        async def __call__(self, request):
+            if request.url.path != "/v1/chat/completions":
+                return await super().__call__(request)
+            body = json.loads(request.content)
+            prompt = body["messages"][0]["content"]
+            if not prompt.startswith("Question "):
+                return await super().__call__(request)
+            index = int(prompt.splitlines()[0].split()[1])
+            self.eval_active += 1
+            self.eval_peak = max(self.eval_peak, self.eval_active)
+            try:
+                if index == 0 and expected_concurrency > 1:
+                    await self.second_finished.wait()
+                else:
+                    await asyncio.sleep(0)
+                self.completed.append(index)
+                if index == 1:
+                    self.second_finished.set()
+                if index == failed_index:
+                    return httpx.Response(500, json={"error": "evaluation failure"})
+                return httpx.Response(
+                    200, json=payload(body, content="ABCD"[index % 4])
+                )
+            finally:
+                self.eval_active -= 1
+
+    server = EvaluationServer()
+    report = run(args, server)
+    evaluation = by_name(report)["evaluation"]
+    assert evaluation["questions"] == evaluation["requested_questions"] == 100
+    assert server.eval_peak == evaluation["concurrency"] == expected_concurrency
+    assert sorted(server.completed) == list(range(100))
+    if expected_concurrency > 1:
+        assert server.completed.index(1) < server.completed.index(0)
+    assert [result["case"] for result in evaluation["results"]] == [
+        f"eval-{index}" for index in range(100)
+    ]
+    assert evaluation["correct"] == (100 if failed_index is None else 99)
+    assert evaluation["missing_answers"] == (0 if failed_index is None else 1)
+    assert report["ok"] == (failed_index is None)
+    if failed_index is not None:
+        result = evaluation["results"][failed_index]
+        assert not result["ok"] and result["status"] == 500
+        assert result["answer"] == "ABCD"[failed_index % 4]
+
+
 @pytest.mark.parametrize(
     "content,reasoning,finish,predicted,missing,truncated,correct",
     [
@@ -469,6 +544,9 @@ def test_invalid_cache_token_counts_fail(value):
         ("--max-ttft-ms", "inf"),
         ("--repeats", "0"),
         ("--min-accuracy", "nan"),
+        ("--eval-limit", "0"),
+        ("--eval-concurrency", "0"),
+        ("--eval-concurrency", "-1"),
     ],
 )
 def test_invalid_cli_limits_fail(tmp_path, flag, value):

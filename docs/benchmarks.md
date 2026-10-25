@@ -303,7 +303,8 @@ is bundled or downloaded:
 
 ```bash
 uv run scripts/check_server.py https://YOUR-ENDPOINT \
-  --eval-file eval/abstract_algebra_test.csv --eval-limit 20 --eval-max-tokens 256 \
+  --eval-file eval/mmlu100.jsonl --eval-limit 100 --eval-concurrency 32 \
+  --eval-max-tokens 256 \
   --min-accuracy 0.5 --output artifacts/server-eval.json
 ```
 
@@ -311,7 +312,12 @@ JSONL is also supported: each line contains
 `{"question": "...", "choices": ["...", "..."], "answer": "A"}`; answers may
 be zero-based indices. The checker records answers and accuracy, fails missing/unparseable answers,
 and applies the selected minimum. A small subset is a regression check, not a
-full MMLU score. JSON reports separate passed, failed, and skipped checks.
+full MMLU score. By default the checker evaluates up to 100 questions with at most
+32 requests in flight; both settings are configurable with `--eval-limit` and
+`--eval-concurrency`. Supply at least 100 questions for a 100-question check,
+preferably a fixed sample across subjects. Reports retain input question order,
+the actual question count, configured concurrency, and per-request errors even
+when responses finish out of order. JSON reports separate passed, failed, and skipped checks.
 
 ## Recorded V4.1 measurements
 

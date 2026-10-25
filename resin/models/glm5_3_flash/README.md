@@ -91,8 +91,9 @@ RESIN_MODEL=glm-5.3-flash uv run modal deploy deploy/modal_serve.py
 uv run scripts/check_server.py "$ENDPOINT" --model nvidia/GLM-5.3-Flash-NVFP4 \
   --output artifacts/glm53/server-check.json --image --stress --dp-size 4 \
   --prefix-cache-repeats 2112 \
-  --reasoning-effort low high max --eval-file /path/to/mmlu20.jsonl \
-  --eval-limit 20 --eval-max-tokens 2048 --eval-reasoning-effort low \
+  --reasoning-effort low high max --eval-file /path/to/mmlu100.jsonl \
+  --eval-limit 100 --eval-concurrency 32 \
+  --eval-max-tokens 2048 --eval-reasoning-effort low \
   --min-accuracy 0.9
 ```
 

@@ -575,7 +575,7 @@ async def check_server(client, args, *, on_update=None):
             )
         else:
             rows = load_evaluation(args.eval_file, args.eval_limit)
-            results = []
+            cases = []
             for index, row in enumerate(rows):
                 labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[: len(row["choices"])]
                 prompt = (
@@ -587,8 +587,7 @@ async def check_server(client, args, *, on_update=None):
                     )
                     + "\nRespond with only the letter of the correct answer."
                 )
-                result = await run_case(
-                    client,
+                cases.append(
                     Case(
                         name=f"eval-{index}",
                         body={
@@ -599,9 +598,14 @@ async def check_server(client, args, *, on_update=None):
                                 else {}
                             ),
                         },
-                    ),
-                    args.timeout,
+                    )
                 )
+            evaluation = await run_stage(
+                client, "evaluation", cases, args.eval_concurrency, args.timeout
+            )
+            results = []
+            for row, result in zip(rows, evaluation["results"], strict=True):
+                labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[: len(row["choices"])]
                 predicted = (
                     extract_answer(result.get("content", ""), labels)
                     if result["ok"]
@@ -627,6 +631,9 @@ async def check_server(client, args, *, on_update=None):
                 if not missing and not truncated and accuracy >= args.min_accuracy
                 else "failed",
                 source=str(args.eval_file),
+                concurrency=args.eval_concurrency,
+                elapsed_s=evaluation["elapsed_s"],
+                requested_questions=args.eval_limit,
                 reasoning_effort=args.eval_reasoning_effort,
                 max_tokens=args.eval_max_tokens,
                 questions=len(results),
@@ -764,7 +771,18 @@ def parse_args(argv=None):
         type=Path,
         help="Local MMLU CSV (question,A,B,C,D,answer; no header) or JSONL {question,choices,answer}",
     )
-    parser.add_argument("--eval-limit", type=int, default=20)
+    parser.add_argument(
+        "--eval-limit",
+        type=int,
+        default=100,
+        help="Maximum evaluation questions (default: 100)",
+    )
+    parser.add_argument(
+        "--eval-concurrency",
+        type=int,
+        default=32,
+        help="Maximum in-flight evaluation requests (default: 32)",
+    )
     parser.add_argument("--eval-max-tokens", type=int, default=256)
     parser.add_argument(
         "--eval-reasoning-effort",
@@ -787,6 +805,7 @@ def parse_args(argv=None):
         args.max_ttft_ms,
         args.ttft_ratio,
         args.eval_limit,
+        args.eval_concurrency,
         args.eval_max_tokens,
         args.stress_requests,
         args.dp_size,
@@ -830,7 +849,9 @@ async def main(args):
             timeout=args.timeout,
             follow_redirects=True,
             limits=httpx.Limits(
-                max_connections=max(args.concurrency, *args.stress_concurrency)
+                max_connections=max(
+                    args.concurrency, args.eval_concurrency, *args.stress_concurrency
+                )
             ),
         ) as client:
             report = await check_server(client, args, on_update=save)

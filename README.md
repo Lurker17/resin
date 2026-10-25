@@ -116,7 +116,8 @@ acceptance and model routing are the defaults. `--accepted-drafts K` and
 For an already running endpoint, `scripts/check_server.py URL --output REPORT`
 checks serving correctness, prefix-cache reuse, context-size TTFT, and optional
 image/reasoning/stress cases. It can also evaluate a small local MMLU CSV or
-JSONL subset with `--eval-file`; see
+JSONL subset with `--eval-file` (defaults: `--eval-limit 100`,
+`--eval-concurrency 32`); see
 [server checks](docs/benchmarks.md#http-correctness-and-latency-checks).
 
 ## Minimal use

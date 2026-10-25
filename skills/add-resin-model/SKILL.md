@@ -136,14 +136,14 @@ cached-versus-fresh continuation parity, not just a positive cache-hit counter.
 Select media/reasoning options that the model actually supports and record skips.
 Validate context boundaries with tokenization evidence where available.
 
-For example, after setting `SERVER_URL` to the test server and `MMLU_CSV` to a
-locally available canonical MMLU subject CSV:
+For example, after setting `SERVER_URL` to the test server and `MMLU_JSONL` to a
+locally available fixed MMLU sample with at least 100 questions across subjects:
 
 ```bash
 uv run scripts/check_server.py "$SERVER_URL" \
   --output artifacts/model-check.json --stress \
   --context-lengths 128 512 2048 8192 \
-  --eval-file "$MMLU_CSV" --eval-limit 20 --min-accuracy 0.5
+  --eval-file "$MMLU_JSONL" --eval-limit 100 --eval-concurrency 32 --min-accuracy 0.5
 ```
 
 Choose longer contexts, supported `--image` and `--reasoning-effort` checks, and an
