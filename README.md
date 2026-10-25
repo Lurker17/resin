@@ -15,11 +15,11 @@ token IDs ──► Rust Engine ──► frozen BatchPlan ──► Python Runn
 
 Resin also has optional HTTP serving and Prometheus metrics.
 
-This makes it possible to autonomously "vibe code" even the most complex models.
-In half a day of agentic coding, we used Resin to build standalone engines
+With the right kernels, this makes it possible to autonomously "vibe code" even
+the most complex models. In 12 hours, we used Resin to build standalone engines
 for [DeepSeek-V4.1-Flash](models/cuda/resin_models_cuda/deepseek_v41/) and
 [GLM-5.3-Flash](models/cuda/resin_models_cuda/glm5_3_flash/) on Blackwell GPUs
-that rival vLLM and SGLang, running the latest megakernels.
+that rival vLLM and SGLang.
 
 <center>
 <table>
