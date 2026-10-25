@@ -337,7 +337,7 @@ class TestCudaGraph:
         sampler = object()
         monkeypatch.setattr(runner_runtime.torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(runner_runtime.torch.cuda, "current_device", lambda: 3)
-        monkeypatch.setattr(runner_runtime, "FlashInferSampler", lambda: sampler)
+        monkeypatch.setattr(runner_runtime, "FusedSampler", lambda: sampler)
 
         runner = _ConcreteCudaRunner(device="cuda", label="test", kv_cache_dtype="fp8")
 

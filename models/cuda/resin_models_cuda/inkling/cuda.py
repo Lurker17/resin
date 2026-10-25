@@ -23,6 +23,7 @@ from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
     graph_sample,
+    graph_sample_block,
     pad_sampling_inputs,
     validate_hybrid_plan,
 )
@@ -293,15 +294,7 @@ class InklingCudaRunner(CudaRunner):
                 )
                 if phase_timing is not None:
                     phase_timing.mark(2)
-                targets = torch.stack(
-                    [
-                        graph_sample(
-                            self._sampler, logits[:, step].contiguous(), sampling, step
-                        )
-                        for step in range(self.speculative_tokens + 1)
-                    ],
-                    dim=1,
-                )
+                targets = graph_sample_block(self._sampler, logits, sampling)
                 matches = drafts == targets[:, : self.speculative_tokens]
                 accepted = torch.cumprod(matches.to(torch.int32), dim=1).sum(1)
                 processed = accepted.to(torch.long) + 1
@@ -552,13 +545,7 @@ class InklingCudaRunner(CudaRunner):
         )
         if phase_timing is not None:
             phase_timing.mark(2)
-        targets = torch.stack(
-            [
-                self._sample(logits[:, step].contiguous(), plan, step)
-                for step in range(self.speculative_tokens + 1)
-            ],
-            dim=1,
-        )
+        targets = self._sampler(logits, plan)
         acceptance = self._speculation.accept(drafts.tolist(), targets.tolist())
         processed = torch.tensor(
             [count + 1 for count in acceptance.accepted_counts],

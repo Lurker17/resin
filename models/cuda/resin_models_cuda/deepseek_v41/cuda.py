@@ -39,7 +39,7 @@ from resin.backend.cuda.parallel import (
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
-    graph_sample,
+    graph_sample_block,
     pad_sampling_inputs,
 )
 from resin.backend.cuda.sampling import (
@@ -780,11 +780,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
             )
             self._dspark_phase_events[shape] = phase_events
 
-        def sample(logits: torch.Tensor, step: int) -> torch.Tensor:
-            return self._broadcast_tokens(
-                graph_sample(self._sampler, logits, sampling, step)
-            )
-
         def launch() -> None:
             with use_default_dtype(torch.bfloat16), torch.device(self.device):
                 if phase_timing is not None:
@@ -828,10 +823,10 @@ class DeepSeekV41CudaRunner(CudaRunner):
                     verify_hidden, positions, cache=cache
                 )
                 output_ids[:, :block_size].copy_(drafts)
-                for index in range(block_size + 1):
-                    output_ids[:, block_size + index].copy_(
-                        sample(verify_logits[:, index].contiguous(), index)
-                    )
+                targets = self._broadcast_tokens(
+                    graph_sample_block(self._sampler, verify_logits, sampling)
+                )
+                output_ids[:, block_size:].copy_(targets)
                 if phase_timing is not None:
                     phase_timing.mark(3)
                 if phase_events is not None:
@@ -1183,13 +1178,10 @@ class DeepSeekV41CudaRunner(CudaRunner):
             phase_timing.mark(2)
         self._model.commit_dspark_main_block(verify_hidden, positions, cache=cache)
 
-        target_columns = [
-            self._sample_target(verify_logits[:, index].contiguous(), plan, index)
-            for index in range(self.speculative_tokens + 1)
-        ]
+        targets = self._broadcast_tokens(self._sampler(verify_logits, plan))
         accepted = self._accept_speculative(
             drafts.tolist(),
-            torch.stack(target_columns, dim=1).tolist(),
+            targets.tolist(),
             positions,
             cache,
         )

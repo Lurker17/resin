@@ -56,6 +56,10 @@ module-name = "resin._resin"
 python-source = "."
 python-packages = ["resin"]
 features = ["pyo3/extension-module"]
+include = [
+  { path = "resin/backend/cuda/sampling_air.cu", format = ["sdist", "wheel"] },
+  { path = "resin/backend/cuda/sampling_topk.cu", format = ["sdist", "wheel"] },
+]
 
 [tool.ruff]
 target-version = "py311"

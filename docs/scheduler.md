@@ -155,7 +155,7 @@ and effective seed per row; the runner derives random offsets from absolute
 sequence progress so requests can share a batch without
 sharing a random stream. The optional
 `extra` value is an opaque Python object for custom runner code; Resin preserves
-it but does not inspect it. Shared Torch and FlashInfer backend samplers consume
+it but does not inspect it. Shared Torch and fused CUDA backend samplers consume
 the standard fields.
 
 ## Step and completion

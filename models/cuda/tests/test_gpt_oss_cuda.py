@@ -21,7 +21,7 @@ from resin import (
 from resin.backend.cuda.graphs import default_decode_graph_shapes
 from resin.backend.cuda.paged_kv import paged_attention_host_inputs
 from resin.backend.cuda.runner import CudaRunner
-from resin.backend.cuda.sampling import FlashInferSampler
+from resin.backend.cuda.sampling import FusedSampler
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import TorchSampler
 from resin.models.gpt_oss.plan import (
@@ -326,7 +326,7 @@ class TestGptOssCudaNativePlan:
         runner = object.__new__(GptOssCudaRunner)
         runner.parallel_groups = None
         runner.vocab_size = 16
-        setattr(runner, "_sampler", FlashInferSampler)
+        setattr(runner, "_sampler", FusedSampler)
         setattr(runner, "_cuda_graph_mode_enabled", lambda _: True)
         shapes = default_decode_graph_shapes(4, speculative=False, max_batch_size=128)
         runner._graph_logits = {shape: torch.empty(shape[0], 16) for shape in shapes}
@@ -354,7 +354,7 @@ class TestGptOssCudaNativePlan:
         )
         for name, values in expected.items():
             np.testing.assert_array_equal(inputs[name][: len(values)], values)
-        for name, values in FlashInferSampler.host_inputs(plan, 16).items():
+        for name, values in FusedSampler.host_inputs(plan, 16).items():
             assert inputs[name][:rows] == values
         for name in ("token_ids", "positions"):
             np.testing.assert_array_equal(inputs[name][:rows], getattr(plan, name))

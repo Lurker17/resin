@@ -5,7 +5,7 @@ from dataclasses import fields, replace
 import pytest
 import torch
 
-from resin.backend.cuda.sampling import FlashInferSampler, SamplingTensors
+from resin.backend.cuda.sampling import FusedSampler, SamplingTensors
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA GPU"
@@ -14,9 +14,8 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def sampler():
-    pytest.importorskip("flashinfer")
     pytest.importorskip("triton")
-    return FlashInferSampler()
+    return FusedSampler()
 
 
 def _inputs(logits):
@@ -137,11 +136,11 @@ def test_graph_catalogue_replays_and_mutable_request_state(sampler):
 def _conditional_distribution(logits, temperature, top_k, top_p):
     """Independent FP64 oracle; probability-threshold cutoffs retain ties."""
     values = torch.tensor(logits, dtype=torch.float64) / temperature
-    values[values < values.topk(top_k).values[-1]] = -torch.inf
     probabilities = values.softmax(0)
     descending = probabilities.sort(descending=True).values
     crossing = min(int((descending.cumsum(0) < top_p).sum()), len(descending) - 1)
     probabilities[probabilities < descending[crossing]] = 0
+    probabilities[values < values.topk(top_k).values[-1]] = 0
     return probabilities / probabilities.sum()
 
 

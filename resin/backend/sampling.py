@@ -392,16 +392,20 @@ class TorchSampler:
                 continue
             scores = logits[row].float() / temperature
             top_k = values["top_ks"][row]
-            if top_k < scores.numel():
+            top_p = values["top_ps"][row]
+            if top_k < scores.numel() and top_p == 1.0:
                 scores, token_ids = torch.topk(scores, top_k, sorted=True)
             else:
                 scores, token_ids = torch.sort(scores, descending=True)
             probabilities = torch.softmax(scores, dim=-1)
-            top_p = values["top_ps"][row]
             if top_p < 1.0:
+                # Select the nucleus from the full temperature distribution,
+                # then apply the top-k limit and normalize the retained mass.
                 cumulative = probabilities.cumsum(dim=-1)
                 keep = cumulative - probabilities < top_p
                 probabilities = probabilities * keep
+                probabilities = probabilities[:top_k]
+                token_ids = token_ids[:top_k]
                 probabilities = probabilities / probabilities.sum()
             generator = torch.Generator(device=logits.device)
             generator.manual_seed(

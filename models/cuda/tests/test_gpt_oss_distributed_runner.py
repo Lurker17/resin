@@ -12,7 +12,7 @@ from resin import BatchPhase, BatchPlan, ForwardOutput, Parallelism, SamplingPar
 from resin.backend.cuda.graphs import CudaGraphMode
 from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.cuda.runner import CudaRunner
-from resin.backend.cuda.sampling import FlashInferSampler
+from resin.backend.cuda.sampling import FusedSampler
 from resin.backend.distributed import StepContext
 from resin.backend.paged_attention import PagedAttentionBatch, PagedAttentionGroup
 from resin.backend.sampling import token_output
@@ -577,7 +577,7 @@ def test_decode_graph_retains_logits_and_stages_active_row_count(monkeypatch):
     groups = _groups(Parallelism(world_size=2, ep=2, attn_dp=2))
     runner = _runner(monkeypatch, groups)
     runner.vocab_size = 3
-    runner._sampler = FlashInferSampler
+    runner._sampler = FusedSampler
     runner._cuda_graph_mode_enabled = lambda mode: True
     shape = (4, 2)
     logits = torch.tensor([[1.0, 3.0, 0.0], [2.0, 1.0, 4.0], [0.0] * 3, [0.0] * 3])

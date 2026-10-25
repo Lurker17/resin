@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from resin import BatchPhase, BatchPlan, ForwardOutput
-from resin.backend.cuda.sampling import FlashInferSampler
+from resin.backend.cuda.sampling import FusedSampler
 from resin.backend.speculative import SpeculativeStats
 from resin_models_cuda.gemma4 import cuda as gemma_runtime
 from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
@@ -44,7 +44,7 @@ def test_graph_output_preserves_acceptance_layout_and_owns_tokens(
     runner.device = torch.device("cpu")
     runner.speculative_tokens = draft_tokens
     runner._speculation = SpeculativeStats(draft_tokens)
-    runner._sampler = FlashInferSampler
+    runner._sampler = FusedSampler
     runner.vocab_size = 10
     runner.config = SimpleNamespace(vocab_size=10, hidden_size=2)
     shape = (3, 128)

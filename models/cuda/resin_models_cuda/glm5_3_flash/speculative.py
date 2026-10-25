@@ -253,8 +253,8 @@ def speculative_step(
 ):
     """One greedy draft chain, one target block, and one native-MTP repair block.
 
-    ``sample(logits, offset)`` applies the runner's target sampling policy with
-    deterministic per-position RNG offsets. Greedy proposals are accepted only
+    ``sample(logits)`` samples the complete [rows, width, vocab] verification
+    block with deterministic per-position RNG offsets. Greedy proposals are accepted only
     when they equal those target samples, preserving the target distribution.
     ``capacity(width)`` optionally enters the runner's EP dispatch graph context.
     ``fixed_acceptance`` is an optional scalar tensor: -1 selects natural
@@ -313,9 +313,7 @@ def speculative_step(
     )
     if phase_timing is not None:
         phase_timing.mark(2)
-    targets = torch.stack(
-        [sample(logits[:, i].contiguous(), i) for i in range(width)], dim=1
-    )
+    targets = sample(logits)
     accepted = (drafts == targets[:, :-1]).int().cumprod(1).sum(1)
     if fixed_acceptance is not None:
         accepted = torch.where(fixed_acceptance >= 0, fixed_acceptance, accepted)

@@ -10,7 +10,26 @@ from test_qwen3_5_media import _media
 from resin import BatchPhase, BatchPlan
 from resin.backend.cuda.runner import CudaRunner
 from resin_models_cuda.qwen3_5.checkpoint import DEFAULT_MODEL
-from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
+from resin_models_cuda.qwen3_5.cuda import (
+    Qwen3_5CudaRunner,
+    _accepted_verification_state,
+)
+
+
+@pytest.mark.parametrize("state_shape", [(2, 3, 4), (2, 3, 4, 5)])
+def test_batched_verification_commits_each_rows_accepted_state(state_shape):
+    accepted = torch.tensor([0, 1, 3])
+    states = [
+        torch.arange(3 * int(np.prod(state_shape))).reshape(3, *state_shape)
+        + 1000 * step
+        for step in range(4)
+    ]
+    snapshots = [state.clone() for state in states]
+    selected = _accepted_verification_state(states, accepted)
+    expected = torch.stack((states[0][0], states[1][1], states[3][2]))
+    torch.testing.assert_close(selected, expected)
+    for state, snapshot in zip(states, snapshots, strict=True):
+        torch.testing.assert_close(state, snapshot)
 
 
 def test_graph_rope_deltas_stay_on_host_and_match_eager_positions() -> None:

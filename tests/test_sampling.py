@@ -6,7 +6,7 @@ from output_helpers import forward_output
 
 import resin
 from resin import BatchPlan, Engine, SamplingParams
-from resin.backend.cuda.sampling import FlashInferSampler, SamplingTensors
+from resin.backend.cuda.sampling import FusedSampler
 from resin.backend.sampling import TorchSampler, batch_sampling_inputs
 from resin.backend.speculative import SpeculativeStats, accept_speculative_tokens
 
@@ -214,41 +214,46 @@ class TestSharedSampler:
 
         assert sampler(logits, plan).tolist() == [1, 1, 1]
 
-    def test_flashinfer_sampler_receives_per_row_filter_and_rng_tensors(
+    @pytest.mark.parametrize(
+        ("top_p", "top_k", "expected"),
+        [
+            (0.7, 2, [0.60 / 0.85, 0.25 / 0.85]),
+            (0.7, 1, [1.0]),
+            (0.5, 2, [1.0, 0.0]),
+            (1.0, 2, [0.60 / 0.85, 0.25 / 0.85]),
+        ],
+    )
+    def test_torch_sampler_applies_top_p_before_top_k(
+        self, monkeypatch: pytest.MonkeyPatch, top_p, top_k, expected
+    ) -> None:
+        # At p=.7 the original .60/.25/.15 distribution needs two tokens.
+        # Renormalizing its top two first would incorrectly keep only .60.
+        logits = torch.tensor([[0.60, 0.25, 0.15]]).log()
+        plan = self._plan(
+            [SamplingParams(temperature=1.0, top_p=top_p, top_k=top_k, seed=7)]
+        )
+        observed = []
+
+        def sample(probabilities, count, *, generator):
+            observed.append(probabilities.clone())
+            return probabilities.argmax().reshape(count)
+
+        monkeypatch.setattr(torch, "multinomial", sample)
+        assert TorchSampler()(logits, plan).tolist() == [0]
+        assert len(observed) == 1
+        torch.testing.assert_close(observed[0], torch.tensor(expected))
+
+    def test_fused_sampler_receives_per_row_filter_and_rng_tensors(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        calls = {}
-        sampler = FlashInferSampler.__new__(FlashInferSampler)
+        received = []
+        sampler = FusedSampler.__new__(FusedSampler)
 
-        def mask_logits(logits, top_k):
-            calls["top_k"] = top_k.clone()
-            threshold = logits.sort(descending=True).values.gather(
-                1, top_k.long()[:, None] - 1
-            )
-            return logits.masked_fill(logits < threshold, -torch.inf)
+        def sample_tensors(logits, tensors, *, out=None):
+            received.append(tensors)
+            return logits.argmax(-1)
 
-        def softmax(logits, *, temperature):
-            calls["temperatures"] = temperature.clone()
-            return torch.softmax(logits / temperature[:, None], dim=-1)
-
-        def renorm(probabilities, top_p, *, is_deterministic):
-            calls["probabilities"] = probabilities.clone()
-            calls["top_p"] = top_p.clone()
-            assert is_deterministic is True
-            return probabilities
-
-        def sample(probabilities, seeds, offsets):
-            calls["seed"] = seeds.clone()
-            calls["offset"] = offsets.clone()
-            return (
-                torch.tensor([2, 0], dtype=torch.int32),
-                torch.tensor([True, True]),
-            )
-
-        monkeypatch.setattr(sampler, "_mask_logits", mask_logits, raising=False)
-        monkeypatch.setattr(sampler, "_softmax", softmax, raising=False)
-        monkeypatch.setattr(sampler, "_renorm", renorm, raising=False)
-        monkeypatch.setattr(sampler, "_sample", sample, raising=False)
+        monkeypatch.setattr(sampler, "sample_tensors", sample_tensors)
         plan = BatchPlan(
             sequence_ids=[10, 11],
             context_lengths=[1, 2],
@@ -260,60 +265,41 @@ class TestSharedSampler:
             ],
         )
         logits = torch.tensor([[0.0, 1.0, 2.0], [0.0, 3.0, 1.0]])
-
-        assert sampler(logits, plan).tolist()[0] in {1, 2}
-        assert sampler(logits, plan).tolist()[1] == 1
-        torch.testing.assert_close(calls["temperatures"], torch.tensor([0.5, 1.0]))
-        assert calls["top_k"].tolist() == [2, 3]
-        torch.testing.assert_close(
-            calls["probabilities"][0],
-            torch.cat((torch.zeros(1), torch.tensor([2.0, 4.0]).softmax(-1))),
-        )
-        torch.testing.assert_close(calls["top_p"], torch.tensor([0.8, 1.0]))
-        assert calls["seed"].tolist() == [31, 32]
-        assert calls["offset"].tolist() == [64, 96]
-
+        output = torch.empty(2, dtype=torch.int64)
+        assert sampler(logits, plan, out=output) is output
+        assert output.tolist() == [2, 1]
+        tensors = received[0]
+        torch.testing.assert_close(tensors.temperatures, torch.tensor([0.5, 1.0]))
+        assert tensors.top_ks.tolist() == [2, 3]
+        torch.testing.assert_close(tensors.top_ps, torch.tensor([0.8, 1.0]))
+        assert tensors.seeds.tolist() == [31, 32]
+        assert tensors.offsets.tolist() == [64, 96]
+        assert tensors.stochastic_mask.tolist() == [True, False]
         shifted = sampler.host_inputs(plan, 3, offset_delta=64)
         assert shifted["sampling_offsets"] == (128, 160)
 
-    def test_flashinfer_sampler_rejects_invalid_or_out_of_range_samples(
+    def test_fused_sampler_prepares_one_policy_batch_for_verified_block(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        sampler = FlashInferSampler.__new__(FlashInferSampler)
-        monkeypatch.setattr(
-            sampler, "_mask_logits", lambda logits, top_k: logits, raising=False
-        )
-        monkeypatch.setattr(
-            sampler,
-            "_softmax",
-            lambda logits, *, temperature: torch.softmax(
-                logits / temperature[:, None], dim=-1
-            ),
-            raising=False,
-        )
-        monkeypatch.setattr(
-            sampler,
-            "_renorm",
-            lambda probabilities, top_p, **kwargs: probabilities,
-            raising=False,
-        )
-        monkeypatch.setattr(
-            sampler,
-            "_sample",
-            lambda *args, **kwargs: (
-                torch.tensor([-1, 99, 0], dtype=torch.int32),
-                torch.tensor([False, True, True]),
-            ),
-            raising=False,
-        )
-        tensors = SamplingTensors(
-            temperatures=torch.ones(3),
-            top_ps=torch.ones(3),
-            top_ks=torch.full((3,), 100, dtype=torch.int32),
-            seeds=torch.zeros(3, dtype=torch.int64),
-            offsets=torch.zeros(3, dtype=torch.int64),
-            stochastic_mask=torch.ones(3, dtype=torch.bool),
-        )
-        logits = torch.tensor([[0.0, 2.0, 1.0], [3.0, 0.0, 1.0], [0.0, 1.0, 2.0]])
+        sampler = FusedSampler.__new__(FusedSampler)
+        received = []
 
-        assert sampler.sample_tensors(logits, tensors).tolist() == [1, 0, 0]
+        def sample_block(logits, tensors):
+            received.append((logits, tensors))
+            return logits.argmax(-1)
+
+        monkeypatch.setattr(sampler, "sample_block", sample_block)
+        plan = BatchPlan(
+            sequence_ids=[10, 11],
+            context_lengths=[1, 2],
+            token_ids=[1, 2],
+            token_indptr=[0, 1, 2],
+            sampling_params=[SamplingParams(seed=31), SamplingParams(seed=32)],
+        )
+        logits = torch.randn(2, 4, 14)[:, :, 1::2]
+        result = sampler(logits, plan, offset_delta=32)
+        torch.testing.assert_close(result, logits.argmax(-1))
+        assert len(received) == 1
+        assert received[0][0] is logits
+        assert received[0][1].offsets.tolist() == [96, 128]
+        assert received[0][1].seeds.tolist() == [31, 32]

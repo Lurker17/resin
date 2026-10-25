@@ -190,8 +190,8 @@ def _cpu_runner(monkeypatch, drafts, capacity):
     )
     monkeypatch.setattr(
         runner_module,
-        "graph_sample",
-        lambda sampler, logits, values, offset: logits.argmax(-1),
+        "graph_sample_block",
+        lambda sampler, logits, values: logits.argmax(-1),
     )
     config = SimpleNamespace(hc_mult=4, rms_norm_eps=1e-6, num_hidden_layers=0)
     generator = torch.Generator().manual_seed(921)

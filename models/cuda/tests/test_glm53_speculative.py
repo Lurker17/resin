@@ -130,19 +130,26 @@ class _ToyCache:
 def test_speculation_verifies_once_and_repairs_first_middle_all_acceptance():
     model, cache = _ToyModel(), _ToyCache()
     positions = torch.tensor([3, 6, 10])
+    sampling_calls = []
+
+    def sample(logits):
+        sampling_calls.append(logits.shape)
+        return logits.argmax(-1)
+
     output, logits = speculative_step(
         model,
         cache,
         torch.tensor([1, 8, 16]),
         positions,
         3,
-        lambda logits, offset: logits.argmax(-1),
+        sample,
         projection_rows=64,
     )
     tokens, counts, feedback = accepted_block(output, positions, 3)
     assert len(model.target_calls) == 1
     assert model.target_calls[0].tolist() == [1, 2, 3, 4, 8, 9, 10, 11, 16, 17, 18, 19]
     assert logits.shape == (3, 4, 32)
+    assert sampling_calls == [(3, 4, 32)]
     assert counts.tolist() == [1, 2, 4]
     assert [tokens[i, :n].tolist() for i, n in enumerate(counts)] == [
         [7],
@@ -175,7 +182,7 @@ def test_fixed_acceptance_is_runtime_data_and_commits_matching_state(depth):
         torch.tensor([1, 8, 16]),
         positions,
         3,
-        lambda logits, offset: logits.argmax(-1),
+        lambda logits: logits.argmax(-1),
         projection_rows=64,
         fixed_acceptance=torch.tensor(depth),
     )

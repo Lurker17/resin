@@ -27,6 +27,7 @@ from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
     graph_sample,
+    graph_sample_block,
     pad_sampling_inputs,
     validate_hybrid_plan,
 )
@@ -70,6 +71,15 @@ if TYPE_CHECKING:
 
 _CACHE_WORKSPACE_BYTES = 512 * 1024**2
 _GRAPH_WORKSPACE_BYTES = 128 * 1024**2
+
+
+def _accepted_verification_state(states, accepted):
+    """Select the state after the first token plus the accepted draft prefix."""
+    selected = states[0]
+    shape = (accepted.shape[0],) + (1,) * (selected.ndim - 1)
+    for step, state in enumerate(states[1:], start=1):
+        selected = torch.where((accepted >= step).reshape(shape), state, selected)
+    return selected
 
 
 class Qwen3_5CudaRunner(CudaRunner):
@@ -528,12 +538,9 @@ class Qwen3_5CudaRunner(CudaRunner):
                 phase_timing.mark(2)
             verify_ids = torch.cat((first[:, None], drafts), dim=1)
 
-            active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
-            selected_recurrent = recurrent
-            selected_convolution = convolution
-            selected_hidden = anchor_hidden[:, -1]
             verify_hidden = []
-            target_columns = []
+            recurrent_steps = []
+            convolution_steps = []
             work_recurrent = recurrent
             work_convolution = convolution
             for step in range(self.speculative_tokens + 1):
@@ -551,35 +558,31 @@ class Qwen3_5CudaRunner(CudaRunner):
                     ].expand(3, -1, -1),
                 )
                 current_hidden = hidden[:, -1]
-                selected_recurrent = torch.where(
-                    active[:, None, None, None, None],
-                    work_recurrent,
-                    selected_recurrent,
-                )
-                selected_convolution = torch.where(
-                    active[:, None, None, None],
-                    work_convolution,
-                    selected_convolution,
-                )
-                selected_hidden = torch.where(
-                    active[:, None], current_hidden, selected_hidden
-                )
+                # Forward work does not depend on acceptance. Retain each
+                # returned state, then select its accepted prefix after one
+                # batched draw of the complete verification block.
+                recurrent_steps.append(work_recurrent)
+                convolution_steps.append(work_convolution)
                 verify_hidden.append(current_hidden)
-                target = graph_sample(
-                    self._sampler,
-                    self._model.logits(current_hidden),
-                    sampling,
-                    step + 1,
-                )
-                target_columns.append(target)
-                if step < self.speculative_tokens:
-                    active = active & (drafts[:, step] == target)
-            if phase_timing is not None:
-                phase_timing.mark(3)
-            targets = torch.stack(target_columns, dim=1)
+            verify_hidden = torch.stack(verify_hidden, dim=1)
+            targets = graph_sample_block(
+                self._sampler,
+                self._model.logits(verify_hidden),
+                sampling,
+                start_step=1,
+            )
             matches = drafts == targets[:, : self.speculative_tokens]
             accepted = torch.cumprod(matches.to(torch.int64), dim=1).sum(1)
             processed = accepted + 1
+            selected_recurrent = _accepted_verification_state(recurrent_steps, accepted)
+            selected_convolution = _accepted_verification_state(
+                convolution_steps, accepted
+            )
+            selected_hidden = verify_hidden.gather(
+                1, accepted[:, None, None].expand(-1, 1, verify_hidden.shape[-1])
+            ).squeeze(1)
+            if phase_timing is not None:
+                phase_timing.mark(3)
 
             repair_ids = torch.cat((drafts, targets[:, -1:]), dim=1)
             correction = targets.gather(1, accepted[:, None])
@@ -593,7 +596,7 @@ class Qwen3_5CudaRunner(CudaRunner):
             self._mtp_forward(
                 cache,
                 repair_ids,
-                torch.stack(verify_hidden, dim=1),
+                verify_hidden,
                 repair_positions,
                 attention_runtime=attention,
                 max_sequence_length=graph_seq_len,
@@ -695,7 +698,7 @@ class Qwen3_5CudaRunner(CudaRunner):
 
     def _sample(self, logits: torch.Tensor, plan: BatchPlan, step: int = 0):
         return self._sampler(
-            logits.float(),
+            logits,
             plan,
             offset_delta=step * SAMPLING_OFFSET_STRIDE,
         )
@@ -1026,13 +1029,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         verify_logits = self._model.logits(verify_hidden)
         if phase_timing is not None:
             phase_timing.mark(3)
-        targets = torch.stack(
-            [
-                self._sample(verify_logits[:, step].contiguous(), plan, step + 1)
-                for step in range(self.speculative_tokens + 1)
-            ],
-            dim=1,
-        )
+        targets = self._sample(verify_logits, plan, 1)
         acceptance = self._speculation.accept(draft_ids.tolist(), targets.tolist())
 
         rows = []

@@ -35,10 +35,8 @@ from resin.backend.cuda.parallel import (
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
+    graph_sample_block,
     pad_sampling_inputs,
-)
-from resin.backend.cuda.sampling import (
-    SamplingTensors,
 )
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import (
@@ -1092,20 +1090,9 @@ class Gemma4CudaRunner(CudaRunner):
             if phase_timing is not None:
                 phase_timing.mark(2)
             output_ids[:, : self.speculative_tokens].copy_(drafts)
-            for index in range(width):
-                step_sampling = SamplingTensors(
-                    temperatures=sampling.temperatures,
-                    top_ps=sampling.top_ps,
-                    top_ks=sampling.top_ks,
-                    seeds=sampling.seeds,
-                    offsets=sampling.offsets + index * SAMPLING_OFFSET_STRIDE,
-                    stochastic_mask=sampling.stochastic_mask,
-                )
-                output_ids[:, self.speculative_tokens + index].copy_(
-                    self._sampler.sample_tensors(
-                        verify_logits[:, index].contiguous(), step_sampling
-                    )
-                )
+            output_ids[:, self.speculative_tokens :].copy_(
+                graph_sample_block(self._sampler, verify_logits, sampling)
+            )
 
             if phase_timing is not None:
                 phase_timing.mark(3)
@@ -1554,14 +1541,11 @@ class Gemma4CudaRunner(CudaRunner):
         )
         if phase_timing is not None:
             phase_timing.mark(2)
-        target_columns = [
-            self._sample_target(verify_logits[:, index].contiguous(), native, index)
-            for index in range(width)
-        ]
+        targets = self._sampler(verify_logits, native)
         accepted = self._accept_speculative(
             sequence_ids,
             drafts.tolist(),
-            torch.stack(target_columns, dim=1).tolist(),
+            targets.tolist(),
             verify_hidden_rows,
         )
         if phase_timing is not None:

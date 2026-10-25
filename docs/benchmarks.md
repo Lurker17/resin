@@ -673,7 +673,9 @@ retain their original scope and source provenance.
 On a CUDA environment with deployment dependencies, run:
 
 ```bash
-uv run pytest tests/test_sampling_cuda.py -q
+uv run pytest tests/test_sampling_cuda.py tests/test_sampling_fused_cuda.py \
+  tests/test_sampling_filters_cuda.py tests/test_sampling_blocks_cuda.py \
+  tests/test_sampling_guard_cuda.py -q
 ```
 
 These checks cover request-local random streams across batch permutations and
@@ -682,8 +684,108 @@ mutable graph inputs. The graph catalogue captures batches 1 through 128 in a
 shared pool, and the vocabulary smoke uses 201,088 classes. Environments without
 CUDA skip these tests; the CPU sampler contract tests remain in the normal suite.
 
-Filtering uses FlashInfer with deterministic nucleus normalization. A shared
-categorical kernel owns the random draw: the full request seed is its Philox key,
-while sampling offset and vocabulary index occupy separate counter words. This
-keeps the stream independent of physical batch position, including when a graph
-replays with new request state.
+`FusedSampler` is the shared CUDA runner default. Parallel radix selectors handle
+runtime top-k/top-p for large vocabularies, while a single-block selector handles
+small vocabularies. Inactive rows skip vocabulary filtering. Two tiled kernels
+then choose a vocabulary tile and token using one per-request Philox CDF draw.
+Top-p uses the full temperature-scaled distribution, followed by the top-k cap,
+retaining all cutoff ties. This changes the previous top-k-before-top-p behavior. There
+are no CUDA graph conditional nodes or host reads of sampling policy tensors.
+
+The full request seed is the Philox key, with counter words
+`(0, 0, offset_low32, offset_high32)`. All 32 bits of the first random word form
+the uniform draw; scalar targets and conditional fractions use FP64, while
+vocabulary weights and cumulative sums use FP32. The stream is independent of
+physical batch position. The engine owns offset advancement, including speculative
+columns. Each call owns its scratch, so captured columns and separate streams do
+not share mutable sampler buffers. Parameters and strides stay runtime inputs;
+changing temperature, k, p, seed, offset, or mask does not compile another variant.
+
+CDF sampling replaces the former vocabulary-wide Gumbel draws and intentionally
+changes seeded token choices. A request still produces the same choices when
+sampled alone, reordered, padded, or combined into a verification block. Top-p
+uses FP32 exponential weights. The native AIR selector reconstructs deterministic
+FP32 bucket masses; the small-vocabulary selector accumulates FP64 mass. Tests
+compare against independent sorting, FP64 distributions and Philox arithmetic,
+including FP16/BF16 logits, cutoff ties, nonfinite fallback, large finite logits, shifted
+pointers, changed-input graph replay and the two real vocabulary sizes.
+When the inclusive top-k set has less than `(top_p - 0.001)` of the full mass,
+top-p cannot remove any of those tokens. FP64 mass partials certify this shortcut;
+AIR skips its vocabulary work for that row. Rows near the boundary still run
+the complete selector.
+
+`FusedSampler.sample_block(logits, sampling, start_step=0)` handles verification
+logits shaped `[requests, positions, vocabulary]` in one sampler invocation.
+The plan-based `sampler(logits, plan)` entry point also accepts this block shape
+and prepares the request policies once.
+The first two dimensions flatten as a view, including padded vocabulary strides;
+non-viewable storage is rejected instead of silently copied. One small kernel
+expands all request metadata and sets each column's offset to
+`base + (start_step + column) * SAMPLING_OFFSET_STRIDE`. The filtering and draw
+kernels then process the complete block. `graph_sample_block` exposes this at the
+shared runner boundary. GLM, DeepSeek, Gemma, Inkling, and Qwen verification
+callers use the block path in eager execution and CUDA graphs. Draft calls that
+depend on previously sampled tokens still run sequentially. Qwen verification
+begins at `start_step=1`; the other verification blocks begin at zero. Qwen
+retains the states produced during verification and selects the accepted prefix
+after block sampling. DeepSeek broadcasts the complete sampled block once.
+
+### Sampler qualification (2026-10-25)
+
+The final CDF snapshot `f402251c` was tested on an NVIDIA B200 and an NVIDIA
+H100 80GB HBM3 (SM90). Each passed all 133 CUDA tests with zero skips, all
+64 paired benchmark cases, and five verification-block comparisons. The CPU
+sampler and runner suites passed 302 tests; one CUDA-dependent test was skipped
+locally. These are sampler microbenchmarks, not end-to-end model speedups.
+
+The matrix uses FP32 logits, vocabularies 154,880 and 201,088, batches 1/8/64/256,
+and eight policies covering greedy, unfiltered, top-k, top-p and mixed requests.
+Times are the median of five event-timed trials of 16 calls per CUDA graph,
+excluding compilation, model execution and host scheduling. The immutable
+baseline is commit `56176e5`. Every measured median improved against that
+baseline; 48 cases per GPU preserve the filtering policy. The other 16 include
+the requested top-p-before-top-k behavior change.
+
+Representative B8, vocabulary 154,880, microseconds per complete batch call:
+
+| GPU | Policy | Previous sampler | Fused CDF sampler |
+| --- | --- | ---: | ---: |
+| B200 | Temperature 1, no filters | 252.34 | 29.45 |
+| B200 | Top-k 40 | 194.22 | 67.68 |
+| B200 | Top-p 0.9 | 181.02 | 93.13 |
+| B200 | Top-k 40 + top-p 0.9† | 194.10 | 70.50 |
+| H100 | Temperature 1, no filters | 345.56 | 33.15 |
+| H100 | Top-k 40 | 512.37 | 68.12 |
+| H100 | Top-p 0.9 | 184.02 | 105.18 |
+| H100 | Top-k 40 + top-p 0.9† | 200.76 | 72.85 |
+
+† Joint filtering changed order, so this row compares old and new behavior rather
+than claiming a speedup for identical filtering semantics. Seeded token choices
+also change with the CDF draw; request-local batching invariance is tested.
+
+Four-position unfiltered verification, vocabulary 154,880, microseconds per
+complete block. B8 means eight requests and 32 sampled positions. The previous
+parallel Gumbel block uses the same current filters and metadata as CDF, so that
+comparison isolates the draw implementation:
+
+| GPU | Requests | Legacy columns | Current CDF columns | Parallel Gumbel block | CDF block |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| B200 | 1 | 623.82 | 100.74 | 25.11 | 24.27 |
+| B200 | 8 | 961.99 | 143.05 | 61.45 | 44.41 |
+| B200 | 64 | 2527.06 | 350.08 | 305.58 | 162.06 |
+| H100 | 1 | 557.06 | 107.51 | 27.79 | 26.79 |
+| H100 | 8 | 1286.54 | 167.37 | 69.30 | 49.45 |
+| H100 | 64 | 3316.52 | 413.11 | 347.08 | 179.61 |
+
+CDF won all five paired block comparisons on both GPUs. The B8 unfiltered block
+uses 12 CUDA kernels versus 53 for current separate columns and 81 for legacy
+columns. The model callers above now use the block API; full-model performance
+curves were not rerun for this sampler-only qualification.
+
+Independent checks cover policy support, FP64 CDF references, full-width Philox
+counters, cutoff ties, replay with changed parameters, and absence of new native
+or Triton variants after policy/stride changes. Exact oracle comparisons omit
+numerically ambiguous draws within a documented `2e-7` CDF boundary band;
+all sampled tokens still receive support checks. Each GPU's 28 saved traces,
+source hashes, compiler/resource logs and raw timing records are retained under
+[`artifacts/shared-sampler/f402251c/`](../artifacts/shared-sampler/f402251c/).

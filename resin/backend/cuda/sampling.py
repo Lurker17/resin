@@ -1,4 +1,4 @@
-"""Shared FlashInfer logits processing for CUDA model runners."""
+"""Shared graph-safe fused sampling for CUDA model runners."""
 
 from __future__ import annotations
 
@@ -19,28 +19,25 @@ class SamplingTensors:
     stochastic_mask: torch.Tensor
 
 
-class FlashInferSampler:
-    """Temperature, top-k, and top-p sampling over row-aligned batch plans.
+class FusedSampler:
+    """Temperature, top-k, and top-p sampling with request-local Philox streams.
 
-    Sampling uses per-row seed and offset tensors, so a request's random
-    stream is independent of batch composition. Greedy and unsampled rows still
-    enter the fixed-shape CUDA kernels when mixed with sampled rows, but their
-    random result is discarded and their native offset is not advanced.
+    Runtime device parameters may change between CUDA graph replays. Unfiltered
+    rows sample directly from logits. Top-p uses the full temperature-scaled
+    distribution, followed by top-k; filtered rows retain every token tied at
+    either cutoff. Greedy rows use the lowest argmax token ID.
     """
 
     def __init__(self) -> None:
-        from flashinfer.sampling import (
-            softmax,
-            top_k_mask_logits,
-            top_p_renorm_probs,
+        from resin.backend.cuda.filtered_sampling import (
+            prepare_filters,
+            validate_filtered_inputs,
         )
+        from resin.backend.cuda.logits_sampling import sample_logits
 
-        from resin.backend.cuda.categorical import sample_categorical
-
-        self._mask_logits = top_k_mask_logits
-        self._softmax = softmax
-        self._renorm = top_p_renorm_probs
-        self._sample = sample_categorical
+        self._sample_logits = sample_logits
+        self._prepare_filters = prepare_filters
+        self._validate_inputs = validate_filtered_inputs
 
     @staticmethod
     def host_inputs(
@@ -90,29 +87,93 @@ class FlashInferSampler:
         }
 
     def sample_tensors(self, logits, tensors: SamplingTensors, *, out=None):
-        greedy = logits.argmax(dim=-1)
-        # Mask before softmax to normalize the top-k conditional distribution.
-        # FlashInfer's probabilities-first renormalizer uses unordered FP32
-        # atomics across CTAs, even when the later sampler is deterministic.
-        masked_logits = self._mask_logits(logits, tensors.top_ks)
-        probabilities = self._softmax(masked_logits, temperature=tensors.temperatures)
-        probabilities = self._renorm(
-            probabilities,
+        self._validate_inputs(
+            logits,
+            tensors.temperatures,
+            tensors.top_ks,
             tensors.top_ps,
-            is_deterministic=True,
+            tensors.seeds,
+            tensors.offsets,
+            tensors.stochastic_mask,
+            out,
         )
-        # FlashInfer 0.6.15 reads only seed[0]/offset[0] when drawing samples.
-        # Own the draw so requests keep their random stream when batches change.
-        sampled, valid = self._sample(probabilities, tensors.seeds, tensors.offsets)
-        sampled = sampled.to(dtype=greedy.dtype)
-        in_range = (sampled >= 0) & (sampled < logits.shape[-1])
-        safe_sampled = sampled.clamp(0, logits.shape[-1] - 1)
-        sampled = torch.where(valid & in_range, safe_sampled, greedy)
-        result = torch.where(tensors.stochastic_mask, sampled, greedy)
-        if out is None:
-            return result
-        out.copy_(result)
-        return out
+        filters = self._prepare_filters(
+            logits,
+            tensors.temperatures,
+            tensors.top_ks,
+            tensors.top_ps,
+            tensors.stochastic_mask,
+        )
+        return self._sample_logits(
+            logits,
+            tensors.temperatures,
+            tensors.seeds,
+            tensors.offsets,
+            tensors.stochastic_mask,
+            filter_state=filters,
+            out=out,
+        )
+
+    def sample_block(
+        self, logits, tensors: SamplingTensors, *, out=None, start_step: int = 0
+    ):
+        """Sample all [request, verified position, vocabulary] logits together.
+
+        Each request keeps its seed and policy. Column i uses its original
+        offset plus (start_step + i) * SAMPLING_OFFSET_STRIDE. Metadata is
+        expanded in one device launch; no input or RNG state is mutated.
+        The first two logits dimensions must flatten as a view, including
+        padded or strided vocabulary storage. No vocabulary copy is made.
+        """
+        from resin.backend.cuda.logits_sampling import _check_no_overlap
+        from resin.backend.cuda.sampling_blocks import expand_sampling
+
+        if type(start_step) is not int or start_step < 0:
+            raise ValueError("sampling start_step must be a nonnegative integer")
+        if logits.ndim != 3 or logits.shape[1] < 1:
+            raise ValueError("block logits must have shape [rows, width>=1, vocab]")
+        rows, width, vocab = logits.shape
+        self._validate_inputs(
+            logits[:, 0, :],
+            tensors.temperatures,
+            tensors.top_ks,
+            tensors.top_ps,
+            tensors.seeds,
+            tensors.offsets,
+            tensors.stochastic_mask,
+        )
+        try:
+            flat_logits = logits.view(rows * width, vocab)
+        except RuntimeError as error:
+            raise ValueError("block logits must flatten without copying") from error
+        flat_out = None
+        if out is not None:
+            if (
+                out.shape != (rows, width)
+                or out.dtype != torch.int64
+                or out.device != logits.device
+                or not out.is_contiguous()
+            ):
+                raise ValueError(
+                    "block output must be contiguous CUDA int64 [rows, width]"
+                )
+            _check_no_overlap(
+                (
+                    ("logits", logits),
+                    ("temperatures", tensors.temperatures),
+                    ("top_ps", tensors.top_ps),
+                    ("top_ks", tensors.top_ks),
+                    ("seeds", tensors.seeds),
+                    ("offsets", tensors.offsets),
+                    ("stochastic_mask", tensors.stochastic_mask),
+                ),
+                (),
+                out,
+            )
+            flat_out = out.view(rows * width)
+        expanded = expand_sampling(tensors, width, start_step)
+        result = self.sample_tensors(flat_logits, expanded, out=flat_out)
+        return out if out is not None else result.view(rows, width)
 
     def __call__(self, logits, plan=None, *, out=None, offset_delta: int = 0):
         if plan is None:
@@ -121,8 +182,10 @@ class FlashInferSampler:
                 return result
             out.copy_(result)
             return out
-        if logits.ndim != 2:
-            raise ValueError("sampling logits must have shape [batch, vocab]")
+        if logits.ndim not in (2, 3) or (logits.ndim == 3 and logits.shape[1] < 1):
+            raise ValueError(
+                "sampling logits must have shape [batch, vocab] or [batch, width, vocab]"
+            )
         values = batch_sampling_inputs(plan, logits.shape[-1])
         if logits.shape[0] != len(values["temperatures"]):
             raise ValueError("sampling logits must contain one row per plan sequence")
@@ -161,7 +224,11 @@ class FlashInferSampler:
                     device=device,
                 ),
             )
-            result = self.sample_tensors(logits, tensors)
+            result = (
+                self.sample_block(logits, tensors)
+                if logits.ndim == 3
+                else self.sample_tensors(logits, tensors)
+            )
 
         if out is None:
             return result
@@ -169,4 +236,8 @@ class FlashInferSampler:
         return out
 
 
-__all__ = ["FlashInferSampler", "SAMPLING_OFFSET_STRIDE", "SamplingTensors"]
+__all__ = [
+    "FusedSampler",
+    "SAMPLING_OFFSET_STRIDE",
+    "SamplingTensors",
+]

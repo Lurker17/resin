@@ -28,7 +28,7 @@ from resin.backend.cuda.graphs import (
 from resin.backend.cuda.metrics import CudaMetrics, GraphPhaseTiming
 from resin.backend.cuda.sampling import (
     SAMPLING_OFFSET_STRIDE,
-    FlashInferSampler,
+    FusedSampler,
     SamplingTensors,
 )
 from resin.backend.cuda.tensor_graphs import (
@@ -102,7 +102,7 @@ class CudaRunner(Runner):
             lambda: torch.cuda.synchronize(self.device),
             label=f"{label} eager execution",
         )
-        self._sampler = FlashInferSampler()
+        self._sampler = FusedSampler()
         self._cache_binding: CachePoolBinding | None = None
         self._cuda_graph_executor: CudaGraphExecutor | None = None
         self._parallel_graph_model = None
@@ -684,16 +684,25 @@ def pad_sampling_inputs(sampler, plan, vocab_size: int, padding: int):
 
 def graph_sample(sampler, logits, sampling: SamplingTensors, step: int):
     return sampler.sample_tensors(
-        logits.float(),
+        logits,
         SamplingTensors(
             sampling.temperatures,
             sampling.top_ps,
             sampling.top_ks,
             sampling.seeds,
-            sampling.offsets + step * SAMPLING_OFFSET_STRIDE,
+            sampling.offsets
+            if step == 0
+            else sampling.offsets + step * SAMPLING_OFFSET_STRIDE,
             sampling.stochastic_mask,
         ),
     )
+
+
+def graph_sample_block(
+    sampler, logits, sampling: SamplingTensors, *, out=None, start_step: int = 0
+):
+    """Sample a complete verification block with request-local column offsets."""
+    return sampler.sample_block(logits, sampling, out=out, start_step=start_step)
 
 
 def validate_hybrid_plan(
@@ -727,6 +736,7 @@ __all__ = [
     "CudaRunner",
     "capture_sampling_inputs",
     "graph_sample",
+    "graph_sample_block",
     "pad_sampling_inputs",
     "resolve_kv_cache_dtype",
     "validate_hybrid_plan",

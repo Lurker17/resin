@@ -21,11 +21,10 @@ from resin.backend.cuda.metrics import observe_execution
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
-    graph_sample,
+    graph_sample_block,
     pad_sampling_inputs,
     validate_hybrid_plan,
 )
-from resin.backend.cuda.sampling import SAMPLING_OFFSET_STRIDE
 from resin.backend.cuda.slab import graph_scratch_parent_count
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.plans import PagedCachePlan
@@ -285,8 +284,8 @@ class Glm53FlashCudaRunner(CudaRunner):
                         speculative_step,
                     )
 
-                    def sample(logits, offset):
-                        return graph_sample(self._sampler, logits, sampling, offset)
+                    def sample(logits):
+                        return graph_sample_block(self._sampler, logits, sampling)
 
                     def capacity(width):
                         return self._parallel_graph_capacity(
@@ -458,9 +457,7 @@ class Glm53FlashCudaRunner(CudaRunner):
                 ids,
                 positions,
                 self.speculative_tokens,
-                lambda values, offset: self._sampler(
-                    values.float(), plan, offset_delta=offset * SAMPLING_OFFSET_STRIDE
-                ),
+                lambda values: self._sampler(values, plan),
                 fixed_acceptance=torch.tensor(
                     -1 if fixed is None else fixed, device=self.device
                 ),
