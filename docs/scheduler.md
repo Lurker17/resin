@@ -10,6 +10,7 @@ engine = Engine(
     runner,
     max_running_requests=32,
     context_length=32768,
+    enable_overlap=True,  # default
     scheduler_config=SchedulerConfig(
         max_batch_tokens=4096,
         prefill_chunk_size=8192,
@@ -160,11 +161,15 @@ the standard fields.
 
 ## Step and completion
 
-`step()` selects at most one batch, calls the runner synchronously, commits its
-result, and returns token events. It returns an empty list when the queue is
-empty or when a continuation-prefill step advances cache state without sampling.
+`step()` drives batch submission and completion and returns committed token
+events. The default overlap scheduler can enqueue a decode batch and return an
+empty list while it runs, then submit a safe continuation before harvesting the
+previous result. Without overlap, a step selects at most one batch, calls the
+runner synchronously, and commits its result before returning. An empty list
+also occurs when there is no work or a continuation-prefill step advances cache
+state without sampling; use `has_work()` to determine whether work remains.
 
-On successful completion Resin:
+On successful synchronous completion Resin:
 
 1. validates every raw output row against the phase and leased write capacity;
 2. applies stop and length limits and prepares progress updates and events;
@@ -176,6 +181,30 @@ On successful completion Resin:
 
 Stop token IDs and `SamplingParams.max_output_tokens` are terminal conditions.
 Cancellation completes a ready request without running another model step.
+
+## Overlap scheduling
+
+`Engine(enable_overlap=True)` is the default. Runners can implement the optional
+`enqueue(plan, *, feedback=None)` boundary and return an owned completion with
+`result()` and device `feedback`. The Engine submits the next decode continuation
+using that feedback before collecting and committing the previous result on the
+CPU, so device execution overlaps host completion work. Synchronous runners
+continue to work through `forward()`.
+
+Overlap requires a stable decode cohort, no generated-token logprobs, enough
+remaining output and context budget, and both steps' write spans inside the same
+owned blocks in every cache group. The Engine retains the requests and a single
+writer lease across continuations. New arrivals, cancellation, close, and cache
+page boundaries drain pending work before changing ownership. Other steps,
+including prefill, use the synchronous path. `enable_overlap=False` disables
+overlap for the Engine; `step(allow_overlap=False)` drains pending work or runs
+the next batch synchronously.
+
+Completions use the same output validation and logical commit rules as the
+synchronous path. A stop token can finish a request while its successor is
+already in flight: the result is published immediately, but its row, runner
+state, and cache lease remain live until that successor completes. Outputs from
+the successor for finished rows are discarded before resources are retired.
 
 ## Failure semantics
 
@@ -193,5 +222,5 @@ allowed while Resin can prove that physical execution did not begin.
 Scheduling does not choose CUDA graph buckets, kernel shapes, or sampling
 kernels. Those remain runner concerns. Cache admission and request progress are
 Engine concerns; sampling offsets are derived from absolute sequence progress.
-The native scheduler deliberately executes one synchronous step at a time.
-Resin does not yet plan the next batch ahead or overlap prefill and decode.
+Overlap submits safe decode continuations ahead of CPU completion; prefill and
+decode still execute as separate phases and do not overlap each other.

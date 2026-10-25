@@ -89,13 +89,25 @@ code owns the selection policy; the graph runner only handles ranges and sizes.
 V4.1 uses this to give its full producer and compact consumer regions separate
 capacities.
 
-Prefill regions share input/output buffers per token bucket and tensor layout,
-and a private capture memory pool per mode, separate from decode. Larger buckets
-are captured first.
+All modes in one `CudaGraphExecutor`, including prefill and decode, share one
+private capture memory pool and one capture stream. Sharing is automatic;
+there is no per-mode opt-in. Each mode captures larger buckets first, while
+separate executors and standalone caches keep independent pools.
+Prefill regions additionally share input/output buffers per token bucket and
+tensor layout.
 Regions execute serially: a caller must consume a region's output before
 another region overwrites the shared buffer. Concurrent replay on multiple
 streams is unsupported. Each current model consumes the output into a new
 attention/residual tensor or persistent state before the next region.
+
+Each program must initialize its temporary workspace on every replay. Persistent
+state, inputs, outputs, and values passed across graph breaks must live in
+fixed-address storage allocated outside capture. This permits alternating modes
+and batch buckets without depending on another capture's temporary contents.
+Closing one mode releases its graphs without invalidating the remaining modes;
+executor shutdown synchronizes and releases every graph before its shared
+workspace. These ownership constraints follow
+[PyTorch's shared-pool guidance](https://docs.pytorch.org/docs/2.14/notes/cuda.html#sharing-memory-across-captures).
 
 Graph replay always returns its device buffers. The caller consumes or copies
 them before replay can overwrite them; the graph cache does not materialize

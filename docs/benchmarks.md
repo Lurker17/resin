@@ -143,11 +143,18 @@ requires ADP=EP=world size, CP1, and at least two GPUs.
 
 ## Prefill and decode traces
 
-`--trace-dir DIR` captures two extra passes after each measured case. Prefill
+`--trace-dir DIR` captures extra passes after each measured case. Prefill
 traces run two fresh complete cohorts, including every chunk of the requested
-context. Decode traces run two live completions, preserving overlap. Traced
+context. Decode traces run two live completions, or three with overlap. Traced
 work does not alter measured timing, acceptance, graph counters, or context
 bounds, and no benchmark metric collectives run between traced passes.
+
+Decode traces reserve output and context headroom beyond the requested completion
+count, so reaching `max_output_tokens` does not drain overlap during capture.
+The Engine's termination guard is unchanged. A final forward may remain pending
+after the last completion and is included by the profiler's final synchronization;
+attribute costs to observed graph/kernel counts, not completion count alone.
+Historical traces near termination retain their original scope and measurements.
 
 Traces include CPU/CUDA activity from **attention-DP driver processes**. This
 covers all ranks for DeepSeek's ADP=world-size layout. TP/CP follower processes
@@ -207,7 +214,9 @@ output tokens/s/GPU = per-user tokens/s * global_batch_size / gpu_count
 The draft width is read from the measurements; `--draft-tokens` can optionally
 assert that width. Projection rescales the same timings and does not rerun
 verification or change observed acceptance. Its footer identifies projected
-and observed acceptance. The chart conventions follow
+and observed acceptance. Conditional work, such as accepted-prefix rollback, may
+cost more at higher acceptance; a fixed-cycle-time projection does not simulate
+that additional work. The chart conventions follow
 [DeepInfer's sweep plotter](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/examples/sweep/plot_pareto.py).
 
 To compare topologies with matching model/source/kernel/workload policies:
@@ -255,6 +264,9 @@ Engine construction and graph capture, then call `resin.bench.run_sweep` with
 `resin.bench.perfetto_trace(directory, rank, metadata)` as `trace_step` to enable
 the same untimed traces. Multi-driver runs must coordinate with
 `distributed_reducer` and invoke the same trace passes on every driver.
+`perfetto_trace(..., decode_passes=N)` advertises its count automatically. For a
+custom callback, pass `trace_decode_passes=N` to `run_sweep` when using a different
+count; exceeding the reserved count fails before another forward is submitted.
 
 ## HTTP correctness and latency checks
 
@@ -469,8 +481,10 @@ removable work, not promised wall-time savings; some bundles overlap.
 | Markov vocabulary additions | 3 | 0.015 | 0.304 | Accumulate the projection into logits through DeepGEMM's `out_acc` contract. |
 | FP8 casts, total footprint | 92 | 0.161 | 0.287 | Emit attention normalization's FP8 values/scales directly where the consumer permits it. |
 
-Sampling changes must retain Resin's top-k-before-top-p distribution and per-request
-Philox seed/offset stream. DeepInfer's sampler uses different filtering and RNG
+That historical Resin sampler used top-k-before-top-p and a per-request Philox
+seed/offset stream. The later [fused sampler](#shared-sampler-checks) deliberately
+changes filtering order and stochastic choices; comparisons must identify which
+contract they use. DeepInfer's sampler also has different filtering and RNG
 contracts, so copying it requires an explicit adapter and independent validation.
 Shifted HC must apply the previous pre-mix; the unshifted fused operator is not a
 drop-in replacement. Route tensors must be prepared outside capture and retained
