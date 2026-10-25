@@ -1477,7 +1477,9 @@ impl<P: Clone> EngineCore<P> {
             // Runner cleanup proves physical execution is terminal. Only now
             // may its writer lease return and cache pages become reusable.
             self.release_kv_access(batch.resources.take());
-            if let Err(error) = self.publish_batch_prefixes(&mut batch, &prepared_progress) {
+            if let Err(error) =
+                self.publish_batch_prefixes(&mut batch, &prepared_progress, output_token_ids)
+            {
                 return self.quarantine(batch, "native prefix publication failed", error);
             }
         }
@@ -1655,15 +1657,37 @@ impl<P: Clone> EngineCore<P> {
         &mut self,
         batch: &mut Batch<P>,
         progress: &[PreparedProgress],
+        physical_output: TokenRows<'_>,
     ) -> Result<()> {
         let Some(alignment) = self.prefix_alignment() else {
             return Ok(());
         };
-        for (row, progress) in batch.rows.iter_mut().zip(progress) {
+        let has_recurrent_state = self
+            .runner_config
+            .cache_layout
+            .as_ref()
+            .is_some_and(|layout| layout.groups().iter().any(|group| group.is_recurrent()));
+        for ((row, progress), physical_tokens) in batch
+            .rows
+            .iter_mut()
+            .zip(progress)
+            .zip(physical_output.iter())
+        {
             if row.terminal
                 || !row.request.cacheable
                 || progress.resident_tokens == 0
                 || progress.resident_tokens % alignment != 0
+            {
+                continue;
+            }
+            // EOS/output limits can shorten a speculative result after the
+            // runner committed the whole accepted block. STATE groups need
+            // only store its final checkpoint, so the shortened aligned
+            // history has no guaranteed matching recurrent state. History-only
+            // caches still contain valid token-addressed entries for it.
+            if has_recurrent_state
+                && row.scheduled.phase == Phase::Decode
+                && progress.sampled_tokens.len() < physical_tokens.len()
             {
                 continue;
             }

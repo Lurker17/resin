@@ -2,7 +2,7 @@ use resin_core::engine::{
     EngineCore, Error, ErrorKind, ExecutionPlan, OwnedTokenRows, Runner, RunnerConfig,
     SchedulerConfig, Submission, TokenRows,
 };
-use resin_core::resources::kv::{KvGroupLayout, KvLayout, KvRetention};
+use resin_core::resources::kv::{KvGroupFamily, KvGroupLayout, KvLayout, KvRetention};
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
 
@@ -151,6 +151,84 @@ fn admission_credits_restored_physical_prefix_pages_only() {
         }
         engine.close(&mut model).unwrap();
     }
+}
+
+fn check_stopped_speculative_prefix(stop_token: bool) {
+    for family in [KvGroupFamily::State, KvGroupFamily::History] {
+        for truncated in [true, false] {
+            let mut groups = vec![
+                KvGroupLayout::new_with_family(4, 1, KvRetention::FullContext, family).unwrap(),
+            ];
+            if family == KvGroupFamily::State {
+                // Hybrid attention: the STATE group need not be the first.
+                groups.insert(
+                    0,
+                    KvGroupLayout::new(2, 1, KvRetention::FullContext).unwrap(),
+                );
+            }
+            let mut engine = EngineCore::new(
+                RunnerConfig {
+                    cache_layout: Some(KvLayout::new(16, groups).unwrap()),
+                    continuation_prefill: true,
+                    cache_write_lookahead_tokens: 3,
+                    ..Default::default()
+                },
+                1,
+                32,
+                SchedulerConfig::default(),
+                true,
+            )
+            .unwrap();
+            let mut model = Model::default();
+            let mut submission = input(vec![10, 11, 12], if stop_token { 8 } else { 2 });
+            if stop_token {
+                submission.stop_token_ids = vec![14];
+            }
+            let request = engine.submit(submission).unwrap();
+            engine.step(&mut model).unwrap(); // Prompt state at 3, sampled anchor 13.
+            model.outputs.push_back(Ok(vec![if truncated {
+                vec![14, 15, 16]
+            } else {
+                vec![14]
+            }]));
+            engine.step(&mut model).unwrap();
+            assert_eq!(request.take_result().unwrap(), [13, 14]);
+            assert!(!engine.has_work());
+
+            // The logical history ends at resident token 4, but a truncated
+            // physical block committed state at 6. A token-addressed cache can
+            // reuse its first four entries; a final-only recurrent checkpoint
+            // cannot supply state at that intermediate boundary.
+            let resumed = engine.submit(input(vec![10, 11, 12, 13, 99], 1)).unwrap();
+            let expected = if family == KvGroupFamily::State && truncated {
+                0
+            } else {
+                4
+            };
+            assert_eq!(
+                resumed.cached_tokens(),
+                expected,
+                "family={family:?}, truncated={truncated}, stop_token={stop_token}"
+            );
+            engine.step(&mut model).unwrap();
+            assert_eq!(model.plans.last().unwrap().context_lengths, [expected]);
+            while engine.has_work() {
+                engine.step(&mut model).unwrap();
+            }
+            resumed.take_result().unwrap();
+            engine.close(&mut model).unwrap();
+        }
+    }
+}
+
+#[test]
+fn eos_inside_speculative_block_does_not_publish_intermediate_state() {
+    check_stopped_speculative_prefix(true);
+}
+
+#[test]
+fn output_limit_inside_speculative_block_does_not_publish_intermediate_state() {
+    check_stopped_speculative_prefix(false);
 }
 
 #[test]

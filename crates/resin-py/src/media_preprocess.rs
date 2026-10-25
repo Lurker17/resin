@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 
 use crate::{
     media_payload::{
-        DeepSeekV41Image, DeepSeekV41Media, Gemma4Media, InklingMedia, Qwen35Media, error,
+        DeepSeekV41Image, DeepSeekV41Media, Gemma4Media, Glm53FlashMedia, InklingMedia,
+        Qwen35Media, error,
     },
     recipe_media::MediaTokens,
     recipe_types::MediaSources,
@@ -25,6 +26,7 @@ enum Payload {
     Gemma(media::gemma::Prepared, u32, u32),
     Inkling(media::inkling::Prepared, u32),
     Qwen(media::qwen::Prepared, usize, u32),
+    Glm(media::qwen::Prepared, usize, u32),
 }
 pub(crate) struct Prepared {
     pub(crate) expansions: Vec<MediaTokens>,
@@ -131,6 +133,15 @@ pub(crate) fn process(
                 Payload::Qwen(prepared, config.merge_size, id),
             )
         }
+        MediaConfig::Glm(config) => {
+            let id = encoder.special_id("<|image|>")?;
+            let prepared = config.process(&images)?;
+            (
+                prepared.token_counts.clone(),
+                "<|image|>",
+                Payload::Glm(prepared, config.merge_size, id),
+            )
+        }
         MediaConfig::Gemma(_) => unreachable!(),
     };
     let id = encoder.special_id(marker)?;
@@ -156,6 +167,22 @@ impl Prepared {
     ) -> PyResult<Py<PyAny>> {
         let tokens = token_ids.to_vec();
         Ok(match self.payload {
+            Payload::Glm(data, merge, marker) => {
+                let positions = spans.iter().flat_map(|&(p, n)| p..p + n).collect();
+                Py::new(
+                    py,
+                    Glm53FlashMedia::build(
+                        py,
+                        tokens,
+                        positions,
+                        data.pixel_values,
+                        data.image_grid_thw,
+                        merge,
+                        marker,
+                    )?,
+                )?
+                .into_any()
+            }
             Payload::Inkling(data, marker) => Py::new(
                 py,
                 InklingMedia::build(py, tokens, marker, Some(data.pixel_values))?,

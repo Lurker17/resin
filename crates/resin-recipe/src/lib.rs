@@ -2,6 +2,7 @@
 
 pub mod deepseek;
 pub mod gemma;
+pub mod glm;
 pub mod gpt_oss;
 pub mod inkling;
 mod json;
@@ -21,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 pub use deepseek::{DeepSeekV41Parser, DeepSeekV41Tokens};
 pub use gemma::{Gemma4Parser, Gemma4Tokens};
+pub use glm::{GlmParser, GlmTokens};
 pub use gpt_oss::{GptOssParser, GptOssTokens};
 pub use inkling::{InklingParser, InklingTokens};
 pub use lfm2::{Lfm2Parser, Lfm2Tokens};

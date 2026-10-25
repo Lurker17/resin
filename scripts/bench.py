@@ -234,6 +234,7 @@ def _rank(
         "overlap": overlap,
         "timing": "continuous_completions" if overlap else "synchronized_steps",
         "prefill_chunk_size": options["prefill_chunk_size"],
+        "context_capacity": capacity,
         "max_batch_tokens": prefill_budget,
     }
     engine_options: dict[str, Any] = dict(
@@ -262,7 +263,7 @@ def _rank(
         prompt = torch.randint(
             1000, min(30_000, raw.vocab_size), (capacity,), generator=generator
         ).tolist()
-        records = run_sweep(
+        run_sweep(
             engine,
             cases,
             runner=observed,
@@ -278,11 +279,11 @@ def _rank(
             trace_step=(
                 None
                 if options.get("trace_dir") is None
-                else perfetto_trace(options["trace_dir"], rank, metadata)
+                else perfetto_trace(
+                    options["trace_dir"], rank, metadata, decode_passes=2 + int(overlap)
+                )
             ),
         )
-        if rank == 0:
-            Path(report_path).write_text(json.dumps(records))
     finally:
         # Closing a poisoned domain still tells followers to stop. Preserve the
         # original failure/report if close repeats that same domain error.
@@ -332,6 +333,18 @@ def _validate_configuration(model, cases, topology, options):
         )
     if spec.family in {"gemma4", "qwen3_5"} and prefill_chunk_size > 4096:
         raise ValueError(f"{model} supports prefill chunks up to 4096 tokens")
+    if spec.family == "glm5_3_flash":
+        if (
+            topology.attn_tp != 1
+            or topology.cp != 1
+            or topology.attn_dp != topology.world_size
+            or topology.ep != topology.world_size
+        ):
+            raise ValueError("GLM requires attention-DP=EP=world size, TP1 and CP1")
+        if prefill_chunk_size % 64:
+            raise ValueError("GLM prefill chunks must align to 64-token pages")
+        if draft_tokens > 7:
+            raise ValueError("GLM native MTP supports at most seven draft tokens")
     if numa not in ("auto", "off", "required"):
         raise ValueError("numa must be 'auto', 'off', or 'required'")
     if expert_backend not in ("flashinfer", "deepgemm"):
@@ -403,8 +416,14 @@ def run_benchmark(
     numa: Literal["auto", "off", "required"] = "auto",
     trace_dir: str | None = None,
     assistant_checkpoint: str | Path | None = None,
+    progress_path: str | Path | None = None,
 ) -> list[dict]:
-    """One load and graph catalog for all compatible points in this sweep."""
+    """One load and graph catalog for all compatible points in this sweep.
+
+    ``progress_path`` optionally retains a JSON array of completed cases even
+    if a later case or worker fails. It must be a new file. Updates happen
+    outside timing; successful results also include worker NUMA placement.
+    """
     spec = get_model(model)
     topology = parallelism or Parallelism()
     draft_tokens = spec.draft_tokens if draft_tokens is None else draft_tokens
@@ -433,7 +452,15 @@ def run_benchmark(
     if torch.cuda.device_count() < topology.world_size:
         raise ValueError(f"the sweep requires {topology.world_size} visible GPUs")
     with tempfile.TemporaryDirectory(prefix="resin-bench-") as directory:
-        output = Path(directory) / "results.json"
+        output = (
+            Path(directory) / "results.json"
+            if progress_path is None
+            else Path(progress_path).expanduser().resolve()
+        )
+        if progress_path is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with output.open("x") as stream:
+                stream.write("[]")
         port = 0
         if topology.world_size > 1:
             with socket.socket() as listener:
@@ -455,6 +482,10 @@ def run_benchmark(
         }
         for record in records:
             record["numa"] = placement
+        if progress_path is not None:
+            pending = output.with_suffix(output.suffix + ".tmp")
+            pending.write_text(json.dumps(records))
+            pending.replace(output)
         return records
 
 
@@ -524,12 +555,33 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--phases", default="prefill,decode", help="prefill, decode, or prefill,decode"
     )
-    parser.add_argument("--context-lengths", type=_integers, default=[4096])
+    parser.add_argument(
+        "--context-lengths",
+        type=_integers,
+        help="prompt lengths for both phases; phase-specific options take precedence",
+    )
+    parser.add_argument(
+        "--prefill-context-lengths",
+        type=_integers,
+        help="prefill prompt lengths (default: 4096,8192,16384,32768,65536)",
+    )
+    parser.add_argument(
+        "--decode-context-lengths",
+        type=_integers,
+        help="initial decode context lengths (default: 8192)",
+    )
     parser.add_argument(
         "--batch-sizes",
         type=_integers,
-        default=[1, 2, 4, 8],
-        help="requests per attention-DP replica (throughput is normalized per GPU)",
+        help="requests per attention-DP replica for both phases; phase-specific options take precedence",
+    )
+    parser.add_argument(
+        "--prefill-batch-sizes", type=_integers, help="prefill batches (default: 1)"
+    )
+    parser.add_argument(
+        "--decode-batch-sizes",
+        type=_integers,
+        help="decode batches (default: 1,2,4,8,16,32,64)",
     )
     parser.add_argument("--shared-prefix-tokens", type=int, default=0)
     parser.add_argument(
@@ -549,7 +601,11 @@ def argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measure-steps", type=int, default=20)
-    parser.add_argument("--prefill-chunk-size", type=int)
+    parser.add_argument(
+        "--prefill-chunk-size",
+        type=int,
+        help="execution chunk size, separate from prompt length (default: model preset, at least 4096; subject to kernel limits)",
+    )
     for phase, default in (("prefill", "breakable"), ("decode", "full")):
         parser.add_argument(
             f"--{phase}-graph",
@@ -608,6 +664,18 @@ def _configuration(args):
     phases = args.phases.split(",")
     if not phases or any(phase not in {"prefill", "decode"} for phase in phases):
         raise ValueError("phases must be prefill, decode, or prefill,decode")
+    contexts = {
+        "prefill": args.prefill_context_lengths
+        or args.context_lengths
+        or [4096, 8192, 16384, 32768, 65536],
+        "decode": args.decode_context_lengths or args.context_lengths or [8192],
+    }
+    batches = {
+        "prefill": args.prefill_batch_sizes or args.batch_sizes or [1],
+        "decode": args.decode_batch_sizes
+        or args.batch_sizes
+        or [1, 2, 4, 8, 16, 32, 64],
+    }
     cases = [
         asdict(
             BenchCase(
@@ -618,11 +686,11 @@ def _configuration(args):
             )
         )
         for phase in dict.fromkeys(phases)
-        for context in args.context_lengths
-        for batch in args.batch_sizes
+        for context in contexts[phase]
+        for batch in batches[phase]
     ]
     chunk = (
-        spec.prefill_chunk_size
+        max(4096, spec.prefill_chunk_size)
         if args.prefill_chunk_size is None
         else args.prefill_chunk_size
     )
@@ -630,7 +698,12 @@ def _configuration(args):
         from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
 
         chunk = min(
-            chunk, max(1, FlashInferSM90MXFP4Kernel.max_tokens // max(args.batch_sizes))
+            chunk,
+            max(
+                1,
+                FlashInferSM90MXFP4Kernel.max_tokens
+                // max(case["batch_size"] for case in cases),
+            ),
         )
     options = dict(
         draft_tokens=spec.draft_tokens

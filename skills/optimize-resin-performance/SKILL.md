@@ -36,8 +36,8 @@ host with `MODEL_KEY` and `CHECKPOINT` set:
 
 ```bash
 uv run scripts/bench.py --model "$MODEL_KEY" --backend local \
-  --checkpoint "$CHECKPOINT" --context-lengths 4096,8192 \
-  --batch-sizes 1,2,4,8 --output artifacts/perf-baseline.jsonl \
+  --checkpoint "$CHECKPOINT" --context-lengths 8192 \
+  --decode-batch-sizes 1,2,4,8 --output artifacts/perf-baseline.jsonl \
   --trace-dir artifacts/perf-baseline-traces --plot
 ```
 
@@ -49,6 +49,19 @@ completion intervals, including intervening host work, with no per-step metric
 reductions or synchronization that drains overlap. Include page-boundary drains
 in the measured window. Report startup/compilation/capture separately from warm
 prefill and also test first-use TTFT when investigating serving latency.
+
+Start decode tuning and Perfetto captures at **8,192 context tokens**.
+Iterate prefill at **4K and 8K prompts**, then expand to the default
+**4K, 8K, 16K, 32K, 64K** curve. Compare 4K/8K execution chunks where supported;
+report prompt length and chunk size separately and time complete prompts.
+Serving defaults such as a 512-token chunk are not the prefill performance target.
+For decode, extend batches per attention replica through **16, 32, and 64** when
+memory permits; 1/2/4/8 alone can miss the throughput plateau. Record configured
+batch/graph capacity as well as live batch, since padding can change small-batch
+cost. Use consistent capacity for paired comparisons and preflight the full cohort.
+Get 8K decode fast before expanding to 32K or 131K when useful and feasible. Keep short
+contexts and nearby boundaries for correctness checks; avoid redundant 128/512/2K
+performance traces unless they expose a distinct bottleneck or reproduce a bug.
 
 Primary throughput counts actual committed output tokens. Natural acceptance,
 forced `--accepted-drafts`, and plot-only `--accept-rate` projections answer
@@ -122,10 +135,24 @@ be graphable, but the selected full/breakable policy determines actual capture
 coverage. Verify replay/fallback counters. Measure staging cost and padded work;
 larger buckets may change GEMM rounding as well as runtime. An intentional exact-row
 prefill fallback is different from an unprepared graph or an eager-only kernel.
+If target/speculative parity requires matching projection shapes, select that
+shape from the executing batch bucket, not the server's concurrency limit; raising
+the limit should not enlarge existing small-batch work. Check both numerical
+parity and padding cost across the supported buckets.
 Keep graph inputs/outputs at stable addresses, update mutable metadata, and consume
 or copy shared output views before replay overwrites them. Shared prefill-region
 buffers execute serially; overlapping streams cannot replay them concurrently.
 See [graph policy and ownership](../../docs/cuda-graphs.md).
+
+**Separate matched-batch parity from cross-batch variation.** Compare target-only
+and speculative outputs with matched physical batch buckets, prompts, sampling,
+source and cache state. Different batch shapes or retirement schedules can change
+floating-point reductions and greedy wording even in target-only decoding. Check
+that target-only control before spending effort forcing cross-batch bitwise
+identity; require such invariance only when the user or workload needs it. Keep
+matched-batch parity, cache ownership, graph coverage and completion checks strict.
+Ordinary numerical variation does not excuse dropped tokens, stale state or
+incorrect stop handling.
 
 **Overlap through the existing completion contract.** Use the Engine's
 enqueue/completion and device-feedback path rather than weakening synchronous
@@ -140,6 +167,11 @@ NCCL operation. See [distributed execution](../../docs/distributed.md).
 
 **Fuse with the real numerical contract.** Preserve accumulator precision, packed
 scale/weight strides, sentinel ordering, masks, recurrent state and rollback.
+Prefer existing fused kernels or implement a fused GPU operation for repeated
+pointwise, routing, packing and state-update chains. CUDA graphs still launch each
+unfused operation; capture alone does not make raw Torch chains efficient. Keep
+independent Torch references for testing and use proven GEMM/library kernels where
+appropriate.
 Stage quantization/layout conversion at load time where possible. For sampling,
 preserve top-k-before-top-p, normalization and request-local Philox seed/offset
 semantics under batch permutation and padding. A copied upstream kernel may use a

@@ -339,6 +339,7 @@ def test_native_media_does_not_import_python_image_or_tensor_libraries() -> None
             ('gemma4', {{'media_config': {GEMMA_CONFIG!r}}}, (2, 2)),
             ('qwen3_5', {{'media_config': {{'patch_size': 2, 'merge_size': 2, 'do_resize': False}}}}, (4, 4)),
             ('qwen3_8', {{'media_config': {{'patch_size': 2, 'merge_size': 2, 'do_resize': False}}}}, (4, 4)),
+            ('glm5_3_flash', {{'media_config': {{'patch_size': 2, 'merge_size': 2, 'do_resize': False}}}}, (4, 4)),
             ('inkling', {{'media_config': {{'size': {{'height': 2, 'width': 2}}}}}}, (2, 2)),
             ('deepseek_v41', {{'vision_config': {{'min_pixels': 0}}}}, (14, 14)),
         ]

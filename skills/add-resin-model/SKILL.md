@@ -28,10 +28,13 @@ other speculators. Record revisions, supported GPU architectures/dtypes/layouts,
 licenses, and the baseline implementations to compare. Check attention, positional
 encoding, MoE routing, recurrent/sliding state, vocabulary, and multimodal details.
 
-Reuse a native recipe from [`resin-recipe`](../../crates/resin-recipe/README.md)
-when its formatting, parsing and media semantics match. Otherwise implement the
-recipe in that crate and its bindings; do not put a second chat template or parser
-inside a deployment script.
+Reuse an existing recipe when its formatting, parsing and media semantics match.
+When working in the Resin repository or a fork, implement a new native Rust recipe
+in [`resin-recipe`](../../crates/resin-recipe/README.md) and its bindings. When
+importing Resin as a library without its source, implement the
+[`resin.recipe.Recipe`](../../resin/recipe.py) protocol in Python instead; a Rust
+change is not required. Keep formatting and parsing in the recipe rather than
+duplicating them inside a deployment script.
 
 Before implementation, read the relevant parts of:
 
@@ -163,11 +166,11 @@ for the profiling and iteration loop, including lessons from earlier Resin work.
 Use [`scripts/bench.py`](../../scripts/bench.py), backed by `resin.bench`, and
 [`scripts/plot_bench.py`](../../scripts/plot_bench.py). Read the
 [benchmark guide](../../docs/benchmarks.md) for timing and topology semantics.
-Run multiple context lengths and batches on the target GPU configuration:
+Start with an 8K curve and traces on the target GPU configuration:
 
 ```bash
 uv run scripts/bench.py --model "$MODEL_KEY" --backend modal \
-  --context-lengths 4096,8192 --batch-sizes 1,2,4,8 \
+  --context-lengths 8192 --decode-batch-sizes 1,2,4,8 \
   --output artifacts/model-bench.jsonl --trace-dir artifacts/model-traces --plot
 ```
 
@@ -175,6 +178,9 @@ Use `--backend local --checkpoint PATH` on an existing GPU host; provide a separ
 assistant checkpoint when needed. Modal benchmarks use the shared pinned model
 registry. Download/publish its checkpoint first with the shared tooling. Choose
 sizes that fit the agreed hardware; the example sweep is not a fixed target.
+Iterate prefill at 4K/8K first, then measure the default 4K/8K/16K/32K/64K prompt
+curve. Use 4K/8K chunks where supported and record them separately from total
+prompt length; each prefill timing must include the complete prompt.
 
 Deliver both complete-cohort prefill latency versus input tokens/s/GPU and decode
 interactivity (output tokens/s/user) versus output tokens/s/GPU. Batch counts are

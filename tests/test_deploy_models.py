@@ -24,6 +24,7 @@ def test_factory_arguments_match_native_runner_and_cache_geometry(monkeypatch, n
     class_name = {
         "gpt_oss": "GptOssCudaRunner",
         "deepseek_v41": "DeepSeekV41CudaRunner",
+        "glm5_3_flash": "Glm53FlashCudaRunner",
         "gemma4": "Gemma4CudaRunner",
         "qwen3_5": "Qwen3_5CudaRunner",
         "inkling": "InklingCudaRunner",
@@ -52,12 +53,15 @@ def test_factory_arguments_match_native_runner_and_cache_geometry(monkeypatch, n
         prefill_chunk_size=4096,
         draft_tokens=spec.draft_tokens,
         decode_batch_sizes=(1, 4, 8),
+        profile_graph_phases=True,
     )
     args, options = calls[0]
     assert args[0] == spec.path
     assert options["device"] == "cuda:0"
     width = {"gpt_oss": 65, "gemma4": 129, "inkling": 8198}.get(spec.family, 8193)
     assert options["cuda_graph_decode_shapes"] == ((1, width), (4, width), (8, width))
+    if spec.family in {"glm5_3_flash", "deepseek_v41"}:
+        assert options["profile_graph_phases"] is True
     if spec.family != "inkling":
         assert options["parallel_groups"] is groups
     if spec.assistant:
@@ -141,3 +145,144 @@ def test_gpu_override_cannot_reuse_incompatible_kernel_cache(model, gpu):
 @pytest.mark.parametrize("gpu", ["H100", "H200"])
 def test_gpt_gpu_override_preserves_sm90_kernel_architecture(gpu):
     assert validate_gpu("gpt-oss-120b", gpu) == gpu
+
+
+@pytest.mark.parametrize(
+    "maximum,expected",
+    [(3, (1, 2, 3)), (8, (1, 2, 4, 8)), (17, (1, 2, 4, 8, 12, 16, 17))],
+)
+def test_glm_default_target_and_mtp_catalogs_match_physical_batches(
+    monkeypatch, maximum, expected
+):
+    module = importlib.import_module("resin_models_cuda.glm5_3_flash.cuda")
+    calls = []
+
+    class Runner:
+        def __init__(self, *args, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(module, "Glm53FlashCudaRunner", Runner)
+    for drafts in (0, 1, 3, 7):
+        create_runner(
+            "glm-5.3-flash",
+            device="cuda:0",
+            context_length=4096,
+            max_batch_size=maximum,
+            prefill_chunk_size=512,
+            draft_tokens=drafts,
+        )
+    shapes = tuple((batch, 4096) for batch in expected)
+    assert all(call["cuda_graph_decode_shapes"] == shapes for call in calls)
+    for active in range(1, maximum + 1):
+        selected = [
+            next(
+                shape
+                for shape in call["cuda_graph_decode_shapes"]
+                if shape[0] >= active
+            )
+            for call in calls
+        ]
+        assert selected == [selected[0]] * len(calls)
+
+
+@pytest.mark.parametrize(
+    "policy,catalog,expected",
+    [
+        ("full", (3, 5, 8), ((3, 4096), (5, 4096), (8, 4096))),
+        ("full", (), ()),
+        ("disabled", None, ()),
+    ],
+)
+def test_glm_explicit_catalog_and_disabled_override_remain_authoritative(
+    monkeypatch, policy, catalog, expected
+):
+    module = importlib.import_module("resin_models_cuda.glm5_3_flash.cuda")
+    calls = []
+
+    class Runner:
+        def __init__(self, *args, **kwargs):
+            calls.append(kwargs["cuda_graph_decode_shapes"])
+
+    monkeypatch.setattr(module, "Glm53FlashCudaRunner", Runner)
+    for drafts in (0, 3):
+        create_runner(
+            "glm-5.3-flash",
+            device="cuda:0",
+            context_length=4096,
+            max_batch_size=8,
+            prefill_chunk_size=512,
+            draft_tokens=drafts,
+            decode_graph=policy,
+            decode_batch_sizes=catalog,
+        )
+    assert calls == [expected, expected]
+
+
+@pytest.mark.parametrize("include_mtp", [False, True])
+@pytest.mark.parametrize("checkpoint", ["serving", "full-window"])
+def test_glm_serving_checkpoints_allow_real_engine_prefix_reuse(
+    include_mtp, checkpoint
+):
+    from output_helpers import forward_output
+
+    from resin import Engine, RunnerConfig, SamplingParams, SchedulerConfig
+    from resin.models.glm5_3_flash.config import Glm53Config
+    from resin_models_cuda.glm5_3_flash.cache import CacheGeometry
+
+    spec = get_model("glm-5.3-flash")
+    chunk = spec.prefill_chunk_size if checkpoint == "serving" else spec.context_length
+    geometry = CacheGeometry.from_config(
+        Glm53Config(), state_tokens=chunk, include_mtp=include_mtp
+    )
+
+    class Runner:
+        # Actual model geometry and native Engine ownership, without allocating
+        # cache tensors or model weights. Only publication/lookup is tested.
+        runner_config = RunnerConfig(
+            cache_layout=geometry.layout(128),
+            max_batch_tokens=chunk,
+            prefill_chunk_size=chunk,
+            continuation_prefill=True,
+            cache_write_lookahead_tokens=4 if include_mtp else 0,
+        )
+
+        def __init__(self):
+            self.plans = []
+
+        def bind_resources(self, binding):
+            self.binding = binding
+
+        def forward(self, plan):
+            self.plans.append(plan)
+            return forward_output(
+                [int(plan.token_ids[end - 1]) + 1 for end in plan.token_indptr[1:]]
+            )
+
+    runner = Runner()
+    with Engine(
+        runner,
+        context_length=spec.context_length,
+        max_running_requests=spec.max_batch_size,
+        prefix_cache=True,
+        scheduler_config=SchedulerConfig(
+            max_batch_tokens=chunk, prefill_chunk_size=chunk
+        ),
+    ) as engine:
+        prompt = list(range(spec.prefill_chunk_size + 256))
+        first = engine.submit(
+            prompt, sampling_params=SamplingParams(max_output_tokens=1)
+        )
+        while engine.has_work():
+            engine.step()
+        assert first.take_result() == [len(prompt)]
+        runner.plans.clear()
+        second = engine.submit(
+            prompt, sampling_params=SamplingParams(max_output_tokens=1)
+        )
+        expected = spec.prefill_chunk_size if checkpoint == "serving" else 0
+        assert second.cached_tokens == expected
+        while engine.has_work():
+            engine.step()
+        assert runner.plans[0].context_lengths.tolist() == [expected]
+        assert sum(plan.num_tokens for plan in runner.plans) == len(prompt) - expected
+        assert second.take_result() == [len(prompt)]

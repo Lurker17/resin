@@ -208,6 +208,38 @@ def test_zero_cache_hits_fail_when_telemetry_is_present(tmp_path):
     assert by_name(report)["prefix_cache"]["status"] == "failed"
 
 
+@pytest.mark.parametrize("repeats,expected", [(256, "failed"), (3072, "passed")])
+def test_prefix_probe_can_reach_large_state_checkpoints(tmp_path, repeats, expected):
+    class CheckpointCache(Server):
+        async def __call__(self, request):
+            response = await super().__call__(request)
+            if request.url.path == "/v1/chat/completions":
+                body = json.loads(request.content)
+                prompt = body["messages"][0]["content"]
+                if isinstance(prompt, str) and prompt.startswith("Cache check "):
+                    value = response.json()
+                    details = value["usage"]["prompt_tokens_details"]
+                    details["cached_tokens"] = details["cached_tokens"] // 8192 * 8192
+                    return httpx.Response(200, json=value)
+            return response
+
+    server = CheckpointCache()
+    report = run(options(tmp_path, "--prefix-cache-repeats", str(repeats)), server)
+    probe = by_name(report)["prefix_cache"]
+    assert probe["status"] == expected
+    assert probe["prompt_repetitions"] == repeats
+    first, second = probe["results"]
+    assert first["cached_prompt_tokens"] == 0
+    assert first["prompt_tokens"] == second["prompt_tokens"]
+    assert second["cached_prompt_tokens"] == (8192 if expected == "passed" else 0)
+
+
+@pytest.mark.parametrize("repeats", ["0", "-1"])
+def test_prefix_probe_requires_positive_repetitions(tmp_path, repeats):
+    with pytest.raises(SystemExit):
+        options(tmp_path, "--prefix-cache-repeats", repeats)
+
+
 @pytest.mark.parametrize(
     "text,expected",
     [
@@ -223,6 +255,134 @@ def test_zero_cache_hits_fail_when_telemetry_is_present(tmp_path):
 )
 def test_answer_extraction_does_not_grade_incidental_letters(text, expected):
     assert checks.extract_answer(text, "ABCD") == expected
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("**A**", "A"),
+        ("  **(B).**  ", "B"),
+        (
+            "**Answer: A. Routing packets from source to destination (best-effort)**",
+            "A",
+        ),
+        (
+            "**A. a boundary established before the present-day human landscape developed**",
+            "A",
+        ),
+        ("**Final answer: C. Vitamin B deficiency**", "C"),
+        ("Answer: **A**", "A"),
+        ("**A**\n**Answer: A. first choice**", "A"),
+        ("**Answer: A. first choice**\n- **D** would be incorrect.", "A"),
+        ("**A good explanation is not a letter answer.**", None),
+        ("An incidental **A** in a sentence.", None),
+        ("**A** or **B**", None),
+        ("Answer: A\n**A** or **B**", None),
+        ("**A. or B**", None),
+        ("**A. OR B**", None),
+        ("**A. A/B**", None),
+        ("**A. first choice; B. second choice**", None),
+        ("**A. first choice**\n**B. second choice**", None),
+        ("**A**\n**Answer: B. second choice**", None),
+        ("**Answer: A or B**", None),
+        ("**Answer: A. first choice; Answer: B**", None),
+        ("**A. first choice \\boxed{B}**", None),
+        ("**Answer: E. outside the available choices**", None),
+        ("A. first choice\nB. second choice", None),
+        ("**A", None),
+    ],
+)
+def test_markdown_answers_require_an_unambiguous_declaration(text, expected):
+    assert checks.extract_answer(text, "ABCD") == expected
+
+
+@pytest.mark.parametrize("eval_effort", [None, "low"])
+def test_evaluation_reasoning_effort_is_independent_of_protocol_checks(
+    tmp_path, eval_effort
+):
+    source = tmp_path / "questions.jsonl"
+    source.write_text(
+        json.dumps({"question": "Choose", "choices": ["one", "two"], "answer": "A"})
+    )
+    extra = ["--eval-reasoning-effort", eval_effort] if eval_effort else []
+    server = Server(answer="**Answer: A. one**")
+    report = run(
+        options(
+            tmp_path,
+            "--context-lengths",
+            "--reasoning-effort",
+            "high",
+            "--eval-file",
+            str(source),
+            *extra,
+        ),
+        server,
+    )
+    row = by_name(report)["evaluation"]
+    assert row["status"] == "passed" and row["correct"] == 1
+    assert row["reasoning_effort"] == eval_effort
+    assert row["missing_answers"] == row["truncated_outputs"] == 0
+    for request in server.requests:
+        if request.url.path != "/v1/chat/completions":
+            continue
+        body = json.loads(request.content)
+        prompt = body["messages"][0]["content"]
+        if prompt.startswith("Choose\n"):
+            assert body.get("reasoning_effort") == eval_effort
+        elif "reasoning_effort" in body:
+            assert body["reasoning_effort"] == "high"
+
+
+@pytest.mark.parametrize(
+    "content,reasoning,finish,predicted,missing,truncated,correct",
+    [
+        ("", "Answer: A", "stop", None, 1, 0, 0),
+        ("", "Answer: A", "length", None, 1, 1, 0),
+        ("**A**", "Answer: B", "stop", "A", 0, 0, 1),
+        ("**A**", "Answer: B", "length", "A", 0, 1, 0),
+    ],
+)
+def test_evaluation_grades_only_complete_final_content(
+    tmp_path, content, reasoning, finish, predicted, missing, truncated, correct
+):
+    class EvaluationResponse(Server):
+        async def __call__(self, request):
+            response = await super().__call__(request)
+            if request.url.path == "/v1/chat/completions":
+                body = json.loads(request.content)
+                if body["messages"][0]["content"].startswith("Choose\n"):
+                    data = response.json()
+                    choice = data["choices"][0]
+                    choice["message"] = {
+                        "content": content,
+                        "reasoning_content": reasoning,
+                    }
+                    choice["finish_reason"] = finish
+                    return httpx.Response(200, json=data)
+            return response
+
+    source = tmp_path / "questions.jsonl"
+    source.write_text(
+        json.dumps({"question": "Choose", "choices": ["one", "two"], "answer": "A"})
+    )
+    report = run(
+        options(
+            tmp_path,
+            "--context-lengths",
+            "--eval-file",
+            str(source),
+            "--min-accuracy",
+            "0",
+        ),
+        EvaluationResponse(),
+    )
+    row = by_name(report)["evaluation"]
+    assert row["results"][0]["predicted"] == predicted
+    assert row["missing_answers"] == missing
+    assert row["truncated_outputs"] == truncated
+    assert row["correct"] == correct
+    assert row["status"] == ("failed" if missing or truncated else "passed")
+    assert report["ok"] == (not missing and not truncated)
 
 
 def test_missing_eval_answers_fail_even_with_zero_minimum_accuracy(tmp_path):
@@ -411,6 +571,10 @@ def test_missing_auth_environment_still_writes_failure_report(tmp_path, monkeypa
         "\\boxed{A} \\boxed{B}",
         "Answer: A\nFinal answer: B",
         "Answer: A\nAnswer: unknown",
+        "**A** — B",
+        "**A** — A or B could apply.",
+        "**A** — Explanation.\nFinal answer: B",
+        "**A** — Answer: B",
     ],
 )
 def test_conflicting_or_ambiguous_answer_forms_are_not_graded(answer):
@@ -424,6 +588,9 @@ def test_conflicting_or_ambiguous_answer_forms_are_not_graded(answer):
         "Final answer: (A).\nExplanation on a separate line.",
         "A\nAnswer: A\n\\boxed{A}.",
         "Answer: \\boxed{A}.",
+        "**A** — This is the selected option.",
+        "**A** – This is the selected option.",
+        "Answer: **A**: This is the selected option.",
     ],
 )
 def test_agreeing_answer_forms_and_separate_explanations_remain_valid(answer):

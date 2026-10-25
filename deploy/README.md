@@ -18,7 +18,7 @@ second publishes the endpoint. Use `--publish-only` on the first command to
 publish completion markers for complete existing files. Every model uses the
 same checkpoint validation contract for serving and benchmarking.
 
-Available keys: `gpt-oss-20b`, `gpt-oss-120b`, `deepseek-v41`, `gemma4`, `qwen3_5`,
+Available keys: `gpt-oss-20b`, `gpt-oss-120b`, `deepseek-v41`, `glm-5.3-flash`, `gemma4`, `qwen3_5`,
 and `inkling`. The `qwen3_5` selection currently pins Qwen3.8-27B. Each selection
 gets its own Modal app/endpoint; model additions require registry configuration
 and a runner adapter, not another deployment script.

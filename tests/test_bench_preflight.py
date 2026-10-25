@@ -9,6 +9,47 @@ from resin import Parallelism
 from scripts import bench
 
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_persistent_progress_survives_worker_failure(tmp_path, monkeypatch, fails):
+    output = tmp_path / "results" / "completed.json"
+    record = {"phase": "decode", "committed_tokens": 8}
+    monkeypatch.setattr(bench.torch.cuda, "device_count", lambda: 4)
+
+    def spawn(function, *, args, devices, numa):
+        # The real worker uses this callback only after a complete timed case.
+        save = bench._result_callback(args[1])
+        save(record)
+        if fails:
+            raise RuntimeError("next case failed")
+        return SimpleNamespace(placements=[None] * 4)
+
+    monkeypatch.setattr(bench.resin.process, "spawn", spawn)
+
+    def run():
+        return bench.run_benchmark(
+            "glm-5.3-flash",
+            "unused",
+            [{"phase": "decode", "context_length": 128, "batch_size": 1}],
+            parallelism=Parallelism(world_size=4, attn_dp=4, ep=4),
+            prefill_chunk_size=512,
+            progress_path=output,
+        )
+
+    if fails:
+        with pytest.raises(RuntimeError, match="next case failed"):
+            run()
+        assert json.loads(output.read_text()) == [record]
+    else:
+        records = run()
+        assert json.loads(output.read_text()) == records
+        assert records[0]["numa"] == {"mode": "auto", "bindings": [None] * 4}
+    saved = output.read_bytes()
+    with pytest.raises(FileExistsError):
+        run()
+    assert output.read_bytes() == saved
+    assert not output.with_suffix(".json.tmp").exists()
+
+
 @pytest.mark.parametrize(
     "model,topology,message",
     [

@@ -11,6 +11,7 @@ from __future__ import annotations
 import gzip
 import json
 import shutil
+import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
@@ -45,13 +46,26 @@ class BenchCase:
             )
 
 
-def perfetto_trace(directory: str | Path, rank: int = 0, metadata: dict | None = None):
-    """Capture two untimed prefill cohorts or decode completions for each case.
+def perfetto_trace(
+    directory: str | Path,
+    rank: int = 0,
+    metadata: dict | None = None,
+    *,
+    decode_passes: int = 2,
+):
+    """Capture two untimed prefill cohorts or ``decode_passes`` completions.
 
     Pass the returned callback as ``run_sweep(trace_step=...)``. Each rank writes
     a compressed Chrome trace that can be opened in Perfetto or combined with
     ``scripts/merge_bench_traces.py``. CUDA imports occur only when tracing.
+    Raw export and inspection use local temporary storage; only the compressed
+    trace is written to the requested directory, which may be a shared volume.
+    Use three decode completions for an overlapping Engine: one may harvest
+    already-completed work submitted before the profiler started. This captures
+    at least two fresh forwards while preserving the normal overlap path.
     """
+    if type(decode_passes) is not int or decode_passes < 1:
+        raise ValueError("decode_passes must be a positive integer")
     import torch
 
     directory = Path(directory)
@@ -59,7 +73,9 @@ def perfetto_trace(directory: str | Path, rank: int = 0, metadata: dict | None =
 
     def trace(case, run_pass):
         name = f"{case.phase}-ctx{case.context_length}-b{case.batch_size}-rank{rank:03}"
-        target = directory / f"{name}.json"
+        target = directory / f"{name}.json.gz"
+        passes = decode_passes if case.phase == "decode" else 2
+        unit = "decode completions" if case.phase == "decode" else "prefill cohorts"
         torch.cuda.synchronize()
         with torch.profiler.profile(
             activities=[
@@ -68,24 +84,32 @@ def perfetto_trace(directory: str | Path, rank: int = 0, metadata: dict | None =
             ],
         ) as profiler:
             profiler.add_metadata("resin_rank", str(rank))
-            profiler.add_metadata("resin_timing", "two passes after measurement")
+            profiler.add_metadata(
+                "resin_timing", f"{passes} untimed {unit} after measurement"
+            )
             profiler.add_metadata_json(
                 "resin_benchmark",
-                json.dumps({**(metadata or {}), "case": asdict(case)}),
+                json.dumps(
+                    {
+                        **(metadata or {}),
+                        "case": asdict(case),
+                        "trace_passes": passes,
+                        "trace_unit": unit,
+                    }
+                ),
             )
             with torch.profiler.record_function(f"resin.{name}"):
-                for _ in range(2):
+                for _ in range(passes):
                     run_pass()
                 torch.cuda.synchronize()
-        profiler.export_chrome_trace(str(target))
-        with (
-            target.open("rb") as source,
-            gzip.open(target.with_suffix(".json.gz"), "wb") as destination,
-        ):
-            shutil.copyfileobj(source, destination)
-        data = json.loads(target.read_text())
-        kernels = sum(event.get("cat") == "kernel" for event in data["traceEvents"])
-        target.unlink()
+        with tempfile.TemporaryDirectory(prefix="resin-bench-trace-") as staging:
+            raw = Path(staging) / f"{name}.json"
+            profiler.export_chrome_trace(str(raw))
+            with raw.open("rb") as source, gzip.open(target, "wb") as destination:
+                shutil.copyfileobj(source, destination)
+            with raw.open() as source:
+                data = json.load(source)
+            kernels = sum(event.get("cat") == "kernel" for event in data["traceEvents"])
         print(
             f"[bench-trace] rank={rank} case={name} CUDA kernel events={kernels}",
             flush=True,
@@ -329,7 +353,8 @@ def run_sweep(
     chunking does not turn a context's prefill latency into a single chunk's time.
     trace_step receives an untimed workload callback: one fresh complete cohort
     for prefill, or one live completion for decode. It may invoke that callback
-    twice; all distributed drivers must participate in the same passes.
+    twice, or three times for overlapped decode to allow for a completion
+    submitted before tracing. All distributed drivers must use the same passes.
     """
 
     for name, value, minimum in (
@@ -519,8 +544,8 @@ def run_sweep(
                         if not measured:
                             warmed = count
             else:
-                # Keep the cohort live through measurement, two optional trace
-                # passes, and any completion already queued by overlap.
+                # Two trace completions need a third with overlap because one
+                # may only harvest work submitted before tracing began.
                 extra_steps = (2 if trace_step is not None else 1) + int(overlap)
                 maximum = 1 + (warmup_steps + measure_steps + extra_steps) * (
                     runner.draft_tokens + 1

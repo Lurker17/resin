@@ -457,6 +457,126 @@ def test_overlap_trace_has_two_full_completions_without_metric_collectives():
         raw.shutdown()
 
 
+@pytest.mark.parametrize("context", [513, 560])
+@pytest.mark.parametrize("warmup", [0, 3])
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("drafts,accepted", [(0, 0), (3, 0), (3, 3)])
+def test_decode_trace_submits_two_fresh_forwards_with_exact_context_headroom(
+    monkeypatch, context, warmup, overlap, drafts, accepted
+):
+    class PipelinedRunner(Runner):
+        def __init__(self):
+            super().__init__(drafts=drafts)
+            self.runner_config = RunnerConfig(
+                cache_layout=CacheLayout(
+                    parent_capacity=256, groups=[CacheGroupLayout(64)]
+                ),
+                cache_write_lookahead_tokens=drafts + 1 if drafts else 0,
+            )
+
+        def output(self, plan, feedback=None):
+            tokens = plan.token_ids.tolist() if feedback is None else feedback.tokens
+            positions = (
+                plan.context_lengths.tolist()
+                if feedback is None
+                else feedback.positions
+            )
+            rows = [[token + i + 1 for i in range(accepted + 1)] for token in tokens]
+            return forward_output(rows), SimpleNamespace(
+                tokens=[row[-1] for row in rows],
+                positions=[position + accepted + 1 for position in positions],
+            )
+
+        def forward(self, plan):
+            self.plans.append(plan)
+            if plan.phase == BatchPhase.PREFILL:
+                return forward_output([2] * plan.num_sequences)
+            return self.output(plan)[0]
+
+        def enqueue(self, plan, *, feedback=None):
+            self.plans.append(plan)
+            output, next_feedback = self.output(plan, feedback)
+            return SimpleNamespace(feedback=next_feedback, result=lambda: output)
+
+    def run(traced):
+        monkeypatch.setattr("resin.bench.time.perf_counter", iter(range(1000)).__next__)
+        raw = PipelinedRunner()
+        runner = BenchmarkRunner(raw)
+        extra = (2 if traced else 1) + int(overlap)
+        headroom = 1 + (warmup + 2 + extra) * (drafts + 1)
+        engine = Engine(
+            runner,
+            max_running_requests=2,
+            context_length=context + headroom,
+            enable_overlap=overlap,
+        )
+        reductions = []
+
+        def reduce_step(value):
+            reductions.append(value)
+            return value
+
+        def trace(case, run_pass):
+            before = len(raw.plans)
+            before_reductions = len(reductions)
+            for _ in range(2 + int(overlap)):
+                result = run_pass()
+                assert result["sequences"] == 2
+                assert result["committed_tokens"] == 2 * (accepted + 1)
+            # Counting completions alone misses a pre-profiler carry-in. These
+            # are actual new forward/enqueue calls made inside the trace scope.
+            assert len(raw.plans) - before >= 2
+            assert len(reductions) == before_reductions
+
+        try:
+            record = run_sweep(
+                engine,
+                [BenchCase(phase="decode", context_length=context, batch_size=2)],
+                runner=runner,
+                prompt_tokens=[1],
+                warmup_steps=warmup,
+                measure_steps=2,
+                trace_step=trace if traced else None,
+                reduce_step=reduce_step,
+            )[0]
+            assert not engine.has_work()
+            return record
+        finally:
+            engine.close()
+
+    baseline, traced = run(False), run(True)
+    for field in (
+        "step_seconds",
+        "committed_tokens",
+        "measure_steps",
+        "measured_context_start_min",
+        "measured_context_end_max",
+    ):
+        assert baseline[field] == traced[field]
+
+
+@pytest.mark.parametrize("traced", [False, True])
+def test_zero_measure_steps_fail_before_any_work_or_tracing(traced):
+    raw = Runner()
+    runner = BenchmarkRunner(raw)
+    engine = Engine(runner)
+    traces = []
+    try:
+        with pytest.raises(ValueError, match="measure_steps must be an integer >= 1"):
+            run_sweep(
+                engine,
+                [BenchCase(phase="decode", context_length=4, batch_size=1)],
+                runner=runner,
+                prompt_tokens=[1],
+                warmup_steps=0,
+                measure_steps=0,
+                trace_step=(lambda *args: traces.append(args)) if traced else None,
+            )
+        assert not raw.plans and not traces and not engine.has_work()
+    finally:
+        engine.close()
+
+
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
 def test_trace_failure_cleans_up_requests(phase):
     runner = BenchmarkRunner(Runner(drafts=4), accepted_drafts=0)

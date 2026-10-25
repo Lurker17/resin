@@ -19,6 +19,72 @@ def test_model_defaults_build_valid_natural_sweeps(name):
     assert options["draft_tokens"] == spec.draft_tokens
     assert options["accepted_drafts"] is None
     assert options["balanced_experts"] is False
+    assert [
+        (case["context_length"], case["batch_size"])
+        for case in cases
+        if case["phase"] == "prefill"
+    ] == [(length, 1) for length in (4096, 8192, 16384, 32768, 65536)]
+    assert [
+        (case["context_length"], case["batch_size"])
+        for case in cases
+        if case["phase"] == "decode"
+    ] == [(8192, batch) for batch in (1, 2, 4, 8, 16, 32, 64)]
+
+
+def test_phase_specific_sweeps_override_shared_values():
+    args = bench.argument_parser().parse_args(
+        [
+            "--model",
+            "glm-5.3-flash",
+            "--context-lengths",
+            "2048",
+            "--batch-sizes",
+            "2",
+            "--prefill-context-lengths",
+            "4096,8192",
+            "--prefill-batch-sizes",
+            "1",
+            "--decode-context-lengths",
+            "8192",
+            "--decode-batch-sizes",
+            "1,4",
+        ]
+    )
+    _, cases, _, options = bench._configuration(args)
+    assert [
+        (case["phase"], case["context_length"], case["batch_size"]) for case in cases
+    ] == [
+        ("prefill", 4096, 1),
+        ("prefill", 8192, 1),
+        ("decode", 8192, 1),
+        ("decode", 8192, 4),
+    ]
+    assert options["prefill_chunk_size"] == 8192
+
+
+def test_shared_sweep_options_remain_compatible():
+    args = bench.argument_parser().parse_args(
+        [
+            "--model",
+            "glm-5.3-flash",
+            "--context-lengths",
+            "1024,2048",
+            "--batch-sizes",
+            "1,2",
+            "--prefill-chunk-size",
+            "512",
+        ]
+    )
+    _, cases, _, options = bench._configuration(args)
+    assert [
+        (case["phase"], case["context_length"], case["batch_size"]) for case in cases
+    ] == [
+        (phase, length, batch)
+        for phase in ("prefill", "decode")
+        for length in (1024, 2048)
+        for batch in (1, 2)
+    ]
+    assert options["prefill_chunk_size"] == 512
 
 
 def test_deepseek_world_override_scales_replica_and_expert_axes():

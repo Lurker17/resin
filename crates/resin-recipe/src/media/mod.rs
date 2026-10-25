@@ -7,6 +7,7 @@ use crate::Error;
 
 pub mod deepseek;
 pub mod gemma;
+pub mod glm;
 pub mod inkling;
 pub mod qwen;
 

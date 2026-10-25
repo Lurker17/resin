@@ -125,6 +125,12 @@ def load_evaluation(path: Path, limit: int):
 def extract_answer(text: str, labels: str) -> str | None:
     """Require all explicit answers to agree, rejecting ambiguous declarations."""
 
+    def unbold(value):
+        value = value.strip()
+        # Do not turn prose such as "**A** or **B**" into a declaration.
+        match = re.fullmatch(r"\*\*([^*]+)\*\*", value)
+        return match[1].strip() if match else value
+
     def letter(value):
         match = re.fullmatch(
             r"(?:([A-Z])|\(([A-Z])\)|\[([A-Z])\])[.,;:!?]*", value.strip()
@@ -134,12 +140,39 @@ def extract_answer(text: str, labels: str) -> str | None:
     answers = set()
     boxed = r"\\boxed\{([^{}]*)\}"
     for line in text.splitlines():
+        if re.match(r"^\s*\*\*[A-Z]\*\*\s+(?i:or|and)\b", line):
+            return None
+        plain = unbold(line)
+        bold_line = plain != line.strip()
         declaration = re.match(
-            r"^\s*(?:final\s+answer|answer)\s*[:=](.*)$", line, re.IGNORECASE
+            r"^\s*(?:final\s+answer|answer)\s*[:=](.*)$", plain, re.IGNORECASE
         )
-        value = declaration[1].strip() if declaration else line.strip()
+        value = unbold(declaration[1]) if declaration else plain
+        selected = re.fullmatch(r"\*\*([A-Z])\*\*\s*[—–:-]\s*(\S.*)", value)
+        if selected:
+            # A bold selected letter followed by an explanation is an explicit
+            # declaration; apply the same ambiguity checks as a bold option.
+            value = f"{selected[1]}. {selected[2]}"
+            bold_line = True
         if answer := letter(value):
             answers.add(answer)
+        elif (declaration or bold_line) and (
+            option := re.fullmatch(r"([A-Z])\.\s+(\S.*)", value)
+        ):
+            # A selected option may include its text. Limit this to explicit
+            # answer declarations or a complete bold line, so incidental prose
+            # and an ordinary A./B. option list are not scored as answers.
+            suffix = option[2]
+            if (
+                re.search(r"\b(?i:or|and)\s+(?:(?i:option)\s+)?[A-Z]\b", suffix)
+                or re.search(r"(?:^|\s)[A-Z][.)]\s+", suffix)
+                or re.search(r"\b[A-Z]\s*[/,]\s*[A-Z]\b", suffix)
+                or letter(suffix)
+                or "\\boxed" in suffix
+                or re.search(r"\b(?:final\s+answer|answer)\s*[:=]", suffix, re.I)
+            ):
+                return None
+            answers.add(option[1])
         elif "\\boxed" in value:
             boxes = re.findall(boxed, value)
             # A box may be repeated, but surrounding alternatives or prose on
@@ -415,7 +448,7 @@ async def check_server(client, args, *, on_update=None):
                 **request_body(
                     model,
                     f"Cache check {uuid.uuid4().hex}. "
-                    + "Remember this passage. " * 256
+                    + "Remember this passage. " * args.prefix_cache_repeats
                     + "Reply OK.",
                     1,
                 ),
@@ -428,7 +461,12 @@ async def check_server(client, args, *, on_update=None):
                 client, Case(name="prefix-repeat", body=body), args.timeout
             )
             if not first["ok"] or not second["ok"]:
-                record("prefix_cache", "failed", results=[first, second])
+                record(
+                    "prefix_cache",
+                    "failed",
+                    prompt_repetitions=args.prefix_cache_repeats,
+                    results=[first, second],
+                )
             elif any(
                 "cached_prompt_tokens" not in result for result in (first, second)
             ):
@@ -436,6 +474,7 @@ async def check_server(client, args, *, on_update=None):
                     "prefix_cache",
                     "skipped",
                     reason="response has no per-request cached-token telemetry",
+                    prompt_repetitions=args.prefix_cache_repeats,
                     results=[first, second],
                 )
             else:
@@ -445,6 +484,7 @@ async def check_server(client, args, *, on_update=None):
                     if second["prompt_tokens"] == first["prompt_tokens"]
                     and second["cached_prompt_tokens"] > first["cached_prompt_tokens"]
                     else "failed",
+                    prompt_repetitions=args.prefix_cache_repeats,
                     results=[first, second],
                 )
 
@@ -551,7 +591,14 @@ async def check_server(client, args, *, on_update=None):
                     client,
                     Case(
                         name=f"eval-{index}",
-                        body=request_body(model, prompt, args.eval_max_tokens),
+                        body={
+                            **request_body(model, prompt, args.eval_max_tokens),
+                            **(
+                                {"reasoning_effort": args.eval_reasoning_effort}
+                                if args.eval_reasoning_effort is not None
+                                else {}
+                            ),
+                        },
                     ),
                     args.timeout,
                 )
@@ -560,24 +607,32 @@ async def check_server(client, args, *, on_update=None):
                     if result["ok"]
                     else None
                 )
+                truncated = result.get("finish_reason") == "length"
                 results.append(
                     {
                         **result,
                         "answer": row["answer"],
                         "predicted": predicted,
-                        "correct": predicted == row["answer"],
+                        "truncated": truncated,
+                        "correct": predicted == row["answer"] and not truncated,
                     }
                 )
             correct = sum(1 for row in results if row["correct"])
             missing = sum(row["predicted"] is None for row in results)
+            truncated = sum(1 for row in results if row["truncated"])
             accuracy = correct / len(results)
             record(
                 "evaluation",
-                "passed" if not missing and accuracy >= args.min_accuracy else "failed",
+                "passed"
+                if not missing and not truncated and accuracy >= args.min_accuracy
+                else "failed",
                 source=str(args.eval_file),
+                reasoning_effort=args.eval_reasoning_effort,
+                max_tokens=args.eval_max_tokens,
                 questions=len(results),
                 correct=correct,
                 missing_answers=missing,
+                truncated_outputs=truncated,
                 accuracy=accuracy,
                 minimum_accuracy=args.min_accuracy,
                 results=results,
@@ -668,6 +723,16 @@ def parse_args(argv=None):
     parser.add_argument("--reasoning-effort", nargs="+")
     parser.add_argument("--skip-prefix-cache", action="store_true")
     parser.add_argument(
+        "--prefix-cache-repeats",
+        type=int,
+        default=256,
+        help=(
+            "Repeated phrases in the cache probe (default: 256); choose a prompt "
+            "longer than the model's state-checkpoint interval and below its context "
+            "limit. Actual prompt and cached token counts are reported."
+        ),
+    )
+    parser.add_argument(
         "--context-length",
         type=int,
         help="Configured context limit; exact boundary checking needs chat tokenization",
@@ -701,6 +766,10 @@ def parse_args(argv=None):
     )
     parser.add_argument("--eval-limit", type=int, default=20)
     parser.add_argument("--eval-max-tokens", type=int, default=256)
+    parser.add_argument(
+        "--eval-reasoning-effort",
+        help="Reasoning effort for evaluation requests only, separate from --reasoning-effort checks",
+    )
     parser.add_argument("--min-accuracy", type=float, default=0.5)
     parser.add_argument("--stress", action="store_true")
     parser.add_argument("--stress-requests", type=int, default=32)
@@ -713,6 +782,7 @@ def parse_args(argv=None):
         args.timeout,
         args.max_tokens,
         args.concurrency,
+        args.prefix_cache_repeats,
         args.repeats,
         args.max_ttft_ms,
         args.ttft_ratio,

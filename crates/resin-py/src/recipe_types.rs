@@ -721,6 +721,8 @@ pub(crate) struct RenderOptions {
     #[pyo3(get)]
     preserve_thinking: Option<bool>,
     #[pyo3(get)]
+    clear_thinking: Option<bool>,
+    #[pyo3(get)]
     add_generation_prompt: Option<bool>,
     #[pyo3(get)]
     add_vision_id: Option<bool>,
@@ -741,12 +743,13 @@ pub(crate) struct RenderOptions {
 #[pymethods]
 impl RenderOptions {
     #[new]
-    #[pyo3(signature=(*, reasoning_effort: "str | int | float | None" = None, enable_thinking=None, preserve_thinking=None, add_generation_prompt=None, add_vision_id=None, use_system_prompt=None, model_identity=None, knowledge_cutoff=None, conversation_start_date=None, auto_drop_analysis=None, thinking_mode=None, response_format=None))]
+    #[pyo3(signature=(*, reasoning_effort: "str | int | float | None" = None, enable_thinking=None, preserve_thinking=None, clear_thinking=None, add_generation_prompt=None, add_vision_id=None, use_system_prompt=None, model_identity=None, knowledge_cutoff=None, conversation_start_date=None, auto_drop_analysis=None, thinking_mode=None, response_format=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         reasoning_effort: Option<&Bound<'_, PyAny>>,
         enable_thinking: Option<bool>,
         preserve_thinking: Option<bool>,
+        clear_thinking: Option<bool>,
         add_generation_prompt: Option<bool>,
         add_vision_id: Option<bool>,
         use_system_prompt: Option<bool>,
@@ -763,6 +766,7 @@ impl RenderOptions {
                 .map_err(|_| PyValueError::new_err("reasoning_effort must be a name or number"))?,
             enable_thinking,
             preserve_thinking,
+            clear_thinking,
             add_generation_prompt,
             add_vision_id,
             use_system_prompt,

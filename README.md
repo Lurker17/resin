@@ -274,7 +274,7 @@ owning token IDs, optional prepared media, and an internal parser seed.
 `SamplingParams(stop_token_ids=...)` when
 submitting a rendered prompt to an Engine; HTTP serving uses them automatically.
 The factory returns the common `NativeRecipe` implementation. Supported names
-are `gpt_oss`, `deepseek_v41`, `gemma4`, `inkling`, `lfm2`, `qwen3_5`, and
+are `gpt_oss`, `deepseek_v41`, `glm5_3_flash`, `gemma4`, `inkling`, `lfm2`, `qwen3_5`, and
 `qwen3_8`. Supply formatting defaults directly, for example
 `get_native_recipe("gpt_oss", tokenizer, reasoning_effort="high")`.
 Native recipes infer model stops by default;
@@ -376,6 +376,21 @@ not qualify the supported attention-TP contract. Image inputs use the checkpoint
 vision tower and aligner through the shared HTTP media interface, with causal
 chunked prefill and image-aware prefix-cache keys.
 See the family README for memory and optimization limits.
+
+[GLM-5.3-Flash NVFP4](resin/models/glm5_3_flash/README.md) runs on four B200s with
+EP4 and attention DP4, native reasoning/tools and still images, full decode
+graphs, and optional NextN/MTP. Source `878d83d4` completes the controlled 8K
+K0/K3 curve through batch 64 with 508 exact matched-batch request prefixes, and
+the five-point 4K–64K prefill curve with four concurrent requests. Measured MTP3
+reaches 107.18 output tokens/s/user at batch one and 2455.95 tokens/s/GPU at batch
+64; the separately labeled 75%-acceptance projection gives 143.37 and 3077.33.
+These use four authored tasks with filler. Outputs can vary across batch
+schedules; retirement lifecycle checks pass. The per-bucket runtime passed
+446 B200 and 2158 CPU tests. Serving defaults are context 16384, prefill chunk
+8192 and target-only decode; final `c2de4fba` HTTP and compiler/runner audits
+remain pending. K3 is opt-in. Use registry key `glm-5.3-flash`. The family README
+links measured and projected figures, raw results, 8K traces, source provenance
+and qualification limits.
 
 Current limits include no prefill/decode disaggregation. A
 [distributed coordinator prototype](docs/distributed.md) covers explicit TP, CP,

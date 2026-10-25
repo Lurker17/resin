@@ -48,18 +48,27 @@ PROPERTY_TYPES = {
             ),
             ("InklingMedia", ("image_positions",)),
             ("Qwen35Media", ("image_positions",)),
+            ("Glm53FlashMedia", ("image_positions",)),
         )
         for name in ("token_ids", "cache_key", *extra)
     },
     **{
         (owner, "token_spans"): "tuple[MediaTokenSpan, ...]"
-        for owner in ("DeepSeekV41Media", "Gemma4Media", "InklingMedia", "Qwen35Media")
+        for owner in (
+            "DeepSeekV41Media",
+            "Gemma4Media",
+            "InklingMedia",
+            "Qwen35Media",
+            "Glm53FlashMedia",
+        )
     },
     **{
         (owner, name): f"npt.NDArray[np.{dtype}]" + (" | None" if optional else "")
         for owner, name, dtype, optional in (
             ("InklingMedia", "pixel_values", "float32", True),
             ("Qwen35Media", "pixel_values", "float32", False),
+            ("Glm53FlashMedia", "pixel_values", "float32", False),
+            ("Glm53FlashMedia", "image_grid_thw", "int64", False),
             ("Qwen35Media", "image_grid_thw", "int64", False),
             ("Qwen35Media", "position_ids", "int64", False),
             ("Gemma4Media", "pixel_values", "float32", True),

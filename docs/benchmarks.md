@@ -13,7 +13,7 @@ Download pinned weights on a Modal CPU worker, then sweep prefill and decode:
 ```bash
 uv run scripts/bench.py --model deepseek-v41 --backend modal --download-only
 uv run scripts/bench.py --model deepseek-v41 --backend modal \
-  --context-lengths 4096,8192 --batch-sizes 1,2,4,8 \
+  --prefill-context-lengths 4096,8192 --decode-context-lengths 8192 \
   --output bench/deepseek-v41.jsonl --trace-dir bench/traces --plot
 ```
 
@@ -22,7 +22,7 @@ For local GPUs, point to an existing checkpoint:
 ```bash
 uv run scripts/bench.py --model gpt-oss-20b --backend local \
   --checkpoint /path/to/gpt-oss-20b \
-  --context-lengths 4096,8192 --batch-sizes 1,2,4,8 \
+  --prefill-context-lengths 4096,8192 --decode-context-lengths 8192 \
   --output bench/gpt-oss-20b.jsonl --trace-dir bench/gpt-oss-traces
 uv run scripts/plot_bench.py bench/gpt-oss-20b.jsonl
 ```
@@ -34,7 +34,7 @@ existing files by validating and atomically publishing their inventory markers.
 It does not download or read weight bodies. Serving uses the same inventories.
 
 Available model keys are `gpt-oss-20b`, `gpt-oss-120b`, `deepseek-v41`, `gemma4`,
-`qwen3_5`, and `inkling`. The Qwen runner currently pins Qwen3.8-27B. Hardware,
+`glm-5.3-flash`, `qwen3_5`, and `inkling`. The Qwen runner currently pins Qwen3.8-27B. Hardware,
 parallelism, draft count, and memory defaults come from each registry entry.
 DeepSeek defaults to four B300s with ADP4/EP4, attention TP1, DeepGEMM experts,
 and three drafts; GPT-OSS has no draft model. Override topology with
@@ -44,10 +44,42 @@ accepts H100 or H200; other presets currently require their configured GPU.
 Record files retain the actual device name.
 
 Use `--phases prefill`, `--phases decode`, or `--phases prefill,decode` (default).
+The default prefill curve uses **4K, 8K, 16K, 32K, and 64K prompt tokens**, with
+one request per attention replica. Decode defaults to an **8K initial context**
+and batches of **1, 2, 4, 8, 16, 32, and 64**. During iteration, use
+`--prefill-context-lengths 4096,8192` before expanding to the full curve. Set
+`--prefill-context-lengths` / `--decode-context-lengths` and
+`--prefill-batch-sizes` / `--decode-batch-sizes` independently. The existing
+`--context-lengths` and `--batch-sizes` set both phases; phase-specific options
+take precedence. Choose a sweep that fits the model and available cache memory.
+Use `--decode-batch-sizes 1,2,4,8` for a smaller initial sweep, then extend through
+16/32/64 to find the throughput plateau and its interactivity cost. Cache
+preflight rejects an oversized cohort instead of silently measuring fewer users.
+One resident sweep shares a context capacity large enough for its longest case
+plus generation headroom; records include `context_capacity`. Run the full
+prefill curve and the 8K decode curve separately when a larger sparse-index or
+graph capacity would change decode cost:
+
+```bash
+uv run scripts/bench.py --model glm-5.3-flash --backend modal \
+  --phases prefill --prefill-chunk-size 8192 --output bench/glm-prefill.jsonl --plot
+uv run scripts/bench.py --model glm-5.3-flash --backend modal \
+  --phases decode --output bench/glm-decode.jsonl --plot
+```
+
 Batch sizes count requests **per attention-DP replica**; the global batch is
 `batch_size * attn_dp`. Throughput is divided by total GPU count, including TP/CP
-participants. `--prefill-chunk-size`, `--prefill-graph`, and `--decode-graph`
-control execution policy. The default graph policies are breakable prefill and
+participants. For example, attention-DP4 with batch one at 8K runs four concurrent
+8192-token prompts, totaling 32768 input tokens per complete cohort.
+`--prefill-chunk-size`, `--prefill-graph`, and `--decode-graph`
+control execution policy. Prompt length is the total input; chunk size is the
+maximum work submitted per request in an Engine step. The benchmark CLI defaults
+to the model's chunk size or 4K, whichever is larger, subject to kernel limits
+(single-GPU GPT-OSS also limits the flattened batch). This benchmark default is
+independent of a smaller serving chunk chosen for prefix reuse or scheduling.
+Use `--prefill-chunk-size 4096` or `8192` to compare chunk policies where supported;
+each plotted latency still covers the **whole prompt**, including every chunk.
+The default graph policies are breakable prefill and
 full decode. Each point uses five warmup steps and twenty measured steps unless
 overridden with `--warmup-steps` and `--measure-steps`.
 
@@ -212,6 +244,11 @@ graph policies, expert backend, quantization, prefill budget, and startup times.
 The source digest prevents combining different uncommitted source under one
 Git commit. Timing measures real Engine execution, not a synthetic latency model.
 
+For a resident sweep, `scripts.bench.run_benchmark(..., progress_path=...)` can
+retain completed cases as an atomic JSON array if a later worker or case fails.
+The path must be new; successful runs also add NUMA placement to that snapshot.
+This optional progress file is separate from the CLI's appended JSONL results.
+
 For an existing Engine, wrap the model runner in `BenchmarkRunner` before
 Engine construction and graph capture, then call `resin.bench.run_sweep` with
 `BenchCase` values. The caller owns Engine lifetime. Supply
@@ -234,6 +271,11 @@ cache hits, and a context-size TTFT sweep. `--image` adds a built-in image test
 settings. `--stress` adds the existing HTTP stress/robustness suite. Unsupported
 capabilities are reported as skipped where evidence cannot be collected; use
 `--skip-prefix-cache` or `--skip-logprobs` for intentionally disabled features.
+For recurrent models, the repeated prompt must extend past a reusable state
+checkpoint. Increase `--prefix-cache-repeats` from its default 256 phrases when
+needed, keeping the prompt inside the server's context limit. The report records
+the repetition count, actual prompt tokens, and cached tokens for both requests;
+a zero-hit repeat still fails the check.
 
 The context sweep uses fresh early prefixes to avoid cache hits hiding prefill
 work. Requested sizes are repeated-word counts; records include actual server

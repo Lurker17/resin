@@ -733,6 +733,9 @@ pub(crate) fn get_native_recipe(
             resin_recipe::deepseek::DeepSeekV41Recipe::new(recipe_params(params)?)
                 .map_err(recipe_error)?,
         ),
+        "glm5_3_flash" => Box::new(resin_recipe::glm::Glm53FlashRecipe::new(recipe_params(
+            image_processor_params(tokenizer, params)?,
+        )?)),
         "gemma4" => {
             if params.get("media_config").is_none_or(Value::is_null) {
                 params.insert(

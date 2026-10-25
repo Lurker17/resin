@@ -2,7 +2,7 @@
 
 Stock model conversation formats, independent of Python, HTTP and GPU execution.
 Concrete recipes implement the `Recipe` trait for GPT-OSS, DeepSeek V4.1,
-Inkling, Qwen3.5/3.8, Gemma4 or LFM2.5. Each family owns serde construction
+Inkling, Qwen3.5/3.8, Gemma4, GLM-5.3-Flash or LFM2.5. Each family owns serde construction
 parameters, such as `GptOssRecipeParams`, and its matching renderer, parser,
 message policy and stop markers.
 
@@ -85,3 +85,18 @@ Run `cargo test -p resin-recipe` for native invariants,
 See the [fuzz README](../../tests/recipe_fuzz/README.md) for budgets and oracle
 limitations and the [Python API example](../../README.md#modal-http-endpoints)
 for native recipe construction.
+
+GLM-5.3-Flash uses `get_native_recipe("glm5_3_flash", tokenizer)`, with the
+NVIDIA NVFP4 checkpoint template pinned to
+`da920bb0b9f4a06727223a349e55468e38352348`. It supports text conversations,
+reasoning (`low`, `high`, or the template default `max`), `clear_thinking`, and
+GLM XML tool calls. The three static stops are `<|endoftext|>`, `<|user|>` and
+`<|observation|>`. The template always opens `<think>`; it does not implement an
+`enable_thinking=False` mode. Images use a native processor with aspect-preserving
+bicubic resize, a black-padded aligned canvas, CLIP normalization, and the
+checkpoint's temporal/spatial patch order. `Glm53FlashMedia` owns pixel/grid
+buffers, absolute image positions and pixel-dependent cache identity; it supports
+distributed transport and partial image prefill. Native defaults match the pinned
+checkpoint; `media_config` can supply the checkpoint's `image_processor` object.
+Video and audio input remain unsupported. The pinned text/format oracle is `tests/fixtures/glm_hf.json`;
+`licenses/glm-MIT.txt` retains the upstream Z.AI notice.

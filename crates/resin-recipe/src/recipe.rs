@@ -67,6 +67,7 @@ pub enum BlockKind {
 pub enum MediaConfig {
     DeepSeek(media::deepseek::Config, Option<u32>),
     Gemma(media::gemma::Config),
+    Glm(media::glm::Config),
     Inkling(media::inkling::Config),
     Qwen(media::qwen::Config),
 }

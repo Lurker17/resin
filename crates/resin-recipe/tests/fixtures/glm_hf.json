@@ -1,0 +1,705 @@
+{
+  "source": {
+    "repo": "nvidia/GLM-5.3-Flash-NVFP4",
+    "revision": "da920bb0b9f4a06727223a349e55468e38352348"
+  },
+  "template": "chat_template.jinja",
+  "cases": [
+    {
+      "name": "simple",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          }
+        ]
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello 🦀<|assistant|><think>"
+    },
+    {
+      "name": "effort_low",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          }
+        ],
+        "reasoning_effort": "low"
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>Hello 🦀<|assistant|><think>"
+    },
+    {
+      "name": "effort_high",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          }
+        ],
+        "reasoning_effort": "high"
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hello 🦀<|assistant|><think>"
+    },
+    {
+      "name": "effort_max",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          }
+        ],
+        "reasoning_effort": "max"
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello 🦀<|assistant|><think>"
+    },
+    {
+      "name": "effort_medium",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          }
+        ],
+        "reasoning_effort": "medium"
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello 🦀<|assistant|><think>"
+    },
+    {
+      "name": "system",
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Be precise."
+          },
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          }
+        ]
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>Be precise.<|user|>Hello 🦀<|assistant|><think>"
+    },
+    {
+      "name": "no_generation",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          }
+        ],
+        "add_generation_prompt": false
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello 🦀"
+    },
+    {
+      "name": "assistant_history",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          },
+          {
+            "role": "assistant",
+            "content": "  answer  ",
+            "reasoning_content": "reason"
+          },
+          {
+            "role": "user",
+            "content": "Continue"
+          }
+        ]
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello 🦀<|assistant|><think>reason</think>answer<|user|>Continue<|assistant|><think>"
+    },
+    {
+      "name": "clear_old_thinking",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          },
+          {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "old"
+          },
+          {
+            "role": "user",
+            "content": "Continue"
+          },
+          {
+            "role": "assistant",
+            "content": "next",
+            "reasoning_content": "new"
+          }
+        ],
+        "clear_thinking": true
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello 🦀<|assistant|><think></think>answer<|user|>Continue<|assistant|><think>new</think>next<|assistant|><think>"
+    },
+    {
+      "name": "inline_reasoning",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>why</think>  yes  "
+          }
+        ]
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello 🦀<|assistant|><think>why</think>yes<|assistant|><think>"
+    },
+    {
+      "name": "tools",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "weather",
+              "description": "Weather in 東京",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "days": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              },
+              "strict": true
+            }
+          },
+          {
+            "name": "later",
+            "description": "A deferred tool",
+            "defer_loading": true,
+            "parameters": {
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"weather\", \"description\": \"Weather in 東京\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Hello 🦀<|assistant|><think>"
+    },
+    {
+      "name": "tool_calls",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          },
+          {
+            "role": "assistant",
+            "content": "Looking it up",
+            "reasoning_content": " Need data ",
+            "tool_calls": [
+              {
+                "id": "b",
+                "function": {
+                  "name": "weather",
+                  "arguments": {
+                    "city": "東京",
+                    "days": 2
+                  }
+                }
+              },
+              {
+                "id": "a",
+                "function": {
+                  "name": "later",
+                  "arguments": {}
+                }
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "weather",
+              "description": "Weather in 東京",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "days": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              },
+              "strict": true
+            }
+          },
+          {
+            "name": "later",
+            "description": "A deferred tool",
+            "defer_loading": true,
+            "parameters": {
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"weather\", \"description\": \"Weather in 東京\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Hello 🦀<|assistant|><think> Need data </think>Looking it up<tool_call>weather<arg_key>city</arg_key><arg_value>東京</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call><tool_call>later</tool_call><|assistant|><think>"
+    },
+    {
+      "name": "tool_results_sorted",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          },
+          {
+            "role": "assistant",
+            "content": "Looking it up",
+            "reasoning_content": " Need data ",
+            "tool_calls": [
+              {
+                "id": "b",
+                "function": {
+                  "name": "weather",
+                  "arguments": {
+                    "city": "東京",
+                    "days": 2
+                  }
+                }
+              },
+              {
+                "id": "a",
+                "function": {
+                  "name": "later",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "a",
+            "content": "second"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "b",
+            "content": "first"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "weather",
+              "description": "Weather in 東京",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "days": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              },
+              "strict": true
+            }
+          },
+          {
+            "name": "later",
+            "description": "A deferred tool",
+            "defer_loading": true,
+            "parameters": {
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"weather\", \"description\": \"Weather in 東京\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Hello 🦀<|assistant|><think> Need data </think>Looking it up<tool_call>weather<arg_key>city</arg_key><arg_value>東京</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call><tool_call>later</tool_call><|observation|><tool_response>first</tool_response><tool_response>second</tool_response><|assistant|><think>"
+    },
+    {
+      "name": "tool_results_unsorted",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          },
+          {
+            "role": "assistant",
+            "content": "Looking it up",
+            "reasoning_content": " Need data ",
+            "tool_calls": [
+              {
+                "id": "b",
+                "function": {
+                  "name": "weather",
+                  "arguments": {
+                    "city": "東京",
+                    "days": 2
+                  }
+                }
+              },
+              {
+                "id": "a",
+                "function": {
+                  "name": "later",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "second"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "b",
+            "content": "first"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "weather",
+              "description": "Weather in 東京",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "days": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              },
+              "strict": true
+            }
+          },
+          {
+            "name": "later",
+            "description": "A deferred tool",
+            "defer_loading": true,
+            "parameters": {
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"weather\", \"description\": \"Weather in 東京\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Hello 🦀<|assistant|><think> Need data </think>Looking it up<tool_call>weather<arg_key>city</arg_key><arg_value>東京</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call><tool_call>later</tool_call><|observation|><tool_response>second</tool_response><tool_response>first</tool_response><|assistant|><think>"
+    },
+    {
+      "name": "tool_results_duplicate",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          },
+          {
+            "role": "assistant",
+            "content": "Looking it up",
+            "reasoning_content": " Need data ",
+            "tool_calls": [
+              {
+                "id": "b",
+                "function": {
+                  "name": "weather",
+                  "arguments": {
+                    "city": "東京",
+                    "days": 2
+                  }
+                }
+              },
+              {
+                "id": "a",
+                "function": {
+                  "name": "later",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "a",
+            "content": "one"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "a",
+            "content": "two"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "weather",
+              "description": "Weather in 東京",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "days": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              },
+              "strict": true
+            }
+          },
+          {
+            "name": "later",
+            "description": "A deferred tool",
+            "defer_loading": true,
+            "parameters": {
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"weather\", \"description\": \"Weather in 東京\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Hello 🦀<|assistant|><think> Need data </think>Looking it up<tool_call>weather<arg_key>city</arg_key><arg_value>東京</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call><tool_call>later</tool_call><|observation|><tool_response>one</tool_response><tool_response>two</tool_response><|assistant|><think>"
+    },
+    {
+      "name": "tool_outputs_list",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          },
+          {
+            "role": "assistant",
+            "content": "Looking it up",
+            "reasoning_content": " Need data ",
+            "tool_calls": [
+              {
+                "id": "b",
+                "function": {
+                  "name": "weather",
+                  "arguments": {
+                    "city": "東京",
+                    "days": 2
+                  }
+                }
+              },
+              {
+                "id": "a",
+                "function": {
+                  "name": "later",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": [
+              {
+                "id": "a",
+                "output": "second"
+              },
+              {
+                "id": "b",
+                "output": [
+                  {
+                    "type": "text",
+                    "text": "first"
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "weather",
+              "description": "Weather in 東京",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "days": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              },
+              "strict": true
+            }
+          },
+          {
+            "name": "later",
+            "description": "A deferred tool",
+            "defer_loading": true,
+            "parameters": {
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"weather\", \"description\": \"Weather in 東京\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Hello 🦀<|assistant|><think> Need data </think>Looking it up<tool_call>weather<arg_key>city</arg_key><arg_value>東京</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call><tool_call>later</tool_call><|observation|><tool_response>first</tool_response><tool_response>second</tool_response><|assistant|><think>"
+    },
+    {
+      "name": "deferred_tool_reference",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello 🦀"
+          },
+          {
+            "role": "assistant",
+            "content": "Looking it up",
+            "reasoning_content": " Need data ",
+            "tool_calls": [
+              {
+                "id": "b",
+                "function": {
+                  "name": "weather",
+                  "arguments": {
+                    "city": "東京",
+                    "days": 2
+                  }
+                }
+              },
+              {
+                "id": "a",
+                "function": {
+                  "name": "later",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "a",
+            "content": [
+              {
+                "type": "tool_reference",
+                "name": "later"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "weather",
+              "description": "Weather in 東京",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "days": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              },
+              "strict": true
+            }
+          },
+          {
+            "name": "later",
+            "description": "A deferred tool",
+            "defer_loading": true,
+            "parameters": {
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"weather\", \"description\": \"Weather in 東京\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Hello 🦀<|assistant|><think> Need data </think>Looking it up<tool_call>weather<arg_key>city</arg_key><arg_value>東京</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call><tool_call>later</tool_call><|observation|><tool_response><tools>\n{\"name\": \"later\", \"description\": \"A deferred tool\", \"parameters\": {\"type\": \"object\"}}\n</tools></tool_response><|assistant|><think>"
+    },
+    {
+      "name": "content_blocks",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              "one",
+              {
+                "type": "text",
+                "text": "two"
+              },
+              {
+                "type": "image_url",
+                "image_url": "x"
+              },
+              {
+                "type": "video",
+                "video": "v"
+              },
+              {
+                "type": "audio",
+                "audio": "a"
+              }
+            ]
+          }
+        ]
+      },
+      "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>onetwo<|begin_of_image|><|image|><|end_of_image|><|begin_of_video|><|video|><|end_of_video|><|begin_of_audio|><|end_of_audio|><|assistant|><think>"
+    }
+  ]
+}

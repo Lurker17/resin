@@ -260,6 +260,65 @@ impl Qwen35Media {
 }
 
 #[pyclass(frozen, module = "resin._resin")]
+pub(crate) struct Glm53FlashMedia {
+    identity: Identity,
+    positions: Vec<usize>,
+    #[pyo3(get, name = "image_token_id")]
+    marker: u32,
+    #[pyo3(get, name = "spatial_merge_size")]
+    merge: usize,
+    #[pyo3(get, name = "pixel_values")]
+    pixels: Py<PyArrayDyn<f32>>,
+    #[pyo3(get, name = "image_grid_thw")]
+    grids: Py<PyArrayDyn<i64>>,
+}
+#[pymethods]
+impl Glm53FlashMedia {
+    #[new]
+    #[pyo3(signature=(*, token_ids, image_positions, pixel_values, image_grid_thw, spatial_merge_size, image_token_id))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        token_ids: Vec<u32>,
+        image_positions: Vec<usize>,
+        pixel_values: &Bound<'_, PyAny>,
+        image_grid_thw: &Bound<'_, PyAny>,
+        spatial_merge_size: usize,
+        image_token_id: u32,
+    ) -> PyResult<Self> {
+        Self::build(
+            py,
+            token_ids,
+            image_positions,
+            f32_tensor(pixel_values)?,
+            i64_tensor(image_grid_thw)?,
+            spatial_merge_size,
+            image_token_id,
+        )
+    }
+    #[getter]
+    fn token_ids(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        tuple(py, self.identity.tokens.iter().copied())
+    }
+    #[getter]
+    fn image_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        tuple(py, self.positions.iter().copied())
+    }
+    #[getter]
+    fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        spans(py, [])
+    }
+    #[getter]
+    fn digest(&self) -> &str {
+        &self.identity.digest
+    }
+    #[getter]
+    fn cache_key(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        tuple(py, self.identity.keys.iter().copied())
+    }
+}
+
+#[pyclass(frozen, module = "resin._resin")]
 pub(crate) struct Gemma4Media {
     identity: Identity,
     types: Vec<u8>,
@@ -601,6 +660,75 @@ impl DeepSeekV41Media {
         })
     }
 }
+fn validate_packed_images(
+    tokens: &[u32],
+    positions: &[usize],
+    pixels: &Tensor<f32>,
+    grids: &Tensor<i64>,
+    merge: usize,
+    marker: u32,
+    family: &str,
+) -> PyResult<Vec<(usize, usize)>> {
+    if positions.is_empty()
+        || positions.iter().any(|&p| tokens.get(p) != Some(&marker))
+        || positions.windows(2).any(|p| p[0] >= p[1])
+    {
+        return Err(error(format!(
+            "{family} image placeholders do not match image token IDs"
+        )));
+    }
+    if pixels.shape.len() != 2 {
+        return Err(error("pixel_values must have rank 2"));
+    }
+    if merge == 0 || grids.shape.len() != 2 || grids.shape[1] != 3 {
+        return Err(error(format!(
+            "{family} image grids must have shape [images, 3] and a positive merge size"
+        )));
+    }
+    // Grids retain image boundaries even when two expansions are adjacent.
+    let mut ranges = Vec::new();
+    let mut remaining = positions;
+    let mut patch_count = 0usize;
+    for grid in grids.data.as_chunks::<3>().0 {
+        let dims = grid.map(|d| usize::try_from(d).ok().filter(|&d| d > 0));
+        let [Some(t), Some(h), Some(w)] = dims else {
+            return Err(error(format!("{family} image grids must be positive")));
+        };
+        if !h.is_multiple_of(merge) || !w.is_multiple_of(merge) {
+            return Err(error(format!(
+                "{family} image grid must be divisible by spatial merge size"
+            )));
+        }
+        patch_count = t
+            .checked_mul(h)
+            .and_then(|n| n.checked_mul(w))
+            .and_then(|n| patch_count.checked_add(n))
+            .ok_or_else(|| error(format!("{family} image grid overflows")))?;
+        let count = t
+            .checked_mul(h / merge)
+            .and_then(|n| n.checked_mul(w / merge))
+            .filter(|&n| n <= remaining.len())
+            .ok_or_else(|| {
+                error(format!(
+                    "{family} image grid does not match its placeholder range"
+                ))
+            })?;
+        let (image, tail) = remaining.split_at(count);
+        if image.windows(2).any(|p| p[1] != p[0] + 1) {
+            return Err(error(format!(
+                "{family} image placeholders must be contiguous within each image"
+            )));
+        }
+        ranges.push((image[0], count));
+        remaining = tail;
+    }
+    if !remaining.is_empty() || patch_count != pixels.shape[0] {
+        return Err(error(format!(
+            "{family} image grids do not match pixels and placeholders"
+        )));
+    }
+    Ok(ranges)
+}
 impl Qwen35Media {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
@@ -612,60 +740,8 @@ impl Qwen35Media {
         merge: usize,
         marker: u32,
     ) -> PyResult<Self> {
-        if positions.is_empty()
-            || positions.iter().any(|&p| tokens.get(p) != Some(&marker))
-            || positions.windows(2).any(|p| p[0] >= p[1])
-        {
-            return Err(error(
-                "Qwen image placeholders do not match image token IDs",
-            ));
-        }
-        if pixels.shape.len() != 2 {
-            return Err(error("pixel_values must have rank 2"));
-        }
-        if merge == 0 || grids.shape.len() != 2 || grids.shape[1] != 3 {
-            return Err(error(
-                "Qwen image grids must have shape [images, 3] and a positive merge size",
-            ));
-        }
-        // Grids retain image boundaries even when two expansions are adjacent.
-        let mut ranges = Vec::new();
-        let mut remaining = positions.as_slice();
-        let mut patch_count = 0usize;
-        for grid in grids.data.as_chunks::<3>().0 {
-            let dims = grid.map(|d| usize::try_from(d).ok().filter(|&d| d > 0));
-            let [Some(t), Some(h), Some(w)] = dims else {
-                return Err(error("Qwen image grids must be positive"));
-            };
-            if !h.is_multiple_of(merge) || !w.is_multiple_of(merge) {
-                return Err(error(
-                    "Qwen image grid must be divisible by spatial merge size",
-                ));
-            }
-            patch_count = t
-                .checked_mul(h)
-                .and_then(|n| n.checked_mul(w))
-                .and_then(|n| patch_count.checked_add(n))
-                .ok_or_else(|| error("Qwen image grid overflows"))?;
-            let count = t
-                .checked_mul(h / merge)
-                .and_then(|n| n.checked_mul(w / merge))
-                .filter(|&n| n <= remaining.len())
-                .ok_or_else(|| error("Qwen image grid does not match its placeholder range"))?;
-            let (image, tail) = remaining.split_at(count);
-            if image.windows(2).any(|p| p[1] != p[0] + 1) {
-                return Err(error(
-                    "Qwen image placeholders must be contiguous within each image",
-                ));
-            }
-            ranges.push((image[0], count));
-            remaining = tail;
-        }
-        if !remaining.is_empty() || patch_count != pixels.shape[0] {
-            return Err(error(
-                "Qwen image grids do not match pixels and placeholders",
-            ));
-        }
+        let ranges =
+            validate_packed_images(&tokens, &positions, &pixels, &grids, merge, marker, "Qwen")?;
         let (rope, delta) =
             qwen::mrope_positions(tokens.len(), &ranges, &grids, merge).map_err(error)?;
         let mut hash = Sha256::new();
@@ -681,6 +757,41 @@ impl Qwen35Media {
             grids: array(py, grids)?,
             rope: array(py, rope)?,
             delta,
+        })
+    }
+}
+impl Glm53FlashMedia {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build(
+        py: Python<'_>,
+        tokens: Vec<u32>,
+        positions: Vec<usize>,
+        pixels: Tensor<f32>,
+        grids: Tensor<i64>,
+        merge: usize,
+        marker: u32,
+    ) -> PyResult<Self> {
+        validate_packed_images(&tokens, &positions, &pixels, &grids, merge, marker, "GLM")?;
+        if grids
+            .data
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .any(|grid| grid[0] != 1)
+        {
+            return Err(error("GLM image payload supports still images only"));
+        }
+        let mut hash = Sha256::new();
+        Digest::update(&mut hash, b"resin.glm53flash.media.v1");
+        f32_hash(&mut hash, "pixels", &pixels);
+        i64_hash(&mut hash, "grids", &grids);
+        Ok(Self {
+            identity: Identity::new(tokens, &positions, hash)?,
+            positions,
+            marker,
+            merge,
+            pixels: array(py, pixels)?,
+            grids: array(py, grids)?,
         })
     }
 }
@@ -715,6 +826,11 @@ enum MediaDescriptor {
         pixels: bool,
     },
     Qwen {
+        positions: Vec<usize>,
+        merge: usize,
+        marker: u32,
+    },
+    Glm {
         positions: Vec<usize>,
         merge: usize,
         marker: u32,
@@ -781,6 +897,16 @@ pub(crate) fn _media_to_buffers(
         push_buffer(py, &mut buffers, &value.pixels);
         push_buffer(py, &mut buffers, &value.grids);
         MediaDescriptor::Qwen {
+            positions: value.positions.clone(),
+            merge: value.merge,
+            marker: value.marker,
+        }
+    } else if let Ok(value) = media.cast::<Glm53FlashMedia>() {
+        let value = value.borrow();
+        push_values(media, &mut buffers, &value.identity.tokens);
+        push_buffer(py, &mut buffers, &value.pixels);
+        push_buffer(py, &mut buffers, &value.grids);
+        MediaDescriptor::Glm {
             positions: value.positions.clone(),
             merge: value.merge,
             marker: value.marker,
@@ -882,6 +1008,19 @@ pub(crate) fn _media_from_buffers(
             Py::new(
                 py,
                 Qwen35Media::build(py, tokens, positions, pixels, grids, merge, marker)?,
+            )?
+            .into_any()
+        }
+        MediaDescriptor::Glm {
+            positions,
+            merge,
+            marker,
+        } => {
+            let pixels = take_buffer(py, &mut buffers)?;
+            let grids = take_buffer(py, &mut buffers)?;
+            Py::new(
+                py,
+                Glm53FlashMedia::build(py, tokens, positions, pixels, grids, merge, marker)?,
             )?
             .into_any()
         }

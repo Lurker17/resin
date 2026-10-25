@@ -113,6 +113,39 @@ MODEL_SPECS = {
 }
 MODEL_SPECS.update(
     {
+        "glm-5.3-flash": ModelSpec(
+            name="glm-5.3-flash",
+            family="glm5_3_flash",
+            checkpoint=Checkpoint(
+                repo_id="nvidia/GLM-5.3-Flash-NVFP4",
+                revision="da920bb0b9f4a06727223a349e55468e38352348",
+                directory="nvfp4",
+                required_files=(
+                    "config.json",
+                    "hf_quant_config.json",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "generation_config.json",
+                ),
+            ),
+            model_mount="/models/resin-glm5-3-flash",
+            model_volume="resin-glm5-3-flash-nvfp4-models-v1",
+            kernel_mount="/kernel-cache/resin-glm5-3-flash",
+            kernel_volume="resin-glm5-3-flash-kernels-v1",
+            gpu="B200",
+            label="glm-5.3-flash-nvfp4",
+            world_size=4,
+            attn_dp=4,
+            ep=4,
+            # Full decode graphs scan this sparse-index capacity even for short
+            # requests. Keep a practical serving window with room for an 8K
+            # prefix checkpoint and its continuation, rather than allocating
+            # the checkpoint's 1M architectural limit at startup.
+            context_length=16384,
+            max_batch_size=8,
+            prefill_chunk_size=8192,
+            gpu_memory_utilization=0.65,
+        ),
         "deepseek-v41": ModelSpec(
             name="deepseek-v41",
             family="deepseek_v41",
@@ -456,7 +489,9 @@ def create_runner(
         from resin.backend.cuda.graphs import default_decode_graph_shapes
 
         shapes = default_decode_graph_shapes(
-            width, speculative=bool(draft_tokens), max_batch_size=max_batch_size
+            width,
+            speculative=bool(draft_tokens) and spec.family != "glm5_3_flash",
+            max_batch_size=max_batch_size,
         )
     else:
         shapes = tuple((batch, width) for batch in sorted(set(decode_batch_sizes)))
@@ -494,6 +529,20 @@ def create_runner(
             profile_graph_phases=profile_graph_phases,
             fast_allreduce=fast_allreduce,
             gpu_memory_utilization=memory,
+            **common,
+        )
+    if spec.family == "glm5_3_flash":
+        from resin_models_cuda.glm5_3_flash.cuda import Glm53FlashCudaRunner
+
+        return Glm53FlashCudaRunner(
+            checkpoint,
+            parallel_groups=groups,
+            max_seq_len=context_length,
+            max_batch_size=max_batch_size,
+            prefill_chunk_size=prefill_chunk_size,
+            speculative_tokens=draft_tokens,
+            gpu_memory_utilization=memory,
+            profile_graph_phases=profile_graph_phases,
             **common,
         )
     if spec.family == "gemma4":
@@ -548,7 +597,7 @@ def create_recipe(
 
     spec = get_model(model)
     path = spec.path if checkpoint is None else Path(checkpoint)
-    if spec.family == "deepseek_v41":
+    if spec.family in {"deepseek_v41", "glm5_3_flash"}:
         from tokenizers import Tokenizer
 
         return get_native_recipe(
