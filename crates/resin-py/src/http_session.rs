@@ -670,7 +670,7 @@ pub(crate) struct NativeHttpSession {
 #[pymethods]
 impl NativeHttpSession {
     #[new]
-    #[pyo3(signature = (engine, recipe, *, stream_interval = 1, emit_first_token = false))]
+    #[pyo3(signature = (engine, recipe: "Recipe", *, stream_interval = 1, emit_first_token = false))]
     fn new(
         py: Python<'_>,
         engine: Py<Engine>,

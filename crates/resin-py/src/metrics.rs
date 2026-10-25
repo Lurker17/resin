@@ -109,7 +109,8 @@ pub(crate) struct RunnerMetrics(RunnerMetricsSnapshot);
 impl RunnerMetrics {
     #[new]
     #[pyo3(signature = (*, forward_execution_seconds = None, cuda_graph_passes = None,
-        spec_draft_tokens = 0, spec_accepted_tokens = 0, spec_verify_rows = 0, dp_attention_sync_wait_seconds = None))]
+        spec_draft_tokens = 0, spec_accepted_tokens = 0, spec_verify_rows = 0,
+        dp_attention_sync_wait_seconds: "dict[str, Any] | None" = None))]
     fn new(
         forward_execution_seconds: Option<BTreeMap<String, f64>>,
         cuda_graph_passes: Option<BTreeMap<String, u64>>,
@@ -161,6 +162,7 @@ impl RunnerMetrics {
     }
 
     /// Plain fields for inspection and explicit distributed transport.
+    #[pyo3(signature = () -> "dict[str, Any]")]
     fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         Ok(pythonize(py, &self.0)?)
     }
@@ -220,6 +222,7 @@ impl HistogramAccumulator {
         result
     }
 
+    #[pyo3(signature = () -> "dict[str, Any]")]
     fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         Ok(pythonize(py, &self.0)?)
     }

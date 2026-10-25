@@ -372,6 +372,7 @@ pub(crate) fn sources(py: Python<'_>, sources: MediaSources) -> PyResult<Vec<Sou
 }
 
 #[pyfunction]
+#[pyo3(signature = (height, width) -> "tuple[int, ...]")]
 pub(crate) fn image_token_types(
     py: Python<'_>,
     height: usize,

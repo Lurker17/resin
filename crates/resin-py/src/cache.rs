@@ -452,13 +452,13 @@ impl CacheGroupPlan {
     #[pyo3(signature = (
         *,
         group_index,
-        block_indptr,
-        block_slab_ids,
-        block_slotnums,
-        block_table_start_indices,
-        append_slab_ids,
-        append_slotnums,
-        append_block_offsets,
+        block_indptr: "Sequence[int] | npt.NDArray[np.uint32]",
+        block_slab_ids: "Sequence[int] | npt.NDArray[np.uint32]",
+        block_slotnums: "Sequence[int] | npt.NDArray[np.uint32]",
+        block_table_start_indices: "Sequence[int] | npt.NDArray[np.uint32]",
+        append_slab_ids: "Sequence[int] | npt.NDArray[np.uint32]",
+        append_slotnums: "Sequence[int] | npt.NDArray[np.uint32]",
+        append_block_offsets: "Sequence[int] | npt.NDArray[np.uint32]",
         blocks_per_slab = 1
     ))]
     #[allow(clippy::too_many_arguments)]

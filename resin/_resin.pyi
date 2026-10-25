@@ -6,8 +6,13 @@ from resin.recipe import Recipe
 from resin.recipe import ContentBlock
 import numpy as np
 import numpy.typing as npt
-from resin.protocols import MediaInput, MediaTokenSpan, Runner, TokenSpan
-from resin.protocols import FinalizingResponseParser
+from resin.protocols import (
+    FinalizingResponseParser,
+    MediaInput,
+    MediaTokenSpan,
+    Runner,
+    TokenSpan,
+)
 
 __version__: Final[str]
 
@@ -48,31 +53,33 @@ class BatchPlan:
         cls,
         /,
         *,
-        sequence_ids: Sequence[int] | npt.NDArray[np.uint64],
-        context_lengths: Sequence[int] | npt.NDArray[np.uint32],
-        token_ids: Sequence[int] | npt.NDArray[np.uint32],
-        token_indptr: Sequence[int] | npt.NDArray[np.uint32],
-        prefill_lengths: Sequence[int] | npt.NDArray[np.uint32] | None = None,
+        sequence_ids: "Sequence[int] | npt.NDArray[np.uint64]",
+        context_lengths: "Sequence[int] | npt.NDArray[np.uint32]",
+        token_ids: "Sequence[int] | npt.NDArray[np.uint32]",
+        token_indptr: "Sequence[int] | npt.NDArray[np.uint32]",
+        prefill_lengths: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
         phase: BatchPhase = ...,
         batch_id: int = 0,
         batch_key: int | None = None,
         cache_groups: Sequence[CacheGroupPlan] | None = None,
-        sampling_mask: Sequence[bool] | npt.NDArray[np.bool_] | None = None,
+        sampling_mask: "Sequence[bool] | npt.NDArray[np.bool_] | None" = None,
         sampling_params: Sequence[SamplingParams] | None = None,
-        media: Sequence[MediaInput | None] | None = None,
-        prompt_score_indices: Sequence[int] | npt.NDArray[np.uint32] | None = None,
-        prompt_score_token_ids: Sequence[int] | npt.NDArray[np.uint32] | None = None,
-        prompt_score_indptr: Sequence[int] | npt.NDArray[np.uint32] | None = None,
-        prompt_score_top_counts: Sequence[int] | npt.NDArray[np.uint32] | None = None,
-        prompt_target_indptr: Sequence[int] | npt.NDArray[np.uint32] | None = None,
-        prompt_target_token_ids: Sequence[int] | npt.NDArray[np.uint32] | None = None,
+        media: "Sequence[MediaInput | None] | None" = None,
+        prompt_score_indices: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+        prompt_score_token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+        prompt_score_indptr: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+        prompt_score_top_counts: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+        prompt_target_indptr: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+        prompt_target_token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
     ) -> BatchPlan: ...
     def __repr__(self, /) -> str: ...
     @staticmethod
     def _from_wire(
-        data: npt.NDArray[np.uint8], requests: dict[int, Any], pending: dict[int, Any]
+        data: "npt.NDArray[np.uint8]",
+        requests: "dict[int, Any]",
+        pending: "dict[int, Any]",
     ) -> BatchPlan: ...
-    def _to_wire(self, /) -> npt.NDArray[np.uint8]: ...
+    def _to_wire(self, /) -> "npt.NDArray[np.uint8]": ...
     @property
     def batch_id(self, /) -> int:
         """
@@ -274,13 +281,13 @@ class CacheGroupPlan:
         /,
         *,
         group_index: int,
-        block_indptr: Sequence[int] | npt.NDArray[np.uint32],
-        block_slab_ids: Sequence[int] | npt.NDArray[np.uint32],
-        block_slotnums: Sequence[int] | npt.NDArray[np.uint32],
-        block_table_start_indices: Sequence[int] | npt.NDArray[np.uint32],
-        append_slab_ids: Sequence[int] | npt.NDArray[np.uint32],
-        append_slotnums: Sequence[int] | npt.NDArray[np.uint32],
-        append_block_offsets: Sequence[int] | npt.NDArray[np.uint32],
+        block_indptr: "Sequence[int] | npt.NDArray[np.uint32]",
+        block_slab_ids: "Sequence[int] | npt.NDArray[np.uint32]",
+        block_slotnums: "Sequence[int] | npt.NDArray[np.uint32]",
+        block_table_start_indices: "Sequence[int] | npt.NDArray[np.uint32]",
+        append_slab_ids: "Sequence[int] | npt.NDArray[np.uint32]",
+        append_slotnums: "Sequence[int] | npt.NDArray[np.uint32]",
+        append_block_offsets: "Sequence[int] | npt.NDArray[np.uint32]",
         blocks_per_slab: int = 1,
     ) -> CacheGroupPlan: ...
     def __repr__(self, /) -> str: ...
@@ -488,7 +495,7 @@ class Engine:
     def __new__(
         cls,
         /,
-        runner: Runner,
+        runner: "Runner",
         *,
         max_running_requests: int = 32,
         context_length: int = 32768,
@@ -579,12 +586,12 @@ class Engine:
     def submit(
         self,
         /,
-        token_ids: Sequence[int] | npt.NDArray[np.uint32] | None = None,
+        token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
         *,
         priority: int = 0,
         batch_key: int | None = None,
         sampling_params: SamplingParams | None = None,
-        media: MediaInput | None = None,
+        media: "MediaInput | None" = None,
         prompt_target_logprobs: Sequence[Sequence[int]] | None = None,
     ) -> RequestLease: ...
 
@@ -618,21 +625,21 @@ class ForwardOutput:
         cls,
         /,
         *,
-        token_ids: npt.NDArray[np.uint32],
-        token_indptr: npt.NDArray[np.uint32],
-        logprobs: npt.NDArray[np.float32] | None = None,
-        logprob_indptr: npt.NDArray[np.uint32] | None = None,
-        top_indptr: npt.NDArray[np.uint32] | None = None,
-        top_token_ids: npt.NDArray[np.uint32] | None = None,
-        top_logprobs: npt.NDArray[np.float32] | None = None,
-        prompt_logprobs: npt.NDArray[np.float32] | None = None,
-        prompt_logprob_indptr: npt.NDArray[np.uint32] | None = None,
-        prompt_top_indptr: npt.NDArray[np.uint32] | None = None,
-        prompt_top_token_ids: npt.NDArray[np.uint32] | None = None,
-        prompt_top_logprobs: npt.NDArray[np.float32] | None = None,
-        prompt_target_indptr: npt.NDArray[np.uint32] | None = None,
-        prompt_target_token_ids: npt.NDArray[np.uint32] | None = None,
-        prompt_target_logprobs: npt.NDArray[np.float32] | None = None,
+        token_ids: "npt.NDArray[np.uint32]",
+        token_indptr: "npt.NDArray[np.uint32]",
+        logprobs: "npt.NDArray[np.float32] | None" = None,
+        logprob_indptr: "npt.NDArray[np.uint32] | None" = None,
+        top_indptr: "npt.NDArray[np.uint32] | None" = None,
+        top_token_ids: "npt.NDArray[np.uint32] | None" = None,
+        top_logprobs: "npt.NDArray[np.float32] | None" = None,
+        prompt_logprobs: "npt.NDArray[np.float32] | None" = None,
+        prompt_logprob_indptr: "npt.NDArray[np.uint32] | None" = None,
+        prompt_top_indptr: "npt.NDArray[np.uint32] | None" = None,
+        prompt_top_token_ids: "npt.NDArray[np.uint32] | None" = None,
+        prompt_top_logprobs: "npt.NDArray[np.float32] | None" = None,
+        prompt_target_indptr: "npt.NDArray[np.uint32] | None" = None,
+        prompt_target_token_ids: "npt.NDArray[np.uint32] | None" = None,
+        prompt_target_logprobs: "npt.NDArray[np.float32] | None" = None,
     ) -> ForwardOutput: ...
     @property
     def logprob_indptr(self, /) -> npt.NDArray[np.uint32] | None: ...
@@ -736,7 +743,7 @@ class Image:
     @staticmethod
     def from_bytes(data: bytes, *, media_type: str) -> Image: ...
     @staticmethod
-    def from_rgb(array: npt.NDArray[np.float32]) -> Image: ...
+    def from_rgb(array: "npt.NDArray[np.float32]") -> Image: ...
     @property
     def source(self, /) -> Any: ...
 
@@ -786,14 +793,14 @@ class InklingResponseParser:
         cls,
         /,
         tokenizer: RecipeTokenizer,
-        token_ids: Mapping[str, int],
+        token_ids: "Mapping[str, int]",
         *,
-        prompt_ids: Sequence[int] | npt.NDArray[np.uint32] = ...,
+        prompt_ids: "Sequence[int] | npt.NDArray[np.uint32]" = ...,
     ) -> InklingResponseParser: ...
     def feed(
-        self, /, token_ids: Sequence[int] | npt.NDArray[np.uint32]
+        self, /, token_ids: "Sequence[int] | npt.NDArray[np.uint32]"
     ) -> list[ParserEvent]: ...
-    def finish(self, /, reason: Literal["stop", "length"]) -> list[ParserEvent]: ...
+    def finish(self, /, reason: 'Literal["stop", "length"]') -> list[ParserEvent]: ...
 
 @final
 class Lfm2Recipe(_NativeRecipe):
@@ -813,7 +820,7 @@ class Message:
         cls,
         /,
         role: Role,
-        content: Sequence[ContentBlock],
+        content: "Sequence[ContentBlock]",
         *,
         tools: Sequence[Tool] = ...,
         task: str | None = None,
@@ -975,7 +982,7 @@ class RecipeTokenizer:
     def decode(
         self,
         /,
-        token_ids: Sequence[int] | npt.NDArray[np.uint32],
+        token_ids: "Sequence[int] | npt.NDArray[np.uint32]",
         *,
         skip_special_tokens: bool = False,
     ) -> str: ...
@@ -1002,7 +1009,7 @@ class RenderOptions:
         cls,
         /,
         *,
-        reasoning_effort: str | int | float | None = None,
+        reasoning_effort: "str | int | float | None" = None,
         enable_thinking: bool | None = None,
         preserve_thinking: bool | None = None,
         add_generation_prompt: bool | None = None,
@@ -1049,9 +1056,9 @@ class RenderedPrompt:
     def __new__(
         cls,
         /,
-        token_ids: Sequence[int] | npt.NDArray[np.uint32],
+        token_ids: "Sequence[int] | npt.NDArray[np.uint32]",
         *,
-        media: MediaInput | None = None,
+        media: "MediaInput | None" = None,
     ) -> RenderedPrompt: ...
     @property
     def media(self, /) -> MediaInput | None: ...
@@ -1174,9 +1181,9 @@ class RunnerMetrics:
         spec_draft_tokens: int = 0,
         spec_accepted_tokens: int = 0,
         spec_verify_rows: int = 0,
-        dp_attention_sync_wait_seconds: dict[str, Any] | None = None,
+        dp_attention_sync_wait_seconds: "dict[str, Any] | None" = None,
     ) -> RunnerMetrics: ...
-    def as_dict(self, /) -> dict[str, Any]:
+    def as_dict(self, /) -> "dict[str, Any]":
         """
         Plain fields for inspection and explicit distributed transport.
         """
@@ -1425,7 +1432,7 @@ class _HistogramAccumulator:
         Return a snapshot with this coordinator's wait observations included.
         """
     def observe(self, /, value: float, *, weight: int = 1) -> None: ...
-    def snapshot(self, /) -> dict[str, Any]: ...
+    def snapshot(self, /) -> "dict[str, Any]": ...
 
 @final
 class _HttpEvents:
@@ -1460,7 +1467,7 @@ class _HttpServer:
         cls,
         /,
         engine: Engine,
-        recipe: Recipe,
+        recipe: "Recipe",
         *,
         model: str,
         stream_interval: int = 1,
@@ -1491,7 +1498,7 @@ class _HttpSession:
         cls,
         /,
         engine: Engine,
-        recipe: Recipe,
+        recipe: "Recipe",
         *,
         stream_interval: int = 1,
         emit_first_token: bool = False,
@@ -1522,7 +1529,7 @@ class _NativeRecipe(Recipe):
     def parse_response(
         self,
         /,
-        token_ids: Sequence[int] | npt.NDArray[np.uint32],
+        token_ids: "Sequence[int] | npt.NDArray[np.uint32]",
         *,
         prompt: RenderedPrompt,
     ) -> Any: ...
@@ -1548,16 +1555,16 @@ class _NativeResponseParser(FinalizingResponseParser):
     Common native handle recognized directly by the HTTP actor.
     """
     def feed(
-        self, /, token_ids: Sequence[int] | npt.NDArray[np.uint32]
+        self, /, token_ids: "Sequence[int] | npt.NDArray[np.uint32]"
     ) -> list[ParserEvent]: ...
-    def finish(self, /, reason: Literal["stop", "length"]) -> list[ParserEvent]: ...
+    def finish(self, /, reason: 'Literal["stop", "length"]') -> list[ParserEvent]: ...
 
 def _media_from_buffers(
-    metadata: bytes, buffers: Sequence[npt.NDArray[Any]]
-) -> MediaInput: ...
+    metadata: bytes, buffers: "Sequence[npt.NDArray[Any]]"
+) -> "MediaInput": ...
 def _media_to_buffers(
-    media: MediaInput,
-) -> tuple[bytes, tuple[npt.NDArray[Any], ...]]: ...
+    media: "MediaInput",
+) -> "tuple[bytes, tuple[npt.NDArray[Any], ...]]": ...
 def _numa_get_policy() -> tuple[int, list[int]]:
     """
     Read the calling thread's allocation policy without changing existing pages.
@@ -1575,4 +1582,4 @@ def _runner_metrics_prometheus_protobuf(
     Encode physical-rank observations separately from logical request ownership.
     """
 
-def image_token_types(height: int, width: int) -> tuple[int, ...]: ...
+def image_token_types(height: int, width: int) -> "tuple[int, ...]": ...

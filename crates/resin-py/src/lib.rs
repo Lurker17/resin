@@ -645,11 +645,17 @@ impl BatchPlan {
 }
 #[pymethods]
 impl BatchPlan {
+    #[pyo3(signature = () -> "npt.NDArray[np.uint8]")]
     fn _to_wire<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u8>>> {
         Ok(PyArray1::from_vec(py, self.encode_wire()?))
     }
 
     #[staticmethod]
+    #[pyo3(signature = (
+        data: "npt.NDArray[np.uint8]",
+        requests: "dict[int, Any]",
+        pending: "dict[int, Any]"
+    ))]
     fn _from_wire(
         data: PyReadonlyArray1<'_, u8>,
         requests: &Bound<'_, PyDict>,
@@ -664,24 +670,24 @@ impl BatchPlan {
     #[new]
     #[pyo3(signature = (
         *,
-        sequence_ids,
-        context_lengths,
-        token_ids,
-        token_indptr,
-        prefill_lengths = None,
+        sequence_ids: "Sequence[int] | npt.NDArray[np.uint64]",
+        context_lengths: "Sequence[int] | npt.NDArray[np.uint32]",
+        token_ids: "Sequence[int] | npt.NDArray[np.uint32]",
+        token_indptr: "Sequence[int] | npt.NDArray[np.uint32]",
+        prefill_lengths: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
         phase = BatchPhase::Prefill,
         batch_id = 0,
         batch_key = None,
         cache_groups = None,
-        sampling_mask = None,
+        sampling_mask: "Sequence[bool] | npt.NDArray[np.bool_] | None" = None,
         sampling_params = None,
-        media = None,
-        prompt_score_indices = None,
-        prompt_score_token_ids = None,
-        prompt_score_indptr = None,
-        prompt_score_top_counts = None,
-        prompt_target_indptr = None,
-        prompt_target_token_ids = None
+        media: "Sequence[MediaInput | None] | None" = None,
+        prompt_score_indices: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+        prompt_score_token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+        prompt_score_indptr: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+        prompt_score_top_counts: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+        prompt_target_indptr: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+        prompt_target_token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1510,7 +1516,7 @@ impl Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner, *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, enable_overlap = true, enable_metrics = true))]
+    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, enable_overlap = true, enable_metrics = true))]
     #[allow(
         clippy::too_many_arguments,
         reason = "Python constructor exposes keyword configuration"
@@ -1585,12 +1591,12 @@ impl Engine {
         })
     }
     #[pyo3(signature = (
-        token_ids = None,
+        token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
         *,
         priority = 0,
         batch_key = None,
         sampling_params = None,
-        media = None,
+        media: "MediaInput | None" = None,
         prompt_target_logprobs = None
     ))]
     #[allow(clippy::too_many_arguments)]

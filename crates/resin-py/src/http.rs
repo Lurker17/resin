@@ -39,7 +39,7 @@ impl NativeHttpServer {
     #[new]
     #[pyo3(signature = (
         engine,
-        recipe,
+        recipe: "Recipe",
         *,
         model,
         stream_interval = 1,

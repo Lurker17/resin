@@ -54,7 +54,24 @@ pub struct ForwardOutput {
 #[pymethods]
 impl ForwardOutput {
     #[new]
-    #[pyo3(signature = (*, token_ids, token_indptr, logprobs = None, logprob_indptr = None, top_indptr = None, top_token_ids = None, top_logprobs = None, prompt_logprobs = None, prompt_logprob_indptr = None, prompt_top_indptr = None, prompt_top_token_ids = None, prompt_top_logprobs = None, prompt_target_indptr = None, prompt_target_token_ids = None, prompt_target_logprobs = None))]
+    #[pyo3(signature = (
+        *,
+        token_ids: "npt.NDArray[np.uint32]",
+        token_indptr: "npt.NDArray[np.uint32]",
+        logprobs: "npt.NDArray[np.float32] | None" = None,
+        logprob_indptr: "npt.NDArray[np.uint32] | None" = None,
+        top_indptr: "npt.NDArray[np.uint32] | None" = None,
+        top_token_ids: "npt.NDArray[np.uint32] | None" = None,
+        top_logprobs: "npt.NDArray[np.float32] | None" = None,
+        prompt_logprobs: "npt.NDArray[np.float32] | None" = None,
+        prompt_logprob_indptr: "npt.NDArray[np.uint32] | None" = None,
+        prompt_top_indptr: "npt.NDArray[np.uint32] | None" = None,
+        prompt_top_token_ids: "npt.NDArray[np.uint32] | None" = None,
+        prompt_top_logprobs: "npt.NDArray[np.float32] | None" = None,
+        prompt_target_indptr: "npt.NDArray[np.uint32] | None" = None,
+        prompt_target_token_ids: "npt.NDArray[np.uint32] | None" = None,
+        prompt_target_logprobs: "npt.NDArray[np.float32] | None" = None
+    ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,

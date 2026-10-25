@@ -120,6 +120,7 @@ impl Image {
         Ok(Self::new(source.into_any().unbind()))
     }
     #[staticmethod]
+    #[pyo3(signature=(array: "npt.NDArray[np.float32]"))]
     fn from_rgb(array: Py<PyAny>) -> Self {
         Self::new(array)
     }
@@ -506,7 +507,7 @@ pub(crate) struct Message {
 #[pymethods]
 impl Message {
     #[new]
-    #[pyo3(signature=(role, content, *, tools=Vec::new(), task=None, continuation=false, response_format=None))]
+    #[pyo3(signature=(role, content: "Sequence[ContentBlock]", *, tools=Vec::new(), task=None, continuation=false, response_format=None))]
     fn new(
         py: Python<'_>,
         role: Role,
@@ -754,7 +755,7 @@ pub(crate) struct RenderOptions {
 #[pymethods]
 impl RenderOptions {
     #[new]
-    #[pyo3(signature=(*, reasoning_effort=None, enable_thinking=None, preserve_thinking=None, add_generation_prompt=None, add_vision_id=None, use_system_prompt=None, model_identity=None, knowledge_cutoff=None, conversation_start_date=None, auto_drop_analysis=None, thinking_mode=None, response_format=None))]
+    #[pyo3(signature=(*, reasoning_effort: "str | int | float | None" = None, enable_thinking=None, preserve_thinking=None, add_generation_prompt=None, add_vision_id=None, use_system_prompt=None, model_identity=None, knowledge_cutoff=None, conversation_start_date=None, auto_drop_analysis=None, thinking_mode=None, response_format=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         reasoning_effort: Option<&Bound<'_, PyAny>>,

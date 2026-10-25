@@ -759,6 +759,7 @@ fn push_values<T: numpy::Element>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (media: "MediaInput") -> "tuple[bytes, tuple[npt.NDArray[Any], ...]]")]
 pub(crate) fn _media_to_buffers(
     py: Python<'_>,
     media: &Bound<'_, PyAny>,
@@ -850,6 +851,7 @@ fn take_buffer<T: numpy::Element + Copy>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (metadata, buffers: "Sequence[npt.NDArray[Any]]") -> "MediaInput")]
 pub(crate) fn _media_from_buffers(
     py: Python<'_>,
     metadata: &[u8],

@@ -1,10 +1,9 @@
-"""Add public types that the native stub generator cannot infer."""
+"""Add property types, protocol bases, and imports absent from native stubs."""
 
 import ast
 from pathlib import Path
 
 STUB_PATH = Path(__file__).resolve().parents[1] / "resin" / "_resin.pyi"
-U32_INPUT = "Sequence[int] | npt.NDArray[np.uint32]"
 OUTPUT_COLUMNS = {
     "token_ids": "npt.NDArray[np.uint32]",
     "token_indptr": "npt.NDArray[np.uint32]",
@@ -26,82 +25,11 @@ OUTPUT_COLUMNS = {
     },
 }
 
-PARAMETERS = {
-    ("", "_media_to_buffers"): {"media": "MediaInput"},
-    ("", "_media_from_buffers"): {"buffers": "Sequence[npt.NDArray[Any]]"},
-    ("Message", "__new__"): {"content": "Sequence[ContentBlock]"},
-    ("RenderOptions", "__new__"): {"reasoning_effort": "str | int | float | None"},
-    ("RenderedPrompt", "__new__"): {
-        "token_ids": U32_INPUT,
-        "media": "MediaInput | None",
-    },
-    ("RecipeTokenizer", "decode"): {"token_ids": U32_INPUT},
-    ("Image", "from_rgb"): {"array": "npt.NDArray[np.float32]"},
-    ("_NativeResponseParser", "feed"): {"token_ids": U32_INPUT},
-    ("_NativeResponseParser", "finish"): {"reason": 'Literal["stop", "length"]'},
-    ("BatchPlan", "__new__"): {
-        "sequence_ids": "Sequence[int] | npt.NDArray[np.uint64]",
-        "context_lengths": U32_INPUT,
-        "prefill_lengths": f"{U32_INPUT} | None",
-        "token_ids": U32_INPUT,
-        "token_indptr": U32_INPUT,
-        "sampling_mask": "Sequence[bool] | npt.NDArray[np.bool_] | None",
-        "prompt_score_indices": f"{U32_INPUT} | None",
-        "prompt_score_token_ids": f"{U32_INPUT} | None",
-        "prompt_score_indptr": f"{U32_INPUT} | None",
-        "prompt_score_top_counts": f"{U32_INPUT} | None",
-        "prompt_target_indptr": f"{U32_INPUT} | None",
-        "prompt_target_token_ids": f"{U32_INPUT} | None",
-        "media": "Sequence[MediaInput | None] | None",
-    },
-    ("BatchPlan", "_from_wire"): {
-        "data": "npt.NDArray[np.uint8]",
-        "requests": "dict[int, Any]",
-        "pending": "dict[int, Any]",
-    },
-    ("CacheGroupPlan", "__new__"): {
-        name: U32_INPUT
-        for name in (
-            "block_indptr",
-            "block_slab_ids",
-            "block_slotnums",
-            "block_table_start_indices",
-            "append_slab_ids",
-            "append_slotnums",
-            "append_block_offsets",
-        )
-    },
-    ("Engine", "__new__"): {"runner": "Runner"},
-    ("Engine", "cancel"): {"request": "RequestLease"},
-    ("Engine", "submit"): {
-        "token_ids": f"{U32_INPUT} | None",
-        "media": "MediaInput | None",
-    },
-    ("RunnerMetrics", "__new__"): {
-        "dp_attention_sync_wait_seconds": "dict[str, Any] | None"
-    },
-    ("ForwardOutput", "__new__"): OUTPUT_COLUMNS,
-    ("_HttpServer", "__new__"): {"recipe": "Recipe"},
-    ("_HttpSession", "__new__"): {"recipe": "Recipe"},
-    ("InklingResponseParser", "__new__"): {
-        "token_ids": "Mapping[str, int]",
-        "prompt_ids": U32_INPUT,
-    },
-    ("InklingResponseParser", "feed"): {"token_ids": U32_INPUT},
-    ("_NativeRecipe", "parse_response"): {"token_ids": U32_INPUT},
-    ("InklingResponseParser", "finish"): {"reason": 'Literal["stop", "length"]'},
-}
-
-RETURNS = {
+PROPERTY_TYPES = {
     ("EngineMetrics", "requests"): "dict[str, Any]",
     ("EngineMetrics", "cache"): "dict[str, Any] | None",
-    ("_HistogramAccumulator", "snapshot"): "dict[str, Any]",
-    ("RunnerMetrics", "as_dict"): "dict[str, Any]",
     ("RunnerMetrics", "dp_attention_sync_wait_seconds"): "dict[str, Any] | None",
     ("SamplingParams", "stop_token_ids"): "tuple[int, ...]",
-    ("", "_media_to_buffers"): "tuple[bytes, tuple[npt.NDArray[Any], ...]]",
-    ("", "_media_from_buffers"): "MediaInput",
-    ("", "image_token_types"): "tuple[int, ...]",
     ("DeepSeekV41Image", "types"): "tuple[int, ...]",
     ("DeepSeekV41Image", "patches"): "npt.NDArray[np.float32]",
     ("DeepSeekV41Media", "images"): "tuple[DeepSeekV41Image, ...]",
@@ -146,12 +74,7 @@ RETURNS = {
     ("RenderedPrompt", "media"): "MediaInput | None",
     ("RenderedPrompt", "token_ids"): "npt.NDArray[np.uint32]",
     ("_NativeRecipe", "stop_token_ids"): "Sequence[int]",
-    ("_NativeResponseParser", "feed"): "list[ParserEvent]",
-    ("_NativeResponseParser", "finish"): "list[ParserEvent]",
-    ("InklingResponseParser", "feed"): "list[ParserEvent]",
-    ("InklingResponseParser", "finish"): "list[ParserEvent]",
     ("BatchPlan", "sequence_ids"): "npt.NDArray[np.uint64]",
-    ("BatchPlan", "_to_wire"): "npt.NDArray[np.uint8]",
     **{
         (owner, name): "npt.NDArray[np.uint32]"
         for owner, names in (
@@ -213,9 +136,7 @@ class Normalizer(ast.NodeVisitor):
         )
         self.owner = ""
         self.edits: list[tuple[int, int, bytes]] = []
-        self.found_parameters: set[tuple[str, str, str]] = set()
         self.found_returns: set[tuple[str, str]] = set()
-        self.found_retention_default = False
         self.found_bases: set[str] = set()
 
     def replace(self, node: ast.expr, replacement: str) -> None:
@@ -253,56 +174,28 @@ class Normalizer(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         key = (self.owner, node.name)
-        replacements = PARAMETERS.get(key, {})
-        arguments = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
-        by_name = {argument.arg: argument for argument in arguments}
-        for name, replacement in replacements.items():
-            argument = by_name.get(name)
-            if argument is None or argument.annotation is None:
+        if replacement := PROPERTY_TYPES.get(key):
+            if not any(
+                isinstance(decorator, ast.Name) and decorator.id == "property"
+                for decorator in node.decorator_list
+            ):
                 raise ValueError(
-                    f"generated stub is missing parameter {self.owner}.{node.name}.{name}"
+                    f"generated stub is missing property {self.owner}.{node.name}"
                 )
-            self.replace(argument.annotation, replacement)
-            self.found_parameters.add((*key, name))
-        if replacement := RETURNS.get(key):
             if node.returns is None:
                 raise ValueError(
                     f"generated stub is missing return type {self.owner}.{node.name}"
                 )
             self.replace(node.returns, replacement)
             self.found_returns.add(key)
-        if key == ("CacheGroupLayout", "__new__"):
-            defaults = dict(
-                zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True)
-            )
-            retention = by_name.get("retention")
-            default = defaults.get(retention) if retention is not None else None
-            if default is None:
-                raise ValueError(
-                    "generated stub is missing CacheGroupLayout.retention default"
-                )
-            self.replace(default, "...")
-            self.found_retention_default = True
 
     def validate(self) -> None:
-        expected_parameters = {
-            (*key, name)
-            for key, replacements in PARAMETERS.items()
-            for name in replacements
-        }
-        missing_parameters = expected_parameters - self.found_parameters
-        missing_returns = RETURNS.keys() - self.found_returns
+        missing_returns = PROPERTY_TYPES.keys() - self.found_returns
         missing_bases = BASES.keys() - self.found_bases
-        if (
-            missing_parameters
-            or missing_returns
-            or not self.found_retention_default
-            or missing_bases
-        ):
+        if missing_returns or missing_bases:
             raise ValueError(
                 "generated stub structure changed "
-                f"(parameters={sorted(missing_parameters)}, returns={sorted(missing_returns)}, "
-                f"retention_default={self.found_retention_default}, "
+                f"(properties={sorted(missing_returns)}, "
                 f"bases={sorted(missing_bases)})"
             )
 

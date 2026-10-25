@@ -110,7 +110,7 @@ impl RecipeTokenizer {
         }
     }
 
-    #[pyo3(signature = (token_ids, *, skip_special_tokens = false))]
+    #[pyo3(signature = (token_ids: "Sequence[int] | npt.NDArray[np.uint32]", *, skip_special_tokens = false))]
     fn decode(&self, token_ids: Vec<u32>, skip_special_tokens: bool) -> PyResult<String> {
         match &self.source {
             TokenizerSource::Native(tokenizer, _) => tokenizer
@@ -265,7 +265,7 @@ pub(crate) struct NativeInklingParser {
 #[pymethods]
 impl NativeInklingParser {
     #[new]
-    #[pyo3(signature = (tokenizer, token_ids, *, prompt_ids = Vec::new()))]
+    #[pyo3(signature = (tokenizer, token_ids: "Mapping[str, int]", *, prompt_ids: "Sequence[int] | npt.NDArray[np.uint32]" = Vec::new()))]
     fn new(
         tokenizer: &RecipeTokenizer,
         token_ids: HashMap<String, u32>,
@@ -298,11 +298,13 @@ impl NativeInklingParser {
         })
     }
 
+    #[pyo3(signature = (token_ids: "Sequence[int] | npt.NDArray[np.uint32]"))]
     fn feed(&self, py: Python<'_>, token_ids: Vec<u32>) -> PyResult<Vec<Py<ParserEvent>>> {
         let events = py.detach(|| feed(&self.inner, &token_ids))?;
         recipe_events::to_python(py, events)
     }
 
+    #[pyo3(signature = (reason: r#"Literal["stop", "length"]"#))]
     fn finish(&self, py: Python<'_>, reason: &str) -> PyResult<Vec<Py<ParserEvent>>> {
         let reason = parse_finish_reason(reason)?;
         let events = py.detach(|| finish(&self.inner, reason))?;
@@ -410,11 +412,13 @@ pub(crate) struct NativeResponseParser {
 }
 #[pymethods]
 impl NativeResponseParser {
+    #[pyo3(signature = (token_ids: "Sequence[int] | npt.NDArray[np.uint32]"))]
     fn feed(&self, py: Python<'_>, token_ids: Vec<u32>) -> PyResult<Vec<Py<ParserEvent>>> {
         let events = py.detach(|| feed(&self.inner, &token_ids))?;
         recipe_events::to_python(py, events)
     }
 
+    #[pyo3(signature = (reason: r#"Literal["stop", "length"]"#))]
     fn finish(&self, py: Python<'_>, reason: &str) -> PyResult<Vec<Py<ParserEvent>>> {
         let reason = parse_finish_reason(reason)?;
         let events = py.detach(|| finish(&self.inner, reason))?;
@@ -436,7 +440,7 @@ struct ParserSeed {
 #[pymethods]
 impl RenderedPrompt {
     #[new]
-    #[pyo3(signature=(token_ids, *, media=None))]
+    #[pyo3(signature=(token_ids: "Sequence[int] | npt.NDArray[np.uint32]", *, media: "MediaInput | None" = None))]
     fn new(token_ids: Vec<u32>, media: Option<Py<PyAny>>) -> Self {
         Self {
             token_ids,
@@ -738,7 +742,7 @@ impl NativeRecipe {
             inner: Arc::new(Mutex::new(parser)),
         })
     }
-    #[pyo3(signature=(token_ids, *, prompt))]
+    #[pyo3(signature=(token_ids: "Sequence[int] | npt.NDArray[np.uint32]", *, prompt))]
     fn parse_response(
         &self,
         py: Python<'_>,
