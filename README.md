@@ -13,9 +13,9 @@ token IDs ──► Rust Engine ──► frozen BatchPlan ──► Python Runn
                   └──────── ownership & commit ────────┘
 ```
 
-Resin also has optional HTTP serving and Prometheus metrics above that boundary,
-using a _recipe_ for chat formatting, response parsing and media.
+Resin also has optional HTTP serving and Prometheus metrics.
 
+This makes it possible to autonomously "vibe code" even the most complex models.
 In half a day of agentic coding, we used Resin to build standalone engines
 for [DeepSeek-V4.1-Flash](models/cuda/resin_models_cuda/deepseek_v41/) and
 [GLM-5.3-Flash](models/cuda/resin_models_cuda/glm5_3_flash/) on Blackwell GPUs
