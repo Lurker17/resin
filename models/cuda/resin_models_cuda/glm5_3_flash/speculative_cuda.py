@@ -1,8 +1,8 @@
-"""Bit-preserving accepted-prefix preparation for GLM KDA rollback.
+"""Bit-preserving convolution history and hidden selection for GLM rollback.
 
-The recurrence stays in FLA. These kernels only mask raw logits, select saved
-convolution samples and gather the accepted hidden row. Counts and source
-strides are device/runtime metadata, independent of context length or sampling.
+Counts and source strides are device/runtime metadata, independent of context
+length or sampling. Masked-logit preparation remains an independent test control
+for the original FLA recurrence.
 """
 
 from __future__ import annotations
@@ -12,6 +12,91 @@ from typing import Any, cast
 import torch
 import triton
 import triton.language as tl
+
+
+@triton.jit(do_not_specialize=["width", "h0", "h1", "h2", "h3", "r0", "r1", "r2", "c0"])
+def _select_history(
+    History,
+    Raw,
+    Counts,
+    Output,
+    width,
+    h0,
+    h1,
+    h2,
+    h3,
+    r0,
+    r1,
+    r2,
+    c0,
+    GROUPS: tl.constexpr,
+    CHANNELS: tl.constexpr,
+    HISTORY: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(1).to(tl.int64)
+    index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    valid = index < GROUPS * CHANNELS * HISTORY
+    position = index % HISTORY
+    channel = index // HISTORY % CHANNELS
+    group = index // (HISTORY * CHANNELS)
+    source_position = tl.load(Counts + row * c0).to(tl.int64) + position
+    saved = source_position < HISTORY
+    prior = tl.load(
+        History + row * h0 + group * h1 + channel * h2 + source_position * h3,
+        valid & saved,
+        other=0,
+    )
+    current = tl.load(
+        Raw
+        + (row * width + source_position - HISTORY) * r0
+        + group * r1
+        + channel * r2,
+        valid & ~saved,
+        other=0,
+    )
+    tl.store(
+        Output + row * GROUPS * CHANNELS * HISTORY + index,
+        tl.where(saved, prior, current),
+        valid,
+    )
+
+
+def select_history(counts, width, history, raw):
+    """Select the three accepted convolution samples without preparing KDA logits."""
+    rows = _counts(counts, width)
+    if history.ndim != 4 or raw.ndim != 3:
+        raise ValueError("convolution history/raw QKV must have rank 4/3")
+    groups, channels, length = history.shape[1:]
+    if history.shape[0] != rows or raw.shape != (rows * width, groups, channels):
+        raise ValueError("convolution history and packed QKV shapes disagree")
+    if length != 3:
+        raise ValueError("GLM convolution repair requires three saved samples")
+    if any(x.device != counts.device for x in (history, raw)):
+        raise ValueError("convolution history and counts must share a device")
+    if history.dtype != raw.dtype:
+        raise ValueError("saved and current convolution samples must share a dtype")
+    output = torch.empty(history.shape, device=history.device, dtype=history.dtype)
+    if rows:
+        with torch.cuda.device(counts.device):
+            cast(Any, _select_history)[
+                (triton.cdiv(groups * channels * length, 256), rows)
+            ](
+                history,
+                raw,
+                counts,
+                output,
+                width,
+                *history.stride(),
+                *raw.stride(),
+                counts.stride(0),
+                groups,
+                channels,
+                length,
+                256,
+                num_warps=4,
+            )
+    return output
 
 
 @triton.jit(

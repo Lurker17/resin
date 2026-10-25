@@ -44,21 +44,50 @@ class SpeculativeTape:
     by the batch and FLA never mutates them. Accepted lengths are runtime inputs.
     """
 
-    def __init__(self, batch, width: int):
+    def __init__(self, batch, width: int, *, reuse_initial_state: bool = False):
         self.batch, self.width = batch, width
         self.records: list[KdaRecord] = []
+        self.reuse_initial_state = reuse_initial_state
+        self._owned_regions = []
+        self._page_storage = None
+        if reuse_initial_state:
+            arena = getattr(
+                getattr(batch, "device_cache", None), "recurrent_states", None
+            )
+            if not isinstance(arena, Tensor):
+                raise ValueError("KDA scratch reuse requires the Engine cache arena")
+            self._page_storage = arena.untyped_storage().data_ptr()
 
     @classmethod
-    def attach(cls, batch, width: int):
+    def attach(cls, batch, width: int, *, reuse_initial_state: bool = False):
         if not 1 <= width <= 8:
             raise ValueError("KDA speculative blocks must contain 1–8 tokens")
-        tape = cls(batch, width)
+        tape = cls(batch, width, reuse_initial_state=reuse_initial_state)
         for layer in batch.layers.values():
             if layer.recurrent is not None:
                 layer.speculative_tape = tape
         return tape
 
     def record(self, layer, raw_qkv, q, k, v, forget, beta, a_log, dt_bias, bound):
+        if self.reuse_initial_state:
+            initial = layer.recurrent
+            if initial.dtype != torch.float32 or not initial.is_contiguous():
+                raise ValueError(
+                    "KDA scratch reuse requires packed FP32 initial states"
+                )
+            pointer = initial.untyped_storage().data_ptr()
+            if pointer == self._page_storage:
+                raise ValueError(
+                    "KDA scratch reuse cannot overwrite Engine cache pages"
+                )
+            start = initial.storage_offset()
+            end = start + initial.numel()
+            if any(
+                pointer == prior and start < stop and begin < end
+                for prior, begin, stop in self._owned_regions
+            ):
+                raise ValueError("KDA scratch reuse requires disjoint layer states")
+            self._owned_regions.append((pointer, start, end))
         self.records.append(
             KdaRecord(
                 layer,
@@ -84,50 +113,74 @@ class SpeculativeTape:
         accepted prefix remain invisible under causal selection and are replaced
         when their positions are next written, including partial pool boundaries.
         """
+        from resin_models_cuda.glm5_3_flash.index_tail import commit_tail
+
+        for layer in self.batch.layers.values():
+            commit_tail(layer, counts)
         rows = counts.shape[0]
         accepted = None
         if not counts.is_cuda:
             within = torch.arange(self.width, device=counts.device)[None, :]
             accepted = (within < counts[:, None]).flatten()
         for record in self.records:
-            # A zero beta and zero log-decay preserve the state exactly. Both
-            # supported gate parameterizations approach zero at raw gate -inf.
             if counts.is_cuda:
+                from resin_models_cuda.glm5_3_flash.kda_state_cuda import (
+                    accepted_kda_state,
+                )
                 from resin_models_cuda.glm5_3_flash.speculative_cuda import (
-                    prepare_replay,
+                    select_history,
                 )
 
-                forget, beta, history = prepare_replay(
-                    counts,
-                    self.width,
+                # Only state survives verification. Avoid producing discarded
+                # attention outputs or executing rejected recurrent updates.
+                reuse: dict[str, Any] = (
+                    {"out": record.initial, "initial_is_owned": True}
+                    if self.reuse_initial_state
+                    else {}
+                )
+                record.layer.recurrent = accepted_kda_state(
+                    record.key,
+                    record.value,
                     record.forget,
                     record.beta,
+                    record.a_log,
+                    record.dt_bias,
+                    record.initial,
+                    record.layer.cu_seqlens,
+                    counts,
+                    record.lower_bound,
+                    **reuse,
+                )
+                history = select_history(
+                    counts,
+                    self.width,
                     record.history,
                     record.raw_qkv,
                 )
             else:
+                # Independent reference: mask rejected updates and execute the
+                # original full recurrence, retaining only its final state.
                 assert accepted is not None
                 forget = record.forget.masked_fill(~accepted[:, None, None], -torch.inf)
                 # Keep raw logits: kernels.kda applies sigmoid in FP32 for both
                 # verification and replay; rejected logits produce exactly zero.
                 beta = record.beta.masked_fill(~accepted[:, None], -torch.inf)
-            replay = SimpleNamespace(
-                recurrent=record.initial,
-                cu_seqlens=record.layer.cu_seqlens,
-                cu_seqlens_cpu=None,
-            )
-            _, record.layer.recurrent = kernels.kda(
-                record.query,
-                record.key,
-                record.value,
-                forget,
-                beta,
-                record.a_log,
-                record.dt_bias,
-                record.lower_bound,
-                replay,
-            )
-            if not counts.is_cuda:
+                replay = SimpleNamespace(
+                    recurrent=record.initial,
+                    cu_seqlens=record.layer.cu_seqlens,
+                    cu_seqlens_cpu=None,
+                )
+                _, record.layer.recurrent = kernels.kda(
+                    record.query,
+                    record.key,
+                    record.value,
+                    forget,
+                    beta,
+                    record.a_log,
+                    record.dt_bias,
+                    record.lower_bound,
+                    replay,
+                )
                 source = torch.cat(
                     (
                         record.history.permute(0, 3, 1, 2),
@@ -283,6 +336,7 @@ def speculative_step(
     hidden = rms_norm(batch.previous_hidden, model.norm, model.config.rms_norm_eps)
     current = anchors.flatten()
     drafts = []
+    repair_initial_tail = None
     if phase_timing is not None:
         phase_timing.mark(0)
     for step in range(draft_tokens):
@@ -297,13 +351,17 @@ def speculative_step(
         )
         with capacity(1) if capacity is not None else nullcontext():
             logits, hidden = model.mtp_forward(current, hidden, draft_positions, cache)
+        if step == 0 and getattr(template, "index_tail", None) is not None:
+            # The first draft's p-1 pair is exact; later recursive pairs are
+            # provisional. Repair must start from this owned tail snapshot.
+            repair_initial_tail = template.index_tail.snapshot()
         current = logits.argmax(-1)
         drafts.append(current)
     drafts = torch.stack(drafts, dim=1)
     if phase_timing is not None:
         phase_timing.mark(1)
     verify_ids = torch.cat((anchors.reshape(rows, 1), drafts), dim=1)
-    tape = SpeculativeTape.attach(batch, width)
+    tape = SpeculativeTape.attach(batch, width, reuse_initial_state=anchors.is_cuda)
     with capacity(width) if capacity is not None else nullcontext():
         verified_hidden = model.forward_hidden(
             verify_ids.flatten(), block_positions, batch
@@ -319,13 +377,14 @@ def speculative_step(
         accepted = torch.where(fixed_acceptance >= 0, fixed_acceptance, accepted)
     counts = accepted + 1
     selected_hidden = tape.commit(counts, verified_hidden)
-    batch.store(selected_hidden)
     # Rebuild the native MTP cache using verified target states, replacing the
     # approximate recursively generated draft states. Only accepted positions
     # can be observed subsequently; spare writes are inside the lookahead lease.
     bonus = targets.gather(1, accepted[:, None])
     repair_ids = torch.cat((drafts, targets[:, -1:]), dim=1)
     repair_ids = repair_ids.scatter(1, accepted[:, None], bonus)
+    if repair_initial_tail is not None:
+        template.index_tail.assign(repair_initial_tail)
     repair = MtpCache(
         layer_id, template, block_positions, block_sequences, block_offsets, positions
     )
@@ -333,6 +392,12 @@ def speculative_step(
     with capacity(width) if capacity is not None else nullcontext():
         embedded = torch.nn.functional.embedding(repair_ids.flatten(), model.embedding)
         model.mtp(embedded, previous, block_positions, repair)
+    from resin_models_cuda.glm5_3_flash.index_tail import commit_tail
+
+    commit_tail(repair.view, counts)
+    # Persist both the accepted target tails and the repaired native-MTP tail
+    # together with the recurrent state. Prefix snapshots now own all history.
+    batch.store(selected_hidden)
     if phase_timing is not None:
         phase_timing.mark(3)
     return torch.cat((drafts, targets), dim=1), logits

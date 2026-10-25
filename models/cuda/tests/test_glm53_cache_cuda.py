@@ -30,18 +30,40 @@ def _geometry():
 
 def _fixture(device, batch, *, width=3, first=0, geometry=None, capacity=None):
     geometry = geometry or _geometry()
+    parents_per_row = (width + geometry.packings[1] - 1) // geometry.packings[1]
     arena = CacheArena(
-        device, geometry.layout(capacity or batch + 3), geometry, max_batch_size=batch
+        device,
+        geometry.layout(capacity or batch * parents_per_row + 3),
+        geometry,
+        max_batch_size=batch,
     )
     arena.storage.random_(0, 256)
-    parents = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
-    parents = parents[:, None].expand(batch, width).contiguous()
-    slots = torch.arange(width, device=device, dtype=torch.int32)
-    slots = (slots % geometry.packings[1])[None].expand(batch, width).contiguous()
+    # Logical checkpoints need distinct (parent,slot) pairs even when the
+    # bounded-tail layout leaves only one state slot per physical slab.
+    rows = torch.arange(batch, device=device, dtype=torch.int32)
+    columns = torch.arange(width, device=device, dtype=torch.int32)
+    parents = (
+        1 + rows[:, None] * parents_per_row + columns[None] // geometry.packings[1]
+    ).contiguous()
+    slots = (columns % geometry.packings[1])[None].expand(batch, width).contiguous()
     group = DevicePageGroup(
         parents, slots, torch.full((batch,), first, device=device, dtype=torch.int32)
     )
     return arena, arena._make_graph_cache((group, group))
+
+
+def _packed_bytes(value):
+    # A one-element logical view can be reported contiguous while retaining a
+    # non-unit last stride. dtype reinterpretation still requires stride 1.
+    # Avoid copying already packed arenas: wide-address tests exceed 8 GiB.
+    if not value.is_contiguous() or (value.ndim and value.stride(-1) != 1):
+        packed = torch.empty(value.shape, dtype=value.dtype, device=value.device)
+        packed.copy_(value)
+        value = packed
+    if value.ndim == 0:
+        value = value.reshape(1)
+    assert value.stride(-1) == 1
+    return value.view(torch.uint8).reshape(-1)
 
 
 def _bitwise_equal(actual, expected):
@@ -49,8 +71,8 @@ def _bitwise_equal(actual, expected):
     # CUDA equal materializes a bool per compared byte. Bound this temporary,
     # including for the >8GiB physical-address oracle; never compare an entire
     # arena in one torch.equal call.
-    actual = actual.view(torch.uint8).reshape(-1)
-    expected = expected.view(torch.uint8).reshape(-1)
+    actual = _packed_bytes(actual)
+    expected = _packed_bytes(expected)
     chunk = 16 * 2**20
     for start in range(0, actual.numel(), chunk):
         assert torch.equal(
@@ -78,7 +100,45 @@ def _on_storage(cache, storage):
         recurrent_states=view(cache.recurrent_states),
         convolution_states=view(cache.convolution_states),
         target_hidden_states=view(cache.target_hidden_states),
+        index_tail_keys=view(cache.index_tail_keys),
+        index_tail_gates=view(cache.index_tail_gates),
+        index_tail_ends=view(cache.index_tail_ends),
     )
+
+
+def _reference_tails(cache, contexts):
+    from resin_models_cuda.glm5_3_flash.index_tail import IndexTail
+
+    parents, slots, _ = cache.locations(
+        1,
+        (contexts - 1).clamp_min(0)[:, None],
+        block_tokens=cache.geometry.state_tokens,
+    )
+    indices = parents[:, 0].long(), slots[:, 0].long()
+    keys, gates, ends = (
+        cache.index_tail_keys[indices],
+        cache.index_tail_gates[indices],
+        cache.index_tail_ends[indices],
+    )
+    fresh = (contexts == 0) | (parents[:, 0] == 0)
+    keys[fresh], gates[fresh], ends[fresh] = 0, 0, -1
+    return [
+        IndexTail(
+            keys[:, i].contiguous(), gates[:, i].contiguous(), ends[:, i].contiguous()
+        )
+        for i in range(len(cache.geometry.full_layers))
+    ]
+
+
+def _reference_store_tails(cache, positions, tails):
+    parents, slots, _ = cache.locations(
+        1, positions[:, None], block_tokens=cache.geometry.state_tokens
+    )
+    valid = parents[:, 0] > 0
+    indices = parents[valid, 0].long(), slots[valid, 0].long()
+    cache.index_tail_keys[indices] = torch.stack([t.keys for t in tails], 1)[valid]
+    cache.index_tail_gates[indices] = torch.stack([t.gates for t in tails], 1)[valid]
+    cache.index_tail_ends[indices] = torch.stack([t.end for t in tails], 1)[valid]
 
 
 def _batch(cache, contexts, lengths):
@@ -133,6 +193,11 @@ def test_batch_cache_owns_initial_states_and_preserves_published_prefix(device):
             [batch.layer(i).convolution for i in cache.geometry.linear_layers], 1
         ),
         hidden,
+    )
+    _reference_store_tails(
+        reference,
+        batch.lengths - 1,
+        [batch.layer(i).index_tail for i in cache.geometry.full_layers],
     )
     batch.store(hidden)
     _bitwise_equal(arena.storage, expected)
@@ -216,6 +281,11 @@ def test_batch_cache_graph_pool_lifetime_and_changed_page_metadata():
         _on_storage(cache, expected).store_state(
             contexts + offsets[1:] - offsets[:-1] - 1, r, c, hidden
         )
+        _reference_store_tails(
+            _on_storage(cache, expected),
+            contexts + offsets[1:] - offsets[:-1] - 1,
+            _reference_tails(cache, contexts),
+        )
         for allocation in pressure:
             allocation.fill_(step)
         graph.replay()
@@ -239,6 +309,11 @@ def test_batch_cache_shifted_window_null_lookup_and_negative_idle_position(devic
     # Only row0 writes the reserved null location. The others own distinct
     # parents, including row1's transition from an absent previous checkpoint.
     _on_storage(cache, expected).store_state(batch.lengths - 1, *initial)
+    _reference_store_tails(
+        _on_storage(cache, expected),
+        batch.lengths - 1,
+        [batch.layer(i).index_tail for i in cache.geometry.full_layers],
+    )
     batch.store(batch.previous_hidden)
     _bitwise_equal(arena.storage, expected)
 
@@ -279,7 +354,10 @@ def test_state_transfer_wide_physical_addresses(mtp):
     )
 
     geometry = CacheGeometry.from_config(
-        Glm53Config(), state_tokens=512, include_mtp=mtp
+        Glm53Config(),
+        state_tokens=512,
+        include_mtp=mtp,
+        latent_dtype=torch.bfloat16,
     )
     parent = 2**31 // (geometry.slab_bytes // 4) + 2
     arena, cache = _fixture("cuda", 1, width=2, geometry=geometry, capacity=parent + 1)
@@ -305,6 +383,26 @@ def test_state_transfer_wide_physical_addresses(mtp):
     )
     scatter_state_layers(cache, contexts - 1, final_r, final_c, final_h)
     _bitwise_equal(arena.storage, expected)
+    # The small raw-index checkpoints use the same >32-bit parent offsets.
+    from resin_models_cuda.glm5_3_flash.cache_cuda import (
+        gather_index_tails,
+        scatter_index_tails,
+    )
+
+    tails = gather_index_tails(cache, contexts)
+    for actual, reference_tail in zip(
+        tails, _reference_tails(cache, contexts), strict=True
+    ):
+        for value, reference_value in zip(
+            (actual.keys, actual.gates, actual.end),
+            (reference_tail.keys, reference_tail.gates, reference_tail.end),
+            strict=True,
+        ):
+            _bitwise_equal(value, reference_value)
+            value.view(torch.uint8).bitwise_xor_(5)
+    _reference_store_tails(_on_storage(cache, expected), contexts - 1, tails)
+    scatter_index_tails(cache, contexts - 1, tails)
+    _bitwise_equal(arena.storage, expected)
 
 
 @CUDA
@@ -315,7 +413,12 @@ def test_state_transfer_does_not_specialize_on_batch_or_context_values():
         device = torch.cuda.current_device()
         return {
             name: set(getattr(cache_cuda, name).device_caches[device][0])
-            for name in ("_gather_state", "_scatter_state")
+            for name in (
+                "_gather_state",
+                "_scatter_state",
+                "_gather_index_tails",
+                "_scatter_index_tails",
+            )
         }
 
     def execute(batch, width, first, dtype):
@@ -327,8 +430,16 @@ def test_state_transfer_does_not_specialize_on_batch_or_context_values():
             _bitwise_equal(r[i], expected[0][:, i])
             _bitwise_equal(c[i], expected[1][:, i])
         _bitwise_equal(h, expected[2])
+        tails = cache_cuda.gather_index_tails(cache, contexts)
+        for actual, expected_tail in zip(
+            tails, _reference_tails(cache, contexts), strict=True
+        ):
+            _bitwise_equal(actual.keys, expected_tail.keys)
+            _bitwise_equal(actual.gates, expected_tail.gates)
+            _bitwise_equal(actual.end, expected_tail.end)
         before = arena.storage.clone()
         cache_cuda.scatter_state_layers(cache, contexts - 1, tuple(r), tuple(c), h)
+        cache_cuda.scatter_index_tails(cache, contexts - 1, tails)
         _bitwise_equal(arena.storage, before)
 
     # Integer dtypes are a bounded ABI distinction, warmed independently.
@@ -345,4 +456,9 @@ def test_state_transfer_does_not_specialize_on_batch_or_context_values():
     ]:
         for dtype in (torch.int32, torch.int64):
             execute(batch, width, first, dtype)
-            assert entries() == baseline
+            current = entries()
+            assert current == baseline, {
+                name: sorted(keys - baseline[name])
+                for name, keys in current.items()
+                if keys != baseline[name]
+            }

@@ -74,7 +74,6 @@ class PrefillTensorGraphs:
                 tuple((n, i + 1) for i in range(len(regions)) for n in self.buckets),
                 self.build,
                 lambda shape: self._buffers(*shape)[0],
-                share_pool=True,
             ),
         )
 

@@ -12,6 +12,7 @@ from torch import Tensor
 if TYPE_CHECKING:
     from resin.backend.topology import RankGroup
 
+
 _MAX_DESTINATIONS_PER_PASS = 22
 
 
@@ -84,48 +85,32 @@ class SparseExpertTransport:
             moe_a2a_sanitize_expert_ids,
         )
 
+        from resin.backend.cuda.expert_parallel_kernels import (
+            prepare_receive,
+            prepare_routes,
+        )
+
         capacity, world_size = self.capacity, self.group.size
         # The pinned primitive specializes K in {1,2,4,6,8,10,16,22}. Usual
         # top-k routing fits one pass. Large expert-TP fanout is partitioned by
         # physical rank, retaining owner-sparse writes in every pass.
-        if owners.shape[1] <= _MAX_DESTINATIONS_PER_PASS:
-            routes = [owners.sort(dim=1).values]
-        else:
-            destinations = torch.zeros(
-                (capacity, world_size), device=hidden.device, dtype=torch.bool
-            )
-            destinations.scatter_(1, owners.long(), True)
-            ranks = torch.arange(world_size, device=hidden.device, dtype=torch.int32)
-            routes = [
-                torch.where(
-                    destinations[:, start : start + _MAX_DESTINATIONS_PER_PASS],
-                    ranks[start : start + _MAX_DESTINATIONS_PER_PASS],
-                    world_size,
-                )
-                for start in range(0, world_size, _MAX_DESTINATIONS_PER_PASS)
-            ]
+        routes = prepare_routes(
+            owners,
+            active,
+            indices,
+            weights,
+            world_size=world_size,
+            rank=self.group.local_rank,
+            num_experts=num_experts,
+            max_destinations_per_pass=_MAX_DESTINATIONS_PER_PASS,
+        )
 
         result = None
-        for route in routes:
-            first = route.min(dim=1, keepdim=True).values
-            selected = active & (first[:, 0] < world_size)
-            route = torch.where(route < world_size, route, first)
-            route = torch.where(selected[:, None], route, self.group.local_rank)
-            k = next(k for k in (1, 2, 4, 6, 8, 10, 16, 22) if k >= route.shape[1])
-            if k != route.shape[1]:
-                route = torch.cat(
-                    (route, route[:, :1].expand(-1, k - route.shape[1])), 1
-                )
-            masked_weights = weights.masked_fill(~selected[:, None], 0)
-            payloads, combine_offset = moe_a2a_dispatch(
-                route.to(torch.int32).contiguous(),
-                [
-                    indices.masked_fill(~selected[:, None], num_experts).to(
-                        torch.int32
-                    ),
-                    masked_weights.float(),
-                    hidden,
-                ],
+        for route, payload_indices, payload_weights in routes:
+            k = route.shape[1]
+            dispatched = moe_a2a_dispatch(
+                route,
+                [payload_indices, payload_weights, hidden],
                 self.workspace,
                 self.metainfo,
                 capacity,
@@ -134,6 +119,16 @@ class SparseExpertTransport:
                 k,
                 world_size,
             )
+            if len(dispatched) == 3:
+                # FlashInfer 0.7 adds optional EPLB gathered statistics. This
+                # transport does not enable EPLB at initialization or dispatch;
+                # the payload and combine-offset contracts remain unchanged.
+                payloads, combine_offset, eplb_stats = dispatched
+                if eplb_stats is not None:
+                    raise RuntimeError("unexpected FlashInfer EPLB statistics")
+            else:
+                # FlashInfer 0.6 returns just the payloads and combine offset.
+                payloads, combine_offset = dispatched
             received_indices, received_weights, received_hidden = payloads
             moe_a2a_sanitize_expert_ids(
                 received_indices,
@@ -142,17 +137,19 @@ class SparseExpertTransport:
                 self.group.local_rank,
                 num_experts,
             )
-            valid = received_indices[..., 0] < num_experts
             # The transport ABI stores routing weights in FP32. Local expert
             # kernels retain the caller's dtype contract (BF16 for DeepSeek).
-            received_weights = received_weights.masked_fill(~valid[..., None], 0).to(
-                weights.dtype
+            received_hidden, received_weights = prepare_receive(
+                received_hidden,
+                received_indices,
+                received_weights,
+                num_experts=num_experts,
+                weight_dtype=weights.dtype,
             )
-            received_hidden = received_hidden.masked_fill(~valid[..., None], 0)
             partial = local(
-                received_hidden.flatten(0, 1),
+                received_hidden,
                 received_indices.flatten(0, 1),
-                received_weights.flatten(0, 1),
+                received_weights,
             )
             combined = moe_a2a_combine(
                 partial.reshape(world_size, capacity, -1).contiguous(),

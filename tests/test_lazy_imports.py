@@ -59,7 +59,7 @@ class TestImport:
         assert "huggingface-hub>=0.35" in cuda_dependencies
         assert "safetensors>=0.5" in cuda_dependencies
         assert any(
-            item.startswith("flashinfer-python==0.6.15.post1")
+            item.startswith("flashinfer-python==0.7.1")
             for item in cuda_dependencies
         )
         assert any(

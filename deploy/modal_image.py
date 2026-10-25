@@ -98,11 +98,11 @@ def build_modal_image(
         )
         # These accelerator-specific supplement wheels live outside PyPI.
         .uv_pip_install(
-            "flashinfer-cubin==0.6.15.post1",
+            "flashinfer-cubin==0.7.1",
             extra_index_url="https://flashinfer.ai/whl",
         )
         .uv_pip_install(
-            "flashinfer-jit-cache==0.6.15.post1+cu130",
+            "flashinfer-jit-cache==0.7.1+cu130",
             extra_index_url="https://flashinfer.ai/whl/cu130",
         )
         # Keep dependency layers independent of local source edits.

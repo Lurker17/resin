@@ -34,9 +34,17 @@ class CacheGeometry:
     conv_history: int
     state_tokens: int
     include_mtp: bool = False
+    latent_dtype: torch.dtype = torch.bfloat16
 
     @classmethod
-    def from_config(cls, config, *, state_tokens: int, include_mtp: bool = False):
+    def from_config(
+        cls,
+        config,
+        *,
+        state_tokens: int,
+        include_mtp: bool = False,
+        latent_dtype: torch.dtype = torch.float8_e4m3fn,
+    ):
         if state_tokens <= 0 or state_tokens % PAGE_TOKENS:
             raise ValueError("GLM state checkpoint width must be a multiple of 64")
         return cls(
@@ -49,6 +57,7 @@ class CacheGeometry:
             config.linear_conv_kernel_dim - 1,
             state_tokens,
             include_mtp,
+            latent_dtype,
         )
 
     @property
@@ -68,27 +77,25 @@ class CacheGeometry:
 
     @property
     def latent_bytes(self):
-        return PAGE_TOKENS * self.latent_dim * 2
-
-    @property
-    def index_bytes(self):
-        return PAGE_TOKENS * self.index_dim * 2
-
-    @property
-    def gate_bytes(self):
-        return PAGE_TOKENS * self.index_dim * 4
+        return PAGE_TOKENS * self.latent_dim * self.latent_dtype.itemsize
 
     @property
     def unit_bytes(self):
-        raw = (
-            self.latent_bytes
-            + self.index_bytes
-            + self.gate_bytes
-            + PAGE_TOKENS // 4 * self.index_dim * 2
-        )
-        # FlashMLA addresses a BF16 storage envelope in latent-width rows.
-        alignment = math.lcm(self.latent_dim * 2, 4)
+        raw = self.latent_bytes + PAGE_TOKENS // 4 * self.index_dim * 2
+        # Both cache consumers address an envelope of latent-width rows.
+        alignment = math.lcm(self.latent_dim * self.latent_dtype.itemsize, 8)
         return math.ceil(raw / alignment) * alignment
+
+    @property
+    def tail_elements(self):
+        return len(self.full_layers) * 4 * self.index_dim
+
+    @property
+    def base_state_bytes(self):
+        return (
+            self.recurrent_elements * 4
+            + (self.convolution_elements + self.hidden_size) * 2
+        )
 
     @property
     def recurrent_elements(self):
@@ -102,10 +109,10 @@ class CacheGeometry:
 
     @property
     def state_bytes(self):
-        return (
-            self.recurrent_elements * 4
-            + (self.convolution_elements + self.hidden_size) * 2
-        )
+        # Four raw rows per sparse layer plus their last logical position.
+        # The two Engine STATE checkpoints own these tails, including prefixes.
+        raw = self.base_state_bytes + self.tail_elements * 6 + len(self.full_layers) * 8
+        return math.ceil(raw / 8) * 8
 
     @property
     def slab_bytes(self):
@@ -156,6 +163,13 @@ class LayerCache:
     # and completed pool g at pool slot g+1. Its first continuation write then
     # belongs to the Engine's append page, never to an immutable prefix page.
     storage_origin: int = 0
+    index_tail: Any = None
+    index_update: Any = None
+    dsa_workspace: Any = None
+    # Set only for the CUDA gather's owned working copy. Ordinary decode may
+    # overwrite it; the Engine slab allocation remains an explicit alias guard.
+    initial_state_owned: bool = False
+    initial_state_arena: Tensor | None = None
 
 
 class BatchCache:
@@ -210,7 +224,12 @@ class BatchCache:
                 cu_seqlens_cpu=cu_seqlens_cpu,
                 recurrent=recurrent[index],
                 convolution=convolution[index],
+                initial_state_owned=contexts.is_cuda,
+                initial_state_arena=device_cache.recurrent_states
+                if contexts.is_cuda
+                else None,
             )
+        tails = device_cache.gather_index_tails(contexts)
         for index, layer in enumerate(geometry.full_layers):
             self.layers[layer] = LayerCache(
                 positions,
@@ -221,10 +240,10 @@ class BatchCache:
                 cu_seqlens_cpu=cu_seqlens_cpu,
                 page_table=device_cache.pages(0, index, len(geometry.full_layers)),
                 latent=device_cache.latent,
-                index_keys=device_cache.index_keys,
-                index_gates=device_cache.index_gates,
                 pooled_keys=device_cache.pooled_keys,
                 storage_origin=int(layer == len(geometry.layer_types)),
+                index_tail=tails[index],
+                dsa_workspace=device_cache.dsa_workspace,
             )
 
     def layer(self, index: int) -> LayerCache:
@@ -232,6 +251,9 @@ class BatchCache:
 
     def store(self, hidden: Tensor) -> None:
         geometry = self.device_cache.geometry
+        self.device_cache.store_index_tails(
+            self.lengths - 1, [self.layers[i].index_tail for i in geometry.full_layers]
+        )
         states, convolutions = [], []
         for index in geometry.linear_layers:
             layer = self.layers[index]
@@ -254,13 +276,68 @@ class BatchCache:
 class DeviceCache(SlabDeviceCache):
     geometry: CacheGeometry
     latent: Tensor
-    index_keys: Tensor
-    index_gates: Tensor
     pooled_keys: Tensor
     recurrent_states: Tensor
     convolution_states: Tensor
     target_hidden_states: Tensor
+    index_tail_keys: Tensor
+    index_tail_gates: Tensor
+    index_tail_ends: Tensor
+    dsa_workspace: Any = None
     page_tokens = PAGE_TOKENS
+
+    def gather_index_tails(self, contexts):
+        from resin_models_cuda.glm5_3_flash.index_tail import IndexTail
+
+        if contexts.is_cuda:
+            from resin_models_cuda.glm5_3_flash.cache_cuda import gather_index_tails
+
+            return gather_index_tails(self, contexts)
+        slabs, slots, _ = self.locations(
+            STATE_GROUP,
+            (contexts - 1).clamp_min(0)[:, None],
+            block_tokens=self.geometry.state_tokens,
+        )
+        indices = slabs[:, 0].long(), slots[:, 0].long()
+        keys = self.index_tail_keys[indices]
+        gates = self.index_tail_gates[indices]
+        ends = self.index_tail_ends[indices]
+        new = (contexts == 0) | (slabs[:, 0] == 0)
+        keys[new] = 0
+        gates[new] = 0
+        ends[new] = -1
+        return [
+            IndexTail(
+                keys[:, i].contiguous(),
+                gates[:, i].contiguous(),
+                ends[:, i].contiguous(),
+            )
+            for i in range(len(self.geometry.full_layers))
+        ]
+
+    def store_index_tails(self, positions, tails):
+        if positions.is_cuda:
+            from resin_models_cuda.glm5_3_flash.cache_cuda import scatter_index_tails
+
+            scatter_index_tails(self, positions, tails)
+            return
+        slabs, slots, _ = self.locations(
+            STATE_GROUP,
+            positions[:, None],
+            block_tokens=self.geometry.state_tokens,
+        )
+        indices = slabs[:, 0].long(), slots[:, 0].long()
+        valid = slabs[:, 0] > 0
+        indices = indices[0][valid], indices[1][valid]
+        self.index_tail_keys[indices] = torch.stack([t.keys for t in tails], dim=1)[
+            valid
+        ]
+        self.index_tail_gates[indices] = torch.stack([t.gates for t in tails], dim=1)[
+            valid
+        ]
+        self.index_tail_ends[indices] = torch.stack([t.end for t in tails], dim=1)[
+            valid
+        ]
 
     def state_at(self, positions):
         slabs, slots, _ = self.locations(
@@ -311,24 +388,19 @@ class CacheArena(GraphPageTableArena):
         )
         bf16, fp32 = self.storage.view(torch.bfloat16), self.storage.view(torch.float32)
         pages = physical * geometry.slab_units
-        self.latent = bf16.as_strided(
+        latent_storage = self.storage.view(geometry.latent_dtype)
+        self.latent = latent_storage.as_strided(
             (pages, PAGE_TOKENS, geometry.latent_dim),
-            (geometry.unit_bytes // 2, geometry.latent_dim, 1),
-        )
-        self.index_keys = bf16.as_strided(
-            (pages, PAGE_TOKENS, geometry.index_dim),
-            (geometry.unit_bytes // 2, geometry.index_dim, 1),
-            geometry.latent_bytes // 2,
-        )
-        self.index_gates = fp32.as_strided(
-            (pages, PAGE_TOKENS, geometry.index_dim),
-            (geometry.unit_bytes // 4, geometry.index_dim, 1),
-            (geometry.latent_bytes + geometry.index_bytes) // 4,
+            (
+                geometry.unit_bytes // geometry.latent_dtype.itemsize,
+                geometry.latent_dim,
+                1,
+            ),
         )
         self.pooled_keys = bf16.as_strided(
             (pages, PAGE_TOKENS // 4, geometry.index_dim),
             (geometry.unit_bytes // 2, geometry.index_dim, 1),
-            (geometry.latent_bytes + geometry.index_bytes + geometry.gate_bytes) // 2,
+            geometry.latent_bytes // 2,
         )
         n, h, d, c = (
             len(geometry.linear_layers),
@@ -366,6 +438,29 @@ class CacheArena(GraphPageTableArena):
             geometry.recurrent_elements * 2 + geometry.convolution_elements,
         )
 
+        f, d = len(geometry.full_layers), geometry.index_dim
+        self.index_tail_keys = bf16.as_strided(
+            (physical, state_slots, f, 4, d),
+            (geometry.slab_bytes // 2, geometry.state_bytes // 2, 4 * d, d, 1),
+            geometry.base_state_bytes // 2,
+        )
+        self.index_tail_gates = fp32.as_strided(
+            (physical, state_slots, f, 4, d),
+            (geometry.slab_bytes // 4, geometry.state_bytes // 4, 4 * d, d, 1),
+            (geometry.base_state_bytes + geometry.tail_elements * 2) // 4,
+        )
+        self.index_tail_ends = self.storage.view(torch.int64).as_strided(
+            (physical, state_slots, f),
+            (geometry.slab_bytes // 8, geometry.state_bytes // 8, 1),
+            (geometry.base_state_bytes + geometry.tail_elements * 6) // 8,
+        )
+
+        self.dsa_workspace = None
+        if self.storage.is_cuda and geometry.latent_dtype == torch.float8_e4m3fn:
+            from resin_models_cuda.glm5_3_flash.dsa import DsaWorkspace
+
+            self.dsa_workspace = DsaWorkspace(device)
+
     def _graph_padding_address(self, index, row):
         return graph_scratch_address(
             self.layout.parent_capacity,
@@ -398,10 +493,12 @@ class CacheArena(GraphPageTableArena):
             self.geometry,
             groups,
             self.latent,
-            self.index_keys,
-            self.index_gates,
             self.pooled_keys,
             self.recurrent_states,
             self.convolution_states,
             self.target_hidden_states,
+            self.index_tail_keys,
+            self.index_tail_gates,
+            self.index_tail_ends,
+            self.dsa_workspace,
         )

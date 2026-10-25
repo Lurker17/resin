@@ -456,3 +456,208 @@ def scatter_state_layers(
         block,
         num_warps=4,
     )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "batch",
+        "table_width",
+        "table_stride",
+        "key_parent",
+        "key_slot",
+        "gate_parent",
+        "gate_slot",
+        "end_parent",
+        "end_slot",
+        "output_end_stride",
+    ]
+)
+def _gather_index_tails(
+    Keys,
+    Gates,
+    Ends,
+    Parents,
+    Slots,
+    First,
+    Contexts,
+    OutKeys,
+    OutGates,
+    OutEnds,
+    batch,
+    table_width,
+    table_stride,
+    key_parent,
+    key_slot,
+    gate_parent,
+    gate_slot,
+    end_parent,
+    end_slot,
+    output_end_stride,
+    STATE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    seq, layer = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    context = tl.load(Contexts + seq)
+    column = tl.maximum(context - 1, 0) // STATE - tl.load(First + seq)
+    valid = (column >= 0) & (column < table_width)
+    parent = tl.load(Parents + seq * table_stride + column, valid, other=0).to(tl.int64)
+    slot = tl.load(Slots + seq * table_stride + column, valid, other=0).to(tl.int64)
+    offset = tl.arange(0, BLOCK)
+    live = (context > 0) & (parent > 0)
+    key = tl.load(
+        Keys + parent * key_parent + slot * key_slot + layer * WIDTH + offset,
+        live & (offset < WIDTH),
+        other=0,
+    )
+    gate = tl.load(
+        Gates + parent * gate_parent + slot * gate_slot + layer * WIDTH + offset,
+        live & (offset < WIDTH),
+        other=0,
+    )
+    end = tl.load(Ends + parent * end_parent + slot * end_slot + layer, live, other=-1)
+    output = (layer * batch + seq) * WIDTH + offset
+    tl.store(OutKeys + output, key, offset < WIDTH)
+    tl.store(OutGates + output, gate, offset < WIDTH)
+    tl.store(OutEnds + layer * output_end_stride + seq, end)
+
+
+def gather_index_tails(cache, contexts):
+    from resin_models_cuda.glm5_3_flash.index_tail import IndexTail
+
+    g = cache.geometry
+    layers, batch = len(g.full_layers), contexts.numel()
+    keys = torch.empty(
+        (layers, batch, 4, g.index_dim), device=contexts.device, dtype=torch.bfloat16
+    )
+    gates = torch.empty_like(keys, dtype=torch.float32)
+    # The scatter consumes a tuple of layer views. Triton 3.7.1 specializes
+    # tuple element pointer alignment even with the argument's alignment flag
+    # disabled. Keep every layer aligned at B1/odd B without copies or kernels.
+    ends = torch.empty_strided(
+        (layers, batch),
+        (triton.cdiv(batch, 2) * 2, 1),
+        device=contexts.device,
+        dtype=torch.int64,
+    )
+    group = cache.groups[1]
+    if batch:
+        cast(Any, _gather_index_tails)[(batch, layers)](
+            cache.index_tail_keys,
+            cache.index_tail_gates,
+            cache.index_tail_ends,
+            group.slab_ids,
+            group.slotnums,
+            group.first_blocks,
+            contexts,
+            keys,
+            gates,
+            ends,
+            batch,
+            group.slab_ids.shape[1],
+            group.slab_ids.stride(0),
+            *cache.index_tail_keys.stride()[:2],
+            *cache.index_tail_gates.stride()[:2],
+            *cache.index_tail_ends.stride()[:2],
+            ends.stride(0),
+            g.state_tokens,
+            4 * g.index_dim,
+            triton.next_power_of_2(4 * g.index_dim),
+        )
+    return [IndexTail(keys[i], gates[i], ends[i]) for i in range(layers)]
+
+
+@triton.jit(
+    do_not_specialize=[
+        "table_width",
+        "table_stride",
+        "key_parent",
+        "key_slot",
+        "gate_parent",
+        "gate_slot",
+        "end_parent",
+        "end_slot",
+    ]
+)
+def _scatter_index_tails(
+    Keys,
+    Gates,
+    Ends,
+    Parents,
+    Slots,
+    First,
+    Positions,
+    InKeys,
+    InGates,
+    InEnds,
+    table_width,
+    table_stride,
+    key_parent,
+    key_slot,
+    gate_parent,
+    gate_slot,
+    end_parent,
+    end_slot,
+    STATE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    LAYERS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    seq, layer = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    position = tl.load(Positions + seq)
+    logical = tl.where(
+        position < 0, -((-position + STATE - 1) // STATE), position // STATE
+    )
+    column = logical - tl.load(First + seq)
+    valid = (column >= 0) & (column < table_width)
+    parent = tl.load(Parents + seq * table_stride + column, valid, other=0).to(tl.int64)
+    slot = tl.load(Slots + seq * table_stride + column, valid, other=0).to(tl.int64)
+    offset = tl.arange(0, BLOCK)
+    for i in tl.static_range(LAYERS):
+        if layer == i:
+            key = tl.load(InKeys[i] + seq * WIDTH + offset, offset < WIDTH, other=0)
+            gate = tl.load(InGates[i] + seq * WIDTH + offset, offset < WIDTH, other=0)
+            end = tl.load(InEnds[i] + seq)
+            tl.store(
+                Keys + parent * key_parent + slot * key_slot + layer * WIDTH + offset,
+                key,
+                (offset < WIDTH) & (parent > 0),
+            )
+            tl.store(
+                Gates
+                + parent * gate_parent
+                + slot * gate_slot
+                + layer * WIDTH
+                + offset,
+                gate,
+                (offset < WIDTH) & (parent > 0),
+            )
+            tl.store(
+                Ends + parent * end_parent + slot * end_slot + layer, end, parent > 0
+            )
+
+
+def scatter_index_tails(cache, positions, tails):
+    g, group = cache.geometry, cache.groups[1]
+    if positions.numel():
+        cast(Any, _scatter_index_tails)[(positions.numel(), len(tails))](
+            cache.index_tail_keys,
+            cache.index_tail_gates,
+            cache.index_tail_ends,
+            group.slab_ids,
+            group.slotnums,
+            group.first_blocks,
+            positions,
+            tuple(t.keys for t in tails),
+            tuple(t.gates for t in tails),
+            tuple(t.end for t in tails),
+            group.slab_ids.shape[1],
+            group.slab_ids.stride(0),
+            *cache.index_tail_keys.stride()[:2],
+            *cache.index_tail_gates.stride()[:2],
+            *cache.index_tail_ends.stride()[:2],
+            g.state_tokens,
+            4 * g.index_dim,
+            len(tails),
+            triton.next_power_of_2(4 * g.index_dim),
+        )

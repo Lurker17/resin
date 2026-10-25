@@ -75,7 +75,7 @@ class SafetensorReader:
         self._context = None
         self._handle = None
 
-    def read(self, path: Path, key: str):
+    def _open(self, path: Path):
         if path != self._path:
             from safetensors import safe_open
 
@@ -84,7 +84,45 @@ class SafetensorReader:
             self._handle = self._context.__enter__()
             self._path = path
         assert self._handle is not None
-        return self._handle.get_tensor(key)
+        return self._handle
+
+    def read(self, path: Path, key: str):
+        return self._open(path).get_tensor(key)
+
+    def read_slice(
+        self,
+        path: Path,
+        key: str,
+        slices: tuple[slice, ...],
+        *,
+        shape: tuple[int, ...] | None = None,
+    ):
+        """Read bounded contiguous axis intervals without materializing the rest.
+
+        ``shape`` describes the full checkpoint tensor, before slicing. Reject
+        clipped or stepped intervals rather than silently changing shard geometry.
+        The returned CPU tensor retains its storage after this reader changes files.
+        """
+        source = self._open(path).get_slice(key)
+        actual = tuple(source.get_shape())
+        if shape is not None and actual != tuple(shape):
+            raise ValueError(f"{key}: expected {shape}, found {actual}")
+        if not isinstance(slices, tuple) or len(slices) != len(actual):
+            raise ValueError("slices must specify one interval per tensor axis")
+        normalized = []
+        for interval, size in zip(slices, actual, strict=True):
+            if not isinstance(interval, slice) or interval.step not in (None, 1):
+                raise ValueError("tensor slices must be contiguous intervals")
+            start = 0 if interval.start is None else interval.start
+            stop = size if interval.stop is None else interval.stop
+            if (
+                type(start) is not int
+                or type(stop) is not int
+                or not 0 <= start < stop <= size
+            ):
+                raise ValueError(f"slice [{start}:{stop}] is outside axis size {size}")
+            normalized.append(slice(start, stop))
+        return source[tuple(normalized)]
 
 
 __all__ = ["SafetensorReader", "indexed_tensor_files"]

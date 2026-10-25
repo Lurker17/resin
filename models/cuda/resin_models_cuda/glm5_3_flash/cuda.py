@@ -42,7 +42,9 @@ class PreparedBatch:
 
 
 class Glm53FlashCudaRunner(CudaRunner):
-    parallelism_capabilities = ParallelismCapabilities(attn_dp=True, ep=True)
+    parallelism_capabilities = ParallelismCapabilities(
+        attn_dp=True, ep=True, expert_tp=True
+    )
 
     def __init__(
         self,
@@ -77,12 +79,12 @@ class Glm53FlashCudaRunner(CudaRunner):
                 parallel_groups.topology, model="GLM-5.3-Flash"
             )
             mesh = parallel_groups.topology
-            if mesh.attn_dp != mesh.world_size or mesh.ep != mesh.world_size:
-                raise ValueError("GLM currently requires attention-DP=EP=world size")
+            if mesh.attn_dp != mesh.world_size:
+                raise ValueError("GLM requires attention-DP=world size")
         super().__init__(
             device=device,
             label="GLM-5.3-Flash",
-            kv_cache_dtype="bfloat16",
+            kv_cache_dtype="fp8",
             cuda_graph_prefill=cuda_graph_prefill,
             cuda_graph_decode=cuda_graph_decode,
         )

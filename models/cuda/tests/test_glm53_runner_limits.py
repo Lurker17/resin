@@ -11,6 +11,7 @@ from resin import (
     BatchPlan,
     Engine,
     ForwardOutput,
+    Parallelism,
     RunnerConfig,
     SamplingParams,
 )
@@ -19,6 +20,7 @@ from resin_models_cuda.glm5_3_flash.cuda import Glm53FlashCudaRunner
 
 
 @pytest.mark.parametrize("drafts", [0, 1, 3, 7])
+@pytest.mark.parametrize("ep", [1, 2, 4])
 @pytest.mark.parametrize(
     "catalog,policy,expected",
     [
@@ -29,7 +31,7 @@ from resin_models_cuda.glm5_3_flash.cuda import Glm53FlashCudaRunner
     ],
 )
 def test_direct_constructor_preserves_common_ordinary_decode_catalog(
-    monkeypatch, drafts, catalog, policy, expected
+    monkeypatch, drafts, ep, catalog, policy, expected
 ):
     import resin_models_cuda.glm5_3_flash.cuda as module
     from resin.models.glm5_3_flash.config import Glm53Config
@@ -78,6 +80,9 @@ def test_direct_constructor_preserves_common_ordinary_decode_catalog(
         max_seq_len=4096,
         max_batch_size=8,
         speculative_tokens=drafts,
+        parallel_groups=SimpleNamespace(
+            topology=Parallelism(world_size=4, attn_dp=4, ep=ep)
+        ),
         cuda_graph_decode_shapes=catalog,
         cuda_graph_decode=policy,
     )

@@ -18,6 +18,7 @@ class ParallelismCapabilities:
     # when attn_dp * attn_tp * cp < world_size.
     attn_tp: bool = False
     cp: bool = False
+
     ep: bool = False
     expert_tp: bool = False
 

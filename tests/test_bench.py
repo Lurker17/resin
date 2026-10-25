@@ -18,7 +18,13 @@ from resin import (
 )
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.torch import benchmark_expert_indices
-from resin.bench import BenchCase, BenchmarkRunner, distributed_reducer, run_sweep
+from resin.bench import (
+    BenchCase,
+    BenchmarkRunner,
+    decode_output_budget,
+    distributed_reducer,
+    run_sweep,
+)
 
 
 class Runner:
@@ -502,8 +508,14 @@ def test_decode_trace_submits_two_fresh_forwards_with_exact_context_headroom(
         monkeypatch.setattr("resin.bench.time.perf_counter", iter(range(1000)).__next__)
         raw = PipelinedRunner()
         runner = BenchmarkRunner(raw)
-        extra = (2 if traced else 1) + int(overlap)
-        headroom = 1 + (warmup + 2 + extra) * (drafts + 1)
+        headroom = decode_output_budget(
+            warmup_steps=warmup,
+            measure_steps=2,
+            draft_tokens=drafts,
+            overlap=overlap,
+            trace_passes=2 + int(overlap) if traced else 0,
+            cache_write_lookahead_tokens=raw.runner_config.cache_write_lookahead_tokens,
+        )
         engine = Engine(
             runner,
             max_running_requests=2,

@@ -71,6 +71,12 @@ baselines, read current primary sources and match actual computation, hardware,
 precision, routing, sampling and timing. A digitized curve with mismatched policy
 is indicative, not proof of parity or state-of-the-art performance.
 
+A plot-only acceptance projection holds measured cycle time fixed. It does not
+simulate changed execution cost: accepted-prefix rollback, cache repair or other
+conditional work may become more expensive as more drafts are accepted. State
+this limit when optimizing such a path, and use measured before/after throughput
+for the primary speedup claim.
+
 ## Locate the limiting interval
 
 Capture a few complete prefill/decode passes outside throughput timing and inspect
@@ -85,6 +91,14 @@ summed kernel durations, GPU-active union, critical path and wall-clock completi
 intervals: overlapping kernel work is not additive savings. Engine minus GPU
 timing is unattributed time, not a CPU measurement; especially do not subtract
 different profiler and benchmark runs.
+
+Keep steady-decode traces away from request termination. Reserve output and
+context headroom beyond the traced completions and verify continuation counters
+during capture: reaching the output-budget guard intentionally drains overlap.
+That tail can expose CPU coordination and graph-launch gaps even when the timed
+window used normal overlap. Use separate labeled captures to study retirement.
+Correlate CPU graph launches with actual GPU graph intervals before treating a
+Gloo span as exposed latency; the next launch may already be queued behind work.
 
 Use the evidence to choose the next experiment:
 
@@ -173,8 +187,10 @@ unfused operation; capture alone does not make raw Torch chains efficient. Keep
 independent Torch references for testing and use proven GEMM/library kernels where
 appropriate.
 Stage quantization/layout conversion at load time where possible. For sampling,
-preserve top-k-before-top-p, normalization and request-local Philox seed/offset
-semantics under batch permutation and padding. A copied upstream kernel may use a
+preserve the documented filtering order (currently top-p on the full scaled
+distribution, then the top-k cap, retaining cutoff ties), normalization and
+request-local Philox seed/offset semantics under batch permutation and padding.
+A copied upstream kernel may use a
 different distribution or memory layout. Microbenchmark an independent reference,
 then measure the full workload; fewer kernels alone do not qualify a win.
 

@@ -265,9 +265,80 @@ three drafts. The user-visible 80 versus expected 200 tokens/s gap could not be
 attributed entirely to overlap or kernels. Match topology and acceptance first.
 
 The historical sampler bundle (1.501 ms B8 and 5.405 ms B256 of summed kernel work)
-was a candidate opportunity, not a completed speedup. Preserve top-k-before-top-p
-and full request-local Philox seed/offset behavior (`580dde5`, `b2f7c3c`); a faster
-upstream sampler with another contract is not a drop-in replacement.
+was a candidate opportunity, not a completed speedup. Those sources used
+top-k-before-top-p (`580dde5`, `b2f7c3c`). The later fused sampler deliberately
+changed to top-p on the full scaled distribution followed by the top-k cap,
+retaining cutoff ties, and CDF sampling changed seeded stochastic choices.
+See the current [sampling contract](../../../docs/benchmarks.md#shared-sampler-checks)
+before choosing an oracle; a faster upstream sampler with another contract is
+not a drop-in replacement.
+
+## 13. A graphed adapter or rollback can dominate the work it surrounds
+
+The October 25 GLM-5.3-Flash MTP3 traces at 8K context used four B200s,
+EP4/attention-DP4, 8192-token chunks and controlled greedy prompts. Source
+`878d83d4` is recorded in the local artifact manifests; these are observations
+from that implementation, not measured optimization wins.
+
+At B8, four captured sampler calls took 1.35 ms per cycle, including 1.09 ms
+in top-p processing even though the final selection was greedy. The eager
+sampler's greedy branch did not apply inside the captured tensor path. Fusing
+all 28 final selection kernels could address only 43 microseconds. Inspect
+which branches actually execute in the graph before choosing a sampler fusion;
+runtime changes to sampling parameters must remain valid on replay.
+
+Every MoE dispatch had 32 preparation kernels after routing: buffer padding,
+owner expansion, sorting, selection and payload masks. Across 46 dispatches
+that was 1,472 kernels and 2.21 ms at B8. This identifies a shared transport
+adapter as a fusion target without changing expert GEMMs or router tie order.
+Preserve expert-TP fanout, duplicate destinations, source-replica rules, idle
+participation, sentinels, wire precision and multipass behavior.
+
+The contiguous post-sampling KDA block was accepted-prefix rollback: another
+34 recurrences after the target's 34. At B64, target recurrence took 11.25 ms
+and rollback recurrence 11.06 ms per cycle. The latter discarded its attention
+outputs. A state-only recurrence is a candidate, subject to independent state
+parity and graph tests; retaining every intermediate state instead would add
+roughly 34 GiB at width four for this model and batch. Separate necessary state
+repair from avoidable output computation and quantify the memory tradeoff.
+
+An accepted-prefix implementation also changes how cost depends on acceptance.
+Projecting 75% acceptance from a lower-acceptance run scales output tokens while
+holding cycle time fixed; it does not execute the additional recurrent updates.
+Label that projection accordingly and base the optimization claim on measured
+throughput with matched outputs and acceptance.
+
+Evidence: `artifacts/glm53/wide-8k-878d83d4/analysis/sampling-kda-dispatch-focus.md`
+and its JSON/raw-trace hashes. Durations are per rank per fresh graph cycle,
+averaged over four ranks. They are not additive predicted speedups.
+
+The subsequent paired `9d0ba3df` → `48c370b5` experiment on one four-B200
+allocation validated dispatch fusion and accepted-prefix state-only rollback.
+Measured MTP3 throughput improved 14.2–18.4% across B1–64, with 1016 complete
+cross-source outputs and all measured acceptance/commit counts unchanged. At
+B64, summed rollback kernel time fell 12.856 → 5.598 ms per observed forward;
+main KDA stayed about 11.24 ms, and dispatch collective waits increased about
+0.77 ms. This demonstrates why component savings must be checked against whole
+completion timing. Sampling was unchanged in these frozen snapshots.
+
+Keep timing outliers visible: the K0 B4 baseline contained a 74 ms interval
+against a 16 ms median, inflating its apparent speedup. The report retains that
+window and uses the consistent MTP3 curve as its primary result. Likewise, three
+requested trace completions contained only two fresh K0 forwards because one
+completion was already in flight at profiler entry; normalize kernel counts by
+observed forwards, not requested completions. Evidence and before/after traces:
+`artifacts/glm53/dispatch-kda-paired-48c370b5-attempt2/README.md`.
+
+The older `address-fixed-target-traces/decode-ctx8192-b8-all-ranks.json.gz`
+also exposed a trace-budget trap. Its K0 budget was 19 tokens; prefill, three
+warmup and twelve measured completions committed 16, leaving the trace at the
+terminal overlap guard. The last graph had a real 10.27 ms GPU gap on rank zero,
+with six CPU vote pairs spanning 5.93 ms and a 3.49 ms profiled graph-launch call.
+The measured window still recorded a continuation on every step. This is evidence
+about that terminal capture, not a 10 ms steady-state coordination penalty.
+Reserve headroom for steady traces and inspect GPU intervals: in the later MTP3
+B8 trace, 4.6–5.7 ms CPU vote sequences overlapped running graphs and the actual
+inter-graph gaps were about 0.15 ms.
 
 ## Conversation provenance
 

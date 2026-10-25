@@ -171,25 +171,20 @@ class ExpertParallelDispatch(LayerCollective):
 
         if hidden.is_cuda:
             from resin.backend.cuda.expert_parallel import sparse_expert_transport
+            from resin.backend.cuda.expert_parallel_kernels import prepare_dispatch
 
-            def pad(tensor: Tensor) -> Tensor:
-                padded = tensor.new_zeros((capacity, *tensor.shape[1:]))
-                if source:
-                    padded[:rows].copy_(tensor)
-                return padded
-
-            padded_hidden, padded_indices, padded_weights = (
-                pad(tensor) for tensor in (hidden, indices, weights)
+            padded_hidden, padded_indices, padded_weights, owners, active = (
+                prepare_dispatch(
+                    hidden,
+                    indices,
+                    weights,
+                    capacity,
+                    source=source,
+                    valid_rows=valid_rows,
+                    expert_tp=self.expert_tp,
+                    experts_per_rank=self.experts_per_rank,
+                )
             )
-            active = torch.arange(capacity, device=hidden.device) < (
-                valid_rows if valid_rows is not None else rows
-            )
-            active &= source
-            owners = padded_indices.div(self.experts_per_rank, rounding_mode="floor")
-            owners = (
-                owners[..., None] * self.expert_tp
-                + torch.arange(self.expert_tp, device=hidden.device)
-            ).flatten(1)
             key = (
                 capacity,
                 hidden.shape[1],

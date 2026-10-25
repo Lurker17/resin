@@ -10,10 +10,75 @@ from resin.backend.cuda.expert_parallel import SparseExpertTransport
 from resin.backend.topology import RankGroup
 
 
+@pytest.fixture
+def cpu_preparation(monkeypatch):
+    """Keep this wire/callback ABI test independent of CUDA and Triton.
+
+    The ordinary GPU preparation tests separately compare the fused kernels
+    against these original Torch operations, including graph replay.
+    """
+    kernels = ModuleType("resin.backend.cuda.expert_parallel_kernels")
+
+    def prepare_routes(
+        owners,
+        active,
+        indices,
+        weights,
+        *,
+        world_size,
+        rank,
+        num_experts,
+        max_destinations_per_pass,
+    ):
+        if owners.shape[1] <= max_destinations_per_pass:
+            routes = [owners.sort(dim=1).values]
+        else:
+            destinations = torch.zeros(
+                owners.shape[0], world_size, dtype=torch.bool, device=owners.device
+            )
+            destinations.scatter_(1, owners.long(), True)
+            ranks = torch.arange(world_size, device=owners.device, dtype=torch.int32)
+            routes = [
+                torch.where(
+                    destinations[:, start : start + max_destinations_per_pass],
+                    ranks[start : start + max_destinations_per_pass],
+                    world_size,
+                )
+                for start in range(0, world_size, max_destinations_per_pass)
+            ]
+        for route in routes:
+            first = route.min(dim=1, keepdim=True).values
+            selected = active & (first[:, 0] < world_size)
+            route = torch.where(route < world_size, route, first)
+            route = torch.where(selected[:, None], route, rank)
+            k = next(k for k in (1, 2, 4, 6, 8, 10, 16, 22) if k >= route.shape[1])
+            if k != route.shape[1]:
+                route = torch.cat(
+                    (route, route[:, :1].expand(-1, k - route.shape[1])), 1
+                )
+            yield (
+                route.int().contiguous(),
+                indices.masked_fill(~selected[:, None], num_experts).int(),
+                weights.masked_fill(~selected[:, None], 0).float(),
+            )
+
+    def prepare_receive(hidden, indices, weights, *, num_experts, weight_dtype):
+        valid = indices[..., 0] < num_experts
+        return (
+            hidden.masked_fill(~valid[..., None], 0).flatten(0, 1),
+            weights.masked_fill(~valid[..., None], 0).to(weight_dtype).flatten(0, 1),
+        )
+
+    monkeypatch.setattr(kernels, "prepare_routes", prepare_routes, raising=False)
+    monkeypatch.setattr(kernels, "prepare_receive", prepare_receive, raising=False)
+    monkeypatch.setitem(sys.modules, kernels.__name__, kernels)
+
+
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("multipass", [False, True])
+@pytest.mark.parametrize("dispatch_arity", [2, 3])
 def test_sparse_transport_restores_router_dtype_masks_padding_and_combines_fp32(
-    monkeypatch, weight_dtype, multipass
+    monkeypatch, cpu_preparation, weight_dtype, multipass, dispatch_arity
 ):
     import resin.backend.cuda.expert_parallel as implementation
 
@@ -36,10 +101,12 @@ def test_sparse_transport_restores_router_dtype_masks_padding_and_combines_fp32(
         # Undefined receive padding may contain arbitrary wire bytes. It must
         # be zeroed before invoking a strict local kernel, in its own dtype.
         receives[1][:, 1].fill_(7)
-        return receives, 0
+        # 0.7 appends optional EPLB stats; this transport leaves EPLB disabled.
+        return (receives, 42) if dispatch_arity == 2 else (receives, 42, None)
 
     def combine(partial, *args):
         assert partial.dtype == torch.float32
+        assert args[-1] == 42  # Exact matching dispatch workspace offset.
         return partial.sum(0)
 
     monkeypatch.setattr(api, "moe_a2a_dispatch", dispatch, raising=False)

@@ -4,7 +4,9 @@ Resin runs the native hybrid KDA/sparse-MLA model on **four B200s with EP4 and
 attention DP4**. The shared registry key is `glm-5.3-flash`; the native recipe is
 `glm5_3_flash`. The integration includes reasoning, tools, still images, full
 decode CUDA graphs, completion overlap, and optional native NextN/MTP decoding.
-Attention TP, context parallelism, and expert TP are currently unsupported.
+Attention TP and context parallelism are unsupported. EP1 with expert TP4 and
+attention DP4 also passes full-model qualification, including NVFP4 target and
+BF16 MTP expert sharding. EP4 remains the registry default.
 
 ## Checkpoint and architecture
 
@@ -25,7 +27,8 @@ and 18B activated parameters.
 | Vision | 24 blocks; width 1024; 16 heads; spatial patch 14, temporal patch 2, merge 2; output width 4096 |
 | Native MTP | One additional sparse-attention NextN block from the same checkpoint |
 
-Each EP rank loads its routed experts. Attention, dense/shared experts,
+Each EP rank loads its routed experts; expert TP additionally shards their
+intermediate dimension before quantized-weight preparation. Attention, dense/shared experts,
 embeddings, output head, and the BF16 vision tower are replicated across the
 attention-DP ranks. Target routed experts and the first three dense blocks use
 NVFP4 checkpoint scales; shared and MTP experts retain their BF16 representation.
@@ -66,6 +69,10 @@ labeled separately. Controlled-prompt results below use retained recipe-rendered
 inputs. See the [benchmark protocol](../../../docs/benchmarks.md). A local CUDA
 host uses `--backend local --checkpoint /path/to/checkpoint` with the same topology.
 
+For expert TP4 with attention DP4, keep `--world-size 4 --attn-dp 4`,
+`--attn-tp 1 --cp 1`, and set `--ep 1`. The shared topology derives expert TP as `world_size / ep`;
+`--attn-tp` controls attention projections and must remain one for this model.
+
 For the requested decode presentation, collect a separate K3 run with
 `--draft-tokens 3`, retain its raw JSONL, then generate a **projected MTP3 curve
 at 75% acceptance**:
@@ -100,12 +107,13 @@ uv run scripts/check_server.py "$ENDPOINT" --model nvidia/GLM-5.3-Flash-NVFP4 \
 Defaults are B200×4, EP4/attention DP4, context capacity 16384, batch capacity 8
 per replica, prefill chunk 8192, memory utilization 0.65, and zero draft tokens.
 KDA state checkpoints and reusable prefixes align to 8192 tokens; an 8448-token
-prompt can reuse its first 8192 tokens within the 16384-token window. This new
-serving profile awaits the final full-model audit. The server-check example uses
+prompt can reuse its first 8192 tokens within the 16384-token window. The K0/K3
+HTTP and runner audits pass at this context/chunk size with batch capacity 2;
+the separate 8K performance profile is tested through batch 64. The server-check example uses
 2112 repeated phrases so its cache probe exceeds the 8192-token checkpoint;
 the report retains actual server token counts. Larger contexts need explicit capacity and memory checks;
 the checkpoint's advertised 1,048,576-token limit is not qualified. B300 and
-other parallel layouts need their own kernel-image and correctness validation.
+layouts other than EP4 or expert TP4 need their own kernel-image and correctness validation.
 
 ## Graphs and speculative decoding
 
@@ -140,6 +148,14 @@ restores convolution history, and repairs the MTP cache. Prefill primes shifted
 hidden/token pairs across chunks, including image embeddings. MTP remains an
 explicit option rather than the deployment default.
 
+KDA rollback uses a state-only adaptation of FLA's recurrent kernel. Accepted
+counts stay on the device; rejected updates and discarded attention outputs are
+omitted, while an independent history kernel restores the accepted convolution
+samples. The shared expert transport fuses padding/owner preparation, route and
+payload preparation, and received-row cleanup. FlashInfer still performs the
+dispatch/combine collectives and expert computation. These changes preserve the
+FP32 recurrent state and the transport's existing routing and precision contracts.
+
 ## Recipe and media
 
 `get_native_recipe("glm5_3_flash", tokenizer)` implements the pinned template,
@@ -159,12 +175,104 @@ text-path compiler audit.
 
 ## Qualification and measured performance
 
+Source **`48c370b5`**, which adds dispatch fusion and accepted-prefix KDA rollback
+to `9d0ba3df`, passes full EP4/attention-DP4 qualification at context 16384,
+batch capacity two and chunk 8192. Fresh K0 and MTP3 groups on the same four-B200
+allocation each score **Low 20/20 and Max 20/20**, with no missing or truncated
+responses. HTTP behavior, tools, images, concurrency, stress, real 8192-token
+prefix reuse, genuine EOS, unseen-context compiler checks and the context
+boundary all pass. The 35 active matched-profile pairs contain 1696 exact output
+positions; five idle records are retained. The audit ends before HTTP, so it
+does not establish image-encoder compiler stability. See the
+[fusion qualification](../../../artifacts/glm53/combined-qualification-48c370b5/summary.json).
+
+The frozen candidate also passes 2219 CPU tests (266 skipped). Its unchanged
+kernel files were checked in 49 KDA/speculation regressions on B200, 55 dispatch
+preparation tests on B200, and 10 distributed tests on four B200s. Those checks
+cover independent numerical references, changed-input graph replay, runtime
+strides/counts, idle replicas, expert-TP fanout, multipass transport and wire
+precision. The performance comparisons below retain their individual source
+identities; a correctness pass does not transfer timings between snapshots.
+
+The [paired dispatch/KDA report](../../../artifacts/glm53/dispatch-kda-paired-48c370b5-attempt2/README.md)
+compares `9d0ba3df` and `48c370b5` on one four-B200 allocation, with fresh K0/K3
+groups for each source and the same 8438-token capacity and B1–64 graph catalog.
+Measured MTP3 throughput improves **14.2–18.4%** across all seven batches. All
+1016 complete cross-source outputs and their stage sequences match over 71896
+token positions, and measured draft/accepted/committed counts are unchanged.
+
+| 8K decode, output tokens/s/GPU | Before | After | Change in this run |
+| --- | ---: | ---: | ---: |
+| K0, batch 8 | 479.13 | 553.13 | +15.4% |
+| K0, batch 64 | 1824.16 | 1971.67 | +8.1% |
+| MTP3, batch 1 | 109.62 | 125.15 | +14.2% |
+| MTP3, batch 8 | 727.57 | 844.83 | +16.1% |
+| MTP3, batch 64 | 2466.60 | 2875.80 | +16.6% |
+
+Four-request prefill cohorts improve from 256.12 to 251.89 ms at 4K and 508.67
+to 501.25 ms at 8K; input throughput rises 1.7% and 1.5% respectively. These are
+three complete measured cohorts per point under the same resident decode profile,
+not the dedicated 4K–64K prefill profile below. The report retains every timing
+sample, including a slow K0 B4 baseline interval that inflates its apparent gain;
+the headline gain uses the more consistent MTP3 results.
+
+In all-rank K3 traces, per-dispatch preparation drops from 32 kernels to two and
+receive cleanup from seven to one. At B64, summed accepted-state rollback work
+falls from 12.856 to 5.598 ms per observed forward; the main KDA recurrence stays
+about 11.24 ms. Collective wait changes are retained, and component durations are
+not added together as a predicted speedup. The
+[decode figure](../../../artifacts/glm53/dispatch-kda-paired-48c370b5-attempt2/comparison/decode-before-after.png)
+keeps actual acceptance alongside the 75% projection. That projection holds
+measured cycle time fixed and does not simulate additional accepted-prefix work.
+Prefill figures and all-rank Perfetto traces are linked from the paired report.
+
 Source **`878d83d4`** completes the controlled 8K decode curve through batch 64
 and the 4K–64K prefill curve on four B200s with EP4/attention DP4 and chunk 8192.
 The underlying per-bucket runtime `da779293` passed 446 B200 regression tests and
-2158 CPU tests (188 skipped). The final **`c2de4fba`** target/K3 HTTP and runner/compiler
-audits at serving capacity 16384 remain pending; performance and matched-batch
-parity results do not substitute for those checks.
+2158 CPU tests (188 skipped). The **`c2de4fba`** target/K3 HTTP and runner/compiler
+audits pass at serving capacity 16384, batch capacity 2 and chunk 8192. Both modes
+score 20/20 on the Low/2048 and Max/8192 MMLU smoke subsets, without missing or
+truncated responses. K3's completed continuation uses the content-pinned K0
+reference from a different allocation; that distinction is retained in the
+[final qualification summary](../../../artifacts/glm53/final-qualification-c2de4fba-k3-retry2/summary.json).
+
+Source **`9d0ba3df`** additionally qualifies EP1/expert TP4/attention DP4 at the
+same 16384/B2/chunk-8192 serving profile. Fresh K0 and K3 process groups on one
+four-B200 allocation each score Low 20/20 and Max 20/20 with no truncation.
+HTTP behavior, tools, images, concurrency, stress, 8192-token prefix reuse,
+genuine EOS, unseen-context compiler checks and the public context boundary all
+pass. The 35 active matched-profile output pairs contain 1701 exact positions;
+five idle records are retained separately. See the
+[expert-TP qualification](../../../artifacts/glm53/expert-tp4-qualification-9d0ba3df-attempt2/summary.json).
+
+The same source completes EP4 decode sweeps at 8K through batch 64 and at
+131072 tokens through batch eight. The 131K K0/MTP3 comparison has 60 exact
+common-prefix pairs and 2388 compared positions. At batch eight, measured K0
+and MTP3 reach **452.58 and 693.10 output tokens/s/GPU**; the separate 75%
+projection is 863.26. Four concurrent 131K prefills average **13.0271 seconds**,
+or **10061.5 input tokens/s/GPU**. At memory fraction 0.65, MTP3 batch 16 exceeds
+the measured cache capacity; larger batches are not reported as measured points.
+The [8K/131K report](../../../artifacts/glm53/topology-sweeps-9d0ba3df/ep4/report/README.md)
+includes both context profiles, all requested capacity decisions, measured and
+projected curves, and all-rank Perfetto traces. This benchmark scope is separate
+from the 16K/B2 serving qualification above.
+
+The [matched expert-layout comparison](../../../artifacts/glm53/topology-sweeps-9d0ba3df/comparison/README.md)
+also completes expert TP4 at both contexts on source `9d0ba3df`. Each layout has
+568 exact within-layout K0/K3 request-prefix comparisons over 21800 positions.
+At 8K/B8, the fixed-time 75% projections are 954.73 TPS/GPU for EP4 and 990.38
+for expert TP4; at B64, EP4 leads 3061.23 to 2902.27. At 131K/B8, measured MTP3
+is 693.10 versus 712.30 TPS/GPU. Four-request 131K prefill takes 13.0271 versus
+12.6441 seconds. These use separate allocations and controlled prompts, so the
+small layout differences are workload-specific observations. The original
+131K expert-TP4 K0 B1/B2 windows contain large isolated stalls, retained in the
+report. A separate [trace-free repeat](../../../artifacts/glm53/tp4-131k-k0-repeat-9d0ba3df-attempt2/expert-tp4/report/README.md)
+measures 66.06/129.92/249.15/467.22 TPS/GPU at B1/2/4/8, with all 120 common-prefix
+comparisons to the original K0/K3 outputs exact. Its maximum B1/B2 completion
+intervals are 15.53/15.65 ms; the earlier 1.478/0.286-second pauses did not recur.
+The repeat omits standalone prefill profiling and does not establish the cause
+of those pauses or replace the original measurements. The four-line overview compares the same baseline source
+for both layouts and contexts, separately from the newer fusion comparison.
 
 The [wide decode report](../../../artifacts/glm53/wide-8k-878d83d4/accepted-batch-variance/README.md)
 and [75%-acceptance figure](../../../artifacts/glm53/wide-8k-878d83d4/accepted-batch-variance/decode-8k-projected75.png)
@@ -203,7 +311,8 @@ passed the explicitly bounded scopes below.
 | Completed check | Source and result |
 | --- | --- |
 | B200 family regression suite | `40206b4a`: all 304 passed, including graph replay, cache addressing, fixed projections, KDA/MTP rollback, vision and exact fused pointwise operations |
-| Per-bucket runtime regression suites | `da779293`: 446 B200 tests and 2158 CPU tests pass; final serving HTTP/compiler qualification remains pending |
+| Per-bucket runtime regression suites | `da779293`: 446 B200 tests and 2158 CPU tests pass |
+| Serving and compiler qualification | `c2de4fba`: K0/K3 HTTP and all eight runner/compiler gates pass; each mode scores Low 20/20 and Max 20/20 without truncation |
 | Short production K0/K3 cohorts | `91d5d30a`: 132 request pairs and 7396 compared tokens, all exact |
 | Controlled-prompt 12-point comparison | `91d5d30a`: 180 request pairs and 7380 compared tokens, all exact; K3 was 1.45–1.87× faster than matched K0 |
 | Fresh 8K production K0/K3 comparison | `40206b4a`: all 60 common-prefix request pairs exact at batches 1/2/4/8 |
@@ -296,13 +405,15 @@ Low stays 2048; neither historical score transfers to the new run. The final
 quality harness uses context 16384, batch 2 and the default serving/audit chunk
 8192. Performance runs record their explicit chunk settings.
 
-Final-source `c2de4fba` target and native K3 HTTP evaluation are pending, using the original
-20 questions, Low/2048 and Max/8192 output budgets, a 90% accuracy floor for each
-effort, and no missing, truncated or errored responses. Behavior, tools, media,
-concurrency and stress remain separate checks. The old 2048-budget report is
-preserved; the revised budget does not change its historical score.
+Source `c2de4fba` target and native K3 HTTP evaluation both pass using the original
+20 questions, Low/2048 and Max/8192 output budgets: all four mode/effort scores
+are 20/20, with no missing, truncated or errored responses. Behavior, tools, media,
+concurrency and stress checks also pass. The old 2048-budget report is preserved;
+the revised budget does not change its historical score. A helper serialization
+fix and an infrastructure interruption preceded the completed K3 continuation;
+their partial artifacts remain separate from the successful run.
 
-The pending runner audit covers actual 8192-token prefix hits on an 8448-token
+The completed runner audit covers actual 8192-token prefix hits on an 8448-token
 prompt with exact 64-token warm/cached/fresh continuations, separate genuine-EOS cohorts, paired 8K raw-64
 outputs, and the 16382+2 public-context boundary. All-rank compiler observations
 compare loaded variants, compiler counters and artifact hashes after those
@@ -318,7 +429,8 @@ latency. No matched external speed benchmark establishes state-of-the-art perfor
 MMLU here is a fixed 20-question integration smoke subset, not a full MMLU score.
 CPU, primitive GPU, production-token, HTTP and compiler checks have distinct
 scopes. Serving defaults are context 16384, prefill chunk 8192 and target-only
-decoding; full-model qualification of that profile remains pending.
+decoding. HTTP/compiler qualification uses batch capacity 2; the other batch and
+context combinations retain their separately reported performance/validation scopes.
 
 ## Sources and ownership
 

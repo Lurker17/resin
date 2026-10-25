@@ -270,7 +270,133 @@ def _compress(
         )
 
 
+@triton.jit(
+    do_not_specialize=["table_stride", "key_stride", "gate_stride", "pool_stride"]
+)
+def _compress_tail(
+    Positions,
+    Sequences,
+    Offsets,
+    Table,
+    Keys,
+    Gates,
+    TailKeys,
+    TailGates,
+    TailEnds,
+    Ape,
+    Pooled,
+    table_stride,
+    key_stride,
+    gate_stride,
+    pool_stride,
+    WIDTH: tl.constexpr,
+    PAGE: tl.constexpr,
+    ORIGIN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    pos = tl.load(Positions + token)
+    if (pos >= 0) & ((pos + 1) % 4 == 0):
+        seq = tl.load(Sequences + token).to(tl.int64)
+        pool_slot = pos // 4 + ORIGIN
+        page = tl.load(
+            Table + seq * table_stride + pool_slot // (PAGE // 4),
+            (seq >= 0) & (pool_slot // (PAGE // 4) < table_stride),
+            other=0,
+        ).to(tl.int64)
+        begin, end = tl.load(Offsets + seq), tl.load(Offsets + seq + 1)
+        first = tl.load(Positions + begin, begin < end, other=-1)
+        tail_end = tl.load(TailEnds + seq)
+        channels, group = tl.arange(0, BLOCK), tl.arange(0, 4)
+        source = pos - 3 + group
+        row = begin + source - first
+        current = (source >= first) & (row < end)
+        prior = source - (tail_end - 3)
+        prior_valid = (~current) & (prior >= 0) & (prior < 4)
+        mask = channels[None, :] < WIDTH
+        keys = tl.load(
+            Keys + row[:, None].to(tl.int64) * key_stride + channels[None, :],
+            current[:, None] & mask,
+            other=0,
+        ).to(tl.bfloat16)
+        old_keys = tl.load(
+            TailKeys + seq * 4 * WIDTH + prior[:, None] * WIDTH + channels[None, :],
+            prior_valid[:, None] & mask,
+            other=0,
+        )
+        keys = tl.where(current[:, None], keys, old_keys)
+        logits = tl.load(
+            Gates + row[:, None].to(tl.int64) * gate_stride + channels[None, :],
+            current[:, None] & mask,
+            other=0,
+        ).to(tl.float32)
+        old_logits = tl.load(
+            TailGates + seq * 4 * WIDTH + prior[:, None] * WIDTH + channels[None, :],
+            prior_valid[:, None] & mask,
+            other=0,
+        )
+        logits = tl.where(current[:, None], logits, old_logits)
+        logits += tl.load(
+            Ape + group[:, None] * WIDTH + channels[None, :], mask, other=0
+        ).to(tl.float32)
+        weights = tl.exp(logits - tl.max(logits, 0)[None, :])
+        weights = weights / tl.sum(weights, 0)[None, :]
+        product = (weights.to(keys.dtype).to(tl.float32) * keys.to(tl.float32)).to(
+            keys.dtype
+        )
+        pooled = tl.sum(product.to(tl.float32), 0)
+        tl.store(
+            Pooled + page * pool_stride + pool_slot % (PAGE // 4) * WIDTH + channels,
+            pooled,
+            (page > 0) & (channels < WIDTH),
+        )
+
+
 def store_sparse_cuda(latent, keys, gates, ape, cache):
+    if getattr(cache, "index_tail", None) is not None:
+        from resin_models_cuda.glm5_3_flash.index_tail import (
+            finish_update,
+            record_update,
+        )
+
+        update = record_update(cache, keys, gates)
+        tail = update.initial
+        cast(Any, _store)[(latent.shape[0], triton.cdiv(latent.shape[-1], 256))](
+            latent,
+            cache.positions,
+            cache.sequence_indices,
+            cache.page_table,
+            cache.latent,
+            cache.page_table.stride(0),
+            cache.latent.stride(0),
+            latent.shape[-1],
+            cache.page_tokens,
+            getattr(cache, "storage_origin", 0),
+            256,
+        )
+        cast(Any, _compress_tail)[(latent.shape[0],)](
+            cache.positions,
+            cache.sequence_indices,
+            cache.cu_seqlens,
+            cache.page_table,
+            keys,
+            gates,
+            tail.keys,
+            tail.gates,
+            tail.end,
+            ape,
+            cache.pooled_keys,
+            cache.page_table.stride(0),
+            keys.stride(0),
+            gates.stride(0),
+            cache.pooled_keys.stride(0),
+            keys.shape[-1],
+            cache.page_tokens,
+            getattr(cache, "storage_origin", 0),
+            triton.next_power_of_2(keys.shape[-1]),
+        )
+        finish_update(cache, update)
+        return
     for source, target in (
         (latent, cache.latent),
         (keys, cache.index_keys),

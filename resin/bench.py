@@ -46,6 +46,48 @@ class BenchCase:
             )
 
 
+def decode_output_budget(
+    *,
+    warmup_steps: int,
+    measure_steps: int,
+    draft_tokens: int,
+    overlap: bool,
+    trace_passes: int = 0,
+    cache_write_lookahead_tokens: int | None = None,
+) -> int:
+    """Reserve output tokens without making a trace drain the decode pipeline.
+
+    The Engine retains a continuation only with more than two maximum write
+    steps remaining. Traces need that reservation *after* their last completion,
+    in addition to the worst-case accepted output count. Before constructing a
+    runner, the default lookahead conservatively covers the extra speculative
+    cache row used by GLM and Qwen; callers with a runner use its actual config.
+    Untraced requests keep their existing budget.
+    """
+    for name, value, minimum in (
+        ("warmup_steps", warmup_steps, 0),
+        ("measure_steps", measure_steps, 1),
+        ("draft_tokens", draft_tokens, 0),
+        ("trace_passes", trace_passes, 0),
+    ):
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}")
+    if cache_write_lookahead_tokens is None:
+        cache_write_lookahead_tokens = draft_tokens + 1 if draft_tokens else 0
+    if (
+        type(cache_write_lookahead_tokens) is not int
+        or cache_write_lookahead_tokens < 0
+    ):
+        raise ValueError("cache_write_lookahead_tokens must be an integer >= 0")
+    if not trace_passes:
+        return 1 + (warmup_steps + measure_steps + 1 + int(overlap)) * (
+            draft_tokens + 1
+        )
+    generated = 1 + (warmup_steps + measure_steps + trace_passes) * (draft_tokens + 1)
+    reservation = 2 * (cache_write_lookahead_tokens + 1) + 1 if overlap else 0
+    return generated + reservation
+
+
 def perfetto_trace(
     directory: str | Path,
     rank: int = 0,
@@ -117,6 +159,9 @@ def perfetto_trace(
         if not kernels:
             raise RuntimeError(f"{case.phase} trace contains no CUDA kernel activity")
 
+    # run_sweep reserves the advertised count, including custom trace lengths.
+    # Plain user callbacks can instead pass trace_decode_passes explicitly.
+    setattr(trace, "decode_passes", decode_passes)
     return trace
 
 
@@ -337,6 +382,7 @@ def run_sweep(
     metadata: dict | None = None,
     on_result: Callable[[dict], None] | None = None,
     trace_step: Callable[[BenchCase, Callable[[], dict]], None] | None = None,
+    trace_decode_passes: int | None = None,
 ) -> list[dict]:
     """Measure prefill cohorts or a steady decode window on an existing Engine.
 
@@ -354,7 +400,11 @@ def run_sweep(
     trace_step receives an untimed workload callback: one fresh complete cohort
     for prefill, or one live completion for decode. It may invoke that callback
     twice, or three times for overlapped decode to allow for a completion
-    submitted before tracing. All distributed drivers must use the same passes.
+    submitted before tracing. perfetto_trace advertises its exact decode count;
+    custom callbacks use these defaults or declare trace_decode_passes. More
+    calls than reserved fail before executing extra work. All distributed
+    drivers must use the same passes. Trace output headroom preserves the normal
+    continuation guard; cache-page boundaries can still interrupt overlap.
     """
 
     for name, value, minimum in (
@@ -375,6 +425,27 @@ def run_sweep(
     overlap = bool(getattr(local, "overlap", False)) and callable(
         getattr(runner.runner, "enqueue", None)
     )
+    declared_passes = getattr(trace_step, "decode_passes", None)
+    if trace_step is None:
+        if trace_decode_passes is not None:
+            raise ValueError("trace_decode_passes requires trace_step")
+        trace_passes = 0
+    else:
+        if (
+            trace_decode_passes is not None
+            and declared_passes is not None
+            and trace_decode_passes != declared_passes
+        ):
+            raise ValueError("trace_decode_passes disagrees with the trace callback")
+        trace_passes = (
+            trace_decode_passes
+            if trace_decode_passes is not None
+            else declared_passes
+            if declared_passes is not None
+            else 2 + int(overlap)
+        )
+        if type(trace_passes) is not int or trace_passes < 1:
+            raise ValueError("trace_decode_passes must be a positive integer")
     if local.has_work():
         raise ValueError("benchmark engine must not have active requests")
     reduce = reduce_step or (lambda value: value)
@@ -544,11 +615,17 @@ def run_sweep(
                         if not measured:
                             warmed = count
             else:
-                # Two trace completions need a third with overlap because one
-                # may only harvest work submitted before tracing began.
-                extra_steps = (2 if trace_step is not None else 1) + int(overlap)
-                maximum = 1 + (warmup_steps + measure_steps + extra_steps) * (
-                    runner.draft_tokens + 1
+                maximum = decode_output_budget(
+                    warmup_steps=warmup_steps,
+                    measure_steps=measure_steps,
+                    draft_tokens=runner.draft_tokens,
+                    overlap=overlap,
+                    trace_passes=trace_passes,
+                    cache_write_lookahead_tokens=getattr(
+                        getattr(runner, "runner_config", None),
+                        "cache_write_lookahead_tokens",
+                        0,
+                    ),
                 )
                 if case.context_length + maximum > local.context_length:
                     raise ValueError("engine context cannot fit the full decode window")
@@ -654,9 +731,16 @@ def run_sweep(
             if trace_step is not None:
                 synchronize()
                 previous_completion = None
+                traced_completions = 0
 
                 def trace_pass():
+                    nonlocal traced_completions
                     if case.phase == "decode":
+                        if traced_completions >= trace_passes:
+                            raise ValueError(
+                                "trace exceeded reserved decode completions"
+                            )
+                        traced_completions += 1
                         return step(defer_reduce=True)
                     # A complete cohort exercises all chunks of this context.
                     # Admission clears private prefix state before each pass.

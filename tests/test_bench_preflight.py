@@ -163,3 +163,53 @@ def test_cache_preflight_credits_only_the_configured_shared_history():
         bench._cache_preflight(
             raw, [BenchCase(phase="prefill", context_length=12, batch_size=2)], options
         )
+
+
+@pytest.mark.parametrize("drafts,lookahead,output_budget", [(0, 0, 22), (3, 4, 84)])
+def test_trace_cache_preflight_covers_actual_continuation_reservation(
+    capsys, drafts, lookahead, output_budget
+):
+    from resin import CacheGroupLayout, CacheLayout, RunnerConfig
+    from resin.backend.capacity import plan_cache_capacity
+    from resin.bench import BenchCase
+
+    options = dict(
+        warmup_steps=3,
+        measure_steps=12,
+        draft_tokens=drafts,
+        overlap=True,
+        trace_dir="traces",
+    )
+    context = 60
+    peak_context = context + output_budget + lookahead
+    required = (peak_context + 15) // 16
+    layout = CacheLayout(parent_capacity=required - 1, groups=[CacheGroupLayout(16)])
+    raw = SimpleNamespace(
+        cache_layout=layout,
+        cache_capacity_plan=plan_cache_capacity(100, 100, 0.5, 10),
+        runner_config=RunnerConfig(
+            cache_write_lookahead_tokens=lookahead, cache_layout=layout
+        ),
+        enqueue=lambda plan: None,
+    )
+    case = BenchCase(phase="decode", context_length=context, batch_size=1)
+    # Explicit independent budgets include the strict two-write-step guard:
+    # K0: 19 generated +3; K3: 73 generated +11 (lookahead4).
+    assert bench._decode_budget(options, raw) == output_budget
+    assert bench._context_capacity([case], options) == context + output_budget
+    with pytest.raises(ValueError, match=f"needs {required} cache parents"):
+        bench._cache_preflight(raw, [case], options)
+    report = json.loads(capsys.readouterr().out.split(" ", 1)[1])
+    assert report["cases"][0]["peak_context"] == peak_context
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("drafts", [0, 3])
+def test_untraced_cli_context_geometry_is_unchanged(overlap, drafts):
+    from resin.bench import BenchCase
+
+    options = dict(
+        warmup_steps=3, measure_steps=12, draft_tokens=drafts, overlap=overlap
+    )
+    case = BenchCase(phase="decode", context_length=8192, batch_size=8)
+    assert bench._context_capacity([case], options) == 8192 + 19 * (drafts + 1)

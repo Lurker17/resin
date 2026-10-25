@@ -87,6 +87,25 @@ def test_shared_sweep_options_remain_compatible():
     assert options["prefill_chunk_size"] == 512
 
 
+@pytest.mark.parametrize("ep,expert_tp", [(4, 1), (2, 2), (1, 4)])
+def test_glm_expert_tp_keeps_all_four_attention_replicas(ep, expert_tp):
+    args = bench.argument_parser().parse_args(
+        ["--model", "glm-5.3-flash", "--ep", str(ep), "--attn-dp", "4"]
+    )
+    _, _, topology, _ = bench._configuration(args)
+    assert topology.attn_dp == topology.world_size == 4
+    assert topology.ep == ep
+    assert topology.expert_tp == expert_tp
+
+
+def test_glm_rejects_attention_replication_without_four_independent_drivers():
+    args = bench.argument_parser().parse_args(
+        ["--model", "glm-5.3-flash", "--ep", "1", "--attn-dp", "2"]
+    )
+    with pytest.raises(ValueError, match="attention-DP=world size"):
+        bench._configuration(args)
+
+
 def test_deepseek_world_override_scales_replica_and_expert_axes():
     args = bench.argument_parser().parse_args(
         [

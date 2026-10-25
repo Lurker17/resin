@@ -79,12 +79,12 @@ def test_mla_index_views_and_storage_envelope_are_disjoint():
     draft_page = int(cache.pages(0, 1, 2)[0, 0])
     assert target_page != draft_page
     arena.latent[target_page].fill_(1)
-    arena.index_keys[target_page].fill_(2)
-    arena.index_gates[target_page].fill_(3)
+    arena.index_tail_keys[2].fill_(2)
+    arena.index_tail_gates[2].fill_(3)
     arena.pooled_keys[target_page].fill_(4)
     assert arena.latent[target_page].eq(1).all()
-    assert arena.index_keys[target_page].eq(2).all()
-    assert arena.index_gates[target_page].eq(3).all()
+    assert arena.index_tail_keys[2].eq(2).all()
+    assert arena.index_tail_gates[2].eq(3).all()
     assert arena.pooled_keys[target_page].eq(4).all()
     assert not arena.latent[draft_page].count_nonzero()
     assert arena.latent.stride(0) % shape.latent_dim == 0

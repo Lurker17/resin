@@ -693,6 +693,10 @@ def test_mtp_origin_preserves_shared_prefix_and_logical_pooling(boundary, device
     immutable = arena.storage[1 : prefix_parents + 1].clone()
 
     branch = view([*shared, prefix_parents + 1], length, 4)
+    # This page-origin unit fixture omits Engine STATE groups; supply its
+    # published tail explicitly. Engine checkpoint/fork coverage lives in the
+    # bounded-tail tests.
+    prefix_tail = prefix.index_tail.snapshot()
     branch_latent = torch.randn(4, 512, device=device, dtype=torch.bfloat16) * 0.2
     branch_keys = torch.full((4, 128), 64, device=device, dtype=torch.bfloat16)
     branch_gates = torch.randn(4, 128, device=device)
@@ -704,6 +708,7 @@ def test_mtp_origin_preserves_shared_prefix_and_logical_pooling(boundary, device
     mla_query = torch.randn(2, 64, 512, device=device, dtype=torch.bfloat16) * 0.2
 
     def launch():
+        branch.index_tail.assign(prefix_tail)
         kernels.store_sparse(
             branch_latent, branch_keys, branch_gates, device_ape, branch
         )
@@ -790,10 +795,17 @@ def test_sparse_cache_addresses_cross_signed32_boundaries_and_replay(origin):
     a few pages are touched. Unused rows and wrapped-address canaries are NaNs,
     representing recycled FULL pages formerly used for recurrent checkpoints.
     """
-    from resin.models.glm5_3_flash.config import Glm53Config
-    from resin_models_cuda.glm5_3_flash.cache import CacheGeometry
-
-    geometry = CacheGeometry.from_config(Glm53Config(), state_tokens=256)
+    # Preserve the independently exercised legacy full-history adapter's wide
+    # address regression. Production now keeps raw keys/gates in STATE tails;
+    # their current-layout graph/address tests are in test_glm53_index_tail.py.
+    geometry = SimpleNamespace(
+        latent_dim=512,
+        index_dim=128,
+        unit_bytes=118784,
+        latent_bytes=65536,
+        index_bytes=16384,
+        gate_bytes=32768,
+    )
     assert (geometry.latent_dim, geometry.index_dim) == (512, 128)
     bf16_stride, fp32_stride = geometry.unit_bytes // 2, geometry.unit_bytes // 4
     first_bf16_overflow = (1 << 31) // bf16_stride + 1

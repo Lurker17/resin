@@ -30,6 +30,7 @@ def test_trace_preserves_cpu_diagnostics_but_rejects_missing_cuda(
         {"git_commit": "qualified-source", "overlap": overlap},
         decode_passes=2 + int(overlap),
     )
+    assert getattr(trace, "decode_passes") == 2 + int(overlap)
     case = BenchCase(phase=phase, context_length=4096, batch_size=256)
     steps = []
 

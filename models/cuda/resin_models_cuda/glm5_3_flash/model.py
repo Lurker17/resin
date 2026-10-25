@@ -16,6 +16,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from resin.backend.cuda.parallel import TensorParallelLayout
 from resin.backend.expert_parallel import ExpertParallelDispatch
 from resin_models_cuda.glm5_3_flash.projections import fixed_rows
 from resin_models_cuda.glm5_3_flash.weights import nvfp4_expert_scales
@@ -117,6 +118,18 @@ class Router(nn.Module):
         )
 
 
+def _read_expert_projection(reader, name, shape, dtype, shard, *, enabled, down, pack):
+    """Read only the TP interval, retaining the original TP1 loading path."""
+    if not enabled:
+        return reader.read(name, shape, dtype)
+    slices = (
+        (slice(None), slice(shard.start // pack, shard.stop // pack))
+        if down
+        else (shard.as_slice(), slice(None))
+    )
+    return reader.read(name, shape, dtype, slices=slices)
+
+
 class Nvfp4Experts(nn.Module):
     """Rank-local TRT-LLM W4A4 experts with global checkpoint calibration."""
 
@@ -131,21 +144,41 @@ class Nvfp4Experts(nn.Module):
     clamp_limits: Tensor
 
     def __init__(
-        self, config, reader, prefix, *, ep_size=1, ep_rank=0, max_tokens=32768
+        self,
+        config,
+        reader,
+        prefix,
+        *,
+        ep_size=1,
+        ep_rank=0,
+        max_tokens=32768,
+        expert_tensor_parallel: TensorParallelLayout | None = None,
     ):
         super().__init__()
-        count = config.n_routed_experts // ep_size
+        owned = TensorParallelLayout(ep_rank, ep_size).even_shard(
+            config.n_routed_experts, name="n_routed_experts"
+        )
+        self.expert_tensor_parallel = expert_tensor_parallel or TensorParallelLayout()
+        # Slice complete quantization and kernel tiles before TRT's row shuffle.
+        # Keep TP1's original geometry, including small independent test fixtures.
+        self.intermediate_shard = self.expert_tensor_parallel.aligned_shard(
+            config.moe_intermediate_size,
+            alignment=128 if self.expert_tensor_parallel.enabled else 16,
+            name="moe_intermediate_size",
+        )
         self.total, self.start, self.count = (
             config.n_routed_experts,
-            ep_rank * count,
-            count,
+            owned.start,
+            owned.size,
         )
         self.intermediate, self.hidden = (
-            config.moe_intermediate_size,
+            self.intermediate_shard.size,
             config.hidden_size,
         )
         self.max_tokens = max_tokens
         h, m = self.hidden, self.intermediate
+        full_m = config.moe_intermediate_size
+        count = self.count
         for name, shape, dtype in (
             ("w13", (count, 2 * m, h // 2), torch.uint8),
             ("w13_scales", (count, 2 * m, h // 16), torch.float8_e4m3fn),
@@ -173,16 +206,28 @@ class Nvfp4Experts(nn.Module):
         for local in range(count):
             base = f"{prefix}{self.start + local}."
             for position, name in enumerate(("gate_proj", "up_proj", "down_proj")):
-                output_width, input_width = (h, m) if name == "down_proj" else (m, h)
-                weight = reader.read(
+                output_width, input_width = (
+                    (h, full_m) if name == "down_proj" else (full_m, h)
+                )
+                weight = _read_expert_projection(
+                    reader,
                     base + name + ".weight",
                     (output_width, input_width // 2),
                     torch.uint8,
+                    self.intermediate_shard,
+                    enabled=self.expert_tensor_parallel.enabled,
+                    down=name == "down_proj",
+                    pack=2,
                 )
-                block_scale = reader.read(
+                block_scale = _read_expert_projection(
+                    reader,
                     base + name + ".weight_scale",
                     (output_width, input_width // 16),
                     torch.float8_e4m3fn,
+                    self.intermediate_shard,
+                    enabled=self.expert_tensor_parallel.enabled,
+                    down=name == "down_proj",
+                    pack=16,
                 )
                 if name == "down_proj":
                     self.w2[local].copy_(weight)
@@ -264,13 +309,37 @@ class Bf16Experts(nn.Module):
     clamp: Tensor
 
     def __init__(
-        self, config, reader, prefix, *, ep_size=1, ep_rank=0, max_tokens=32768
+        self,
+        config,
+        reader,
+        prefix,
+        *,
+        ep_size=1,
+        ep_rank=0,
+        max_tokens=32768,
+        expert_tensor_parallel: TensorParallelLayout | None = None,
     ):
         super().__init__()
-        self.count = config.n_routed_experts // ep_size
-        self.start, self.limit = ep_rank * self.count, config.swiglu_limit
-        self.max_tokens = max_tokens
-        h, m = config.hidden_size, config.moe_intermediate_size
+        owned = TensorParallelLayout(ep_rank, ep_size).even_shard(
+            config.n_routed_experts, name="n_routed_experts"
+        )
+        self.expert_tensor_parallel = expert_tensor_parallel or TensorParallelLayout()
+        self.intermediate_shard = self.expert_tensor_parallel.aligned_shard(
+            config.moe_intermediate_size,
+            alignment=128 if self.expert_tensor_parallel.enabled else 16,
+            name="moe_intermediate_size",
+        )
+        self.total, self.count, self.start = (
+            config.n_routed_experts,
+            owned.size,
+            owned.start,
+        )
+        self.limit, self.max_tokens = config.swiglu_limit, max_tokens
+        self.hidden, self.intermediate = (
+            config.hidden_size,
+            self.intermediate_shard.size,
+        )
+        h, m, full_m = self.hidden, self.intermediate, config.moe_intermediate_size
         self.register_buffer(
             "w13",
             torch.empty(
@@ -283,15 +352,23 @@ class Bf16Experts(nn.Module):
         )
         for local in range(self.count):
             base = f"{prefix}{self.start + local}."
-            self.w13[local, :m].copy_(
-                reader.read(base + "up_proj.weight", (m, h), torch.bfloat16)
-            )
-            self.w13[local, m:].copy_(
-                reader.read(base + "gate_proj.weight", (m, h), torch.bfloat16)
-            )
-            self.w2[local].copy_(
-                reader.read(base + "down_proj.weight", (h, m), torch.bfloat16)
-            )
+            for name, destination in (
+                ("up_proj", self.w13[local, :m]),
+                ("gate_proj", self.w13[local, m:]),
+                ("down_proj", self.w2[local]),
+            ):
+                destination.copy_(
+                    _read_expert_projection(
+                        reader,
+                        base + name + ".weight",
+                        (h, full_m) if name == "down_proj" else (full_m, h),
+                        torch.bfloat16,
+                        self.intermediate_shard,
+                        enabled=self.expert_tensor_parallel.enabled,
+                        down=name == "down_proj",
+                        pack=1,
+                    )
+                )
         for name, value in (("alpha", 1.0), ("beta", 0.0), ("clamp", self.limit)):
             self.register_buffer(
                 name,

@@ -31,7 +31,7 @@ from deploy.models import MODEL_SPECS, create_runner, get_model, validate_gpu
 from resin import Engine, Parallelism, SchedulerConfig
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.topology import ParallelGroups
-from resin.bench import perfetto_trace
+from resin.bench import decode_output_budget, perfetto_trace
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -76,6 +76,34 @@ def _result_callback(report_path):
     return save
 
 
+def _decode_budget(options, raw=None):
+    overlap = options.get("overlap", True) and (
+        raw is None or callable(getattr(raw, "enqueue", None))
+    )
+    config = getattr(raw, "runner_config", None)
+    return decode_output_budget(
+        warmup_steps=options["warmup_steps"],
+        measure_steps=options["measure_steps"],
+        draft_tokens=options["draft_tokens"],
+        overlap=overlap,
+        trace_passes=2 + int(overlap) if options.get("trace_dir") else 0,
+        cache_write_lookahead_tokens=getattr(
+            config, "cache_write_lookahead_tokens", None
+        ),
+    )
+
+
+def _context_capacity(cases, options):
+    # Preserve existing untraced graph geometry. Traced cohorts additionally
+    # reserve the continuation guard through their last requested completion.
+    headroom = (options["warmup_steps"] + options["measure_steps"] + 4) * (
+        options["draft_tokens"] + 1
+    )
+    if options.get("trace_dir") and any(case.phase == "decode" for case in cases):
+        headroom = max(headroom, _decode_budget(options))
+    return max(case.context_length for case in cases) + headroom
+
+
 def _cache_preflight(raw, cases, options, groups=None):
     """Reject a partial decode cohort before spending time on capture or prefill."""
     plan = getattr(raw, "cache_capacity_plan", None)
@@ -86,12 +114,18 @@ def _cache_preflight(raw, cases, options, groups=None):
     for case in cases:
         context = case.context_length
         if case.phase == "decode":
-            context += (
-                options["warmup_steps"]
-                + options["measure_steps"]
-                + 1
-                + (2 if options.get("trace_dir") else 0)
-            ) * (options["draft_tokens"] + 1) + options["draft_tokens"]
+            if options.get("trace_dir"):
+                # Include the same output reservation as admission, plus actual
+                # cache writes beyond the final public token position.
+                config = getattr(raw, "runner_config", None)
+                lookahead = getattr(
+                    config, "cache_write_lookahead_tokens", options["draft_tokens"]
+                )
+                context += _decode_budget(options, raw) + lookahead
+            else:
+                context += (options["warmup_steps"] + options["measure_steps"] + 1) * (
+                    options["draft_tokens"] + 1
+                ) + options["draft_tokens"]
         parents = layout.estimated_parent_count(
             [context] * case.batch_size, shared_prefix_tokens=case.shared_prefix_tokens
         )
@@ -174,10 +208,7 @@ def _rank(
     )
     # Reserve real generated positions, including draft write lookahead. Context
     # lengths on the charts remain the prompt lengths recorded by the harness.
-    headroom = (options["warmup_steps"] + options["measure_steps"] + 4) * (
-        options["draft_tokens"] + 1
-    )
-    capacity = max(case.context_length for case in cases) + headroom
+    capacity = _context_capacity(cases, options)
     if rank == 0:
         print(f"[bench] loading {model} over {topology.world_size} GPUs", flush=True)
     started = time.perf_counter()
@@ -338,9 +369,10 @@ def _validate_configuration(model, cases, topology, options):
             topology.attn_tp != 1
             or topology.cp != 1
             or topology.attn_dp != topology.world_size
-            or topology.ep != topology.world_size
         ):
-            raise ValueError("GLM requires attention-DP=EP=world size, TP1 and CP1")
+            raise ValueError(
+                "GLM requires attention-DP=world size, attention TP1 and CP1"
+            )
         if prefill_chunk_size % 64:
             raise ValueError("GLM prefill chunks must align to 64-token pages")
         if draft_tokens > 7:

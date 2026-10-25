@@ -292,19 +292,25 @@ class CudaGraphMode:
     callers commonly register ``prefill`` and ``decode``. Either mode may
     build one full graph with :class:`CudaGraphStep` or a breakable graph with
     :class:`CudaGraphProgram`; capture and replay stay identical.
+    All modes and shapes in an executor share one memory pool and capture stream.
     """
 
     shapes: tuple[GraphShape, ...]
     build: Callable[[GraphShape], CudaGraphStep | CudaGraphProgram]
     capture_inputs: Callable[[GraphShape], Mapping[str, object]]
-    share_pool: bool = False
 
     def __post_init__(self) -> None:
         if not callable(self.build) or not callable(self.capture_inputs):
             raise TypeError("CUDA graph mode hooks must be callable")
-        if not isinstance(self.share_pool, bool):
-            raise TypeError("CUDA graph share_pool must be a boolean")
         object.__setattr__(self, "shapes", tuple(self.shapes))
+
+
+@dataclass(slots=True)
+class _CudaGraphWorkspace:
+    """Lazily allocated resources shared by one executor's serialized graphs."""
+
+    pool: Any | None = None
+    stream: Any | None = None
 
 
 @dataclass(slots=True)
@@ -328,6 +334,11 @@ class CudaGraphCache:
     or a segmented :class:`CudaGraphProgram`. This cache owns persistent input
     staging, explicit warmup/capture, parity validation, ordered graph breaks,
     replay, failure poisoning, and metrics. It executes only the current batch.
+
+    Captures share a memory pool and must replay serially. Persistent state
+    and outputs needed across replays must use storage allocated outside capture.
+    An executor supplies the same workspace to every mode; standalone caches
+    own their workspace.
     """
 
     def __init__(
@@ -337,7 +348,7 @@ class CudaGraphCache:
         *,
         build: Callable[[GraphShape], CudaGraphStep | CudaGraphProgram],
         synchronize_failure: Callable[[], None],
-        share_pool: bool = False,
+        _workspace: _CudaGraphWorkspace | None = None,
     ) -> None:
         self.device = device
         self.shapes = shapes
@@ -348,9 +359,9 @@ class CudaGraphCache:
         self._fallbacks: Counter[str] = Counter()
         self._replay_count = 0
         self._poison: str | None = None
-        self._share_pool = share_pool
-        self._pool: Any | None = None
-        self._capture_stream: Any | None = None
+        self._workspace: _CudaGraphWorkspace | None = (
+            _workspace if _workspace is not None else _CudaGraphWorkspace()
+        )
         self._closed = False
         self._closed_stats: CudaGraphStats | None = None
 
@@ -406,8 +417,8 @@ class CudaGraphCache:
             entry.graphs = ()
             entry.program = None
             entry.staging = None
-        self._pool = None
-        self._capture_stream = None
+        # Drop this cache's reference without invalidating other modes' graphs.
+        self._workspace = None
         self._closed_stats = stats
         self._closed = True
 
@@ -431,10 +442,8 @@ class CudaGraphCache:
         if before_capture is not None:
             before_capture()
         captured = set(self.stats["captured_shapes"])
-        capture_shapes = (
-            sorted(self.shapes, reverse=True) if self._share_pool else self.shapes
-        )
-        for shape in capture_shapes:
+        # Seed the shared pool with the largest workspace before smaller shapes.
+        for shape in sorted(self.shapes, reverse=True):
             if shape not in captured:
                 self.capture(shape, inputs_for_shape(shape))
         if after_capture is not None:
@@ -532,9 +541,11 @@ class CudaGraphCache:
         program = entry.program
         assert program is not None
         current = torch.cuda.current_stream(self.device)
-        if self._capture_stream is None:
-            self._capture_stream = torch.cuda.Stream(device=self.device)
-        warmup = self._capture_stream
+        workspace = self._workspace
+        assert workspace is not None
+        if workspace.stream is None:
+            workspace.stream = torch.cuda.Stream(device=self.device)
+        warmup = workspace.stream
         warmup.wait_stream(current)
         with torch.cuda.stream(warmup), torch.inference_mode():
             for _ in range(3):
@@ -595,8 +606,10 @@ class CudaGraphCache:
     def _capture_regions(self, entry: _GraphEntry, stream) -> tuple[Any | None, ...]:
         program = entry.program
         assert program is not None
-        if self._share_pool and self._pool is None:
-            self._pool = torch.cuda.graph_pool_handle()
+        workspace = self._workspace
+        assert workspace is not None
+        if workspace.pool is None:
+            workspace.pool = torch.cuda.graph_pool_handle()
         graphs: list[Any | None] = []
         for region in program.regions:
             if not region.capture:
@@ -614,7 +627,7 @@ class CudaGraphCache:
             # close() can release NCCL graph references before communicator teardown.
             entry.graphs = tuple(graphs)
             with (
-                torch.cuda.graph(graph, pool=self._pool, stream=stream),
+                torch.cuda.graph(graph, pool=workspace.pool, stream=stream),
                 torch.inference_mode(),
             ):
                 region.launch()
@@ -684,7 +697,12 @@ class CudaGraphCache:
 
 
 class CudaGraphExecutor:
-    """Own independent graph buckets without duplicating phase machinery."""
+    """Own mode-specific graph buckets sharing one pool and capture stream.
+
+    Prefill, decode, and any additional modes must execute serially, with no
+    capture-allocated state needed across modes. Their shared workspace stays
+    alive until every cache has released its graphs.
+    """
 
     def __init__(
         self,
@@ -697,6 +715,7 @@ class CudaGraphExecutor:
             raise ValueError("CUDA graph mode names must be nonempty")
         self.device = device
         self._synchronize_failure = synchronize_failure
+        self._workspace: _CudaGraphWorkspace | None = _CudaGraphWorkspace()
         self._modes: dict[str, CudaGraphMode] = {}
         self._caches: dict[str, CudaGraphCache] = {}
         self._closed = False
@@ -716,7 +735,7 @@ class CudaGraphExecutor:
             mode.shapes,
             build=mode.build,
             synchronize_failure=self._synchronize_failure,
-            share_pool=mode.share_pool,
+            _workspace=self._workspace,
         )
 
     def mode(self, name: str) -> CudaGraphCache:
@@ -746,6 +765,7 @@ class CudaGraphExecutor:
             torch.cuda.synchronize(self.device)
         for cache in self._caches.values():
             cache._release()
+        self._workspace = None
         self._modes.clear()
         self._closed = True
 

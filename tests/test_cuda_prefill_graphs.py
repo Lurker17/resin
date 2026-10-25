@@ -312,8 +312,12 @@ def test_cuda_prefill_regions_replay_dynamic_lengths_with_shared_memory(with_ids
         row["capture_memory_bytes"] >= 0 for row in stats["prefill"]["shape_stats"]
     )
     cache = runner._require_cuda_graph_executor().mode("prefill")
-    assert cache._pool is not None
+    assert cache._workspace is not None and cache._workspace.pool is not None
     assert {
         graph.pool() for entry in cache._entries.values() for graph in entry.graphs
-    } == {cache._pool}
-    assert runner._require_cuda_graph_executor().mode("decode")._pool is None
+    } == {cache._workspace.pool}
+    assert (
+        runner._require_cuda_graph_executor().mode("decode")._workspace
+        is cache._workspace
+    )
+    runner.close_cuda_graphs()

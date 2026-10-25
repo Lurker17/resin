@@ -8,6 +8,7 @@ pinned FLA KDA and FlashMLA implementations; page adapters are Resin-owned.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import cast
 
 import torch
@@ -67,8 +68,49 @@ def reference_kda(q, k, v, g, beta, state, offsets):
     return output, final
 
 
-def kda(q, k, v, forget, beta, a_log, dt_bias, lower_bound, cache):
-    """KDA uses per-key decay, unlike Qwen's scalar-per-head delta rule."""
+def _owned_recurrent_state(cache):
+    """Validate the explicit CUDA-gather ownership contract without reading data."""
+    initial = cache.recurrent
+    arena = getattr(cache, "initial_state_arena", None)
+    if not getattr(cache, "initial_state_owned", False) or not isinstance(
+        arena, Tensor
+    ):
+        raise ValueError("KDA in-place decode requires explicitly owned gather scratch")
+    if initial.dtype != torch.float32 or not initial.is_contiguous():
+        raise ValueError("KDA in-place decode requires packed FP32 gather scratch")
+    if initial.untyped_storage().data_ptr() == arena.untyped_storage().data_ptr():
+        raise ValueError("KDA in-place decode cannot overwrite Engine cache pages")
+    if getattr(cache, "speculative_tape", None) is not None:
+        raise ValueError(
+            "KDA in-place decode cannot overwrite a speculative initial state"
+        )
+    return initial
+
+
+def kda(
+    q,
+    k,
+    v,
+    forget,
+    beta,
+    a_log,
+    dt_bias,
+    lower_bound,
+    cache,
+    *,
+    output_final_state=True,
+    reuse_initial_state=False,
+):
+    """KDA uses per-key decay, with optional owned-scratch reuse for decode.
+
+    Prefill and speculative verification retain their independent initial-state
+    contract. Ordinary decode can opt into FLA's existing lower-level in-place
+    API after validating the Engine's separately gathered working allocation.
+    """
+    if reuse_initial_state:
+        _owned_recurrent_state(cache)
+        if not q.is_cuda or not output_final_state:
+            raise ValueError("KDA scratch reuse requires CUDA final-state output")
     # Serving reference: SGLang 5971f47's KDA keeps sigmoid(beta) in FP32
     # for both chunk prefill and recurrent decode. Rounding it to BF16 here
     # changes every recurrent update, including speculative accepted-prefix replay.
@@ -81,7 +123,10 @@ def kda(q, k, v, forget, beta, a_log, dt_bias, lower_bound, cache):
             if lower_bound is not None
             else -decay * F.softplus(gate)
         )
-        return reference_kda(q, k, v, gate, beta, cache.recurrent, cache.cu_seqlens)
+        output, final = reference_kda(
+            q, k, v, gate, beta, cache.recurrent, cache.cu_seqlens
+        )
+        return output, final if output_final_state else None
     from fla.ops.kda import chunk_kda, fused_recurrent_kda
 
     from resin_models_cuda.glm5_3_flash.state_cuda import beta_sigmoid, preserve_idle
@@ -91,10 +136,24 @@ def kda(q, k, v, forget, beta, a_log, dt_bias, lower_bound, cache):
     small = q.shape[0] <= (cache.cu_seqlens.shape[0] - 1) * 8
     # FLA input_guard loses its wrapped callable signature in upstream typing.
     kernel = cast(
-        Callable[..., tuple[Tensor, Tensor]],
+        Callable[..., tuple[Tensor, Tensor | None]],
         fused_recurrent_kda if small else chunk_kda,
     )
     kwargs = {}
+    if reuse_initial_state:
+        if not small:
+            raise ValueError("KDA scratch reuse is restricted to recurrent decode")
+        # The pinned FLA 0.5.2 public wrapper hardcodes inplace_final_state=False.
+        # Its lower wrapper exposes the same kernel with caller-owned final
+        # storage. Each CTA owns all K entries of one 32-column V tile, loads its
+        # initial tile before storing, and never reads another CTA's columns.
+        from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
+
+        kernel = cast(
+            Callable[..., tuple[Tensor, Tensor | None]], fused_recurrent_kda_fwd
+        )
+        kwargs["inplace_final_state"] = True
+        q, k, v, forget = (value.contiguous() for value in (q, k, v, forget))
     if not small:
         from resin_models_cuda.glm5_3_flash.kernels_cuda import l2norm_cuda
 
@@ -109,25 +168,31 @@ def kda(q, k, v, forget, beta, a_log, dt_bias, lower_bound, cache):
             "cu_seqlens_cpu": cache.cu_seqlens_cpu,
             "safe_gate": lower_bound is not None,
         }
-    output, final = kernel(
-        q.unsqueeze(0),
-        k.unsqueeze(0),
-        v.unsqueeze(0),
-        forget.unsqueeze(0),
-        beta.unsqueeze(0),
-        A_log=a_log.reshape(-1).float(),
-        dt_bias=dt_bias.reshape(-1).float(),
-        initial_state=cache.recurrent.contiguous(),
-        output_final_state=True,
-        use_qk_l2norm_in_kernel=small,
-        use_gate_in_kernel=True,
-        lower_bound=lower_bound,
-        cu_seqlens=cache.cu_seqlens,
-        **kwargs,
-    )
+    # The lower wrapper lacks public input_guard. All operands have the same
+    # contiguous contract; select the input device explicitly as input_guard does.
+    with torch.cuda.device(q.device) if reuse_initial_state else nullcontext():
+        output, final = kernel(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            forget.unsqueeze(0),
+            beta.unsqueeze(0),
+            A_log=a_log.reshape(-1).float().contiguous(),
+            dt_bias=dt_bias.reshape(-1).float().contiguous(),
+            initial_state=cache.recurrent.contiguous(),
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=small,
+            use_gate_in_kernel=True,
+            lower_bound=lower_bound,
+            cu_seqlens=cache.cu_seqlens.contiguous(),
+            **kwargs,
+        )
     # FLA's recurrent kernel returns before writing an empty sequence's final
     # state. Preserve it explicitly for idle/padded attention replicas.
-    final = preserve_idle(cache.recurrent, final, cache.cu_seqlens)
+    if output_final_state and not reuse_initial_state:
+        final = preserve_idle(cache.recurrent, final, cache.cu_seqlens)
+    # In-place FLA leaves an empty interval's original state untouched, so no
+    # repair kernel or second state allocation is needed in that mode.
     return output.squeeze(0), final
 
 
@@ -137,6 +202,9 @@ def store_sparse(latent: Tensor, keys: Tensor, gates: Tensor, ape: Tensor, cache
         from resin_models_cuda.glm5_3_flash.kernels_cuda import store_sparse_cuda
 
         store_sparse_cuda(latent, keys, gates, ape, cache)
+        return
+    if getattr(cache, "index_tail", None) is not None:
+        _store_sparse_tail(latent, keys, gates, ape, cache)
         return
     origin = getattr(cache, "storage_origin", 0)
     for token, (seq, pos) in enumerate(
@@ -167,6 +235,53 @@ def store_sparse(latent: Tensor, keys: Tensor, gates: Tensor, ape: Tensor, cache
         cache.pooled_keys[page, pool_slot % (cache.page_tokens // 4)] = (
             probs * pool_keys
         ).sum(0)
+
+
+def _store_sparse_tail(latent, keys, gates, ape, cache):
+    from resin_models_cuda.glm5_3_flash.index_tail import finish_update, record_update
+
+    update = record_update(cache, keys, gates)
+    origin = getattr(cache, "storage_origin", 0)
+    offsets = cache.cu_seqlens.tolist()
+    for token, (seq, pos) in enumerate(
+        zip(cache.sequence_indices.tolist(), cache.positions.tolist())
+    ):
+        if pos < 0 or seq < 0:
+            continue
+        physical = pos + origin
+        page = int(cache.page_table[seq, physical // cache.page_tokens])
+        if page > 0:
+            cache.latent[page, physical % cache.page_tokens] = latent[token].to(
+                cache.latent.dtype
+            )
+        if (pos + 1) % 4:
+            continue
+        pool_slot = pos // 4 + origin
+        page = int(cache.page_table[seq, pool_slot // (cache.page_tokens // 4)])
+        if page <= 0:
+            continue
+        begin, end = offsets[seq : seq + 2]
+        first = int(cache.positions[begin])
+        prior_end = int(update.initial.end[seq])
+        pool_keys, pool_gates = [], []
+        for position in range(pos - 3, pos + 1):
+            row = begin + position - first
+            if position >= first and row < end:
+                pool_keys.append(keys[row].to(update.initial.keys.dtype))
+                pool_gates.append(gates[row].float())
+            else:
+                slot = position - (prior_end - 3)
+                if not 0 <= slot < 4:
+                    raise ValueError("raw index tail does not cover a completed pool")
+                pool_keys.append(update.initial.keys[seq, slot])
+                pool_gates.append(update.initial.gates[seq, slot])
+        pool_keys = torch.stack(pool_keys)
+        logits = torch.stack(pool_gates).float() + ape.float()
+        probs = logits.softmax(0).to(pool_keys.dtype)
+        cache.pooled_keys[page, pool_slot % (cache.page_tokens // 4)] = (
+            probs * pool_keys
+        ).sum(0)
+    finish_update(cache, update)
 
 
 def select_indices(
@@ -231,8 +346,33 @@ def latent_envelope(latent: Tensor) -> Tensor:
     return latent.as_strided((rows, 1, width), (width, width, 1))
 
 
-def sparse_attention(query: Tensor, indices: Tensor, latent: Tensor, scale: float):
-    """Sparse absorbed MLA; never expand full history into 64 K/V heads."""
+def sparse_attention(
+    query: Tensor,
+    indices: Tensor,
+    latent: Tensor,
+    scale: float,
+    *,
+    workspace=None,
+    sequence_lengths: Tensor | None = None,
+    max_seq_len: int | None = None,
+):
+    """Sparse absorbed MLA with raw FP8 TRT and an explicit BF16 reference path."""
+    if latent.dtype == torch.float8_e4m3fn:
+        from resin_models_cuda.glm5_3_flash.dsa import fp8_sparse_attention
+
+        if sequence_lengths is None or max_seq_len is None:
+            raise ValueError(
+                "FP8 MLA needs runtime sequence lengths and fixed capacity"
+            )
+        return fp8_sparse_attention(
+            query,
+            indices,
+            latent,
+            scale,
+            workspace=workspace,
+            sequence_lengths=sequence_lengths,
+            max_seq_len=max_seq_len,
+        )
     envelope = latent_envelope(latent)
     if query.is_cuda:
         from flash_mla import flash_mla_sparse_fwd

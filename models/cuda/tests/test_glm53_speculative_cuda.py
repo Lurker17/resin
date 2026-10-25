@@ -64,11 +64,13 @@ def _actual(data, width):
     from resin_models_cuda.glm5_3_flash.speculative_cuda import (
         finish_commit,
         prepare_replay,
+        select_history,
     )
 
     counts, contexts, forget, beta, history, raw, hidden = data
     return (
-        *prepare_replay(counts, width, forget, beta, history, raw),
+        *prepare_replay(counts, width, forget, beta, history, raw)[:2],
+        select_history(counts, width, history, raw),
         *finish_commit(counts, width, contexts, hidden),
     )
 
@@ -128,7 +130,7 @@ def test_replay_preparation_real_geometry_and_graph_lifetime():
 
 @torch.inference_mode()
 def test_actual_tape_owns_initial_states_and_matches_preparation(monkeypatch):
-    from resin_models_cuda.glm5_3_flash import speculative
+    from resin_models_cuda.glm5_3_flash import kda_state_cuda
 
     data, width = _fixture(3, 4), 4
     counts, contexts, forget, beta, history, raw, hidden = data
@@ -137,13 +139,13 @@ def test_actual_tape_owns_initial_states_and_matches_preparation(monkeypatch):
     q = torch.randn(12, 2, 16, device="cuda", dtype=torch.bfloat16)
     expected = _reference(data, width)
 
-    def recurrence(query, key, value, masked_f, masked_b, a, dt, bound, cache):
-        assert cache.recurrent is initial
-        _bits(masked_f, expected[0])
-        _bits(masked_b, expected[1])
-        return value, initial.clone()
+    def recurrence(key, value, raw_f, raw_b, a, dt, state, offsets, accepted, bound):
+        assert state is initial
+        assert raw_f is forget and raw_b is beta
+        assert accepted is counts
+        return initial.clone()
 
-    monkeypatch.setattr(speculative.kernels, "kda", recurrence)
+    monkeypatch.setattr(kda_state_cuda, "accepted_kda_state", recurrence)
     layer = SimpleNamespace(
         recurrent=initial,
         convolution=history,
@@ -181,7 +183,7 @@ def _entries():
     device = torch.cuda.current_device()
     return {
         name: set(getattr(module, name).device_caches[device][0])
-        for name in ("_prepare_replay", "_finish_commit")
+        for name in ("_prepare_replay", "_select_history", "_finish_commit")
     }
 
 
@@ -208,6 +210,7 @@ def test_source_addresses_above_two_gib_are_not_truncated():
     from resin_models_cuda.glm5_3_flash.speculative_cuda import (
         finish_commit,
         prepare_replay,
+        select_history,
     )
 
     if torch.cuda.mem_get_info()[0] < 4 * 1024**3:
@@ -223,6 +226,7 @@ def test_source_addresses_above_two_gib_are_not_truncated():
     beta = torch.zeros(2, 1, device="cuda", dtype=torch.bfloat16)
     history = torch.full((1, 3, 4, 3), 5, device="cuda", dtype=torch.bfloat16)
     _, _, repaired = prepare_replay(counts, 2, forget, beta, history, raw)
+    _bits(select_history(counts, 2, history, raw), repaired)
     _bits(repaired[..., 0], history[..., 2])
     _bits(repaired[..., 1], raw[0][None])
     _bits(repaired[..., 2], raw[1][None])

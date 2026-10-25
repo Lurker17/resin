@@ -140,3 +140,12 @@ python/sglang/kernels/ops/layernorm/mhc.py.
 https://github.com/sgl-project/sglang/blob/baa9befa381511cd4d56f83980951e5a45fffc6d/python/sglang/kernels/ops/layernorm/mhc.py
 SGLang is licensed under the Apache License, Version 2.0. The adaptation keeps
 token count dynamic, uses a fixed reduction split, and disables PDL scheduling.
+
+The accepted-prefix KDA state kernel in
+models/cuda/resin_models_cuda/glm5_3_flash/kda_state_cuda.py is adapted from
+flash-linear-attention 0.5.2, fla/ops/kda/fused_recurrent.py.
+https://github.com/fla-org/flash-linear-attention/blob/v0.5.2/fla/ops/kda/fused_recurrent.py
+The MIT license and copyright notice are retained at
+models/cuda/resin_models_cuda/glm5_3_flash/LICENSE.fla. The adaptation computes
+only accepted recurrent state, with Resin's FP32 beta sigmoid and explicit
+preservation of empty rows; it does not produce attention outputs.

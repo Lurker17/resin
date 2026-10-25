@@ -306,6 +306,11 @@ def _attention_checks():
         store_kv,
     )
     from resin_models_cuda.deepseek_v41.cache import CacheArena, CacheGeometry
+    from resin_models_cuda.deepseek_v41.upstream.fused_transform import (
+        CastArgs,
+        KVCacheOutArgs,
+        fused_norm_rope_hadamard_cast_store_kvcache,
+    )
 
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.manual_seed(4101)
@@ -406,7 +411,14 @@ def _attention_checks():
                 extra >= 0, compressed_ids.flatten()[extra.clamp_min(0).long()], -1
             )
             if draft:
-                store_kv(cache.draft_cache, draft_ids, pack_kv(draft_values))
+                # These fixtures are already normalized/rotated. Exercise the
+                # production fused cache writer's cast/store stages, rather
+                # than the reference store_kv helper's dynamic boolean gather.
+                fused_norm_rope_hadamard_cast_store_kvcache(
+                    draft_values.flatten(0, 1),
+                    cast_args=CastArgs("e4m3", 32),
+                    out_args=KVCacheOutArgs(cache.draft_cache, draft_ids.flatten()),
+                )
             output = fused_attention(
                 attention,
                 query,
@@ -489,10 +501,19 @@ def _attention_checks():
             positions.add_(1).remainder_(256)
             selected[:, :-1].add_(7).remainder_(256)
             extra[:, :-1].add_(11).remainder_(256)
+            if draft:
+                draft_values.add_(0.005)
             eager = execute(draft=draft).clone()
+            if draft:
+                cache.draft_cache.zero_()
             graph.replay()
             torch.cuda.synchronize()
             replay.append(_check(captured, eager))
+            if draft:
+                _check(
+                    gather_kv(cache.draft_cache, draft_ids),
+                    _decode(pack_kv(draft_values)).flatten(0, 1),
+                )
         result["draft_graph_replays" if draft else "graph_replays"] = replay
         graph.reset()
     result["ok"] = True

@@ -636,8 +636,8 @@ class TestCudaGraph:
         assert stats["captured_shapes"] == ((1, 4), (2, 4))
         assert events == [
             "before",
-            ("inputs", (1, 4)),
             ("inputs", (2, 4)),
+            ("inputs", (1, 4)),
             "after",
         ]
 
@@ -649,7 +649,7 @@ class TestCudaGraph:
         )
         assert events == ["before", "after"]
 
-    def test_shared_pools_are_lazy_isolated_by_mode_and_capture_largest_first(
+    def test_all_modes_share_one_lazy_pool_and_stream_and_capture_largest_first(
         self, monkeypatch
     ):
         torch = _Torch()
@@ -657,7 +657,7 @@ class TestCudaGraph:
         monkeypatch.setattr(graph_runtime, "torch", torch)
         order = []
 
-        def mode(name, share_pool):
+        def mode(name):
             def build(shape):
                 order.append((name, shape))
                 state = _Tensor([0])
@@ -670,16 +670,14 @@ class TestCudaGraph:
                     ),
                 )
 
-            return CudaGraphMode(
-                ((1, 4), (4, 4)), build, lambda _: {"value": [1]}, share_pool=share_pool
-            )
+            return CudaGraphMode(((1, 4), (4, 4)), build, lambda _: {"value": [1]})
 
         graphs = CudaGraphExecutor(
             "cuda:0",
             {
-                "prefill": mode("prefill", True),
-                "decode": mode("decode", False),
-                "other": mode("other", True),
+                "prefill": mode("prefill"),
+                "decode": mode("decode"),
+                "other": mode("other"),
             },
             synchronize_failure=lambda: None,
         )
@@ -688,16 +686,61 @@ class TestCudaGraph:
         assert order == [
             (name, shape)
             for name in ("prefill", "decode", "other")
-            for shape in (((1, 4), (4, 4)) if name == "decode" else ((4, 4), (1, 4)))
+            for shape in ((4, 4), (1, 4))
         ]
-        first, second = torch.cuda.pools
-        assert first is not second
-        assert [graph.pool for graph in torch.cuda.graphs] == [first] * 4 + [
-            None
-        ] * 4 + [second] * 4
+        (pool,) = torch.cuda.pools
+        assert [graph.pool for graph in torch.cuda.graphs] == [pool] * 12
+        assert len({graph.stream for graph in torch.cuda.graphs}) == 1
         graphs.capture_all()
-        assert len(torch.cuda.pools) == 2
+        assert len(torch.cuda.pools) == 1
         assert graphs.mode("prefill").run((1, 4), {"value": [2]}).tolist() == [2]
+
+        # Modes registered after startup join the same workspace.
+        graphs.add_mode("later", mode("later"))
+        graphs.capture_all()
+        assert len(torch.cuda.pools) == 1
+        assert all(graph.pool is pool for graph in torch.cuda.graphs)
+        assert len({graph.stream for graph in torch.cuda.graphs}) == 1
+
+    def test_pool_lifetime_is_per_executor_and_closing_one_mode_keeps_siblings(
+        self, monkeypatch
+    ):
+        torch = _Torch()
+        monkeypatch.setattr(staging, "torch", torch)
+        monkeypatch.setattr(graph_runtime, "torch", torch)
+
+        def build(_shape):
+            state = _Tensor([0])
+            return CudaGraphStep({"value": state}, state, lambda: None)
+
+        mode = CudaGraphMode(((1, 4),), build, lambda _: {"value": [1]})
+        first = CudaGraphExecutor(
+            "cuda:0",
+            {"prefill": mode, "decode": mode},
+            synchronize_failure=lambda: None,
+        )
+        second = CudaGraphExecutor(
+            "cuda:0",
+            {"decode": mode},
+            synchronize_failure=lambda: None,
+        )
+        standalone = _cache(((1, 4),), build)
+        first.capture_all()
+        second.capture_all()
+        standalone.capture_all(mode.capture_inputs)
+        assert len(set(torch.cuda.pools)) == 3
+        before = first.mode("decode")._workspace
+        first.mode("prefill").close()
+        assert first.mode("prefill")._workspace is None
+        assert first.mode("decode")._workspace is before
+        assert first.mode("decode").run((1, 4), {"value": [7]}).tolist() == [7]
+        first.close()
+        assert first._workspace is None
+        assert second.mode("decode").run((1, 4), {"value": [9]}).tolist() == [9]
+        assert standalone.run((1, 4), {"value": [11]}).tolist() == [11]
+        second.close()
+        standalone.close()
+        assert all(graph.reset_count == 1 for graph in torch.cuda.graphs)
 
     def test_capture_warms_stream_local_kernel_state_and_preserves_breaks_and_pool(
         self, monkeypatch
@@ -730,7 +773,6 @@ class TestCudaGraph:
                 ),
             ),
             synchronize_failure=lambda: None,
-            share_pool=True,
         )
         cache.capture_all(lambda _: {})
         assert len(initialized) == 1
@@ -746,7 +788,7 @@ class TestCudaGraph:
         assert all(current is stream for _, current in events)
         assert torch.cuda.current_stream("cuda:0") is caller
         cache.close()
-        assert cache._capture_stream is None
+        assert cache._workspace is None
 
     def test_cache_close_resets_graphs_after_synchronizing_and_is_idempotent(
         self, monkeypatch
@@ -772,7 +814,6 @@ class TestCudaGraph:
             ((1, 4), (2, 4)),
             build=build,
             synchronize_failure=lambda: None,
-            share_pool=True,
         )
         cache.capture_all(lambda _: {"value": [1]})
         stats = cache.stats
@@ -792,7 +833,7 @@ class TestCudaGraph:
 
         assert events == ["sync", "reset", "reset", "reset", "reset"]
         assert [graph.reset_count for graph in torch.cuda.graphs] == [1] * 4
-        assert cache._pool is None
+        assert cache._workspace is None
         assert all(
             not entry.graphs and entry.program is None and entry.staging is None
             for entry in cache._entries.values()

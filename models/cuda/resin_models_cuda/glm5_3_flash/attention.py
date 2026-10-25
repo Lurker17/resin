@@ -6,6 +6,8 @@ models/glm5_next (Apache-2.0). This module owns no request-ID cache or allocator
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -121,9 +123,21 @@ class KdaAttention(nn.Module):
             self.dt_bias,
             self.lower_bound,
             cache,
+            # Accepted-state rollback replaces verification's final state.
+            # Keep only the owned initial scratch until acceptance is known.
+            **(
+                {"output_final_state": False}
+                if tape is not None and tape.reuse_initial_state
+                else {"reuse_initial_state": True}
+                if tape is None
+                and projection_rows > 0
+                and getattr(cache, "initial_state_owned", False)
+                else {}
+            ),
         )
         # The caller commits these states only after the owning forward succeeds.
-        cache.recurrent = recurrent_state
+        if recurrent_state is not None:
+            cache.recurrent = recurrent_state
         cache.convolution = convolution_state
         normalized = gated_rms_norm(
             core, self.out_norm, output_gate.reshape_as(core), self.eps
@@ -243,9 +257,20 @@ class SparseAttention(nn.Module):
                 cache,
                 self.topk,
             )
+            attention_kwargs: dict[str, Any] = {}
+            if cache.latent is not None and cache.latent.dtype == torch.float8_e4m3fn:
+                attention_kwargs = dict(
+                    workspace=cache.dsa_workspace,
+                    sequence_lengths=positions[start:end] + 1,
+                    max_seq_len=cache.page_table.shape[1] * cache.page_tokens,
+                )
             pieces.append(
                 kernels.sparse_attention(
-                    absorbed[start:end], selected, cache.latent, self.query_dim**-0.5
+                    absorbed[start:end],
+                    selected,
+                    cache.latent,
+                    self.query_dim**-0.5,
+                    **attention_kwargs,
                 )
             )
         attended = pieces[0] if len(pieces) == 1 else torch.cat(pieces)

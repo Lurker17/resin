@@ -15,11 +15,15 @@ class WeightReader:
     def close(self):
         self.reader.close()
 
-    def read(self, name, shape=None, dtype=None, *, cpu=False):
+    def read(self, name, shape=None, dtype=None, *, cpu=False, slices=None):
         if name not in self.files:
             raise ValueError(f"checkpoint missing {name}")
-        tensor = self.reader.read(self.files[name], name)
-        if shape is not None and tuple(tensor.shape) != tuple(shape):
+        tensor = (
+            self.reader.read(self.files[name], name)
+            if slices is None
+            else self.reader.read_slice(self.files[name], name, slices, shape=shape)
+        )
+        if slices is None and shape is not None and tuple(tensor.shape) != tuple(shape):
             raise ValueError(f"{name}: expected {shape}, found {tuple(tensor.shape)}")
         if dtype is not None and tensor.dtype != dtype:
             raise ValueError(f"{name}: expected {dtype}, found {tensor.dtype}")
