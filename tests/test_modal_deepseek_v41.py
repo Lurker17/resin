@@ -15,8 +15,8 @@ from resin.backend import distributed
 from resin.backend.topology import ParallelGroups
 from resin.recipe import DeepSeekV41Recipe
 from resin.server import HttpServer
-from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 from resin_models_cuda.deepseek_v41 import cuda as runner_module
+from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
 
 
 @pytest.mark.parametrize("rank,fail", [(0, False), (3, False), (0, True)])
@@ -42,10 +42,10 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
         cuda_graph_stats = {"prefill": {"capture_count": 1}}
 
         def __init__(self, model, **options):
-            assert options.pop("expert_backend") == "deepgemm"
+            assert options["expert_backend"] == "deepgemm"
             # Validate actual runner options rather than having a permissive
             # mock conceal unsupported CUDA constructor parameters.
-            signature(DeepSeekV4CudaRunner.__init__).bind(self, model, **options)
+            signature(DeepSeekV41CudaRunner.__init__).bind(self, model, **options)
             assert model == deployment.CHECKPOINT
             assert options["parallel_groups"] is groups
             assert options["device"] == f"cuda:{rank}"

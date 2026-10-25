@@ -477,18 +477,6 @@ class DeepSeekV41Recipe(_NativeRecipe):
     ) -> DeepSeekV41Recipe: ...
 
 @final
-class DeepSeekV4Recipe(_NativeRecipe):
-    def __new__(
-        cls,
-        /,
-        tokenizer: Any,
-        *,
-        options: RenderOptions | None = None,
-        stop_token_ids: Sequence[int] | None = None,
-        media_config: Any | None = None,
-    ) -> DeepSeekV4Recipe: ...
-
-@final
 class Engine:
     def __enter__(self, /) -> Engine: ...
     def __exit__(self, /, _exc_type: Any, _exc_value: Any, _traceback: Any) -> bool: ...

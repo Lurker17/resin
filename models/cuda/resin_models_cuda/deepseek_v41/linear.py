@@ -16,7 +16,7 @@ from resin_models_cuda.deepseek_v41.kernels import act_quant, fp8_gemm
 
 def quantize_fp8(value):
     """DeepInfer's per-token block32 cast, including the packed TMA scale ABI."""
-    from resin_models_cuda.deepseek_v4.tilelang_kernels import per_token_cast
+    from resin_models_cuda.deepseek_v41.tilelang_kernels import per_token_cast
 
     return per_token_cast(
         value.reshape(-1, value.shape[-1]),

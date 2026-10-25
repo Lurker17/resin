@@ -332,11 +332,14 @@ def run_probe(group, *, rows: int = 8, max_tokens: int | None = None):
         swiglu_limit=10,
     )
     with use_default_dtype(torch.bfloat16), torch.device(device):
-        source: Any = MoEWeights(
-            0, args, expert_parallel=TensorParallelLayout(rank=rank, size=world)
-        )
         gate = Gate(args)
-        source.gate, source.shared_experts = gate, SharedExpert(args)
+        source: Any = MoEWeights(
+            0,
+            args,
+            gate,
+            SharedExpert(args),
+            expert_parallel=TensorParallelLayout(rank=rank, size=world),
+        )
     gate.weight.normal_(std=hidden**-0.5)
     gate.bias.zero_()
     gate.benchmark_replica = rank

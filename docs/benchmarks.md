@@ -26,17 +26,17 @@ The chart axes and speculative projection follow
 Download the pinned checkpoint before allocating GPUs:
 
 ```bash
-uv run modal run deploy/modal_bench.py --model deepseek-v4 --download-only
+uv run modal run deploy/modal_bench.py --model deepseek-v41 --download-only
 ```
 
 Run prefill and decode sweeps, then produce both charts:
 
 ```bash
 uv run modal run deploy/modal_bench.py \
-  --model deepseek-v4 --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 \
+  --model deepseek-v41 --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 \
   --context-lengths 4096,8192 --batch-sizes 1,2,4,8 \
-  --output bench/deepseek-v4.jsonl
-uv run scripts/plot_bench.py bench/deepseek-v4.jsonl
+  --output bench/deepseek-v41.jsonl
+uv run scripts/plot_bench.py bench/deepseek-v41.jsonl
 ```
 
 To reuse one long prefix within each attention replica, set `--shared-prefix-tokens`.
@@ -101,17 +101,15 @@ paths at K0 and K4. Its unrelated draft weights exercise rejection and rollback;
 the real-checkpoint check below additionally exercises accepted drafts. This
 synthetic smoke does not test model quality or Engram tables.
 
-Both DeepSeek launchers share the same checkpoint volume and completion marker.
+DeepSeek serving and benchmark jobs share a checkpoint volume and completion marker.
 For an older generic download whose files are already complete, publish only
 the small inventory marker with
 `uv run modal run deploy/modal_bench.py --model deepseek-v41 --publish-only`.
 This CPU operation stats the indexed files and publishes metadata atomically;
 it does not download or read the weight bodies. New downloads publish the marker
-automatically. GPU sweeps require that complete inventory. The legacy
-`modal_deepseek_v4.py` run/serve/benchmark paths use attention TP and now reject
-these one-KV-head MLA models; their checkpoint download remains usable.
+automatically. GPU sweeps require that complete inventory.
 
-Attention TP means KV-head sharding, so both DeepSeek MLA families require
+Attention TP means KV-head sharding, so DeepSeek-V4.1 requires
 `attn_tp=1`. Earlier four-GPU TP4 debug reports sliced query heads while
 replicating KV; their results do not qualify this contract. The initial V4.1
 target used eight B300s with attention DP8/EP8 and replicated Engram tables.
@@ -397,7 +395,7 @@ block. Benchmark defaults remain four drafts. Wider meshes and longer contexts
 need separate qualification; see the
 [family limits](../models/cuda/resin_models_cuda/deepseek_v41/README.md).
 
-Available model names are `deepseek-v4`, `deepseek-v41`, `gpt-oss-20b`, and
+Available model names are `deepseek-v41`, `gpt-oss-20b`, and
 `gpt-oss-120b`. The GPT-OSS benchmark path currently uses the Hopper expert kernel
 and has no draft model:
 
@@ -597,9 +595,9 @@ Raw results and source digests are in
 and the successful Qwen rerun
 [`qwen_result.json`](../artifacts/cuda-model-improvements/qwen_result.json).
 The first file records the initial Qwen probe failure; the rerun is the Qwen
-qualification record. The reproducible probes are
-`deploy/cuda_index_routing_probe.py`, `deploy/inkling_prefill_probe.py`, and
-`deploy/qwen3_5_kernel_probe.py`.
+qualification record. The surviving probes are
+`deploy/inkling_prefill_probe.py` and `deploy/qwen3_5_kernel_probe.py`; the
+V4-specific index/routing probe was retired with that model.
 
 ## Shared sampler checks
 

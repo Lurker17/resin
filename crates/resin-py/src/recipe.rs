@@ -846,32 +846,6 @@ fn deepseek_thinking(options: &mut Map<String, Value>) -> PyResult<()> {
     }
     Ok(())
 }
-const DEEPSEEK: RecipeDefinition = RecipeDefinition {
-    messages: MessagePolicy {
-        roles: &[
-            Role::SYSTEM,
-            Role::DEVELOPER,
-            Role::USER,
-            Role::ASSISTANT,
-            Role::TOOL,
-            Role::LATEST_REMINDER,
-        ],
-        controls: &["task", "wo_eos", "response_format"],
-        tools: ToolScope::AnyInstruction,
-        ..MessagePolicy::STANDARD
-    },
-    normalize_options: Some(deepseek_thinking),
-    ..RecipeDefinition::new(
-        "deepseek_v4",
-        ModelFormat::DeepSeek,
-        &[
-            "reasoning_effort",
-            "thinking_mode",
-            "enable_thinking",
-            "response_format",
-        ],
-    )
-};
 const QWEN: RecipeDefinition = RecipeDefinition {
     media_kind: Some(MediaKind::Qwen),
     ..RecipeDefinition::new(
@@ -903,7 +877,6 @@ recipe_class!(
         )
     }
 );
-recipe_class!(DeepSeekV4Recipe, DEEPSEEK);
 recipe_class!(
     Qwen35Recipe,
     RecipeDefinition {
@@ -980,14 +953,32 @@ impl Gemma4Recipe {
 pub(crate) struct DeepSeekV41Recipe;
 impl DeepSeekV41Recipe {
     const DEFINITION: RecipeDefinition = RecipeDefinition {
-        name: "deepseek_v41",
-        format: ModelFormat::DeepSeekV41,
         messages: MessagePolicy {
+            roles: &[
+                Role::SYSTEM,
+                Role::DEVELOPER,
+                Role::USER,
+                Role::ASSISTANT,
+                Role::TOOL,
+                Role::LATEST_REMINDER,
+            ],
             media_roles: Some(&[Role::USER]),
-            ..DEEPSEEK.messages
+            controls: &["task", "wo_eos", "response_format"],
+            tools: ToolScope::AnyInstruction,
+            ..MessagePolicy::STANDARD
         },
         media_kind: Some(MediaKind::DeepSeek),
-        ..DEEPSEEK
+        normalize_options: Some(deepseek_thinking),
+        ..RecipeDefinition::new(
+            "deepseek_v41",
+            ModelFormat::DeepSeekV41,
+            &[
+                "reasoning_effort",
+                "thinking_mode",
+                "enable_thinking",
+                "response_format",
+            ],
+        )
     };
 }
 #[pymethods]

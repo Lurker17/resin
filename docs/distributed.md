@@ -32,7 +32,7 @@ single-rank execution. The current CUDA implementations declare:
 | Model | Attention TP | Attention DP | CP | EP | Expert / dense FFN TP |
 | --- | --- | --- | --- | --- | --- |
 | GPT-OSS | Yes | Yes | Yes | Yes | Yes |
-| DeepSeek-V4 / V4.1 | No: one MLA KV head | Yes | Yes | Yes | Yes |
+| DeepSeek-V4.1 | No: one MLA KV head | Yes | Yes | Yes | Yes |
 | Gemma 4 | Yes | No | No | No | Yes |
 | Qwen3.5 / Qwen3.8 | Yes | No | No | No | Yes |
 | Inkling | No | No | No | No | No |
@@ -41,7 +41,7 @@ Attention replication is always allowed; it repeats the same attention
 computation without introducing another sharding axis.
 These axes compose through the explicit `parallel_groups=` preparation path.
 Model dimensions, quantization blocks, and kernel capabilities still constrain
-valid layouts. DeepSeek-V4
+valid layouts. DeepSeek-V4.1
 DSpark uses the same meshes for draft and target verification, including
 empty-replica participation and captured expert exchanges.
 The GPT-OSS and DeepSeek explicit-group paths provide
@@ -51,7 +51,7 @@ cross-rank combine does not add an intermediate activation rounding step.
 `DistributedWorker` validates a declared capability set collectively before
 serving begins. Custom distributed runners may supply the same declaration.
 
-See [DeepSeek-V4 parallelism](deepseek-v4-parallelism.md) and
+See [DeepSeek-V4.1 parallelism](../models/cuda/resin_models_cuda/deepseek_v41/README.md) and
 [GPT-OSS parallelism](gpt-oss-parallelism.md) for the implemented
 model paths and real-GPU validation commands.
 
@@ -213,7 +213,7 @@ that rank's query segment preserves causal and sliding-window positions. Empty
 query sequences are excluded from FA4 metadata. Final hidden rows are gathered
 before selecting each request's last token.
 
-DeepSeek-V4 preserves full hidden states, MLA KV writes, and ordered recurrent
+DeepSeek-V4.1 preserves full hidden states, MLA KV writes, and ordered recurrent
 compressor updates on each CP rank. It partitions indexer query scoring, sparse
 attention, and query/output projection work, then gathers attention outputs
 before the full FFN. This preserves the compressor's ordered state updates.

@@ -1,6 +1,6 @@
 # CUDA graph policies
 
-The GPT-OSS, Gemma 4, DeepSeek V4, Qwen3.5, and Inkling CUDA runners accept:
+The GPT-OSS, Gemma 4, DeepSeek V4.1, Qwen3.5, and Inkling CUDA runners accept:
 
 ```python
 from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
@@ -149,7 +149,7 @@ The projection implementation passes 719 local tests (65 GPU skips), all 16
 shared-runtime checks on a [B300](https://modal.com/apps/ekzhang/main/ap-uO1BoGsDsOcdWhBlbmFcvm),
 and bounded full-checkpoint workloads with 32-token chunks on two GPUs. See the
 [GPT-OSS Hopper results](gpt-oss-parallelism.md#hopper-validation) and
-[DeepSeek Blackwell results](deepseek-v4-parallelism.md#cuda-graphs-and-current-costs).
+[DeepSeek Blackwell results](../models/cuda/resin_models_cuda/deepseek_v41/README.md#validation).
 The GPU probes compare nonzero eager and captured projections exactly, and
 exercise changing contexts, chunk sizes, page ownership, and idle replicas.
 They do not establish full-model numerical parity across quantized layouts.

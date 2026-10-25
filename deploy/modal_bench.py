@@ -24,8 +24,8 @@ ROOT = Path(__file__).resolve().parents[1]
 TRACE_VOLUME = modal.Volume.from_name(
     "resin-benchmark-traces-v1", create_if_missing=True
 )
-# Share the existing checkpoint volumes, while keeping model identity explicit
-# in every result. Repository Python files are never downloaded or executed.
+# Keep the existing volume IDs: V4.1 weights and compiled kernels are already
+# stored there. Repository Python files are never downloaded or executed.
 CHECKPOINTS = {
     "gpt-oss-20b": (
         "resin-gpt-oss-models-v2",
@@ -42,14 +42,6 @@ CHECKPOINTS = {
         "120b",
         "openai/gpt-oss-120b",
         "b5c939de8f754692c1647ca79fbf85e8c1e70f8a",
-    ),
-    "deepseek-v4": (
-        "resin-deepseek-v4-models-v1",
-        1,
-        "/models/deepseek",
-        "flash-0731",
-        "deepseek-ai/DeepSeek-V4-Flash-0731",
-        "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
     ),
     "deepseek-v41": (
         "resin-deepseek-v4-models-v1",
@@ -257,7 +249,7 @@ def probe() -> dict:
 
 @app.local_entrypoint()
 def main(
-    model: str = "deepseek-v4",
+    model: str = "deepseek-v41",
     gpu: str = "B300",
     world_size: int = 8,
     attn_dp: int = 8,

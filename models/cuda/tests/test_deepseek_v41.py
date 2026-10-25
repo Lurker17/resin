@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import Mock
 
 import numpy as np
@@ -13,7 +14,6 @@ from resin import Parallelism
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.backend.cuda.slab import DevicePageGroup
 from resin.models.deepseek_v41.config import DeepSeekV41Config
-from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
 from resin_models_cuda.deepseek_v41.cache import CacheArena, CacheGeometry
 from resin_models_cuda.deepseek_v41.checkpoint import DEFAULT_REVISION
 from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
@@ -42,7 +42,7 @@ def test_official_checkpoint_geometry_and_distinct_draft_experts():
     assert inference["dspark_n_activated_experts"] == 3
 
 
-@pytest.mark.parametrize("runner_type", [DeepSeekV4CudaRunner, DeepSeekV41CudaRunner])
+@pytest.mark.parametrize("runner_type", [DeepSeekV41CudaRunner, DeepSeekV41CudaRunner])
 @pytest.mark.parametrize("argument", ["tensor_parallel", "parallel_groups"])
 def test_deepseek_rejects_query_only_tp_before_cuda_or_checkpoint_access(
     monkeypatch, runner_type, argument
@@ -94,7 +94,7 @@ def test_mega_moe_rejects_unsupported_mesh_before_cuda(monkeypatch, parallelism)
             expert_backend="deepgemm",
             parallel_groups=None
             if parallelism is None
-            else SimpleNamespace(topology=parallelism),
+            else cast(Any, SimpleNamespace(topology=parallelism)),
         )
 
 
@@ -412,9 +412,10 @@ def test_block32_grouped_output_weight_dequantization():
     )
 
 
-def test_new_runner_reuses_the_existing_graph_and_distributed_lifecycle():
-    from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
+def test_runner_owns_its_graph_and_distributed_lifecycle():
+    from resin.backend.cuda.runner import CudaRunner
 
+    assert DeepSeekV41CudaRunner.__bases__ == (CudaRunner,)
     for name in (
         "forward_distributed",
         "_new_decode_graph_step",
@@ -422,9 +423,7 @@ def test_new_runner_reuses_the_existing_graph_and_distributed_lifecycle():
         "_accept_speculative",
         "_graph_forward",
     ):
-        assert getattr(DeepSeekV41CudaRunner, name) is getattr(
-            DeepSeekV4CudaRunner, name
-        )
+        assert name in DeepSeekV41CudaRunner.__dict__
 
 
 def test_token_history_addresses_remain_int64_above_sixteen_gibibytes():

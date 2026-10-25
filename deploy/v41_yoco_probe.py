@@ -102,7 +102,7 @@ class ProbeRunner(DeepSeekV41CudaRunner):
         if not isinstance(batch_invariant, bool):
             raise TypeError("batch_invariant must be a bool")
         # Install the locked TileLang/TileKernels import compatibility first.
-        import_module("resin_models_cuda.deepseek_v4.tilelang_kernels")
+        import_module("resin_models_cuda.deepseek_v41.tilelang_kernels")
         deep_gemm = import_module("deep_gemm")
         tile_kernels = import_module("tile_kernels")
         deep_gemm.use_deterministic_algorithms(batch_invariant)

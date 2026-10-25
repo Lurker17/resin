@@ -1,15 +1,70 @@
 """Stream checkpoint-shaped tensors into prepared V4.1 attention/EP shards."""
 
 from pathlib import Path
+from typing import Any
 
 import torch
 
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
-from resin_models_cuda.deepseek_v4.weights import (
-    _coerce_for_target,
-    _shard_routed_expert,
-    tensor_parallel_axis,
-)
+
+
+def tensor_parallel_axis(name: str) -> int | None:
+    """Return the axis used by DeepSeek's published TP=4 conversion."""
+
+    if name in {"embed.weight", "head.weight"} or name.endswith(".attn_sink"):
+        return 0
+    if any(
+        f".{component}." in name
+        for component in ("wq_b", "wo_a", "weights_proj", "markov_w1", "markov_w2")
+    ):
+        return 0
+    if ".wo_b." in name:
+        return 1
+    return None
+
+
+def _shard_routed_expert(tensor: Any, name: str, model: Any):
+    """Slice the logical intermediate axis, including packed weights/scales."""
+
+    module_path, separator, expert_path = name.rpartition(".experts.")
+    if not separator:
+        if not name.startswith("experts."):
+            return tensor
+        module_path, expert_path = "", name.removeprefix("experts.")
+    projection = expert_path.split(".")[1]
+    axis = {"w1": 0, "w3": 0, "w2": 1}.get(projection)
+    if axis is None:
+        return tensor
+    source = model.get_submodule(module_path) if module_path else model
+    shard = getattr(source, "expert_intermediate_shard", None)
+    if shard is None:
+        return tensor
+    total = source.routed_intermediate_size
+    width = tensor.shape[axis]
+    if total % width:
+        raise ValueError(
+            f"checkpoint tensor {name!r} has invalid expert block geometry"
+        )
+    packing = total // width
+    if shard.start % packing or shard.size % packing:
+        raise ValueError(f"checkpoint tensor {name!r} crosses an expert TP block")
+    return tensor.narrow(
+        axis, shard.start // packing, shard.size // packing
+    ).contiguous()
+
+
+def _coerce_for_target(tensor: Any, target: Any):
+    fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4 is not None and target.dtype == fp4 and tensor.dtype == torch.int8:
+        tensor = tensor.view(fp4)
+    elif tensor.dtype != target.dtype:
+        tensor = tensor.to(dtype=target.dtype)
+    if tuple(tensor.shape) != tuple(target.shape):
+        raise ValueError(
+            f"checkpoint shape {tuple(tensor.shape)} does not match model "
+            f"shape {tuple(target.shape)}"
+        )
+    return tensor
 
 
 def _attention_shard(tensor, name, rank, size):

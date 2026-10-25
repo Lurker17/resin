@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from functools import cache
-from pathlib import Path
 
 from deepseek_recipe import (
     ChatCompletionRequest,
@@ -20,7 +18,6 @@ from deepseek_recipe import (
 from deepseek_recipe import (
     Tokenizer as DeepSeekTokenizer,
 )
-from tml_renderers import chat, renderers
 from tokenizers import Tokenizer as HFTokenizer
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
@@ -28,7 +25,7 @@ from tokenizers.pre_tokenizers import ByteLevel
 
 import resin
 from recipe_fuzz.harness import Case, Part, normalize
-from resin.recipe import DeepSeekV4Recipe, DeepSeekV41Recipe
+from resin.recipe import DeepSeekV41Recipe
 
 MARKERS = (
     "<｜User｜>",
@@ -42,11 +39,11 @@ MARKERS = (
 )
 
 
-class DeepSeekAdapter:
+class DeepSeekV41Adapter:
     commits_tools_at_close = False
-    model = "deepseek_v4"
-    reference_model = "DeepSeek-V4-Pro"
-    tag_names = ("tool_calls", "invoke", "parameter")
+    model = "deepseek_v41"
+    reference_model = "DeepSeek-V4.1-Flash"
+    tag_names = (" calls", " invoke", " parameter")
 
     @staticmethod
     def case(case):
@@ -79,19 +76,9 @@ class DeepSeekAdapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.recipe = (
-            DeepSeekV41Recipe if self.model == "deepseek_v41" else DeepSeekV4Recipe
-        )(backend)
+        self.recipe = DeepSeekV41Recipe(backend)
         self.reference = DeepSeekTokenizer.from_str(backend.to_str())
         self.oracles = (("deepseek-recipe", self.oracle),)
-        if self.model == "deepseek_v4":
-            self.tml = renderers.DeepSeekV4()
-            _, self.tml_parser = self.tml.render_for_completion(
-                chat.OpenAIMessage.from_oss_messages(
-                    [{"role": "user", "content": "hi"}]
-                )
-            )
-            self.oracles += (("tml-deepseek-v4", self.tml_oracle),)
 
     @classmethod
     def fragments(cls, case, *, terminal=True):
@@ -234,22 +221,42 @@ class DeepSeekAdapter:
                     "parameters": {"type": "object"},
                 }
             ]
+        request["messages"].insert(1, {"role": "user", "content": "Begin."})
+        messages = []
+        for message in request["messages"]:
+            if message["role"] == "assistant" and messages[-1]["role"] == "assistant":
+                messages.append({"role": "user", "content": "Continue."})
+            messages.append(message)
+        request["messages"] = messages
+        request["reasoning_effort"] = {"low": "low", "medium": "high", "xhigh": "max"}[
+            request["reasoning_effort"]
+        ]
+        request["messages"].insert(-1, {"role": "system", "content": "Be precise."})
         return request
 
     @staticmethod
     def prompt_oracle(request):
-        messages = deepcopy(request["messages"])
+        body = {
+            "model": "DeepSeek-V4.1-Flash",
+            "messages": deepcopy(request["messages"]),
+            "thinking": {
+                "type": "enabled"
+                if request["extra"]["thinking_mode"] == "thinking"
+                else "disabled"
+            },
+        }
+        for message in body["messages"]:
+            for call in message.get("tool_calls", []):
+                call.setdefault("type", "function")
+        if "reasoning_effort" in request:
+            body["reasoning_effort"] = request["reasoning_effort"]
         if tools := request.get("tools"):
-            messages[0]["tools"] = [
-                {"type": "function", "function": tool} for tool in tools
+            body["tools"] = [
+                tool if "function" in tool else {"type": "function", "function": tool}
+                for tool in tools
             ]
-        mode = request["extra"]["thinking_mode"]
-        effort = {"low": "low", "medium": "high", "xhigh": "max"}[
-            request["reasoning_effort"]
-        ]
-        return checkpoint_encoder()(
-            messages, thinking_mode=mode, reasoning_effort=effort
-        )
+        converted = ChatCompletionRequest(body).convert(ConversionOptions())
+        return DeepseekV41Encoding().render_conversation(converted.conversation).prompt
 
     def tool_truncation(self, case):
         ids = self.encode(case, terminal=False)
@@ -293,92 +300,3 @@ class DeepSeekAdapter:
                 for tool in tools.values()
             ]
         )
-
-    def tml_oracle(self, case):
-        ids = []
-        for special, text in self.fragments(case):
-            ids.extend(
-                [self.tml.tokenizer.encode_special(text)]
-                if special
-                else self.tml.tokenizer.encode_ordinary(text)
-            )
-        parts = []
-        for message in self.tml_parser.parse_tokens(ids):
-            match message.content:
-                case chat.Text(text=text):
-                    parts.append(Part("text", text))
-                case chat.Thinking(text=text):
-                    parts.append(Part("reasoning", text))
-                case chat.InvokeTool(name=name, args=args):
-                    parts.append(
-                        Part(
-                            "tool",
-                            {
-                                "name": name,
-                                "args": {
-                                    arg.name: json.loads(arg.value) for arg in args
-                                },
-                            },
-                        )
-                    )
-                case chat.ModelEndSampling():
-                    pass
-                case other:
-                    raise AssertionError(f"unexpected DeepSeek content {other}")
-        return normalize(parts)
-
-
-class DeepSeekV41Adapter(DeepSeekAdapter):
-    model = "deepseek_v41"
-    reference_model = "DeepSeek-V4.1-Flash"
-    tag_names = (" calls", " invoke", " parameter")
-
-    @staticmethod
-    def prompt_case(case):
-        request = DeepSeekAdapter.prompt_case(case)
-        # The protocol oracle inserts an assistant header into malformed
-        # system->assistant histories; keep generated conversations valid.
-        request["messages"].insert(1, {"role": "user", "content": "Begin."})
-        messages = []
-        for message in request["messages"]:
-            if message["role"] == "assistant" and messages[-1]["role"] == "assistant":
-                messages.append({"role": "user", "content": "Continue."})
-            messages.append(message)
-        request["messages"] = messages
-        request["reasoning_effort"] = {"low": "low", "medium": "high", "xhigh": "max"}[
-            request["reasoning_effort"]
-        ]
-        request["messages"].insert(-1, {"role": "system", "content": "Be precise."})
-        return request
-
-    @staticmethod
-    def prompt_oracle(request):
-        body = {
-            "model": "DeepSeek-V4.1-Flash",
-            "messages": deepcopy(request["messages"]),
-            "thinking": {
-                "type": "enabled"
-                if request["extra"]["thinking_mode"] == "thinking"
-                else "disabled"
-            },
-        }
-        for message in body["messages"]:
-            for call in message.get("tool_calls", []):
-                call.setdefault("type", "function")
-        if "reasoning_effort" in request:
-            body["reasoning_effort"] = request["reasoning_effort"]
-        if tools := request.get("tools"):
-            body["tools"] = [
-                tool if "function" in tool else {"type": "function", "function": tool}
-                for tool in tools
-            ]
-        converted = ChatCompletionRequest(body).convert(ConversionOptions())
-        return DeepseekV41Encoding().render_conversation(converted.conversation).prompt
-
-
-@cache
-def checkpoint_encoder():
-    path = Path(__file__).with_name("references") / "deepseek_v4_encoding.py.txt"
-    namespace = {"__name__": "_resin_test_deepseek_v4_reference"}
-    exec(compile(path.read_text(), str(path), "exec"), namespace)
-    return namespace["encode_messages"]

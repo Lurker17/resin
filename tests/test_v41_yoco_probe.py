@@ -34,7 +34,7 @@ def test_probe_kernel_controls_precede_model_init_and_preserve_false(
 
     events = []
     modules = {
-        "resin_models_cuda.deepseek_v4.tilelang_kernels": SimpleNamespace(),
+        "resin_models_cuda.deepseek_v41.tilelang_kernels": SimpleNamespace(),
         "deep_gemm": SimpleNamespace(
             use_deterministic_algorithms=lambda value: events.append(
                 ("deep_gemm", value)

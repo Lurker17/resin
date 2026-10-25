@@ -329,7 +329,6 @@ def test_rendered_prompt_token_view_is_owned_readonly_and_outlives_prompt():
     ("constructor", "default_markers"),
     [
         (resin.recipe.GptOssRecipe, ["<|return|>", "<|call|>"]),
-        (resin.recipe.DeepSeekV4Recipe, ["<｜end▁of▁sentence｜>"]),
         (resin.recipe.DeepSeekV41Recipe, ["<｜end▁of▁sentence｜>"]),
         (resin.recipe.InklingRecipe, ["<|content_model_end_sampling|>"]),
         (resin.recipe.Qwen35Recipe, ["<|im_end|>", "<|endoftext|>"]),

@@ -7,13 +7,12 @@ import torch
 from safetensors.torch import save_file
 from torch import nn
 
-from resin_models_cuda.deepseek_v4.weights import load_deepseek_v4_weights
 from resin_models_cuda.deepseek_v41.weights import load_weights
 
 
-@pytest.fixture(params=[load_deepseek_v4_weights, load_weights], ids=["v4", "v41"])
-def loader(request):
-    return request.param
+@pytest.fixture
+def loader():
+    return load_weights
 
 
 def checkpoint(tmp_path, *, columns=4):

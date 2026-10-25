@@ -61,7 +61,7 @@ def deepgemm(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        "resin_models_cuda.deepseek_v4.tilelang_kernels.per_token_cast", quantize
+        "resin_models_cuda.deepseek_v41.tilelang_kernels.per_token_cast", quantize
     )
     return calls, quantize
 

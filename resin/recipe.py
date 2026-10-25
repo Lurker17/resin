@@ -5,7 +5,6 @@ from typing import Protocol
 
 from resin._resin import (
     Audio,
-    DeepSeekV4Recipe,
     DeepSeekV41Image,
     DeepSeekV41Media,
     DeepSeekV41Recipe,
@@ -87,7 +86,6 @@ class Recipe(Protocol):
 __all__ = [
     "Audio",
     "ContentBlock",
-    "DeepSeekV4Recipe",
     "DeepSeekV41Image",
     "DeepSeekV41Media",
     "DeepSeekV41Recipe",

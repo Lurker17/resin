@@ -2,7 +2,7 @@
 
 Stock model conversation formats, independent of Python, HTTP and GPU execution.
 `ModelFormat` selects a matching renderer, incremental parser and stop markers
-for GPT-OSS, DeepSeek V4/V4.1, Inkling, Qwen3.5/3.8, Gemma4 or LFM2.5.
+for GPT-OSS, DeepSeek V4.1, Inkling, Qwen3.5/3.8, Gemma4 or LFM2.5.
 
 Model code describes format rules. Shared `Parser<G>` owns token batching,
 decoder boundaries, EOS handling and finalization; each grammar handles only
@@ -88,7 +88,7 @@ additional `clean_up_tokenization_spaces` postprocessing.
 References are pinned checkpoint templates/encoders for prompt parity. Harmony
 and DeepSeek Recipe are primary parser oracles; TML supplies secondary checks
 where available. All reference libraries and templates are development-only.
-DeepSeek V4.1 has its own recipe for the revised DSML grammar and image slots. LFM's
+DeepSeek V4.1 supports its DSML grammar and image slots. LFM's
 nested Python-literal strings use a fixed Python 3.13 / Unicode 15.1 printable
 repertoire for deterministic rendering across deployment Python versions.
 

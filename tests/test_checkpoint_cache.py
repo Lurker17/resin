@@ -78,24 +78,19 @@ def test_missing_or_empty_shard_cannot_be_published(tmp_path, missing):
     assert not (tmp_path / MARKER_NAME).exists()
 
 
-def test_generic_metadata_only_publication_is_reused_by_legacy_download(
-    monkeypatch, tmp_path
-):
+def test_metadata_only_publication_is_ready_for_v41_serving(monkeypatch, tmp_path):
     from deploy import modal_bench as generic
-    from deploy import modal_deepseek_v4 as legacy
+    from deploy import modal_deepseek_v41 as serving
 
-    model = legacy._model_spec("flash-1017")
-    monkeypatch.setattr(legacy, "MODEL_CACHE_MOUNT", str(tmp_path))
-    target = legacy._model_path(model)
+    target = tmp_path / "flash-1017" / serving.REVISION
     checkpoint(target)
     operations = []
     volume = SimpleNamespace(
         reload=lambda: operations.append("reload"),
         commit=lambda: operations.append("commit"),
     )
-    monkeypatch.setattr(legacy, "model_cache_volume", volume)
     monkeypatch.setattr(
-        generic, "_checkpoint", lambda name: (target, model.repo_id, model.revision)
+        generic, "_checkpoint", lambda name: (target, serving.MODEL, serving.REVISION)
     )
     monkeypatch.setitem(
         generic.MODEL_VOLUMES, generic.CHECKPOINTS["deepseek-v41"][2], volume
@@ -105,15 +100,12 @@ def test_generic_metadata_only_publication_is_reused_by_legacy_download(
         raise AssertionError("metadata-only publication must not download weights")
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", no_redownload)
-    monkeypatch.setattr(legacy, "snapshot_download", no_redownload)
     with pytest.warns(UserWarning, match="executing locally"):
         report = generic.download.local("deepseek-v41", True)
     assert report["metadata_only"] is True
     assert report["files"] == len(checkpoint_inventory(target))
     assert operations == ["reload", "commit"]
-    assert legacy._checkpoint_is_complete(model)
-    assert legacy._download_checkpoint(model)["cache_hit"] is True
-    assert legacy._require_checkpoint(model)[0] == target
+    assert checkpoint_is_complete(target, serving.MODEL, serving.REVISION)
 
 
 def test_generic_deepseek_sweep_rejects_config_only_before_model_loading(

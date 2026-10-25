@@ -134,7 +134,7 @@ does not scan all cached entries.
 ## Speculative decoding
 
 The generic Engine schedules one decode anchor per sequence. A runner such as
-DeepSeek-V4 may draft and verify several tokens, then return the accepted token
+DeepSeek-V4.1 may draft and verify several tokens, then return the accepted token
 row. `cache_write_lookahead_tokens` reserves enough destinations for the maximum
 verified block. DSpark state updates and target verification remain inside the
 model runner and its fused kernels.
@@ -153,8 +153,9 @@ path. See the [runner contract](kernel-boundary.md) for Python error handling.
 The [distributed prototype](distributed.md) adds explicit attention TP/CP/DP and
 expert EP/TP meshes, one request Engine per attention-DP replica, and synchronous
 phase agreement across communicating replicas. It leaves model partitioning and
-kernel collectives in prepared runtimes. GPT-OSS and DeepSeek-V4 prepare
-attention head shards separately from expert ownership and intermediate shards.
+kernel collectives in prepared runtimes. GPT-OSS prepares attention head shards
+separately from expert ownership and intermediate shards. DeepSeek-V4.1 keeps
+its single MLA KV head whole and composes attention DP/CP with expert EP/TP.
 Shared expert dispatch returns complete origin rows across EP and expert TP;
 models do not reduce that result again across attention TP. Sampling uses the
 full device request-replica group.

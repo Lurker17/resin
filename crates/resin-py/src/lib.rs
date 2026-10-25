@@ -2054,7 +2054,7 @@ mod _resin {
 
     #[pymodule_export]
     use crate::recipe::{
-        DeepSeekV4Recipe, DeepSeekV41Recipe, Gemma4Recipe, GptOssRecipe, InklingRecipe, Lfm2Recipe,
+        DeepSeekV41Recipe, Gemma4Recipe, GptOssRecipe, InklingRecipe, Lfm2Recipe,
         NativeInklingParser, NativeRecipe, NativeResponseParser, Qwen35Recipe, Qwen38Recipe,
         RecipeTokenizer, RenderedPrompt,
     };

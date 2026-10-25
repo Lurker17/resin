@@ -585,9 +585,9 @@ def test_partial_admission_is_canceled_on_failure():
 def test_deepseek_fixed_acceptance_reaches_actual_compressor_rollback(monkeypatch):
     from types import SimpleNamespace
 
-    from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
+    from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
 
-    runner = DeepSeekV4CudaRunner.__new__(DeepSeekV4CudaRunner)
+    runner = DeepSeekV41CudaRunner.__new__(DeepSeekV41CudaRunner)
     runner.device = torch.device("cpu")
     runner.speculative_tokens = 4
     runner._speculation = SpeculativeStats(4, benchmark_accepted_drafts=3)

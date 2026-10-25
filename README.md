@@ -226,8 +226,7 @@ DeepSeek uses the shared distributed HTTP coordinator, with a 1,048,576-token co
 32 running requests per attention-DP replica, CUDA graphs, and three speculative
 draft tokens with natural acceptance. Requests are routed round-robin unless
 `routed_dp_rank` in the JSON body or `resin-routed-dp-rank` in the header selects
-a replica (0–3). Both MLA families have one KV head and require `attn_tp=1`.
-The older `modal_deepseek_v4.py` retains TP-only diagnostics, not this endpoint.
+a replica (0–3). DeepSeek-V4.1 has one MLA KV head and requires `attn_tp=1`.
 GPT-OSS 120B uses the same distributed worker/engine coordinator with attention
 TP2 and expert TP2; the 20B endpoint keeps a single local Engine.
 
@@ -339,7 +338,7 @@ writable; the runner copies only when input and output pages differ. LRU entries
 use spare capacity in the same pool and are evicted when live requests need it.
 
 Implemented runner modules include a synchronous PyTorch LFM2 reference and
-local CUDA implementations for GPT-OSS, DeepSeek-V4-Flash, and
+local CUDA implementations for GPT-OSS and
 [DeepSeek-V4.1-Flash-1017](models/cuda/resin_models_cuda/deepseek_v41/README.md). The GPT-OSS CUDA
 path uses one History group and one Window group over the flat pool. Its
 deployment harness supports intra-container tensor parallel sizes 1, 2, 4, and
@@ -348,18 +347,13 @@ graphs. Attention heads, KV storage, and MXFP4 expert intermediate dimensions
 are sharded; row-parallel attention and expert outputs are reduced through one
 NCCL group.
 
-DeepSeek-V4 uses six logical groups over one fungible physical parent pool:
-sliding attention KV, c4 compressed history, the c4 compressor tail, c128
-compressed history, the c128 compressor tail, and the c4 indexer tail. Smaller
-groups use power-of-two child packing, while the parent count is computed from
-post-load free VRAM and a configurable memory-utilization target. Compressor
-tails are cache-like rolling token rows rather than whole-request checkpoints,
-so aligned prefix snapshots share them exactly like attention pages. The Modal
-web deployment enables the native exact-token LRU prefix cache.
-
-V4.1 owns shifted hyper-connections, block32 quantization, Engram, shared source
+DeepSeek-V4.1 owns shifted hyper-connections, block32 quantization, Engram, shared source
 KV, CED selection, and its changed DSpark stages. Four cache groups hold sliding
 KV, shared compressed KV/index keys, compressor state, and Engram token history.
+Smaller groups use power-of-two child packing within the Engine's physical
+parent pool. The parent count follows post-load free VRAM and a configurable
+memory-utilization target. The HTTP deployment enables exact-token LRU prefix
+caching, including the model's rolling state.
 Its initial deployment target is eight B300s with attention DP8, EP8, and
 attention TP1. Engram tables are sharded over the GPU domain, and packed FP8/FP4
 KV shares Engine-owned slabs. Prepared DeepInfer operators and metadata pass
@@ -373,7 +367,7 @@ See the family README for memory and optimization limits.
 Current limits include no prefill/decode disaggregation. A
 [distributed coordinator prototype](docs/distributed.md) covers explicit TP, CP,
 attention DP, and EP groups with coordinated submission and completion.
-[DeepSeek-V4 Flash](docs/deepseek-v4-parallelism.md) and
+[DeepSeek-V4.1 Flash](models/cuda/resin_models_cuda/deepseek_v41/README.md) and
 [GPT-OSS](docs/gpt-oss-parallelism.md) describe their composed attention TP/DP,
 CP, EP, and expert-TP execution paths and validation. Production multi-node
 serving remains unimplemented.
@@ -406,7 +400,7 @@ CacheGroupPlan
 ```
 
 Concrete runners are explicit imports from architecture submodules such as
-`resin_models_cuda.deepseek_v4`, `resin_models_cuda.gpt_oss`, and
+`resin_models_cuda.deepseek_v41`, `resin_models_cuda.gpt_oss`, and
 `resin_models_torch.lfm2`.
 
 ## Checks

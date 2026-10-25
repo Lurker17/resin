@@ -85,7 +85,7 @@ group from the architectural forward.
   attention from PyTorch operations.
 - Write custom cuTile or TileLang when fusing a long architecture-specific
   chain materially removes launches or memory traffic. MHC normalization and
-  DeepSeek-V4 compressor/state updates are representative examples.
+  DeepSeek-V4.1 compressor/state updates are representative examples.
 - Keep the launch sequence short. Compare a Perfetto trace with the reference
   implementation and account for every material dispatch, synchronization, and
   collective. Avoid host reads, `.item()`, implicit stream waits, and temporary

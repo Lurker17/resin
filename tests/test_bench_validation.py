@@ -106,7 +106,7 @@ def test_single_driver_success_keeps_the_existing_report_shape(checkpoint, monke
 @pytest.mark.parametrize(
     "model,topology,message",
     [
-        ("deepseek-v4", Parallelism(), "currently requires V4.1"),
+        ("deepseek-v4", Parallelism(), "unknown benchmark model"),
         ("gpt-oss-20b", Parallelism(), "currently requires V4.1"),
         ("deepseek-v41", Parallelism(), "at least two ranks"),
         (

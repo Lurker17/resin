@@ -1,11 +1,11 @@
-"""The 1017 recipe selects an explicit format over the shared native grammar."""
+"""The DeepSeek V4.1 recipe preserves the 1017 prompt and tool grammar."""
 
 import pytest
 from recipe_fuzz.deepseek import DeepSeekV41Adapter
 from recipe_fuzz.harness import Case, Part
 
 import resin
-from resin.recipe import DeepSeekV4Recipe, DeepSeekV41Recipe
+from resin.recipe import DeepSeekV41Recipe
 
 
 @pytest.fixture(scope="module")
@@ -42,7 +42,7 @@ def test_numeric_budget_validates_before_rendering(adapter, effort):
         )
 
 
-def test_v41_and_v4_select_different_tool_grammars(adapter):
+def test_v41_tool_grammar_preserves_namespaces_and_arguments(adapter):
     case = Case(
         (
             Part("reasoning", "plan"),
@@ -61,13 +61,3 @@ def test_v41_and_v4_select_different_tool_grammars(adapter):
     assert parsed["tool_calls"] == [
         {"id": "call_0", "name": "ns::f", "arguments": '{"n": 1}'}
     ]
-    legacy_recipe = DeepSeekV4Recipe(adapter.recipe.tokenizer)
-    legacy = legacy_recipe.parse_response(
-        ids,
-        prompt=legacy_recipe.render(
-            [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])],
-            options=resin.recipe.RenderOptions(thinking_mode="thinking"),
-        ),
-    )
-    assert legacy["tool_calls"] == []
-    assert "<｜DSML｜ calls>" in legacy["content"]

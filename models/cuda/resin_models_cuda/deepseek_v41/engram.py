@@ -283,7 +283,7 @@ class Engram(nn.Module):
 @cache
 def _gate_kernels():
     # Load the shared TileLang compatibility adapter before TileKernels 1.0.
-    import_module("resin_models_cuda.deepseek_v4.tilelang_kernels")
+    import_module("resin_models_cuda.deepseek_v41.tilelang_kernels")
     return import_module("tile_kernels.engram")
 
 

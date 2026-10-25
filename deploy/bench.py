@@ -55,11 +55,7 @@ def _runner(model, checkpoint, *, device, groups, cases, options, context_capaci
             ),
             **common,
         )
-    if model == "deepseek-v4":
-        from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
-
-        runner_type = DeepSeekV4CudaRunner
-    elif model == "deepseek-v41":
+    if model == "deepseek-v41":
         from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
 
         runner_type = DeepSeekV41CudaRunner
@@ -67,11 +63,7 @@ def _runner(model, checkpoint, *, device, groups, cases, options, context_capaci
         raise ValueError(f"unknown benchmark model: {model}")
     return runner_type(
         checkpoint,
-        **(
-            {"expert_backend": options["expert_backend"]}
-            if model == "deepseek-v41"
-            else {}
-        ),
+        expert_backend=options["expert_backend"],
         max_seq_len=context_capacity,
         max_batch_size=max(batches),
         speculative_tokens=options["draft_tokens"],
@@ -431,6 +423,8 @@ def run_benchmark(
     """One load and graph catalog for all compatible points in this sweep."""
     from resin.bench import BenchCase
 
+    if model not in ("gpt-oss-20b", "gpt-oss-120b", "deepseek-v41"):
+        raise ValueError(f"unknown benchmark model: {model}")
     topology = parallelism or Parallelism()
     if numa not in ("auto", "off", "required"):
         raise ValueError("numa must be 'auto', 'off', or 'required'")

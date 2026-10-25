@@ -1,36 +1,26 @@
+# Base configuration fields adapted from DeepSeek-V4-Flash-0731 (MIT).
 """DeepSeek V4.1's shared-KV/CED and shifted-HC text architecture.
 
-The runner, sampling, graph lifetime, EP transport and prepared FP4 expert
-storage are shared with V4. Version-specific attention and residual semantics
-are explicit here; checkpoint repository Python is never imported.
+Checkpoint attention, residual, expert, and image semantics live in this
+family; checkpoint repository Python is never imported.
 """
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from resin.backend.cuda.context_parallel import ContextParallelTokens
-from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
+from resin.backend.cuda.parallel import (
+    TensorParallelContext,
+    TensorParallelLayout,
+    TensorShard,
+)
 from resin.backend.loading import prepare_model
 from resin.backend.torch import benchmark_expert_indices
-from resin_models_cuda.deepseek_v4.experts import RoutedExperts as V4RoutedExperts
-from resin_models_cuda.deepseek_v4.gemm import fp4_fused_moe
-from resin_models_cuda.deepseek_v4.model import (
-    ModelArgs as V4Args,
-)
-from resin_models_cuda.deepseek_v4.model import (
-    MoE,
-    MoEWeights,
-    ParallelEmbedding,
-    ParallelHead,
-    RMSNorm,
-    apply_rotary_emb,
-    precompute_freqs_cis,
-)
 from resin_models_cuda.deepseek_v41.attention import (
     fused_attention,
     pack_kv,
@@ -38,6 +28,7 @@ from resin_models_cuda.deepseek_v41.attention import (
     store_attention_kv,
     store_kv,
 )
+from resin_models_cuda.deepseek_v41.experts import MoE, MoEWeights, RoutedExperts
 from resin_models_cuda.deepseek_v41.hc import (
     HCLazyPost,
     materialize,
@@ -45,14 +36,71 @@ from resin_models_cuda.deepseek_v41.hc import (
     prenorm,
 )
 from resin_models_cuda.deepseek_v41.kernels import (
-    act_quant,
     hc_split_sinkhorn,
 )
 from resin_models_cuda.deepseek_v41.linear import Linear, SharedExpert
+from resin_models_cuda.deepseek_v41.primitives import (
+    ParallelEmbedding,
+    ParallelHead,
+    RMSNorm,
+    apply_rotary_emb,
+    precompute_freqs_cis,
+)
 
 
 @dataclass
-class ModelArgs(V4Args):
+class ModelArgs:
+    """Checkpoint-owned DeepSeek V4.1 hyperparameters."""
+
+    max_batch_size: int = 4
+    max_seq_len: int = 4096
+    dtype: Literal["bf16", "fp8"] = "fp8"
+    scale_fmt: Literal[None, "ue8m0"] = "ue8m0"
+    expert_dtype: Literal[None, "fp4"] = None
+    scale_dtype: Literal["fp32", "fp8"] = "fp8"
+    vocab_size: int = 129280
+    dim: int = 4096
+    moe_inter_dim: int = 4096
+    n_layers: int = 7
+    n_hash_layers: int = 0
+    n_mtp_layers: int = 0
+    n_heads: int = 64
+    # moe
+    n_routed_experts: int = 8
+    n_shared_experts: int = 1
+    n_activated_experts: int = 2
+    score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "sqrtsoftplus"
+    route_scale: float = 1.0
+    swiglu_limit: float = 0.0
+    # mqa
+    q_lora_rank: int = 1024
+    head_dim: int = 512
+    rope_head_dim: int = 64
+    norm_eps: float = 1e-6
+    o_groups: int = 8
+    o_lora_rank: int = 1024
+    window_size: int = 128
+    compress_ratios: tuple[int, ...] = (0, 0, 2, 1, 2, 1, 2, 0)
+    # yarn
+    compress_rope_theta: float = 40000.0
+    original_seq_len: int = 0
+    rope_theta: float = 10000.0
+    rope_factor: float = 40
+    beta_fast: int = 32
+    beta_slow: int = 1
+    # index
+    index_n_heads: int = 64
+    index_head_dim: int = 128
+    index_topk: int = 512
+    # hc
+    hc_mult: int = 4
+    hc_sinkhorn_iters: int = 20
+    hc_eps: float = 1e-6
+    # dspark
+    dspark_block_size: int = 0
+    dspark_noise_token_id: int = 0
+    dspark_target_layer_ids: tuple[int, ...] = ()
+    dspark_markov_rank: int = 256
     kv_source_layers: tuple[int, ...] = ()
     index_source_layers: tuple[int, ...] = ()
     candidate_source_layer: int = -1
@@ -79,32 +127,13 @@ class ModelArgs(V4Args):
     vision_rope_theta: float = 10000.0
     vision_downsample_ratio: int = 3
 
+    def expert_intermediate_shard(self, layout: TensorParallelLayout) -> TensorShard:
+        """Partition complete quantization blocks across expert tensor ranks."""
 
-class RoutedExperts(V4RoutedExperts):
-    def local(self, hidden, indices, weights):
-        if not hidden.shape[0]:
-            return torch.zeros_like(
-                hidden, dtype=torch.float32 if self.dispatch else hidden.dtype
-            )
-        quantized, scales = act_quant(hidden, 32, "ue8m0", torch.float8_e8m0fnu)
-        partial = fp4_fused_moe(
-            quantized,
-            scales.view(torch.float8_e4m3fn),
-            indices,
-            # FlashInfer's routed-MoE ABI requires BF16 routing weights;
-            # keep the model/transport contract in FP32 until this boundary.
-            weights.bfloat16(),
-            self.w13_weight,
-            self.w13_scale,
-            self.w2_weight,
-            self.w2_scale,
-            self.output_scales,
-            self.clamp_limits,
-            num_experts=self.num_experts,
-            local_expert_offset=self.start,
-            scale_dtype=torch.float8_e8m0fnu,
+        alignment = 128 if self.expert_dtype == "fp4" or self.dtype == "fp8" else 1
+        return layout.aligned_shard(
+            self.moe_inter_dim, alignment=alignment, name="moe_inter_dim"
         )
-        return partial.float() if self.dispatch else partial
 
 
 class Gate(nn.Module):
@@ -504,11 +533,14 @@ class Block(nn.Module):
             else args
         )
         self.ffn: Any = MoEWeights(
-            layer, moe_args, expert_parallel=ep, expert_tensor_parallel=etp
+            layer,
+            moe_args,
+            Gate(moe_args),
+            SharedExpert(args),
+            expert_parallel=ep,
+            expert_tensor_parallel=etp,
         )
-        self.ffn.gate = Gate(moe_args)
         self.ffn.gate.benchmark_expert_parallel_size = ep.size
-        self.ffn.shared_experts = SharedExpert(args)
         self.engram = engram
         self.attn_norm, self.ffn_norm = (
             RMSNorm(args.dim, args.norm_eps),

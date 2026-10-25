@@ -6,6 +6,7 @@ Python is imported. These checks isolate state semantics from GPU numerics.
 
 import json
 import math
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,17 +21,8 @@ from resin.bench import BenchmarkRunner
 from resin_models_cuda.deepseek_v41.cache import CacheArena, CacheGeometry
 
 
-@pytest.mark.parametrize("version", ["v4", "v41"])
-def test_benchmark_router_permutation_uses_actual_ep_and_adp(
-    implementation, monkeypatch, version
-):
-    import sys
-
-    module = (
-        implementation
-        if version == "v41"
-        else sys.modules["resin_models_cuda.deepseek_v4.model"]
-    )
+def test_benchmark_router_permutation_uses_actual_ep_and_adp(implementation):
+    module = implementation
     args = module.ModelArgs(
         dim=8,
         n_routed_experts=384,
@@ -39,13 +31,7 @@ def test_benchmark_router_permutation_uses_actual_ep_and_adp(
         score_func="sigmoid",
         route_scale=1.5,
     )
-    gate = module.Gate(args) if version == "v41" else module.Gate(0, args)
-    if version == "v4":
-        monkeypatch.setattr(
-            module,
-            "bf16_linear_fp32",
-            lambda hidden, weight: F.linear(hidden.float(), weight.float()),
-        )
+    gate = module.Gate(args)
     with torch.no_grad():
         gate.weight.zero_()
         gate.bias.copy_(torch.arange(384))
@@ -70,12 +56,10 @@ def test_benchmark_router_permutation_uses_actual_ep_and_adp(
     )
 
 
-def test_legacy_deepseek_tp_keeps_its_prepared_expert_owner_count(implementation):
-    import sys
-
+def test_prepared_expert_owner_count_is_preserved(implementation):
     from resin.backend.cuda.parallel import TensorParallelLayout
 
-    module = sys.modules["resin_models_cuda.deepseek_v4.model"]
+    module = implementation
     weights = module.MoEWeights(
         0,
         module.ModelArgs(
@@ -85,6 +69,8 @@ def test_legacy_deepseek_tp_keeps_its_prepared_expert_owner_count(implementation
             n_activated_experts=2,
             expert_dtype=None,
         ),
+        module.Gate(module.ModelArgs(dim=8, n_routed_experts=8, n_activated_experts=2)),
+        module.SharedExpert(module.ModelArgs(dim=8, moe_inter_dim=128)),
         expert_parallel=TensorParallelLayout(rank=0, size=2),
     )
     assert weights.gate.benchmark_expert_parallel_size == 2
@@ -122,6 +108,8 @@ def test_router_retains_official_fp32_probabilities(implementation):
 def test_flashinfer_rounds_routes_only_at_local_kernel_boundary(
     implementation, monkeypatch
 ):
+    from resin_models_cuda.deepseek_v41 import experts
+
     layer = implementation.RoutedExperts.__new__(implementation.RoutedExperts)
     nn.Module.__init__(layer)
     layer.dispatch, layer.num_experts, layer.start = None, 8, 0
@@ -147,14 +135,14 @@ def test_flashinfer_rounds_routes_only_at_local_kernel_boundary(
         return hidden
 
     monkeypatch.setattr(
-        implementation,
+        experts,
         "act_quant",
         lambda *_: (
             hidden.to(torch.float8_e4m3fn),
             torch.ones(1, 1).to(torch.float8_e8m0fnu),
         ),
     )
-    monkeypatch.setattr(implementation, "fp4_fused_moe", fused)
+    monkeypatch.setattr(experts, "fp4_fused_moe", fused)
 
     assert layer.local(hidden, indices, weights) is hidden
     assert torch.equal(observed[0], original.bfloat16())
@@ -364,8 +352,6 @@ def test_indexer_allocation_bound_stays_fixed_while_causal_lengths_advance(
     candidate_source,
     expected_width,
 ):
-    import sys
-
     from resin.backend.cuda.parallel import TensorParallelContext
 
     calls = []

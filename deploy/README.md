@@ -8,24 +8,23 @@ Also, you can publish some basic generation endpoints:
 
 ```bash
 uv run modal deploy deploy/modal_gpt_oss.py
-uv run modal deploy deploy/modal_deepseek_v4.py
+uv run modal deploy deploy/modal_deepseek_v41.py
 uv run modal deploy deploy/modal_qwen3_5.py
 ```
 
-Validate DeepSeek's sliding-window metadata on one B300 without loading a
-checkpoint:
+Download the pinned DeepSeek-V4.1 checkpoint before serving:
 
 ```bash
-uv run modal run deploy/modal_deepseek_v4.py --mode validate-window
+uv run modal run deploy/modal_bench.py --model deepseek-v41 --download-only
 ```
 
-The full model profile path also compares a cached continuation with cold
-prefill after an 8192-token prompt, crossing the default 4096-token chunks:
+Validate eager and captured inference with natural speculative acceptance:
 
 ```bash
-uv run modal run deploy/modal_deepseek_v4.py --mode profile \
-  --input-tokens 8192 --max-output-tokens 32 --temperature 0 --speculative-tokens 5
+uv run modal run deploy/modal_bench.py --model deepseek-v41 --gpu B300 \
+  --world-size 4 --attn-dp 4 --ep 4 --expert-backend deepgemm \
+  --draft-tokens 3 --natural-acceptance --no-balanced-experts --validate-model
 ```
 
-Use `--speculative-tokens 0` to exercise ordinary decode. These full-model
+Use `--draft-tokens 0` to exercise ordinary decode. These full-model
 checks require the pinned checkpoint volume and four B300s.

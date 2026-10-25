@@ -8,14 +8,11 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from test_deepseek_v4 import TestDeepSeekV4Weights as _V4Helpers
 from torch import nn
 
 
 @pytest.fixture
 def implementation(monkeypatch):
-    old = _V4Helpers._native_model(monkeypatch)
-    monkeypatch.setitem(sys.modules, "resin_models_cuda.deepseek_v4.model", old)
     path = Path(__file__).parents[1] / "resin_models_cuda/deepseek_v41/model.py"
     spec = importlib.util.spec_from_file_location(
         "_resin_test_deepseek_v41_model", path
@@ -152,18 +149,13 @@ def test_expert_tp4_balances_whole_fp4_kernel_blocks_without_dropping_columns(
     assert all(s.size % 128 == 0 for s in shards)
 
 
-@pytest.mark.parametrize("version", ["v4", "v41"])
 @pytest.mark.parametrize("component", ["Attention", "Transformer"])
 def test_single_kv_model_constructors_reject_tp_before_parameter_allocation(
-    implementation, monkeypatch, version, component
+    implementation, monkeypatch, component
 ):
     from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 
-    module = (
-        implementation
-        if version == "v41"
-        else sys.modules["resin_models_cuda.deepseek_v4.model"]
-    )
+    module = implementation
     tp = TensorParallelContext(
         TensorParallelLayout(size=2), Mock(spec=torch.distributed.ProcessGroup)
     )
@@ -177,10 +169,8 @@ def test_single_kv_model_constructors_reject_tp_before_parameter_allocation(
     with pytest.raises(ValueError, match="one KV head"):
         if component == "Transformer":
             module.Transformer(module.ModelArgs(), tensor_parallel=tp)
-        elif version == "v41":
-            module.Attention(0, module.ModelArgs(), tp)
         else:
-            module.Attention(0, module.ModelArgs(), tensor_parallel=tp)
+            module.Attention(0, module.ModelArgs(), tp)
 
 
 def test_pinned_checkpoint_namespace_has_no_legacy_hc_head_or_draft_ownership(
@@ -247,9 +237,6 @@ def test_attention_bounds_sparse_active_lengths_for_short_queries(
     attention.prefill_finish = lambda output, positions: output.squeeze(2)
     attention.attn_sink, attention.attention_workspace = torch.zeros(1), torch.empty(0)
     attention.softmax_scale = 512**-0.5
-    monkeypatch.setattr(
-        implementation, "act_quant", lambda values, *args, **kwargs: values
-    )
     monkeypatch.setattr(
         implementation, "apply_rotary_emb", lambda values, *args, **kwargs: values
     )

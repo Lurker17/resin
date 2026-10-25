@@ -19,7 +19,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub use deepseek::{DeepSeekV4Parser, DeepSeekV4Tokens};
+pub use deepseek::{DeepSeekV41Parser, DeepSeekV41Tokens};
 pub use gemma::{Gemma4Parser, Gemma4Tokens};
 pub use gpt_oss::{GptOssParser, GptOssTokens};
 pub use inkling::{InklingParser, InklingTokens};

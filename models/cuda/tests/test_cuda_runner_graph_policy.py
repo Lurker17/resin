@@ -15,7 +15,7 @@ from resin.backend.cuda.graphs import (
     CudaGraphStep,
 )
 from resin.backend.cuda.runner import CudaRunner
-from resin_models_cuda.deepseek_v4.cuda import DeepSeekV4CudaRunner
+from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
 from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
 from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
 from resin_models_cuda.inkling.cuda import InklingCudaRunner
@@ -30,7 +30,7 @@ def _fail(message: str) -> NoReturn:
     "runner_type,args,kwargs",
     [
         (
-            DeepSeekV4CudaRunner,
+            DeepSeekV41CudaRunner,
             ("unused",),
             {"max_seq_len": 32, "tensor_parallel": SimpleNamespace(rank=0, size=1)},
         ),
@@ -75,7 +75,7 @@ def test_model_runner_passes_graph_policies_to_shared_runtime(
 @pytest.mark.parametrize(
     "runner_type",
     [
-        DeepSeekV4CudaRunner,
+        DeepSeekV41CudaRunner,
         InklingCudaRunner,
         Qwen3_5CudaRunner,
         GptOssCudaRunner,
@@ -108,7 +108,7 @@ def test_model_prefill_rejects_uncaptured_graphs_before_accessing_model_state(
 def test_deepseek_decode_policy_places_broadcast_inside_or_between_graphs(
     monkeypatch, policy, parallel
 ):
-    runner = object.__new__(DeepSeekV4CudaRunner)
+    runner = object.__new__(DeepSeekV41CudaRunner)
     runner.speculative_tokens = 0
     runner.parallel_groups = None
     runner.vocab_size = 2

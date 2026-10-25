@@ -27,7 +27,7 @@ class HCLazyPost:
 @cache
 def _post_kernel():
     # Load the shared TileLang compatibility adapter before TileKernels 1.0.
-    import_module("resin_models_cuda.deepseek_v4.tilelang_kernels")
+    import_module("resin_models_cuda.deepseek_v41.tilelang_kernels")
     return import_module("tile_kernels.mhc.post_kernel").mhc_post_fwd
 
 
@@ -54,7 +54,7 @@ def materialize(output: Tensor, state: HCLazyPost) -> Tensor:
 
 @cache
 def _prenorm_kernel():
-    import_module("resin_models_cuda.deepseek_v4.tilelang_kernels")
+    import_module("resin_models_cuda.deepseek_v41.tilelang_kernels")
     # TileKernels 1.0 exposes the reducer builder; newer releases wrap this as
     # mhc_reduce_partials_and_rmsnorm_fwd. Keep the pinned ABI in this adapter.
     return import_module("tile_kernels.mhc.norm_fn_kernel")._mhc_pre_norm_fn_fwd_norm

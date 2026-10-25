@@ -1,9 +1,9 @@
-use super::{BOS, DSML, EOS, THINKING_END, THINKING_START, Version};
+use super::{BOS, DSML, EOS, TAGS, THINKING_END, THINKING_START};
 use crate::parser::{EventSink, Grammar, Parser, tokens};
 use crate::{AttributedText, Decoder, Error, Event, FinishReason};
 use std::collections::HashSet;
 
-tokens! { DeepSeekV4Tokens {
+tokens! { DeepSeekV41Tokens {
     bos => [BOS], eos => [EOS], thinking_start => [THINKING_START],
     thinking_end => [THINKING_END], dsml => [DSML],
 }}
@@ -123,10 +123,9 @@ impl Buffer {
 }
 
 /// Incremental DSML parsing. Only actual control IDs introduce DSML markers.
-pub type DeepSeekV4Parser = Parser<DeepSeekV4Grammar>;
-pub struct DeepSeekV4Grammar {
-    version: Version,
-    tokens: DeepSeekV4Tokens,
+pub type DeepSeekV41Parser = Parser<DeepSeekV41Grammar>;
+pub struct DeepSeekV41Grammar {
+    tokens: DeepSeekV41Tokens,
     stage: Stage,
     buffer: Buffer,
     name: String,
@@ -137,22 +136,12 @@ pub struct DeepSeekV4Grammar {
     ended: bool,
 }
 
-impl DeepSeekV4Parser {
+impl DeepSeekV41Parser {
     pub fn new(
-        tokens: DeepSeekV4Tokens,
+        tokens: DeepSeekV41Tokens,
         decoder: Box<dyn Decoder>,
         prompt_ids: &[u32],
         thinking: bool,
-    ) -> Result<Self, Error> {
-        Self::with_version(tokens, decoder, prompt_ids, thinking, Version::V4)
-    }
-
-    pub fn with_version(
-        tokens: DeepSeekV4Tokens,
-        decoder: Box<dyn Decoder>,
-        prompt_ids: &[u32],
-        thinking: bool,
-        version: Version,
     ) -> Result<Self, Error> {
         tokens.validate()?;
         let thinking = prompt_ids
@@ -169,8 +158,7 @@ impl DeepSeekV4Parser {
             })
             .unwrap_or(thinking);
         Ok(Self::with_grammar(
-            DeepSeekV4Grammar {
-                version,
+            DeepSeekV41Grammar {
                 tokens,
                 stage: if thinking {
                     Stage::Reasoning
@@ -190,7 +178,7 @@ impl DeepSeekV4Parser {
     }
 }
 
-impl DeepSeekV4Grammar {
+impl DeepSeekV41Grammar {
     fn argument(&self, text: String, events: &mut EventSink) {
         if !text.is_empty() {
             events.push(Event::ToolCallArgumentsDelta {
@@ -206,7 +194,7 @@ impl DeepSeekV4Grammar {
         special: bool,
         events: &mut EventSink,
     ) -> Result<(), Error> {
-        let (calls, invoke, parameter) = self.version.tags();
+        let (calls, invoke, parameter) = TAGS;
         self.buffer.push(text, special);
         loop {
             match self.stage {
@@ -344,7 +332,7 @@ impl DeepSeekV4Grammar {
     }
 }
 
-impl Grammar for DeepSeekV4Grammar {
+impl Grammar for DeepSeekV41Grammar {
     const STRICT_END: bool = true;
     fn channel(&self) -> Option<&'static str> {
         (!matches!(self.stage, Stage::Content | Stage::Reasoning)).then_some("tool")

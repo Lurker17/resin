@@ -134,7 +134,6 @@ fn all_model_grammars_preserve_unicode_and_source_indices_across_batching() {
     for model in [
         ModelFormat::GptOss,
         ModelFormat::Inkling,
-        ModelFormat::DeepSeek,
         ModelFormat::DeepSeekV41,
         ModelFormat::Qwen,
         ModelFormat::Gemma,
@@ -155,7 +154,7 @@ fn all_model_grammars_preserve_unicode_and_source_indices_across_batching() {
                     vec![id(&tokenizer, "<|content_thinking|>")],
                     bytes("hi 🦀!"),
                 ),
-                ModelFormat::DeepSeek | ModelFormat::DeepSeekV41 | ModelFormat::Qwen => {
+                ModelFormat::DeepSeekV41 | ModelFormat::Qwen => {
                     (vec![id(&tokenizer, "<think>")], bytes("hi 🦀!"))
                 }
                 ModelFormat::Lfm2 => {
@@ -173,10 +172,9 @@ fn all_model_grammars_preserve_unicode_and_source_indices_across_batching() {
                     generated.push(id(&tokenizer, "<|im_sep|>"));
                 }
                 ModelFormat::Inkling => generated.push(id(&tokenizer, "<|content_text|>")),
-                ModelFormat::DeepSeek
-                | ModelFormat::DeepSeekV41
-                | ModelFormat::Qwen
-                | ModelFormat::Lfm2 => generated.push(id(&tokenizer, "</think>")),
+                ModelFormat::DeepSeekV41 | ModelFormat::Qwen | ModelFormat::Lfm2 => {
+                    generated.push(id(&tokenizer, "</think>"))
+                }
                 ModelFormat::Gemma => generated.push(id(&tokenizer, "<channel|>")),
             }
             generated.extend(bytes("ok 🧠!"));
@@ -232,7 +230,7 @@ fn gemma_header_body_inside_one_token_and_deepseek_marker_prefix_are_attributed(
     let (_, reasoning, owners) = normalize(events);
     assert_eq!(reasoning, "body");
     assert_eq!(owners[&1], vec![(9, 13, 0, 4, 1)]);
-    let mut deepseek = parser(ModelFormat::DeepSeek, tokenizer.clone(), &[]);
+    let mut deepseek = parser(ModelFormat::DeepSeekV41, tokenizer.clone(), &[]);
     let mut events = deepseek.feed(&[id(&tokenizer, "aĊĊ<")]).unwrap();
     events.extend(deepseek.feed(&[id(&tokenizer, "x")]).unwrap());
     events.extend(deepseek.finish(FinishReason::Length).unwrap());
@@ -349,12 +347,12 @@ fn qwen_and_deepseek_tool_channel_hints_exclude_deferred_content() {
     qwen.feed(&[id(&tokenizer, "<think>")]).unwrap();
     assert_eq!(qwen.token_channel(u32::from(b'x')), None);
 
-    let mut deepseek = parser(ModelFormat::DeepSeek, tokenizer.clone(), &[]);
+    let mut deepseek = parser(ModelFormat::DeepSeekV41, tokenizer.clone(), &[]);
     deepseek.feed(&bytes("\n\n<")).unwrap();
     assert_eq!(deepseek.token_channel(u32::from(b'x')), None);
     deepseek.feed(&[id(&tokenizer, "｜DSML｜")]).unwrap();
     assert_eq!(deepseek.token_channel(u32::from(b'x')), None);
-    deepseek.feed(&bytes("tool_calls>")).unwrap();
+    deepseek.feed(&bytes(" calls>")).unwrap();
     assert_eq!(deepseek.token_channel(u32::from(b'<')), Some("tool"));
 }
 

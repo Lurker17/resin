@@ -76,7 +76,7 @@ down-projection bias belongs only to expert-TP lane zero. GPT-OSS's local
 and SwiGLU limit. `MXFP4Weights` carries the six checkpoint tensors into
 FlashInfer preparation; the prepared weights retain their configuration.
 
-`ExpertParallelDispatch` is shared with DeepSeek-V4. With explicit groups it
+`ExpertParallelDispatch` is shared with DeepSeek-V4.1. With explicit groups it
 preserves each attention rank as an independent origin, sends selected rows to
 every intermediate shard of their expert owner, and combines all expert/TP
 partials back into complete origin rows. This result must not be reduced again

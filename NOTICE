@@ -22,8 +22,8 @@ Hugging Face Transformers:
 OpenAI gpt-oss and Hugging Face Transformers are licensed under the Apache
 License, Version 2.0.
 
-The DeepSeek-V4 model hierarchy and cuTile kernels in
-models/cuda/resin_models_cuda/deepseek_v4 contain portions adapted from DeepSeek-V4:
+The retained model primitives and expert kernels in
+models/cuda/resin_models_cuda/deepseek_v41 contain portions adapted from DeepSeek-V4:
 
   Copyright (c) 2023 DeepSeek
   https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731
@@ -56,15 +56,6 @@ from deepinfer/model_executor/layers/tilelang_ops/cuda at that revision.
 The DeepSelect dependency is pinned to the matching DeepInfer submodule
 revision bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18.
 
-The TileLang MHC kernel in
-models/cuda/resin_models_cuda/deepseek_v4/tilelang_kernels.py contains portions adapted
-from SGLang:
-
-  Copyright 2023-2026 SGLang Team
-  https://github.com/sgl-project/sglang
-
-SGLang is licensed under the Apache License, Version 2.0.
-
 Model weights are not distributed with Resin. Users who download Liquid AI or
 OpenAI or DeepSeek checkpoints are responsible for the checkpoints' separate license terms.
 
@@ -79,10 +70,10 @@ The GPT-OSS tool-schema formatting in crates/resin-recipe/src/gpt_oss/schema.rs
 is adapted from OpenAI Harmony (Copyright 2025 OpenAI), Apache License 2.0.
 https://github.com/openai/harmony
 
-The DeepSeek V4 conversation format and tools prompt in crates/resin-recipe
-are adapted from encoding/encoding_dsv4.py in DeepSeek-V4-Flash-0731 and
+The DeepSeek conversation format and tools prompt in crates/resin-recipe
+retain portions adapted from encoding/encoding_dsv4.py in DeepSeek-V4-Flash-0731 and
 DeepSeek-V4-Pro-0813, Copyright (c) 2023 DeepSeek, MIT License.
-The V4.1 variant also follows encoding/encoding.py in
+The supported V4.1 format follows encoding/encoding.py in
 DeepSeek-V4.1-Flash-1017, revision 1bae0e1088993b9b82de08f59de5be5a34e42170,
 under the same copyright and MIT License.
 The image preprocessing in crates/resin-recipe/src/media/deepseek.rs follows

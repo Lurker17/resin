@@ -12,7 +12,7 @@ from tokenizers.pre_tokenizers import ByteLevel
 import resin
 from resin.protocols import FinalizingResponseParser
 from resin.recipe import (
-    DeepSeekV4Recipe,
+    DeepSeekV41Recipe,
     GptOssRecipe,
     InklingRecipe,
     InklingResponseParser,
@@ -343,10 +343,10 @@ def test_callback_decoder_is_captured_once_instead_of_refetched():
 def test_deepseek_constructor_effort_matches_per_request_effort():
     backend = _byte_tokenizer()
     messages = [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])]
-    configured = DeepSeekV4Recipe(
+    configured = DeepSeekV41Recipe(
         backend, options=resin.recipe.RenderOptions(reasoning_effort="high")
     )
-    per_request = DeepSeekV4Recipe(backend)
+    per_request = DeepSeekV41Recipe(backend)
     expected = per_request.debug_render_text(
         messages, options=resin.recipe.RenderOptions(reasoning_effort="high")
     )
