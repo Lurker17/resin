@@ -74,184 +74,6 @@ fn tools_section(tools: &[Value]) -> String {
     lines.join("\n")
 }
 
-/// Render the stock GPT-OSS Harmony scaffold without a Python renderer.
-///
-/// Ordinary text and explicit control markers remain distinct until encoding.
-/// Options are accepted at the request root or in `extra`; a recipe supplies its
-/// construction-time date through `conversation_start_date`.
-pub fn render(request: &Value) -> Result<Prompt, Error> {
-    let messages = messages(request, "GPT-OSS")?;
-    let tools = list(&request["tools"]);
-    let effort = option(request, "reasoning_effort")
-        .and_then(Value::as_str)
-        .unwrap_or("medium")
-        .to_ascii_lowercase();
-    if !["low", "medium", "high"].contains(&effort.as_str()) {
-        return Err(Error::new(
-            "GPT-OSS reasoning_effort must be low, medium, or high",
-        ));
-    }
-    let mut prompt = Prompt::new();
-    if option(request, "use_system_prompt")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-    {
-        let identity = option(request, "model_identity")
-            .and_then(Value::as_str)
-            .unwrap_or("You are ChatGPT, a large language model trained by OpenAI.");
-        let cutoff = option(request, "knowledge_cutoff")
-            .and_then(Value::as_str)
-            .unwrap_or("2024-06");
-        let mut system = format!("{identity}\nKnowledge cutoff: {cutoff}");
-        if let Some(date) = option(request, "conversation_start_date").and_then(Value::as_str) {
-            system.push_str(&format!("\nCurrent date: {date}"));
-        }
-        system.push_str(&format!("\n\nReasoning: {effort}\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message."));
-        if !tools.is_empty() {
-            system
-                .push_str("\nCalls to these tools must go to the commentary channel: 'functions'.");
-        }
-        message(&mut prompt, "system", None, None, &system);
-    }
-    let first_system = messages
-        .iter()
-        .position(|message| message.get("role").and_then(Value::as_str) == Some("system"));
-    if first_system.is_some() || !tools.is_empty() {
-        let mut sections = Vec::new();
-        if let Some(index) = first_system {
-            let instructions = content(messages[index].get("content"));
-            if !instructions.is_empty() {
-                sections.push(format!("# Instructions\n\n{instructions}"));
-            }
-        }
-        if !tools.is_empty() {
-            sections.push(tools_section(tools));
-        }
-        message(&mut prompt, "developer", None, None, &sections.join("\n\n"));
-    }
-    let auto_drop_analysis = option(request, "auto_drop_analysis")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let add_generation_prompt = option(request, "add_generation_prompt")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    for (index, item) in messages.iter().enumerate() {
-        if first_system == Some(index) {
-            continue;
-        }
-        let body = content(item.get("content"));
-        match item.get("role").and_then(Value::as_str).unwrap_or("") {
-            "user" => message(&mut prompt, "user", None, None, &body),
-            "tool" => {
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let author = if name.starts_with("functions.") {
-                    name.to_owned()
-                } else {
-                    format!("functions.{name}")
-                };
-                message(
-                    &mut prompt,
-                    &author,
-                    Some("commentary"),
-                    Some("assistant"),
-                    &body,
-                );
-            }
-            "assistant" => {
-                let calls = list(&item["tool_calls"]);
-                let keep_analysis = !auto_drop_analysis
-                    || (!calls.is_empty()
-                        && !messages[index + 1..].iter().any(|later| {
-                            later.get("role").and_then(Value::as_str) == Some("assistant")
-                                && later
-                                    .get("tool_calls")
-                                    .and_then(Value::as_array)
-                                    .is_none_or(Vec::is_empty)
-                                && !content(later.get("content")).is_empty()
-                        }));
-                let reasoning = item
-                    .get("reasoning_content")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
-                    .filter(|_| keep_analysis);
-                if let Some(reasoning) = reasoning {
-                    message(&mut prompt, "assistant", Some("analysis"), None, reasoning);
-                }
-                // Assistant thinking parts live in reasoning_content, not
-                // its public text list, matching Harmony history rendering.
-                let text = match item.get("content") {
-                    Some(Value::Array(parts)) => parts
-                        .iter()
-                        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-                        .filter_map(|part| part.get("text").and_then(Value::as_str))
-                        .collect(),
-                    _ => body,
-                };
-                if !text.is_empty() || (reasoning.is_none() && calls.is_empty()) {
-                    message(&mut prompt, "assistant", Some("final"), None, &text);
-                }
-                for call in calls {
-                    let function = function(call);
-                    let name = function.get("name").and_then(Value::as_str).unwrap_or("");
-                    let recipient = if name.starts_with("functions.") {
-                        name.to_owned()
-                    } else {
-                        format!("functions.{name}")
-                    };
-                    let arguments = function
-                        .get("arguments")
-                        .map(|arguments| {
-                            arguments
-                                .as_str()
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| crate::json::spaced(arguments))
-                        })
-                        .unwrap_or_else(|| "{}".into());
-                    message(
-                        &mut prompt,
-                        "assistant",
-                        Some("commentary"),
-                        Some(&recipient),
-                        &arguments,
-                    );
-                }
-            }
-            _ => message(
-                &mut prompt,
-                "developer",
-                None,
-                None,
-                &format!("# Instructions\n\n{body}"),
-            ),
-        }
-    }
-    if add_generation_prompt {
-        prompt.special("<|start|>");
-        prompt.text("assistant");
-        prompt.special("<|channel|>");
-        prompt.text("analysis");
-        prompt.special("<|message|>");
-    } else if messages
-        .last()
-        .and_then(|message| message.get("role"))
-        .and_then(Value::as_str)
-        == Some("assistant")
-        && messages
-            .last()
-            .and_then(|message| message.get("tool_calls"))
-            .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty)
-        && let Some(crate::PromptSpan::Special(last)) = prompt.spans.last_mut()
-        && last == "<|end|>"
-    {
-        *last = "<|return|>".into();
-    }
-    Ok(prompt)
-}
-
 use crate::parser::{EventSink, Grammar, Parser, emit_tool, tokens};
 
 tokens! { GptOssTokens {
@@ -398,5 +220,224 @@ impl Grammar for GptOssGrammar {
     fn finish(&mut self, _reason: FinishReason, _events: &mut EventSink) -> Result<(), Error> {
         self.tool_text.clear();
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GptOssRecipeParams {
+    pub add_generation_prompt: Option<bool>,
+    pub reasoning_effort: Option<String>,
+    pub use_system_prompt: Option<bool>,
+    pub model_identity: Option<String>,
+    pub knowledge_cutoff: Option<String>,
+    pub conversation_start_date: Option<String>,
+    pub auto_drop_analysis: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GptOssRecipe {
+    params: GptOssRecipeParams,
+}
+
+impl GptOssRecipe {
+    pub fn new(params: GptOssRecipeParams) -> Self {
+        Self { params }
+    }
+}
+impl crate::Recipe for GptOssRecipe {
+    fn render(&self, request: &Value) -> Result<crate::Prompt, crate::Error> {
+        let request = crate::recipe::request("gpt_oss", &self.params, request)?;
+        let request = &request;
+        let messages = messages(request, "GPT-OSS")?;
+        let tools = list(&request["tools"]);
+        let effort = option(request, "reasoning_effort")
+            .and_then(Value::as_str)
+            .unwrap_or("medium")
+            .to_ascii_lowercase();
+        if !["low", "medium", "high"].contains(&effort.as_str()) {
+            return Err(Error::new(
+                "GPT-OSS reasoning_effort must be low, medium, or high",
+            ));
+        }
+        let mut prompt = Prompt::new();
+        if option(request, "use_system_prompt")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            let identity = option(request, "model_identity")
+                .and_then(Value::as_str)
+                .unwrap_or("You are ChatGPT, a large language model trained by OpenAI.");
+            let cutoff = option(request, "knowledge_cutoff")
+                .and_then(Value::as_str)
+                .unwrap_or("2024-06");
+            let mut system = format!("{identity}\nKnowledge cutoff: {cutoff}");
+            if let Some(date) = option(request, "conversation_start_date").and_then(Value::as_str) {
+                system.push_str(&format!("\nCurrent date: {date}"));
+            }
+            system.push_str(&format!("\n\nReasoning: {effort}\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message."));
+            if !tools.is_empty() {
+                system.push_str(
+                    "\nCalls to these tools must go to the commentary channel: 'functions'.",
+                );
+            }
+            message(&mut prompt, "system", None, None, &system);
+        }
+        let first_system = messages
+            .iter()
+            .position(|message| message.get("role").and_then(Value::as_str) == Some("system"));
+        if first_system.is_some() || !tools.is_empty() {
+            let mut sections = Vec::new();
+            if let Some(index) = first_system {
+                let instructions = content(messages[index].get("content"));
+                if !instructions.is_empty() {
+                    sections.push(format!("# Instructions\n\n{instructions}"));
+                }
+            }
+            if !tools.is_empty() {
+                sections.push(tools_section(tools));
+            }
+            message(&mut prompt, "developer", None, None, &sections.join("\n\n"));
+        }
+        let auto_drop_analysis = option(request, "auto_drop_analysis")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let add_generation_prompt = option(request, "add_generation_prompt")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        for (index, item) in messages.iter().enumerate() {
+            if first_system == Some(index) {
+                continue;
+            }
+            let body = content(item.get("content"));
+            match item.get("role").and_then(Value::as_str).unwrap_or("") {
+                "user" => message(&mut prompt, "user", None, None, &body),
+                "tool" => {
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let author = if name.starts_with("functions.") {
+                        name.to_owned()
+                    } else {
+                        format!("functions.{name}")
+                    };
+                    message(
+                        &mut prompt,
+                        &author,
+                        Some("commentary"),
+                        Some("assistant"),
+                        &body,
+                    );
+                }
+                "assistant" => {
+                    let calls = list(&item["tool_calls"]);
+                    let keep_analysis = !auto_drop_analysis
+                        || (!calls.is_empty()
+                            && !messages[index + 1..].iter().any(|later| {
+                                later.get("role").and_then(Value::as_str) == Some("assistant")
+                                    && later
+                                        .get("tool_calls")
+                                        .and_then(Value::as_array)
+                                        .is_none_or(Vec::is_empty)
+                                    && !content(later.get("content")).is_empty()
+                            }));
+                    let reasoning = item
+                        .get("reasoning_content")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                        .filter(|_| keep_analysis);
+                    if let Some(reasoning) = reasoning {
+                        message(&mut prompt, "assistant", Some("analysis"), None, reasoning);
+                    }
+                    // Assistant thinking parts live in reasoning_content, not
+                    // its public text list, matching Harmony history rendering.
+                    let text = match item.get("content") {
+                        Some(Value::Array(parts)) => parts
+                            .iter()
+                            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                            .filter_map(|part| part.get("text").and_then(Value::as_str))
+                            .collect(),
+                        _ => body,
+                    };
+                    if !text.is_empty() || (reasoning.is_none() && calls.is_empty()) {
+                        message(&mut prompt, "assistant", Some("final"), None, &text);
+                    }
+                    for call in calls {
+                        let function = function(call);
+                        let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+                        let recipient = if name.starts_with("functions.") {
+                            name.to_owned()
+                        } else {
+                            format!("functions.{name}")
+                        };
+                        let arguments = function
+                            .get("arguments")
+                            .map(|arguments| {
+                                arguments
+                                    .as_str()
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| crate::json::spaced(arguments))
+                            })
+                            .unwrap_or_else(|| "{}".into());
+                        message(
+                            &mut prompt,
+                            "assistant",
+                            Some("commentary"),
+                            Some(&recipient),
+                            &arguments,
+                        );
+                    }
+                }
+                _ => message(
+                    &mut prompt,
+                    "developer",
+                    None,
+                    None,
+                    &format!("# Instructions\n\n{body}"),
+                ),
+            }
+        }
+        if add_generation_prompt {
+            prompt.special("<|start|>");
+            prompt.text("assistant");
+            prompt.special("<|channel|>");
+            prompt.text("analysis");
+            prompt.special("<|message|>");
+        } else if messages
+            .last()
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str)
+            == Some("assistant")
+            && messages
+                .last()
+                .and_then(|message| message.get("tool_calls"))
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            && let Some(crate::PromptSpan::Special(last)) = prompt.spans.last_mut()
+            && last == "<|end|>"
+        {
+            *last = "<|return|>".into();
+        }
+        Ok(prompt)
+    }
+    fn create_parser(
+        &self,
+        encoder: &dyn crate::Encoder,
+        decoder: Box<dyn crate::Decoder>,
+        _request: &Value,
+        prompt_ids: &[u32],
+    ) -> Result<Box<dyn crate::ResponseParser>, crate::Error> {
+        Ok(Box::new(GptOssParser::new(
+            GptOssTokens::resolve(encoder)?,
+            decoder,
+            prompt_ids,
+        )?))
+    }
+    fn stop_token_ids(&self, encoder: &dyn crate::Encoder) -> Result<Vec<u32>, crate::Error> {
+        Ok(vec![
+            crate::parser::resolve(encoder, &["<|fim_suffix|>", "<|return|>"])?,
+            crate::parser::resolve(encoder, &["<|ghissue|>", "<|call|>"])?,
+        ])
     }
 }

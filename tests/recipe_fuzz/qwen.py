@@ -14,7 +14,7 @@ from transformers.utils.chat_template_utils import _compile_jinja_template
 
 import resin
 from recipe_fuzz.harness import Case, Part, normalize
-from resin.recipe import Qwen38Recipe
+from resin.recipe import get_native_recipe
 
 MARKERS = (
     "<|im_start|>",
@@ -42,7 +42,7 @@ class QwenAdapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.recipe = Qwen38Recipe(backend)
+        self.recipe = get_native_recipe("qwen3_8", backend)
         self.reference = renderers.Qwen35()
         _, self.reference_parser = self.reference.render_for_completion(
             chat.OpenAIMessage.from_oss_messages([{"role": "user", "content": "hi"}])

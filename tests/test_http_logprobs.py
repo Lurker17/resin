@@ -15,7 +15,7 @@ from test_recipe import _byte_tokenizer
 
 import resin
 from resin import ForwardOutput, RunnerConfig
-from resin.recipe import InklingRecipe, Qwen38Recipe
+from resin.recipe import get_native_recipe
 
 
 @pytest.fixture(scope="module", params=ADAPTERS)
@@ -437,7 +437,7 @@ def piece_recipe(name, pieces, *, terminal=True):
     )
     tail = ids[at + len(text_ids) :] if terminal else []
     return (
-        {"inkling": InklingRecipe, "qwen3_5": Qwen38Recipe}[name](backend),
+        get_native_recipe("qwen3_8" if name == "qwen3_5" else name, backend),
         ids[:at] + piece_ids + tail,
         piece_ids,
     )
@@ -503,7 +503,7 @@ def test_prompt_scores_allow_zero_output_tokens(api, stream):
             "<|content_xml|>",
         ]
     )
-    recipe = InklingRecipe(backend)
+    recipe = get_native_recipe("inkling", backend)
     request_input = {"messages": [{"role": "user", "content": "score this"}]}
     prompt_ids = recipe.render(
         [

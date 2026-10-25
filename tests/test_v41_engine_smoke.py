@@ -8,7 +8,7 @@ from torch import nn
 
 import resin
 from deploy import v41_engine_smoke as smoke
-from resin.recipe import DeepSeekV41Recipe
+from resin.recipe import get_native_recipe
 
 
 def test_engine_smoke_runs_both_natural_widths_with_checkpoint_geometry(monkeypatch):
@@ -31,7 +31,7 @@ def test_engine_smoke_runs_both_natural_widths_with_checkpoint_geometry(monkeypa
         assert config.dspark_noise_token_id < config.vocab_size
         tokenizer = Tokenizer.from_file(str(checkpoint / "tokenizer.json"))
         prompt = (
-            DeepSeekV41Recipe(tokenizer)
+            get_native_recipe("deepseek_v41", tokenizer)
             .render(
                 [
                     resin.recipe.Message(

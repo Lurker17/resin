@@ -20,8 +20,8 @@ def checkpoint(tmp_path, monkeypatch):
     Tokenizer(models.WordLevel({"token": 0})).save(str(tmp_path / "tokenizer.json"))
     monkeypatch.setattr(
         bench,
-        "DeepSeekV41Recipe",
-        lambda tokenizer: SimpleNamespace(
+        "get_native_recipe",
+        lambda name, tokenizer: SimpleNamespace(
             render=lambda messages: SimpleNamespace(token_ids=[2, 3]),
             stop_token_ids=[7],
         ),

@@ -73,7 +73,7 @@ PROPERTY_TYPES = {
     ("RenderOptions", "reasoning_effort"): "str | int | float | None",
     ("RenderedPrompt", "media"): "MediaInput | None",
     ("RenderedPrompt", "token_ids"): "npt.NDArray[np.uint32]",
-    ("_NativeRecipe", "stop_token_ids"): "Sequence[int]",
+    ("NativeRecipe", "stop_token_ids"): "Sequence[int]",
     ("BatchPlan", "sequence_ids"): "npt.NDArray[np.uint64]",
     **{
         (owner, name): "npt.NDArray[np.uint32]"
@@ -122,7 +122,7 @@ PROPERTY_TYPES = {
 
 
 BASES = {
-    "_NativeRecipe": "Recipe",
+    "NativeRecipe": "Recipe",
     "_NativeResponseParser": "FinalizingResponseParser",
 }
 

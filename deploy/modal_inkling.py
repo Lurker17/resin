@@ -19,7 +19,7 @@ from resin.backend.cuda.graphs import (
     default_decode_graph_shapes,
 )
 from resin.backend.parallel import monitor_process_context
-from resin.recipe import InklingRecipe
+from resin.recipe import get_native_recipe
 from resin_models_cuda.inkling.checkpoint import MODEL_SPEC
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -188,7 +188,7 @@ def _build_runtime(
         TARGET_PATH, local_files_only=True, trust_remote_code=False
     )
     tokenizer = processor.tokenizer
-    recipe = InklingRecipe(tokenizer)
+    recipe = get_native_recipe("inkling", tokenizer)
     engine = Engine(
         runner,
         max_running_requests=DEFAULT_MAX_NUM_SEQS,
@@ -299,7 +299,7 @@ def _serve(_: int) -> None:
         torch.cuda.synchronize(runner.device)
         HttpServer(
             engine,
-            recipe=InklingRecipe(processor),
+            recipe=get_native_recipe("inkling", processor),
             model=MODEL_SPEC.target_repo,
             enable_anthropic=False,
         ).serve(host="0.0.0.0", port=8000)

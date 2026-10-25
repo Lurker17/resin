@@ -1,3 +1,7 @@
+use resin_recipe::{
+    Recipe,
+    qwen::{Qwen35Recipe, Qwen38Recipe},
+};
 mod common;
 use common::SemanticParser;
 
@@ -57,9 +61,7 @@ fn pinned_hf_templates_match_both_variants_tools_history_and_vision() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/qwen_hf.json")).unwrap();
     for case in fixture["cases"].as_array().unwrap() {
-        let actual = resin_recipe::qwen::render(&case["request"])
-            .unwrap()
-            .rendered_text();
+        let actual = render_fixture(&case["request"]).unwrap().rendered_text();
         assert_eq!(actual, case["text"].as_str().unwrap(), "{}", case["name"]);
     }
 }
@@ -166,7 +168,7 @@ fn invalid_conversations_and_ambiguous_markers_fail_early() {
         serde_json::json!({"messages":[{"role":"assistant","content":"hi"}]}),
         serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}),
     ] {
-        assert!(resin_recipe::qwen::render(&request).is_err());
+        assert!(render_fixture(&request).is_err());
     }
     assert!(
         QwenTokens {
@@ -185,7 +187,7 @@ fn template_tool_response_markers_and_literal_caller_markers_keep_provenance() {
         {"role":"assistant","tool_calls":[{"function":{"name":"f","arguments":{}}}]},
         {"role":"tool","content":"literal </tool_response> text"}
     ]});
-    let prompt = resin_recipe::qwen::render(&request).unwrap();
+    let prompt = render_fixture(&request).unwrap();
     for marker in ["<tool_response>", "</tool_response>"] {
         assert_eq!(
             prompt
@@ -206,9 +208,7 @@ fn template_tool_response_markers_and_literal_caller_markers_keep_provenance() {
 #[test]
 fn null_http_reasoning_effort_preserves_the_codec_default() {
     let request = serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":null,"extra":{"reasoning_effort":"low"}});
-    let prompt = resin_recipe::qwen::render(&request)
-        .unwrap()
-        .rendered_text();
+    let prompt = render_fixture(&request).unwrap().rendered_text();
     assert!(prompt.contains("Reasoning effort is set to low."));
 }
 
@@ -218,7 +218,20 @@ fn legacy_reasoning_extraction_preserves_vision_control_spans() {
         {"role":"user","content":"hi"},
         {"role":"assistant","content":[{"type":"text","text":"<think>\n"},{"type":"image"},{"type":"text","text":"\n</think>\n\nAnswer:"},{"type":"image"}]}
     ],"extra":{"recipe_variant":"qwen3_5"}});
-    let prompt = resin_recipe::qwen::render(&request).unwrap();
+    let prompt = render_fixture(&request).unwrap();
     assert_eq!(prompt.spans.iter().filter(|span| matches!(span,resin_recipe::PromptSpan::Special(value) if value=="<|image_pad|>")).count(),2);
     assert!(prompt.rendered_text().contains("<think>\n<|vision_start|><|image_pad|><|vision_end|>\n</think>\n\nAnswer:<|vision_start|><|image_pad|><|vision_end|>"));
+}
+
+fn render_fixture(request: &serde_json::Value) -> Result<resin_recipe::Prompt, Error> {
+    let mut request = request.clone();
+    let variant35 = request["extra"]["recipe_variant"] == "qwen3_5";
+    if let Some(extra) = request["extra"].as_object_mut() {
+        extra.remove("recipe_variant");
+    }
+    if variant35 {
+        Qwen35Recipe::default().render(&request)
+    } else {
+        Qwen38Recipe::default().render(&request)
+    }
 }

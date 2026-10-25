@@ -73,204 +73,6 @@ fn thinking_mode(request: &Value, configured_effort: bool) -> Result<bool, Error
     )
 }
 
-/// Render the pinned checkpoint's prompt format, with explicit control spans.
-pub fn render(request: &Value) -> Result<Prompt, Error> {
-    let (thinking, effort_prefix) = settings(request)?;
-    let mut messages = request["messages"]
-        .as_array()
-        .ok_or_else(|| Error::new("messages must be an array"))?
-        .clone();
-    if messages.is_empty() {
-        return Err(Error::new("conversation must contain at least one message"));
-    }
-    let tools = request["tools"]
-        .as_array()
-        .filter(|tools| !tools.is_empty());
-    let response_format = request["extra"]
-        .get("response_format")
-        .filter(|value| !value.is_null());
-    if tools.is_some() || response_format.is_some() {
-        if messages[0]["role"] != "system" {
-            messages.insert(0, serde_json::json!({"role": "system", "content": ""}));
-        }
-        if let Some(tools) = tools {
-            messages[0]["tools"] = Value::Array(tools.clone());
-        }
-        if let Some(format) = response_format {
-            messages[0]["response_format"] = format.clone();
-        }
-    }
-    let messages = merge_messages(messages)?;
-    let drop_thinking = !messages.iter().any(|message| {
-        message["tools"]
-            .as_array()
-            .is_some_and(|tools| !tools.is_empty())
-    });
-    let last_user = messages
-        .iter()
-        .enumerate()
-        .rposition(|(index, message)| starts_turn(index, message));
-    let messages: Vec<_> = messages
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, mut message)| {
-            if thinking && drop_thinking && last_user.is_some_and(|last| index < last) {
-                match message["role"].as_str() {
-                    Some("developer") => return None,
-                    Some("assistant") => {
-                        message.as_object_mut().unwrap().remove("reasoning_content");
-                    }
-                    _ => {}
-                }
-            }
-            Some(message)
-        })
-        .collect();
-    let last_user = messages
-        .iter()
-        .enumerate()
-        .rposition(|(index, message)| starts_turn(index, message));
-    let mut prompt = Prompt::new();
-    prompt.special(BOS);
-    if thinking || messages[0]["role"] == "system" {
-        prompt.special(SYSTEM);
-    }
-    if thinking {
-        prompt.text(effort_prefix);
-    }
-    for (index, message) in messages.iter().enumerate() {
-        let role = message["role"]
-            .as_str()
-            .ok_or_else(|| Error::new("message role must be a string"))?;
-        match role {
-            "system" | "developer" => {
-                if role == "developer" {
-                    return Err(Error::new(
-                        "DeepSeek V4.1 uses system messages for instructions",
-                    ));
-                }
-                if index > 0 {
-                    prompt.special(SYSTEM);
-                }
-                prompt.text(content(message)?);
-                if let Some(tools) = message["tools"]
-                    .as_array()
-                    .filter(|tools| !tools.is_empty())
-                {
-                    prompt.text("\n\n");
-                    render_tools(&mut prompt, tools)?;
-                }
-                if let Some(format) = message
-                    .get("response_format")
-                    .filter(|value| !value.is_null())
-                {
-                    prompt.text("\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n");
-                    prompt.text(json_spaced(format));
-                }
-            }
-            "user" => {
-                prompt.special(USER);
-                if let Some(blocks) = message["content_blocks"].as_array() {
-                    for (index, block) in blocks.iter().enumerate() {
-                        if index > 0 {
-                            prompt.text("\n\n");
-                        }
-                        match block["type"].as_str() {
-                            Some("text") => {
-                                prompt.text(block["text"].as_str().unwrap_or(""));
-                            }
-                            Some("image" | "image_url") => {
-                                prompt.special(IMAGE);
-                            }
-                            Some("tool_result") => {
-                                prompt.text("<tool_result>");
-                                prompt.text(text_value(&block["content"])?);
-                                prompt.text("</tool_result>");
-                            }
-                            _ => return Err(Error::new("unsupported DeepSeek user content block")),
-                        }
-                    }
-                } else {
-                    prompt.text(content(message)?);
-                }
-            }
-            "latest_reminder" => {
-                prompt.special(REMINDER);
-                prompt.text(content(message)?);
-            }
-            "assistant" => {
-                let after_last_user = last_user.is_none_or(|last| index > last);
-                let previous_has_task = index > 0
-                    && messages[index - 1]
-                        .get("task")
-                        .is_some_and(|value| !value.is_null());
-                if thinking && !previous_has_task && (!drop_thinking || after_last_user) {
-                    prompt.text(message["reasoning_content"].as_str().unwrap_or(""));
-                    prompt.special(THINKING_END);
-                }
-                prompt.text(content(message)?);
-                if let Some(calls) = message["tool_calls"]
-                    .as_array()
-                    .filter(|calls| !calls.is_empty())
-                {
-                    render_tool_calls(&mut prompt, calls)?;
-                }
-                if message["wo_eos"] != true {
-                    prompt.special(EOS);
-                }
-            }
-            _ => {
-                return Err(Error::new(format!(
-                    "unsupported DeepSeek message role: {role}"
-                )));
-            }
-        }
-        let follows_assistant = messages.get(index + 1).is_none_or(|next| {
-            matches!(next["role"].as_str(), Some("assistant" | "latest_reminder"))
-        });
-        if follows_assistant
-            && (index + 1 < messages.len() || request["add_generation_prompt"] != false)
-        {
-            if let Some(task) = message.get("task").filter(|value| !value.is_null()) {
-                let task = task
-                    .as_str()
-                    .ok_or_else(|| Error::new("DeepSeek task must be a string"))?;
-                if ![
-                    "action",
-                    "query",
-                    "authority",
-                    "domain",
-                    "title",
-                    "read_url",
-                ]
-                .contains(&task)
-                {
-                    return Err(Error::new("unsupported DeepSeek task"));
-                }
-                if task == "action" {
-                    prompt.special(ASSISTANT);
-                    prompt.special(if thinking {
-                        THINKING_START
-                    } else {
-                        THINKING_END
-                    });
-                }
-                prompt.special(format!("<｜{task}｜>"));
-            } else if role == "user" || (role == "system" && index > 0) {
-                prompt.special(ASSISTANT);
-                prompt.special(
-                    if thinking && (!drop_thinking || last_user.is_none_or(|last| index >= last)) {
-                        THINKING_START
-                    } else {
-                        THINKING_END
-                    },
-                );
-            }
-        }
-    }
-    Ok(prompt)
-}
-
 fn content(message: &Value) -> Result<String, Error> {
     text_value(&message["content"])
 }
@@ -476,6 +278,309 @@ fn qualified_function(value: &Value) -> Result<Value, Error> {
     Ok(result)
 }
 
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeepSeekV41RecipeParams {
+    pub add_generation_prompt: Option<bool>,
+    pub reasoning_effort: Option<crate::ReasoningEffort>,
+    pub thinking_mode: Option<String>,
+    pub enable_thinking: Option<bool>,
+    pub response_format: Option<Value>,
+    #[serde(skip_serializing)]
+    pub vision_config: Option<crate::media::deepseek::Config>,
+    #[serde(skip_serializing)]
+    pub image_token_id: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DeepSeekV41Recipe {
+    params: DeepSeekV41RecipeParams,
+}
+
+impl DeepSeekV41Recipe {
+    pub fn new(mut params: DeepSeekV41RecipeParams) -> Result<Self, Error> {
+        if let Some(enabled) = params.enable_thinking.take() {
+            let mode = if enabled { "thinking" } else { "chat" };
+            if params
+                .thinking_mode
+                .as_deref()
+                .is_some_and(|value| value != mode)
+            {
+                return Err(Error::new("conflicting enable_thinking and thinking_mode"));
+            }
+            params.thinking_mode = Some(mode.into());
+        }
+        Ok(Self { params })
+    }
+    fn request(&self, raw: &Value) -> Result<Value, crate::Error> {
+        let mut request = crate::recipe::request("deepseek_v41", &self.params, raw)?;
+        let options = request["extra"].as_object_mut().unwrap();
+        if option(raw, "enable_thinking").is_some() && option(raw, "thinking_mode").is_none() {
+            options.remove("thinking_mode");
+        }
+        if let Some(enabled) = options.remove("enable_thinking") {
+            let mode = if enabled == true { "thinking" } else { "chat" };
+            if options
+                .get("thinking_mode")
+                .is_some_and(|value| value != mode)
+            {
+                return Err(crate::Error::new(
+                    "conflicting enable_thinking and thinking_mode",
+                ));
+            }
+            options.insert("thinking_mode".into(), Value::String(mode.into()));
+        }
+        Ok(request)
+    }
+}
+impl crate::Recipe for DeepSeekV41Recipe {
+    fn message_policy(&self) -> crate::MessagePolicy {
+        crate::MessagePolicy {
+            roles: &[
+                "system",
+                "developer",
+                "user",
+                "assistant",
+                "tool",
+                "latest_reminder",
+            ],
+            media_roles: Some(&["user"]),
+            controls: &["task", "wo_eos", "response_format"],
+            tools: crate::ToolScope::AnyInstruction,
+            ..crate::MessagePolicy::STANDARD
+        }
+    }
+    fn render(&self, request: &Value) -> Result<crate::Prompt, crate::Error> {
+        let request = self.request(request)?;
+        let request = &request;
+        let (thinking, effort_prefix) = settings(request)?;
+        let mut messages = request["messages"]
+            .as_array()
+            .ok_or_else(|| Error::new("messages must be an array"))?
+            .clone();
+        if messages.is_empty() {
+            return Err(Error::new("conversation must contain at least one message"));
+        }
+        let tools = request["tools"]
+            .as_array()
+            .filter(|tools| !tools.is_empty());
+        let response_format = request["extra"]
+            .get("response_format")
+            .filter(|value| !value.is_null());
+        if tools.is_some() || response_format.is_some() {
+            if messages[0]["role"] != "system" {
+                messages.insert(0, serde_json::json!({"role": "system", "content": ""}));
+            }
+            if let Some(tools) = tools {
+                messages[0]["tools"] = Value::Array(tools.clone());
+            }
+            if let Some(format) = response_format {
+                messages[0]["response_format"] = format.clone();
+            }
+        }
+        let messages = merge_messages(messages)?;
+        let drop_thinking = !messages.iter().any(|message| {
+            message["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty())
+        });
+        let last_user = messages
+            .iter()
+            .enumerate()
+            .rposition(|(index, message)| starts_turn(index, message));
+        let messages: Vec<_> = messages
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, mut message)| {
+                if thinking && drop_thinking && last_user.is_some_and(|last| index < last) {
+                    match message["role"].as_str() {
+                        Some("developer") => return None,
+                        Some("assistant") => {
+                            message.as_object_mut().unwrap().remove("reasoning_content");
+                        }
+                        _ => {}
+                    }
+                }
+                Some(message)
+            })
+            .collect();
+        let last_user = messages
+            .iter()
+            .enumerate()
+            .rposition(|(index, message)| starts_turn(index, message));
+        let mut prompt = Prompt::new();
+        prompt.special(BOS);
+        if thinking || messages[0]["role"] == "system" {
+            prompt.special(SYSTEM);
+        }
+        if thinking {
+            prompt.text(effort_prefix);
+        }
+        for (index, message) in messages.iter().enumerate() {
+            let role = message["role"]
+                .as_str()
+                .ok_or_else(|| Error::new("message role must be a string"))?;
+            match role {
+                "system" | "developer" => {
+                    if role == "developer" {
+                        return Err(Error::new(
+                            "DeepSeek V4.1 uses system messages for instructions",
+                        ));
+                    }
+                    if index > 0 {
+                        prompt.special(SYSTEM);
+                    }
+                    prompt.text(content(message)?);
+                    if let Some(tools) = message["tools"]
+                        .as_array()
+                        .filter(|tools| !tools.is_empty())
+                    {
+                        prompt.text("\n\n");
+                        render_tools(&mut prompt, tools)?;
+                    }
+                    if let Some(format) = message
+                        .get("response_format")
+                        .filter(|value| !value.is_null())
+                    {
+                        prompt.text("\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n");
+                        prompt.text(json_spaced(format));
+                    }
+                }
+                "user" => {
+                    prompt.special(USER);
+                    if let Some(blocks) = message["content_blocks"].as_array() {
+                        for (index, block) in blocks.iter().enumerate() {
+                            if index > 0 {
+                                prompt.text("\n\n");
+                            }
+                            match block["type"].as_str() {
+                                Some("text") => {
+                                    prompt.text(block["text"].as_str().unwrap_or(""));
+                                }
+                                Some("image" | "image_url") => {
+                                    prompt.special(IMAGE);
+                                }
+                                Some("tool_result") => {
+                                    prompt.text("<tool_result>");
+                                    prompt.text(text_value(&block["content"])?);
+                                    prompt.text("</tool_result>");
+                                }
+                                _ => {
+                                    return Err(Error::new(
+                                        "unsupported DeepSeek user content block",
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        prompt.text(content(message)?);
+                    }
+                }
+                "latest_reminder" => {
+                    prompt.special(REMINDER);
+                    prompt.text(content(message)?);
+                }
+                "assistant" => {
+                    let after_last_user = last_user.is_none_or(|last| index > last);
+                    let previous_has_task = index > 0
+                        && messages[index - 1]
+                            .get("task")
+                            .is_some_and(|value| !value.is_null());
+                    if thinking && !previous_has_task && (!drop_thinking || after_last_user) {
+                        prompt.text(message["reasoning_content"].as_str().unwrap_or(""));
+                        prompt.special(THINKING_END);
+                    }
+                    prompt.text(content(message)?);
+                    if let Some(calls) = message["tool_calls"]
+                        .as_array()
+                        .filter(|calls| !calls.is_empty())
+                    {
+                        render_tool_calls(&mut prompt, calls)?;
+                    }
+                    if message["wo_eos"] != true {
+                        prompt.special(EOS);
+                    }
+                }
+                _ => {
+                    return Err(Error::new(format!(
+                        "unsupported DeepSeek message role: {role}"
+                    )));
+                }
+            }
+            let follows_assistant = messages.get(index + 1).is_none_or(|next| {
+                matches!(next["role"].as_str(), Some("assistant" | "latest_reminder"))
+            });
+            if follows_assistant
+                && (index + 1 < messages.len()
+                    || option(request, "add_generation_prompt") != Some(&Value::Bool(false)))
+            {
+                if let Some(task) = message.get("task").filter(|value| !value.is_null()) {
+                    let task = task
+                        .as_str()
+                        .ok_or_else(|| Error::new("DeepSeek task must be a string"))?;
+                    if ![
+                        "action",
+                        "query",
+                        "authority",
+                        "domain",
+                        "title",
+                        "read_url",
+                    ]
+                    .contains(&task)
+                    {
+                        return Err(Error::new("unsupported DeepSeek task"));
+                    }
+                    if task == "action" {
+                        prompt.special(ASSISTANT);
+                        prompt.special(if thinking {
+                            THINKING_START
+                        } else {
+                            THINKING_END
+                        });
+                    }
+                    prompt.special(format!("<｜{task}｜>"));
+                } else if role == "user" || (role == "system" && index > 0) {
+                    prompt.special(ASSISTANT);
+                    prompt.special(
+                        if thinking
+                            && (!drop_thinking || last_user.is_none_or(|last| index >= last))
+                        {
+                            THINKING_START
+                        } else {
+                            THINKING_END
+                        },
+                    );
+                }
+            }
+        }
+        Ok(prompt)
+    }
+    fn create_parser(
+        &self,
+        encoder: &dyn crate::Encoder,
+        decoder: Box<dyn crate::Decoder>,
+        request: &Value,
+        prompt_ids: &[u32],
+    ) -> Result<Box<dyn crate::ResponseParser>, crate::Error> {
+        let request = self.request(request)?;
+        Ok(Box::new(DeepSeekV41Parser::new(
+            DeepSeekV41Tokens::resolve(encoder)?,
+            decoder,
+            prompt_ids,
+            settings(&request)?.0,
+        )?))
+    }
+    fn stop_token_ids(&self, encoder: &dyn crate::Encoder) -> Result<Vec<u32>, crate::Error> {
+        Ok(vec![encoder.special_id(EOS)?])
+    }
+    fn media_config(&self) -> Option<crate::MediaConfig> {
+        Some(crate::MediaConfig::DeepSeek(
+            self.params.vision_config.clone().unwrap_or_default(),
+            self.params.image_token_id,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +605,22 @@ mod tests {
                 .0
         );
         assert!(settings(&serde_json::json!({"reasoning_effort": "medium"})).is_err());
+        let recipe = DeepSeekV41Recipe::new(
+            serde_json::from_value(serde_json::json!({"enable_thinking": true})).unwrap(),
+        )
+        .unwrap();
+        let chat = crate::Recipe::render(&recipe, &serde_json::json!({"messages": [{"role": "user", "content": "hello"}], "extra": {"thinking_mode": "chat"}})).unwrap();
+        assert!(!chat.rendered_text().ends_with(THINKING_START));
+        let alias_chat = crate::Recipe::render(&recipe, &serde_json::json!({"messages": [{"role": "user", "content": "hello"}], "extra": {"enable_thinking": false}})).unwrap();
+        assert_eq!(chat.rendered_text(), alias_chat.rendered_text());
+        assert!(
+            DeepSeekV41Recipe::new(
+                serde_json::from_value(
+                    serde_json::json!({"enable_thinking": true, "thinking_mode": "chat"})
+                )
+                .unwrap()
+            )
+            .is_err()
+        );
     }
 }

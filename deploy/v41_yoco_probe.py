@@ -24,7 +24,7 @@ import torch
 import resin
 from deploy.deepseek_v41_validation import _validation_stage
 from resin import SamplingParams
-from resin.recipe import DeepSeekV41Recipe
+from resin.recipe import get_native_recipe
 from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
 
 
@@ -652,8 +652,9 @@ def run_validation(
             raise RuntimeError(f"YOCO validation {stage}: {errors}")
 
     try:
-        recipe = DeepSeekV41Recipe(
-            Tokenizer.from_file(str(Path(checkpoint) / "tokenizer.json"))
+        recipe = get_native_recipe(
+            "deepseek_v41",
+            Tokenizer.from_file(str(Path(checkpoint) / "tokenizer.json")),
         )
         prompt = recipe.render(
             [

@@ -8,6 +8,8 @@ use pyo3::{
     types::{PyBytes, PyTuple},
 };
 use pythonize::{depythonize, pythonize};
+use resin_recipe::{BlockKind, MessagePolicy, ReasoningEffort};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 /// Conversation role. This enum is extensible: new roles may be added.
@@ -445,44 +447,6 @@ fn extract_blocks(content: &Bound<'_, PyAny>) -> PyResult<Vec<Block>> {
         .collect()
 }
 
-/// Structural requirements supplied by a concrete recipe, not inferred from model names.
-#[derive(Clone, Copy)]
-pub(crate) struct MessagePolicy {
-    pub(crate) roles: &'static [Role],
-    pub(crate) assistant_order: &'static [BlockKind],
-    pub(crate) reorder_wire_fields: bool,
-    pub(crate) controls: &'static [&'static str],
-    pub(crate) tools: ToolScope,
-    pub(crate) media_roles: Option<&'static [Role]>,
-}
-impl MessagePolicy {
-    pub(crate) const STANDARD: Self = Self {
-        roles: &[
-            Role::SYSTEM,
-            Role::DEVELOPER,
-            Role::USER,
-            Role::ASSISTANT,
-            Role::TOOL,
-        ],
-        assistant_order: &[BlockKind::Thinking, BlockKind::Text, BlockKind::Call],
-        reorder_wire_fields: false,
-        controls: &[],
-        tools: ToolScope::InitialInstruction,
-        media_roles: None,
-    };
-}
-#[derive(Clone, Copy)]
-pub(crate) enum ToolScope {
-    InitialInstruction,
-    AnyInstruction,
-}
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum BlockKind {
-    Thinking,
-    Text,
-    Call,
-    Result,
-}
 impl Block {
     fn kind(&self) -> BlockKind {
         match self {
@@ -636,7 +600,7 @@ impl Message {
         }
     }
     pub(crate) fn validate_for(&self, policy: &MessagePolicy) -> PyResult<()> {
-        if !policy.roles.contains(&self.role) {
+        if !policy.roles.contains(&self.role.spelling()) {
             return Err(PyValueError::new_err(format!(
                 "this recipe does not support the {} role",
                 self.role.spelling()
@@ -654,7 +618,7 @@ impl Message {
         if self.has_media()
             && policy
                 .media_roles
-                .is_some_and(|roles| !roles.contains(&self.role))
+                .is_some_and(|roles| !roles.contains(&self.role.spelling()))
         {
             return Err(PyValueError::new_err(
                 "this recipe does not support media in this message role",
@@ -748,9 +712,31 @@ fn content_value(mut content: Vec<Value>) -> Value {
 
 /// Explicit rendering controls; absent fields inherit recipe defaults.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct RenderOptions {
-    pub(crate) value: Map<String, Value>,
+    reasoning_effort: Option<ReasoningEffort>,
+    #[pyo3(get)]
+    enable_thinking: Option<bool>,
+    #[pyo3(get)]
+    preserve_thinking: Option<bool>,
+    #[pyo3(get)]
+    add_generation_prompt: Option<bool>,
+    #[pyo3(get)]
+    add_vision_id: Option<bool>,
+    #[pyo3(get)]
+    use_system_prompt: Option<bool>,
+    #[pyo3(get)]
+    model_identity: Option<String>,
+    #[pyo3(get)]
+    knowledge_cutoff: Option<String>,
+    #[pyo3(get)]
+    conversation_start_date: Option<String>,
+    #[pyo3(get)]
+    auto_drop_analysis: Option<bool>,
+    #[pyo3(get)]
+    thinking_mode: Option<String>,
+    response_format: Option<Value>,
 }
 #[pymethods]
 impl RenderOptions {
@@ -771,167 +757,73 @@ impl RenderOptions {
         thinking_mode: Option<String>,
         response_format: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let mut value = Map::new();
-        for (key, v) in [
-            ("enable_thinking", enable_thinking),
-            ("preserve_thinking", preserve_thinking),
-            ("add_generation_prompt", add_generation_prompt),
-            ("add_vision_id", add_vision_id),
-            ("use_system_prompt", use_system_prompt),
-            ("auto_drop_analysis", auto_drop_analysis),
-        ] {
-            if let Some(v) = v {
-                value.insert(key.into(), Value::Bool(v));
-            }
+        let response_format = json_value(response_format)?;
+        Self {
+            reasoning_effort: serde_json::from_value(json_value(reasoning_effort)?)
+                .map_err(|_| PyValueError::new_err("reasoning_effort must be a name or number"))?,
+            enable_thinking,
+            preserve_thinking,
+            add_generation_prompt,
+            add_vision_id,
+            use_system_prompt,
+            model_identity,
+            knowledge_cutoff,
+            conversation_start_date,
+            auto_drop_analysis,
+            thinking_mode,
+            response_format: (!response_format.is_null()).then_some(response_format),
         }
-        for (key, v) in [
-            ("model_identity", model_identity),
-            ("knowledge_cutoff", knowledge_cutoff),
-            ("conversation_start_date", conversation_start_date),
-            ("thinking_mode", thinking_mode),
-        ] {
-            if let Some(v) = v {
-                value.insert(key.into(), Value::String(v));
-            }
-        }
-        for (key, v) in [
-            ("reasoning_effort", reasoning_effort),
-            ("response_format", response_format),
-        ] {
-            let v = json_value(v)?;
-            if !v.is_null() {
-                value.insert(key.into(), v);
-            }
-        }
-        Self::validate(value)
-    }
-    #[getter]
-    fn enable_thinking(&self) -> Option<bool> {
-        self.value.get("enable_thinking").and_then(Value::as_bool)
-    }
-    #[getter]
-    fn preserve_thinking(&self) -> Option<bool> {
-        self.value.get("preserve_thinking").and_then(Value::as_bool)
-    }
-    #[getter]
-    fn add_generation_prompt(&self) -> Option<bool> {
-        self.value
-            .get("add_generation_prompt")
-            .and_then(Value::as_bool)
-    }
-    #[getter]
-    fn add_vision_id(&self) -> Option<bool> {
-        self.value.get("add_vision_id").and_then(Value::as_bool)
-    }
-    #[getter]
-    fn use_system_prompt(&self) -> Option<bool> {
-        self.value.get("use_system_prompt").and_then(Value::as_bool)
-    }
-    #[getter]
-    fn auto_drop_analysis(&self) -> Option<bool> {
-        self.value
-            .get("auto_drop_analysis")
-            .and_then(Value::as_bool)
-    }
-    #[getter]
-    fn model_identity(&self) -> Option<&str> {
-        self.value.get("model_identity").and_then(Value::as_str)
-    }
-    #[getter]
-    fn knowledge_cutoff(&self) -> Option<&str> {
-        self.value.get("knowledge_cutoff").and_then(Value::as_str)
-    }
-    #[getter]
-    fn conversation_start_date(&self) -> Option<&str> {
-        self.value
-            .get("conversation_start_date")
-            .and_then(Value::as_str)
-    }
-    #[getter]
-    fn thinking_mode(&self) -> Option<&str> {
-        self.value.get("thinking_mode").and_then(Value::as_str)
+        .validate()
     }
     #[getter]
     fn reasoning_effort(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        json_get(
-            py,
-            self.value.get("reasoning_effort").unwrap_or(&Value::Null),
-        )
+        Ok(pythonize(py, &self.reasoning_effort)?.unbind())
     }
     #[getter]
     fn response_format(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        json_get(
-            py,
-            self.value.get("response_format").unwrap_or(&Value::Null),
-        )
+        Ok(pythonize(py, &self.response_format)?.unbind())
     }
     fn __repr__(&self) -> String {
-        format!("RenderOptions({})", Value::Object(self.value.clone()))
+        format!("RenderOptions({})", Value::Object(self.to_map()))
     }
 }
 impl RenderOptions {
-    pub(crate) const FIELDS: &'static [&'static str] = &[
-        "reasoning_effort",
-        "enable_thinking",
-        "preserve_thinking",
-        "add_generation_prompt",
-        "add_vision_id",
-        "use_system_prompt",
-        "model_identity",
-        "knowledge_cutoff",
-        "conversation_start_date",
-        "auto_drop_analysis",
-        "thinking_mode",
-        "response_format",
-    ];
+    pub(crate) fn to_map(&self) -> Map<String, Value> {
+        let Value::Object(mut value) = serde_json::to_value(self).unwrap() else {
+            unreachable!()
+        };
+        value.retain(|_, value| !value.is_null());
+        value
+    }
     pub(crate) fn from_wire(request: &Value) -> PyResult<Self> {
-        let mut value = Map::new();
-        for key in Self::FIELDS {
-            if let Some(v) = request
-                .get(*key)
+        let Value::Object(mut value) = serde_json::to_value(Self::default()).unwrap() else {
+            unreachable!()
+        };
+        for (key, field) in &mut value {
+            *field = request
+                .get(key)
                 .filter(|v| !v.is_null())
-                .or_else(|| request["extra"].get(*key).filter(|v| !v.is_null()))
-            {
-                value.insert((*key).into(), v.clone());
-            }
+                .or_else(|| request["extra"].get(key).filter(|v| !v.is_null()))
+                .cloned()
+                .unwrap_or(Value::Null);
         }
-        if !value.contains_key("thinking_mode") && request["extra"]["thinking"]["type"] == "enabled"
-        {
+        if value["thinking_mode"].is_null() && request["extra"]["thinking"]["type"] == "enabled" {
             value.insert("thinking_mode".into(), json!("thinking"));
         }
-        Self::validate(value)
+        let options: Self = serde_path_to_error::deserialize(Value::Object(value))
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        options.validate()
     }
-    fn validate(value: Map<String, Value>) -> PyResult<Self> {
-        for (key, v) in &value {
-            match key.as_str() {
-                "reasoning_effort" if !v.is_string() && !v.is_number() => {
-                    return Err(PyValueError::new_err(
-                        "reasoning_effort must be a name or number",
-                    ));
-                }
-                "enable_thinking"
-                | "preserve_thinking"
-                | "add_generation_prompt"
-                | "add_vision_id"
-                | "use_system_prompt"
-                | "auto_drop_analysis"
-                    if !v.is_boolean() =>
-                {
-                    return Err(PyValueError::new_err(format!("{key} must be a bool")));
-                }
-                "model_identity" | "knowledge_cutoff" | "conversation_start_date"
-                    if !v.is_string() =>
-                {
-                    return Err(PyValueError::new_err(format!("{key} must be a string")));
-                }
-                "thinking_mode" if !matches!(v.as_str(), Some("thinking" | "chat")) => {
-                    return Err(PyValueError::new_err(
-                        "thinking_mode must be thinking or chat",
-                    ));
-                }
-                _ => (),
-            }
+    fn validate(self) -> PyResult<Self> {
+        if self
+            .thinking_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "thinking" | "chat"))
+        {
+            return Err(PyValueError::new_err(
+                "thinking_mode must be thinking or chat",
+            ));
         }
-        Ok(Self { value })
+        Ok(self)
     }
 }

@@ -5,7 +5,7 @@ from recipe_fuzz.deepseek import DeepSeekV41Adapter
 from recipe_fuzz.harness import Case, Part
 
 import resin
-from resin.recipe import DeepSeekV41Recipe
+from resin.recipe import get_native_recipe
 
 
 @pytest.fixture(scope="module")
@@ -14,7 +14,7 @@ def adapter():
 
 
 def test_exported_recipe_uses_system_token_and_numeric_native_options(adapter):
-    model_recipe = DeepSeekV41Recipe(adapter.recipe.tokenizer)
+    model_recipe = get_native_recipe("deepseek_v41", adapter.recipe.tokenizer)
     messages = [
         resin.recipe.Message(
             resin.recipe.Role.SYSTEM, [resin.recipe.Text("literal <｜System｜>")]

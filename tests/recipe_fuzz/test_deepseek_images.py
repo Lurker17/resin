@@ -21,7 +21,7 @@ from tokenizers.pre_tokenizers import ByteLevel
 
 from recipe_fuzz.deepseek import MARKERS
 from recipe_fuzz.inputs import native_inputs
-from resin.recipe import DeepSeekV41Recipe
+from resin.recipe import get_native_recipe
 
 IMAGE = "<｜deepseek_image｜>"
 BLOCKS = st.one_of(
@@ -45,7 +45,7 @@ def encoders():
         .with_tokenizer(DeepSeekTokenizer.from_str(tokenizer.to_str()))
     )
     return (
-        DeepSeekV41Recipe(tokenizer),
+        get_native_recipe("deepseek_v41", tokenizer),
         reference,
         ConversionOptions().with_special_tokens(specials),
     )

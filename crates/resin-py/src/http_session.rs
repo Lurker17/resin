@@ -3,9 +3,7 @@ use crate::http_distributed::{HttpEvents, HttpIngress};
 use crate::http_logprobs::Vocabulary;
 use crate::http_output::OutputScores;
 use crate::http_stop::StopFilter;
-use crate::recipe::{
-    self, NativeInklingParser, NativeRecipe, NativeResponseParser, RenderedPrompt, SharedParser,
-};
+use crate::recipe::{self, NativeRecipe, NativeResponseParser, RenderedPrompt, SharedParser};
 use crate::recipe_events;
 use crate::recipe_types::{Message, RenderOptions, Tool};
 use crate::{CompletionReason, Engine, RequestLease, SamplingParams, TokenEvent};
@@ -49,9 +47,6 @@ enum Parser {
 impl Parser {
     fn new(py: Python<'_>, object: Py<PyAny>) -> PyResult<Self> {
         if let Ok(native) = object.bind(py).cast::<NativeResponseParser>() {
-            return Ok(Self::Native(native.borrow().inner.clone()));
-        }
-        if let Ok(native) = object.bind(py).cast::<NativeInklingParser>() {
             return Ok(Self::Native(native.borrow().inner.clone()));
         }
         let finish = optional_method(py, &object, "finish")?;

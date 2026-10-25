@@ -12,7 +12,7 @@ from recipe_fuzz.qwen import QwenAdapter
 
 import resin
 from resin import MediaInput
-from resin.recipe import Qwen35Media, Qwen35Recipe
+from resin.recipe import Qwen35Media, get_native_recipe
 
 
 def _media() -> Qwen35Media:
@@ -116,7 +116,8 @@ def test_qwen_recipe_normalizes_images_and_attaches_processor_payload() -> None:
     tokenizer = QwenAdapter().recipe.tokenizer
     image_id = tokenizer.token_to_id("<|image_pad|>")
 
-    model_recipe = Qwen35Recipe(
+    model_recipe = get_native_recipe(
+        "qwen3_5",
         tokenizer,
         media_config={
             "patch_size": 2,
@@ -160,7 +161,7 @@ def test_native_qwen_rotary_positions_cover_prompt_and_decode_continuation():
 
 
 def test_qwen_recipe_rejects_video_instead_of_dropping_its_embeddings() -> None:
-    model_recipe = Qwen35Recipe(QwenAdapter().recipe.tokenizer)
+    model_recipe = get_native_recipe("qwen3_5", QwenAdapter().recipe.tokenizer)
     with pytest.raises(ValueError, match="does not support video"):
         model_recipe.render(
             [

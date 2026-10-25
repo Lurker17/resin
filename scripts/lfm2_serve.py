@@ -4,7 +4,7 @@ import torch
 from transformers import AutoTokenizer
 
 from resin import Engine
-from resin.recipe import Lfm2Recipe
+from resin.recipe import get_native_recipe
 from resin.server import HttpServer
 from resin_models_torch.lfm2 import (
     DEFAULT_MODEL,
@@ -18,7 +18,7 @@ def main() -> None:
 
     model = DEFAULT_MODEL
     tokenizer = AutoTokenizer.from_pretrained(model, revision=DEFAULT_REVISION)
-    recipe = Lfm2Recipe(tokenizer)
+    recipe = get_native_recipe("lfm2", tokenizer)
     runner = Lfm2TorchRunner(model, device="cpu")
     engine = Engine(runner)
 

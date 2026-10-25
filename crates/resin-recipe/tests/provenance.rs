@@ -1,5 +1,11 @@
+use resin_recipe::deepseek::DeepSeekV41Recipe;
+use resin_recipe::gemma::Gemma4Recipe;
+use resin_recipe::gpt_oss::GptOssRecipe;
+use resin_recipe::inkling::InklingRecipe;
+use resin_recipe::lfm2::Lfm2Recipe;
+use resin_recipe::qwen::Qwen38Recipe;
 use resin_recipe::{
-    AttributedEvent, Decoder, Event, FinishReason, ModelFormat, ResponseParser, Tokenizer,
+    AttributedEvent, Decoder, Event, FinishReason, Recipe, ResponseParser, Tokenizer,
     TokenizerDecoder, TokenizerEncoder,
 };
 use serde_json::{Map, json};
@@ -79,8 +85,23 @@ fn bytes(text: &str) -> Vec<u32> {
 fn id(tokenizer: &Tokenizer, text: &str) -> u32 {
     tokenizer.token_to_id(text).unwrap()
 }
+fn token_parts(tokenizer: &Tokenizer, parts: &[&str]) -> Vec<u32> {
+    parts
+        .iter()
+        .flat_map(|part| {
+            tokenizer
+                .token_to_id(part)
+                .map_or_else(|| bytes(part), |id| vec![id])
+        })
+        .collect()
+}
+
+fn recipe<R: Recipe + Default + 'static>() -> Box<dyn Recipe> {
+    Box::new(R::default())
+}
+
 fn parser(
-    model: ModelFormat,
+    model: &dyn Recipe,
     tokenizer: Arc<Tokenizer>,
     prompt: &[u32],
 ) -> Box<dyn ResponseParser> {
@@ -131,56 +152,50 @@ fn normalize(events: Vec<AttributedEvent>) -> (String, String, Ownership) {
 
 #[test]
 fn all_model_grammars_preserve_unicode_and_source_indices_across_batching() {
-    for model in [
-        ModelFormat::GptOss,
-        ModelFormat::Inkling,
-        ModelFormat::DeepSeekV41,
-        ModelFormat::Qwen,
-        ModelFormat::Gemma,
-        ModelFormat::Lfm2,
+    for (model, prompt, before, transition) in [
+        (
+            recipe::<GptOssRecipe>(),
+            &[
+                "<|im_start|>",
+                "assistant",
+                "<|meta_sep|>",
+                "analysis",
+                "<|im_sep|>",
+            ][..],
+            &[][..],
+            &["<|im_end|>", "<|im_start|>", "assistant", "<|im_sep|>"][..],
+        ),
+        (
+            recipe::<InklingRecipe>(),
+            &["<|content_thinking|>"],
+            &[],
+            &["<|content_text|>"],
+        ),
+        (
+            recipe::<DeepSeekV41Recipe>(),
+            &["<think>"],
+            &[],
+            &["</think>"],
+        ),
+        (recipe::<Qwen38Recipe>(), &["<think>"], &[], &["</think>"]),
+        (
+            recipe::<Gemma4Recipe>(),
+            &["<|channel>"],
+            &[],
+            &["<channel|>"],
+        ),
+        (recipe::<Lfm2Recipe>(), &[], &["<think>"], &["</think>"]),
     ] {
         for fallback in [false, true] {
             let tokenizer = tokenizer(fallback, &[]);
-            let (prompt, mut generated) = match model {
-                ModelFormat::GptOss => {
-                    let mut prompt = vec![id(&tokenizer, "<|im_start|>")];
-                    prompt.extend(bytes("assistant"));
-                    prompt.push(id(&tokenizer, "<|meta_sep|>"));
-                    prompt.extend(bytes("analysis"));
-                    prompt.push(id(&tokenizer, "<|im_sep|>"));
-                    (prompt, bytes("hi 🦀!"))
-                }
-                ModelFormat::Inkling => (
-                    vec![id(&tokenizer, "<|content_thinking|>")],
-                    bytes("hi 🦀!"),
-                ),
-                ModelFormat::DeepSeekV41 | ModelFormat::Qwen => {
-                    (vec![id(&tokenizer, "<think>")], bytes("hi 🦀!"))
-                }
-                ModelFormat::Lfm2 => {
-                    let mut generated = vec![id(&tokenizer, "<think>")];
-                    generated.extend(bytes("hi 🦀!"));
-                    (vec![], generated)
-                }
-                ModelFormat::Gemma => (vec![id(&tokenizer, "<|channel>")], bytes("hi 🦀!")),
-            };
-            match model {
-                ModelFormat::GptOss => {
-                    generated.push(id(&tokenizer, "<|im_end|>"));
-                    generated.push(id(&tokenizer, "<|im_start|>"));
-                    generated.extend(bytes("assistant"));
-                    generated.push(id(&tokenizer, "<|im_sep|>"));
-                }
-                ModelFormat::Inkling => generated.push(id(&tokenizer, "<|content_text|>")),
-                ModelFormat::DeepSeekV41 | ModelFormat::Qwen | ModelFormat::Lfm2 => {
-                    generated.push(id(&tokenizer, "</think>"))
-                }
-                ModelFormat::Gemma => generated.push(id(&tokenizer, "<channel|>")),
-            }
+            let prompt = token_parts(&tokenizer, prompt);
+            let mut generated = token_parts(&tokenizer, before);
+            generated.extend(bytes("hi 🦀!"));
+            generated.extend(token_parts(&tokenizer, transition));
             generated.extend(bytes("ok 🧠!"));
             let mut expected = None;
             for chunk_size in [1, 2, 3, 7, generated.len()] {
-                let mut decoder = parser(model, tokenizer.clone(), &prompt);
+                let mut decoder = parser(model.as_ref(), tokenizer.clone(), &prompt);
                 let mut events = Vec::new();
                 for chunk in generated.chunks(chunk_size) {
                     events.extend(decoder.feed(chunk).unwrap());
@@ -205,7 +220,7 @@ fn all_model_grammars_preserve_unicode_and_source_indices_across_batching() {
 #[test]
 fn qwen_trim_retains_delayed_internal_whitespace_and_marks_partial_tokens() {
     let tokenizer = tokenizer(false, &["ĠhelloĠ", "worldĠ"]);
-    let mut parser = parser(ModelFormat::Qwen, tokenizer.clone(), &[]);
+    let mut parser = parser(recipe::<Qwen38Recipe>().as_ref(), tokenizer.clone(), &[]);
     let first = id(&tokenizer, "ĠhelloĠ");
     let second = id(&tokenizer, "worldĠ");
     let mut events = parser.feed(&[first]).unwrap();
@@ -220,7 +235,7 @@ fn qwen_trim_retains_delayed_internal_whitespace_and_marks_partial_tokens() {
 #[test]
 fn gemma_header_body_inside_one_token_and_deepseek_marker_prefix_are_attributed() {
     let tokenizer = tokenizer(false, &["analysisĊbody", "aĊĊ<", "x"]);
-    let mut gemma = parser(ModelFormat::Gemma, tokenizer.clone(), &[]);
+    let mut gemma = parser(recipe::<Gemma4Recipe>().as_ref(), tokenizer.clone(), &[]);
     let events = gemma
         .feed(&[
             id(&tokenizer, "<|channel>"),
@@ -230,7 +245,11 @@ fn gemma_header_body_inside_one_token_and_deepseek_marker_prefix_are_attributed(
     let (_, reasoning, owners) = normalize(events);
     assert_eq!(reasoning, "body");
     assert_eq!(owners[&1], vec![(9, 13, 0, 4, 1)]);
-    let mut deepseek = parser(ModelFormat::DeepSeekV41, tokenizer.clone(), &[]);
+    let mut deepseek = parser(
+        recipe::<DeepSeekV41Recipe>().as_ref(),
+        tokenizer.clone(),
+        &[],
+    );
     let mut events = deepseek.feed(&[id(&tokenizer, "aĊĊ<")]).unwrap();
     events.extend(deepseek.feed(&[id(&tokenizer, "x")]).unwrap());
     events.extend(deepseek.finish(FinishReason::Length).unwrap());
@@ -260,31 +279,31 @@ fn transformed_tools_have_no_fabricated_provenance_and_serde_keeps_flat_events()
     let tokenizer = tokenizer(false, &[]);
     for (model, open, body, close) in [
         (
-            ModelFormat::Inkling,
+            recipe::<InklingRecipe>(),
             "<|content_invoke_tool_json|>",
             r#"{"name":"f","args":{"a":1}}"#,
             "<|content_text|>",
         ),
         (
-            ModelFormat::Qwen,
+            recipe::<Qwen38Recipe>(),
             "<tool_call>",
             "<function=f><parameter=a>1</parameter></function>",
             "</tool_call>",
         ),
         (
-            ModelFormat::Gemma,
+            recipe::<Gemma4Recipe>(),
             "<|tool_call>",
             "call:f{a:1}",
             "<tool_call|>",
         ),
         (
-            ModelFormat::Lfm2,
+            recipe::<Lfm2Recipe>(),
             "<|tool_call_start|>",
             "[f(a=1)]",
             "<|tool_call_end|>",
         ),
     ] {
-        let mut parser = parser(model, tokenizer.clone(), &[]);
+        let mut parser = parser(model.as_ref(), tokenizer.clone(), &[]);
         let mut ids = vec![id(&tokenizer, open)];
         ids.extend(bytes(body));
         ids.push(id(&tokenizer, close));
@@ -296,7 +315,7 @@ fn transformed_tools_have_no_fabricated_provenance_and_serde_keeps_flat_events()
         );
         assert!(events.iter().all(|event| event.spans.is_empty()));
     }
-    let mut parser = parser(ModelFormat::Qwen, tokenizer, &[]);
+    let mut parser = parser(recipe::<Qwen38Recipe>().as_ref(), tokenizer, &[]);
     let event = parser.feed(&bytes("x")).unwrap().pop().unwrap();
     let value = serde_json::to_value(&event).unwrap();
     assert_eq!(value["type"], "text_delta");
@@ -335,7 +354,7 @@ fn source_bytes_share_decoder_conventions_and_unsupported_chains_fail_upfront() 
 #[test]
 fn qwen_and_deepseek_tool_channel_hints_exclude_deferred_content() {
     let tokenizer = tokenizer(false, &[]);
-    let mut qwen = parser(ModelFormat::Qwen, tokenizer.clone(), &[]);
+    let mut qwen = parser(recipe::<Qwen38Recipe>().as_ref(), tokenizer.clone(), &[]);
     assert_eq!(qwen.token_channel(u32::from(b'x')), None);
     let open = id(&tokenizer, "<tool_call>");
     assert_eq!(qwen.token_channel(open), Some("control"));
@@ -347,7 +366,11 @@ fn qwen_and_deepseek_tool_channel_hints_exclude_deferred_content() {
     qwen.feed(&[id(&tokenizer, "<think>")]).unwrap();
     assert_eq!(qwen.token_channel(u32::from(b'x')), None);
 
-    let mut deepseek = parser(ModelFormat::DeepSeekV41, tokenizer.clone(), &[]);
+    let mut deepseek = parser(
+        recipe::<DeepSeekV41Recipe>().as_ref(),
+        tokenizer.clone(),
+        &[],
+    );
     deepseek.feed(&bytes("\n\n<")).unwrap();
     assert_eq!(deepseek.token_channel(u32::from(b'x')), None);
     deepseek.feed(&[id(&tokenizer, "｜DSML｜")]).unwrap();

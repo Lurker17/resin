@@ -1,4 +1,5 @@
 //! Inkling's pinned template; user text never becomes a control token.
+use super::{InklingParser, InklingRecipe, InklingTokens};
 use crate::render::{function, object_arguments, option, value_or};
 use crate::{Error, Prompt};
 use serde_json::{Value, json};
@@ -49,145 +50,174 @@ fn emit_effort(prompt: &mut Prompt, effort: &str) {
         &format!("Thinking effort level: {effort}"),
     );
 }
-pub fn render(request: &Value) -> Result<Prompt, Error> {
-    let messages = request["messages"]
-        .as_array()
-        .ok_or_else(|| Error::new("messages must be an array"))?;
-    let mut prompt = Prompt::new();
-    if let Some(tools) = request["tools"]
-        .as_array()
-        .filter(|tools| !tools.is_empty())
-    {
-        let specs: Vec<Value> = tools
-            .iter()
-            .map(|tool| {
-                let function = function(tool);
-                json!({
-                    "description": value_or(&function["description"], json!("")),
-                    "name": function["name"],
-                    "parameters": value_or(&function["parameters"], json!({})),
-                    "type": value_or(&tool["type"], json!("function")),
-                })
-            })
-            .collect();
-        prompt
-            .special("<|message_system|>")
-            .text("tool_declare")
-            .special("<|content_xml|>")
-            .text(compact(&Value::Array(specs)))
-            .special("<|end_message|>");
-    }
-    let effort = effort(request)?;
-    let mut effort_emitted = false;
-    for message in messages {
-        let role = message["role"].as_str().unwrap_or("");
-        let token = match role {
-            "system" => "<|message_system|>",
-            "user" => "<|message_user|>",
-            "assistant" => "<|message_model|>",
-            "tool" => "<|message_tool|>",
-            _ => return Err(Error::new(format!("unknown Inkling message role: {role}"))),
-        };
-        if !effort_emitted && role != "system" {
-            emit_effort(&mut prompt, &effort);
-            effort_emitted = true;
-        }
-        if role == "tool" {
-            let name = message["name"]
-                .as_str()
-                .filter(|v| !v.is_empty())
-                .or_else(|| {
-                    let id = message["tool_call_id"].as_str()?;
-                    messages
-                        .iter()
-                        .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
-                        .filter(|call| call["id"].as_str() == Some(id))
-                        .filter_map(|call| call["function"]["name"].as_str())
-                        .next_back()
-                })
-                .unwrap_or("");
-            prompt
-                .special(token)
-                .text(name)
-                .special("<|content_text|>")
-                .text(message["content"].as_str().unwrap_or(""))
-                .special("<|end_message|>");
-            continue;
-        }
-        if role == "assistant"
-            && let Some(reasoning) = message["reasoning_content"]
-                .as_str()
-                .filter(|v| !v.is_empty())
+
+impl crate::Recipe for InklingRecipe {
+    fn render(&self, request: &Value) -> Result<crate::Prompt, crate::Error> {
+        let request = crate::recipe::request("inkling", &self.params, request)?;
+        let request = &request;
+        let messages = request["messages"]
+            .as_array()
+            .ok_or_else(|| Error::new("messages must be an array"))?;
+        let mut prompt = Prompt::new();
+        if let Some(tools) = request["tools"]
+            .as_array()
+            .filter(|tools| !tools.is_empty())
         {
-            block(&mut prompt, token, "<|content_thinking|>", reasoning);
+            let specs: Vec<Value> = tools
+                .iter()
+                .map(|tool| {
+                    let function = function(tool);
+                    json!({
+                        "description": value_or(&function["description"], json!("")),
+                        "name": function["name"],
+                        "parameters": value_or(&function["parameters"], json!({})),
+                        "type": value_or(&tool["type"], json!("function")),
+                    })
+                })
+                .collect();
+            prompt
+                .special("<|message_system|>")
+                .text("tool_declare")
+                .special("<|content_xml|>")
+                .text(compact(&Value::Array(specs)))
+                .special("<|end_message|>");
         }
-        match &message["content"] {
-            Value::String(text) => block(&mut prompt, token, "<|content_text|>", text),
-            Value::Array(parts) => {
-                for part in parts {
-                    if let Some(text) = part.as_str() {
-                        block(&mut prompt, token, "<|content_text|>", text);
-                        continue;
-                    }
-                    match part["type"].as_str().unwrap_or("text") {
-                        "text" | "input_text" => block(
-                            &mut prompt,
-                            token,
-                            "<|content_text|>",
-                            part["text"].as_str().unwrap_or(""),
-                        ),
-                        "image" | "input_image" | "image_url" => {
-                            prompt
-                                .special(token)
-                                .special("<|content_image|>")
-                                .special("<|unused_200054|>")
-                                .special("<|end_message|>");
-                        }
-                        "audio" | "input_audio" | "audio_url" => {
-                            prompt
-                                .special(token)
-                                .special("<|content_audio_input|>")
-                                .special("<|unused_200053|>")
-                                .special("<|audio_end|>")
-                                .special("<|end_message|>");
-                        }
-                        other => {
-                            return Err(Error::new(format!(
-                                "unsupported Inkling content part: {other}"
-                            )));
-                        }
-                    }
-                }
+        let effort = effort(request)?;
+        let mut effort_emitted = false;
+        for message in messages {
+            let role = message["role"].as_str().unwrap_or("");
+            let token = match role {
+                "system" => "<|message_system|>",
+                "user" => "<|message_user|>",
+                "assistant" => "<|message_model|>",
+                "tool" => "<|message_tool|>",
+                _ => return Err(Error::new(format!("unknown Inkling message role: {role}"))),
+            };
+            if !effort_emitted && role != "system" {
+                emit_effort(&mut prompt, &effort);
+                effort_emitted = true;
             }
-            _ => (),
-        }
-        if role == "assistant" {
-            for call in message["tool_calls"].as_array().into_iter().flatten() {
-                let function = &call["function"];
-                let name = function["name"]
+            if role == "tool" {
+                let name = message["name"]
                     .as_str()
-                    .ok_or_else(|| Error::new("tool call function name must be a string"))?;
-                let args = value_or(&function["arguments"], json!({}));
-                let args = object_arguments(&args)?;
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| {
+                        let id = message["tool_call_id"].as_str()?;
+                        messages
+                            .iter()
+                            .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+                            .filter(|call| call["id"].as_str() == Some(id))
+                            .filter_map(|call| call["function"]["name"].as_str())
+                            .next_back()
+                    })
+                    .unwrap_or("");
                 prompt
                     .special(token)
                     .text(name)
-                    .special("<|content_invoke_tool_json|>")
-                    .text(format!(
-                        "{{\"name\":{},\"args\":{}}}",
-                        compact(&Value::String(name.into())),
-                        compact(&Value::Object(args.into_owned()))
-                    ))
+                    .special("<|content_text|>")
+                    .text(message["content"].as_str().unwrap_or(""))
                     .special("<|end_message|>");
+                continue;
             }
-            prompt.special("<|content_model_end_sampling|>");
+            if role == "assistant"
+                && let Some(reasoning) = message["reasoning_content"]
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+            {
+                block(&mut prompt, token, "<|content_thinking|>", reasoning);
+            }
+            match &message["content"] {
+                Value::String(text) => block(&mut prompt, token, "<|content_text|>", text),
+                Value::Array(parts) => {
+                    for part in parts {
+                        if let Some(text) = part.as_str() {
+                            block(&mut prompt, token, "<|content_text|>", text);
+                            continue;
+                        }
+                        match part["type"].as_str().unwrap_or("text") {
+                            "text" | "input_text" => block(
+                                &mut prompt,
+                                token,
+                                "<|content_text|>",
+                                part["text"].as_str().unwrap_or(""),
+                            ),
+                            "image" | "input_image" | "image_url" => {
+                                prompt
+                                    .special(token)
+                                    .special("<|content_image|>")
+                                    .special("<|unused_200054|>")
+                                    .special("<|end_message|>");
+                            }
+                            "audio" | "input_audio" | "audio_url" => {
+                                prompt
+                                    .special(token)
+                                    .special("<|content_audio_input|>")
+                                    .special("<|unused_200053|>")
+                                    .special("<|audio_end|>")
+                                    .special("<|end_message|>");
+                            }
+                            other => {
+                                return Err(Error::new(format!(
+                                    "unsupported Inkling content part: {other}"
+                                )));
+                            }
+                        }
+                    }
+                }
+                _ => (),
+            }
+            if role == "assistant" {
+                for call in message["tool_calls"].as_array().into_iter().flatten() {
+                    let function = &call["function"];
+                    let name = function["name"]
+                        .as_str()
+                        .ok_or_else(|| Error::new("tool call function name must be a string"))?;
+                    let args = value_or(&function["arguments"], json!({}));
+                    let args = object_arguments(&args)?;
+                    prompt
+                        .special(token)
+                        .text(name)
+                        .special("<|content_invoke_tool_json|>")
+                        .text(format!(
+                            "{{\"name\":{},\"args\":{}}}",
+                            compact(&Value::String(name.into())),
+                            compact(&Value::Object(args.into_owned()))
+                        ))
+                        .special("<|end_message|>");
+                }
+                prompt.special("<|content_model_end_sampling|>");
+            }
         }
+        if !effort_emitted {
+            emit_effort(&mut prompt, &effort);
+        }
+        if option(request, "add_generation_prompt")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            prompt.special("<|message_model|>");
+        }
+        Ok(prompt)
     }
-    if !effort_emitted {
-        emit_effort(&mut prompt, &effort);
+    fn create_parser(
+        &self,
+        encoder: &dyn crate::Encoder,
+        decoder: Box<dyn crate::Decoder>,
+        _request: &Value,
+        prompt_ids: &[u32],
+    ) -> Result<Box<dyn crate::ResponseParser>, crate::Error> {
+        Ok(Box::new(InklingParser::new(
+            InklingTokens::resolve(encoder)?,
+            decoder,
+            prompt_ids,
+        )?))
     }
-    if request["add_generation_prompt"].as_bool().unwrap_or(true) {
-        prompt.special("<|message_model|>");
+    fn stop_token_ids(&self, encoder: &dyn crate::Encoder) -> Result<Vec<u32>, crate::Error> {
+        Ok(vec![encoder.special_id("<|content_model_end_sampling|>")?])
     }
-    Ok(prompt)
+    fn media_config(&self) -> Option<crate::MediaConfig> {
+        Some(crate::MediaConfig::Inkling(
+            self.params.media_config.clone().unwrap_or_default(),
+        ))
+    }
 }

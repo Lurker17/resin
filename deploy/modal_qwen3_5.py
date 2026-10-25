@@ -15,7 +15,7 @@ import resin
 from deploy.graph_validation import capture_cuda_graphs, validate_prefill_graphs
 from deploy.modal_image import build_modal_image
 from resin.backend.parallel import monitor_process_context
-from resin.recipe import Qwen38Recipe
+from resin.recipe import get_native_recipe
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_ID = "RadixArk/Qwen3.8-27B-NVFP4"
@@ -199,7 +199,7 @@ def _build_runtime(
     processor = AutoProcessor.from_pretrained(
         MODEL_PATH, local_files_only=True, trust_remote_code=False
     )
-    recipe = Qwen38Recipe(processor)
+    recipe = get_native_recipe("qwen3_8", processor)
     graph_started = time.perf_counter()
     graph_stats = capture_cuda_graphs(runner)
     graph_capture_s = time.perf_counter() - graph_started

@@ -18,7 +18,7 @@ import modal
 import resin
 from deploy.checkpoint_cache import checkpoint_is_complete
 from deploy.modal_image import build_modal_image
-from resin.recipe import DeepSeekV41Recipe
+from resin.recipe import get_native_recipe
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
@@ -106,7 +106,9 @@ def _serve_rank(rank: int, port: int) -> None:
         flush=True,
     )
     runner.capture_cuda_graphs()
-    recipe = DeepSeekV41Recipe(Tokenizer.from_file(str(CHECKPOINT / "tokenizer.json")))
+    recipe = get_native_recipe(
+        "deepseek_v41", Tokenizer.from_file(str(CHECKPOINT / "tokenizer.json"))
+    )
     engine = DistributedEngine(
         DistributedWorker(runner, groups),
         max_running_requests=MAX_SEQUENCES,

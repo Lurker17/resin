@@ -7,11 +7,11 @@ pub mod inkling;
 mod json;
 pub mod lfm2;
 pub mod media;
-mod model;
 mod parser;
 mod prompt;
 mod provenance;
 pub mod qwen;
+mod recipe;
 mod render;
 mod tokenizer;
 
@@ -24,10 +24,10 @@ pub use gemma::{Gemma4Parser, Gemma4Tokens};
 pub use gpt_oss::{GptOssParser, GptOssTokens};
 pub use inkling::{InklingParser, InklingTokens};
 pub use lfm2::{Lfm2Parser, Lfm2Tokens};
-pub use model::ModelFormat;
 pub use prompt::{Encoder, Prompt, PromptSpan, TokenizerEncoder};
 pub use provenance::{AttributedEvent, AttributedText, TokenSpan};
 pub use qwen::{QwenParser, QwenTokens};
+pub use recipe::{BlockKind, MediaConfig, MessagePolicy, ReasoningEffort, Recipe, ToolScope};
 pub use tokenizer::{TokenBytes, Tokenizer, TokenizerDecoder};
 
 /// A semantic response event, shared by streaming and complete responses.

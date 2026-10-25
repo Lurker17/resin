@@ -1,3 +1,4 @@
+use resin_recipe::{Recipe, lfm2::Lfm2Recipe};
 mod common;
 use common::SemanticParser;
 
@@ -75,7 +76,7 @@ fn rendering_matches_pinned_huggingface_template() {
     // LiquidAI/LFM2.5-230M@13a53837c4906b4f7405932532ba85d182bb013b.
     for line in include_str!("fixtures/lfm2_prompts.jsonl").lines() {
         let fixture: Value = serde_json::from_str(line).unwrap();
-        let prompt = resin_recipe::lfm2::render(&fixture["request"]).unwrap();
+        let prompt = Lfm2Recipe::default().render(&fixture["request"]).unwrap();
         assert_eq!(
             prompt.rendered_text(),
             fixture["expected"].as_str().unwrap()
@@ -183,13 +184,13 @@ fn escaped_unicode_surrogate_pairs_in_json_arguments_decode_to_unicode() {
 
 #[test]
 fn json_string_history_arguments_are_accepted_at_the_api_boundary() {
-    let prompt = resin_recipe::lfm2::render(&json!({"messages":[{"role":"assistant","tool_calls":[{"function":{"name":"f","arguments":"{\"n\": true}"}}]}]})).unwrap();
+    let prompt = Lfm2Recipe::default().render(&json!({"messages":[{"role":"assistant","tool_calls":[{"function":{"name":"f","arguments":"{\"n\": true}"}}]}]})).unwrap();
     assert!(prompt.rendered_text().contains("[f(n=True)]"));
 }
 
 #[test]
 fn python_repr_uses_pinned_unicode_15_1_printability() {
-    let prompt = resin_recipe::lfm2::render(&json!({"messages":[{"role":"assistant","tool_calls":[{"function":{"name":"f","arguments":{"xs":["\u{13460}\u{2ebf0}\0"]}}}]}]})).unwrap();
+    let prompt = Lfm2Recipe::default().render(&json!({"messages":[{"role":"assistant","tool_calls":[{"function":{"name":"f","arguments":{"xs":["\u{13460}\u{2ebf0}\0"]}}}]}]})).unwrap();
     assert!(
         prompt
             .rendered_text()

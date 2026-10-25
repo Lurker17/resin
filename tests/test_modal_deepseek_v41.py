@@ -13,7 +13,7 @@ from deploy import modal_deepseek_v41 as deployment
 from resin import Engine
 from resin.backend import distributed
 from resin.backend.topology import ParallelGroups
-from resin.recipe import DeepSeekV41Recipe
+from resin.recipe import NativeRecipe
 from resin.server import HttpServer
 from resin_models_cuda.deepseek_v41 import cuda as runner_module
 from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
@@ -23,7 +23,7 @@ from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
 def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail):
     calls = []
     groups = SimpleNamespace(rank=rank)
-    render = DeepSeekV41Recipe.render
+    render = NativeRecipe.render
 
     def initialize(backend, **options):
         assert backend == "nccl"
@@ -142,7 +142,12 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
     monkeypatch.setattr(dist, "init_process_group", initialize)
     monkeypatch.setattr(ParallelGroups, "create", make_groups)
     monkeypatch.setattr(runner_module, "DeepSeekV41CudaRunner", Runner)
-    monkeypatch.setattr(deployment, "DeepSeekV41Recipe", Recipe)
+
+    def recipe_factory(name, tokenizer):
+        assert name == "deepseek_v41"
+        return Recipe(tokenizer)
+
+    monkeypatch.setattr(deployment, "get_native_recipe", recipe_factory)
     monkeypatch.setattr(tokenizers, "Tokenizer", SimpleNamespace(from_file=tokenizer))
     monkeypatch.setattr(distributed, "DistributedEngine", RequestEngine)
     monkeypatch.setattr(distributed, "DistributedWorker", Worker)

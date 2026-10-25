@@ -7,7 +7,7 @@ use pyo3::{
 };
 use pythonize::depythonize;
 use resin_recipe::{
-    Encoder, Error,
+    Encoder, Error, MediaConfig,
     media::{self, RgbImage, Source, Video},
 };
 use serde_json::{Value, json};
@@ -20,19 +20,6 @@ use crate::{
     recipe_types::MediaSources,
 };
 
-#[derive(Clone, Copy)]
-pub(crate) enum Kind {
-    DeepSeek,
-    Gemma,
-    Inkling,
-    Qwen,
-}
-pub(crate) enum Processor {
-    DeepSeek(media::deepseek::Config, Option<u32>),
-    Gemma(media::gemma::Config),
-    Inkling(media::inkling::Config),
-    Qwen(media::qwen::Config),
-}
 enum Payload {
     DeepSeek(media::deepseek::Prepared, u32),
     Gemma(media::gemma::Prepared, u32, u32),
@@ -44,7 +31,7 @@ pub(crate) struct Prepared {
     payload: Payload,
 }
 
-fn config_of(owner: &Bound<'_, PyAny>, name: &str) -> PyResult<Value> {
+pub(crate) fn config_of(owner: &Bound<'_, PyAny>, name: &str) -> PyResult<Value> {
     let Some(processor) = crate::recipe::optional_attr(owner, name)? else {
         return Ok(json!({}));
     };
@@ -53,150 +40,112 @@ fn config_of(owner: &Bound<'_, PyAny>, name: &str) -> PyResult<Value> {
     }
     Ok(depythonize(&processor.call_method0("to_dict")?)?)
 }
-impl Processor {
-    pub(crate) fn new(
-        kind: Kind,
-        owner: &Bound<'_, PyAny>,
-        config: Option<Value>,
-    ) -> PyResult<Self> {
-        let config = if let Some(config) = config {
-            config
-        } else {
-            match kind {
-                Kind::Gemma => {
-                    json!({"image_processor":config_of(owner,"image_processor")?,"video_processor":config_of(owner,"video_processor")?})
-                }
-                Kind::DeepSeek => json!({}),
-                _ => config_of(owner, "image_processor")?,
-            }
-        };
-        Ok(match kind {
-            Kind::DeepSeek => {
-                let marker = config
-                    .get("image_token_id")
-                    .filter(|v| !v.is_null())
-                    .map(|v| serde_json::from_value(v.clone()))
-                    .transpose()
-                    .map_err(error)?;
-                let cfg = config.get("vision_config").cloned().unwrap_or(config);
-                Self::DeepSeek(
-                    serde_json::from_value(if cfg.is_null() { json!({}) } else { cfg })
-                        .map_err(error)?,
-                    marker,
-                )
-            }
-            Kind::Gemma => Self::Gemma(serde_json::from_value(config).map_err(error)?),
-            Kind::Inkling => Self::Inkling(serde_json::from_value(config).map_err(error)?),
-            Kind::Qwen => Self::Qwen(serde_json::from_value(config).map_err(error)?),
-        })
-    }
-    pub(crate) fn process(
-        &self,
-        sources: Vec<Source>,
-        encoder: &dyn Encoder,
-    ) -> Result<Prepared, Error> {
-        let mut expansions = Vec::new();
-        if let Self::Gemma(config) = self {
-            let prepared = config.process(&sources)?;
-            let image_id = encoder.special_id("<|image|>")?;
-            let video_id = encoder.special_id("<|video|>")?;
-            let boi = encoder.special_id("<|image>")?;
-            let eoi = encoder.special_id("<image|>")?;
-            for expansion in &prepared.expansions {
-                let mut ids = Vec::new();
-                let mut prefix = String::new();
-                for (index, frame) in expansion.frames.iter().enumerate() {
-                    if let Some(timestamp) = &frame.timestamp {
-                        let text = format!("{timestamp} ");
-                        if index == 0 {
-                            prefix = text;
-                        } else {
-                            ids.extend(encoder.encode_text(&format!(" {text}"))?);
-                        }
-                    }
-                    ids.push(boi);
-                    ids.extend(std::iter::repeat_n(
-                        if expansion.is_video {
-                            video_id
-                        } else {
-                            image_id
-                        },
-                        frame.token_count,
-                    ));
-                    ids.push(eoi);
-                }
-                expansions.push(MediaTokens::from_parts(
-                    if expansion.is_video {
-                        "<|video|>"
+pub(crate) fn process(
+    config: &MediaConfig,
+    sources: Vec<Source>,
+    encoder: &dyn Encoder,
+) -> Result<Prepared, Error> {
+    let mut expansions = Vec::new();
+    if let MediaConfig::Gemma(config) = config {
+        let prepared = config.process(&sources)?;
+        let image_id = encoder.special_id("<|image|>")?;
+        let video_id = encoder.special_id("<|video|>")?;
+        let boi = encoder.special_id("<|image>")?;
+        let eoi = encoder.special_id("<image|>")?;
+        for expansion in &prepared.expansions {
+            let mut ids = Vec::new();
+            let mut prefix = String::new();
+            for (index, frame) in expansion.frames.iter().enumerate() {
+                if let Some(timestamp) = &frame.timestamp {
+                    let text = format!("{timestamp} ");
+                    if index == 0 {
+                        prefix = text;
                     } else {
-                        "<|image|>"
-                    },
-                    ids,
-                    prefix,
-                    String::new(),
-                ));
-            }
-            return Ok(Prepared {
-                expansions,
-                payload: Payload::Gemma(prepared, image_id, video_id),
-            });
-        }
-        let images = sources
-            .into_iter()
-            .map(|source| match source {
-                Source::Image(image) => Ok(image),
-                Source::Video(_) => Err(Error::new("this recipe does not support video input")),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let (counts, marker, payload) = match self {
-            Self::DeepSeek(config, expected) => {
-                let id = encoder.special_id("<｜deepseek_image｜>")?;
-                if expected.is_some_and(|v| v != id) {
-                    return Err(Error::new(
-                        "tokenizer image token does not match checkpoint image_token_id",
-                    ));
+                        ids.extend(encoder.encode_text(&format!(" {text}"))?);
+                    }
                 }
-                let prepared = config.process(&images)?;
-                (
-                    prepared.token_counts(),
-                    "<｜deepseek_image｜>",
-                    Payload::DeepSeek(prepared, id),
-                )
+                ids.push(boi);
+                ids.extend(std::iter::repeat_n(
+                    if expansion.is_video {
+                        video_id
+                    } else {
+                        image_id
+                    },
+                    frame.token_count,
+                ));
+                ids.push(eoi);
             }
-            Self::Inkling(config) => {
-                let id = encoder.special_id("<|unused_200054|>")?;
-                let prepared = config.process(&images)?;
-                (
-                    prepared.token_counts.clone(),
-                    "<|unused_200054|>",
-                    Payload::Inkling(prepared, id),
-                )
-            }
-            Self::Qwen(config) => {
-                let id = encoder.special_id("<|image_pad|>")?;
-                let prepared = config.process(&images)?;
-                (
-                    prepared.token_counts.clone(),
-                    "<|image_pad|>",
-                    Payload::Qwen(prepared, config.merge_size, id),
-                )
-            }
-            Self::Gemma(_) => unreachable!(),
-        };
-        let id = encoder.special_id(marker)?;
-        for count in counts {
             expansions.push(MediaTokens::from_parts(
-                marker,
-                vec![id; count],
-                String::new(),
+                if expansion.is_video {
+                    "<|video|>"
+                } else {
+                    "<|image|>"
+                },
+                ids,
+                prefix,
                 String::new(),
             ));
         }
-        Ok(Prepared {
+        return Ok(Prepared {
             expansions,
-            payload,
-        })
+            payload: Payload::Gemma(prepared, image_id, video_id),
+        });
     }
+    let images = sources
+        .into_iter()
+        .map(|source| match source {
+            Source::Image(image) => Ok(image),
+            Source::Video(_) => Err(Error::new("this recipe does not support video input")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (counts, marker, payload) = match config {
+        MediaConfig::DeepSeek(config, expected) => {
+            let id = encoder.special_id("<｜deepseek_image｜>")?;
+            if expected.is_some_and(|v| v != id) {
+                return Err(Error::new(
+                    "tokenizer image token does not match checkpoint image_token_id",
+                ));
+            }
+            let prepared = config.process(&images)?;
+            (
+                prepared.token_counts(),
+                "<｜deepseek_image｜>",
+                Payload::DeepSeek(prepared, id),
+            )
+        }
+        MediaConfig::Inkling(config) => {
+            let id = encoder.special_id("<|unused_200054|>")?;
+            let prepared = config.process(&images)?;
+            (
+                prepared.token_counts.clone(),
+                "<|unused_200054|>",
+                Payload::Inkling(prepared, id),
+            )
+        }
+        MediaConfig::Qwen(config) => {
+            let id = encoder.special_id("<|image_pad|>")?;
+            let prepared = config.process(&images)?;
+            (
+                prepared.token_counts.clone(),
+                "<|image_pad|>",
+                Payload::Qwen(prepared, config.merge_size, id),
+            )
+        }
+        MediaConfig::Gemma(_) => unreachable!(),
+    };
+    let id = encoder.special_id(marker)?;
+    for count in counts {
+        expansions.push(MediaTokens::from_parts(
+            marker,
+            vec![id; count],
+            String::new(),
+            String::new(),
+        ));
+    }
+    Ok(Prepared {
+        expansions,
+        payload,
+    })
 }
 impl Prepared {
     pub(crate) fn bind(

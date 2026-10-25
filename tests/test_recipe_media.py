@@ -12,7 +12,7 @@ import torch
 from recipe_fuzz.inputs import native_inputs
 
 import resin
-from resin.recipe import Gemma4Recipe, InklingRecipe, Qwen38Recipe
+from resin.recipe import get_native_recipe
 
 MODELS = (
     (
@@ -44,11 +44,7 @@ def model_processor(request):
         )
     except OSError:
         pytest.skip(f"pinned processor {repo}@{revision} is not cached")  # ty: ignore[too-many-positional-arguments]
-    constructor = {
-        "inkling": InklingRecipe,
-        "qwen3_5": Qwen38Recipe,
-        "gemma4": Gemma4Recipe,
-    }[model]
+    recipe_name = "qwen3_8" if model == "qwen3_5" else model
     image_config = processor.image_processor.to_dict()
     config = (
         {
@@ -58,7 +54,11 @@ def model_processor(request):
         if model == "gemma4"
         else image_config
     )
-    return model, processor, constructor(processor.tokenizer, media_config=config)
+    return (
+        model,
+        processor,
+        get_native_recipe(recipe_name, processor.tokenizer, media_config=config),
+    )
 
 
 def image():
@@ -140,7 +140,7 @@ def test_native_recipe_preserves_real_image_geometry_and_tools(model_processor):
 
 
 def test_native_recipe_matches_unresized_reference_pixels(model_processor):
-    model, processor, recipe = model_processor
+    model, processor, _recipe = model_processor
     config = processor.image_processor.to_dict()
     if model == "inkling":
         factor = config["size"]["height"]
@@ -157,7 +157,11 @@ def test_native_recipe_matches_unresized_reference_pixels(model_processor):
         images=[pixels], do_rescale=False, return_tensors="pt"
     )
     native_config = {"image_processor": config} if model == "gemma4" else config
-    configured = type(recipe)(processor.tokenizer, media_config=native_config)
+    configured = get_native_recipe(
+        "qwen3_8" if model == "qwen3_5" else model,
+        processor.tokenizer,
+        media_config=native_config,
+    )
     actual = configured.render(
         [
             resin.recipe.Message(

@@ -24,7 +24,7 @@ from tokenizers.pre_tokenizers import ByteLevel
 
 import resin
 from recipe_fuzz.harness import Case, Part, normalize
-from resin.recipe import GptOssRecipe
+from resin.recipe import get_native_recipe
 
 MARKERS = (
     "<|start|>",
@@ -46,7 +46,7 @@ class GptOssAdapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.recipe = GptOssRecipe(backend)
+        self.recipe = get_native_recipe("gpt_oss", backend)
         self.reference = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
         self.tml = renderers.GptOss()
         _, self.tml_parser = self.tml.render_for_completion(

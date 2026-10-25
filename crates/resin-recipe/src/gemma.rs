@@ -70,180 +70,6 @@ fn tool_response(prompt: &mut Prompt, name: &str, response: &Value) {
     prompt.text("}").special("<tool_response|>");
 }
 
-/// Render the pinned Gemma 4 template, preserving explicit control-token spans.
-pub fn render(request: &Value) -> Result<Prompt, Error> {
-    let messages = messages(request, "Gemma 4")?;
-    let tools = array(&request["tools"]);
-    let enable_thinking = option(request, "enable_thinking")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mut prompt = Prompt::new();
-    prompt.special("<bos>");
-    let system = matches!(string(&messages[0]["role"]), "system" | "developer");
-    let mut previous_kind = None;
-    if enable_thinking || !tools.is_empty() || system {
-        prompt.special("<|turn>").text("system\n");
-        if enable_thinking {
-            prompt.special("<|think|>").text("\n");
-            previous_kind = Some("think");
-        }
-        if system {
-            match messages[0].get("content") {
-                Some(Value::String(text)) => {
-                    prompt.text(text.trim());
-                }
-                Some(Value::Array(parts)) => {
-                    for part in parts {
-                        prompt.text(string(&part["text"]).trim()).text(" ");
-                    }
-                }
-                _ => {}
-            }
-        }
-        for tool in tools {
-            prompt.special("<|tool>");
-            values::declaration(&mut prompt, tool.get("function").unwrap_or(tool));
-            prompt.special("<tool|>");
-            previous_kind = Some("tool");
-        }
-        prompt.special("<turn|>").text("\n");
-    }
-    let messages = if system { &messages[1..] } else { messages };
-    let last_user = messages
-        .iter()
-        .rposition(|message| string(&message["role"]) == "user");
-    let mut previous_role = "";
-    for (index, message) in messages.iter().enumerate() {
-        let role = string(&message["role"]);
-        if role == "tool" {
-            continue;
-        }
-        if !matches!(
-            role,
-            "user" | "assistant" | "system" | "developer" | "model"
-        ) {
-            return Err(Error::new(format!("unsupported Gemma 4 role {role:?}")));
-        }
-        previous_kind = None;
-        let assistant = role == "assistant" || role == "model";
-        if !(assistant && previous_role == "assistant") {
-            prompt
-                .special("<|turn>")
-                .text(if assistant { "model" } else { role })
-                .text("\n");
-        }
-        previous_role = role;
-        let calls = array(&message["tool_calls"]);
-        let reasoning = message
-            .get("reasoning")
-            .filter(|value| truthy(value))
-            .or_else(|| message.get("reasoning_content"));
-        if !calls.is_empty()
-            && last_user.is_none_or(|last| index > last)
-            && let Some(reasoning) = reasoning
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-        {
-            prompt
-                .special("<|channel>")
-                .text("thought\n")
-                .text(reasoning)
-                .text("\n")
-                .special("<channel|>");
-        }
-        for call in calls {
-            let function = function(call);
-            prompt
-                .special("<|tool_call>")
-                .text(format!("call:{}{{", string(&function["name"])));
-            match function.get("arguments") {
-                Some(Value::Object(arguments)) => {
-                    prompt.separated(values::sorted(arguments), ",", |prompt, (name, value)| {
-                        prompt.text(name).text(":");
-                        values::argument(prompt, value, false);
-                    });
-                }
-                Some(Value::String(arguments)) => {
-                    prompt.text(arguments);
-                }
-                _ => {}
-            }
-            prompt.text("}").special("<tool_call|>");
-            previous_kind = Some("tool_call");
-        }
-        let mut has_response = false;
-        let responses = array(&message["tool_responses"]);
-        if !responses.is_empty() {
-            for response in responses {
-                tool_response(
-                    &mut prompt,
-                    response
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown"),
-                    response.get("response").unwrap_or(&Value::Null),
-                );
-                has_response = true;
-                previous_kind = Some("tool_response");
-            }
-        } else if !calls.is_empty() {
-            for follow in messages[index + 1..]
-                .iter()
-                .take_while(|follow| string(&follow["role"]) == "tool")
-            {
-                let name = calls
-                    .iter()
-                    .rfind(|call| call.get("id") == follow.get("tool_call_id"))
-                    .map(|call| string(&function(call)["name"]))
-                    .unwrap_or_else(|| {
-                        follow
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown")
-                    });
-                let body = follow.get("content").unwrap_or(&Value::Null);
-                if let Some(parts) = body.as_array() {
-                    let text = parts
-                        .iter()
-                        .filter(|part| string(&part["type"]) == "text")
-                        .map(|part| string(&part["text"]))
-                        .collect::<String>();
-                    tool_response(&mut prompt, name, &Value::String(text));
-                } else {
-                    tool_response(&mut prompt, name, body);
-                }
-                has_response = true;
-                previous_kind = Some("tool_response");
-            }
-        }
-        let mut body = Prompt::new();
-        if let Some(kind) = content(&mut body, message.get("content"), assistant) {
-            previous_kind = Some(kind);
-        }
-        let has_content = !body.rendered_text().trim().is_empty();
-        prompt.append(body);
-        if previous_kind == Some("tool_call") && !has_response {
-            prompt.special("<|tool_response>");
-        } else if !(has_response && !has_content) {
-            prompt.special("<turn|>").text("\n");
-        }
-    }
-    if option(request, "add_generation_prompt")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-        && !matches!(previous_kind, Some("tool_response" | "tool_call"))
-    {
-        prompt.special("<|turn>").text("model\n");
-        if !enable_thinking {
-            prompt
-                .special("<|channel>")
-                .text("thought\n")
-                .special("<channel|>");
-        }
-    }
-    Ok(prompt)
-}
-
 use crate::parser::{EventSink, Grammar, Parser, emit_tool, tokens};
 
 tokens! { Gemma4Tokens {
@@ -392,5 +218,241 @@ impl Grammar for Gemma4Grammar {
     fn finish(&mut self, _reason: FinishReason, _events: &mut EventSink) -> Result<(), Error> {
         self.tool.clear();
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Gemma4RecipeParams {
+    pub add_generation_prompt: Option<bool>,
+    pub enable_thinking: Option<bool>,
+    #[serde(skip_serializing)]
+    pub media_config: Option<crate::media::gemma::Config>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Gemma4Recipe {
+    params: Gemma4RecipeParams,
+}
+
+impl Gemma4Recipe {
+    pub fn new(params: Gemma4RecipeParams) -> Self {
+        Self { params }
+    }
+}
+impl crate::Recipe for Gemma4Recipe {
+    fn message_policy(&self) -> crate::MessagePolicy {
+        crate::MessagePolicy {
+            assistant_order: &[
+                crate::BlockKind::Thinking,
+                crate::BlockKind::Call,
+                crate::BlockKind::Result,
+                crate::BlockKind::Text,
+            ],
+            reorder_wire_fields: true,
+            ..crate::MessagePolicy::STANDARD
+        }
+    }
+    fn render(&self, request: &Value) -> Result<crate::Prompt, crate::Error> {
+        let request = crate::recipe::request("gemma4", &self.params, request)?;
+        let request = &request;
+        let messages = messages(request, "Gemma 4")?;
+        let tools = array(&request["tools"]);
+        let enable_thinking = option(request, "enable_thinking")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut prompt = Prompt::new();
+        prompt.special("<bos>");
+        let system = matches!(string(&messages[0]["role"]), "system" | "developer");
+        let mut previous_kind = None;
+        if enable_thinking || !tools.is_empty() || system {
+            prompt.special("<|turn>").text("system\n");
+            if enable_thinking {
+                prompt.special("<|think|>").text("\n");
+                previous_kind = Some("think");
+            }
+            if system {
+                match messages[0].get("content") {
+                    Some(Value::String(text)) => {
+                        prompt.text(text.trim());
+                    }
+                    Some(Value::Array(parts)) => {
+                        for part in parts {
+                            prompt.text(string(&part["text"]).trim()).text(" ");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for tool in tools {
+                prompt.special("<|tool>");
+                values::declaration(&mut prompt, tool.get("function").unwrap_or(tool));
+                prompt.special("<tool|>");
+                previous_kind = Some("tool");
+            }
+            prompt.special("<turn|>").text("\n");
+        }
+        let messages = if system { &messages[1..] } else { messages };
+        let last_user = messages
+            .iter()
+            .rposition(|message| string(&message["role"]) == "user");
+        let mut previous_role = "";
+        for (index, message) in messages.iter().enumerate() {
+            let role = string(&message["role"]);
+            if role == "tool" {
+                continue;
+            }
+            if !matches!(
+                role,
+                "user" | "assistant" | "system" | "developer" | "model"
+            ) {
+                return Err(Error::new(format!("unsupported Gemma 4 role {role:?}")));
+            }
+            previous_kind = None;
+            let assistant = role == "assistant" || role == "model";
+            if !(assistant && previous_role == "assistant") {
+                prompt
+                    .special("<|turn>")
+                    .text(if assistant { "model" } else { role })
+                    .text("\n");
+            }
+            previous_role = role;
+            let calls = array(&message["tool_calls"]);
+            let reasoning = message
+                .get("reasoning")
+                .filter(|value| truthy(value))
+                .or_else(|| message.get("reasoning_content"));
+            if !calls.is_empty()
+                && last_user.is_none_or(|last| index > last)
+                && let Some(reasoning) = reasoning
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+            {
+                prompt
+                    .special("<|channel>")
+                    .text("thought\n")
+                    .text(reasoning)
+                    .text("\n")
+                    .special("<channel|>");
+            }
+            for call in calls {
+                let function = function(call);
+                prompt
+                    .special("<|tool_call>")
+                    .text(format!("call:{}{{", string(&function["name"])));
+                match function.get("arguments") {
+                    Some(Value::Object(arguments)) => {
+                        prompt.separated(
+                            values::sorted(arguments),
+                            ",",
+                            |prompt, (name, value)| {
+                                prompt.text(name).text(":");
+                                values::argument(prompt, value, false);
+                            },
+                        );
+                    }
+                    Some(Value::String(arguments)) => {
+                        prompt.text(arguments);
+                    }
+                    _ => {}
+                }
+                prompt.text("}").special("<tool_call|>");
+                previous_kind = Some("tool_call");
+            }
+            let mut has_response = false;
+            let responses = array(&message["tool_responses"]);
+            if !responses.is_empty() {
+                for response in responses {
+                    tool_response(
+                        &mut prompt,
+                        response
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown"),
+                        response.get("response").unwrap_or(&Value::Null),
+                    );
+                    has_response = true;
+                    previous_kind = Some("tool_response");
+                }
+            } else if !calls.is_empty() {
+                for follow in messages[index + 1..]
+                    .iter()
+                    .take_while(|follow| string(&follow["role"]) == "tool")
+                {
+                    let name = calls
+                        .iter()
+                        .rfind(|call| call.get("id") == follow.get("tool_call_id"))
+                        .map(|call| string(&function(call)["name"]))
+                        .unwrap_or_else(|| {
+                            follow
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                        });
+                    let body = follow.get("content").unwrap_or(&Value::Null);
+                    if let Some(parts) = body.as_array() {
+                        let text = parts
+                            .iter()
+                            .filter(|part| string(&part["type"]) == "text")
+                            .map(|part| string(&part["text"]))
+                            .collect::<String>();
+                        tool_response(&mut prompt, name, &Value::String(text));
+                    } else {
+                        tool_response(&mut prompt, name, body);
+                    }
+                    has_response = true;
+                    previous_kind = Some("tool_response");
+                }
+            }
+            let mut body = Prompt::new();
+            if let Some(kind) = content(&mut body, message.get("content"), assistant) {
+                previous_kind = Some(kind);
+            }
+            let has_content = !body.rendered_text().trim().is_empty();
+            prompt.append(body);
+            if previous_kind == Some("tool_call") && !has_response {
+                prompt.special("<|tool_response>");
+            } else if !(has_response && !has_content) {
+                prompt.special("<turn|>").text("\n");
+            }
+        }
+        if option(request, "add_generation_prompt")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+            && !matches!(previous_kind, Some("tool_response" | "tool_call"))
+        {
+            prompt.special("<|turn>").text("model\n");
+            if !enable_thinking {
+                prompt
+                    .special("<|channel>")
+                    .text("thought\n")
+                    .special("<channel|>");
+            }
+        }
+        Ok(prompt)
+    }
+    fn create_parser(
+        &self,
+        encoder: &dyn crate::Encoder,
+        decoder: Box<dyn crate::Decoder>,
+        _request: &Value,
+        prompt_ids: &[u32],
+    ) -> Result<Box<dyn crate::ResponseParser>, crate::Error> {
+        Ok(Box::new(Gemma4Parser::new(
+            Gemma4Tokens::resolve(encoder)?,
+            decoder,
+            prompt_ids,
+        )?))
+    }
+    fn stop_token_ids(&self, encoder: &dyn crate::Encoder) -> Result<Vec<u32>, crate::Error> {
+        Ok(vec![
+            encoder.special_id("<turn|>")?,
+            encoder.special_id("<eos>")?,
+        ])
+    }
+    fn media_config(&self) -> Option<crate::MediaConfig> {
+        Some(crate::MediaConfig::Gemma(
+            self.params.media_config.clone().unwrap_or_default(),
+        ))
     }
 }

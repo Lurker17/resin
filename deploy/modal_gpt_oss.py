@@ -44,7 +44,7 @@ from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLay
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.parallel import monitor_process_context
 from resin.backend.topology import ParallelGroups
-from resin.recipe import GptOssRecipe
+from resin.recipe import NativeRecipe, Recipe, get_native_recipe
 from resin.server import HttpServer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -244,7 +244,7 @@ def _require_cached_model(model_key: str) -> tuple[Path, dict[str, object]]:
 
 def _load_recipe(
     model_path: Path,
-) -> tuple[PreTrainedTokenizerBase, GptOssRecipe]:
+) -> tuple[PreTrainedTokenizerBase, NativeRecipe]:
     tokenizer_path = model_path / "tokenizer.json"
     if not tokenizer_path.is_file():
         raise RuntimeError(
@@ -256,13 +256,15 @@ def _load_recipe(
             str(model_path), local_files_only=True, trust_remote_code=False
         ),
     )
-    recipe = GptOssRecipe(
-        tokenizer, options=resin.recipe.RenderOptions(reasoning_effort="medium")
+    recipe = get_native_recipe(
+        "gpt_oss",
+        tokenizer,
+        reasoning_effort="medium",
     )
     return tokenizer, recipe
 
 
-def _encode_prompt(recipe: GptOssRecipe, prompt: str) -> list[int]:
+def _encode_prompt(recipe: Recipe, prompt: str) -> list[int]:
     messages: list[resin.recipe.Message] = [
         resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(prompt)])
     ]
@@ -274,7 +276,7 @@ def _encode_prompt(recipe: GptOssRecipe, prompt: str) -> list[int]:
     return token_ids.tolist()
 
 
-def _generation_prefix_ids(recipe: GptOssRecipe, prompt: str) -> list[int]:
+def _generation_prefix_ids(recipe: Recipe, prompt: str) -> list[int]:
     """Return the harmony scaffolding the model continues from.
 
     The Engine returns sampled completion IDs only.  GPT-OSS starts its
@@ -528,14 +530,12 @@ def _run_prompt(
 def _render_prompt_report(
     report: dict[str, object],
     tokenizer: PreTrainedTokenizerBase,
-    recipe: GptOssRecipe,
+    parsed: dict[str, object],
     generation_prefix_ids: list[int],
-    prompt: resin.recipe.RenderedPrompt,
 ) -> dict[str, object]:
     raw_output_ids = report.pop("_output_ids", None)
     output_ids = cast(list[int], raw_output_ids)
     rendered_output_ids = generation_prefix_ids + output_ids
-    parsed = recipe.parse_response(output_ids, prompt=prompt)
     report.update(
         {
             "text": tokenizer.decode(
@@ -1357,9 +1357,10 @@ def _run_model(
         return _render_prompt_report(
             report,
             tokenizer,
-            recipe,
+            recipe.parse_response(
+                cast(list[int], report["_output_ids"]), prompt=rendered
+            ),
             generation_prefix_ids,
-            rendered,
         )
 
     return run_cached_workload(kernel_cache_volume, workload)

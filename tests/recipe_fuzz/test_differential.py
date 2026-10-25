@@ -27,7 +27,7 @@ from recipe_fuzz.harness import (
 from recipe_fuzz.inputs import native_inputs
 from recipe_fuzz.lfm2 import Lfm2Adapter
 from recipe_fuzz.qwen import QwenAdapter
-from resin.recipe import InklingRecipe, InklingResponseParser, Tokenizer
+from resin.recipe import InklingResponseParser, Tokenizer, get_native_recipe
 
 MARKERS = (
     "message_system",
@@ -84,7 +84,7 @@ class InklingAdapter:
             f"<|{name}|>": backend.token_to_id(f"<|{name}|>") for name in MARKERS
         }
         assert all(token_id is not None for token_id in self.ids.values())
-        self.recipe = InklingRecipe(backend)
+        self.recipe = get_native_recipe("inkling", backend)
         self.tokenizer = Tokenizer(backend)
         assert self.tokenizer.is_native
         self.reference = tokenizers.O200kBaseChatTokenizer()

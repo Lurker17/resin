@@ -19,7 +19,7 @@ from resin import Engine, MediaInput, RunnerConfig, SamplingParams, SchedulerCon
 from resin.recipe import (
     DeepSeekV41Image,
     DeepSeekV41Media,
-    DeepSeekV41Recipe,
+    get_native_recipe,
     image_token_types,
 )
 
@@ -45,13 +45,15 @@ def _data_url(rgb):
 def recipe():
     tokenizer = Tokenizer.from_str(DeepSeekV41Adapter().recipe.tokenizer.to_str())
     tokenizer.add_special_tokens([IMAGE_TOKEN])
-    return DeepSeekV41Recipe(tokenizer)
+    return get_native_recipe("deepseek_v41", tokenizer)
 
 
 @pytest.mark.parametrize("case", FIXTURE["cases"])
 def test_native_pixels_preserve_published_geometry(case, recipe):
-    recipe = DeepSeekV41Recipe(
-        recipe.tokenizer, vision_config={"max_wh_ratio": case["max_wh_ratio"]}
+    recipe = get_native_recipe(
+        "deepseek_v41",
+        recipe.tokenizer,
+        vision_config={"max_wh_ratio": case["max_wh_ratio"]},
     )
     rgb = _pattern(case["width"], case["height"])
     media = recipe.render(
@@ -88,7 +90,9 @@ def test_native_pixels_preserve_published_geometry(case, recipe):
 def test_native_patch_order_and_normalization_are_exact_without_resizing(recipe):
     rgb = _pattern(28, 14)
     source = rgb.astype(np.float32) / 255
-    recipe = DeepSeekV41Recipe(recipe.tokenizer, vision_config={"min_pixels": 0})
+    recipe = get_native_recipe(
+        "deepseek_v41", recipe.tokenizer, vision_config={"min_pixels": 0}
+    )
     media = recipe.render(
         [
             resin.recipe.Message(

@@ -1,8 +1,16 @@
 # resin-recipe
 
 Stock model conversation formats, independent of Python, HTTP and GPU execution.
-`ModelFormat` selects a matching renderer, incremental parser and stop markers
-for GPT-OSS, DeepSeek V4.1, Inkling, Qwen3.5/3.8, Gemma4 or LFM2.5.
+Concrete recipes implement the `Recipe` trait for GPT-OSS, DeepSeek V4.1,
+Inkling, Qwen3.5/3.8, Gemma4 or LFM2.5. Each family owns serde construction
+parameters, such as `GptOssRecipeParams`, and its matching renderer, parser,
+message policy and stop markers.
+
+Rust callers construct a recipe once from its parameters. `render` merges and
+validates each request's `extra` controls against those defaults. The matching
+parser uses the same recipe parameters and the actual rendered prefix. Media
+configuration is captured at construction and stays outside per-request
+rendering controls.
 
 Model code describes format rules. Shared `Parser<G>` owns token batching,
 decoder boundaries, EOS handling and finalization; each grammar handles only
@@ -33,36 +41,15 @@ Inkling/Harmony/Qwen/Gemma/LFM commit validated calls at their closing marker;
 DeepSeek streams DSML calls and argument deltas as they arrive. Finalization does
 not invent complete arguments for an unfinished call.
 
-Python callers import concrete native classes such as
-`from resin.recipe import GptOssRecipe, Gemma4Recipe` and instantiate
-`GptOssRecipe(tokenizer)` or `Gemma4Recipe(processor)`. A media recipe snapshots
-processor configuration once; callers may instead supply a tokenizer and
-`media_config` mapping. Video inputs are decoded frames. `resin.recipe.Recipe`
-is a structural protocol. `render(messages, *, tools=(), options=None)` accepts typed `Message`
-content and returns `RenderedPrompt`, which exposes token IDs and prepared
-media. The recipe exposes its model stops as `recipe.stop_token_ids`.
-`prompt.token_ids` is a read-only NumPy `uint32` array; `recipe.stop_token_ids`
-returns a list of integers. Native recipe
-constructors accept `stop_token_ids=None` to infer model defaults, a sequence
-to replace them, or `[]` to disable token stopping. The protocol's `tokenizer`
-property is a normalized Resin `Tokenizer` snapshot, or `None` if vocabulary
-metadata is unavailable. Native recipes also offer `debug_render_text(...)`
-to inspect formatting without preparing media. `create_parser(prompt)` binds a fresh parser
-to the actual rendered prefix and options. A native prompt belongs to the
-recipe that rendered it.
+Python's `get_native_recipe(name, tokenizer_or_processor)` factory returns the
+common `NativeRecipe`, implementing the structural `Recipe` protocol. See the
+[Python API example](../../README.md#modal-http-endpoints) for construction,
+formatting defaults, typed messages, media preparation and Engine submission.
 
-`Message` holds a `Role` and ordered `Text`, `Thinking`, `Image`, `Video`, `Audio`,
-`ToolCall` or `ToolResult` blocks. Recipes validate model-specific roles, block
-orders and media support; the role enum can grow. Tool declarations and
-`RenderOptions` are separate rendering arguments. Qwen3.5 and Qwen3.8 select
-their distinct formats through explicit constructors.
-
-Pass `prompt.token_ids` and `prompt.media` to `Engine.submit`, and
-`recipe.stop_token_ids` to `SamplingParams`. HTTP serving uses the recipe's stops
-automatically. Each `create_parser(prompt)`
-call creates independent response state without retaining pixels. Custom
-Python recipes may construct `RenderedPrompt` themselves and supply their own
-parser; native recipes require a prompt rendered by the same recipe instance.
+A native `RenderedPrompt` belongs to the recipe instance that rendered it.
+Each `create_parser(prompt)` call creates independent response state without
+retaining pixels. Pass `recipe.stop_token_ids` to `SamplingParams` for direct
+Engine submissions; HTTP serving applies those stops automatically.
 
 These parsers use one common native handle; the HTTP actor consumes Rust events
 directly. Python callers receive immutable `ParserEvent` variants: `TextDelta`,

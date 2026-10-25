@@ -5,7 +5,7 @@ from tokenizers import Tokenizer
 
 import resin
 from resin import Engine, SamplingParams
-from resin.recipe import Lfm2Recipe
+from resin.recipe import get_native_recipe
 from resin_models_torch.lfm2 import DEFAULT_MODEL, DEFAULT_REVISION, Lfm2TorchRunner
 
 
@@ -14,7 +14,7 @@ def main() -> None:
 
     model = DEFAULT_MODEL
     tokenizer = Tokenizer.from_pretrained(model, revision=DEFAULT_REVISION)
-    recipe = Lfm2Recipe(tokenizer)
+    recipe = get_native_recipe("lfm2", tokenizer)
     conversation = [
         resin.recipe.Message(
             resin.recipe.Role.SYSTEM,

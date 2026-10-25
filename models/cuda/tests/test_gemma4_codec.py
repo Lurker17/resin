@@ -9,7 +9,7 @@ from PIL import Image
 from recipe_fuzz.gemma import GemmaAdapter
 
 import resin
-from resin.recipe import Gemma4Media, Gemma4Recipe
+from resin.recipe import Gemma4Media, get_native_recipe
 
 
 def _data_url() -> str:
@@ -24,7 +24,8 @@ def test_recipe_attaches_media_and_preserves_token_controls(source_kind) -> None
     tokenizer = GemmaAdapter().recipe.tokenizer
     image_id = tokenizer.token_to_id("<|image|>")
 
-    model_recipe = Gemma4Recipe(
+    model_recipe = get_native_recipe(
+        "gemma4",
         tokenizer,
         stop_token_ids=(1, 106),
         media_config={

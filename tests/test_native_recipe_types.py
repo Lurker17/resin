@@ -13,7 +13,7 @@ from test_http_lifecycle import post, running_server
 from test_recipe import _byte_tokenizer
 
 import resin
-from resin.recipe import InklingMedia
+from resin.recipe import InklingMedia, NativeRecipe, get_native_recipe
 
 
 def tokenizer():
@@ -61,8 +61,8 @@ def test_typed_inputs_own_json_values_and_copy_out_fields():
 
 def test_native_prompt_is_owned_bound_to_one_recipe_and_parsers_are_fresh():
     backend = tokenizer()
-    first = resin.recipe.GptOssRecipe(backend)
-    second = resin.recipe.GptOssRecipe(backend)
+    first = get_native_recipe("gpt_oss", backend)
+    second = get_native_recipe("gpt_oss", backend)
     prompt = first.render(
         [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])]
     )
@@ -130,7 +130,7 @@ def test_native_event_constructor_validates_span_storage(spans, error):
 
 
 def test_parser_does_not_retain_media_or_the_rendered_prompt():
-    native = resin.recipe.InklingRecipe(tokenizer())
+    native = get_native_recipe("inkling", tokenizer())
     pixels = np.zeros((40, 40, 3), dtype=np.float32)
     source = weakref.ref(pixels)
     messages = [
@@ -151,7 +151,7 @@ def test_parser_does_not_retain_media_or_the_rendered_prompt():
 
 
 def test_native_media_accounts_for_each_source():
-    native = resin.recipe.InklingRecipe(tokenizer())
+    native = get_native_recipe("inkling", tokenizer())
     valid = resin.recipe.Image(source=np.zeros((40, 40, 3), dtype=np.float32))
     prompt = native.render(
         [resin.recipe.Message(resin.recipe.Role.USER, [valid, valid])]
@@ -171,7 +171,7 @@ def test_native_media_accounts_for_each_source():
 
 
 def test_public_order_and_per_message_controls_are_not_silently_dropped():
-    native = resin.recipe.GptOssRecipe(tokenizer())
+    native = get_native_recipe("gpt_oss", tokenizer())
     messages = [
         resin.recipe.Message(
             resin.recipe.Role.ASSISTANT,
@@ -216,8 +216,10 @@ def test_public_order_and_per_message_controls_are_not_silently_dropped():
 
 
 def test_raw_tool_arguments_survive_without_json_reserialization():
-    native = resin.recipe.GptOssRecipe(
-        tokenizer(), options=resin.recipe.RenderOptions(use_system_prompt=False)
+    native = get_native_recipe(
+        "gpt_oss",
+        tokenizer(),
+        use_system_prompt=False,
     )
     raw = '{ "n": 1.00, "nested": [true, null] }'
     text = native.debug_render_text(
@@ -248,7 +250,7 @@ def test_native_http_lowering_matches_public_typed_messages():
             '<|"|>',
         ]
     )
-    native = resin.recipe.Gemma4Recipe(backend)
+    native = get_native_recipe("gemma4", backend)
     messages = [
         resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("Go")]),
         resin.recipe.Message(
@@ -326,33 +328,40 @@ def test_rendered_prompt_token_view_is_owned_readonly_and_outlives_prompt():
 
 
 @pytest.mark.parametrize(
-    ("constructor", "default_markers"),
+    ("recipe_name", "default_markers"),
     [
-        (resin.recipe.GptOssRecipe, ["<|return|>", "<|call|>"]),
-        (resin.recipe.DeepSeekV41Recipe, ["<｜end▁of▁sentence｜>"]),
-        (resin.recipe.InklingRecipe, ["<|content_model_end_sampling|>"]),
-        (resin.recipe.Qwen35Recipe, ["<|im_end|>", "<|endoftext|>"]),
-        (resin.recipe.Qwen38Recipe, ["<|im_end|>", "<|endoftext|>"]),
-        (resin.recipe.Gemma4Recipe, ["<turn|>", "<eos>"]),
-        (resin.recipe.Lfm2Recipe, ["<|im_end|>"]),
+        ("gpt_oss", ["<|return|>", "<|call|>"]),
+        ("deepseek_v41", ["<｜end▁of▁sentence｜>"]),
+        ("inkling", ["<|content_model_end_sampling|>"]),
+        ("qwen3_5", ["<|im_end|>", "<|endoftext|>"]),
+        ("qwen3_8", ["<|im_end|>", "<|endoftext|>"]),
+        ("gemma4", ["<turn|>", "<eos>"]),
+        ("lfm2", ["<|im_end|>"]),
     ],
 )
 def test_native_recipe_stop_defaults_and_overrides_share_one_contract(
-    constructor, default_markers
+    recipe_name, default_markers
 ):
     backend = tokenizer()
     backend.add_special_tokens(default_markers)
     expected = [backend.token_to_id(marker) for marker in default_markers]
-    default = constructor(backend)
+    default = get_native_recipe(recipe_name, backend)
+    assert type(default) is NativeRecipe and default.tokenizer.is_native
     assert isinstance(default.stop_token_ids, list)
     assert default.stop_token_ids == expected
-    assert constructor(backend, stop_token_ids=None).stop_token_ids == expected
-    assert constructor(backend, stop_token_ids=[]).stop_token_ids == []
+    for override, wanted in [(None, expected), ([], [])]:
+        assert (
+            get_native_recipe(
+                recipe_name, backend, stop_token_ids=override
+            ).stop_token_ids
+            == wanted
+        )
 
     source = [901, 902]
-    recipe = constructor(backend, stop_token_ids=source)
+    recipe = get_native_recipe(recipe_name, backend, stop_token_ids=source)
     source[0] = 999
     stops = recipe.stop_token_ids
+    assert isinstance(stops, list)
     assert stops == [901, 902]
     stops[0] = 0
     stops.append(903)

@@ -13,7 +13,7 @@ from tokenizers.pre_tokenizers import ByteLevel
 
 import resin
 from recipe_fuzz.harness import Case, Part, normalize
-from resin.recipe import Lfm2Recipe
+from resin.recipe import get_native_recipe
 
 MARKERS = (
     "<|startoftext|>",
@@ -35,7 +35,7 @@ class Lfm2Adapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.recipe = Lfm2Recipe(backend)
+        self.recipe = get_native_recipe("lfm2", backend)
         self.oracles = (("python-literal-ast", self.oracle),)
 
     @staticmethod

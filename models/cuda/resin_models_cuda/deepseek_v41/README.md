@@ -22,10 +22,10 @@ DeepSelect `bfa4507d`, and TileKernels 1.0.0; full revisions live in
 | `batch.py` | Prepare shared store slots, attention indices, compression lengths and state-page mappings once per forward. |
 | `yoco.py` | Select retained consumer queries and bound their SWA visibility over complete producer KV. |
 | `cache.py` | Typed zero-copy views over Engine-owned byte slabs and live page tables. |
-| `cuda.py` | Adapt the shared V4 serving runtime and prepare graph regions. |
+| `cuda.py` | Adapt the serving runtime and prepare graph regions. |
 | Shared Resin runtime | Scheduling, cache admission, graph lifecycle, sampling, scores and distributed steps. |
 
-`resin.recipe.DeepSeekV41Recipe` prepares typed image content independently of HTTP.
+`resin.recipe.get_native_recipe("deepseek_v41", tokenizer)` prepares typed image content independently of HTTP.
 Its resize, padding, normalization and patch order follow the pinned checkpoint's
 image processor. The Rust recipe expands trusted image slots; `DeepSeekV41Media`
 owns the CPU patches and includes their identity in prefix-cache keys. The runner

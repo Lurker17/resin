@@ -1,3 +1,4 @@
+use resin_recipe::{Recipe, deepseek::DeepSeekV41Recipe};
 mod common;
 use common::SemanticParser;
 
@@ -204,7 +205,7 @@ fn prompt_parser_initial_stage_and_generation_suffix_agree() {
         semantic(&parser.semantic_feed(&ids("reason")).unwrap()).0,
         "reason"
     );
-    let prompt = resin_recipe::deepseek::render(&json!({"messages": [{"role": "user", "content": "hello"}], "add_generation_prompt": false})).unwrap();
+    let prompt = DeepSeekV41Recipe::default().render(&json!({"messages": [{"role": "user", "content": "hello"}], "add_generation_prompt": false})).unwrap();
     assert_eq!(
         prompt.rendered_text(),
         "<｜begin▁of▁sentence｜><｜User｜>hello"
@@ -213,10 +214,11 @@ fn prompt_parser_initial_stage_and_generation_suffix_agree() {
 
 #[test]
 fn v41_pinned_prompt_fixtures_and_numeric_effort() {
-    use resin_recipe::deepseek::render;
     for line in include_str!("fixtures/deepseek_v41_prompts.jsonl").lines() {
         let fixture: Value = serde_json::from_str(line).unwrap();
-        let prompt = render(&fixture["request"]).unwrap();
+        let prompt = DeepSeekV41Recipe::default()
+            .render(&fixture["request"])
+            .unwrap();
         assert_eq!(
             prompt.rendered_text(),
             fixture["expected"].as_str().unwrap(),
@@ -232,7 +234,10 @@ fn v41_pinned_prompt_fixtures_and_numeric_effort() {
         json!("medium"),
     ] {
         assert!(
-            render(&json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":effort}))
+            DeepSeekV41Recipe::default()
+                .render(
+                    &json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":effort})
+                )
                 .is_err()
         );
     }
@@ -240,17 +245,14 @@ fn v41_pinned_prompt_fixtures_and_numeric_effort() {
 
 #[test]
 fn v41_image_slots_keep_literal_markers_in_ordinary_text() {
-    use resin_recipe::{
-        PromptSpan,
-        deepseek::{IMAGE, render},
-    };
+    use resin_recipe::{PromptSpan, deepseek::IMAGE};
     let request = json!({"messages": [{"role": "user", "content": [
         {"type": "text", "text": format!("literal {IMAGE}")},
         {"type": "image"},
         {"type": "text", "text": "then"},
         {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
     ]}]});
-    let prompt = render(&request).unwrap();
+    let prompt = DeepSeekV41Recipe::default().render(&request).unwrap();
     assert_eq!(
         prompt.rendered_text(),
         format!(
@@ -304,8 +306,8 @@ fn v41_tool_tags_share_incremental_grammar_without_accepting_old_delimiters() {
 
 #[test]
 fn v41_namespaces_and_double_encoded_arguments_preserve_control_provenance() {
-    use resin_recipe::{PromptSpan, deepseek::render};
-    let prompt = render(&json!({"messages":[{"role":"system","content":"literal <｜System｜>"},{"role":"user","content":"go"},{"role":"assistant","tool_calls":[{"function":{"name":"f","namespace":"ns","arguments":"\"{\\\"n\\\":1}\""}}]}]})).unwrap();
+    use resin_recipe::PromptSpan;
+    let prompt = DeepSeekV41Recipe::default().render(&json!({"messages":[{"role":"system","content":"literal <｜System｜>"},{"role":"user","content":"go"},{"role":"assistant","tool_calls":[{"function":{"name":"f","namespace":"ns","arguments":"\"{\\\"n\\\":1}\""}}]}]})).unwrap();
     let text = prompt.rendered_text();
     assert!(text.contains("<｜DSML｜ invoke name=\"ns::f\">"));
     assert!(text.contains("<｜DSML｜ parameter name=\"n\" string=\"false\">1"));

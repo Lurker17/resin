@@ -12,7 +12,7 @@ from transformers.utils.chat_template_utils import _compile_jinja_template
 
 import resin
 from recipe_fuzz.harness import Case, Part, normalize
-from resin.recipe import Gemma4Recipe
+from resin.recipe import get_native_recipe
 
 MARKERS = (
     "<bos>",
@@ -83,7 +83,7 @@ class GemmaAdapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.recipe = Gemma4Recipe(backend)
+        self.recipe = get_native_recipe("gemma4", backend)
         self.template = _compile_jinja_template(
             (Path(__file__).with_name("templates") / "gemma4.jinja").read_text()
         )

@@ -240,15 +240,15 @@ Because `requires_proxy_auth=False`, anyone with a URL can submit inference
 requests and incur GPU usage; remove the deployment when it is no longer
 needed.
 
-Construct a native recipe directly from its tokenizer or multimodal processor.
+Select a native recipe by name and supply its tokenizer or multimodal processor.
 Messages and content blocks are Rust-owned typed objects:
 
 ```python
 import resin
-from resin.recipe import GptOssRecipe
+from resin.recipe import get_native_recipe
 from resin.server import HttpServer
 
-recipe = GptOssRecipe(tokenizer)
+recipe = get_native_recipe("gpt_oss", tokenizer)
 prompt = recipe.render(
     [
         resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("Hello!")]),
@@ -265,9 +265,13 @@ owning token IDs, optional prepared media, and an internal parser seed.
 `recipe.stop_token_ids` returns a list of integers. Pass the recipe's stops to
 `SamplingParams(stop_token_ids=...)` when
 submitting a rendered prompt to an Engine; HTTP serving uses them automatically.
-Native recipes infer model stops by default. Their `stop_token_ids` constructor
-argument accepts a replacement sequence, with `None` selecting the defaults and
-`[]` disabling token stopping.
+The factory returns the common `NativeRecipe` implementation. Supported names
+are `gpt_oss`, `deepseek_v41`, `gemma4`, `inkling`, `lfm2`, `qwen3_5`, and
+`qwen3_8`. Supply formatting defaults directly, for example
+`get_native_recipe("gpt_oss", tokenizer, reasoning_effort="high")`.
+Native recipes infer model stops by default;
+`stop_token_ids=None` selects those defaults, a sequence replaces them, and
+`[]` disables token stopping.
 `create_parser(prompt)` creates a fresh incremental parser with the same resolved
 formatting options. It emits text, reasoning, and tool-call deltas; an optional
 `finish("stop" | "length")` flushes buffered output before completion.
@@ -280,7 +284,8 @@ use `render(...)` for generation.
 
 For images, put `resin.recipe.Image.from_rgb(array)` or
 `resin.recipe.Image.from_bytes(data, media_type="image/png")` in a message and pass
-the model's processor to its recipe, for example `Gemma4Recipe(processor)`.
+the model's processor to the factory, for example
+`get_native_recipe("gemma4", processor)`.
 The recipe snapshots processor configuration once; image/video requests then use
 Rust decoding, resizing, normalization and patchification. A tokenizer plus an
 explicit `media_config` mapping also works. Model-owned preprocessing supplies

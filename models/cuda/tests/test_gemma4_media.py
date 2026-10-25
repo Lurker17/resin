@@ -10,7 +10,7 @@ from recipe_fuzz.gemma import GemmaAdapter
 
 import resin
 from resin import Engine, MediaInput, MediaTokenSpan, SamplingParams
-from resin.recipe import Gemma4Media, Gemma4Recipe
+from resin.recipe import Gemma4Media, get_native_recipe
 
 
 def _png_bytes() -> bytes:
@@ -20,7 +20,8 @@ def _png_bytes() -> bytes:
 
 
 def test_encoded_image_boundary_is_bytes_plus_explicit_mime() -> None:
-    recipe = Gemma4Recipe(
+    recipe = get_native_recipe(
+        "gemma4",
         GemmaAdapter().recipe.tokenizer,
         media_config={
             "image_processor": {
@@ -130,8 +131,8 @@ def test_native_patches_match_reference_without_resize_and_own_input(is_video) -
         block = resin.recipe.Image.from_rgb(image)
         field = "image_processor"
     native_config = {**config, "do_sample_frames": False} if is_video else config
-    recipe = Gemma4Recipe(
-        GemmaAdapter().recipe.tokenizer, media_config={field: native_config}
+    recipe = get_native_recipe(
+        "gemma4", GemmaAdapter().recipe.tokenizer, media_config={field: native_config}
     )
     messages = [
         resin.recipe.Message(

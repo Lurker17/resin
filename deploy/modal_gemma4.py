@@ -19,7 +19,7 @@ from resin.backend.cuda.graphs import (
     default_decode_graph_shapes,
 )
 from resin.backend.parallel import monitor_process_context
-from resin.recipe import Gemma4Recipe
+from resin.recipe import Recipe, get_native_recipe
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_ID = "nvidia/Gemma-4-31B-IT-NVFP4"
@@ -207,7 +207,7 @@ def _synthetic_image(size: int = 96):
     return np.stack((horizontal, vertical, 1.0 - horizontal), axis=-1).copy()
 
 
-def _generate(engine, recipe: Gemma4Recipe, prompt: str, max_output_tokens: int):
+def _generate(engine, recipe: Recipe, prompt: str, max_output_tokens: int):
     from resin import SamplingParams
 
     prepared = recipe.render(
@@ -243,7 +243,7 @@ def _generate(engine, recipe: Gemma4Recipe, prompt: str, max_output_tokens: int)
     return media, lease.take_result(), steps
 
 
-def _warmup_text(engine, recipe: Gemma4Recipe) -> None:
+def _warmup_text(engine, recipe: Recipe) -> None:
     from resin import SamplingParams
 
     prepared = recipe.render(
@@ -282,7 +282,9 @@ def smoke_test(
         speculative_tokens=speculative_tokens, validate_graphs=True
     )
     try:
-        recipe = Gemma4Recipe(processor, stop_token_ids=runner.config.eos_token_ids)
+        recipe = get_native_recipe(
+            "gemma4", processor, stop_token_ids=runner.config.eos_token_ids
+        )
         warmup_started = time.perf_counter()
         _, _, warmup_steps = _generate(
             engine,
@@ -343,7 +345,9 @@ def _serve(_: int) -> None:
         speculative_tokens=PRODUCTION_SPECULATIVE_TOKENS
     )
     try:
-        recipe = Gemma4Recipe(processor, stop_token_ids=runner.config.eos_token_ids)
+        recipe = get_native_recipe(
+            "gemma4", processor, stop_token_ids=runner.config.eos_token_ids
+        )
         # Compile/load every exact kernel geometry before opening the socket.
         warmup, _, _ = _generate(engine, recipe, "Name the main colors.", 2)
         del warmup

@@ -1,5 +1,4 @@
 mod render;
-pub use render::render;
 
 use crate::parser::{EventSink, Grammar, Parser, emit_tool, tokens};
 use crate::{AttributedText, Decoder, Error, FinishReason};
@@ -124,5 +123,25 @@ impl Grammar for InklingGrammar {
     fn finish(&mut self, _reason: FinishReason, _events: &mut EventSink) -> Result<(), Error> {
         self.tool.clear();
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InklingRecipeParams {
+    pub add_generation_prompt: Option<bool>,
+    pub reasoning_effort: Option<crate::ReasoningEffort>,
+    #[serde(skip_serializing)]
+    pub media_config: Option<crate::media::inkling::Config>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InklingRecipe {
+    params: InklingRecipeParams,
+}
+
+impl InklingRecipe {
+    pub fn new(params: InklingRecipeParams) -> Self {
+        Self { params }
     }
 }

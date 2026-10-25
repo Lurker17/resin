@@ -15,7 +15,7 @@ import torch
 from PIL import Image
 
 import resin
-from resin.recipe import DeepSeekV41Recipe, Gemma4Recipe, InklingRecipe, Qwen35Recipe
+from resin.recipe import get_native_recipe
 
 
 class Tokenizer:
@@ -147,8 +147,8 @@ def test_image_sources_share_one_owned_rgb_boundary() -> None:
     Image.fromarray(pixels).save(encoded, format="PNG")
     raw = encoded.getvalue()
     rgb = pixels.astype(np.float32) / np.float32(255)
-    recipe = InklingRecipe(
-        Tokenizer(), media_config={"size": {"height": 2, "width": 2}}
+    recipe = get_native_recipe(
+        "inkling", Tokenizer(), media_config={"size": {"height": 2, "width": 2}}
     )
     sources = (
         resin.recipe.Image.from_rgb(rgb),
@@ -170,9 +170,9 @@ def test_image_sources_share_one_owned_rgb_boundary() -> None:
     assert np.array_equal(payloads[0].pixel_values, before)
 
 
-@pytest.mark.parametrize("constructor", [InklingRecipe, Qwen35Recipe])
-def test_image_only_recipes_reject_video(constructor) -> None:
-    recipe = constructor(Tokenizer())
+@pytest.mark.parametrize("recipe_name", ["inkling", "qwen3_5"])
+def test_image_only_recipes_reject_video(recipe_name) -> None:
+    recipe = get_native_recipe(recipe_name, Tokenizer())
     with pytest.raises(ValueError, match="image|video"):
         render_media(
             recipe,
@@ -181,7 +181,7 @@ def test_image_only_recipes_reject_video(constructor) -> None:
 
 
 def test_gemma_interleaved_geometry_and_atomic_spans() -> None:
-    recipe = Gemma4Recipe(Tokenizer(), media_config=GEMMA_CONFIG)
+    recipe = get_native_recipe("gemma4", Tokenizer(), media_config=GEMMA_CONFIG)
     first = np.full((2, 2, 3), 0.25, dtype=np.float32)
     second = np.full((2, 2, 3), 0.75, dtype=np.float32)
     frames = np.stack([np.full_like(first, 0.5), np.ones_like(first)])
@@ -234,7 +234,8 @@ def test_gemma_interleaved_geometry_and_atomic_spans() -> None:
 
 def test_qwen_and_inkling_native_patch_counts_and_layout() -> None:
     pixels = np.full((4, 8, 3), 0.5, dtype=np.float32)
-    qwen = Qwen35Recipe(
+    qwen = get_native_recipe(
+        "qwen3_5",
         Tokenizer(),
         media_config={
             "patch_size": 2,
@@ -255,7 +256,8 @@ def test_qwen_and_inkling_native_patch_counts_and_layout() -> None:
         media, "pixel_values", "image_grid_thw", "position_ids"
     )
     assert restored.rope_delta == media.rope_delta
-    inkling = InklingRecipe(
+    inkling = get_native_recipe(
+        "inkling",
         Tokenizer(),
         media_config={"size": {"height": 2, "width": 2}, "do_normalize": False},
     )
@@ -268,7 +270,9 @@ def test_qwen_and_inkling_native_patch_counts_and_layout() -> None:
 
 
 def test_deepseek_geometry_positions_and_cache_identity() -> None:
-    recipe = DeepSeekV41Recipe(Tokenizer(), vision_config={"min_pixels": 0})
+    recipe = get_native_recipe(
+        "deepseek_v41", Tokenizer(), vision_config={"min_pixels": 0}
+    )
     source = np.ones((14, 28, 3), dtype=np.float32)
     blocks = [
         resin.recipe.Image.from_rgb(source),
@@ -332,14 +336,14 @@ def test_native_media_does_not_import_python_image_or_tensor_libraries() -> None
 
         sys.meta_path.insert(0, BlockPythonMedia())
         cases = [
-            ('Gemma4Recipe', {{'media_config': {GEMMA_CONFIG!r}}}, (2, 2)),
-            ('Qwen35Recipe', {{'media_config': {{'patch_size': 2, 'merge_size': 2, 'do_resize': False}}}}, (4, 4)),
-            ('Qwen38Recipe', {{'media_config': {{'patch_size': 2, 'merge_size': 2, 'do_resize': False}}}}, (4, 4)),
-            ('InklingRecipe', {{'media_config': {{'size': {{'height': 2, 'width': 2}}}}}}, (2, 2)),
-            ('DeepSeekV41Recipe', {{'vision_config': {{'min_pixels': 0}}}}, (14, 14)),
+            ('gemma4', {{'media_config': {GEMMA_CONFIG!r}}}, (2, 2)),
+            ('qwen3_5', {{'media_config': {{'patch_size': 2, 'merge_size': 2, 'do_resize': False}}}}, (4, 4)),
+            ('qwen3_8', {{'media_config': {{'patch_size': 2, 'merge_size': 2, 'do_resize': False}}}}, (4, 4)),
+            ('inkling', {{'media_config': {{'size': {{'height': 2, 'width': 2}}}}}}, (2, 2)),
+            ('deepseek_v41', {{'vision_config': {{'min_pixels': 0}}}}, (14, 14)),
         ]
         for name, config, size in cases:
-            recipe = getattr(resin.recipe, name)(Tokenizer(), **config)
+            recipe = resin.recipe.get_native_recipe(name, Tokenizer(), **config)
             plain = recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text('hello')])])
             assert plain.media is None
             image = resin.recipe.Image.from_rgb(np.zeros((*size, 3), dtype=np.float32))
@@ -347,10 +351,10 @@ def test_native_media_does_not_import_python_image_or_tensor_libraries() -> None
             assert prompt.media is not None
             assert isinstance(prompt.media.token_ids, tuple)
             assert resin._resin._media_from_buffers(*resin._resin._media_to_buffers(prompt.media)).cache_key == prompt.media.cache_key
-            if name == 'InklingRecipe':
+            if name == 'inkling':
                 encoded = resin.recipe.Image.from_bytes({encoded.getvalue()!r}, media_type='image/png')
                 assert recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [encoded])]).media is not None
-            if name == 'Gemma4Recipe':
+            if name == 'gemma4':
                 video = resin.recipe.Video(source=np.zeros((2, *size, 3), dtype=np.float32))
                 assert recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [video])]).media is not None
         assert not {{'PIL', 'torch', 'transformers'}} & sys.modules.keys()

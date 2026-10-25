@@ -12,12 +12,10 @@ from tokenizers.pre_tokenizers import ByteLevel
 import resin
 from resin.protocols import FinalizingResponseParser
 from resin.recipe import (
-    DeepSeekV41Recipe,
-    GptOssRecipe,
-    InklingRecipe,
     InklingResponseParser,
     ParserEvent,
     Tokenizer,
+    get_native_recipe,
 )
 
 MARKERS = (
@@ -96,9 +94,7 @@ def test_complete_response_uses_actual_generation_prefix() -> None:
             "<|constrain|>",
         ]
     )
-    model_recipe = GptOssRecipe(
-        backend, options=resin.recipe.RenderOptions(use_system_prompt=False)
-    )
+    model_recipe = get_native_recipe("gpt_oss", backend, use_system_prompt=False)
     messages = [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])]
     prompt = model_recipe.render(messages)
     output = backend.encode(
@@ -294,7 +290,7 @@ class _CallbackTokenizer:
 
 def test_callback_tokenizer_keeps_ordinary_encoding_and_serving_stops_separate():
     tokenizer = _CallbackTokenizer()
-    model_recipe = InklingRecipe(tokenizer)
+    model_recipe = get_native_recipe("inkling", tokenizer)
     marker = "<|content_model_end_sampling|>"
     messages = [
         resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(marker)])
@@ -311,7 +307,7 @@ def test_callback_tokenizer_rejects_unknown_or_boolean_control_ids(
 ):
     tokenizer = _CallbackTokenizer()
     monkeypatch.setattr(tokenizer, "convert_tokens_to_ids", lambda _: invalid_id)
-    model_recipe = InklingRecipe(tokenizer)
+    model_recipe = get_native_recipe("inkling", tokenizer)
     with pytest.raises(ValueError, match="control token"):
         model_recipe.stop_token_ids
 
@@ -328,7 +324,7 @@ def test_callback_decoder_is_captured_once_instead_of_refetched():
             return super().decode
 
     tokenizer = TokenizerWithProperty()
-    model_recipe = InklingRecipe(tokenizer)
+    model_recipe = get_native_recipe("inkling", tokenizer)
     parser = model_recipe.create_parser(
         model_recipe.render(
             [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])]
@@ -343,10 +339,12 @@ def test_callback_decoder_is_captured_once_instead_of_refetched():
 def test_deepseek_constructor_effort_matches_per_request_effort():
     backend = _byte_tokenizer()
     messages = [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])]
-    configured = DeepSeekV41Recipe(
-        backend, options=resin.recipe.RenderOptions(reasoning_effort="high")
+    configured = get_native_recipe(
+        "deepseek_v41",
+        backend,
+        reasoning_effort="high",
     )
-    per_request = DeepSeekV41Recipe(backend)
+    per_request = get_native_recipe("deepseek_v41", backend)
     expected = per_request.debug_render_text(
         messages, options=resin.recipe.RenderOptions(reasoning_effort="high")
     )
@@ -382,7 +380,7 @@ def test_callback_recipe_stop_ids_are_static_after_first_resolution():
     tokenizer.markers = dict(tokenizer.markers)
     marker = "<|content_model_end_sampling|>"
     expected = tokenizer.markers[marker]
-    recipe = InklingRecipe(tokenizer)
+    recipe = get_native_recipe("inkling", tokenizer)
     assert recipe.stop_token_ids == [expected]
     tokenizer.markers[marker] = expected + 1
     assert recipe.stop_token_ids == [expected]

@@ -1,3 +1,4 @@
+use resin_recipe::{Recipe, gpt_oss::GptOssRecipe};
 mod common;
 use common::SemanticParser;
 
@@ -243,7 +244,7 @@ fn ambiguous_control_ids_are_rejected() {
 
 #[test]
 fn canonical_system_developer_tools_and_generation_prefix() {
-    let prompt = resin_recipe::gpt_oss::render(&serde_json::json!({
+    let prompt = GptOssRecipe::default().render(&serde_json::json!({
         "messages": [{"role":"system","content":"Be brief."},{"role":"user","content":"hi"}],
         "tools": [{"name":"weather","description":"Weather.","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],
         "extra": {"conversation_start_date":"2026-10-21","reasoning_effort":"high"},
@@ -276,7 +277,8 @@ fn history_tools_reasoning_and_terminal_turns_render_without_python() {
         "use_system_prompt": false,
         "add_generation_prompt": false,
     });
-    let text = resin_recipe::gpt_oss::render(&request)
+    let text = GptOssRecipe::default()
+        .render(&request)
         .unwrap()
         .rendered_text();
     assert_eq!(
@@ -292,7 +294,8 @@ fn history_tools_reasoning_and_terminal_turns_render_without_python() {
     let mut dropped = request;
     dropped["auto_drop_analysis"] = serde_json::json!(true);
     assert!(
-        !resin_recipe::gpt_oss::render(&dropped)
+        !GptOssRecipe::default()
+            .render(&dropped)
             .unwrap()
             .rendered_text()
             .contains("Think.")
@@ -306,7 +309,8 @@ fn official_harmony_fixtures_cover_tool_schemas_and_history_options() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/gpt_oss_harmony.json")).unwrap();
     for case in fixture["cases"].as_array().unwrap() {
-        let actual = resin_recipe::gpt_oss::render(&case["request"])
+        let actual = GptOssRecipe::default()
+            .render(&case["request"])
             .unwrap()
             .rendered_text();
         assert_eq!(actual, case["text"].as_str().unwrap(), "{}", case["name"]);
@@ -316,8 +320,14 @@ fn official_harmony_fixtures_cover_tool_schemas_and_history_options() {
 #[test]
 fn null_http_reasoning_effort_preserves_the_codec_default() {
     let request = serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":null,"extra":{"reasoning_effort":"high"}});
-    let prompt = resin_recipe::gpt_oss::render(&request)
+    let prompt = GptOssRecipe::default()
+        .render(&request)
         .unwrap()
         .rendered_text();
     assert!(prompt.contains("Reasoning: high"));
+    let recipe = GptOssRecipe::new(
+        serde_json::from_value(serde_json::json!({"reasoning_effort": "low"})).unwrap(),
+    );
+    let inherited = recipe.render(&serde_json::json!({"messages": request["messages"], "extra": {"reasoning_effort": null}})).unwrap();
+    assert!(inherited.rendered_text().contains("Reasoning: low"));
 }

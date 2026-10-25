@@ -6,7 +6,7 @@ import pytest
 
 import resin
 from resin.protocols import FinalizingResponseParser
-from resin.recipe import InklingRecipe
+from resin.recipe import get_native_recipe
 
 SPECIAL_TOKENS = {
     "<|message_model|>": 200001,
@@ -47,7 +47,7 @@ def _text_ids(text: str) -> list[int]:
 
 
 def test_native_recipe_renders_typed_messages_and_tools() -> None:
-    model_recipe = InklingRecipe(FakeTokenizer())
+    model_recipe = get_native_recipe("inkling", FakeTokenizer())
     messages = [
         resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hello")])
     ]
@@ -62,7 +62,7 @@ def test_native_recipe_renders_typed_messages_and_tools() -> None:
 
 
 def test_render_maps_openai_xhigh_to_inkling_max() -> None:
-    model_recipe = InklingRecipe(FakeTokenizer())
+    model_recipe = get_native_recipe("inkling", FakeTokenizer())
     messages = [
         resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hello")])
     ]
@@ -86,18 +86,20 @@ def test_processor_recipe_preserves_explicit_format_controls():
     ]
     options = resin.recipe.RenderOptions(reasoning_effort="low")
     expected = (
-        InklingRecipe(Processor.tokenizer)
+        get_native_recipe("inkling", Processor.tokenizer)
         .render(messages, options=options)
         .token_ids.tolist()
     )
     assert (
-        InklingRecipe(Processor()).render(messages, options=options).token_ids.tolist()
+        get_native_recipe("inkling", Processor())
+        .render(messages, options=options)
+        .token_ids.tolist()
         == expected
     )
 
 
 def test_render_rejects_unknown_reasoning_effort() -> None:
-    model_recipe = InklingRecipe(FakeTokenizer())
+    model_recipe = get_native_recipe("inkling", FakeTokenizer())
     with pytest.raises(ValueError, match="reasoning_effort"):
         model_recipe.render(
             [
@@ -119,7 +121,7 @@ def _parser(model_recipe, *prefix):
 
 
 def test_parser_separates_repeated_reasoning_and_visible_text_blocks() -> None:
-    recipe = InklingRecipe(FakeTokenizer())
+    recipe = get_native_recipe("inkling", FakeTokenizer())
     parser = _parser(recipe)
 
     assert parser.feed([200008, *_text_ids("think")]) == [
@@ -148,7 +150,7 @@ def test_parser_separates_repeated_reasoning_and_visible_text_blocks() -> None:
 
 
 def test_parser_uses_prompt_tail_to_continue_reasoning() -> None:
-    recipe = InklingRecipe(FakeTokenizer())
+    recipe = get_native_recipe("inkling", FakeTokenizer())
     parser = _parser(recipe, 200008)
 
     assert parser.feed(_text_ids("continued")) == [
@@ -157,7 +159,7 @@ def test_parser_uses_prompt_tail_to_continue_reasoning() -> None:
 
 
 def test_parser_extracts_json_tool_call_and_hides_header_metadata() -> None:
-    recipe = InklingRecipe(FakeTokenizer())
+    recipe = get_native_recipe("inkling", FakeTokenizer())
     parser = _parser(recipe)
     payload = '{"name":"weather","args":{"city":"SF"}}'
 
@@ -176,7 +178,7 @@ def test_parser_extracts_json_tool_call_and_hides_header_metadata() -> None:
 
 
 def test_raw_tool_and_tool_error_blocks_remain_visible() -> None:
-    recipe = InklingRecipe(FakeTokenizer())
+    recipe = get_native_recipe("inkling", FakeTokenizer())
     parser = _parser(recipe)
 
     assert parser.feed([200057, *_text_ids("raw"), 200010]) == [
@@ -188,7 +190,7 @@ def test_raw_tool_and_tool_error_blocks_remain_visible() -> None:
 
 
 def test_native_recipe_implements_python_protocols() -> None:
-    recipe = InklingRecipe(FakeTokenizer())
+    recipe = get_native_recipe("inkling", FakeTokenizer())
     compatible_recipe: resin.recipe.Recipe = recipe
     parser: FinalizingResponseParser = _parser(recipe, 200004)
 
@@ -207,7 +209,7 @@ def test_recipe_prepares_one_tokenizer_for_independent_parsers() -> None:
             return super().decode
 
     tokenizer = CountingTokenizer()
-    model_recipe = InklingRecipe(tokenizer)
+    model_recipe = get_native_recipe("inkling", tokenizer)
     first = _parser(model_recipe, 200004)
     second = _parser(model_recipe, 200008)
     assert tokenizer.reads == 1
@@ -219,7 +221,7 @@ def test_recipe_prepares_one_tokenizer_for_independent_parsers() -> None:
 def test_parser_discards_unterminated_tool_at_finish(
     reason: Literal["stop", "length"],
 ) -> None:
-    parser = _parser(InklingRecipe(FakeTokenizer()))
+    parser = _parser(get_native_recipe("inkling", FakeTokenizer()))
 
     assert parser.feed([200049, *_text_ids('{"name":"weather","args":')]) == []
     assert parser.finish(reason) == []
@@ -233,7 +235,7 @@ def test_parser_discards_unterminated_tool_at_finish(
     ["{bad json", "[]", '{"args":{}}', '{"name":"weather","args":"SF"}'],
 )
 def test_parser_rejects_invalid_closed_tool_block(payload: str) -> None:
-    parser = _parser(InklingRecipe(FakeTokenizer()))
+    parser = _parser(get_native_recipe("inkling", FakeTokenizer()))
 
     with pytest.raises(ValueError):
         parser.feed([200049, *_text_ids(payload), 200010])

@@ -15,103 +15,6 @@ const THINK_END: &str = "</think>";
 const TOOL: &str = "<|tool_call_start|>";
 const TOOL_END: &str = "<|tool_call_end|>";
 
-/// Render the LFM2.5 checkpoint's chat template without running Python/Jinja.
-pub fn render(request: &Value) -> Result<Prompt, Error> {
-    let messages = messages(request, "LFM2")?;
-    let mut prompt = Prompt::new();
-    prompt.special(BOS);
-    let (system, messages) = if messages[0]["role"] == "system" {
-        (content(&messages[0]["content"])?, &messages[1..])
-    } else {
-        (String::new(), messages)
-    };
-    let tools = list(&request["tools"]);
-    if !system.is_empty() || !tools.is_empty() {
-        prompt.special(START);
-        prompt.text("system\n");
-        prompt.text(&system);
-        if !tools.is_empty() {
-            if !system.is_empty() {
-                prompt.text("\n");
-            }
-            prompt.text("List of tools: [");
-            for (index, tool) in tools.iter().enumerate() {
-                if index > 0 {
-                    prompt.text(", ");
-                }
-                prompt.text(
-                    tool.as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| crate::json::spaced(tool)),
-                );
-            }
-            prompt.text("]");
-        }
-        prompt.special(END);
-        prompt.text("\n");
-    }
-    let last_user = messages
-        .iter()
-        .rposition(|message| message["role"] == "user");
-    let preserve =
-        request["extra"]["preserve_thinking"] == true || request["preserve_thinking"] == true;
-    for (index, message) in messages.iter().enumerate() {
-        let role = message["role"]
-            .as_str()
-            .ok_or_else(|| Error::new("message role must be a string"))?;
-        if !["system", "developer", "user", "assistant", "tool"].contains(&role) {
-            return Err(Error::new(format!("unsupported LFM2 message role: {role}")));
-        }
-        prompt.special(START);
-        prompt.text(role);
-        prompt.text("\n");
-        if role == "assistant" {
-            let keeps_thinking = preserve || last_user.is_none_or(|last| index > last);
-            let thinking = ["thinking", "reasoning", "reasoning_content"]
-                .into_iter()
-                .filter_map(|key| message[key].as_str())
-                .find(|text| !text.is_empty());
-            if let Some(thinking) = thinking.filter(|_| keeps_thinking) {
-                prompt.special(THINK);
-                prompt.text(thinking);
-                prompt.special(THINK_END);
-            }
-            let mut text = content(&message["content"])?;
-            if !keeps_thinking && let Some((_, answer)) = text.rsplit_once(THINK_END) {
-                text = answer.trim().to_owned();
-            }
-            let calls = message.get("tool_calls").filter(|value| !value.is_null());
-            const CONTINUE: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
-            let continued = calls.is_some() && text.ends_with(CONTINUE);
-            prompt.text(if continued {
-                &text[..text.len() - CONTINUE.len()]
-            } else {
-                &text
-            });
-            if let Some(calls) = calls {
-                render_calls(
-                    &mut prompt,
-                    calls
-                        .as_array()
-                        .ok_or_else(|| Error::new("tool_calls must be an array"))?,
-                )?;
-            }
-            if continued {
-                prompt.text(CONTINUE);
-            }
-        } else {
-            prompt.text(content(&message["content"])?);
-        }
-        prompt.special(END);
-        prompt.text("\n");
-    }
-    if request["add_generation_prompt"] != false {
-        prompt.special(START);
-        prompt.text("assistant\n");
-    }
-    Ok(prompt)
-}
-
 fn content(value: &Value) -> Result<String, Error> {
     text_content(value, |block| match block["type"].as_str() {
         Some("image") => Err(Error::new(
@@ -260,5 +163,138 @@ impl Grammar for Lfm2Grammar {
     fn finish(&mut self, _reason: FinishReason, _events: &mut EventSink) -> Result<(), Error> {
         self.tool.clear();
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Lfm2RecipeParams {
+    pub add_generation_prompt: Option<bool>,
+    pub preserve_thinking: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Lfm2Recipe {
+    params: Lfm2RecipeParams,
+}
+
+impl Lfm2Recipe {
+    pub fn new(params: Lfm2RecipeParams) -> Self {
+        Self { params }
+    }
+}
+impl crate::Recipe for Lfm2Recipe {
+    fn render(&self, request: &Value) -> Result<crate::Prompt, crate::Error> {
+        let request = crate::recipe::request("lfm2", &self.params, request)?;
+        let request = &request;
+        let messages = messages(request, "LFM2")?;
+        let mut prompt = Prompt::new();
+        prompt.special(BOS);
+        let (system, messages) = if messages[0]["role"] == "system" {
+            (content(&messages[0]["content"])?, &messages[1..])
+        } else {
+            (String::new(), messages)
+        };
+        let tools = list(&request["tools"]);
+        if !system.is_empty() || !tools.is_empty() {
+            prompt.special(START);
+            prompt.text("system\n");
+            prompt.text(&system);
+            if !tools.is_empty() {
+                if !system.is_empty() {
+                    prompt.text("\n");
+                }
+                prompt.text("List of tools: [");
+                for (index, tool) in tools.iter().enumerate() {
+                    if index > 0 {
+                        prompt.text(", ");
+                    }
+                    prompt.text(
+                        tool.as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| crate::json::spaced(tool)),
+                    );
+                }
+                prompt.text("]");
+            }
+            prompt.special(END);
+            prompt.text("\n");
+        }
+        let last_user = messages
+            .iter()
+            .rposition(|message| message["role"] == "user");
+        let preserve =
+            request["extra"]["preserve_thinking"] == true || request["preserve_thinking"] == true;
+        for (index, message) in messages.iter().enumerate() {
+            let role = message["role"]
+                .as_str()
+                .ok_or_else(|| Error::new("message role must be a string"))?;
+            if !["system", "developer", "user", "assistant", "tool"].contains(&role) {
+                return Err(Error::new(format!("unsupported LFM2 message role: {role}")));
+            }
+            prompt.special(START);
+            prompt.text(role);
+            prompt.text("\n");
+            if role == "assistant" {
+                let keeps_thinking = preserve || last_user.is_none_or(|last| index > last);
+                let thinking = ["thinking", "reasoning", "reasoning_content"]
+                    .into_iter()
+                    .filter_map(|key| message[key].as_str())
+                    .find(|text| !text.is_empty());
+                if let Some(thinking) = thinking.filter(|_| keeps_thinking) {
+                    prompt.special(THINK);
+                    prompt.text(thinking);
+                    prompt.special(THINK_END);
+                }
+                let mut text = content(&message["content"])?;
+                if !keeps_thinking && let Some((_, answer)) = text.rsplit_once(THINK_END) {
+                    text = answer.trim().to_owned();
+                }
+                let calls = message.get("tool_calls").filter(|value| !value.is_null());
+                const CONTINUE: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
+                let continued = calls.is_some() && text.ends_with(CONTINUE);
+                prompt.text(if continued {
+                    &text[..text.len() - CONTINUE.len()]
+                } else {
+                    &text
+                });
+                if let Some(calls) = calls {
+                    render_calls(
+                        &mut prompt,
+                        calls
+                            .as_array()
+                            .ok_or_else(|| Error::new("tool_calls must be an array"))?,
+                    )?;
+                }
+                if continued {
+                    prompt.text(CONTINUE);
+                }
+            } else {
+                prompt.text(content(&message["content"])?);
+            }
+            prompt.special(END);
+            prompt.text("\n");
+        }
+        if crate::render::option(request, "add_generation_prompt") != Some(&Value::Bool(false)) {
+            prompt.special(START);
+            prompt.text("assistant\n");
+        }
+        Ok(prompt)
+    }
+    fn create_parser(
+        &self,
+        encoder: &dyn crate::Encoder,
+        decoder: Box<dyn crate::Decoder>,
+        _request: &Value,
+        prompt_ids: &[u32],
+    ) -> Result<Box<dyn crate::ResponseParser>, crate::Error> {
+        Ok(Box::new(Lfm2Parser::new(
+            Lfm2Tokens::resolve(encoder)?,
+            decoder,
+            prompt_ids,
+        )?))
+    }
+    fn stop_token_ids(&self, encoder: &dyn crate::Encoder) -> Result<Vec<u32>, crate::Error> {
+        Ok(vec![encoder.special_id("<|im_end|>")?])
     }
 }

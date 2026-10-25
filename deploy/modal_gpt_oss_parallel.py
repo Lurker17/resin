@@ -21,7 +21,7 @@ from deploy.jit_cache import (
     prepare_kernel_cache,
 )
 from deploy.modal_image import build_modal_image
-from resin.recipe import GptOssRecipe
+from resin.recipe import get_native_recipe
 
 ROOT = Path(
     os.environ.get("RESIN_MODAL_SOURCE_ROOT", Path(__file__).resolve().parents[1])
@@ -197,8 +197,10 @@ def validate_parallel(
     )
     if tokenizer is None:
         raise RuntimeError("the GPT-OSS checkpoint did not load a tokenizer")
-    recipe = GptOssRecipe(
-        tokenizer, options=resin.recipe.RenderOptions(reasoning_effort="medium")
+    recipe = get_native_recipe(
+        "gpt_oss",
+        tokenizer,
+        reasoning_effort="medium",
     )
     texts = {
         "short": "Continue the sequence with the next number: 2, 4, 6,",
@@ -336,8 +338,10 @@ def probe_prompt_scores(attention_oracle: bool = False):
     _checkpoint_inventory()
     prepare_kernel_cache(kernel_volume)
     tokenizer = AutoTokenizer.from_pretrained(str(MODEL_PATH), local_files_only=True)
-    recipe = GptOssRecipe(
-        tokenizer, options=resin.recipe.RenderOptions(reasoning_effort="medium")
+    recipe = get_native_recipe(
+        "gpt_oss",
+        tokenizer,
+        reasoning_effort="medium",
     )
     text = (
         "Every request owns its cache pages. Expert workers may process tokens "

@@ -21,7 +21,7 @@ from deploy.bench_trace import decode_trace
 from resin import Engine, Parallelism, SchedulerConfig
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.topology import ParallelGroups
-from resin.recipe import DeepSeekV41Recipe
+from resin.recipe import get_native_recipe
 
 
 def _runner(model, checkpoint, *, device, groups, cases, options, context_capacity):
@@ -181,8 +181,9 @@ def _checkpoint_validation(raw, engine, checkpoint, metadata, groups):
 
     try:
         with _validation_stage("prompt", coordinate):
-            recipe = DeepSeekV41Recipe(
-                Tokenizer.from_file(str(Path(checkpoint) / "tokenizer.json"))
+            recipe = get_native_recipe(
+                "deepseek_v41",
+                Tokenizer.from_file(str(Path(checkpoint) / "tokenizer.json")),
             )
             prompt = recipe.render(
                 [
