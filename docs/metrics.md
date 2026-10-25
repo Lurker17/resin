@@ -192,8 +192,10 @@ A warmed two-matmul microbenchmark measured about 13 µs extra per pass for
 whole-pass timing and 30 µs for captured draft/verify detail. These are
 instrumentation measurements on a tiny graph, not end-to-end model benchmarks.
 The [H100 validation run](https://modal.com/apps/ekzhang/main/ap-cdI1ckx429UUBtzuhQnldS)
-passed three shared-runtime tests covering captured and eager timing. Run
-`uv run modal run deploy/modal_metrics.py::validate` to repeat the probe.
+passed three shared-runtime tests covering captured and eager timing. The
+one-off Modal wrapper has been retired; run
+`uv run pytest tests/test_cuda_metrics.py -q` on a CUDA host for the current
+shared-runtime timing tests.
 Graphs captured before metrics are enabled retain whole-pass timing only.
 Enable metrics before the initial capture for draft/verify detail;
 `capture_cuda_graphs()` is idempotent and does not rebuild existing graphs.

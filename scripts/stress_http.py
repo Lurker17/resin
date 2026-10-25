@@ -48,11 +48,15 @@ class Completion:
         self.visible_bytes = 0
         self.events = 0
         self.preview = ""
+        self.content = ""
+        self.reasoning_content = ""
 
     def add(self, value: dict[str, Any], *, stream: bool) -> bool:
         if "error" in value:
             raise ValueError(f"response error: {value['error']}")
         identifier = value["id"]
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError("missing or invalid response ID")
         if self.identifier is not None and identifier != self.identifier:
             raise ValueError("response ID changed midstream")
         self.identifier = identifier
@@ -79,6 +83,8 @@ class Completion:
             if choice["index"] != 0:
                 raise ValueError("unexpected choice index")
             message = choice["delta" if stream else "message"]
+            self.content += message.get("content") or ""
+            self.reasoning_content += message.get("reasoning_content") or ""
             text = (message.get("content") or "") + (
                 message.get("reasoning_content") or ""
             )
@@ -100,13 +106,18 @@ class Completion:
             self.usage["prompt_tokens"],
             self.usage["completion_tokens"],
         )
-        if not (prompt > 0 and 0 <= completion <= max_tokens):
+        if not (
+            type(prompt) is int
+            and type(completion) is int
+            and prompt > 0
+            and 0 <= completion <= max_tokens
+        ):
             raise ValueError("invalid token usage")
         if self.usage["total_tokens"] != prompt + completion:
             raise ValueError("inconsistent total token usage")
         if self.scored and self.raw_scores != completion:
             raise ValueError("generation logprobs do not cover completion tokens")
-        return {
+        result = {
             "prompt_tokens": prompt,
             "completion_tokens": completion,
             "finish_reason": self.finish_reason,
@@ -114,7 +125,16 @@ class Completion:
             "events": self.events,
             "visible_bytes": self.visible_bytes,
             "preview": self.preview,
+            "content": self.content,
+            "reasoning_content": self.reasoning_content,
         }
+        details = self.usage.get("prompt_tokens_details") or {}
+        if "cached_tokens" in details:
+            cached = details["cached_tokens"]
+            if type(cached) is not int or not 0 <= cached <= prompt:
+                raise ValueError("invalid cached prompt token usage")
+            result["cached_prompt_tokens"] = cached
+        return result
 
 
 async def sse_data(response: httpx.Response):
@@ -215,7 +235,14 @@ def percentile(values: list[float], quantile: float) -> float | None:
 
 
 async def run_stage(
-    client, name, cases, concurrency, timeout, *, event_path: Path | None = None
+    client,
+    name,
+    cases,
+    concurrency,
+    timeout,
+    *,
+    event_path: Path | None = None,
+    validate_result=None,
 ):
     semaphore = asyncio.Semaphore(concurrency)
     finished = 0
@@ -246,6 +273,11 @@ async def run_stage(
                 }
             )
             result = await run_case(client, case, timeout)
+            if result["ok"] and validate_result is not None:
+                try:
+                    validate_result(result)
+                except Exception as error:
+                    result.update(ok=False, error=f"{type(error).__name__}: {error}")
             record({"event": "finish", **result})
             finished += 1
             if not result["ok"]:

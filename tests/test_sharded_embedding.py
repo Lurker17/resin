@@ -11,12 +11,28 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from deploy.engram_validation import table_values
 from resin import Parallelism
 from resin.backend.collectives import close_layer_collectives, layer_collectives
 from resin.backend.embedding import ShardedEmbeddingLookup
 from resin.backend.topology import ParallelGroups
 from resin_models_cuda.deepseek_v41.engram import ParallelEngramEmbedding
+
+
+def table_values(rows, dimension, device):
+    values = (
+        (
+            torch.arange(rows * dimension, device=device).reshape(rows, dimension) % 19
+            - 9
+        )
+        / 8
+    ).to(torch.float8_e4m3fn)
+    exponents = (
+        torch.arange(rows, device=device)[:, None]
+        + torch.arange(dimension // 32, device=device)
+    ) % 7 - 3
+    scales = (2.0 ** exponents.float()).to(torch.float8_e8m0fnu)
+    reference = (values.float() * scales.float().repeat_interleave(32, -1)).bfloat16()
+    return values, scales, reference
 
 
 @torch.inference_mode()

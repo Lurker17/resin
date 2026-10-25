@@ -1,210 +1,90 @@
-"""Resident Engine sweeps on Modal; raw points are appended to local JSONL."""
+"""Modal transport for scripts/bench.py; measurement lives in resin.bench."""
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
-import subprocess
 from pathlib import Path
-from typing import Any
-from uuid import uuid4
 
 import modal
 
-from deploy.jit_cache import (
-    KERNEL_CACHE_ENV,
-    KERNEL_CACHE_MOUNT,
-    KERNEL_CACHE_VOLUME_NAME,
-    KERNEL_CACHE_VOLUME_VERSION,
-)
 from deploy.modal_image import build_modal_image
+from deploy.models import MODEL_SPECS, get_model, image_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 TRACE_VOLUME = modal.Volume.from_name(
     "resin-benchmark-traces-v1", create_if_missing=True
 )
-# Keep the existing volume IDs: V4.1 weights and compiled kernels are already
-# stored there. Repository Python files are never downloaded or executed.
-CHECKPOINTS = {
-    "gpt-oss-20b": (
-        "resin-gpt-oss-models-v2",
-        2,
-        "/models/gpt",
-        "20b",
-        "openai/gpt-oss-20b",
-        "6cee5e81ee83917806bbde320786a8fb61efebee",
-    ),
-    "gpt-oss-120b": (
-        "resin-gpt-oss-models-v2",
-        2,
-        "/models/gpt",
-        "120b",
-        "openai/gpt-oss-120b",
-        "b5c939de8f754692c1647ca79fbf85e8c1e70f8a",
-    ),
-    "deepseek-v41": (
-        "resin-deepseek-v4-models-v1",
-        1,
-        "/models/deepseek",
-        "flash-1017",
-        "deepseek-ai/DeepSeek-V4.1-Flash-1017",
-        "1bae0e1088993b9b82de08f59de5be5a34e42170",
-    ),
-}
 MODEL_VOLUMES = {
-    mount: modal.Volume.from_name(name, version=version, create_if_missing=True)
-    for name, version, mount, *_ in CHECKPOINTS.values()
+    spec.model_mount: modal.Volume.from_name(
+        spec.model_volume, version=spec.model_volume_version, create_if_missing=True
+    )
+    for spec in MODEL_SPECS.values()
 }
-KERNEL_VOLUME = modal.Volume.from_name(
-    "resin-deepseek-v4-kernels-v2", version=1, create_if_missing=True
-)
-HOPPER_KERNEL_VOLUME = modal.Volume.from_name(
-    KERNEL_CACHE_VOLUME_NAME,
-    version=KERNEL_CACHE_VOLUME_VERSION,
-    create_if_missing=True,
-)
-image = (
-    build_modal_image(
-        ROOT,
-        env={
-            **KERNEL_CACHE_ENV,
-            "CC": "gcc-13",
-            "CXX": "g++-13",
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-            "DG_JIT_CACHE_DIR": "/kernel-cache/.cache/deep_gemm",
-            "TILELANG_CACHE_DIR": "/kernel-cache/.cache/tilelang",
-            "CUDA_TILE_CACHE_DIR": "/kernel-cache/.cache/cutile-python",
-        },
+KERNEL_VOLUMES = {
+    spec.kernel_mount: modal.Volume.from_name(
+        spec.kernel_volume, version=spec.kernel_volume_version, create_if_missing=True
     )
-    .add_local_file(ROOT / "deploy/bench.py", "/root/deploy/bench.py", copy=True)
-    .add_local_file(
-        ROOT / "deploy/bench_trace.py", "/root/deploy/bench_trace.py", copy=True
-    )
-    .add_local_file(
-        ROOT / "deploy/deepseek_v41_validation.py",
-        "/root/deploy/deepseek_v41_validation.py",
-        copy=True,
-    )
-    .add_local_file(
-        ROOT / "deploy/flashmla_validation.py",
-        "/root/deploy/flashmla_validation.py",
-        copy=True,
-    )
+    for spec in MODEL_SPECS.values()
+    if spec.kernel_mount is not None and spec.kernel_volume is not None
+}
+image = build_modal_image(ROOT).add_local_file(
+    ROOT / "scripts/bench.py", "/root/scripts/bench.py", copy=True
 )
 app = modal.App(
     "resin-bench",
     image=image,
-    volumes={
-        **MODEL_VOLUMES,
-        "/kernel-cache/.cache": KERNEL_VOLUME,
-        KERNEL_CACHE_MOUNT: HOPPER_KERNEL_VOLUME,
-        "/bench-traces": TRACE_VOLUME,
-    },
+    volumes={**MODEL_VOLUMES, **KERNEL_VOLUMES, "/bench-traces": TRACE_VOLUME},
 )
-
-
-def _checkpoint(model: str) -> tuple[Path, str, str]:
-    _, _, mount, key, repo, revision = CHECKPOINTS[model]
-    return Path(mount) / key / revision, repo, revision
 
 
 @app.function(cpu=16, memory=32768, timeout=4 * 60 * 60)
 def download(model: str, metadata_only: bool = False) -> dict:
-    """Publish a complete pinned checkpoint using a CPU worker."""
-    target, repo, revision = _checkpoint(model)
-    volume = MODEL_VOLUMES[CHECKPOINTS[model][2]]
+    """Populate the same pinned checkpoint and marker used by serving."""
+    from deploy.models import download_checkpoint
+
+    spec = get_model(model)
+    volume = MODEL_VOLUMES[spec.model_mount]
     volume.reload()
-    if metadata_only and not model.startswith("deepseek"):
-        raise ValueError(
-            "metadata-only publication currently targets DeepSeek checkpoints"
-        )
-    if not metadata_only:
-        from huggingface_hub import snapshot_download
-
-        target.mkdir(parents=True, exist_ok=True)
-        snapshot_download(
-            repo,
-            revision=revision,
-            local_dir=target,
-            allow_patterns=[
-                "config.json",
-                "model*.safetensors",
-                "model.safetensors.index.json",
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "inference/config.json",
-            ],
-        )
-    inventory = {}
-    if model.startswith("deepseek"):
-        from deploy.checkpoint_cache import publish_checkpoint
-
-        inventory = publish_checkpoint(target, repo, revision)
+    result = download_checkpoint(spec, metadata_only=metadata_only)
     volume.commit()
-    return {
-        "repo_id": repo,
-        "revision": revision,
-        "path": str(target),
-        "metadata_only": metadata_only,
-        "files": len(inventory),
-        "bytes": sum(inventory.values()),
-    }
+    return result
 
 
 @app.function(cpu=32, memory=262144, timeout=4 * 60 * 60, single_use_containers=True)
 def sweep(model: str, cases: list[dict], topology: dict, options: dict) -> list[dict]:
-    if model.startswith("deepseek"):
-        # Hopper's precompiled attention stack has an explicit architecture;
-        # DeepSeek's Blackwell kernels infer it from their current device.
-        for name in (
-            "TORCH_CUDA_ARCH_LIST",
-            "FLASHINFER_CUDA_ARCH_LIST",
-            "FLASH_ATTENTION_ARCH",
-            "CUTE_DSL_ARCH",
-        ):
-            os.environ.pop(name, None)
-        os.environ["TRITON_CACHE_DIR"] = "/kernel-cache/.cache/triton"
-    from deploy.bench import run_benchmark
-    from deploy.jit_cache import ensure_kernel_cache_dirs, install_flashinfer_hash_cache
+    spec = get_model(model)
+    # Set compiler namespaces before importing any concrete CUDA runner. Each
+    # invocation gets a fresh container, so models cannot inherit another arch.
+    os.environ.update(image_environment(spec))
+    from deploy.models import prepare_runtime, require_checkpoint
     from resin import Parallelism
+    from scripts.bench import run_benchmark
 
-    target, repo, revision = _checkpoint(model)
-    if model.startswith("deepseek"):
-        from deploy.checkpoint_cache import checkpoint_is_complete
-
-        if not checkpoint_is_complete(target, repo, revision):
-            raise FileNotFoundError(
-                f"download the pinned {model} checkpoint first; use --publish-only "
-                "to validate and publish files already present in the volume"
-            )
-    elif not (target / "config.json").is_file():
-        raise FileNotFoundError(f"download the pinned {model} checkpoint first")
-    if model.startswith("gpt-oss"):
-        ensure_kernel_cache_dirs()
-        install_flashinfer_hash_cache()
+    MODEL_VOLUMES[spec.model_mount].reload()
+    kernel_volume = KERNEL_VOLUMES.get(spec.kernel_mount)
+    if kernel_volume is not None:
+        kernel_volume.reload()
+    checkpoint = require_checkpoint(spec, draft_tokens=options["draft_tokens"])
+    prepare_runtime(spec)
+    options = dict(options)
+    options["metadata"] = {
+        **options.get("metadata", {}),
+        "repo_id": spec.repo_id,
+        "checkpoint_revision": spec.revision,
+    }
     try:
         return run_benchmark(
-            model,
-            target,
-            cases,
-            parallelism=Parallelism(**topology),
-            metadata={
-                **options.pop("metadata", {}),
-                "repo_id": repo,
-                "checkpoint_revision": revision,
-            },
-            **options,
+            model, checkpoint, cases, parallelism=Parallelism(**topology), **options
         )
     finally:
-        KERNEL_VOLUME.commit()
-        HOPPER_KERNEL_VOLUME.commit()
+        if kernel_volume is not None:
+            kernel_volume.commit()
         if options.get("trace_dir"):
             TRACE_VOLUME.commit()
 
 
 def download_traces(remote_directory: str, output: str | Path) -> list[str]:
-    """Download this run's rank traces and combine each case for Perfetto."""
+    """Retrieve raw rank traces and merge each prefill/decode case for Perfetto."""
     from scripts.merge_bench_traces import merge_traces
 
     prefix = Path(remote_directory).relative_to("/bench-traces").as_posix()
@@ -218,170 +98,12 @@ def download_traces(remote_directory: str, output: str | Path) -> list[str]:
         with target.open("wb") as stream:
             for chunk in TRACE_VOLUME.read_file(entry.path):
                 stream.write(chunk)
-        case = target.name.rsplit("-rank", 1)[0]
-        cases.setdefault(case, []).append(target)
+        cases.setdefault(target.name.rsplit("-rank", 1)[0], []).append(target)
     merged = []
     for case, sources in sorted(cases.items()):
         target = destination / f"{case}-all-ranks.json.gz"
         merge_traces(sources, target)
         merged.append(str(target))
     if not merged:
-        raise RuntimeError(f"no decode traces found in {remote_directory}")
+        raise RuntimeError(f"no benchmark traces found in {remote_directory}")
     return merged
-
-
-@app.function(cpu=16, memory=32768, timeout=30 * 60, single_use_containers=True)
-def probe() -> dict:
-    for name in (
-        "TORCH_CUDA_ARCH_LIST",
-        "FLASHINFER_CUDA_ARCH_LIST",
-        "FLASH_ATTENTION_ARCH",
-        "CUTE_DSL_ARCH",
-    ):
-        os.environ.pop(name, None)
-    from deploy.deepseek_v41_validation import run_probes
-
-    try:
-        return run_probes()
-    finally:
-        KERNEL_VOLUME.commit()
-
-
-@app.local_entrypoint()
-def main(
-    model: str = "deepseek-v41",
-    gpu: str = "B300",
-    world_size: int = 8,
-    attn_dp: int = 8,
-    attn_tp: int = 1,
-    cp: int = 1,
-    ep: int = 8,
-    phases: str = "prefill,decode",
-    context_lengths: str = "4096",
-    shared_prefix_tokens: int = 0,
-    batch_sizes: str = "1,2,4,8",
-    draft_tokens: int = 4,
-    accepted_drafts: int = -1,
-    natural_acceptance: bool = False,
-    balanced_experts: bool = True,
-    warmup_steps: int = 5,
-    measure_steps: int = 20,
-    prefill_chunk_size: int = 4096,
-    prefill_graph: str = "breakable",
-    decode_graph: str = "full",
-    gpu_memory_utilization: float = 0.9,
-    output: str = "bench/results.jsonl",
-    download_only: bool = False,
-    publish_only: bool = False,
-    probe_only: bool = False,
-    validate_model: bool = False,
-    expert_backend: str = "flashinfer",
-    profile_graph_phases: bool = False,
-    overlap: bool = True,
-    numa: str = "auto",
-    trace_dir: str = "",
-):
-    from deploy.bench import write_results
-    from resin import Parallelism
-    from resin.bench import BenchCase
-
-    if model not in CHECKPOINTS:
-        raise ValueError(f"model must be one of {list(CHECKPOINTS)}")
-    if probe_only:
-        print(json.dumps(probe.with_options(gpu=gpu).remote(), indent=2))
-        return
-    if download_only or publish_only:
-        function = (
-            download.with_options(cpu=2, memory=2048, timeout=300)
-            if publish_only
-            else download
-        )
-        print(json.dumps(function.remote(model, publish_only), indent=2))
-        return
-    topology = dict(
-        world_size=world_size, attn_dp=attn_dp, attn_tp=attn_tp, cp=cp, ep=ep
-    )
-    Parallelism(**topology)
-    cases: list[dict[str, Any]] = [
-        dict(
-            phase=phase,
-            context_length=int(context),
-            batch_size=int(batch),
-            shared_prefix_tokens=shared_prefix_tokens,
-        )
-        for phase in phases.split(",")
-        for context in context_lengths.split(",")
-        for batch in batch_sizes.split(",")
-    ]
-    for case in cases:
-        BenchCase(**case)
-    if trace_dir and (validate_model or "decode" not in phases.split(",")):
-        raise ValueError(
-            "traces require a decode benchmark, outside checkpoint validation"
-        )
-    if model.startswith("gpt-oss") and draft_tokens:
-        raise ValueError("GPT-OSS has no draft model; pass --draft-tokens 0")
-    git_revision = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-    ).strip()
-    dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT))
-    source = hashlib.sha256(git_revision.encode())
-    source.update(
-        subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=ROOT)
-    )
-    for name in sorted(
-        subprocess.check_output(
-            ["git", "ls-files", "--others", "--exclude-standard"], cwd=ROOT, text=True
-        ).splitlines()
-    ):
-        path = ROOT / name
-        if path.suffix in {".py", ".rs", ".toml", ".lock", ".cu", ".cuh"}:
-            source.update(name.encode())
-            source.update(path.read_bytes())
-    remote_trace_dir = f"/bench-traces/{uuid4().hex}" if trace_dir else ""
-    options = dict(
-        draft_tokens=draft_tokens,
-        accepted_drafts=(
-            None
-            if natural_acceptance
-            else min(3, draft_tokens)
-            if accepted_drafts == -1
-            else accepted_drafts
-        ),
-        balanced_experts=balanced_experts,
-        warmup_steps=warmup_steps,
-        measure_steps=measure_steps,
-        prefill_chunk_size=prefill_chunk_size,
-        prefill_graph=prefill_graph,
-        decode_graph=decode_graph,
-        gpu_memory_utilization=gpu_memory_utilization,
-        validate_model=validate_model,
-        expert_backend=expert_backend,
-        profile_graph_phases=profile_graph_phases,
-        overlap=overlap,
-        numa=numa,
-        trace_dir=remote_trace_dir or None,
-        metadata={
-            "git_commit": git_revision,
-            "dirty": dirty,
-            "source_digest": source.hexdigest(),
-        },
-    )
-    records = sweep.with_options(gpu=f"{gpu}:{world_size}").remote(
-        model, cases, topology, options
-    )
-    if validate_model:
-        target = Path(output)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(records, indent=2))
-        print(json.dumps(records, indent=2))
-        if not all(record.get("ok") is True for record in records):
-            raise RuntimeError(
-                f"checkpoint validation failed; reports saved to {target}"
-            )
-        return
-    write_results(output, records)
-    print(f"Appended {len(records)} raw points to {output}")
-    if trace_dir:
-        for path in download_traces(remote_trace_dir, trace_dir):
-            print(f"Perfetto trace: {path}")

@@ -84,30 +84,40 @@ FA4/CuTe DSL, Triton, compiler-extension helpers, and MoE tactic files each have
 their own upstream reuse semantics. Routing all of their directories beneath one
 mount is not equivalent to validating them with `ArtifactCache`.
 
-## Operational pattern
+## Runtime integration
 
-The intended deployment sequence is:
+The shared deployment registry selects compiler environment variables and
+persistent cache volumes. Before importing GPU libraries, runtime setup creates
+the compiler directories and installs the FlashInfer content-addressed loading
+wrapper where applicable. A cache miss builds in local scratch and publishes
+the completed library through `ArtifactCache`; later workers validate that
+specific artifact before loading it.
 
-1. Build an image with pinned compiler and runtime dependencies.
-2. Select the exact ABI namespace.
-3. Exercise representative shapes in one prewarm worker.
-4. Publish completed artifacts and readiness records.
-5. Start a fresh worker and require stable artifact content on hits.
-6. Scale read-mostly workers only after that verification.
+The launchers capture graphs and warm up their model before serving, then commit
+the kernel volume. They do not run a separate prewarm/reuse-verification job or
+publish a whole-workload qualification marker. The former one-off cache probes
+and saved-autotune harness have been retired; the portable artifact API remains.
 
-Atomic publication is not a distributed compiler lock. Multiple cold writers
-can duplicate work or contend inside an upstream build directory, so prewarming
-should be single-writer.
+Atomic artifact publication is not a distributed compiler lock. Multiple cold
+writers can duplicate work or contend inside an upstream build directory.
 
-Persistent kernels remove compilation from request execution. They do not remove
-framework import, device-context creation, weight loading, graph capture, or
-model warmup.
+Valid cache hits can avoid compilation for covered specializations. They do not
+remove framework import, device-context creation, weight loading, graph capture,
+or model warmup. A new layout, bucket, or backend may still compile.
+
+The parameterized `deploy/modal_serve.py` and the Modal adapter used by
+`scripts/bench.py` share registry-selected cache volumes and `deploy/jit_cache.py`
+helpers. A benchmark trace records execution after warmup; it is not by itself
+a cold-start or no-recompilation qualification.
 
 ## Current limitations
 
 - The portable store is filesystem-backed; an object-store API needs an adapter.
 - The FlashInfer wrapper is version-specific and must be revalidated on upgrade.
-- The prewarm protocol has no distributed lock.
+- Concurrent cache misses have no distributed compiler lock.
 - A validated compiled artifact says nothing about live cache correctness.
-- The GPT-OSS deployment harness has completed a single-sequence H200 run on
-  the flat-cache runner; broader cold-worker and multi-shape validation remains.
+- Historical GPT-OSS cache qualification covered a single-sequence H200 run;
+  it does not establish current cold-worker or arbitrary-shape behavior.
+- Similar TTFT values do not prove absence of compilation. That claim requires
+  compilation-event instrumentation or before/after artifact evidence, with
+  the measured cache paths and process scope recorded.

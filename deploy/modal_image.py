@@ -80,8 +80,7 @@ def build_modal_image(
         .run_commands(
             # FlashMLA's post-build spill checker probes PCI devices even on
             # CPU builders. Modal hides PCI sysfs even in GPU-backed builds.
-            # Give only this build an empty inventory; the real cuobjdump
-            # spill check still runs.
+            # Give this build an empty inventory for the upstream build hook.
             "mkdir -p /tmp/resin-build-bin",
             "printf '%s\\n' '#!/bin/sh' "
             "'exec /usr/bin/lspci -F /dev/null \"$@\"' "
@@ -96,16 +95,6 @@ def build_modal_image(
         )
         .env(
             {"PATH": (f"{_DEPENDENCY_ROOT}/.venv/bin:/root/.cargo/bin:{_SYSTEM_PATH}")}
-        )
-        .add_local_file(
-            root / "scripts/check_flashmla_artifact.py",
-            "/tmp/check_flashmla_artifact.py",
-            copy=True,
-        )
-        .run_commands(
-            "python /tmp/check_flashmla_artifact.py "
-            f"> {_DEPENDENCY_ROOT}/flashmla-resources.json",
-            "rm /tmp/check_flashmla_artifact.py",
         )
         # These accelerator-specific supplement wheels live outside PyPI.
         .uv_pip_install(
@@ -124,11 +113,6 @@ def build_modal_image(
             root / "deploy/jit_cache.py", "/root/deploy/jit_cache.py", copy=True
         )
         .add_local_file(
-            root / "deploy/graph_validation.py",
-            "/root/deploy/graph_validation.py",
-            copy=True,
-        )
-        .add_local_file(
             root / "deploy/modal_image.py", "/root/deploy/modal_image.py", copy=True
         )
         .add_local_file(
@@ -136,6 +120,7 @@ def build_modal_image(
             "/root/deploy/checkpoint_cache.py",
             copy=True,
         )
+        .add_local_file(root / "deploy/models.py", "/root/deploy/models.py", copy=True)
         .add_local_file(root / "Cargo.toml", f"{_SOURCE_ROOT}/Cargo.toml", copy=True)
         .add_local_file(root / "Cargo.lock", f"{_SOURCE_ROOT}/Cargo.lock", copy=True)
         .add_local_file(

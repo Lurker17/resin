@@ -25,7 +25,7 @@ def candidate_kernel(monkeypatch):
     import sys
 
     # Evaluate the real factory's shape equations without a CUDA compiler. The
-    # prim_func body is deliberately not executed; the GPU probe checks it.
+    # prim_func body is deliberately not executed by this CPU contract test.
     language = SimpleNamespace(
         dynamic=lambda name: sympy.Symbol(name, integer=True, positive=True),
         ceildiv=lambda value, divisor: sympy.ceiling(value / divisor),
@@ -122,30 +122,3 @@ def test_candidate_wrapper_reuses_factory_while_output_capacity_changes(
         ]
         assert calls[-1] == (width, (5, blocks), stride, 8)
     assert factory_keys == [block_size] * 4
-
-
-@pytest.mark.parametrize("block_size", [8, 16])
-def test_candidate_probe_oracle_covers_empty_partial_and_16k_task_boundaries(
-    block_size,
-):
-    from deploy.v41_candidate_probe import _reference
-
-    width = 16384 + block_size + 1
-    lengths = torch.tensor(
-        [0, 1, block_size, block_size + 1, 16384, 16385, width], dtype=torch.int32
-    )
-    logits = -torch.arange(width).expand(len(lengths), -1).bfloat16().clone()
-    # Scores outside a causal length should never affect its completed blocks.
-    logits.masked_fill_(torch.arange(width)[None] >= lengths[:, None], 1000)
-    scores, counts = _reference(logits, lengths, block_size)
-    assert counts.tolist() == [
-        (int(length) + block_size - 1) // block_size for length in lengths
-    ]
-    assert (scores[0] == -torch.inf).all()
-    for row, count in enumerate(counts.tolist()):
-        if count:
-            assert scores[row, count - 1] == torch.inf
-            for block in range(count - 1):
-                # Monotonic nonpositive input makes each block maximum known.
-                assert scores[row, block] == logits[row, block * block_size]
-    assert not (scores == 1000).any()

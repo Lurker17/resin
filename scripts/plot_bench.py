@@ -113,6 +113,14 @@ def _validate(record):
             raise ValueError(
                 "prefill_tokens must be the measured mean input tokens per step"
             )
+        if "prefill_seconds" in record:
+            cohorts = record["prefill_seconds"]
+            if not isinstance(cohorts, list) or not cohorts:
+                raise ValueError("prefill_seconds must contain complete cohort timings")
+            for value in cohorts:
+                _number(value, "prefill_seconds", minimum=math.nextafter(0, 1))
+            if not math.isclose(sum(cohorts), record["window_seconds"], rel_tol=1e-9):
+                raise ValueError("prefill_seconds must sum to window_seconds")
     elif (
         record["input_tokens"]
         or record["prefill_tokens"]
@@ -133,6 +141,8 @@ def _configuration(record):
     for name in ("prefill_chunk_size", "max_batch_tokens"):
         fixed[name] = record["metadata"].get(name)
     fixed.update(gpu_count=record["gpu_count"], attn_dp=record["attn_dp"])
+    if record["phase"] == "prefill":
+        fixed["prefill_timing"] = "cohort" if "prefill_seconds" in record else "step"
     return fixed
 
 
@@ -197,10 +207,13 @@ def load_records(paths: list[Path], *, compare_topologies=False) -> list[dict]:
     return list(latest.values())
 
 
-def axes(records, phase, *, draft_tokens=4, accept_rate=0.75, compare_topologies=False):
-    """Normalize measured engine steps; decode acceptance is an explicit projection."""
-    _number(draft_tokens, "draft_tokens", integer=True)
-    if _number(accept_rate, "accept_rate") > 1:
+def axes(
+    records, phase, *, draft_tokens=None, accept_rate=None, compare_topologies=False
+):
+    """Use measured tokens and latency unless an acceptance projection is requested."""
+    if draft_tokens is not None:
+        _number(draft_tokens, "draft_tokens", integer=True)
+    if accept_rate is not None and _number(accept_rate, "accept_rate") > 1:
         raise ValueError("accept_rate must be between 0 and 1")
     result = {}
     for record in sorted(
@@ -222,21 +235,26 @@ def axes(records, phase, *, draft_tokens=4, accept_rate=0.75, compare_topologies
                 raise ValueError(
                     "decode throughput requires a fully active requested batch"
                 )
-            if record["draft_tokens"] != draft_tokens:
+            if draft_tokens is not None and record["draft_tokens"] != draft_tokens:
                 raise ValueError(
                     "--draft-tokens must match the measured decode draft_tokens"
                 )
-            speed = steps / seconds * (1 + draft_tokens * accept_rate)
+            speed = (
+                record["committed_tokens"] / seconds / record["global_batch_size"]
+                if accept_rate is None
+                else steps / seconds * (1 + record["draft_tokens"] * accept_rate)
+            )
             point = (
                 speed,
                 speed * record["global_batch_size"] / record["gpu_count"],
                 f"{record['batch_size']:,}",
             )
         else:
-            batch = record["prefill_tokens"]
+            cohorts = record.get("prefill_seconds")
+            batch = record["batch_size"] if cohorts else record["prefill_tokens"]
             label = f"{batch:,.0f}" if batch == int(batch) else f"{batch:,.1f}"
             point = (
-                seconds / steps * 1000,
+                seconds / (len(cohorts) if cohorts else steps) * 1000,
                 record["input_tokens"] / seconds / record["gpu_count"],
                 label,
             )
@@ -309,8 +327,8 @@ def plot(
     phase,
     output_dir,
     *,
-    draft_tokens=4,
-    accept_rate=0.75,
+    draft_tokens=None,
+    accept_rate=None,
     compare_topologies=False,
 ):
     curves = axes(
@@ -375,7 +393,11 @@ def plot(
             pad=12,
         )
         axis.set_xlabel(
-            "Per-user output (tokens/s)" if decode else "Prefill latency (ms/step)"
+            "Per-user output (tokens/s)"
+            if decode
+            else "Prefill latency (ms/cohort)"
+            if "prefill_seconds" in first
+            else "Prefill latency (ms/step)"
         )
         axis.set_ylabel("Output tokens/s/GPU" if decode else "Input tokens/s/GPU")
         axis.set_xlim(0, axis.dataLim.xmax * 1.12)
@@ -401,11 +423,20 @@ def plot(
                 if first["accepted_drafts"] is None
                 else f"fixed {first['accepted_drafts']}/{first['draft_tokens']}"
             )
-            note = f"Projected acceptance {accept_rate:.0%}, {draft_tokens} drafts → τ={1 + draft_tokens * accept_rate:g}; measured acceptance {observed} ({fixed}).\nPoint labels: requests per attention-DP replica."
-            if not draft_tokens:
-                note = "Ordinary decode (no drafts), τ=1.\nPoint labels: requests per attention-DP replica."
+            if accept_rate is None:
+                note = f"Measured output throughput; acceptance {observed} ({fixed})."
+            else:
+                drafts = first["draft_tokens"]
+                note = f"Projected acceptance {accept_rate:.0%}, {drafts} drafts → τ={1 + drafts * accept_rate:g}; measured acceptance {observed} ({fixed})."
+            if not first["draft_tokens"]:
+                note = "Measured ordinary decode (no drafts)."
+            note += "\nPoint labels: requests per attention-DP replica."
         else:
-            note = "Point labels: measured unique input tokens per global prefill step."
+            note = (
+                "Latency covers every chunk of the requested context.\nPoint labels: requests per attention-DP replica."
+                if "prefill_seconds" in first
+                else "Legacy step timings; point labels: measured unique input tokens per global prefill step."
+            )
         if all(
             "measured_context_start_min" in row and "measured_context_end_max" in row
             for row in selected
@@ -453,8 +484,16 @@ def main(argv=None):
     )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--mode", choices=("both", "decode", "prefill"), default="both")
-    parser.add_argument("--draft-tokens", type=int, default=4)
-    parser.add_argument("--accept-rate", type=float, default=0.75)
+    parser.add_argument(
+        "--draft-tokens",
+        type=int,
+        help="optionally require this measured draft count (otherwise read from records)",
+    )
+    parser.add_argument(
+        "--accept-rate",
+        type=float,
+        help="project decode throughput at this acceptance rate; default uses measured output",
+    )
     parser.add_argument(
         "--compare-topologies",
         action="store_true",

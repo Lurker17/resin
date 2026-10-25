@@ -1,13 +1,11 @@
 """Checkpoint metadata publication reads file sizes, never model weight bodies."""
 
 import json
-from types import SimpleNamespace
 
 import pytest
 
 from deploy.checkpoint_cache import (
     MARKER_NAME,
-    checkpoint_inventory,
     checkpoint_is_complete,
     publish_checkpoint,
 )
@@ -78,43 +76,12 @@ def test_missing_or_empty_shard_cannot_be_published(tmp_path, missing):
     assert not (tmp_path / MARKER_NAME).exists()
 
 
-def test_metadata_only_publication_is_ready_for_v41_serving(monkeypatch, tmp_path):
-    from deploy import modal_bench as generic
-    from deploy import modal_deepseek_v41 as serving
-
-    target = tmp_path / "flash-1017" / serving.REVISION
-    checkpoint(target)
-    operations = []
-    volume = SimpleNamespace(
-        reload=lambda: operations.append("reload"),
-        commit=lambda: operations.append("commit"),
-    )
-    monkeypatch.setattr(
-        generic, "_checkpoint", lambda name: (target, serving.MODEL, serving.REVISION)
-    )
-    monkeypatch.setitem(
-        generic.MODEL_VOLUMES, generic.CHECKPOINTS["deepseek-v41"][2], volume
-    )
-
-    def no_redownload(*args, **kwargs):
-        raise AssertionError("metadata-only publication must not download weights")
-
-    monkeypatch.setattr("huggingface_hub.snapshot_download", no_redownload)
-    with pytest.warns(UserWarning, match="executing locally"):
-        report = generic.download.local("deepseek-v41", True)
-    assert report["metadata_only"] is True
-    assert report["files"] == len(checkpoint_inventory(target))
-    assert operations == ["reload", "commit"]
-    assert checkpoint_is_complete(target, serving.MODEL, serving.REVISION)
-
-
-def test_generic_deepseek_sweep_rejects_config_only_before_model_loading(
-    monkeypatch, tmp_path
-):
-    from deploy import modal_bench as generic
-
+def test_single_file_checkpoint_does_not_require_an_index(tmp_path):
     (tmp_path / "config.json").write_text("{}")
-    monkeypatch.setattr(generic, "_checkpoint", lambda name: (tmp_path, "repo", "pin"))
-    with pytest.warns(UserWarning, match="executing locally"):
-        with pytest.raises(FileNotFoundError, match="publish-only"):
-            generic.sweep.local("deepseek-v41", [], {"world_size": 1}, {})
+    (tmp_path / "model.safetensors").write_bytes(b"weights")
+    options = {"required_files": ("config.json",)}
+    files = publish_checkpoint(tmp_path, "assistant", "pin", **options)
+    assert set(files) == {"config.json", "model.safetensors"}
+    assert checkpoint_is_complete(tmp_path, "assistant", "pin", **options)
+    (tmp_path / "model-2.safetensors").write_bytes(b"more weights")
+    assert not checkpoint_is_complete(tmp_path, "assistant", "pin", **options)

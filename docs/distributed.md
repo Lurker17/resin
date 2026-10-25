@@ -114,11 +114,12 @@ then reproduces every distributed FFN-TP2 prompt score exactly, including the
 outputs, establishing that this drift comes from the split FFN arithmetic rather
 than distributed communication, cache mapping, or graph execution.
 
-Run `deploy.dense_parallel_validation.run_validation(model, checkpoint,
-assistant_path=None)` in a two-GPU environment with the deployment dependencies;
-`model` is `"gemma4"` or `"qwen3_5"`. Pass the Gemma assistant checkpoint to include
-its speculative cases. Raw checkpoint and control records are retained under
-`artifacts/cuda-model-improvements/`.
+The dedicated dense-parallel checkpoint validator has been retired. Raw
+checkpoint and control records remain under `artifacts/cuda-model-improvements/`
+as historical evidence. Current performance runs use `scripts/bench.py` with
+`--model gemma4` or `--model qwen3_5` and explicit topology options; local speculative
+Gemma runs also need `--assistant-checkpoint`. The regular tests retain
+distributed transport, cache, and model contracts.
 
 ## CUDA graphs across ranks
 

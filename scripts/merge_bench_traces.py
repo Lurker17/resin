@@ -1,4 +1,4 @@
-"""Merge each decode case's rank traces into a Chrome JSON trace for Perfetto."""
+"""Merge each prefill/decode case's rank traces into a Chrome trace for Perfetto."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 TRACE_NAME = re.compile(
-    r"(?P<case>decode-ctx\d+-b\d+)-rank(?P<rank>\d+)\.json(?:\.gz)?$"
+    r"(?P<case>(?:prefill|decode)-ctx\d+-b\d+)-rank(?P<rank>\d+)\.json(?:\.gz)?$"
 )
 
 
@@ -160,7 +160,9 @@ def main(argv=None):
             if path.is_file() and (match := TRACE_NAME.fullmatch(path.name)):
                 cases[match["case"]].append(path)
         if not cases:
-            raise ValueError(f"no decode rank traces found in {args.directory}")
+            raise ValueError(
+                f"no prefill or decode rank traces found in {args.directory}"
+            )
         directory = args.output_dir or args.directory
         for case, paths in sorted(cases.items()):
             target = directory / f"{case}-all-ranks.json.gz"

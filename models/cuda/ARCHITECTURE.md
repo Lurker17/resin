@@ -56,3 +56,12 @@ registering a `prefill` mode and choosing its region boundaries. It must not
 add a second graph runner, duplicate the model forward pass, or fork cache and
 sampling semantics. Decode can independently remain full-graph or become
 breakable in the same runner.
+
+## Deployment configuration
+
+`deploy/models.py` is a small operational registry for pinned checkpoints,
+hardware defaults, and runner/recipe construction. `deploy/modal_serve.py` and
+`scripts/bench.py` use it to share startup and download behavior across models.
+This registry does not dispatch model kernels or change the direct model-module
+ownership described above. Numerical contracts belong in the normal test suite;
+one-off Modal operator and diagnostic scripts have been retired.

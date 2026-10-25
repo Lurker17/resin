@@ -89,7 +89,8 @@ https://github.com/huggingface/transformers
 The Rust implementations use the image crate's resize filters.
 
 The shared-expert scale layout in resin/backend/cuda/mega_moe.py and the
-validation reference code in deploy/deepinfer_kernel_probe.py are adapted
+validation reference code in tests/test_mega_moe.py and
+models/cuda/tests/test_deepseek_v41_kernels_gpu.py are adapted
 from DeepGEMM at revision 1fc9c66975ee322d628b3288534ca0e9ce12a64d:
 https://github.com/deepseek-ai/DeepGEMM
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -10,8 +9,6 @@ from deploy.jit_cache import (
     _PATH_ENV_KEYS,
     KERNEL_CACHE_ENV,
     KERNEL_CACHE_MOUNT,
-    changed_cache_files,
-    kernel_cache_summary,
 )
 
 
@@ -31,16 +28,6 @@ class TestKernelCacheContract:
         assert KERNEL_CACHE_ENV["FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED"] == "1"
         assert KERNEL_CACHE_ENV["QUACK_CACHE_ENABLED"] == "1"
 
-    def test_manifest_helpers_detect_only_new_or_resized_files(self) -> None:
-        before = {"fa4/a.o": 10, "flashinfer/module.so": 20}
-        after = {**before, "triton/kernel.cubin": 30}
-        assert changed_cache_files(before, after) == ["triton/kernel.cubin"]
-        assert kernel_cache_summary(after) == {
-            "fa4": {"files": 1, "bytes": 10},
-            "flashinfer": {"files": 1, "bytes": 20},
-            "triton": {"files": 1, "bytes": 30},
-        }
-
     def test_environment_override_cannot_escape_mount(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -54,53 +41,50 @@ class TestKernelCacheContract:
     def test_deployment_uses_one_abi_scoped_namespace(self) -> None:
         from deploy.jit_cache import (
             KERNEL_CACHE_ABI,
-            KERNEL_CACHE_MARKER_SCHEMA,
             KERNEL_CACHE_ROOT,
         )
 
         assert Path(KERNEL_CACHE_ROOT) == Path(KERNEL_CACHE_MOUNT) / KERNEL_CACHE_ABI
         assert KERNEL_CACHE_ABI.startswith("v12-blake3-")
-        assert KERNEL_CACHE_MARKER_SCHEMA == 2
 
-    def test_artifact_fingerprints_ignore_mtime_changes(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        from deploy.jit_cache import kernel_artifact_fingerprints
 
-        monkeypatch.setattr("deploy.jit_cache.KERNEL_CACHE_ROOT", tmp_path)
-        artifact = tmp_path / "flash-attention-4" / "fwd" / "kernel.o"
-        artifact.parent.mkdir(parents=True)
-        artifact.write_bytes(b"compiled")
-        before = kernel_artifact_fingerprints()
-        assert (
-            before["flash-attention-4/fwd/kernel.o"]
-            == "8:0a1c9344b835c6d495d9c0373e619936990f97b18cb8ba615b5344adf724a5e5"
-        )
-        stat = artifact.stat()
-        os.utime(
-            artifact,
-            ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
-        )
-        assert kernel_artifact_fingerprints() == before
+def test_flashinfer_artifact_maps_scratch_path_to_durable_namespace(
+    monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
 
-    def test_autotune_json_is_content_fingerprinted_without_mtimes(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        from deploy.jit_cache import kernel_artifact_fingerprints
+    from deploy.jit_cache import _flashinfer_durable_artifact
 
-        monkeypatch.setattr("deploy.jit_cache.KERNEL_CACHE_ROOT", tmp_path)
-        artifact = tmp_path / "flashinfer-autotune" / "gpt-oss.json"
-        artifact.parent.mkdir(parents=True)
-        artifact.write_bytes(b'{"tactic":1}')
-        before = kernel_artifact_fingerprints()
-        assert "flashinfer-autotune/gpt-oss.json" in before
+    workspace = tmp_path / "scratch"
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(workspace))
+    spec = SimpleNamespace(jit_library_path=workspace / "module" / "kernel.so")
+    assert _flashinfer_durable_artifact(spec) == Path("flashinfer/module/kernel.so")
+    spec.jit_library_path = tmp_path / "outside" / "kernel.so"
+    with pytest.raises(RuntimeError, match="escaped its local workspace"):
+        _flashinfer_durable_artifact(spec)
 
-        stat = artifact.stat()
-        os.utime(
-            artifact,
-            ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
-        )
-        assert kernel_artifact_fingerprints() == before
 
-        artifact.write_bytes(b'{"tactic":2}')
-        assert kernel_artifact_fingerprints() != before
+def test_compiler_namespace_preparation_tolerates_concurrent_rank(
+    monkeypatch, tmp_path
+):
+    from deploy import jit_cache
+
+    mount = tmp_path / "volume"
+    root = mount / "abi"
+    monkeypatch.setattr(jit_cache, "KERNEL_CACHE_MOUNT", str(mount))
+    monkeypatch.setattr(jit_cache, "KERNEL_CACHE_ROOT", str(root))
+    for key in jit_cache._PATH_ENV_KEYS:
+        monkeypatch.setenv(key, str(root / key))
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(tmp_path / "scratch"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    original = Path.symlink_to
+
+    def concurrent_create(path, target, **options):
+        original(path, target, **options)
+        raise FileExistsError("another rank won the creation race")
+
+    monkeypatch.setattr(Path, "symlink_to", concurrent_create)
+    jit_cache.ensure_kernel_cache_dirs()
+    trace_link = tmp_path / "home/.cache/flashinfer/trace_apply/solutions"
+    assert trace_link.is_symlink()
+    assert trace_link.resolve() == root / "flashinfer-trace-apply"

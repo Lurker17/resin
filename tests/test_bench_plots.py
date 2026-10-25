@@ -65,7 +65,8 @@ def test_decode_projects_steps_without_relabeling_measured_acceptance(tmp_path):
     row = record()
     rows = load_records([write(tmp_path / "decode.jsonl", row)])
     before = deepcopy(rows)
-    assert axes(rows, "decode") == {4096: [(20, 80, "8")]}
+    assert axes(rows, "decode") == {4096: [(10, 40, "8")]}
+    assert axes(rows, "decode", accept_rate=0.75) == {4096: [(20, 80, "8")]}
     assert axes(rows, "decode", accept_rate=0) == {4096: [(5, 20, "8")]}
     assert rows == before
     assert rows[0]["measured_accept_rate"] == 0.25
@@ -75,6 +76,60 @@ def test_decode_projects_steps_without_relabeling_measured_acceptance(tmp_path):
 def test_prefill_uses_actual_input_counts_and_measured_step_latency(tmp_path):
     rows = load_records([write(tmp_path / "prefill.jsonl", record("prefill"))])
     assert axes(rows, "prefill") == {4096: [(200, 12500, "20,000")]}
+
+
+def test_prefill_cohort_latency_includes_every_chunk(tmp_path):
+    row = record("prefill", prefill_seconds=[0.4])
+    rows = load_records([write(tmp_path / "cohort.jsonl", row)])
+    assert axes(rows, "prefill") == {4096: [(400, 12500, "8")]}
+    output = tmp_path / "plots"
+    main(
+        [
+            str(tmp_path / "cohort.jsonl"),
+            "--mode",
+            "prefill",
+            "--output-dir",
+            str(output),
+        ]
+    )
+    svg = (output / "prefill.svg").read_text()
+    assert "Prefill latency (ms/cohort)" in svg
+    assert "Latency covers every chunk of the requested context" in svg
+
+
+def test_prefill_rejects_mixed_step_and_cohort_latency(tmp_path):
+    path = write(
+        tmp_path / "mixed.jsonl",
+        record("prefill"),
+        record("prefill", prefill_seconds=[0.4]),
+    )
+    with pytest.raises(ValueError, match="mixed .*configurations"):
+        load_records([path])
+
+
+@pytest.mark.parametrize("durations", [[], [0.1], [float("nan")]])
+def test_prefill_cohort_timings_cover_the_measured_window(tmp_path, durations):
+    path = write(tmp_path / "bad.jsonl", record("prefill", prefill_seconds=durations))
+    with pytest.raises(ValueError, match="prefill_seconds"):
+        load_records([path])
+
+
+def test_cli_projection_is_explicit_and_uses_recorded_draft_count(tmp_path):
+    source = write(tmp_path / "decode.jsonl", record())
+    output = tmp_path / "plots"
+    main(
+        [
+            str(source),
+            "--mode",
+            "decode",
+            "--accept-rate",
+            "0.75",
+            "--output-dir",
+            str(output),
+        ]
+    )
+    svg = (output / "decode.svg").read_text()
+    assert "Projected acceptance 75%, 4 drafts" in svg
 
 
 def test_context_curves_and_latest_repeated_point_are_kept_separate(tmp_path):
@@ -87,8 +142,8 @@ def test_context_curves_and_latest_repeated_point_are_kept_separate(tmp_path):
     )
     rows = load_records([path])
     assert axes(rows, "decode") == {
-        4096: [(10, 40, "8"), (20, 160, "16")],
-        8192: [(20, 80, "8")],
+        4096: [(5, 20, "8"), (5, 40, "16")],
+        8192: [(10, 40, "8")],
     }
 
 
@@ -203,7 +258,8 @@ def test_projection_options_are_validated(options):
 def test_natural_acceptance_measurements_allow_an_explicit_projection(tmp_path):
     row = record(accepted_drafts=None, measured_accept_rate=0.6)
     rows = load_records([write(tmp_path / "natural.jsonl", row)])
-    assert axes(rows, "decode") == {4096: [(20, 80, "8")]}
+    assert axes(rows, "decode") == {4096: [(10, 40, "8")]}
+    assert axes(rows, "decode", accept_rate=0.75) == {4096: [(20, 80, "8")]}
     assert rows[0]["measured_accept_rate"] == 0.6
 
 
@@ -237,8 +293,8 @@ def test_cli_renders_two_pngs_and_two_svgs(tmp_path, capsys, contexts):
     assert all(file.stat().st_size > 1000 for file in output.iterdir())
     svg = (output / "decode.svg").read_text()
     assert "fixture GPU" in svg
-    assert "Projected acceptance 75%" in svg
-    assert "measured acceptance 25.0%" in svg
+    assert "Projected acceptance" not in svg
+    assert "Measured output throughput; acceptance 25.0%" in svg
     for context in contexts:
         assert f"Context {context:,}" in svg
     assert "decode.png" in capsys.readouterr().out
@@ -268,6 +324,7 @@ def topology_record(*, world=1, tp=1, ep=1, **changes):
         draft_tokens=0,
         accepted_drafts=0,
         measured_accept_rate=None,
+        committed_tokens=16,
         **changes,
     )
     row["metadata"]["parallelism"].update(

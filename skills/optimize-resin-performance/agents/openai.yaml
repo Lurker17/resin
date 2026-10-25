@@ -1,0 +1,4 @@
+interface:
+  display_name: "Optimize Resin Performance"
+  short_description: "Trace and remove measured Resin inference bottlenecks"
+  default_prompt: "Use $optimize-resin-performance to find and remove the bottlenecks in this Resin workload, preserving correctness and reporting measured curves and traces."

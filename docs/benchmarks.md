@@ -1,139 +1,284 @@
 # Benchmark sweeps
 
-The sweep loads one model per GPU, keeps it resident across cases, and measures
-engine completions after warmup. It writes raw measurements to JSONL;
-plotting runs locally without importing PyTorch. Startup, weight loading, and
-graph capture are outside the measured windows and recorded separately.
-Overlap is enabled by default for capable runners; pass `--no-overlap` to time
-the synchronized reference path. Overlapped decode measures continuous completion
+`resin.bench` supplies the reusable measurement framework. Run it through
+`scripts/bench.py` on a local CUDA host or with `--backend modal`; both backends
+use the same model registry, runner construction, measurements, and JSONL schema.
+`scripts/plot_bench.py` renders charts, and `scripts/merge_bench_traces.py` combines
+rank traces for Perfetto. `deploy/modal_bench.py` is a thin remote adapter.
+
+## Run a sweep
+
+Download pinned weights on a Modal CPU worker, then sweep prefill and decode:
+
+```bash
+uv run scripts/bench.py --model deepseek-v41 --backend modal --download-only
+uv run scripts/bench.py --model deepseek-v41 --backend modal \
+  --context-lengths 4096,8192 --batch-sizes 1,2,4,8 \
+  --output bench/deepseek-v41.jsonl --trace-dir bench/traces --plot
+```
+
+For local GPUs, point to an existing checkpoint:
+
+```bash
+uv run scripts/bench.py --model gpt-oss-20b --backend local \
+  --checkpoint /path/to/gpt-oss-20b \
+  --context-lengths 4096,8192 --batch-sizes 1,2,4,8 \
+  --output bench/gpt-oss-20b.jsonl --trace-dir bench/gpt-oss-traces
+uv run scripts/plot_bench.py bench/gpt-oss-20b.jsonl
+```
+
+The default backend is `local`, which requires `--checkpoint`. Models using a
+separate assistant also accept `--assistant-checkpoint PATH`. Modal uses pinned
+checkpoint volumes from `deploy/models.py`; `--publish-only` adopts complete
+existing files by validating and atomically publishing their inventory markers.
+It does not download or read weight bodies. Serving uses the same inventories.
+
+Available model keys are `gpt-oss-20b`, `gpt-oss-120b`, `deepseek-v41`, `gemma4`,
+`qwen3_5`, and `inkling`. The Qwen runner currently pins Qwen3.8-27B. Hardware,
+parallelism, draft count, and memory defaults come from each registry entry.
+DeepSeek defaults to four B300s with ADP4/EP4, attention TP1, DeepGEMM experts,
+and three drafts; GPT-OSS has no draft model. Override topology with
+`--world-size`, `--attn-dp`, `--attn-tp`, `--cp`, and `--ep`, and Modal hardware
+with `--gpu`. GPU overrides must match the preset kernel architecture: GPT-OSS
+accepts H100 or H200; other presets currently require their configured GPU.
+Record files retain the actual device name.
+
+Use `--phases prefill`, `--phases decode`, or `--phases prefill,decode` (default).
+Batch sizes count requests **per attention-DP replica**; the global batch is
+`batch_size * attn_dp`. Throughput is divided by total GPU count, including TP/CP
+participants. `--prefill-chunk-size`, `--prefill-graph`, and `--decode-graph`
+control execution policy. The default graph policies are breakable prefill and
+full decode. Each point uses five warmup steps and twenty measured steps unless
+overridden with `--warmup-steps` and `--measure-steps`.
+
+## Timing and synthetic workloads
+
+Each sweep loads the model once per GPU and keeps it resident across cases.
+Startup, weight loading, graph capture, and request admission are untimed.
+Prefill processes complete request cohorts at each context length, even when
+chunking requires more than the requested minimum step count. Its latency is
+the sum of timed Engine steps for a complete cohort, excluding admission and
+between-step benchmark reductions. Prefill throughput counts actual new input
+tokens, excluding attention-TP/CP replication and any reused prefix.
+
+Decode prefills outside timing, warms up, then measures the requested number
+of completions while the full cohort stays resident. Context grows during
+warmup and measurement. Overlap is enabled where supported; `--no-overlap`
+selects synchronized execution. Overlapped decode measures continuous completion
 intervals, including CPU work between completions, without per-step CUDA
-synchronization or metric reductions. Warmup reductions are deferred too, so
-the first measured completion cannot advance in an untimed reduction. Each point
-records actual enqueue/continuation counts; static graph phase events are omitted
-when a following replay could overwrite them. Perfetto traces contain two live
-completions after timing, with no benchmark metric collectives between them.
-The requested result file is written after normal sweep completion. Each completed
-point is also flushed as a `[bench-result] {json}` log line, so earlier points can
-be recovered from captured logs if a later case fails.
-Before capture, the launcher logs each rank's cache budget and checks every
-cohort's peak context against the native `CacheLayout.estimated_parent_count`
-estimator. Decode includes warmup, measured generation, and draft write
-lookahead. A case that cannot remain fully resident fails before prefill rather
-than measuring a smaller admitted batch.
-The chart axes and speculative projection follow
+synchronization or benchmark reductions. Metrics are reduced after the window.
+
+Before capture, the launcher checks the full cohort against the cache budget,
+including generated positions, speculative lookahead, and trace headroom. A
+case that cannot fit fails before timing rather than benchmarking a smaller
+admitted batch. Each completed point is printed as `[bench-result] {json}` for
+recovery from logs if a later case fails.
+
+Natural draft acceptance and model expert routing are the defaults. To measure
+a controlled speculative workload, explicitly select the number of draft
+positions and accepted drafts:
+
+```bash
+uv run scripts/bench.py --model deepseek-v41 --backend modal \
+  --phases decode --context-lengths 8192 --batch-sizes 1,4,16 \
+  --draft-tokens 4 --accepted-drafts 3 --balanced-experts \
+  --output bench/deepseek-v41-fixed.jsonl
+```
+
+`--accepted-drafts` changes actual verification/commit and rollback behavior;
+`--balanced-experts` changes routing while retaining router computation and
+weights. These are synthetic performance workloads, not model-quality results.
+Their settings and observed acceptance are recorded. Use separate result files
+for natural and synthetic policies. `--draft-tokens 0` measures ordinary decode
+when the model supports disabling its draft path.
+
+To reuse a long prefix within each attention replica:
+
+```bash
+uv run scripts/bench.py --model deepseek-v41 --backend modal \
+  --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --cp 1 --ep 8 \
+  --phases decode --context-lengths 131072 --shared-prefix-tokens 126976 \
+  --batch-sizes 1,4,16,64,256 --prefill-chunk-size 1024 \
+  --gpu-memory-utilization 0.5 --output bench/deepseek-v41-shared.jsonl
+```
+
+`context_length` remains the total prompt length. The prefix is seeded once
+outside timing, and every request gets a distinct private suffix. Each admitted
+request must report exactly the requested cached length. Independent and
+shared-prefix measurements must use separate chart files. The default is zero
+shared tokens. DeepSeek requires attention TP1; the DeepGEMM expert path
+requires ADP=EP=world size, CP1, and at least two GPUs.
+
+## Prefill and decode traces
+
+`--trace-dir DIR` captures two extra passes after each measured case. Prefill
+traces run two fresh complete cohorts, including every chunk of the requested
+context. Decode traces run two live completions, preserving overlap. Traced
+work does not alter measured timing, acceptance, graph counters, or context
+bounds, and no benchmark metric collectives run between traced passes.
+
+Traces include CPU/CUDA activity from **attention-DP driver processes**. This
+covers all ranks for DeepSeek's ADP=world-size layout. TP/CP follower processes
+remain in their worker loop and are not independently profiled. The records
+should not be interpreted as every GPU's trace for those layouts.
+
+Each case produces raw `<phase>-ctx<length>-b<batch>-rank<rank>.json.gz` files
+and a merged `<phase>-ctx<length>-b<batch>-all-ranks.json.gz`. The Modal backend
+downloads them to the local directory. Local sweeps create a fresh run subdirectory
+beneath `--trace-dir`, preventing stale ranks from an earlier sweep from being
+merged into new traces. Pass that subdirectory to the merger when remerging.
+The merger aligns PyTorch timestamp
+bases and isolates process/flow IDs; open the merged file in
+[Perfetto](https://ui.perfetto.dev/). Source/workload metadata and raw files are
+retained. Merge downloaded or local traces again with:
+
+```bash
+uv run scripts/merge_bench_traces.py bench/traces
+```
+
+## Reading the charts
+
+`--plot` renders the measured phases after the sweep. The standalone plotter
+writes `prefill.png/svg` and `decode.png/svg` beneath the input directory's
+`plots/` folder; use `--output-dir` to choose another destination. For a
+single-phase result, pass the matching `--mode prefill` or `--mode decode`.
+Different context lengths form separate curves; point labels count requests
+per attention-DP replica.
+
+Prefill compares mean complete-cohort latency in milliseconds against actual
+input tokens/s/GPU. `prefill_seconds` records one duration per measured cohort,
+so a long chunked prompt is not mislabeled with one chunk's latency. Older
+schema-1 records without this field still plot their original step timings,
+with a legacy label, and cannot be mixed with cohort timings.
+
+Decode plots use actual committed output by default:
+
+```text
+output tokens/s/GPU = committed_tokens / window_seconds / gpu_count
+per-user tokens/s = committed_tokens / window_seconds / global_batch_size
+```
+
+An explicit `--accept-rate` instead projects throughput from measured step
+latency at an assumed acceptance rate:
+
+```bash
+uv run scripts/plot_bench.py bench/deepseek-v41-fixed.jsonl \
+  --mode decode --accept-rate 0.75
+```
+
+```text
+τ = 1 + recorded_draft_tokens * projected_accept_rate
+per-user tokens/s = measured_steps / window_seconds * τ
+output tokens/s/GPU = per-user tokens/s * global_batch_size / gpu_count
+```
+
+The draft width is read from the measurements; `--draft-tokens` can optionally
+assert that width. Projection rescales the same timings and does not rerun
+verification or change observed acceptance. Its footer identifies projected
+and observed acceptance. The chart conventions follow
 [DeepInfer's sweep plotter](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/examples/sweep/plot_pareto.py).
 
-Download the pinned checkpoint before allocating GPUs:
+To compare topologies with matching model/source/kernel/workload policies:
 
 ```bash
-uv run modal run deploy/modal_bench.py --model deepseek-v41 --download-only
+uv run scripts/plot_bench.py bench/gpt-oss-120b-{tp1,tp2,tp4,ep2,ep4}.jsonl \
+  --compare-topologies --mode decode --output-dir bench/gpt-oss-120b-comparison
 ```
 
-Run prefill and decode sweeps, then produce both charts:
+Decode comparisons can use different prefill capacities between meshes because
+prefill runs outside the decode timing window. Within a curve, incompatible
+configurations are rejected rather than connected. Repeated identical points
+use their latest record; earlier rows are still validated.
+
+## Raw records and reusable API
+
+Each JSONL row has `schema_version: 1`, phase, requested context length,
+local/global batch sizes, GPU count, attention-DP count, and every measured
+`step_seconds`. `window_seconds` is their sum. Prefill adds `prefill_seconds`
+for complete cohorts. `input_tokens` counts actual unique prefill inputs;
+`prefill_tokens` remains their per-step mean for compatibility.
+`committed_tokens` counts generated output.
+
+`draft_tokens`, `accepted_drafts`, `measured_accept_rate`, and
+`balanced_experts` describe the workload. Null `accepted_drafts` means natural
+verification. Shared-prefix fields record requested and observed cached tokens.
+`graph_counts` and `overlap_counts` exclude warmup/tracing. Distributed timings
+use the slowest replica driver and sum tokens over unique drivers. Actual
+context bounds are retained as `measured_context_start_min/max` and
+`measured_context_end_min/max`.
+
+Metadata contains model/checkpoint/source identity, actual hardware, topology,
+graph policies, expert backend, quantization, prefill budget, and startup times.
+The source digest prevents combining different uncommitted source under one
+Git commit. Timing measures real Engine execution, not a synthetic latency model.
+
+For an existing Engine, wrap the model runner in `BenchmarkRunner` before
+Engine construction and graph capture, then call `resin.bench.run_sweep` with
+`BenchCase` values. The caller owns Engine lifetime. Supply
+`resin.bench.perfetto_trace(directory, rank, metadata)` as `trace_step` to enable
+the same untimed traces. Multi-driver runs must coordinate with
+`distributed_reducer` and invoke the same trace passes on every driver.
+
+## HTTP correctness and latency checks
+
+Use the reusable server checker against an already running endpoint:
 
 ```bash
-uv run modal run deploy/modal_bench.py \
-  --model deepseek-v41 --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 \
-  --context-lengths 4096,8192 --batch-sizes 1,2,4,8 \
-  --output bench/deepseek-v41.jsonl
-uv run scripts/plot_bench.py bench/deepseek-v41.jsonl
+uv run scripts/check_server.py https://YOUR-ENDPOINT \
+  --output artifacts/server-check.json
 ```
 
-To reuse one long prefix within each attention replica, set `--shared-prefix-tokens`.
-`--context-lengths` still specifies the total context; the remainder is private:
+It checks JSON/SSE responses, logprobs, concurrent requests, repeated-prefix
+cache hits, and a context-size TTFT sweep. `--image` adds a built-in image test
+(or accepts a path/URL); `--reasoning-effort low high` tests those request
+settings. `--stress` adds the existing HTTP stress/robustness suite. Unsupported
+capabilities are reported as skipped where evidence cannot be collected; use
+`--skip-prefix-cache` or `--skip-logprobs` for intentionally disabled features.
+
+The context sweep uses fresh early prefixes to avoid cache hits hiding prefill
+work. Requested sizes are repeated-word counts; records include actual server
+`prompt_tokens`. Adjust sizes and latency limits explicitly:
 
 ```bash
-uv run modal run deploy/modal_bench.py \
-  --model deepseek-v41 --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 \
-  --expert-backend deepgemm --context-lengths 131072 \
-  --shared-prefix-tokens 126976 --batch-sizes 1,4,16,64,256 \
-  --phases decode --prefill-chunk-size 1024 --gpu-memory-utilization 0.5 \
-  --output bench/deepseek-v41-shared.jsonl
+uv run scripts/check_server.py https://YOUR-ENDPOINT \
+  --context-lengths 128 512 2048 --repeats 2 \
+  --max-ttft-ms 10000 --ttft-ratio 3 --ttft-slack-ms 2000 \
+  --output artifacts/server-contexts.json
 ```
 
-The shared prefix is seeded once per case outside timing. Each request receives
-a distinct private suffix, and its reported cached length must exactly match the
-requested prefix. Unsupported cache/checkpoint reuse fails explicitly. Records
-include shared/private token counts and actual cached-length bounds; prefill
-throughput counts newly processed inputs. Independent and shared-prefix points
-must use separate chart files. The default is zero shared tokens.
-The lower cache budget in this long-context example leaves workspace for the
-captured decode graphs and uncaptured prefill operations. Cache preflight still
-requires the entire requested cohort to fit; unused arena capacity does not
-improve throughput.
+TTFT includes HTTP/network overhead and does not establish whether kernels
+recompiled. If the server exports a cumulative compilation counter, pass
+`--compilation-metric NAME` and run against an idle deployment. The checker
+requires the counter to remain unchanged across the sweep; without that
+counter the compilation assertion is explicitly skipped. Exact context-limit
+checks require `--context-length LIMIT` and a compatible chat-tokenization
+endpoint; Resin currently has no `/tokenize` endpoint, so these checks skip.
 
-The default DeepSeek workload uses four draft tokens, forces three accepted
-drafts per verification step, and balances expert routing. These are controlled
-performance measurements, rather than measurements of natural acceptance or
-routing. Use `--natural-acceptance` to run the actual verifier and
-`--no-balanced-experts` to preserve model routing. The JSONL records both the
-configured acceptance policy and the observed acceptance rate.
-
-V4.1 uses the pinned `DeepSeek-V4.1-Flash-1017` checkpoint and its own native text
-architecture and recipe. Download and sweep it with:
+For a small MMLU accuracy check, supply a standard subject CSV from your chosen
+source/split, with provenance saved alongside it. CSV rows have no header and
+contain the question, choices A–D, and the answer letter. No benchmark dataset
+is bundled or downloaded:
 
 ```bash
-uv run modal run deploy/modal_bench.py --model deepseek-v41 --download-only
-uv run modal run deploy/modal_bench.py \
-  --model deepseek-v41 --gpu B300 --world-size 8 --attn-dp 8 --attn-tp 1 --ep 8 \
-  --expert-backend deepgemm \
-  --context-lengths 4096,8192 --batch-sizes 1,2,4,8 \
-  --output bench/deepseek-v41.jsonl
-uv run scripts/plot_bench.py bench/deepseek-v41.jsonl
+uv run scripts/check_server.py https://YOUR-ENDPOINT \
+  --eval-file eval/abstract_algebra_test.csv --eval-limit 20 --eval-max-tokens 256 \
+  --min-accuracy 0.5 --output artifacts/server-eval.json
 ```
 
-`--expert-backend deepgemm` selects the upstream fused MoE operation, including
-sparse EP exchange and shared experts. Its initial mesh is ADP=EP=world size,
-attention TP1, CP1, and expert TP1. The default `flashinfer` backend retains the
-existing prepared expert path. Backend identity is recorded and checked when
-combining chart points. The two-GPU B300 kernel/adapter probe passes numerical,
-idle-rank, changing-route, and CUDA graph checks, including 1,280 physical rows
-per rank (batch 256 with four draft positions). The separate Engine smoke needs
-only two B300s and generates deterministic synthetic weights locally:
+JSONL is also supported: each line contains
+`{"question": "...", "choices": ["...", "..."], "answer": "A"}`; answers may
+be zero-based indices. The checker records answers and accuracy, fails missing/unparseable answers,
+and applies the selected minimum. A small subset is a regression check, not a
+full MMLU score. JSON reports separate passed, failed, and skipped checks.
 
-```bash
-uv run modal run deploy/modal_deepinfer_kernels.py --mode engine-smoke \
-  --output artifacts/benchmarks/deepseek-v41-synthetic-engine-validation.json
-```
+## Recorded V4.1 measurements
 
-It runs the production V4.1 runner, pages, EP/ADP coordinator, scoring, and graph
-paths at K0 and K4. Its unrelated draft weights exercise rejection and rollback;
-the real-checkpoint check below additionally exercises accepted drafts. This
-synthetic smoke does not test model quality or Engram tables.
+The following qualification and performance reports describe their original
+source revisions. The one-off Modal validation/probe launchers have been
+retired; these artifacts are historical evidence, not results of the current
+benchmark CLI.
 
-DeepSeek serving and benchmark jobs share a checkpoint volume and completion marker.
-For an older generic download whose files are already complete, publish only
-the small inventory marker with
-`uv run modal run deploy/modal_bench.py --model deepseek-v41 --publish-only`.
-This CPU operation stats the indexed files and publishes metadata atomically;
-it does not download or read the weight bodies. New downloads publish the marker
-automatically. GPU sweeps require that complete inventory.
-
-Attention TP means KV-head sharding, so DeepSeek-V4.1 requires
-`attn_tp=1`. Earlier four-GPU TP4 debug reports sliced query heads while
-replicating KV; their results do not qualify this contract. The initial V4.1
-target used eight B300s with attention DP8/EP8 and replicated Engram tables.
-The current runner shards Engram rows across the device domain and stores packed
-FP8 sliding KV and FP4 compressed KV. On eight ranks, Engram table storage drops
-from 188.83 to 23.60 GiB per GPU. Earlier full-checkpoint reports passed
-eager/captured K0 on ADP2/EP2 and ADP8/EP8, and K4 on ADP8/EP8; those reports
-predate the prepared DeepInfer forward operators. See the
-[family memory and qualification details](../models/cuda/resin_models_cuda/deepseek_v41/README.md)
-for exact allocations and the distinction between the current path and older
-replicated-table/BF16-cache measurements.
-
-Run the current prepared forward comparison with natural routing and K3:
-
-```bash
-uv run modal run deploy/modal_bench.py \
-  --model deepseek-v41 --gpu B300 --world-size 4 --attn-dp 4 --attn-tp 1 --ep 4 \
-  --expert-backend deepgemm \
-  --draft-tokens 3 --natural-acceptance --no-balanced-experts --validate-model \
-  --prefill-chunk-size 8 --context-lengths 64 --batch-sizes 1 \
-  --output artifacts/benchmarks/deepinfer-v41-forward-ep4-k3-validation.json
-```
-
-Validation writes a JSON report rather than chart measurements. At clean commit
+At clean commit
 `7087a31`, this [four-B300 run](https://modal.com/apps/ekzhang/main/ap-RGV18BLKlCCRqSzjNVwMBm)
 passes with the released 384 experts on all four drivers. Each driver runs four
 prefill and three decode steps, including three full decode graph replays. Eager
@@ -391,134 +536,10 @@ for measured scope, CP2 coverage and raw evidence.
 
 The implementation uses fixed-width greedy proposals, loads the confidence head
 without applying its length policy, and supports up to the released five-token
-block. Benchmark defaults remain four drafts. Wider meshes and longer contexts
+block. These historical benchmark runs used four drafts; current defaults come from
+the shared model registry. Wider meshes and longer contexts
 need separate qualification; see the
 [family limits](../models/cuda/resin_models_cuda/deepseek_v41/README.md).
-
-Available model names are `deepseek-v41`, `gpt-oss-20b`, and
-`gpt-oss-120b`. The GPT-OSS benchmark path currently uses the Hopper expert kernel
-and has no draft model:
-
-```bash
-uv run modal run deploy/modal_bench.py \
-  --model gpt-oss-20b --gpu 'H100!' --world-size 1 --attn-dp 1 --attn-tp 1 --ep 1 \
-  --draft-tokens 0 --prefill-chunk-size 1024 --output bench/gpt-oss-20b.jsonl
-uv run scripts/plot_bench.py bench/gpt-oss-20b.jsonl --draft-tokens 0
-```
-
-Use `--gpu 'H100!'` for an H100 comparison. Modal can automatically upgrade
-plain `H100` requests to H200; the exclamation mark
-[disables that upgrade](https://modal.com/docs/guide/gpu#automatic-upgrades-to-h200s).
-Records always retain the actual device name.
-
-Use `--phases decode` or `--phases prefill` for one phase and the matching
-`--mode decode` or `--mode prefill` when plotting. Parallelism is configured with
-`--world-size`, `--attn-dp`, `--attn-tp`, `--cp`, and `--ep`. The launcher defaults
-to eight GPUs, attention DP8, attention TP1, CP1, and EP8 for DeepSeek; override
-all relevant fields when selecting another model. Batch sizes count
-requests **per attention-DP replica**; the global batch is `batch_size * attn_dp`.
-`--prefill-chunk-size`, `--prefill-graph`, and `--decode-graph` select execution
-policies. Defaults are a 4,096-token prefill chunk, breakable prefill graphs,
-full decode graphs, five warmup steps, and twenty measured steps. Prefill may
-measure additional steps to finish its request cohort.
-
-## Decode traces
-
-Add `--trace-dir bench/traces` to save Perfetto-compatible Chrome JSON traces.
-After each decode timing window, every attention-DP driver profiles one extra
-full-cohort step with CPU and CUDA activities, including individual CUDA graph
-nodes. This step is excluded from measured durations, acceptance, counters and
-context bounds. Prefill and checkpoint-validation runs are not traced.
-
-The launcher downloads compressed raw rank traces and a merged
-`decode-ctx<length>-b<batch>-all-ranks.json.gz` for each case. The merger aligns
-PyTorch timestamp bases and separates rank process/flow IDs. Open the merged
-file in [Perfetto](https://ui.perfetto.dev/). Source and workload metadata stay
-in the trace. Raw files can also be merged again locally:
-
-```bash
-uv run scripts/merge_bench_traces.py bench/traces
-```
-
-## Reading the charts
-
-The plotter saves `decode.png`, `decode.svg`, `prefill.png`, and `prefill.svg`
-under the JSONL directory's `plots/` folder. Use `--output-dir` to change it.
-Different context lengths form separate curves.
-
-To compare meshes for the same model, pass their result files together with
-`--compare-topologies`. Each topology becomes a separate curve; model revision,
-source, kernels, graph and workload policies must still match. Decode comparisons
-allow different prefill capacities between meshes because prefill runs outside
-the timed decode window:
-
-```bash
-uv run scripts/plot_bench.py bench/gpt-oss-120b-{tp1,tp2,tp4,ep2,ep4}.jsonl \
-  --compare-topologies --draft-tokens 0 --mode decode \
-  --output-dir bench/gpt-oss-120b-comparison
-```
-
-The decode chart has per-user output tokens/s on the horizontal axis and output
-tokens/s/GPU on the vertical axis. Point labels are requests per attention-DP
-replica. Its acceptance setting is an explicit projection of measured step
-latency:
-
-```text
-τ = 1 + draft_tokens * accept_rate
-per-user tokens/s = measured_steps / window_seconds * τ
-output tokens/s/GPU = per-user tokens/s * global_batch_size / gpu_count
-```
-
-Plot defaults are `--draft-tokens 4 --accept-rate 0.75`, hence four committed
-tokens per step. The draft count must match the measured verification width.
-Changing `--accept-rate` rescales throughput using the same measured latency;
-it does not rerun verification or change the recorded observed acceptance.
-The chart footer shows both projected and observed acceptance. Actual measured
-output throughput remains available as
-`committed_tokens / window_seconds / gpu_count` in the raw data.
-
-The prefill chart uses mean milliseconds per measured prefill step horizontally
-and actual input tokens/s/GPU vertically. Point labels show actual unique input
-tokens per global step, rather than the configured token budget. These counts
-exclude replication across attention TP/CP ranks.
-
-## Raw data and comparisons
-
-Each JSONL row has `schema_version: 1`, a phase, context length, local/global
-batch sizes, GPU count, attention-DP size, every measured step duration, and the
-sum of those durations as `window_seconds`. `input_tokens` counts actual unique
-prefill inputs; `prefill_tokens` is their measured per-step mean.
-`committed_tokens` always counts generated outputs. `draft_tokens`,
-`accepted_drafts`, `measured_accept_rate`, and `balanced_experts` describe the
-workload. A null `accepted_drafts` means natural verification.
-
-Balanced routing covers physical router rows, including any padding used by a
-captured prefill bucket. Successive assignments cycle through EP owners first,
-then through experts within each owner, so even a small batch exercises balanced
-communication. Attention-DP replicas receive offset portions of that assignment;
-other attention ranks apply the same ordinal rule to their router rows. The real router GEMM still runs,
-and selected router scores still determine weights.
-`graph_counts` sums replay and fallback counter changes over unique attention-DP
-drivers during measurement, excluding warmup. Distributed timings use the slowest replica driver per step;
-token counts are summed over unique drivers. `window_seconds` sums timed
-`Engine.step` calls, excluding admission and benchmark metric reductions.
-`context_length` is the requested prompt length; the
-`measured_context_start_min/max` and `measured_context_end_min/max` fields record
-the actual contexts after warmup and measurement as decode advances.
-
-Metadata records the model, checkpoint revision, Git commit and source digest,
-hardware, parallelism, graph policies, checkpoint quantization, and prefill
-chunk size. The plotter rejects incompatible configurations within a phase
-instead of connecting them as one curve. Keep separate result files for
-different models, meshes, quantization, graph policies, or acceptance policies.
-The source digest also prevents combining different uncommitted code under the
-same Git commit. Repeated identical sweep points use their latest record;
-validation still checks all earlier rows.
-
-The reusable measurement API is `resin.bench.run_sweep`; the Modal launcher is
-`deploy/modal_bench.py`. The harness observes the real runner and scheduler;
-it does not substitute a synthetic latency model. Plot tests use explicitly
-synthetic fixtures only.
 
 ## Recorded decode sweeps
 
@@ -595,9 +616,9 @@ Raw results and source digests are in
 and the successful Qwen rerun
 [`qwen_result.json`](../artifacts/cuda-model-improvements/qwen_result.json).
 The first file records the initial Qwen probe failure; the rerun is the Qwen
-qualification record. The surviving probes are
-`deploy/inkling_prefill_probe.py` and `deploy/qwen3_5_kernel_probe.py`; the
-V4-specific index/routing probe was retired with that model.
+qualification record. The one-off primitive probes have been retired. Current numerical and graph
+contracts live in `models/cuda/tests/` and `tests/`; the archived results above
+retain their original scope and source provenance.
 
 ## Shared sampler checks
 

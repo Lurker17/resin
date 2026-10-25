@@ -8,11 +8,14 @@ metrics reduced only after the window so in-flight GPU work stays timed.
 
 from __future__ import annotations
 
+import gzip
 import json
+import shutil
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from resin import BatchPhase, BatchPlan, SamplingParams
@@ -40,6 +43,57 @@ class BenchCase:
             raise ValueError(
                 "shared_prefix_tokens must be an integer in [0, context_length)"
             )
+
+
+def perfetto_trace(directory: str | Path, rank: int = 0, metadata: dict | None = None):
+    """Capture two untimed prefill cohorts or decode completions for each case.
+
+    Pass the returned callback as ``run_sweep(trace_step=...)``. Each rank writes
+    a compressed Chrome trace that can be opened in Perfetto or combined with
+    ``scripts/merge_bench_traces.py``. CUDA imports occur only when tracing.
+    """
+    import torch
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    def trace(case, run_pass):
+        name = f"{case.phase}-ctx{case.context_length}-b{case.batch_size}-rank{rank:03}"
+        target = directory / f"{name}.json"
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+        ) as profiler:
+            profiler.add_metadata("resin_rank", str(rank))
+            profiler.add_metadata("resin_timing", "two passes after measurement")
+            profiler.add_metadata_json(
+                "resin_benchmark",
+                json.dumps({**(metadata or {}), "case": asdict(case)}),
+            )
+            with torch.profiler.record_function(f"resin.{name}"):
+                for _ in range(2):
+                    run_pass()
+                torch.cuda.synchronize()
+        profiler.export_chrome_trace(str(target))
+        with (
+            target.open("rb") as source,
+            gzip.open(target.with_suffix(".json.gz"), "wb") as destination,
+        ):
+            shutil.copyfileobj(source, destination)
+        data = json.loads(target.read_text())
+        kernels = sum(event.get("cat") == "kernel" for event in data["traceEvents"])
+        target.unlink()
+        print(
+            f"[bench-trace] rank={rank} case={name} CUDA kernel events={kernels}",
+            flush=True,
+        )
+        if not kernels:
+            raise RuntimeError(f"{case.phase} trace contains no CUDA kernel activity")
+
+    return trace
 
 
 class _ObservedCompletion:
@@ -271,9 +325,11 @@ def run_sweep(
     reductions until the continuous measurement window ends. The caller retains
     engine ownership.
     on_result receives each completed record after request cleanup, outside timing.
-    trace_step may run one extra decode step (two with overlap) after recording
-    measurements. Its outputs are excluded from records; all distributed drivers
-    must participate in that step.
+    Prefill records ``prefill_seconds`` for each complete measured cohort, so
+    chunking does not turn a context's prefill latency into a single chunk's time.
+    trace_step receives an untimed workload callback: one fresh complete cohort
+    for prefill, or one live completion for decode. It may invoke that callback
+    twice; all distributed drivers must participate in the same passes.
     """
 
     for name, value, minimum in (
@@ -389,6 +445,7 @@ def run_sweep(
         )[: case.context_length]
         leases = []
         samples = []
+        prefill_seconds = []
         warmed = 0
         result = None
         nonce = 0
@@ -448,6 +505,7 @@ def run_sweep(
                     count = 0
                     while count < target:
                         admit(1)
+                        cohort_seconds = 0.0
                         while not all(lease.done for lease in leases):
                             result = step()
                             if runner.observation["phase"] != "prefill":
@@ -455,12 +513,16 @@ def run_sweep(
                             count += 1
                             if measured:
                                 samples.append(result)
+                                cohort_seconds += result["seconds"]
+                        if measured:
+                            prefill_seconds.append(cohort_seconds)
                         if not measured:
                             warmed = count
             else:
-                # Reserve a complete extra step for optional tracing, including
-                # maximum speculative acceptance and the initial prefill token.
-                maximum = 1 + (warmup_steps + measure_steps + (3 if overlap else 1)) * (
+                # Keep the cohort live through measurement, two optional trace
+                # passes, and any completion already queued by overlap.
+                extra_steps = (2 if trace_step is not None else 1) + int(overlap)
+                maximum = 1 + (warmup_steps + measure_steps + extra_steps) * (
                     runner.draft_tokens + 1
                 )
                 if case.context_length + maximum > local.context_length:
@@ -535,6 +597,7 @@ def run_sweep(
                     "warmup_steps": warmed,
                     "measure_steps": len(samples),
                     "step_seconds": seconds,
+                    **({"prefill_seconds": prefill_seconds} if prefill_seconds else {}),
                     **(
                         {
                             "device_phase_ms": [
@@ -563,9 +626,29 @@ def run_sweep(
                     "metadata": dict(metadata or {}),
                 }
             )
-            if case.phase == "decode" and trace_step is not None:
+            if trace_step is not None:
                 synchronize()
-                trace_step(case, lambda: step(defer_reduce=overlap))
+                previous_completion = None
+
+                def trace_pass():
+                    if case.phase == "decode":
+                        return step(defer_reduce=True)
+                    # A complete cohort exercises all chunks of this context.
+                    # Admission clears private prefix state before each pass.
+                    admit(1)
+                    traced = []
+                    while not all(lease.done for lease in leases):
+                        traced.append(step(defer_reduce=True))
+                        if runner.observation["phase"] != "prefill":
+                            raise RuntimeError("prefill trace entered decode")
+                    return {
+                        "seconds": sum(item["seconds"] for item in traced),
+                        "input_tokens": sum(item["input_tokens"] for item in traced),
+                        "sequences": case.batch_size,
+                        "steps": len(traced),
+                    }
+
+                trace_step(case, trace_pass)
         except Exception as error:
             diagnostic = dict(
                 **asdict(case),

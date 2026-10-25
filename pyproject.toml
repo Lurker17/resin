@@ -133,8 +133,8 @@ deep-select = [
 [tool.uv.extra-build-variables]
 deep-gemm = { DG_USE_LOCAL_VERSION = "0", DG_FORCE_BUILD = "1" }
 deep-select = { DEEP_SELECT_BUILD_TARGET_PLATFORM = "CUDA", MAX_JOBS = "4", NVCC_THREADS = "4" }
-# Check the artifact separately: CUDA 13.3 spills in an unused legacy split-KV
-# kernel; all fused attention and projection kernels must remain spill-free.
+# CUDA 13.3 spills in an unused legacy split-KV kernel; disable the upstream
+# blanket build-time spill check.
 flash-mla = { FLASH_MLA_BUILD_TARGET_PLATFORM = "CUDA", FLASH_MLA_SKIP_REG_SPILL_CHECK = "1", MAX_JOBS = "4", NVCC_THREADS = "4" }
 
 [tool.uv.sources]

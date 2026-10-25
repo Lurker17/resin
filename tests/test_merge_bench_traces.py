@@ -194,12 +194,14 @@ def test_cli_groups_cases_ignores_merged_outputs_and_retains_inputs(tmp_path, ca
         ("decode-ctx16-b4", 1),
         ("decode-ctx16-b4", 0),
         ("decode-ctx32-b2", 0),
+        ("prefill-ctx16-b4", 0),
+        ("prefill-ctx16-b4", 1),
     ):
         raw.append(write(tmp_path / f"{case}-rank{rank:03}.json.gz", trace))
     write(tmp_path / "decode-ctx16-b4-all-ranks.json.gz", {"old": "replace"})
     (tmp_path / "other.json").write_text("unrelated")
     main([str(tmp_path)])
-    assert len(capsys.readouterr().out.splitlines()) == 2
+    assert len(capsys.readouterr().out.splitlines()) == 3
     assert (
         len(
             read(tmp_path / "decode-ctx16-b4-all-ranks.json.gz")["resinTraceMerge"][
@@ -215,6 +217,14 @@ def test_cli_groups_cases_ignores_merged_outputs_and_retains_inputs(tmp_path, ca
             ]
         )
         == 1
+    )
+    assert (
+        len(
+            read(tmp_path / "prefill-ctx16-b4-all-ranks.json.gz")["resinTraceMerge"][
+                "sources"
+            ]
+        )
+        == 2
     )
     assert all(path.exists() for path in raw)
 

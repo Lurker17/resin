@@ -161,25 +161,26 @@ limits, so these runs establish graph/lifecycle execution rather than a complete
 accuracy qualification. Those results are separate from the older two-GPU proof
 and from DeepSeek-specific Blackwell validation.
 
+The reports below are historical qualification evidence. Their dedicated Modal
+validation launcher has been retired. The runs used the pinned full
+GPT-OSS-20B checkpoint, independent single-GPU baselines, and graph-enabled
+layouts combining attention TP, attention DP, CP, EP, and expert TP. Their
+checks covered logits, greedy output, logprobs, unequal queues, idle/resumed
+replicas, cancellation, cache reuse, and graph teardown; they did not establish
+throughput or MFU.
+
+Use the shared benchmark CLI for current performance measurements:
+
 ```bash
-uv run modal run deploy/modal_gpt_oss_parallel.py --graphs \
-  --report-path artifacts/gpt-oss-parallel-graphs-validation.json
-
-uv run modal run deploy/modal_gpt_oss_parallel.py --composable --world-size 8 --gpu-type H100 \
-  --report-path artifacts/gpt-oss-composable-graphs-validation.json
-
-# Recheck only the layout using every axis.
-uv run modal run deploy/modal_gpt_oss_parallel.py --composable --world-size 8 --gpu-type H100 \
-  --parallel-cases all-axes
+uv run scripts/bench.py --backend modal --model gpt-oss-20b \
+  --gpu H100 --world-size 2 --attn-dp 2 --attn-tp 1 --cp 1 --ep 2 \
+  --context-lengths 4096,8192 --batch-sizes 1,2,4,8 \
+  --output bench/gpt-oss-ep2.jsonl --trace-dir bench/gpt-oss-ep2-traces
 ```
 
-The composable command uses the pinned full GPT-OSS-20B checkpoint, independent
-single-GPU baselines, and graph-enabled layouts combining attention TP, attention
-DP, CP, EP, and expert TP. It also runs NCCL transport, real SM90 partial-expert,
-and real FA4 CP attention comparisons. The full-model workload checks same-history
-logits, greedy output, logprobs, unequal queues, idle/resumed replicas,
-cancellation, cache reuse, capture/replay counts, and orderly graph teardown.
-These are bounded correctness checks; they do not establish throughput or MFU.
+This measures the requested topology; it does not repeat the retired
+cross-topology numerical qualification. Shared transport and runtime contracts
+remain covered by the normal GPU tests.
 
 ### Quantized tensor-parallel numerics
 
@@ -196,10 +197,6 @@ changes. FlashInfer's raw FC2 output is BF16; FP32 routing/communication cannot
 recover rounding already performed inside each intermediate shard. Attention
 TP uses FP32 GEMM partials and reduction, casting once before residual addition.
 
-```bash
-uv run modal run deploy/modal_gpt_oss_parallel.py --expert-probe --gpu-type H100 \
-  --expert-reference-path /profiles/resin-gpt-oss/<run>/baseline-0-expert.pt
-```
 
 `artifacts/gpt-oss-expert-probe.json` records the real-weight comparison.
 `artifacts/gpt-oss-composable-pairs-fp32-attention-diagnostics.json` retains the
@@ -242,9 +239,8 @@ Durable reports in `resin-gpt-oss-profiles` are
 `expert-transport-isolation-20261022T032942Z.json`, and
 `prompt-scoring-isolation-20261022T033120Z.json`. The last report's matching `.pt`
 contains the first-layer attention inputs and outputs for replay without another
-checkpoint load. Reproduce the bounded checks with
-`--expert-transport-probe --expert-reference-path <saved-expert.pt>` or
-`--prompt-scoring-probe --attention-oracle` on `deploy/modal_gpt_oss_parallel.py`.
+checkpoint load. These files preserve evidence from the retired one-off
+diagnostics; current benchmarks do not rerun those diagnostic workflows.
 
 ### Completed graph run
 

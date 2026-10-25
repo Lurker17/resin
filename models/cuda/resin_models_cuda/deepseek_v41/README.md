@@ -147,28 +147,26 @@ regions at distinct producer/consumer capacities without eager fallback. This
 operator check uses synthetic tensors, not checkpoint logits; its report is
 `artifacts/benchmarks/2026-10-22-deepseek-v41-b300-ep8-control/bounded-replay/cp-probe.json`.
 
-Independent B300 operator checks cover paged indexing/CED, projections, compressor
-pooling, packed attention, fused stores, vocabulary heads, HC/Engram residuals and
-shared batch metadata, including graph replay:
+Historical B300 operator checks covered paged indexing/CED, projections,
+compressor pooling, packed attention, fused stores, vocabulary heads,
+HC/Engram residuals, and shared batch metadata, including graph replay. The
+one-off forward, kernel, and checkpoint-validation launchers have been retired;
+the linked reports below retain their measured scope and original revisions.
+
+Current performance measurements use the unified benchmark CLI with natural
+expert routing and acceptance by default:
 
 ```bash
-uv run modal run deploy/modal_v41_forward_probe.py \
-  --output artifacts/benchmarks/deepinfer-v41-forward-probe.json
-uv run modal run deploy/modal_deepinfer_kernels.py --mode mega-moe \
-  --output artifacts/benchmarks/deepinfer-v41-mega-moe-probe.json
+uv run scripts/bench.py --backend modal --model deepseek-v41 \
+  --gpu B300 --world-size 4 --attn-dp 4 --attn-tp 1 --ep 4 \
+  --draft-tokens 3 --prefill-chunk-size 1024 \
+  --context-lengths 512,4096 --batch-sizes 1,2,4 \
+  --gpu-memory-utilization 0.75 --trace-dir bench/v41-traces \
+  --output bench/v41.jsonl --plot
 ```
 
-Validate the full checkpoint with natural expert routing and acceptance:
-
-```bash
-uv run modal run deploy/modal_bench.py \
-  --model deepseek-v41 --gpu B300 --world-size 4 --attn-dp 4 --ep 4 \
-  --expert-backend deepgemm --draft-tokens 3 --natural-acceptance \
-  --no-balanced-experts --validate-model --prefill-chunk-size 1024 \
-  --phases decode --context-lengths 512 --batch-sizes 1,2,4 \
-  --gpu-memory-utilization 0.75 \
-  --output artifacts/benchmarks/2026-10-22-deepseek-v41-prepared/final-validation.json
-```
+This produces prefill/decode measurements and traces. It does not repeat the
+retired eager-versus-captured checkpoint qualification.
 
 The [B300 forward probes](https://modal.com/apps/ekzhang/main/ap-AMkTFWk8QDJEM5Dg1cRdQd)
 and [head probes](https://modal.com/apps/ekzhang/main/ap-CRERPEvWiUcxDXtsYWV0Wn) pass

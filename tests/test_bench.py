@@ -113,6 +113,7 @@ def test_prefill_measures_actual_chunked_inputs_and_keeps_engine_resident():
     assert record["measured_global_batch_size_min"] == 2
     assert record["measured_global_batch_size_max"] == 2
     assert record["window_seconds"] == sum(record["step_seconds"])
+    assert record["prefill_seconds"] == [record["window_seconds"]]
     assert record["metadata"] == {"model": "test"}
     assert not engine.has_work()
     # run_sweep never closes a caller-owned resident engine.
@@ -128,8 +129,8 @@ def test_prefill_measures_actual_chunked_inputs_and_keeps_engine_resident():
 def test_prefill_cohort_budget_and_gpt_capacity_cover_the_measured_batch(
     monkeypatch, budget, actual_batch
 ):
-    from deploy.bench import _runner
     from resin_models_cuda.gpt_oss import cuda
+    from scripts.bench import _runner
 
     class GptRunner(Runner):
         prefill_chunk_size = 1
@@ -155,7 +156,6 @@ def test_prefill_cohort_budget_and_gpt_capacity_cover_the_measured_batch(
             prefill_graph="breakable",
             decode_graph="disabled",
             gpu_memory_utilization=0.9,
-            validate_model=False,
             draft_tokens=0,
         ),
         context_capacity=64,
@@ -194,7 +194,7 @@ def test_prefill_cohort_budget_and_gpt_capacity_cover_the_measured_batch(
 def test_gpt_single_gpu_prefill_budget_respects_normal_kernel_capacity(
     monkeypatch, world, batch, error
 ):
-    from deploy.bench import run_benchmark
+    from scripts.bench import run_benchmark
 
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
     with pytest.raises(ValueError, match=error):
@@ -318,9 +318,9 @@ def test_decode_trace_uses_live_full_cohort_without_changing_measurements(
     def run(traced):
         raw = GraphRunner(drafts=4)
         runner = BenchmarkRunner(raw, accepted_drafts=4)
-        # Exactly the existing reservation: prompt + prefill sample + four
-        # maximum-acceptance steps (warmup, two measured, one traced).
-        engine = Engine(runner, max_running_requests=batch_size, context_length=25)
+        # Reserve the prompt, prefill sample and five maximum-acceptance
+        # steps: warmup, two measured, then two traced completions.
+        engine = Engine(runner, max_running_requests=batch_size, context_length=30)
 
         def trace(actual_case, step):
             assert actual_case is case
@@ -332,6 +332,9 @@ def test_decode_trace_uses_live_full_cohort_without_changing_measurements(
             assert traced_step["sequences"] == batch_size
             assert traced_step["committed_tokens"] == 5 * batch_size
             traces.append(traced_step)
+            second = step()
+            assert list(raw.plans[-1].context_lengths) == [24] * batch_size
+            assert second["committed_tokens"] == 5 * batch_size
 
         completed = []
 
@@ -351,7 +354,7 @@ def test_decode_trace_uses_live_full_cohort_without_changing_measurements(
         )
         assert not engine.has_work()
         assert completed == records
-        assert len(raw.plans) == (5 if traced else 4)
+        assert len(raw.plans) == (6 if traced else 4)
         return records
 
     baseline, profiled = run(False), run(True)
@@ -366,34 +369,111 @@ def test_decode_trace_uses_live_full_cohort_without_changing_measurements(
     assert len(traces) == 1
 
 
-def test_trace_skips_prefill_and_cleans_up_if_decode_callback_fails():
+def test_prefill_trace_runs_two_fresh_complete_cohorts_outside_measurements(
+    monkeypatch,
+):
+    monkeypatch.setattr("resin.bench.time.perf_counter", iter(range(1000)).__next__)
+    traces = []
+
+    def run(traced):
+        raw = Runner(chunked=True)
+        runner = BenchmarkRunner(raw)
+        engine = Engine(
+            runner, max_running_requests=2, context_length=64, prefix_cache=True
+        )
+        case = BenchCase(phase="prefill", context_length=7, batch_size=2)
+
+        def trace(actual_case, run_pass):
+            assert actual_case is case and not engine.has_work()
+            for _ in range(2):
+                first_plan = len(raw.plans)
+                result = run_pass()
+                assert not engine.has_work()
+                assert result["input_tokens"] == 14
+                assert result["steps"] > 1
+                assert raw.plans[first_plan].context_lengths.tolist() == [0, 0]
+                assert all(
+                    plan.phase == BatchPhase.PREFILL for plan in raw.plans[first_plan:]
+                )
+                traces.append(result)
+
+        records = run_sweep(
+            engine,
+            [case],
+            runner=runner,
+            prompt_tokens=[1],
+            warmup_steps=1,
+            measure_steps=1,
+            trace_step=trace if traced else None,
+        )
+        assert not engine.has_work()
+        return records
+
+    assert run(False) == run(True)
+    assert len(traces) == 2
+
+
+def test_overlap_trace_has_two_full_completions_without_metric_collectives():
+    from test_engine_overlap import AsyncRunner
+
+    class PipelinedRunner(AsyncRunner):
+        vocab_size = 1024
+        speculative_tokens = 2
+
+    raw = PipelinedRunner()
+    runner = BenchmarkRunner(raw)
+    engine = Engine(runner, max_running_requests=2, context_length=64)
+    reductions, traces = [], []
+
+    def reduce_step(value):
+        reductions.append(value)
+        return value
+
+    def trace(case, run_pass):
+        before = len(reductions)
+        for _ in range(2):
+            value = run_pass()
+            assert value["sequences"] == 2
+            assert value["committed_tokens"] == 4
+            traces.append(value)
+        assert len(reductions) == before
+
+    try:
+        record = run_sweep(
+            engine,
+            [BenchCase(phase="decode", context_length=4, batch_size=2)],
+            runner=runner,
+            prompt_tokens=[1],
+            warmup_steps=1,
+            measure_steps=2,
+            trace_step=trace,
+            reduce_step=reduce_step,
+        )[0]
+        assert record["committed_tokens"] == 8
+        assert len(traces) == 2
+        assert not engine.has_work()
+    finally:
+        engine.close()
+        raw.shutdown()
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_trace_failure_cleans_up_requests(phase):
     runner = BenchmarkRunner(Runner(drafts=4), accepted_drafts=0)
     engine = Engine(runner, max_running_requests=2, context_length=64)
-
-    def unexpected_trace(*_):
-        raise AssertionError("prefill must not invoke the decode trace hook")
-
-    run_sweep(
-        engine,
-        [BenchCase(phase="prefill", context_length=4, batch_size=2)],
-        runner=runner,
-        prompt_tokens=[1],
-        warmup_steps=0,
-        measure_steps=1,
-        trace_step=unexpected_trace,
-    )
     completed = []
 
-    def failing_trace(case, step):
-        assert case.phase == "decode" and engine.active_request_count == 2
-        step()
-        assert engine.has_work()  # Cleanup must cancel this still-live cohort.
+    def failing_trace(case, run_pass):
+        assert case.phase == phase
+        run_pass()
+        if phase == "decode":
+            assert engine.has_work()
         raise RuntimeError("trace export failed")
 
     with pytest.raises(RuntimeError, match="trace export failed"):
         run_sweep(
             engine,
-            [BenchCase(phase="decode", context_length=4, batch_size=2)],
+            [BenchCase(phase=phase, context_length=4, batch_size=2)],
             runner=runner,
             prompt_tokens=[1],
             warmup_steps=0,
@@ -713,7 +793,7 @@ def test_completed_case_is_saved_before_later_failure_and_requests_are_cleaned(
 ):
     import json
 
-    from deploy.bench import _result_callback
+    from scripts.bench import _result_callback
 
     runner = BenchmarkRunner(Runner())
 

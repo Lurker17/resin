@@ -19,8 +19,14 @@ per-model _recipe_ for chat formatting, response parsing and media handling.
 Model authoring is supported through the library/model-package split and the
 runner contract. Model packages supply their weights, kernels, and forward pass
 while reusing the engine. The [authoring reference](docs/model-forward-pass.md)
-describes that contract; step-by-step tutorials and an authoring skill are still
-planned.
+describes that contract. Use the repository's
+[add-resin-model skill](skills/add-resin-model/SKILL.md) for architecture
+research, runner and speculative-decoding implementation, correctness/evaluation,
+performance curves and traces, and optional deployment.
+For an existing integration, use the
+[optimize-resin-performance skill](skills/optimize-resin-performance/SKILL.md)
+to diagnose bottlenecks and validate improvements, drawing on measured results
+and lessons from Resin's development history.
 
 Importing `resin` does not import PyTorch or initialize CUDA.
 
@@ -29,6 +35,7 @@ The focused contracts are:
 
 - [flat cache pool](docs/cache-pool.md)
 - [scheduler](docs/scheduler.md)
+- [script and deployment inventory](docs/scripts.md)
 - [production code-size report](scripts/cloc.py)
 - [runner/kernel boundary](docs/kernel-boundary.md)
 - [authoring a CUDA model runner](docs/model-forward-pass.md)
@@ -81,39 +88,36 @@ uv run modal setup
 `modal setup` is interactive and only needs to be repeated when the local
 Modal credentials change.
 
-Run GPT-OSS from the flat-cache path as follows. The checkpoint step is
-explicit: GPU modes fail closed if the pinned model and tokenizer are not
-already in the Modal volume.
+All models share one benchmark CLI and one parameterized serving app. The model
+registry in [`deploy/models.py`](deploy/models.py) supplies checkpoint revisions,
+hardware, parallelism, and model-specific runner construction.
 
 ```bash
-# Download and validate the pinned 20B checkpoint once.
-uv run modal run deploy/modal_gpt_oss.py --mode download --model 20b
+# Populate the pinned checkpoint without allocating a GPU.
+uv run scripts/bench.py --backend modal --model gpt-oss-20b --download-only
 
-# Run one prompt on H200. Quote the prompt so Modal receives it as one argument.
-uv run modal run deploy/modal_gpt_oss.py \
-  --mode run --model 20b \
-  --prompt "Explain why batching improves language-model throughput." \
-  --temperature 1.0 --top-p 0.95 --top-k 40 --seed 7
-
-# Sweep 8k prompt / 256 output at batch sizes 1,2,8,16,32.
-uv run modal run deploy/modal_gpt_oss.py \
-  --mode bench --model 20b --cache-mode prewarm
-
-# Re-run the benchmark without changing saved kernel artifacts.
-uv run modal run deploy/modal_gpt_oss.py \
-  --mode bench --model 20b --cache-mode verify
+# Sweep prefill and decode, save traces, and plot the measured results.
+uv run scripts/bench.py --backend modal --model gpt-oss-20b \
+  --context-lengths 4096,8192 --batch-sizes 1,2,4,8 \
+  --output bench/gpt-oss-20b.jsonl --trace-dir bench/traces --plot
 ```
 
-Both GPU modes also accept `--schedule-conservativeness`; larger values leave
-more estimated KV headroom, while smaller values admit more work and may cause
-retraction/replay. Run mode accepts per-request `--temperature`, `--top-p`,
-`--top-k`, and `--seed`. Temperature defaults to `1.0`; pass `--temperature 0`
-for deterministic argmax generation.
+For local GPUs, use `--backend local --checkpoint /path/to/checkpoint`; models
+with a separate draft checkpoint also accept `--assistant-checkpoint`. The
+local backend is the default. Modal submits the repository's source into the
+shared CUDA image, so the client machine does not need CUDA installed.
 
-Use `--model 120b` for the larger checkpoint. These commands submit the
-repository's local source into the Modal image; they do not require a locally
-installed CUDA runtime. GPU quota, the pinned model volume, and the required
-FlashInfer/FA4 packages are still required remotely.
+Prefill charts compare complete-context latency with input tokens/s/GPU; decode
+charts compare per-user output tokens/s with output tokens/s/GPU. Natural draft
+acceptance and model routing are the defaults. `--accepted-drafts K` and
+`--balanced-experts` explicitly enable synthetic workloads. See
+[benchmarking](docs/benchmarks.md) for the timing protocol and trace scope.
+
+For an already running endpoint, `scripts/check_server.py URL --output REPORT`
+checks serving correctness, prefix-cache reuse, context-size TTFT, and optional
+image/reasoning/stress cases. It can also evaluate a small local MMLU CSV or
+JSONL subset with `--eval-file`; see
+[server checks](docs/benchmarks.md#http-correctness-and-latency-checks).
 
 ## Minimal use
 
@@ -202,25 +206,28 @@ uv run python scripts/lfm2_serve.py
 Then open <http://127.0.0.1:8000>. The page reports prompt and generated token
 counts, elapsed generation time, and output tokens per second. The same process
 serves `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, and `/v1/models`.
-Both scripts use PyTorch's automatically selected local device, falling back to
-the CPU when no accelerator is available.
+Both examples explicitly use the CPU Torch runner.
 
 ## Modal HTTP endpoints
 
-The GPT-OSS Modal app also exposes the native server as public,
-unauthenticated Web Functions. Populate the pinned checkpoint volumes before
-the first request, then deploy the app:
+[`deploy/modal_serve.py`](deploy/modal_serve.py) serves every registered model.
+Select `RESIN_MODEL` at launch; each selection has a separate app and endpoint,
+with shared download, warmup, process management, and HTTP startup code.
+Populate its pinned checkpoint before deploying:
 
 ```bash
-# GPT-OSS publishes separate 20B and 120B URLs.
-uv run modal run deploy/modal_gpt_oss.py --mode download --model 20b
-uv run modal run deploy/modal_gpt_oss.py --mode download --model 120b
-uv run modal deploy deploy/modal_gpt_oss.py
+RESIN_MODEL=gpt-oss-20b uv run modal run deploy/modal_serve.py
+RESIN_MODEL=gpt-oss-20b uv run modal deploy deploy/modal_serve.py
 
-# DeepSeek V4.1 Flash uses four B300s with EP4 and attention DP4.
-uv run modal run deploy/modal_bench.py --download-only --model deepseek-v41
-uv run modal deploy deploy/modal_deepseek_v41.py
+RESIN_MODEL=deepseek-v41 uv run modal run deploy/modal_serve.py
+RESIN_MODEL=deepseek-v41 uv run modal deploy deploy/modal_serve.py
 ```
+
+Other selections are `gpt-oss-120b`, `gemma4`, `qwen3_5`, and `inkling`. The
+`qwen3_5` runner currently serves the pinned Qwen3.8-27B checkpoint. Add
+`--publish-only` to the download command to adopt complete files already in the
+checkpoint volume without downloading their contents. Serving and benchmarking
+use the same checkpoint inventory and completion marker.
 
 DeepSeek uses the shared distributed HTTP coordinator, with a 1,048,576-token context limit,
 32 running requests per attention-DP replica, CUDA graphs, and three speculative
@@ -231,7 +238,8 @@ GPT-OSS 120B uses the same distributed worker/engine coordinator with attention
 TP2 and expert TP2; the 20B endpoint keeps a single local Engine.
 
 Each deployed URL serves `/`, `/health`, `/v1/models`,
-`/v1/chat/completions`, `/v1/responses`, and `/v1/messages`. The functions
+`/v1/chat/completions`, and `/v1/responses`; model configuration controls
+`/v1/messages` support. The functions
 scale to zero after 15 idle minutes and are capped at one GPU container apiece.
 The chat demo renders Markdown and TeX math and requests up to 16,384 output
 tokens by default. Model loading, CUDA graph capture, and one real prompt
@@ -426,8 +434,9 @@ The code-size report uses Tokei to count production Rust/Python by component,
 excluding comments, blank lines, tests, deployment tools, and generated stubs.
 Use the current report instead of a checked-in line-count snapshot.
 
-For resident prefill/decode sweeps, fixed speculative acceptance, balanced
-expert routing, and throughput/latency charts, see [benchmarking](docs/benchmarks.md).
+For resident prefill/decode sweeps, optional fixed speculative acceptance and
+balanced routing, Perfetto traces, and throughput/latency charts, see
+[benchmarking](docs/benchmarks.md).
 `Engine` collects native request/cache metrics and optional runner observations
 by default (`enable_metrics=True`). Use `enable_metrics=False` to opt out.
 The HTTP server publishes `/metrics`; see [metrics](docs/metrics.md)
@@ -448,7 +457,7 @@ for Prometheus queries and forwarding through an OTLP Collector.
 - `resin/backend/` — reusable execution and resource gadgets
 - `models/` — separately installable model definitions, loaders, and runners
 - `scripts/` — examples, benchmarks, and local maintenance tools
-- `deploy/` — optional remote validation harnesses
+- `deploy/` — shared model registry, checkpoint/cache helpers, and parameterized Modal serving/benchmark adapters
 - `tests/` — native and runner-contract coverage
 
 Resin is alpha software. Its surface is intentionally small enough to review

@@ -134,10 +134,15 @@ measured 16–19 µs eager versus 24–30 µs through a separate graph in the CP
 layouts. QKV plus RoPE amortizes that boundary across more kernels. These are
 region measurements, not an end-to-end throughput result.
 
-Run `uv run modal run deploy/modal_cuda_graphs.py` to exercise shared-buffer
-reuse, changed inputs, padding, and replay on a Blackwell GPU. The model smoke
-and profiling harnesses also compare first/last prefill regions against eager
-execution, including unpadded inputs, and report bounded timing probes.
+On a CUDA host, exercise shared-buffer reuse, changed inputs, padding, and replay:
+
+```bash
+uv run pytest tests/test_cuda_prefill_graphs.py tests/test_cuda_tensor_graphs.py -q
+```
+
+The former Modal validation wrapper was retired.
+For end-to-end performance, use `scripts/bench.py` with prefill/decode graph
+policies and `--trace-dir`; see [benchmarking](benchmarks.md).
 
 A missing prefill capture is rejected before model state changes. A capture or
 replay failure poisons the runner. Construct a fresh runner rather

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add a Resin Model"
+  short_description: "Build and qualify fast GPU model integrations"
+  default_prompt: "Use $add-resin-model to add and qualify a model on my target GPUs, including speculative decoding, correctness checks, performance curves, and optional deployment."
