@@ -1,11 +1,11 @@
 # Resin
 
-Resin is an inference engine _shell_. It provides modular components for making
-your LLM inference engine.
+Resin is not an inference engine. It's a library of _building blocks_ for LLM
+inference.
 
-At its core is the shared `Engine`: a fast Rust scheduler, KV cache system, and
-metrics server. You then write a `Runner` – **model-specific kernels, running on
-any hardware.**
+At its core is the `Engine` shell: a fast Rust scheduler, KV cache system, and
+metrics server. You then write the forward pass as **model-specific kernels,
+optimized for your hardware.**
 
 ```text
 token IDs ──► Rust Engine ──► frozen BatchPlan ──► Python Runner ───► token IDs
@@ -13,15 +13,31 @@ token IDs ──► Rust Engine ──► frozen BatchPlan ──► Python Runn
                   └──────── ownership & commit ────────┘
 ```
 
-Resin also has built-in HTTP serving and Prometheus metrics above that boundary,
-using a per-model _recipe_ for chat formatting, response parsing and media.
+Resin also has optional HTTP serving and Prometheus metrics above that boundary,
+using a _recipe_ for chat formatting, response parsing and media.
 
-This means you can make a state-of-the-art inference engine for any hardware and
-model without changing the shared scheduler, core, and interface (the tricky
-part). For example, in half a day of agentic coding, we built standalone engines
+In half a day of agentic coding, we used Resin to build standalone engines
 for [DeepSeek-V4.1-Flash](models/cuda/resin_models_cuda/deepseek_v41/) and
 [GLM-5.3-Flash](models/cuda/resin_models_cuda/glm5_3_flash/) on Blackwell GPUs
-that rival vLLM and SGLang, using the latest megakernels.
+that rival vLLM and SGLang, running the latest megakernels.
+
+<center>
+<table>
+<thead>
+<tr>
+<th>Prefill</th>
+<th>Decode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><img width="100%" alt="DeepSeek V4.1 Flash prefill" src="https://i.imgur.com/wFCTaMD.png"></td>
+<td><img width="100%" alt="DeepSeek V4.1 Flash interactivity-throughput curve" src="https://i.imgur.com/yVw8HCy.png"></td>
+</tr>
+</tbody>
+</table>
+<i>Prefill and decode for DeepSeek V4.1 Flash, within 5-10% of DeepInfer.</i>
+</center>
 
 ## Features
 
@@ -48,8 +64,8 @@ packages. Then use the following skills:
   Create an inference engine for a new model from scratch, using Resin.
 - [**optimize-resin-performance**](skills/optimize-resin-performance/SKILL.md) -
   Iterate on your inference engine to improve performance with an "autoresearch"
-  workflow, diagnose bottlenecks and validate improvements, drawing on example
-  optimizations from Resin's history.
+  workflow, diagnose bottlenecks and validate improvements, drawing on past
+  learnings.
 
 Importing `resin` does not import PyTorch or initialize CUDA.
 
