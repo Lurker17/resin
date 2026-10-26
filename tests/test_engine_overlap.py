@@ -480,3 +480,70 @@ def test_arriving_work_drains_the_pending_cohort_before_scheduler_admission():
     engine.cancel(first)
     engine.close()
     runner.shutdown()
+
+
+def test_overlap_logprobs_match_sync_for_mixed_requests():
+    import torch
+
+    from resin.backend.sampling import format_output
+
+    def score(plan, output):
+        rows = [
+            output.token_ids[start:end]
+            for start, end in zip(output.token_indptr[:-1], output.token_indptr[1:])
+        ]
+        logits = torch.linspace(-1, 1, 512).expand(len(rows), 2, -1)
+        return format_output(logits, rows, plan)
+
+    class ScoredRunner(AsyncRunner):
+        def forward(self, plan):
+            return score(plan, super().forward(plan))
+
+        def enqueue(self, plan, *, feedback=None):
+            completion = super().enqueue(plan, feedback=feedback)
+            return SimpleNamespace(
+                feedback=completion.feedback,
+                result=lambda: score(plan, completion.result()),
+            )
+
+    outputs = []
+    for overlap in (False, True):
+        runner = ScoredRunner()
+        runner.require_overlap = overlap
+        engine = Engine(runner, enable_overlap=overlap, context_length=1024)
+        requests = [
+            engine.submit(
+                [start] * 123,
+                sampling_params=SamplingParams(
+                    max_output_tokens=270, logprobs=scored, top_logprobs=top
+                ),
+            )
+            for start, scored, top in [(1, True, 0), (10, True, 3), (20, False, 0)]
+        ]
+        events = {request.id: [] for request in requests}
+        while engine.has_work():
+            for event in engine.step():
+                scores = event.logprobs
+                events[event.request_id].append(
+                    (
+                        event.token_id,
+                        event.index,
+                        None if scores is None else scores.logprob,
+                        None if scores is None else scores.top_logprobs,
+                    )
+                )
+        outputs.append([events[request.id] for request in requests])
+        for request, start in zip(requests, [1, 10, 20]):
+            assert request.take_result() == list(range(start + 1, start + 271))
+        if overlap:
+            assert engine.overlap_stats[1] > 0
+            assert runner.next_submitted.is_set() and runner.prior_harvest.is_set()
+        else:
+            assert engine.overlap_stats == (0, 0)
+        assert engine.cache_free_parent_count == 16
+        engine.close()
+        runner.shutdown()
+    assert outputs[0] == outputs[1]
+    assert all(event[2] is not None and event[3] == [] for event in outputs[1][0])
+    assert all(event[2] is not None and len(event[3]) == 3 for event in outputs[1][1])
+    assert all(event[2:] == (None, None) for event in outputs[1][2])

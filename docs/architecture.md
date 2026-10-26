@@ -90,14 +90,20 @@ from the completed output. A single writer lease transfers between safe decode
 continuations. Arrivals, cancellation, close and page boundaries drain before
 changing ownership. Failures after enqueue retain owners in quarantine.
 
-The fast path requires a stable decode cohort, no generated-token logprobs,
-sufficient remaining budget, and both write spans inside the same owned blocks
-in every cache group. Stop tokens, including EOS, can finish a request while its
-successor step is in flight: its result is published immediately, but its row
+The fast path requires a stable decode cohort, sufficient remaining budget, and
+both write spans inside the same owned blocks in every cache group. Stop tokens,
+including EOS, can finish a request while its successor step is in flight: its
+result is published immediately, but its row
 and cache lease remain alive until that step completes. Successor outputs for
 finished rows are discarded. Other steps use the synchronous path.
 `enable_overlap=False` or `step(allow_overlap=False)` selects the reference path.
 Distributed replicas vote together before enqueue or drain.
+
+The shared CUDA completion supports generated-token logprobs and top
+alternatives during overlap. Scores are computed from raw target logits and
+copied into completion-owned host buffers before another graph replay can reuse
+the logits. Collecting a completion packs only accepted output positions.
+Token-only decoding skips score computation and score transfers.
 
 ## Cache geometry
 
@@ -185,7 +191,6 @@ Perfetto traces.
 
 ## Current limits
 
-- overlapped decode currently excludes generated-token logprobs;
 - no prefill/decode disaggregation;
 - sparse graph-safe expert dispatch requires a shared NVLink domain and retains
   static receive storage; RDMA graph transport and communication overlap are pending;

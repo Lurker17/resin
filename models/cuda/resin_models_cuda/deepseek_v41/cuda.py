@@ -933,6 +933,8 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 rows=batch_size,
                 stats=self._speculation if self.speculative_tokens else None,
                 device=self.device,
+                plan=plan,
+                logits=self._graph_logits[shape] if plan.needs_logprobs else None,
             )
         output = self._run_cuda_graph("decode", shape, inputs)[:batch_size]
         phase_events = self._dspark_phase_events.get(shape)
@@ -1193,16 +1195,12 @@ class DeepSeekV41CudaRunner(CudaRunner):
     def enqueue(self, plan: BatchPlan, *, feedback=None):
         """Submit graph decode and keep exact continuation inputs on the GPU.
 
-        The Engine owns overlap and page leases. Unsupported shapes and scored
-        outputs retain the ordinary synchronous forward contract.
+        The Engine owns overlap and page leases. Unsupported shapes retain the
+        ordinary synchronous forward contract.
         """
         if self.parallel_groups is not None:
             raise RuntimeError("explicit rank groups require enqueue_distributed")
-        if (
-            plan.phase != BatchPhase.DECODE
-            or plan.needs_logprobs
-            or plan.needs_prompt_logprobs
-        ):
+        if plan.phase != BatchPhase.DECODE or plan.needs_prompt_logprobs:
             return self.forward(plan)
         self._check_cuda_graphs(plan.phase)
         self._validate_plan(plan)
@@ -1221,7 +1219,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
     def enqueue_distributed(self, plan, context, *, prepared=None, feedback=None):
         """Generic asynchronous graph submission across composed rank meshes."""
         if context.phase != BatchPhase.DECODE or (
-            plan is not None and (plan.needs_logprobs or plan.needs_prompt_logprobs)
+            plan is not None and plan.needs_prompt_logprobs
         ):
             return self.forward_distributed(plan, context, prepared=prepared)
         prepared = (

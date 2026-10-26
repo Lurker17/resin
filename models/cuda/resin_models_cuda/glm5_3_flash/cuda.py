@@ -422,6 +422,8 @@ class Glm53FlashCudaRunner(CudaRunner):
                 rows=batch_size,
                 device=self.device,
                 stats=self._speculation if self.speculative_tokens else None,
+                plan=plan,
+                logits=self._graph_logits[shape] if plan.needs_logprobs else None,
             )
         output = self._run_cuda_graph("decode", shape, inputs)[:batch_size]
         return self._format_decode(output, self._graph_logits[shape][:batch_size], plan)
@@ -576,11 +578,7 @@ class Glm53FlashCudaRunner(CudaRunner):
 
     @observe_execution
     def enqueue(self, plan, *, feedback=None):
-        if (
-            plan.phase != BatchPhase.DECODE
-            or plan.needs_logprobs
-            or plan.needs_prompt_logprobs
-        ):
+        if plan.phase != BatchPhase.DECODE or plan.needs_prompt_logprobs:
             return self.forward(plan)
         self._check_cuda_graphs(plan.phase)
         cache_plan = self._prepare(plan)
@@ -692,7 +690,7 @@ class Glm53FlashCudaRunner(CudaRunner):
     @observe_execution
     def enqueue_distributed(self, plan, context, *, prepared=None, feedback=None):
         if context.phase != BatchPhase.DECODE or (
-            plan is not None and (plan.needs_logprobs or plan.needs_prompt_logprobs)
+            plan is not None and plan.needs_prompt_logprobs
         ):
             return self.forward_distributed(plan, context, prepared=prepared)
         prepared = (

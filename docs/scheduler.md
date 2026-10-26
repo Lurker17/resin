@@ -191,14 +191,20 @@ using that feedback before collecting and committing the previous result on the
 CPU, so device execution overlaps host completion work. Synchronous runners
 continue to work through `forward()`.
 
-Overlap requires a stable decode cohort, no generated-token logprobs, enough
-remaining output and context budget, and both steps' write spans inside the same
-owned blocks in every cache group. The Engine retains the requests and a single
-writer lease across continuations. New arrivals, cancellation, close, and cache
+Overlap requires a stable decode cohort, enough remaining output and context
+budget, and both steps' write spans inside the same owned blocks in every cache
+group. The Engine retains the requests and a single writer lease across
+continuations. New arrivals, cancellation, close, and cache
 page boundaries drain pending work before changing ownership. Other steps,
 including prefill, use the synchronous path. `enable_overlap=False` disables
 overlap for the Engine; `step(allow_overlap=False)` drains pending work or runs
 the next batch synchronously.
+
+Generated-token logprobs and top alternatives can overlap when the runner's
+completion returns the requested score columns. The shared CUDA completion
+computes scores on the device and copies them into owned buffers before
+the next graph replay. Score packing waits until the completion is collected;
+token-only decoding does not compute or transfer scores.
 
 Completions use the same output validation and logical commit rules as the
 synchronous path. A stop token can finish a request while its successor is

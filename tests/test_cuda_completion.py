@@ -138,3 +138,107 @@ def test_staging_error_identifies_the_device_field_shape_and_dtype():
             targets, {"positions": torch.ones(4, dtype=torch.int32)}
         )
     assert targets["positions"].tolist() == [0] * 4
+
+
+def test_scored_completion_preserves_speculative_outputs_across_replay(monkeypatch):
+    from resin import BatchPlan, SamplingParams
+    from resin.backend.cuda import completion as runtime
+    from resin.backend.sampling import format_output
+
+    use_cuda = torch.cuda.is_available()
+    if not use_cuda:
+
+        class Stager:
+            def __init__(self, device):
+                pass
+
+            def output(self, name, source):
+                return source.clone()
+
+            def device(self, name, values, dtype):
+                return torch.as_tensor(values, dtype=dtype).clone()
+
+        class Event:
+            def record(self, stream):
+                pass
+
+            def synchronize(self):
+                pass
+
+        monkeypatch.setattr(runtime, "TensorStager", Stager)
+        monkeypatch.setattr(runtime.torch.cuda, "Event", Event)
+        monkeypatch.setattr(runtime.torch.cuda, "current_stream", lambda device: None)
+
+    plan = BatchPlan(
+        sequence_ids=[1, 2, 3, 4],
+        context_lengths=[10, 20, 30, 40],
+        token_ids=[0, 0, 0, 0],
+        token_indptr=[0, 1, 2, 3, 4],
+        sampling_params=[
+            SamplingParams(top_logprobs=2, temperature=0.1, top_k=1, top_p=0.2),
+            SamplingParams(),
+            SamplingParams(top_logprobs=1),
+            SamplingParams(top_logprobs=3),
+        ],
+        sampling_mask=[True, True, True, False],
+    )
+    output = torch.tensor(
+        [
+            [1, 2, 3, 1, 6, 4, 2],
+            [0, 1, 2, 0, 1, 2, 5],
+            [2, 3, 4, 6, 1, 2, 3],
+            [5, 4, 3, 5, 4, 1, 0],
+            [0, 0, 0, 0, 0, 0, 0],
+        ]
+    )
+    tokens, counts, feedback = accepted_block(
+        output, torch.ones(5, dtype=torch.int64), 3
+    )
+    logits = torch.randn(5, 4, 7, generator=torch.Generator().manual_seed(42)) + 1e4
+    accepted = [
+        row[:count]
+        for row, count in zip(tokens[:4].tolist(), counts[:4].tolist(), strict=True)
+    ]
+    expected = format_output(logits[:4], accepted, plan)
+    device = "cuda" if use_cuda else "cpu"
+    tokens, counts, logits = (value.to(device) for value in (tokens, counts, logits))
+    feedback = runtime.DeviceFeedback(
+        feedback.token_ids.to(device), feedback.positions.to(device)
+    )
+    normalize = torch.Tensor.log_softmax
+    score_shapes = []
+
+    def record_normalize(tensor, *args, **kwargs):
+        score_shapes.append(tuple(tensor.shape))
+        return normalize(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "log_softmax", record_normalize)
+    debug_mode = torch.cuda.get_sync_debug_mode() if use_cuda else 0
+    try:
+        if use_cuda:
+            torch.cuda.set_sync_debug_mode("error")
+        pending = runtime.DeviceCompletion(
+            tokens, counts, feedback, rows=4, plan=plan, logits=logits
+        )
+        # The next replay may replace every graph output before CPU harvest.
+        tokens.fill_(-1)
+        counts.zero_()
+        logits.fill_(100)
+    finally:
+        if use_cuda:
+            torch.cuda.set_sync_debug_mode(debug_mode)
+    assert score_shapes == [(2, 4, 7)]
+    actual = pending.result()
+    assert pending.result() is actual
+    for name in (
+        "token_ids",
+        "token_indptr",
+        "logprob_indptr",
+        "logprobs",
+        "top_indptr",
+        "top_token_ids",
+        "top_logprobs",
+    ):
+        values, reference = getattr(actual, name), getattr(expected, name)
+        assert values.dtype == reference.dtype
+        np.testing.assert_allclose(values, reference, atol=1e-6, rtol=1e-5)

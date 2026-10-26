@@ -1354,10 +1354,6 @@ impl Engine {
             && allow_overlap
             && self.runner_enqueue.is_some()
             && plan.phase == resin_core::Phase::Decode
-            && plan
-                .payloads
-                .iter()
-                .all(|payload| !payload.sampling_params.logprobs)
             && self.core.retain_continuation(&plan);
         let plan = match Py::new(py, planning::from_core(plan)) {
             Ok(plan) => plan,

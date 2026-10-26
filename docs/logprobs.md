@@ -52,6 +52,21 @@ execution; model runners keep their existing graph eligibility and eager fallbac
 replay does not create Python sampling-policy objects merely to decide whether
 scores are needed.
 
+Generated scores also work with the default overlap scheduler when the runner's
+completion returns the requested score columns. The shared CUDA completion
+computes selected-token scores and top alternatives before the next graph replay
+can overwrite the target logits, and queues asynchronous copies into owned host
+buffers. Collection packs only accepted positions and requested score rows.
+Speculative acceptance, stop
+tokens, and output limits use the same validation and commit rules as
+synchronous decoding.
+
+Scoring adds vocabulary normalization, optional top-k selection, and score
+transfers. These costs occur only for scored batches. Only requested rows are
+scored, while fixed-size buffers cover their maximum verification width and top
+count until collection. Speculative batches may compute scores for positions
+that are later rejected.
+
 ## Array boundary
 
 Runners return a `ForwardOutput` with contiguous one-dimensional NumPy arrays:
@@ -80,10 +95,12 @@ row, including positions beyond EOS or the remaining output budget. All offsets 
 are monotone, and end at their corresponding column length.
 
 Construction retains the exact arrays without dtype conversion or copying. The
-Rust adapter acquires read-only NumPy borrows once and retains their owners until
-the synchronous `step()` returns. Runners must not modify or recycle these buffers
-during that interval, including from `release()`. Tensor-backed NumPy views keep
-their CPU tensors alive through NumPy's base owner. The adapter rejects incorrect
+Rust adapter acquires read-only NumPy borrows once and retains their owners while
+the result is validated and committed. Runners must not modify or recycle these
+buffers during that interval, including from `release()`. An asynchronous
+completion owns its staged score buffers independently of later graph replays.
+Tensor-backed NumPy views keep their CPU tensors alive through NumPy's base
+owner. The adapter rejects incorrect
 dtypes and noncontiguous or unaligned storage instead of silently coercing them.
 
 This removes Python scalar/tuple boxing and intermediate Python-to-Rust token
