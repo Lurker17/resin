@@ -2,6 +2,7 @@ from collections.abc import Sequence
 from typing import Any, Final, final
 from collections.abc import Mapping
 from typing import Literal
+from resin.cache_storage import CacheStorage
 from resin.recipe import Recipe
 from resin.recipe import ContentBlock
 import numpy as np
@@ -476,6 +477,9 @@ class Engine:
         context_length: int = 32768,
         scheduler_config: SchedulerConfig | None = None,
         prefix_cache: bool = False,
+        prefix_cache_storage: CacheStorage | None = None,
+        prefix_cache_namespace: str | bytes | None = None,
+        prefix_cache_max_pending: int = 2,
         enable_overlap: bool = True,
         enable_metrics: bool = True,
     ) -> Engine: ...
@@ -519,6 +523,8 @@ class Engine:
     def max_running_requests(self, /) -> int: ...
     @property
     def metrics_enabled(self, /) -> bool: ...
+    @property
+    def prefix_cache_storage(self, /) -> CacheStorage | None: ...
     def metrics_snapshot(self, /) -> EngineMetrics | None:
         """
         Collect a read-only native snapshot of engine and runner observations.
@@ -582,6 +588,8 @@ class EngineMetrics:
     def requests(self, /) -> dict[str, Any]: ...
     @property
     def runner(self, /) -> RunnerMetrics | None: ...
+    @property
+    def storage(self, /) -> dict[str, Any] | None: ...
 
 @final
 class ForwardOutput:

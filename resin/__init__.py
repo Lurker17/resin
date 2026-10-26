@@ -30,7 +30,15 @@ from resin._resin import (
     TokenLogprobs,
     __version__,
 )
+from resin.cache_storage import (
+    CacheBuffer,
+    CacheOperation,
+    CacheResult,
+    CacheStorage,
+    MemoryCacheStorage,
+)
 from resin.protocols import (
+    CacheStorageRunner,
     ManagedRunner,
     MediaInput,
     MediaTokenSpan,
@@ -38,6 +46,12 @@ from resin.protocols import (
 )
 
 __all__ = [
+    "CacheBuffer",
+    "CacheOperation",
+    "CacheResult",
+    "CacheStorage",
+    "CacheStorageRunner",
+    "MemoryCacheStorage",
     "BatchPhase",
     "BatchPlan",
     "CacheGroupFamily",
