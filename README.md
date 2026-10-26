@@ -3,7 +3,7 @@
 Resin is not an inference engine. It's a library of _building blocks_ for LLM
 inference.
 
-At its core is the `Engine` shell: a fast Rust scheduler, KV cache system, and
+At its core is the headless `Engine`: a fast Rust scheduler, KV cache, and
 metrics server. You then write the forward pass as **model-specific kernels,
 optimized for your hardware.**
 
