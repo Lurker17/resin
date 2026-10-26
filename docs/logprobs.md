@@ -145,7 +145,7 @@ JSON represents a valid negative-infinite logprob as `null`.
 The complete raw list includes reasoning, tool markup, headers, and model
 terminators. Canonical Chat `choices[0].logprobs.content` and Responses
 `output_text.logprobs` contain only tokens proven to belong wholly to visible
-content. All six stock parsers carry source-byte spans through grammar buffers,
+content. Native recipe parsers carry source-byte spans through grammar buffers,
 UTF-8 decoding, trimming, and stop matching. Held text waits until a complete
 source token can be associated with its score. If trimming or a stop string cuts
 inside a token, its surviving text still appears, but that token's score remains
@@ -209,9 +209,10 @@ On the pinned GPT-OSS-20B checkpoint, an independent raw output-head
 temperature/top-k/top-p enabled. Input-only requests return no generated events,
 retain the initial `None`, and complete on one H100 or with composed EP/attention
 DP/attention TP/CP and prefill graph replay. The composed full-model run retains
-nine failed strict numerical comparisons despite matching greedy probes;
-[the model validation record](gpt-oss-parallelism.md#sparse-transport-qualification)
-separates those failures from the exact same-shard sparse transport checks.
+nine failed strict numerical comparisons despite matching greedy probes. These
+historical full-model results have a different scope from the current
+[same-shard sparse transport tests](../tests/test_sparse_expert_transport.py)
+and [distributed prompt-score contract tests](../models/cuda/tests/test_gpt_oss_distributed_runner.py).
 
 Cross-batch numerical parity remains unqualified: the same
 [single-H100 checkpoint](https://modal.com/apps/ekzhang/main/ap-1Roe4kUsfpXJXV9f3dMY8x)

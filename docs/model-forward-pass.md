@@ -1,9 +1,10 @@
 # Authoring a CUDA model runner
 
 A model runner receives a frozen `BatchPlan`, stages its token and page-table
-arrays, executes the model, and returns sampled token IDs. The Engine already
-owns admission, batching, cache allocation, prefix reuse, and request lifetime;
-do not recreate those policies in the forward pass.
+arrays, executes the model, and returns `ForwardOutput` with token rows and any
+requested scores. The Engine already owns admission, batching, cache allocation,
+prefix reuse, and request lifetime; do not recreate those policies in the forward
+pass.
 
 ## Weight preparation
 
@@ -152,8 +153,9 @@ an extra page. Leasing write destinations without extending retention can drop
 a still-readable history page near a block boundary.
 
 Test prefix caching with real continuation requests. A hit must prefill the
-uncached suffix as one chunk, restore recurrent and sliding-window state at the
-same checkpoint, and copy on write before mutating shared pages. Cover:
+uncached suffix within the Engine's chunk and token budgets, restore recurrent
+and sliding-window state at the same checkpoint, and copy on write before
+mutating shared pages. Cover:
 
 - a fixture long enough to publish at least one aligned cache checkpoint; a
   short prompt below the model's shared block alignment cannot produce a hit;
@@ -170,9 +172,11 @@ detect stale recurrent state or a bad ring offset.
 ## Speculative decode
 
 Speculative decoding belongs inside the runner. Set
-`cache_write_lookahead_tokens` to the largest verification block, write drafts
-only into leased destinations, commit exactly the accepted prefix, and clear or
-logically hide rejected recurrent/SWA state before the next step.
+`cache_write_lookahead_tokens` to cover the maximum additional cache writes
+beyond the scheduled decode anchor. The Engine leases the anchor plus this
+lookahead and bounds returned token rows by that capacity. Write drafts only into
+leased destinations, commit exactly the accepted prefix, and clear or logically
+hide rejected recurrent/SWA state before the next step.
 
 Track acceptance rate and time draft, target verification, commit, and sampling
 separately. Always report output-token throughput as well as block latency: a

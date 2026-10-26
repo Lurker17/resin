@@ -33,15 +33,13 @@ checkpoint volumes from `deploy/models.py`; `--publish-only` adopts complete
 existing files by validating and atomically publishing their inventory markers.
 It does not download or read weight bodies. Serving uses the same inventories.
 
-Available model keys are `gpt-oss-20b`, `gpt-oss-120b`, `deepseek-v41`, `gemma4`,
-`glm-5.3-flash`, `qwen3_5`, and `inkling`. The Qwen runner currently pins Qwen3.8-27B. Hardware,
-parallelism, draft count, and memory defaults come from each registry entry.
-DeepSeek defaults to four B300s with ADP4/EP4, attention TP1, DeepGEMM experts,
-and three drafts; GPT-OSS has no draft model. Override topology with
-`--world-size`, `--attn-dp`, `--attn-tp`, `--cp`, and `--ep`, and Modal hardware
-with `--gpu`. GPU overrides must match the preset kernel architecture: GPT-OSS
-accepts H100 or H200; other presets currently require their configured GPU.
-Record files retain the actual device name.
+Run `uv run scripts/bench.py --help` for the available model keys and options.
+The registry in [`deploy/models.py`](../deploy/models.py) defines each preset's
+pinned checkpoints, hardware, parallelism, draft count, and memory defaults.
+Override topology with `--world-size`, `--attn-dp`, `--attn-tp`, `--cp`, and `--ep`,
+and Modal hardware with `--gpu`. The registry's `validate_gpu` checks hardware
+overrides against the preset's kernel architecture; runners validate the selected
+topology. Record files retain the actual device name and parallel layout.
 
 Use `--phases prefill`, `--phases decode`, or `--phases prefill,decode` (default).
 The default prefill curve uses **4K, 8K, 16K, 32K, and 64K prompt tokens**, with

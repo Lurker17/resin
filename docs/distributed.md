@@ -1,4 +1,4 @@
-# Distributed execution prototype
+# Distributed execution
 
 `resin.Parallelism` defines rank placement in the Rust core and exposes that
 immutable configuration to Python. `resin.backend.topology.ParallelGroups` owns
@@ -9,14 +9,14 @@ rank. The other ranks in that replica follow its driver.
 
 The boundaries are:
 
-| Component | Responsibility |
-| --- | --- |
-| `Parallelism` | Rust-defined dimensions, validation, rank placement, and partitions |
-| `ParallelGroups` | Explicit device groups and Gloo control groups |
+| Component           | Responsibility                                                                       |
+| ------------------- | ------------------------------------------------------------------------------------ |
+| `Parallelism`       | Rust-defined dimensions, validation, rank placement, and partitions                  |
+| `ParallelGroups`    | Explicit device groups and Gloo control groups                                       |
 | `DistributedEngine` | Phase agreement, normal local Engine steps, empty participation, failure propagation |
-| Native `Engine` | Local admission, requests, pages, leases, output validation, commit |
-| `DistributedWorker` | Replica commands and model callback invocation |
-| `DistributedRunner` | Weight placement, CP partitioning, expert dispatch/combine, device synchronization |
+| Native `Engine`     | Local admission, requests, pages, leases, output validation, commit                  |
+| `DistributedWorker` | Replica commands and model callback invocation                                       |
+| `DistributedRunner` | Weight placement, CP partitioning, expert dispatch/combine, device synchronization   |
 
 This preserves the existing checkpoint-to-runtime preparation boundary. Create
 groups before preparing model weights and inject the appropriate group into each
@@ -26,23 +26,21 @@ coordinates. Expert payloads travel over `groups.device_domain`, the device grou
 covering the complete serving world. The coordinator never
 infers model weight layouts or uses the default world group for those operations.
 
-CUDA runners declare `parallelism_capabilities`; the shared base defaults to
-single-rank execution. The current CUDA implementations declare:
-
-| Model | Attention TP | Attention DP | CP | EP | Expert / dense FFN TP |
-| --- | --- | --- | --- | --- | --- |
-| GPT-OSS | Yes | Yes | Yes | Yes | Yes |
-| DeepSeek-V4.1 | No: one MLA KV head | Yes | Yes | Yes | Yes |
-| Gemma 4 | Yes | No | No | No | Yes |
-| Qwen3.5 / Qwen3.8 | Yes | No | No | No | Yes |
-| Inkling | No | No | No | No | No |
+CUDA runners declare supported axes in `parallelism_capabilities`, a
+[`ParallelismCapabilities`](../resin/backend/topology.py) value with flags for
+`attn_tp`, `attn_dp`, `cp`, `ep`, and `expert_tp`. The shared CUDA base disables
+these flags by default; each runner opts into the axes its implementation
+supports. Check the selected runner's declaration in
+[`models/cuda/resin_models_cuda/`](../models/cuda/resin_models_cuda/) for its
+supported layouts. Deployment presets in
+[`deploy/models.py`](../deploy/models.py) supply concrete starting topologies.
 
 Attention replication is always allowed; it repeats the same attention
 computation without introducing another sharding axis.
 These axes compose through the explicit `parallel_groups=` preparation path.
 Model dimensions, quantization blocks, and kernel capabilities still constrain
-valid layouts. DeepSeek-V4.1
-DSpark uses the same meshes for draft and target verification, including
+valid layouts. For example, DeepSeek-V4.1 DSpark uses the same meshes for draft
+and target verification, including
 empty-replica participation and captured expert exchanges.
 The GPT-OSS and DeepSeek explicit-group paths provide
 captured prefill FFN and attention-projection regions, plus full decode graphs.
@@ -51,9 +49,10 @@ cross-rank combine does not add an intermediate activation rounding step.
 `DistributedWorker` validates a declared capability set collectively before
 serving begins. Custom distributed runners may supply the same declaration.
 
-See [DeepSeek-V4.1 parallelism](../models/cuda/resin_models_cuda/deepseek_v41/README.md) and
-[GPT-OSS parallelism](gpt-oss-parallelism.md) for the implemented
-model paths and real-GPU validation commands.
+See the [DeepSeek-V4.1 model notes](../models/cuda/resin_models_cuda/deepseek_v41/README.md)
+and [GPT-OSS runner](../models/cuda/resin_models_cuda/gpt_oss/cuda.py) for concrete
+implementations. [Benchmarking](benchmarks.md) documents the shared CLI for
+measuring a model with explicit topology options.
 
 ### Dense model tensor parallelism
 
@@ -190,8 +189,7 @@ The [eight-H100 all-axes run](https://modal.com/apps/ekzhang/main/ap-mAC3PAVTWVW
 also passes EP2/expert-TP4 with attention-DP2, CP2 and attention-TP2 together.
 Every graph comparison is exact against independent arithmetic. Device counters
 in the fully active EP4 fixture record 30 inter-GPU token copies versus the former
-dense transport's 60; deduplicated attention replication reduces that fixture to
-10. Idle replay transfers zero token payloads. Corresponding logical payloads
+dense transport's 60; deduplicated attention replication reduces that fixture to 10. Idle replay transfers zero token payloads. Corresponding logical payloads
 are 3,600/1,200 versus 7,200 bytes, excluding synchronization and protocol traffic.
 These are transport checks, not full-model throughput or MFU measurements.
 
@@ -219,8 +217,9 @@ compressor updates on each CP rank. It partitions indexer query scoring, sparse
 attention, and query/output projection work, then gathers attention outputs
 before the full FFN. This preserves the compressor's ordered state updates.
 
-Both implementations retain complete KV/state copies across CP ranks. CP does
-not increase logical KV-cache capacity in this prototype.
+These implementations retain complete KV/state copies across CP ranks. Their
+CP layouts distribute prefill computation without increasing logical KV-cache
+capacity.
 
 ## Rank placement
 
@@ -264,19 +263,19 @@ For `Parallelism(world_size=8, ep=4, cp=2, attn_dp=2, attn_tp=2)`, both
 attention TP and expert TP are two, and attention replication is one. The groups
 containing rank zero are:
 
-| Group | Ranks |
-| --- | --- |
-| Attention TP | 0, 1 |
-| CP | 0, 2 |
-| Attention DP | 0, 4 |
-| Attention replication | 0 |
-| EP | 0, 2, 4, 6 |
-| Expert TP | 0, 1 |
-| Request replica | 0, 1, 2, 3 |
-| Serving domain | 0–7 |
+| Group                  | Ranks      |
+| ---------------------- | ---------- |
+| Attention TP           | 0, 1       |
+| CP                     | 0, 2       |
+| Attention DP           | 0, 4       |
+| Attention replication  | 0          |
+| EP                     | 0, 2, 4, 6 |
+| Expert TP              | 0, 1       |
+| Request replica        | 0, 1, 2, 3 |
+| Serving domain         | 0–7        |
 | Device request replica | 0, 1, 2, 3 |
-| Device serving domain | 0–7 |
-| Domain drivers | 0, 4 |
+| Device serving domain  | 0–7        |
+| Domain drivers         | 0, 4       |
 
 `Parallelism(world_size=4, attn_dp=4)` gives four attention replicas with
 attention TP one, CP one, and expert TP four. Each rank drives its own request
@@ -396,8 +395,20 @@ logical plan within a replica; phase-specific CP behavior and expert routing
 belong to the model callback.
 
 An optional `validate_distributed(plan, context)` performs host checks before the
-readiness vote. The forward callback must preserve collective ordering and finish
-its device work before returning. Mid-collective process/device failures rely on
+readiness vote. If it returns a non-`None` prepared value, the worker passes that
+value to the execution callback as the keyword-only `prepared` argument. This
+lets runners reuse validated metadata without retaining pending state.
+
+The synchronous forward callback must preserve collective ordering and finish
+its device work before returning. A runner can instead provide
+`enqueue_distributed(plan, context, *, prepared=..., feedback=...)` for deferred
+completion and eligible decode continuations. It returns an owned completion
+with `result()` and device feedback for queued work, or the ordinary synchronous
+result on fallback. The Engine retains the plan and cache leases until
+completion, and every replica must enqueue together. See
+[overlap scheduling](scheduler.md) for the completion contract.
+
+Mid-collective process/device failures rely on
 process-group timeouts and process teardown. The coordinator propagates errors;
 it cannot roll back in-place model state or globally undo a peer's completed local
 commit. Failure marks all native Engines poisoned, preserving resources and
@@ -488,8 +499,10 @@ groups.close()
 
 Initialization and error diagnostics may still use object collectives;
 successful execution votes, plan transport, and HTTP rounds use typed buffers.
-Shared-memory command transport, throughput validation, expert load
-balancing and prefix-aware replica routing remain separate work.
+See [recorded benchmark measurements](benchmarks.md#recorded-decode-sweeps) for
+measured multi-GPU performance and its workload limits. Shared-memory command
+transport, expert load balancing, and prefix-aware replica routing remain
+separate work.
 
 ## Source references and validation
 
@@ -517,12 +530,17 @@ compares a dense SwiGLU reference with EP1/ETP4, EP2/ETP2, and EP4/ETP1 across
 different attention meshes, including unequal intermediate shards, output bias,
 padding masks, idle origins, and FP32 cancellation.
 [`test_context_parallel.py`](../tests/test_context_parallel.py) checks real token
-exchange and global causal/window coordinates. The completed two-H200
-[eager and graph runs](gpt-oss-parallelism.md#hopper-validation) cover the earlier
-EP2 paths. The expanded two/eight-H100 matrices execute composed full-model
+exchange and global causal/window coordinates.
+[`test_distributed_overlap.py`](../tests/test_distributed_overlap.py) checks
+coordinated continuations across replicas, including idle participation and
+synchronous fallback. Historical two-H200 eager/graph runs covered EP2 paths;
+the expanded two/eight-H100 matrices executed composed full-model
 graphs, including all axes together, with matching greedy probes and reclaimed
-request caches. Tensor-parallel layouts still exceed the fixed same-history
-logit-error limits; executing the mesh is not an accuracy pass. Blackwell runs
-also establish DeepSeek graph execution, but expose expert-TP numerical drift
-and a graph-decode discrepancy under investigation. See the model documents
-for the measured limits and reproducible diagnostics.
+request caches. Those tensor-parallel qualification runs exceeded the fixed
+same-history logit-error limits; executing the mesh was not an accuracy pass.
+Later [DeepSeek full-checkpoint validation](../models/cuda/resin_models_cuda/deepseek_v41/README.md#validation)
+at `40a44fd` established exact eager/graph tokens and logprobs on a bounded
+EP4/attention-DP4 workload, plus matching synchronous and overlapped output.
+That result does not establish cross-topology parity or broader model quality.
+The linked model notes and benchmark records retain the revisions and measured
+scope of each run.

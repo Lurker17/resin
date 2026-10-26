@@ -40,8 +40,9 @@ execute straightforwardly.
 
 Separately installable model packages already use this boundary to add models
 and select kernels. The [model authoring reference](model-forward-pass.md)
-documents preparation and execution requirements. Step-by-step tutorials and
-an authoring skill are planned.
+documents preparation and execution requirements. The
+[add-resin-model skill](../skills/add-resin-model/SKILL.md) provides the workflow
+for implementing and validating a runner.
 
 ## Lifecycle
 
@@ -80,9 +81,9 @@ submit a continuation before harvesting the previous batch.
 
 `Engine(enable_overlap=True)` is the default. An optional runner `enqueue()`
 returns an owned completion with `result()` and device `feedback`; the
-synchronous runner contract remains sufficient. The shared DeepSeek CUDA runner
-implements this boundary. Model forward methods receive ordinary device inputs
-and cache views; they do not track pending batches or schedule continuations.
+synchronous runner contract remains sufficient. DeepSeek's CUDA runner is one
+implementation of this boundary. Model forward methods receive ordinary device
+inputs and cache views; they do not track pending batches or schedule continuations.
 
 The Engine keeps one batch in flight. Exact accepted tokens, positions and
 sampling offsets feed the next graph on the GPU; CPU progress and events commit
@@ -156,10 +157,10 @@ path. See the [runner contract](kernel-boundary.md) for Python error handling.
 
 ## Distributed coordination and output
 
-The [distributed prototype](distributed.md) adds explicit attention TP/CP/DP and
-expert EP/TP meshes, one request Engine per attention-DP replica, and synchronous
-phase agreement across communicating replicas. It leaves model partitioning and
-kernel collectives in prepared runtimes. GPT-OSS prepares attention head shards
+The [distributed execution layer](distributed.md) coordinates explicit attention
+TP/CP/DP and expert EP/TP meshes, one request Engine per attention-DP replica,
+and phase agreement across communicating replicas. It leaves model partitioning
+and kernel collectives in prepared runtimes. GPT-OSS prepares attention head shards
 separately from expert ownership and intermediate shards. DeepSeek-V4.1 keeps
 its single MLA KV head whole and composes attention DP/CP with expert EP/TP.
 Shared expert dispatch returns complete origin rows across EP and expert TP;
@@ -195,8 +196,8 @@ Perfetto traces.
 - sparse graph-safe expert dispatch requires a shared NVLink domain and retains
   static receive storage; RDMA graph transport and communication overlap are pending;
 - model dimensions, quantization blocks, and kernel capabilities constrain layouts;
-- sparse transport passes composed meshes on up to eight H100s; DeepSeek-specific
-  Blackwell validation of the new transport is pending;
+- transport and model backend restrictions further constrain valid meshes; see
+  [distributed execution](distributed.md) and the selected runner's validation;
 - no multi-node serving;
 - model runtimes implement device collectives; the native scheduler owns local
   request and page lifetimes.

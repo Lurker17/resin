@@ -80,11 +80,13 @@ allocator.
 
 ## Physical sizing
 
-DeepSeek chooses slab capacity from free VRAM after model load and before
-cache allocation and CUDA graph capture, subject to its memory-utilization
-target. Other runners may supply a fixed capacity. The slab byte size is the
-largest group allocation. Smaller groups set `blocks_per_slab` from their
-exact byte ratio, so the allocator can compare all demand in slab units.
+CUDA runners use the shared
+[`plan_cache_capacity`](../resin/backend/capacity.py) helper to choose slab capacity
+from free VRAM after model load and before cache allocation and CUDA graph
+capture, subject to their memory-utilization targets and workspace reservations.
+Runners may also bound that capacity explicitly. The slab byte size is the
+largest group allocation. Smaller groups set `blocks_per_slab` from their exact
+byte ratio, so the allocator can compare all demand in slab units.
 
 DeepSeek-V4.1 packs its smaller compressed-history and rolling state groups into
 the same slab size. GPT-OSS uses full-history and sliding attention groups with

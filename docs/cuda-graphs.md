@@ -1,6 +1,7 @@
 # CUDA graph policies
 
-The GPT-OSS, Gemma 4, DeepSeek V4.1, Qwen3.5, and Inkling CUDA runners accept:
+CUDA runners built on the shared `resin.backend.cuda.runner.CudaRunner` expose
+separate prefill and decode policies. For example:
 
 ```python
 from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
@@ -50,9 +51,9 @@ recurrent updates, media processing, and sampling retain their existing paths.
 DeepSeek passes token IDs into its hash-routed experts. Qwen3.5 and Inkling keep
 their recurrent/convolution state outside these graphs.
 
-This is a bounded first implementation, not capture of the entire prefill
-transformer. It uses the existing `CudaGraphStep`/`CudaGraphProgram` runtime and
-adds no compiler or alternate model implementation. The policy names follow
+Prefill capture is bounded to these tensor regions. It uses the shared
+`CudaGraphStep`/`CudaGraphProgram` runtime and the model's ordinary forward
+implementation. The policy names follow
 [SGLang's CUDA graph configuration](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/cuda_graph_config.py),
 but Resin's captured regions and model coverage are its own.
 
@@ -76,10 +77,10 @@ work merely to fit a graph. Attention and recurrent state always see the real
 token count. Inputs outside the captured token or dtype range also run eagerly
 and record a fallback. Graph inputs and outputs stay on the GPU.
 
-DeepSeek currently requires exact buckets even for short prefills: padding 17
-tokens to 32 failed its numerical comparison. Model integrations can restrict
-padding through the private region configuration without changing the public
-policy or creating another execution path.
+Model integrations can require exact buckets even for short prefills through
+the private region configuration. DeepSeek and GLM use this policy; padding
+DeepSeek's 17-token input to 32 failed its numerical comparison. Check the
+runner's region configuration for its padding limit.
 
 Models that change row counts between regions can pass `region_tokens` to the
 distributed prefill scope: a mapping from callback index ranges to local row
@@ -162,11 +163,12 @@ than falling back after CUDA may have changed persistent state. See
 [the model authoring contract](model-forward-pass.md#cuda-graphs) for cache,
 continuation, speculative decode, and real-history validation requirements.
 
-The projection implementation passes 719 local tests (65 GPU skips), all 16
-shared-runtime checks on a [B300](https://modal.com/apps/ekzhang/main/ap-uO1BoGsDsOcdWhBlbmFcvm),
-and bounded full-checkpoint workloads with 32-token chunks on two GPUs. See the
-[GPT-OSS Hopper results](gpt-oss-parallelism.md#hopper-validation) and
-[DeepSeek Blackwell results](../models/cuda/resin_models_cuda/deepseek_v41/README.md#validation).
+The initial projection validation passed all 16 shared-runtime checks on a
+[B300](https://modal.com/apps/ekzhang/main/ap-uO1BoGsDsOcdWhBlbmFcvm), plus bounded
+full-checkpoint workloads with 32-token chunks on two GPUs. Current regression
+coverage includes the [GPT-OSS projection tests](../models/cuda/tests/test_gpt_oss_prefill_projections.py)
+and the shared tests above. See also the
+[DeepSeek validation record](../models/cuda/resin_models_cuda/deepseek_v41/README.md#validation).
 The GPU probes compare nonzero eager and captured projections exactly, and
 exercise changing contexts, chunk sizes, page ownership, and idle replicas.
 They do not establish full-model numerical parity across quantized layouts.
@@ -209,11 +211,12 @@ rounds of five calls. These are region measurements, not an end-to-end throughpu
 claim. Small launch-bound work benefits; the largest compute-bound case is
 effectively unchanged. Validation replays are included in reported replay totals.
 
-### Model coverage and remaining limits
+### Initial generation measurements and remaining limits
 
-All five integrations pass the twelve first/last-region numerical probes, which
-include exact graph buckets and awkward lengths that use the eager fallback.
-Completed generation runs are:
+The five integrations measured in this initial validation passed the twelve
+first/last-region numerical probes, including exact graph buckets and awkward
+lengths that use the eager fallback. Completed generation runs from that
+validation are:
 
 | Model / hardware | Capture time, decode + prefill shapes | Completed workload |
 | --- | --- | --- |

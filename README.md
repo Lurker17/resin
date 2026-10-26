@@ -85,6 +85,12 @@ pip install "git+https://github.com/ekzhang/resin.git"
 Pip builds the Rust extension locally. The import remains `resin`.
 Use `@<commit>` after `.git` to pin a revision.
 
+Model runners are separate packages: [`resin-models-cuda`](models/cuda/pyproject.toml)
+for optimized CUDA implementations and
+[`resin-models-torch`](models/torch/pyproject.toml) for reference implementations.
+The repository's development workspace installs both; the examples below assume
+that workspace or a separately installed runner package.
+
 ## Development
 
 Resin requires Python 3.11+ and Rust.
@@ -237,19 +243,20 @@ RESIN_MODEL=deepseek-v41 uv run modal run deploy/modal_serve.py
 RESIN_MODEL=deepseek-v41 uv run modal deploy deploy/modal_serve.py
 ```
 
-Other selections are `gpt-oss-120b`, `gemma4`, `qwen3_5`, and `inkling`. The
-`qwen3_5` runner currently serves the pinned Qwen3.8-27B checkpoint. Add
-`--publish-only` to the download command to adopt complete files already in the
-checkpoint volume without downloading their contents. Serving and benchmarking
-use the same checkpoint inventory and completion marker.
+Use `uv run scripts/bench.py --help` to see the current model keys accepted by
+`RESIN_MODEL` and the benchmark CLI. The shared
+[`MODEL_SPECS` registry](deploy/models.py) defines each selection's checkpoint,
+hardware, and serving limits. Add `--publish-only` to the download command to
+adopt complete files already in the checkpoint volume without downloading their
+contents. Serving and benchmarking use the same checkpoint inventory and
+completion marker.
 
-DeepSeek uses the shared distributed HTTP coordinator, with a 1,048,576-token context limit,
-32 running requests per attention-DP replica, CUDA graphs, and three speculative
-draft tokens with natural acceptance. Requests are routed round-robin unless
-`routed_dp_rank` in the JSON body or `resin-routed-dp-rank` in the header selects
-a replica (0–3). DeepSeek-V4.1 has one MLA KV head and requires `attn_tp=1`.
-GPT-OSS 120B uses the same distributed worker/engine coordinator with attention
-TP2 and expert TP2; the 20B endpoint keeps a single local Engine.
+Multi-rank deployments use the shared distributed worker, Engine, and HTTP
+coordinator. For example, DeepSeek uses attention DP and expert parallelism,
+while GPT-OSS 120B uses attention and expert tensor parallelism. Requests are
+routed round-robin across attention-DP replicas unless `routed_dp_rank` in the
+JSON body or `resin-routed-dp-rank` in the header selects a replica. Single-rank
+deployments use a local Engine through the same HTTP frontend.
 
 Each deployed URL serves `/`, `/health`, `/v1/models`,
 `/v1/chat/completions`, and `/v1/responses`; model configuration controls
@@ -312,30 +319,14 @@ use spare capacity in the same pool and are evicted when live requests need it.
 
 ## Public surface
 
-Top-level imports are limited to native control-plane types:
+The top-level `resin` package exposes the Engine, immutable plans and request
+policies, runner protocols, cache layouts, and metrics types. See
+[`resin/__init__.py`](resin/__init__.py) for the current exports and
+[`resin/protocols.py`](resin/protocols.py) for the runner contracts.
 
-```python
-Engine
-Runner
-ManagedRunner
-BatchPlan
-BatchPhase
-TokenEvent
-ForwardOutput
-TokenLogprobs
-RequestLease
-SamplingParams
-SchedulerConfig
-Parallelism
-RunnerConfig
-ResourceBinding
-CacheGroupLayout
-CacheGroupFamily
-CacheLayout
-CacheGroupPlan
-```
-
-Concrete runners are explicit imports from architecture submodules such as
+Distributed coordination lives in `resin.backend.distributed`, with explicit
+process groups in `resin.backend.topology`. Concrete runners are imports from
+separately installed architecture submodules such as
 `resin_models_cuda.deepseek_v41`, `resin_models_cuda.gpt_oss`, and
 `resin_models_torch.lfm2`.
 

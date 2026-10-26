@@ -10,6 +10,7 @@ The independent sequence metadata is deliberately small:
 
 - `sequence_ids`: stable request IDs, one per sequence.
 - `context_lengths`: tokens processed before this step, one per sequence.
+- `prefill_lengths`: final prompt or replay endpoints, stable across chunks.
 - `token_ids`: scheduled inputs flattened in sequence order.
 - `token_indptr`: offsets that slice `token_ids` for each sequence.
 - `phase`: prefill or decode. A step never mixes phases.
@@ -36,6 +37,11 @@ generate a sampled token. It is used for chunked prefill, when some sequences
 only advance the cache. `sampling_params` contains one effective sampling policy
 per sequence. Random draw offsets are derived from the absolute sampled
 position rather than transported separately.
+
+Prompt scoring uses separate predecessor-row and target-token arrays, so runners
+can project only the requested hidden rows. See the
+[logprob contract](logprobs.md#array-boundary) for these fields and the matching
+`ForwardOutput` score columns.
 
 ## Cache metadata
 

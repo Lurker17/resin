@@ -11,7 +11,9 @@ Keep these stores conceptually separate:
 - the native flat cache pool contains live history and recurrent state;
 - the kernel-artifact store contains compiled libraries and tuning records.
 
-None of them contains tokenizer or chat-template state.
+Tokenizer files may accompany a model checkpoint. Live tokenizer and
+conversation-parser state belongs to the recipe layer, independently of the
+device and kernel caches.
 
 ## Portable API
 
