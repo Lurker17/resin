@@ -15,6 +15,11 @@ token IDs ──► Rust Engine ──► frozen BatchPlan ──► Python Runn
 
 Resin also has optional HTTP serving and Prometheus metrics.
 
+> [!WARNING]
+> This is not production-quality software. If you're looking for an actual
+> inference engine, please use SGLang or vLLM. Read on if you want to hack on
+> LLM inference systems, new models or hardware.
+
 With the right kernels, this makes it possible to autonomously "vibe code" even
 the most complex models. In 12 hours, we used Resin to build standalone engines
 for [DeepSeek-V4.1-Flash](models/cuda/resin_models_cuda/deepseek_v41/) and
@@ -69,7 +74,18 @@ packages. Then use the following skills:
 
 Importing `resin` does not import PyTorch or initialize CUDA.
 
-## Install for development
+## Installation
+
+Install the core library directly from GitHub with Python 3.11+ and Rust installed:
+
+```bash
+pip install "git+https://github.com/ekzhang/resin.git"
+```
+
+Pip builds the Rust extension locally. The import remains `resin`.
+Use `@<commit>` after `.git` to pin a revision.
+
+## Development
 
 Resin requires Python 3.11+ and Rust.
 
@@ -80,18 +96,11 @@ uv run scripts/rust_build_and_types.py
 `uv run` syncs the project dependencies automatically. The build command then
 syncs type-library sources and builds the Rust extension with generated stubs.
 
-Install `resin-models-cuda`; it pulls in `resin[cuda]` for the shared
-accelerator runtime. Reusable device-neutral helpers live in `resin.backend`; CUDA
-helpers are explicit imports from `resin.backend.cuda`.
-
-## Developing
-
 The Modal harnesses are launched from the repository root. Install the
 development dependencies first, then authenticate with Modal once if this is a
 new machine:
 
 ```bash
-uv run scripts/rust_build_and_types.py
 uv run modal setup
 ```
 
