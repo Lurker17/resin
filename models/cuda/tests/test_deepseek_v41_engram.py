@@ -356,6 +356,37 @@ def test_engram_gate_normalizes_each_hc_copy_and_preserves_mask(monkeypatch):
 
 
 @pytest.mark.parametrize("prefill", [False, True])
+def test_model_routes_engram_projection_by_phase(implementation, prefill):
+    from test_deepseek_v41 import _cache
+
+    calls = []
+
+    class PhaseEngram(nn.Module):
+        def forward(self, hidden, *, token_mask, embed_hook, prefill=False):
+            calls.append((prefill, token_mask, embed_hook()))
+            return hidden
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_id, self.engram = 1, PhaseEngram()
+
+        def forward(self, hidden, pre, ids, attention, *, prefill=False):
+            return hidden, pre
+
+    model = implementation.Transformer.__new__(implementation.Transformer)
+    nn.Module.__init__(model)
+    model.vision, model.hc_mult, model.target_layer_ids = None, 1, ()
+    model.engram_hash = lambda *args: "hashes"
+    model.engram_runtime = SimpleNamespace(fetch=lambda hashes: {1: lambda: hashes})
+    model.embed, model.norm = nn.Embedding(4, 2), nn.Identity()
+    model.layers = nn.ModuleList([Layer()])
+    _, cache = _cache()
+    model._run(torch.tensor([[0]]), torch.tensor([[0]]), 1, cache, prefill=prefill)
+    assert calls == [(prefill, None, "hashes")]
+
+
+@pytest.mark.parametrize("prefill", [False, True])
 def test_idle_rank_prefetches_all_engram_and_waits_before_each_layer_collective(
     implementation, prefill, monkeypatch
 ):

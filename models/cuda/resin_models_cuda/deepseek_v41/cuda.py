@@ -394,6 +394,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
         for layer, callback in zip(self._model.layers, prefill_ffns, strict=True):
             layer.prefill_ffn = callback
         self._configure_prefill_attention_graphs()
+        self._configure_prefill_engram_graphs()
 
     def release(self, request_ids: list[int]) -> None:
         for request_id in request_ids:
@@ -618,6 +619,35 @@ class DeepSeekV41CudaRunner(CudaRunner):
             layer.attn.prefill_finish = lambda output, positions, invoke=finish: invoke(
                 *output
             )[None]
+
+    def _configure_prefill_engram_graphs(self):
+        engrams = [
+            (layer.layer_id, layer.engram)
+            for layer in self._model.layers
+            if layer.engram is not None
+        ]
+        if not engrams:
+            return
+        callbacks = self._configure_prefill_tensor_graphs(
+            tuple(
+                CudaGraphTensorRegion(
+                    f"layer.{layer_id}.engram_projection",
+                    lambda values, projection=engram.wkv: projection(values),
+                    (TensorSpec((engram.wkv.weight.shape[1],)),),
+                    TensorSpec((engram.wkv.weight.shape[0],)),
+                )
+                for layer_id, engram in engrams
+            ),
+            mode="prefill_engram",
+            max_tokens=self.prefill_chunk_size,
+            # DeepGEMM's dynamic-M kernel still selects tactics from M. Use
+            # only the bounded shapes captured at startup, including ragged
+            # prompts and suffixes. Lookup, masking and gating stay unpadded.
+            pad_up_to=self.prefill_chunk_size,
+            capture_context=self._prefill_compute_context,
+        )
+        for (_, engram), callback in zip(engrams, callbacks, strict=True):
+            engram.prefill_projection = callback
 
     @contextmanager
     def _prefill_compute_context(self):

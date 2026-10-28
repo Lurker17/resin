@@ -3,6 +3,7 @@
 # 1bae0e1088993b9b82de08f59de5be5a34e42170/inference/engram.py
 """Checkpoint-exact n-gram hashing and row-sharded Engram residuals."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache
 from importlib import import_module
@@ -242,6 +243,7 @@ class Engram(nn.Module):
         self.q_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))
         self.k_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))
         self.register_buffer("_gate_weight", None, persistent=False)
+        self.prefill_projection: Callable | None = None
 
     def prepare_gate(self):
         """Fuse loaded RMS weights once, as in DeepInfer's Engram preparation."""
@@ -251,9 +253,18 @@ class Engram(nn.Module):
             else self.q_weight.float() * self.k_weight.float()
         )
 
-    def forward(self, hidden, hash_ids=None, token_mask=None, *, embed_hook=None):
+    def forward(
+        self, hidden, hash_ids=None, token_mask=None, *, embed_hook=None, prefill=False
+    ):
         embedding = self.embed(hash_ids) if embed_hook is None else embed_hook()
-        projection = self.wkv(embedding.flatten(-2))
+        values = embedding.flatten(-2)
+        if prefill and self.prefill_projection is not None:
+            # Only the independent projection rows are padded. Its borrowed
+            # graph output is consumed by the gate before another replay.
+            projection = self.prefill_projection(values.reshape(-1, values.shape[-1]))
+            projection = projection.view(*values.shape[:-1], projection.shape[-1])
+        else:
+            projection = self.wkv(values)
         if hidden.is_cuda:
             if self._gate_weight is None:
                 raise RuntimeError("prepare Engram gate weights before execution")

@@ -940,7 +940,10 @@ class Transformer(nn.Module):
             if layer.engram is not None:
                 assert hashes is not None
                 hidden = layer.engram(
-                    hidden, token_mask=text_mask, embed_hook=hooks[layer.layer_id]
+                    hidden,
+                    token_mask=text_mask,
+                    embed_hook=hooks[layer.layer_id],
+                    prefill=prefill,
                 )
             if layer.layer_id in self.target_layer_ids:
                 collected.append(hidden.mean(-2))
