@@ -335,34 +335,33 @@ class GraphPagedAttentionRuntime:
         slab_units: int,
         page_tokens: int,
     ) -> tuple[Any, Any, Any]:
+        """Vectorized CSR page tables; padding rows get one null page."""
         import numpy as np
 
         logical = np.zeros(graph_rows * graph_width, dtype=np.int32)
-        indptr = np.zeros(graph_rows + 1, dtype=np.int32)
         last = np.ones(graph_rows, dtype=np.int32)
-        cursor = 0
         pages_per_slab = slab_units // layer_count
-        for row in range(graph_rows):
-            if row < rows:
-                retained = int(group.block_table_start_indices[row]) * page_tokens
-                used = int(sequence_lengths[row]) - retained
-                if used <= 0:
-                    raise ValueError(
-                        "Qwen3.5 graph attention requires retained context"
-                    )
-                count = (used + page_tokens - 1) // page_tokens
-                slabs = group.block_slabs(row)
-                slots = group.block_slots(row)
-                if count > len(slabs) or count > graph_width:
-                    raise ValueError("Qwen3.5 graph attention exceeds its cache lease")
-                logical[cursor : cursor + count] = slabs[:count].astype(
-                    np.int64
-                ) * pages_per_slab + slots[:count].astype(np.int64)
-                last[row] = (used - 1) % page_tokens + 1
-            else:
-                count = 1
-            cursor += count
-            indptr[row + 1] = cursor
+        retained = group.block_table_start_indices[:rows].astype(np.int64) * page_tokens
+        used = np.asarray(sequence_lengths[:rows], dtype=np.int64) - retained
+        if np.any(used <= 0):
+            raise ValueError("Qwen3.5 graph attention requires retained context")
+        count = (used + page_tokens - 1) // page_tokens
+        table = group.block_indptr.astype(np.int64)
+        if np.any(count > table[1 : rows + 1] - table[:rows]) or np.any(
+            count > graph_width
+        ):
+            raise ValueError("Qwen3.5 graph attention exceeds its cache lease")
+        total = int(count.sum())
+        starts = np.cumsum(count) - count
+        source = np.repeat(table[:rows] - starts, count) + np.arange(total)
+        logical[:total] = group.block_slab_ids[source].astype(
+            np.int64
+        ) * pages_per_slab + group.block_slotnums[source].astype(np.int64)
+        last[:rows] = (used - 1) % page_tokens + 1
+        counts = np.ones(graph_rows, dtype=np.int64)
+        counts[:rows] = count
+        indptr = np.zeros(graph_rows + 1, dtype=np.int32)
+        indptr[1:] = np.cumsum(counts)
         return logical, indptr, last
 
     def plan(self, cache_plan: Any, positions: Any) -> dict[str, object]:
