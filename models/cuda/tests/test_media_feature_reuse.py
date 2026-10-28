@@ -46,6 +46,10 @@ def _case(name):
     runner.config = SimpleNamespace(hidden_size=3, image_token_id=8, video_token_id=9)
     runner._media_features = {}
     runner._target_hidden = {}
+    if name == "gemma":
+        runner._hidden_bank = None
+        runner._hidden_free_slots, runner._hidden_slot_generation = [], 0
+        runner._hidden_index_cache, runner._hidden_input_buffers = {}, {}
     runner._vision_feature_cache = VisionFeatureCache(max_entries=1)
     runner.max_batch_size, runner.prefill_chunk_size = 8, 128
     state = SimpleNamespace(calls=0, buffers={})

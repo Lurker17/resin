@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import numpy.typing as npt
 
 from resin import BatchPhase
-from resin.backend.plans import CacheGroupView, PagedCachePlan
+from resin.backend.plans import BatchView, CacheGroupView, PagedCachePlan
 
 PAGE_SIZE = 64
-PREFILL_CHUNK_SIZE = 4096
+PREFILL_CHUNK_SIZE = 8192
 SLIDING_WINDOW = 1024
 WINDOW_RETENTION_TOKENS = PREFILL_CHUNK_SIZE + SLIDING_WINDOW - 1
 
@@ -36,6 +36,8 @@ class Gemma4BatchPlan:
     local: PagedAttentionPlan
     global_: PagedAttentionPlan
     last_token_indices: npt.NDArray[np.int64]
+    local_envelope: PagedAttentionPlan | None = None
+    global_envelope: PagedAttentionPlan | None = None
 
 
 def _paged_plan(
@@ -81,14 +83,117 @@ def _paged_plan(
     )
 
 
+def _reserved_cache_plan(plan, layout, *, decode_lookahead: int):
+    """Validate an immutable reservation envelope without exposing future KV.
+
+    Native wide leases retain the original first page and rounded last page
+    across conservative continuations. This opt-in path validates coverage and
+    append ownership; ordinary exact-active plans keep their stricter validator.
+    """
+    from resin import CacheGroupFamily, CacheLayout
+
+    if not isinstance(layout, CacheLayout):
+        raise TypeError("reserved cache plans require a native CacheLayout")
+    batch = BatchView.from_plan(plan)
+    if batch.phase != BatchPhase.DECODE or np.any(batch.query_lengths != 1):
+        raise ValueError("reservation envelopes require one-token decode rows")
+    if len(batch.cache_groups) != 2 or len(layout.groups) != 2:
+        raise ValueError("Gemma reservation envelopes require history and local groups")
+    positions = batch.positions.astype(np.int64)
+    needed = positions + decode_lookahead + 1
+    groups = []
+    for index, descriptor in enumerate(layout.groups):
+        if (
+            descriptor.family != CacheGroupFamily.HISTORY
+            or descriptor.block_tokens != PAGE_SIZE
+        ):
+            raise ValueError(
+                "Gemma reservation envelopes require token-addressed 64-token pages"
+            )
+        group = CacheGroupView.from_plan(
+            batch,
+            group_index=index,
+            blocks_per_slab=descriptor.blocks_per_slab,
+            parent_capacity=layout.parent_capacity,
+            block_tokens=PAGE_SIZE,
+        )
+        counts = np.diff(group.block_indptr).astype(np.int64)
+        first = group.block_table_start_indices.astype(np.int64)
+        end = (first + counts) * PAGE_SIZE
+        if np.any(counts <= 0) or np.any(end < needed):
+            raise ValueError(
+                "reserved cache envelope does not cover the verification writes"
+            )
+        if descriptor.window_tokens is None:
+            if np.any(first != 0):
+                raise ValueError("history reservation must retain the full prefix")
+        else:
+            read_window = descriptor.read_window_tokens
+            assert read_window is not None
+            earliest = np.maximum(0, positions - read_window)
+            maximum = descriptor.window_tokens - read_window + 1
+            if np.any(first * PAGE_SIZE > earliest):
+                raise ValueError("reserved local envelope omits readable history")
+            # The final physical page includes unused padding. Only the
+            # current logical verification writes consume this write budget;
+            # Native separately bounds any later continuation within its lease.
+            if np.any(needed - positions > maximum):
+                raise ValueError(
+                    "reserved local verification exceeds simultaneous write capacity"
+                )
+            resident = descriptor.window_resident_block_count
+            if resident is not None and np.any(counts > resident):
+                raise ValueError(
+                    "reserved local envelope exceeds retained page capacity"
+                )
+        logical = positions // PAGE_SIZE - first
+        if np.any(logical < 0) or np.any(logical >= counts):
+            raise ValueError("reserved decode anchor lies outside its immutable table")
+        addresses = group.block_indptr[:-1].astype(np.int64) + logical
+        if (
+            np.any(group.append_slab_ids != group.block_slab_ids[addresses])
+            or np.any(group.append_slotnums != group.block_slotnums[addresses])
+            or np.any(group.append_block_offsets != positions % PAGE_SIZE)
+        ):
+            raise ValueError("reserved decode append target is not row-owned")
+        groups.append(group)
+    return PagedCachePlan(batch, layout, tuple(groups))
+
+
+def _reservation_envelope(group: CacheGroupView, token_indptr, positions):
+    packed = group.packed_block_ids.astype(np.int32)
+    first = tuple(int(value) * PAGE_SIZE for value in group.block_table_start_indices)
+    counts = np.diff(group.block_indptr).astype(np.int64)
+    return PagedAttentionPlan(
+        qo_indptr=token_indptr,
+        kv_indptr=group.block_indptr.astype(np.int32),
+        page_indices=packed,
+        last_page_lengths=np.full(len(counts), PAGE_SIZE, dtype=np.int32),
+        append_slots=(
+            group.packed_append_ids * PAGE_SIZE + group.append_block_offsets
+        ).astype(np.int64),
+        first_token_positions=first,
+        kv_lengths=tuple(int(value) * PAGE_SIZE for value in counts),
+    )
+
+
 def build_gemma4_batch_plan(
     plan,
     cache_layout,
     *,
     decode_lookahead: int = 0,
+    prefill_chunk_size: int = PREFILL_CHUNK_SIZE,
+    reservation_tokens: int = 0,
 ) -> Gemma4BatchPlan:
-    cache = PagedCachePlan.from_plan(
-        plan, cache_layout, decode_lookahead=decode_lookahead
+    reserved = reservation_tokens > 0 and plan.phase == BatchPhase.DECODE
+    if reserved and reservation_tokens < 2 * (decode_lookahead + 1):
+        raise ValueError("reservation must cover two maximum-width decode steps")
+    cache = (
+        _reserved_cache_plan(plan, cache_layout, decode_lookahead=decode_lookahead)
+        if reserved
+        else PagedCachePlan.from_plan(
+            plan, cache_layout, decode_lookahead=decode_lookahead
+        )
     )
     batch = cache.batch
     token_ids = batch.token_ids.astype(np.int64, copy=False)
@@ -101,12 +206,39 @@ def build_gemma4_batch_plan(
     if batch.phase != BatchPhase.DECODE and decode_lookahead:
         raise ValueError("decode_lookahead is only valid during decode")
     query_lengths = batch.query_lengths
-    if batch.phase == BatchPhase.PREFILL and np.any(query_lengths > PREFILL_CHUNK_SIZE):
-        raise ValueError(f"prefill rows cannot exceed {PREFILL_CHUNK_SIZE} tokens")
+    if type(prefill_chunk_size) is not int or prefill_chunk_size <= 0:
+        raise ValueError("prefill_chunk_size must be a positive integer")
+    if batch.phase == BatchPhase.PREFILL and np.any(query_lengths > prefill_chunk_size):
+        raise ValueError(f"prefill rows cannot exceed {prefill_chunk_size} tokens")
     if batch.phase == BatchPhase.DECODE and np.any(query_lengths != 1):
         raise ValueError("decode rows must contain one token")
 
     history, local = cache.groups
+    if reserved:
+        local_envelope = _reservation_envelope(local, token_indptr, positions)
+        global_envelope = _reservation_envelope(history, token_indptr, positions)
+
+        def readable(source):
+            return _reshape_paged_plan(
+                source,
+                token_indptr,
+                positions,
+                positions + decode_lookahead + 1,
+                truncate=True,
+                include_append=True,
+            )
+
+        return Gemma4BatchPlan(
+            phase=batch.phase,
+            token_ids=token_ids,
+            positions=positions,
+            token_indptr=token_indptr,
+            local=readable(local_envelope),
+            global_=readable(global_envelope),
+            last_token_indices=(token_indptr[1:] - 1).astype(np.int64),
+            local_envelope=local_envelope,
+            global_envelope=global_envelope,
+        )
 
     return Gemma4BatchPlan(
         phase=batch.phase,
@@ -231,13 +363,53 @@ def expand_gemma4_decode_batch(
     )
 
 
-def gemma4_assistant_context(batch: Gemma4BatchPlan) -> Gemma4BatchPlan:
+def _trim_assistant_local_window(
+    source: PagedAttentionPlan,
+    window_tokens: int,
+) -> PagedAttentionPlan:
+    """Drop whole old pages from a read-only assistant view.
+
+    The unchanged fractional last page and relative sliding-window mask select
+    the same final keys. Absolute query RoPE positions and cache ownership do
+    not depend on this view's first page.
+    """
+    page_rows = []
+    first_positions = []
+    kv_lengths = []
+    for row, length in enumerate(source.kv_lengths):
+        start, end = map(int, source.kv_indptr[row : row + 2])
+        skip_pages = max(0, (length - window_tokens) // PAGE_SIZE)
+        page_rows.append(source.page_indices[start + skip_pages : end])
+        first_positions.append(
+            source.first_token_positions[row] + skip_pages * PAGE_SIZE
+        )
+        kv_lengths.append(length - skip_pages * PAGE_SIZE)
+    indptr = np.zeros(len(page_rows) + 1, dtype=np.int32)
+    indptr[1:] = np.cumsum([len(row) for row in page_rows], dtype=np.int32)
+    return replace(
+        source,
+        kv_indptr=indptr,
+        page_indices=np.concatenate(page_rows).astype(np.int32, copy=False),
+        first_token_positions=tuple(first_positions),
+        kv_lengths=tuple(kv_lengths),
+    )
+
+
+def gemma4_assistant_context(
+    batch: Gemma4BatchPlan,
+    *,
+    local_window_tokens: int | None = None,
+) -> Gemma4BatchPlan:
     """Expose only target K/V preceding each unprocessed decode anchor."""
 
     if batch.phase != BatchPhase.DECODE or np.any(np.diff(batch.token_indptr) != 1):
         raise ValueError("assistant context requires one-token decode rows")
+    if local_window_tokens is not None and (
+        type(local_window_tokens) is not int or local_window_tokens <= 0
+    ):
+        raise ValueError("assistant local window must be a positive integer")
     contexts = batch.positions.astype(np.int64, copy=False)
-    return Gemma4BatchPlan(
+    context = Gemma4BatchPlan(
         phase=BatchPhase.DECODE,
         token_ids=batch.token_ids,
         positions=batch.positions,
@@ -259,6 +431,12 @@ def gemma4_assistant_context(batch: Gemma4BatchPlan) -> Gemma4BatchPlan:
             include_append=False,
         ),
         last_token_indices=batch.last_token_indices,
+    )
+
+    if local_window_tokens is None:
+        return context
+    return replace(
+        context, local=_trim_assistant_local_window(context.local, local_window_tokens)
     )
 
 

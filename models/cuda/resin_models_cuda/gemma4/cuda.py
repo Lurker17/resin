@@ -99,6 +99,7 @@ def plan_gemma4_kv_capacity(
     workspace_bytes: int = _DEFAULT_WORKSPACE_BYTES,
     cache_element_bytes: int = 1,
     tensor_parallel_size: int = 1,
+    config=None,
 ) -> CacheCapacityPlan:
     if cache_element_bytes not in {1, 2}:
         raise ValueError("cache_element_bytes must be one or two")
@@ -110,8 +111,16 @@ def plan_gemma4_kv_capacity(
         raise ValueError("tensor_parallel_size must divide both Gemma KV head counts")
     # One parent holds all 50 local layers for one 64-token page. Global
     # history pages use an equal-sized, differently shaped view of a parent.
+    local_layers = getattr(config, "local_layer_count", 50)
+    kv_heads = 16 if config is None else config.num_key_value_heads
+    head_dim = 256 if config is None else config.head_dim
     bytes_per_parent = (
-        2 * 50 * PAGE_SIZE * (16 // tensor_parallel_size) * 256 * cache_element_bytes
+        2
+        * local_layers
+        * PAGE_SIZE
+        * (kv_heads // tensor_parallel_size)
+        * head_dim
+        * cache_element_bytes
     )
     return plan_cache_capacity(
         total_memory_bytes,
@@ -176,6 +185,15 @@ class Gemma4CudaRunner(CudaRunner):
     page_size = PAGE_SIZE
     prefill_chunk_size = PREFILL_CHUNK_SIZE
     sliding_window = SLIDING_WINDOW
+    local_graph_page_capacity = _LOCAL_GRAPH_PAGE_CAPACITY
+    max_num_seqs = DEFAULT_MAX_NUM_SEQS
+    assistant_geometry_fields = (
+        "num_attention_heads",
+        "num_key_value_heads",
+        "num_global_key_value_heads",
+        "head_dim",
+        "global_head_dim",
+    )
     parallelism_capabilities = ParallelismCapabilities(attn_tp=True, expert_tp=True)
 
     def __init__(
@@ -187,6 +205,7 @@ class Gemma4CudaRunner(CudaRunner):
         assistant_model: str | Path | None = None,
         assistant_revision: str | None = None,
         speculative_tokens: int = 0,
+        prefill_chunk_size: int = PREFILL_CHUNK_SIZE,
         device: str | torch.device,
         nvfp4_backend: str = "auto",
         kv_cache_dtype: str = "fp8",
@@ -196,6 +215,9 @@ class Gemma4CudaRunner(CudaRunner):
         static_memory_fraction: float = 0.95,
         parallel_groups: ParallelGroups | None = None,
     ) -> None:
+        if type(prefill_chunk_size) is not int or prefill_chunk_size <= 0:
+            raise ValueError("prefill_chunk_size must be a positive integer")
+        self.prefill_chunk_size = prefill_chunk_size
         if parallel_groups is not None:
             self.parallelism_capabilities.validate(
                 parallel_groups.topology, model="Gemma 4"
@@ -226,19 +248,11 @@ class Gemma4CudaRunner(CudaRunner):
             cuda_graph_prefill=cuda_graph_prefill,
             cuda_graph_decode=cuda_graph_decode,
         )
-        capability = torch.cuda.get_device_capability(self.device)
-        if capability not in {(10, 0), (10, 3), (11, 0), (12, 0), (12, 1)}:
-            raise RuntimeError(
-                "Gemma 4 NVFP4 W4A16 requires Blackwell-class FP4 hardware, "
-                f"got sm{capability[0]}{capability[1]}"
-            )
-        nvfp4_backend = _select_nvfp4_backend(
-            nvfp4_backend, torch.backends.cudnn.version()
-        )
+        nvfp4_backend = self._prepare_weight_backend(nvfp4_backend)
         cache_dtype = self.kv_cache_torch_dtype
 
         self.model_path = resolve_model_path(model, revision)
-        self._model, self.config, self.raw_config = load_model(
+        self._model, self.config, self.raw_config = self._load_target(
             self.model_path,
             device=self.device,
             nvfp4_backend=nvfp4_backend,
@@ -247,6 +261,11 @@ class Gemma4CudaRunner(CudaRunner):
         )
         self.attention_config = attention_geometry(
             self.config, self.attention_parallel.layout
+        )
+        self.sliding_window = getattr(self.config, "sliding_window", SLIDING_WINDOW)
+        self.window_retention_tokens = self.prefill_chunk_size + self.sliding_window - 1
+        self.local_graph_page_capacity = (
+            1 + (self.window_retention_tokens - 1 + PAGE_SIZE - 1) // PAGE_SIZE
         )
         self._configure_parallel_graphs(self._model, parallel_groups)
         self.nvfp4_backend = nvfp4_backend
@@ -258,7 +277,7 @@ class Gemma4CudaRunner(CudaRunner):
             self.assistant_path = resolve_assistant_path(
                 selected_assistant, assistant_revision
             )
-            self._assistant, assistant_config = load_assistant(
+            self._assistant, assistant_config = self._load_assistant(
                 self.assistant_path,
                 device=self.device,
                 tensor_parallel=self.expert_parallel,
@@ -270,13 +289,7 @@ class Gemma4CudaRunner(CudaRunner):
                 )
             if assistant_config.vocab_size != self.config.vocab_size:
                 raise ValueError("assistant vocabulary does not match Gemma 4 target")
-            for field in (
-                "num_attention_heads",
-                "num_key_value_heads",
-                "num_global_key_value_heads",
-                "head_dim",
-                "global_head_dim",
-            ):
+            for field in self.assistant_geometry_fields:
                 if getattr(assistant_config, field) != getattr(self.config, field):
                     raise ValueError(f"assistant {field} does not match Gemma 4 target")
         self._speculation = SpeculativeStats(speculative_tokens)
@@ -291,13 +304,14 @@ class Gemma4CudaRunner(CudaRunner):
             static_memory_fraction,
             workspace_bytes=(
                 2 * _GRAPH_WORKSPACE_BYTES
-                + PREFILL_CHUNK_SIZE
+                + self.prefill_chunk_size
                 * self.attention_config.num_attention_heads
                 * (self.config.head_dim + self.config.global_head_dim)
                 * _PREFILL_WORKSPACE_BYTES_PER_ELEMENT
             ),
             cache_element_bytes=cache_dtype.itemsize,
             tensor_parallel_size=self.attention_parallel.size,
+            config=self.config,
         )
         local_capacity = capacity_plan.parent_capacity
         if cache_parent_capacity is not None:
@@ -323,11 +337,11 @@ class Gemma4CudaRunner(CudaRunner):
                 self.cache_parent_capacity * self.config.history_blocks_per_parent,
             ),
             speculative=bool(speculative_tokens),
-            max_batch_size=DEFAULT_MAX_NUM_SEQS,
+            max_batch_size=self.max_num_seqs,
         )
-        if any(batch > DEFAULT_MAX_NUM_SEQS for batch, _ in decode_graph_shapes):
+        if any(batch > self.max_num_seqs for batch, _ in decode_graph_shapes):
             raise ValueError(
-                f"Gemma 4 CUDA graph batch capacity exceeds {DEFAULT_MAX_NUM_SEQS}"
+                f"Gemma 4 CUDA graph batch capacity exceeds {self.max_num_seqs}"
             )
         if any(width > maximum_history_pages for _, width in decode_graph_shapes):
             raise ValueError("Gemma 4 CUDA graph page width exceeds context length")
@@ -353,16 +367,19 @@ class Gemma4CudaRunner(CudaRunner):
                 CacheGroupLayout(
                     PAGE_SIZE,
                     retention=CacheRetention.WINDOW,
-                    window_tokens=WINDOW_RETENTION_TOKENS,
-                    read_window_tokens=SLIDING_WINDOW,
+                    window_tokens=self.window_retention_tokens,
+                    read_window_tokens=self.sliding_window,
                 ),
             ],
         )
         self.runner_config = RunnerConfig(
-            max_batch_tokens=PREFILL_CHUNK_SIZE,
-            prefill_chunk_size=PREFILL_CHUNK_SIZE,
+            max_batch_tokens=self.prefill_chunk_size,
+            prefill_chunk_size=self.prefill_chunk_size,
             continuation_prefill=True,
             cache_write_lookahead_tokens=speculative_tokens,
+            cache_write_reservation_tokens=getattr(
+                self, "_cache_write_reservation_tokens", 0
+            ),
             cache_layout=self.cache_layout,
         )
         self._configure_cache_binding(
@@ -380,15 +397,39 @@ class Gemma4CudaRunner(CudaRunner):
         )
         self._media_features: dict[int, _MediaFeatures] = {}
         self._vision_feature_cache = VisionFeatureCache()
-        self._target_hidden: dict[int, Tensor] = {}
+        # CPU registry contains only slot numbers, never one Tensor per request.
+        self._target_hidden: dict[int, int] = {}
+        self._hidden_bank: Tensor | None = None
+        self._hidden_free_slots: list[int] = []
+        self._hidden_slot_generation = 0
+        self._hidden_index_cache: dict[bool, tuple[object, Tensor]] = {}
+        self._hidden_input_buffers: dict[int, Tensor] = {}
         self._build_attention_wrappers()
-        self._prefill_feed_forward = self._configure_prefill_graphs(
+        self._prefill_feed_forward = self._configure_feed_forward_graphs()
+
+    def _prepare_weight_backend(self, backend: str) -> str:
+        capability = torch.cuda.get_device_capability(self.device)
+        if capability not in {(10, 0), (10, 3), (11, 0), (12, 0), (12, 1)}:
+            raise RuntimeError(
+                "Gemma 4 NVFP4 W4A16 requires Blackwell-class FP4 hardware, "
+                f"got sm{capability[0]}{capability[1]}"
+            )
+        return _select_nvfp4_backend(backend, torch.backends.cudnn.version())
+
+    def _load_target(self, *args, **kwargs):
+        return load_model(*args, **kwargs)
+
+    def _load_assistant(self, *args, **kwargs):
+        return load_assistant(*args, **kwargs)
+
+    def _configure_feed_forward_graphs(self):
+        return self._configure_prefill_graphs(
             tuple(
                 lambda hidden, _ids, layer=layer: self._feed_forward(layer, hidden)
                 for layer in self._model.language_model.layers
             ),
             hidden_size=self.config.hidden_size,
-            max_tokens=PREFILL_CHUNK_SIZE,
+            max_tokens=self.prefill_chunk_size,
         )
 
     @property
@@ -416,7 +457,7 @@ class Gemma4CudaRunner(CudaRunner):
 
         def prefill_workspace(head_dim: int) -> Tensor:
             size = (
-                PREFILL_CHUNK_SIZE
+                self.prefill_chunk_size
                 * self.attention_config.num_attention_heads
                 * head_dim
                 * _PREFILL_WORKSPACE_BYTES_PER_ELEMENT
@@ -442,7 +483,12 @@ class Gemma4CudaRunner(CudaRunner):
     def release(self, request_ids: list[int]) -> None:
         for request_id in request_ids:
             self._media_features.pop(request_id, None)
-            self._target_hidden.pop(request_id, None)
+            slot = self._target_hidden.pop(request_id, None)
+            if slot is not None:
+                # Engine releases requests only after their writer leases finish.
+                self._hidden_free_slots.append(slot)
+                self._hidden_slot_generation += 1
+        self._hidden_index_cache.clear()
 
     def _device_plan(self, plan: PagedAttentionPlan) -> _DevicePagedPlan:
         def tensor(values, dtype):
@@ -478,7 +524,7 @@ class Gemma4CudaRunner(CudaRunner):
                 custom_mask=custom_mask,
                 causal=custom_mask is None,
                 sm_scale=1.0,
-                window_left=SLIDING_WINDOW - 1,
+                window_left=self.sliding_window - 1,
                 q_data_type=torch.bfloat16,
                 kv_data_type=self._cache.dtype,
                 o_data_type=torch.bfloat16,
@@ -515,7 +561,7 @@ class Gemma4CudaRunner(CudaRunner):
             self.attention_config.num_key_value_heads,
             self.config.head_dim,
             PAGE_SIZE,
-            window_left=SLIDING_WINDOW - 1,
+            window_left=self.sliding_window - 1,
             **common,
         )
         self._global_decode.plan(
@@ -584,6 +630,9 @@ class Gemma4CudaRunner(CudaRunner):
         features = _MediaFeatures(media, image, video, positions)
         self._media_features[sequence_id] = features
         return features
+
+    def _plan_assistant_attention(self, *args, **kwargs):
+        return self._plan_attention(*args, **kwargs)
 
     @staticmethod
     def _validate_unsplit_vision_blocks(
@@ -663,7 +712,7 @@ class Gemma4CudaRunner(CudaRunner):
             query = batch.positions[start:end, None]
             first = batch.local.first_token_positions[row]
             keys = np.arange(first, first + batch.local.kv_lengths[row])[None, :]
-            allowed = (keys <= query) & (keys >= query - SLIDING_WINDOW + 1)
+            allowed = (keys <= query) & (keys >= query - self.sliding_window + 1)
             features = features_by_row.get(row)
             if features is not None:
                 block_ids = np.asarray(features.media.block_ids, dtype=np.int64)
@@ -676,7 +725,7 @@ class Gemma4CudaRunner(CudaRunner):
                 same = (query_blocks >= 0) & (query_blocks == key_blocks)
                 if np.any(same & ~allowed):
                     any_bidirectional = True
-                allowed |= same & (keys >= query - SLIDING_WINDOW + 1)
+                allowed |= same & (keys >= query - self.sliding_window + 1)
             masks.append(allowed.reshape(-1))
         if not any_bidirectional:
             return None
@@ -692,6 +741,7 @@ class Gemma4CudaRunner(CudaRunner):
         global_: _DevicePagedPlan,
         local_wrapper: Any,
         global_wrapper: Any,
+        token_ids: Tensor | None = None,
     ) -> Tensor:
         rotary = self._model.language_model.rotary_emb
         embeddings = {
@@ -779,7 +829,7 @@ class Gemma4CudaRunner(CudaRunner):
             stages = (("", 1, tuple(row % PAGE_SIZE for row in rows)),)
         for prefix, last_page_length, append_offsets in stages:
             for name, page_width in (
-                ("local", _LOCAL_GRAPH_PAGE_CAPACITY),
+                ("local", self.local_graph_page_capacity),
                 ("global", history_width),
             ):
                 name = prefix + name
@@ -804,7 +854,16 @@ class Gemma4CudaRunner(CudaRunner):
         torch.cuda.synchronize(self.device)
 
     def _plan_graph_attention(
-        self, wrapper, indptr, indices, last, *, local: bool, qo_indptr=None
+        self,
+        wrapper,
+        indptr,
+        indices,
+        last,
+        *,
+        local: bool,
+        qo_indptr=None,
+        assistant: bool = False,
+        non_blocking: bool = False,
     ) -> None:
         """Use the same FlashInfer attention contract at capture and replay."""
 
@@ -813,7 +872,15 @@ class Gemma4CudaRunner(CudaRunner):
             args = (qo_indptr, *args)
         wrapper.plan(
             *args,
-            self.attention_config.num_attention_heads,
+            (
+                getattr(
+                    getattr(self._assistant, "config", None),
+                    "num_attention_heads",
+                    self.attention_config.num_attention_heads,
+                )
+                if assistant
+                else self.attention_config.num_attention_heads
+            ),
             (
                 self.attention_config.num_key_value_heads
                 if local
@@ -826,9 +893,9 @@ class Gemma4CudaRunner(CudaRunner):
             kv_data_type=self._cache.dtype,
             o_data_type=torch.bfloat16,
             sm_scale=1.0,
-            window_left=SLIDING_WINDOW - 1 if local else -1,
+            window_left=self.sliding_window - 1 if local else -1,
             disable_split_kv=True,
-            non_blocking=False,
+            non_blocking=non_blocking,
             **({"causal": True} if qo_indptr is not None else {}),
         )
 
@@ -885,7 +952,7 @@ class Gemma4CudaRunner(CudaRunner):
             )
             return wrapper, plan
 
-        local_wrapper, local = attention(_LOCAL_GRAPH_PAGE_CAPACITY, local=True)
+        local_wrapper, local = attention(self.local_graph_page_capacity, local=True)
         global_wrapper, global_ = attention(history_width, local=False)
         self._graph_attention[shape] = (local_wrapper, global_wrapper)
         token_ids = empty(torch.int64, batch_size)
@@ -902,6 +969,7 @@ class Gemma4CudaRunner(CudaRunner):
                 global_,
                 local_wrapper,
                 global_wrapper,
+                token_ids,
             )
             logits = self._model.logits(hidden)
             self._sampler.sample_tensors(logits, sampling, out=output_ids)
@@ -923,11 +991,17 @@ class Gemma4CudaRunner(CudaRunner):
         inputs.update(self._sampler.graph_inputs(sampling))
         return CudaGraphStep(inputs=inputs, output=output_ids, launch=launch)
 
+    def _new_assistant_graph_attention_wrapper(self, *args, **kwargs):
+        from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+
+        return BatchDecodeWithPagedKVCacheWrapper(*args, **kwargs)
+
+    def _new_verify_attention_wrapper(self, *args, **kwargs):
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+        return BatchPrefillWithPagedKVCacheWrapper(*args, **kwargs)
+
     def _new_speculative_graph_step(self, shape: GraphShape) -> CudaGraphStep:
-        from flashinfer import (
-            BatchDecodeWithPagedKVCacheWrapper,
-            BatchPrefillWithPagedKVCacheWrapper,
-        )
 
         assistant = self._assistant
         if assistant is None:
@@ -943,7 +1017,7 @@ class Gemma4CudaRunner(CudaRunner):
             assistant_kv_indptr = empty(torch.int32, batch_size + 1)
             assistant_page_indices = empty(torch.int32, batch_size * page_width)
             assistant_last = empty(torch.int32, batch_size)
-            assistant_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+            assistant_wrapper = self._new_assistant_graph_attention_wrapper(
                 workspace,
                 "NHD",
                 use_cuda_graph=True,
@@ -958,7 +1032,7 @@ class Gemma4CudaRunner(CudaRunner):
             verify_last = empty(torch.int32, batch_size)
             verify_append_pages = empty(torch.int64, batch_size * width)
             verify_append_offsets = empty(torch.int64, batch_size * width)
-            verify_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            verify_wrapper = self._new_verify_attention_wrapper(
                 workspace,
                 "NHD",
                 use_cuda_graph=True,
@@ -993,6 +1067,7 @@ class Gemma4CudaRunner(CudaRunner):
                 initial_indices,
                 initial_assistant_last,
                 local=local,
+                assistant=True,
             )
             self._plan_graph_attention(
                 verify_wrapper,
@@ -1027,7 +1102,7 @@ class Gemma4CudaRunner(CudaRunner):
             assistant_local,
             verify_local_wrapper,
             verify_local,
-        ) = attention(_LOCAL_GRAPH_PAGE_CAPACITY, local=True)
+        ) = attention(self.local_graph_page_capacity, local=True)
         (
             assistant_global_wrapper,
             assistant_global,
@@ -1090,6 +1165,7 @@ class Gemma4CudaRunner(CudaRunner):
                 verify_global,
                 verify_local_wrapper,
                 verify_global_wrapper,
+                verify_ids,
             )
             verify_hidden_output.copy_(
                 hidden.view(batch_size, width, self.config.hidden_size)
@@ -1169,6 +1245,7 @@ class Gemma4CudaRunner(CudaRunner):
                     tensor(inputs[f"{name}_last_page_lengths"]),
                     local=local,
                     qo_indptr=None if queries is None else tensor(queries),
+                    assistant=prefix == "assistant_",
                 )
 
     @staticmethod
@@ -1220,7 +1297,9 @@ class Gemma4CudaRunner(CudaRunner):
         page_width: int,
         query_width: int,
     ) -> dict[str, object]:
-        def pack_pages(plan: PagedAttentionPlan, prefix: str) -> dict[str, object]:
+        def pack_pages(
+            plan: PagedAttentionPlan, prefix: str, *, padding_last: int = 1
+        ) -> dict[str, object]:
             row_widths = np.diff(plan.kv_indptr)
             if len(row_widths) != active_rows or np.any(row_widths > page_width):
                 raise GraphInputError(f"{prefix} page table exceeds CUDA graph shape")
@@ -1236,7 +1315,7 @@ class Gemma4CudaRunner(CudaRunner):
                     count = 1
                 cursor += count
                 indptr[row + 1] = cursor
-            last = np.ones(graph_rows, dtype=np.int32)
+            last = np.full(graph_rows, padding_last, dtype=np.int32)
             last[:active_rows] = plan.last_page_lengths
             return {
                 f"{prefix}_kv_indptr": indptr,
@@ -1245,7 +1324,9 @@ class Gemma4CudaRunner(CudaRunner):
             }
 
         inputs = pack_pages(assistant, f"assistant_{name}")
-        inputs.update(pack_pages(verify, f"verify_{name}"))
+        inputs.update(
+            pack_pages(verify, f"verify_{name}", padding_last=query_width + 1)
+        )
         append_pages = np.zeros(graph_rows * query_width, dtype=np.int64)
         append_offsets = np.zeros(graph_rows * query_width, dtype=np.int64)
         for row in range(graph_rows):
@@ -1279,7 +1360,7 @@ class Gemma4CudaRunner(CudaRunner):
         active_rows = native.num_sequences
         history_width = int(np.diff(batch.global_.kv_indptr).max())
         local_width = int(np.diff(batch.local.kv_indptr).max())
-        if local_width > _LOCAL_GRAPH_PAGE_CAPACITY:
+        if local_width > self.local_graph_page_capacity:
             raise GraphInputError("local page table exceeds CUDA graph shape")
         shape = self._select_cuda_graph(
             "decode",
@@ -1301,7 +1382,7 @@ class Gemma4CudaRunner(CudaRunner):
                 batch.local,
                 active_rows=active_rows,
                 graph_rows=graph_rows,
-                width=_LOCAL_GRAPH_PAGE_CAPACITY,
+                width=self.local_graph_page_capacity,
             )
         )
         inputs.update(
@@ -1336,7 +1417,7 @@ class Gemma4CudaRunner(CudaRunner):
         active_rows = native.num_sequences
         history_width = int(np.diff(batch.global_.kv_indptr).max())
         local_width = int(np.diff(batch.local.kv_indptr).max())
-        if local_width > _LOCAL_GRAPH_PAGE_CAPACITY:
+        if local_width > self.local_graph_page_capacity:
             raise GraphInputError("local page table exceeds CUDA graph shape")
         shape = self._select_cuda_graph(
             "decode",
@@ -1349,25 +1430,14 @@ class Gemma4CudaRunner(CudaRunner):
         graph_rows, graph_history_width = shape
         padding_rows = graph_rows - active_rows
         width = self.speculative_tokens + 1
-        assistant = gemma4_assistant_context(batch)
+        assistant = gemma4_assistant_context(
+            batch, local_window_tokens=self.sliding_window
+        )
         verify = expand_gemma4_decode_batch(
             batch,
             np.zeros((active_rows, self.speculative_tokens), dtype=np.int64),
         )
-        hidden = torch.stack(
-            [self._target_hidden[sequence_id] for sequence_id in sequence_ids]
-        )
-        if padding_rows:
-            hidden = torch.cat(
-                (
-                    hidden,
-                    torch.zeros(
-                        (padding_rows, self.config.hidden_size),
-                        dtype=hidden.dtype,
-                        device=self.device,
-                    ),
-                )
-            )
+        hidden = self._gather_target_hidden(sequence_ids, graph_rows)
         inputs: dict[str, object] = {
             "token_ids": np.pad(batch.token_ids, (0, padding_rows)),
             "positions": np.pad(batch.positions, (0, padding_rows), constant_values=1),
@@ -1383,7 +1453,7 @@ class Gemma4CudaRunner(CudaRunner):
                 verify.local,
                 active_rows=active_rows,
                 graph_rows=graph_rows,
-                page_width=_LOCAL_GRAPH_PAGE_CAPACITY,
+                page_width=self.local_graph_page_capacity,
                 query_width=width,
             )
         )
@@ -1444,15 +1514,91 @@ class Gemma4CudaRunner(CudaRunner):
                 global_,
                 local_wrapper,
                 global_wrapper,
+                token_ids,
             )
+
+    def _hidden_slot_indices(self, sequence_ids, rows: int, *, write: bool) -> Tensor:
+        sequence_ids = tuple(map(int, sequence_ids))
+        if rows < len(sequence_ids):
+            raise ValueError("hidden-state buffer has fewer rows than requests")
+        if write:
+            missing = tuple(
+                sequence
+                for sequence in sequence_ids
+                if sequence not in self._target_hidden
+            )
+            if len(set(sequence_ids)) != len(sequence_ids):
+                raise ValueError("hidden-state requests must be distinct")
+            if self._hidden_bank is None:
+                capacity = max(self.max_num_seqs, len(missing), 1)
+                self._hidden_bank = torch.empty(
+                    (capacity + 1, self.config.hidden_size),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+                # Slot zero is immutable padding and never belongs to a request.
+                self._hidden_bank[0].zero_()
+                self._hidden_free_slots = list(range(capacity, 0, -1))
+            if len(missing) > len(self._hidden_free_slots):
+                previous = self._hidden_bank
+                old_capacity = len(previous) - 1
+                capacity = max(
+                    old_capacity * 2,
+                    old_capacity + len(missing) - len(self._hidden_free_slots),
+                )
+                self._hidden_bank = previous.new_empty(
+                    (capacity + 1, previous.shape[1])
+                )
+                self._hidden_bank[: len(previous)].copy_(previous)
+                self._hidden_free_slots.extend(range(capacity, old_capacity, -1))
+            if missing:
+                for sequence in missing:
+                    self._target_hidden[sequence] = self._hidden_free_slots.pop()
+                self._hidden_slot_generation += 1
+        key = (sequence_ids, rows, self._hidden_slot_generation)
+        cached = self._hidden_index_cache.get(write)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        slots = [self._target_hidden[sequence] for sequence in sequence_ids]
+        slots.extend([0] * (rows - len(slots)))
+        indices = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        self._hidden_index_cache[write] = (key, indices)
+        return indices
+
+    def _set_target_hidden(self, sequence_ids, hidden: Tensor) -> None:
+        """Save an entire accepted batch with one GPU scatter.
+
+        Slots survive batch permutation and admission. Graph output buffers never
+        alias this bank; all accesses follow the runner's serialized CUDA stream.
+        """
+        if hidden.shape != (len(sequence_ids), self.config.hidden_size):
+            raise ValueError("accepted hidden states must match the request batch")
+        indices = self._hidden_slot_indices(sequence_ids, len(sequence_ids), write=True)
+        assert self._hidden_bank is not None
+        self._hidden_bank.index_copy_(0, indices, hidden)
+
+    def _gather_target_hidden(self, sequence_ids, graph_rows: int) -> Tensor:
+        """Gather saved rows into reusable input storage, padding with slot zero.
+
+        A later gather is queued after the previous graph's input copy on the same
+        stream. Device feedback separately owns in-flight continuation state.
+        """
+        indices = self._hidden_slot_indices(sequence_ids, graph_rows, write=False)
+        assert self._hidden_bank is not None
+        output = self._hidden_input_buffers.get(graph_rows)
+        if output is None:
+            output = self._hidden_bank.new_empty((graph_rows, self.config.hidden_size))
+            self._hidden_input_buffers[graph_rows] = output
+        torch.index_select(self._hidden_bank, 0, indices, out=output)
+        return output
 
     def _store_last_hidden(
         self, native: BatchPlan, batch: Gemma4BatchPlan, hidden: Tensor
     ) -> None:
-        for sequence_id, index in zip(
-            native.sequence_ids, batch.last_token_indices, strict=True
-        ):
-            self._target_hidden[int(sequence_id)] = hidden[int(index)].detach().clone()
+        indices = torch.as_tensor(
+            batch.last_token_indices, dtype=torch.int64, device=self.device
+        )
+        self._set_target_hidden(native.sequence_ids, hidden.index_select(0, indices))
 
     def _sample_target(self, logits: Tensor, plan: BatchPlan, step: int) -> Tensor:
         return self._sampler(
@@ -1479,12 +1625,11 @@ class Gemma4CudaRunner(CudaRunner):
         verify_hidden: Tensor,
     ) -> list[list[int]]:
         acceptance = self._speculation.accept(draft_rows, target_rows)
-        for row, (sequence_id, accepted) in enumerate(
-            zip(sequence_ids, acceptance.accepted_counts, strict=True)
-        ):
-            self._target_hidden[sequence_id] = (
-                verify_hidden[row, accepted].detach().clone()
-            )
+        indices = torch.as_tensor(
+            acceptance.accepted_counts, dtype=torch.int64, device=self.device
+        )[:, None, None].expand(-1, 1, verify_hidden.shape[-1])
+        selected = verify_hidden.gather(1, indices).squeeze(1)
+        self._set_target_hidden(sequence_ids, selected)
         return acceptance.token_rows
 
     def _speculative_decode(
@@ -1500,10 +1645,12 @@ class Gemma4CudaRunner(CudaRunner):
             # all subsequent steps can draft normally.
             return self._single_target_decode(native, batch)
 
-        context = gemma4_assistant_context(batch)
+        context = gemma4_assistant_context(
+            batch, local_window_tokens=self.sliding_window
+        )
         local = self._device_plan(context.local)
         global_ = self._device_plan(context.global_)
-        local_wrapper, global_wrapper = self._plan_attention(
+        local_wrapper, global_wrapper = self._plan_assistant_attention(
             context, local, global_, custom_mask=None
         )
         anchors = torch.as_tensor(
@@ -1512,9 +1659,7 @@ class Gemma4CudaRunner(CudaRunner):
         positions = torch.as_tensor(
             batch.positions, dtype=torch.int64, device=self.device
         )
-        target_hidden = torch.stack(
-            [self._target_hidden[sequence_id] for sequence_id in sequence_ids]
-        )
+        target_hidden = self._gather_target_hidden(sequence_ids, len(sequence_ids))
         phase_timing = self._eager_phase_timing("draft", "target_verify", "decode")
         if phase_timing is not None:
             phase_timing.mark(0)
@@ -1562,17 +1707,22 @@ class Gemma4CudaRunner(CudaRunner):
             phase_timing.mark(3)
         return format_output(verify_logits, accepted, native)
 
+    def _build_batch_plan(self, plan):
+        return build_gemma4_batch_plan(
+            plan,
+            self.cache_layout,
+            prefill_chunk_size=self.prefill_chunk_size,
+            decode_lookahead=self.speculative_tokens
+            if plan.phase == BatchPhase.DECODE
+            else 0,
+            reservation_tokens=getattr(self, "_cache_write_reservation_tokens", 0),
+        )
+
     @torch.inference_mode()
     @observe_execution
     def forward(self, plan: BatchPlan) -> ForwardOutput:
         self._check_cuda_graphs(plan.phase)
-        batch = build_gemma4_batch_plan(
-            plan,
-            self.cache_layout,
-            decode_lookahead=(
-                self.speculative_tokens if plan.phase == BatchPhase.DECODE else 0
-            ),
-        )
+        batch = self._build_batch_plan(plan)
         with self._cuda_failure:
             if batch.phase == BatchPhase.DECODE:
                 if self.speculative_tokens:

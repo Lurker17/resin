@@ -58,10 +58,16 @@ def test_graph_output_preserves_acceptance_layout_and_owns_tokens(
         lambda *_args, **_kwargs: {}
     )
     runner._prepare_graph_attention = lambda *_args: None
-    runner._target_hidden = {7: torch.zeros(2), 8: torch.zeros(2)}
-    hidden = torch.arange(18).reshape(3, 3, 2)
+    if runner_type is Gemma4CudaRunner:
+        runner._target_hidden, runner._hidden_bank = {}, None
+        runner._hidden_free_slots, runner._hidden_slot_generation = [], 0
+        runner._hidden_index_cache, runner._hidden_input_buffers = {}, {}
+        runner._set_target_hidden([7, 8], torch.zeros(2, 2, dtype=torch.bfloat16))
+    else:
+        runner._target_hidden = {7: torch.zeros(2), 8: torch.zeros(2)}
+    hidden = torch.arange(18, dtype=torch.bfloat16).reshape(3, 3, 2)
     runner._graph_verify_hidden = {shape: hidden}
-    monkeypatch.setattr(gemma_runtime, "gemma4_assistant_context", lambda batch: batch)
+    monkeypatch.setattr(gemma_runtime, "gemma4_assistant_context", lambda batch, **_kwargs: batch)
     monkeypatch.setattr(
         gemma_runtime, "expand_gemma4_decode_batch", lambda batch, _: batch
     )
@@ -91,8 +97,10 @@ def test_graph_output_preserves_acceptance_layout_and_owns_tokens(
     runner._run_cuda_graph = lambda *_args: replay
     if runner_type is Gemma4CudaRunner and draft_tokens:
         output = runner._speculative_graph_forward(plan, batch)
-        torch.testing.assert_close(runner._target_hidden[7], hidden[0, 1])
-        torch.testing.assert_close(runner._target_hidden[8], hidden[1, 2])
+        torch.testing.assert_close(
+            runner._gather_target_hidden([7, 8], 2),
+            torch.stack((hidden[0, 1], hidden[1, 2])),
+        )
     else:
         output = runner._graph_forward(plan, batch)
     assert isinstance(output, ForwardOutput)

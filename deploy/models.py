@@ -113,6 +113,39 @@ MODEL_SPECS = {
 }
 MODEL_SPECS.update(
     {
+        "gemma4-e2b": ModelSpec(
+            name="gemma4-e2b",
+            family="gemma4",
+            checkpoint=Checkpoint(
+                repo_id="google/gemma-4-E2B-it",
+                revision="3e22461f65e89153144f8adb70e3b8c2cc9845a7",
+                directory="bf16",
+                required_files=(
+                    "config.json",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                ),
+            ),
+            assistant=Checkpoint(
+                repo_id="google/gemma-4-E2B-it-assistant",
+                revision="2d874ef7d29f9a30599a1e4b3c1cbc9595f005df",
+                directory="assistant",
+                required_files=("config.json",),
+                patterns=("config.json", "model.safetensors"),
+            ),
+            model_mount="/models/resin-gemma4-e2b",
+            model_volume="resin-gemma4-e2b-models-v1",
+            kernel_mount="/cache/resin-gemma4-e2b",
+            kernel_volume="resin-gemma4-e2b-kernels-v1",
+            gpu="A100-80GB",
+            label="gemma4-e2b-bf16",
+            context_length=131072,
+            max_batch_size=256,
+            prefill_chunk_size=8192,
+            draft_tokens=3,
+            gpu_memory_utilization=0.90,
+            memory=128 * 1024,
+        ),
         "glm-5.3-flash": ModelSpec(
             name="glm-5.3-flash",
             family="glm5_3_flash",
@@ -209,6 +242,7 @@ MODEL_SPECS.update(
             label="gemma4-31b",
             app_name="resin-gemma4-nvfp4",
             context_length=262_144,
+            prefill_chunk_size=8192,
             draft_tokens=3,
             gpu_memory_utilization=0.95,
             memory=128 * 1024,
@@ -394,6 +428,13 @@ def image_environment(model: str | ModelSpec) -> dict[str, str]:
             "CMAKE_BUILD_PARALLEL_LEVEL": "12",
         }
     if spec.family == "gemma4":
+        if spec.name == "gemma4-e2b":
+            return {
+                "TORCH_CUDA_ARCH_LIST": "8.0",
+                "FLASHINFER_CUDA_ARCH_LIST": "8.0",
+                "TRITON_CACHE_DIR": f"{spec.kernel_mount}/triton",
+                "FLASHINFER_WORKSPACE_BASE": f"{spec.kernel_mount}/flashinfer",
+            }
         return {"TORCH_CUDA_ARCH_LIST": "12.0", "FLASHINFER_CUDA_ARCH_LIST": "12.0"}
     root = spec.kernel_mount
     env = {
@@ -548,6 +589,18 @@ def create_runner(
             **common,
         )
     if spec.family == "gemma4":
+        if spec.name == "gemma4-e2b":
+            from resin_models_cuda.gemma4.edge_cuda import Gemma4EdgeCudaRunner
+
+            return Gemma4EdgeCudaRunner(
+                checkpoint,
+                parallel_groups=groups,
+                assistant_model=assistant if draft_tokens else None,
+                speculative_tokens=draft_tokens,
+                prefill_chunk_size=prefill_chunk_size,
+                static_memory_fraction=memory,
+                **common,
+            )
         from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
 
         return Gemma4CudaRunner(
@@ -555,6 +608,7 @@ def create_runner(
             parallel_groups=groups,
             assistant_model=assistant if draft_tokens else None,
             speculative_tokens=draft_tokens,
+            prefill_chunk_size=prefill_chunk_size,
             static_memory_fraction=memory,
             **common,
         )
@@ -612,6 +666,20 @@ def create_recipe(
             path, local_files_only=True, trust_remote_code=False
         )
         return get_native_recipe(spec.family, tokenizer, reasoning_effort="medium")
+    if spec.name == "gemma4-e2b":
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            path, local_files_only=True, trust_remote_code=False
+        )
+        options = (
+            {"stop_token_ids": runner.config.eos_token_ids}
+            if runner is not None
+            else {}
+        )
+        return get_native_recipe(
+            "gemma4", tokenizer, empty_thought_prefix=False, **options
+        )
     from transformers import AutoProcessor
 
     processor = AutoProcessor.from_pretrained(

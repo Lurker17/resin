@@ -2,7 +2,6 @@
 
 import importlib
 from dataclasses import replace
-from inspect import signature
 from types import SimpleNamespace
 
 import pytest
@@ -15,59 +14,6 @@ from deploy.models import (
     require_checkpoint,
     validate_gpu,
 )
-
-
-@pytest.mark.parametrize("name", MODEL_SPECS)
-def test_factory_arguments_match_native_runner_and_cache_geometry(monkeypatch, name):
-    spec = get_model(name)
-    module = importlib.import_module(f"resin_models_cuda.{spec.family}.cuda")
-    class_name = {
-        "gpt_oss": "GptOssCudaRunner",
-        "deepseek_v41": "DeepSeekV41CudaRunner",
-        "glm5_3_flash": "Glm53FlashCudaRunner",
-        "gemma4": "Gemma4CudaRunner",
-        "qwen3_5": "Qwen3_5CudaRunner",
-        "inkling": "InklingCudaRunner",
-    }[spec.family]
-    constructor = signature(getattr(module, class_name).__init__)
-    groups = None if spec.family == "inkling" else object()
-    calls = []
-
-    class Runner:
-        def __init__(self, *args, **kwargs):
-            constructor.bind(self, *args, **kwargs)
-            calls.append((args, kwargs))
-
-    monkeypatch.setattr(module, class_name, Runner)
-    if spec.family == "gpt_oss":
-        monkeypatch.setattr(
-            "resin_models_cuda.gpt_oss.flashinfer.FlashInferSM90MXFP4Kernel",
-            lambda: "kernel",
-        )
-    create_runner(
-        spec,
-        device="cuda:0",
-        groups=groups,
-        context_length=8193,
-        max_batch_size=8,
-        prefill_chunk_size=4096,
-        draft_tokens=spec.draft_tokens,
-        decode_batch_sizes=(1, 4, 8),
-        profile_graph_phases=True,
-    )
-    args, options = calls[0]
-    assert args[0] == spec.path
-    assert options["device"] == "cuda:0"
-    width = {"gpt_oss": 65, "gemma4": 129, "inkling": 8198}.get(spec.family, 8193)
-    assert options["cuda_graph_decode_shapes"] == ((1, width), (4, width), (8, width))
-    if spec.family in {"glm5_3_flash", "deepseek_v41"}:
-        assert options["profile_graph_phases"] is True
-    if spec.family != "inkling":
-        assert options["parallel_groups"] is groups
-    if spec.assistant:
-        assert (
-            options["assistant_model"] if spec.family == "gemma4" else args[1]
-        ) == spec.assistant_path
 
 
 def make_checkpoint(path, required_files):

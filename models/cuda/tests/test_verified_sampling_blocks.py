@@ -97,10 +97,15 @@ def test_eager_verification_samples_entire_strided_block_once(monkeypatch, runne
 
         def assistant(*_args, **_kwargs):
             token_ids = next(draft_steps)
-            return torch.nn.functional.one_hot(token_ids, 10).float(), torch.zeros(2, 2)
+            return torch.nn.functional.one_hot(token_ids, 10).float(), torch.zeros(
+                2, 2, dtype=torch.bfloat16
+            )
 
         runner._assistant = SimpleNamespace(forward_step=assistant)
-        runner._target_hidden = {7: torch.zeros(2), 8: torch.zeros(2)}
+        runner._target_hidden, runner._hidden_bank = {}, None
+        runner._hidden_free_slots, runner._hidden_slot_generation = [], 0
+        runner._hidden_index_cache, runner._hidden_input_buffers = {}, {}
+        runner._set_target_hidden([7, 8], torch.zeros(2, 2, dtype=torch.bfloat16))
         runner._cache = SimpleNamespace(
             local_keys=[None],
             local_values=[None],
@@ -110,10 +115,12 @@ def test_eager_verification_samples_entire_strided_block_once(monkeypatch, runne
         runner._device_plan = lambda value: value
         runner._plan_attention = lambda *_args, **_kwargs: (None, None)
         runner._model = SimpleNamespace(
-            embed_tokens=lambda _ids: torch.zeros(2, 2),
+            embed_tokens=lambda _ids: torch.zeros(2, 2, dtype=torch.bfloat16),
             logits=lambda _hidden: logits.view(6, 10),
         )
-        runner._eager_transformer = lambda *_args: torch.zeros(6, 2)
+        runner._eager_transformer = lambda *_args: torch.zeros(
+            6, 2, dtype=torch.bfloat16
+        )
         batch = SimpleNamespace(
             token_ids=plan.token_ids.copy(),
             positions=plan.positions.copy(),
@@ -121,7 +128,7 @@ def test_eager_verification_samples_entire_strided_block_once(monkeypatch, runne
             global_=None,
         )
         monkeypatch.setattr(
-            gemma_runtime, "gemma4_assistant_context", lambda value: value
+            gemma_runtime, "gemma4_assistant_context", lambda value, **_kwargs: value
         )
         monkeypatch.setattr(
             gemma_runtime, "expand_gemma4_decode_batch", lambda value, _drafts: value

@@ -3,17 +3,18 @@ from __future__ import annotations
 import inspect
 import math
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
 import pytest
 import torch
 
-from resin import BatchPhase
+from resin import BatchPhase, BatchPlan
 from resin.backend.cuda.failures import CudaFailureGuard, PostAcceptCudaError
 from resin.backend.cuda.graphs import default_decode_graph_shapes
 from resin.backend.cuda.runner import CudaRunner
 from resin.models.gemma4.config import SLIDING_ATTENTION
-from resin.models.gemma4.plan import PAGE_SIZE, SLIDING_WINDOW
+from resin.models.gemma4.plan import PAGE_SIZE, SLIDING_WINDOW, Gemma4BatchPlan
 from resin_models_cuda.gemma4 import cuda as gemma4_runtime
 from resin_models_cuda.gemma4.cuda import (
     Gemma4CudaRunner,
@@ -21,6 +22,77 @@ from resin_models_cuda.gemma4.cuda import (
     _select_nvfp4_backend,
     plan_gemma4_kv_capacity,
 )
+
+
+def _hidden_storage_runner() -> Gemma4CudaRunner:
+    runner = object.__new__(Gemma4CudaRunner)
+    runner.device = torch.device("cpu")
+    runner.max_num_seqs = 2
+    runner.config = SimpleNamespace(hidden_size=5)
+    runner._target_hidden = {}
+    runner._hidden_bank = None
+    runner._hidden_free_slots = []
+    runner._hidden_slot_generation = 0
+    runner._hidden_index_cache = {}
+    runner._hidden_input_buffers = {}
+    runner._media_features = {}
+    return runner
+
+
+def test_hidden_storage_owns_rows_across_rebatch_growth_and_release() -> None:
+    runner = _hidden_storage_runner()
+    source = torch.arange(10, dtype=torch.bfloat16).reshape(2, 5)
+    runner._set_target_hidden([10, 20], source)
+    saved = runner._gather_target_hidden([20, 10], 4)
+    assert saved.tolist() == [[5, 6, 7, 8, 9], [0, 1, 2, 3, 4], [0] * 5, [0] * 5]
+    output_pointer = saved.data_ptr()
+    index_pointer = runner._hidden_index_cache[False][1].data_ptr()
+    assert runner._gather_target_hidden([20, 10], 4).data_ptr() == output_pointer
+    assert runner._hidden_index_cache[False][1].data_ptr() == index_pointer
+
+    # The next replay can overwrite its result without corrupting saved state.
+    source.fill_(-99)
+    runner._set_target_hidden([30], torch.full((1, 5), 30, dtype=torch.bfloat16))
+    released_slot = runner._target_hidden[20]
+    runner.release([20])
+    runner._set_target_hidden([40], torch.full((1, 5), 40, dtype=torch.bfloat16))
+    assert runner._target_hidden[40] == released_slot
+    assert runner._gather_target_hidden([30, 10, 40], 4).tolist() == [
+        [30] * 5,
+        [0, 1, 2, 3, 4],
+        [40] * 5,
+        [0] * 5,
+    ]
+    with pytest.raises(KeyError):
+        runner._gather_target_hidden([20], 1)
+    with pytest.raises(ValueError, match="distinct"):
+        runner._set_target_hidden([99, 99], torch.zeros(2, 5, dtype=torch.bfloat16))
+
+
+def test_hidden_storage_saves_mixed_acceptance_and_prefill_final_rows() -> None:
+    from resin.backend.speculative import SpeculativeStats
+
+    runner = _hidden_storage_runner()
+    runner._speculation = SpeculativeStats(3)
+    verification = torch.arange(60, dtype=torch.bfloat16).reshape(3, 4, 5)
+    expected = torch.stack((verification[0, 0], verification[1, 1], verification[2, 3]))
+    tokens = runner._accept_speculative(
+        [10, 30, 40],
+        [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+        [[0, 1, 2, 3], [4, 0, 0, 0], [7, 8, 9, 10]],
+        verification,
+    )
+    assert tokens == [[0], [4, 0], [7, 8, 9, 10]]
+    verification.zero_()
+    assert torch.equal(runner._gather_target_hidden([10, 30, 40], 3), expected)
+
+    prefill = torch.arange(20, dtype=torch.bfloat16).reshape(4, 5)
+    runner._store_last_hidden(
+        cast(BatchPlan, SimpleNamespace(sequence_ids=[30, 10])),
+        cast(Gemma4BatchPlan, SimpleNamespace(last_token_indices=[1, 3])),
+        prefill,
+    )
+    assert torch.equal(runner._gather_target_hidden([30, 10], 2), prefill[[1, 3]])
 
 
 def test_capacity_planner_accounts_for_fp8_shared_parent_bytes() -> None:
@@ -36,7 +108,7 @@ def test_capacity_planner_accounts_for_fp8_shared_parent_bytes() -> None:
         // plan.bytes_per_parent
         - 1
     )
-    assert plan.overhead_bytes == 7 * 256 * 1024**2
+    assert plan.overhead_bytes == 13 * 256 * 1024**2
     assert plan.allocation_bytes == (plan.parent_capacity + 1) * plan.bytes_per_parent
 
 
@@ -454,3 +526,123 @@ def test_speculative_failure_after_state_update_is_not_retryable(
 
     assert state == [1]
     assert synchronized == [True]
+
+
+@pytest.fixture
+def cached_edge_runner():
+    from resin_models_cuda.gemma4.edge_cuda import Gemma4EdgeCudaRunner
+
+    runner = object.__new__(Gemma4EdgeCudaRunner)
+    runner.device = torch.device("cpu")
+    runner.speculative_tokens = 3
+    shape = (2, 256)
+    wrappers = [
+        SimpleNamespace(_plan_info=object(), workspace_revision=0) for _ in range(4)
+    ]
+    runner._graph_spec_attention = {
+        shape: (wrappers[0], wrappers[1], wrappers[2], wrappers[3])
+    }
+    calls, failure = [], [None]
+
+    def plan(
+        wrapper,
+        indptr,
+        indices,
+        last,
+        *,
+        local,
+        qo_indptr=None,
+        assistant=False,
+        non_blocking=False,
+    ):
+        calls.append(
+            (wrapper, indptr.clone(), indices.clone(), last.clone(), qo_indptr)
+        )
+        wrapper.workspace_revision += 1
+        if wrapper is failure[0]:
+            failure[0] = None
+            raise RuntimeError("planner failed after mutating workspace")
+        wrapper._plan_info = object()
+
+    setattr(runner, "_plan_graph_attention", plan)
+    inputs = {"verify_qo_indptr": np.array([0, 4, 8], dtype=np.int32)}
+    for prefix in ("assistant_", "verify_"):
+        for kind in ("local", "global"):
+            name = prefix + kind
+            inputs[name + "_kv_indptr"] = np.array([0, 1, 3], dtype=np.int32)
+            inputs[name + "_page_indices"] = np.array(
+                [2, 5, 7, 0, 0, 0], dtype=np.int32
+            )
+            inputs[name + "_last_page_lengths"] = np.array([63, 2], dtype=np.int32)
+    return runner, shape, wrappers, inputs, calls, failure
+
+
+def test_fractional_page_length_and_physical_recycling_keep_schedule(
+    cached_edge_runner,
+):
+    runner, shape, wrappers, inputs, calls, _ = cached_edge_runner
+    runner._prepare_graph_attention(shape, inputs)
+    assert len(calls) == 4
+    for name, value in inputs.items():
+        if name.endswith("page_indices"):
+            value[:3] = [17, 18, 19]
+        if name.endswith("last_page_lengths"):
+            value[:] = [64, 3]
+    runner._prepare_graph_attention(shape, inputs)
+    assert len(calls) == 4
+    assert runner.attention_plan_cache_stats == {"hits": 4, "misses": 4}
+    assert runner.benchmark_counters["attention_plan_cache.hits"] == 4
+    assert runner.benchmark_counters["attention_plan_cache.misses"] == 4
+    assert all(w.workspace_revision == 1 for w in wrappers)
+
+
+@pytest.mark.parametrize("prefix", ["assistant_local", "verify_global"])
+def test_page_boundary_and_unequal_rows_replan_only_changed_wrapper(
+    cached_edge_runner, prefix
+):
+    runner, shape, _, inputs, calls, _ = cached_edge_runner
+    runner._prepare_graph_attention(shape, inputs)
+    inputs[prefix + "_kv_indptr"][:] = [0, 2, 3]
+    # Total pages are unchanged, but one row gained a page and another lost
+    # one. The full CSR signature, not its final value, determines the plan.
+    runner._prepare_graph_attention(shape, inputs)
+    assert len(calls) == 5
+    assert runner.attention_plan_cache_stats == {"hits": 3, "misses": 5}
+    inputs[prefix + "_kv_indptr"][:] = [0, 2, 4]
+    runner._prepare_graph_attention(shape, inputs)
+    assert len(calls) == 6
+
+
+def test_verifier_query_schedule_is_part_of_signature(cached_edge_runner):
+    runner, shape, _, inputs, calls, _ = cached_edge_runner
+    runner._prepare_graph_attention(shape, inputs)
+    inputs["verify_qo_indptr"][:] = [0, 3, 8]
+    runner._prepare_graph_attention(shape, inputs)
+    assert len(calls) == 6
+    assert runner.attention_plan_cache_stats == {"hits": 2, "misses": 6}
+
+
+def test_external_plan_identity_invalidates_last_signature(cached_edge_runner):
+    runner, shape, wrappers, inputs, calls, _ = cached_edge_runner
+    runner._prepare_graph_attention(shape, inputs)
+    wrappers[0]._plan_info = object()
+    runner._prepare_graph_attention(shape, inputs)
+    assert len(calls) == 5
+    assert calls[-1][0] is wrappers[0]
+
+
+def test_failed_replan_invalidates_previous_signature_before_retry(cached_edge_runner):
+    runner, shape, wrappers, inputs, calls, failure = cached_edge_runner
+    runner._prepare_graph_attention(shape, inputs)
+    previous_plan = wrappers[0]._plan_info
+    inputs["assistant_local_kv_indptr"][:] = [0, 2, 4]
+    failure[0] = wrappers[0]
+    with pytest.raises(RuntimeError, match="mutating workspace"):
+        runner._prepare_graph_attention(shape, inputs)
+    assert wrappers[0]._plan_info is previous_plan
+    assert wrappers[0]._resin_edge_last_host_plan is None
+    inputs["assistant_local_kv_indptr"][:] = [0, 1, 3]
+    runner._prepare_graph_attention(shape, inputs)
+    assert len(calls) == 6
+    assert wrappers[0].workspace_revision == 3
+    assert runner.attention_plan_cache_stats == {"hits": 3, "misses": 6}
