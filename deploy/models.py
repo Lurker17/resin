@@ -246,7 +246,6 @@ MODEL_SPECS.update(
             draft_tokens=3,
             gpu_memory_utilization=0.95,
             memory=128 * 1024,
-            enable_anthropic=False,
             image_warmup=True,
         ),
         "qwen3_5": ModelSpec(
@@ -306,7 +305,6 @@ MODEL_SPECS.update(
             gpu="B300",
             label="inkling-small",
             draft_tokens=5,
-            enable_anthropic=False,
         ),
     }
 )
