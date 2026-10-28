@@ -35,7 +35,12 @@ def index_metadata(cache, positions, ratio, runtime):
     return metadata[ratio]
 
 
-def store_index_kv(indexer, latent, cache, freqs, metadata):
+def _projection(indexer, name, values, prefill):
+    operation = getattr(indexer, f"prefill_{name}", None) if prefill else None
+    return (operation if operation is not None else getattr(indexer, name))(values)
+
+
+def store_index_kv(indexer, latent, cache, freqs, metadata, *, prefill=False):
     """Write a full source before compacting its consumer query rows."""
     from resin_models_cuda.deepseek_v41.attention import _cos_sin
     from resin_models_cuda.deepseek_v41.upstream.fused_transform import (
@@ -51,7 +56,7 @@ def store_index_kv(indexer, latent, cache, freqs, metadata):
     if not indexer.owns_k:
         raise ValueError("only an index-K source may store its projected keys")
     transform(
-        indexer.wk(latent).reshape(-1, indexer.head_dim),
+        _projection(indexer, "wk", latent, prefill).reshape(-1, indexer.head_dim),
         norm_args=NormArgs(indexer.k_norm.weight, indexer.k_norm.eps),
         rope_args=RopeArgs(
             metadata.positions_c[indexer.ratio].flatten(),
@@ -69,7 +74,17 @@ def store_index_kv(indexer, latent, cache, freqs, metadata):
 
 
 def paged_index(
-    indexer, hidden, query, latent, positions, capacity, cache, freqs, runtime
+    indexer,
+    hidden,
+    query,
+    latent,
+    positions,
+    capacity,
+    cache,
+    freqs,
+    runtime,
+    *,
+    prefill=False,
 ):
     import deep_gemm
     from deep_select.interface import topk
@@ -96,7 +111,7 @@ def paged_index(
     cos_sin = _cos_sin(freqs)
     cast_args = CastArgs("e2m1", 32, round_sf=True, sf_format="ue8m0")
     if indexer.owns_k and indexer.layer not in runtime.get("full_index_kv_stored", ()):
-        store_index_kv(indexer, latent, cache, freqs, metadata)
+        store_index_kv(indexer, latent, cache, freqs, metadata, prefill=prefill)
     q, sf = cast(
         tuple[torch.Tensor, torch.Tensor],
         transform(
@@ -113,7 +128,7 @@ def paged_index(
     )
     weights = _weights_aligned(
         (
-            indexer.weights_proj(hidden)
+            _projection(indexer, "weights_proj", hidden, prefill)
             * (indexer.head_dim**-0.5 * indexer.n_heads**-0.5)
         ).reshape(-1, indexer.local_heads)
     )

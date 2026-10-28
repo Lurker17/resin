@@ -452,7 +452,8 @@ def test_runner_replay_policy_keeps_dspark_absolute_positions_and_full_scores(
         rows = retained
         return torch.zeros(1, rows, 2), torch.zeros(1, rows, 2)
 
-    def commit(hidden, position, *, cache, valid_tokens):
+    def commit(hidden, position, *, cache, valid_tokens, prefill):
+        assert prefill is True
         stores.append((position, valid_tokens))
 
     runner._model = SimpleNamespace(

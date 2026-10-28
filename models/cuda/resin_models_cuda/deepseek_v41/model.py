@@ -200,7 +200,7 @@ class Compressor(nn.Module):
             self.wgate = Linear(args.dim, args.head_dim, dtype=torch.float32)
         self.norm = RMSNorm(args.head_dim, args.norm_eps)
 
-    def forward(self, hidden, positions, cache, *, metadata=None):
+    def forward(self, hidden, positions, cache, *, metadata=None, prefill=False):
         if self.ratio == 1:
             return self.norm(self.wkv(hidden))
         values, scores = self.wkv(hidden.float()), self.wgate(hidden.float())
@@ -252,6 +252,7 @@ class Indexer(nn.Module):
             self.wk = Linear(args.head_dim, args.index_head_dim, dtype=torch.bfloat16)
             self.k_norm = RMSNorm(args.index_head_dim, args.norm_eps)
         self.allreduce = tp.sum
+        self.prefill_weights_proj = self.prefill_wk = None
 
     def forward(
         self,
@@ -265,12 +266,22 @@ class Indexer(nn.Module):
         runtime,
         *,
         query=None,
+        prefill=False,
     ):
         from resin_models_cuda.deepseek_v41.indexer import paged_index
 
         query = self.wq_b(qr) if query is None else query
         return paged_index(
-            self, hidden, query, latent, positions, capacity, cache, freqs, runtime
+            self,
+            hidden,
+            query,
+            latent,
+            positions,
+            capacity,
+            cache,
+            freqs,
+            runtime,
+            prefill=prefill,
         )
 
 
@@ -332,6 +343,7 @@ class Attention(nn.Module):
             persistent=False,
         )
         self.prefill_project = self.prefill_query = self.prefill_finish = None
+        self.prefill_store_projection = None
 
     def _project(self, hidden):
         if hasattr(self, "project_input"):
@@ -343,19 +355,21 @@ class Attention(nn.Module):
 
         return finish_output(self, output).reshape(*positions.shape, -1)
 
-    def store(self, hidden, positions, cache, *, metadata=None):
+    def store(self, hidden, positions, cache, *, metadata=None, prefill=False):
         metadata = cache.prepare_metadata(positions) if metadata is None else metadata
         positions = metadata.positions
+        operation = getattr(self, "prefill_store_projection", None) if prefill else None
+        kv = (operation if operation is not None else self.wkv)(hidden)
         if hasattr(self, "cos_sin"):
             store_attention_kv(
                 self,
-                self.wkv(hidden),
+                kv,
                 positions,
                 cache.window_cache(self.layer_id),
                 metadata.slot_mapping_store_swa,
             )
             return
-        kv = self.kv_norm(self.wkv(hidden))
+        kv = self.kv_norm(kv)
         apply_rotary_emb(kv[..., -self.rope_head_dim :], self.freqs_cis[positions])
         store_kv(
             cache.window_cache(self.layer_id),
@@ -389,8 +403,12 @@ class Attention(nn.Module):
         from resin_models_cuda.deepseek_v41.indexer import store_index_kv
 
         metadata = runtime["metadata"]
-        latent = self.compressor(hidden, positions, cache, metadata=metadata)
-        store_index_kv(self.indexer, latent, cache, self.freqs_cis, metadata)
+        latent = self.compressor(
+            hidden, positions, cache, metadata=metadata, prefill=True
+        )
+        store_index_kv(
+            self.indexer, latent, cache, self.freqs_cis, metadata, prefill=True
+        )
         self._store_compressed_kv(latent, metadata, cache)
         runtime.setdefault("full_index_kv_stored", set()).add(self.layer_id)
 
@@ -440,7 +458,9 @@ class Attention(nn.Module):
             projected if isinstance(projected, tuple) else (projected, None)
         )
         latent = (
-            self.compressor(hidden, positions, cache, metadata=metadata)
+            self.compressor(
+                hidden, positions, cache, metadata=metadata, prefill=prefill
+            )
             if hasattr(self, "compressor")
             and self.layer_id not in runtime.get("full_index_kv_stored", ())
             else None
@@ -457,6 +477,7 @@ class Attention(nn.Module):
                 self.freqs_cis,
                 runtime,
                 query=index_query,
+                prefill=prefill,
             )
         if latent is not None:
             self._store_compressed_kv(latent, metadata, cache)
@@ -1031,26 +1052,30 @@ class Transformer(nn.Module):
         # and corrected token, compressor and n-gram rows overwrite before use.
         pass
 
-    def _project_main(self, hidden):
-        return self.mtp[0].main_norm(self.mtp[0].main_proj(hidden))
+    def _project_main(self, hidden, *, prefill=False):
+        operation = getattr(self, "prefill_main_projection", None) if prefill else None
+        projection = operation if operation is not None else self.mtp[0].main_proj
+        return self.mtp[0].main_norm(projection(hidden))
 
     def prefill_dspark(self, main_hidden, *, cache):
-        hidden = self._project_main(main_hidden)
+        hidden = self._project_main(main_hidden, prefill=True)
         positions = torch.arange(hidden.shape[1], device=hidden.device)[None]
         metadata = cache.prepare_metadata(positions)
         for layer in self.mtp:
-            layer.attn.store(hidden, positions, cache, metadata=metadata)
+            layer.attn.store(hidden, positions, cache, metadata=metadata, prefill=True)
 
     def commit_dspark_main_block(
-        self, main_hidden, position, *, cache, valid_tokens=None
+        self, main_hidden, position, *, cache, valid_tokens=None, prefill=False
     ):
-        hidden = self._project_main(main_hidden)
+        hidden = self._project_main(main_hidden, prefill=prefill)
         positions = position[:, None] + torch.arange(
             hidden.shape[1], device=hidden.device
         )
         metadata = cache.prepare_metadata(positions, valid_tokens=valid_tokens)
         for layer in self.mtp:
-            layer.attn.store(hidden, positions, cache, metadata=metadata)
+            layer.attn.store(
+                hidden, positions, cache, metadata=metadata, prefill=prefill
+            )
 
     def _draft_attention(self, attention, hidden, metadata, cache):
         positions = metadata.positions

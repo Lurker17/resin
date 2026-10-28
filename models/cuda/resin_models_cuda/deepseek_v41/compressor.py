@@ -53,6 +53,7 @@ class PreparedCompressor(nn.Module):
     def __init__(self, source):
         super().__init__()
         self.layer, self.ratio, self.norm = source.layer, source.ratio, source.norm
+        self.prefill_projection = None
         if self.ratio not in (1, 2):
             raise ValueError("DeepSeek-V4.1 supports only C1/C2 compression")
         if self.ratio == 1:
@@ -70,8 +71,13 @@ class PreparedCompressor(nn.Module):
                 use_fp32_output=True,
             )
 
-    def forward(self, hidden, positions, cache, *, metadata=None):
-        projected = self.projection(hidden)
+    def forward(self, hidden, positions, cache, *, metadata=None, prefill=False):
+        operation = (
+            self.prefill_projection
+            if prefill and self.prefill_projection is not None
+            else self.projection
+        )
+        projected = operation(hidden)
         if self.ratio == 2:
             scores, values = projected.chunk(2, -1)
             projected = compress_projected(

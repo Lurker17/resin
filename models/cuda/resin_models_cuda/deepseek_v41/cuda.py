@@ -395,6 +395,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
             layer.prefill_ffn = callback
         self._configure_prefill_attention_graphs()
         self._configure_prefill_engram_graphs()
+        self._configure_prefill_auxiliary_graphs()
 
     def release(self, request_ids: list[int]) -> None:
         for request_id in request_ids:
@@ -602,7 +603,10 @@ class DeepSeekV41CudaRunner(CudaRunner):
         callbacks = self._configure_prefill_tensor_graphs(
             tuple(regions),
             max_tokens=self.prefill_chunk_size,
-            pad_up_to=0,
+            # These projections are independent per row. Bound DeepGEMM's
+            # tactic selection to startup-captured shapes for ragged prompts;
+            # attention metadata and softmax keep their actual token counts.
+            pad_up_to=self.prefill_chunk_size,
             capture_context=self._prefill_compute_context,
         )
         for index, layer in enumerate(self._model.layers):
@@ -648,6 +652,92 @@ class DeepSeekV41CudaRunner(CudaRunner):
         )
         for (_, engram), callback in zip(engrams, callbacks, strict=True):
             engram.prefill_projection = callback
+
+    def _configure_prefill_auxiliary_graphs(self):
+        regions, bindings = [], []
+
+        def add(name, owner, attribute, projection):
+            width = projection.weight.shape[0]
+            regions.append(
+                CudaGraphTensorRegion(
+                    name,
+                    lambda values, projection=projection: projection(values),
+                    (TensorSpec((projection.weight.shape[1],)),),
+                    TensorSpec((width,), projection.output_dtype),
+                )
+            )
+            bindings.append((owner, attribute, width))
+
+        for layer in self._model.layers:
+            attention = layer.attn
+            if hasattr(attention, "compressor"):
+                compressor = attention.compressor
+                add(
+                    f"layer.{layer.layer_id}.compressor_projection",
+                    compressor,
+                    "prefill_projection",
+                    compressor.projection,
+                )
+            if hasattr(attention, "indexer"):
+                indexer = attention.indexer
+                add(
+                    f"layer.{layer.layer_id}.index_weights_projection",
+                    indexer,
+                    "prefill_weights_proj",
+                    indexer.weights_proj,
+                )
+                if indexer.owns_k:
+                    add(
+                        f"layer.{layer.layer_id}.index_key_projection",
+                        indexer,
+                        "prefill_wk",
+                        indexer.wk,
+                    )
+        if self.speculative_tokens:
+            add(
+                "mtp.main_projection",
+                self._model,
+                "prefill_main_projection",
+                self._model.mtp[0].main_proj,
+            )
+            for layer in self._model.mtp:
+                add(
+                    f"layer.{layer.layer_id}.mtp_store_projection",
+                    layer.attn,
+                    "prefill_store_projection",
+                    layer.attn.wkv,
+                )
+        if not regions:
+            return
+        callbacks = self._configure_prefill_tensor_graphs(
+            tuple(regions),
+            mode="prefill_auxiliary",
+            max_tokens=self.prefill_chunk_size,
+            pad_up_to=self.prefill_chunk_size,
+            capture_context=self._prefill_compute_context,
+        )
+        for (owner, attribute, width), callback in zip(
+            bindings, callbacks, strict=True
+        ):
+
+            def project(values, invoke=callback, width=width):
+                result = invoke(values.reshape(-1, values.shape[-1]))
+                return result.view(*values.shape[:-1], width)
+
+            setattr(owner, attribute, project)
+
+    def _before_cuda_graph_capture(self) -> None:
+        if getattr(self, "_prefill_hc_warmed", False):
+            return
+        from resin_models_cuda.deepseek_v41.hc import warm_prefill_hc
+
+        # The prefill tensor graphs contain only pure projections/FFNs, so
+        # their startup capture does not exercise the surrounding HC kernels.
+        # Their finite split tactics depend on row count, not layer weights.
+        block = next((layer for layer in self._model.layers if layer.lazy_hc), None)
+        if block is not None:
+            warm_prefill_hc(block, self.prefill_chunk_size)
+        self._prefill_hc_warmed = True
 
     @contextmanager
     def _prefill_compute_context(self):
@@ -1108,7 +1198,11 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 else None
             )
             self._model.commit_dspark_main_block(
-                main, positions[offset : offset + 1], cache=cache, valid_tokens=valid
+                main,
+                positions[offset : offset + 1],
+                cache=cache,
+                valid_tokens=valid,
+                prefill=True,
             )
         return logits
 

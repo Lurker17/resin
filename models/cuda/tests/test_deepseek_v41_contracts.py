@@ -450,7 +450,10 @@ def test_indexer_allocation_bound_stays_fixed_while_causal_lengths_advance(
     assert indexer.max_kv_len == max_seq_len // ratio
 
 
-def test_indexer_accepts_the_shared_query_projection(implementation, monkeypatch):
+@pytest.mark.parametrize("prefill", [False, True])
+def test_indexer_accepts_the_shared_query_projection(
+    implementation, monkeypatch, prefill
+):
     from resin_models_cuda.deepseek_v41 import indexer as kernels
 
     indexer = implementation.Indexer.__new__(implementation.Indexer)
@@ -463,13 +466,15 @@ def test_indexer_accepts_the_shared_query_projection(implementation, monkeypatch
     query = torch.ones(2, 5, 32 * 128)
     observed = []
 
-    def execute(module, hidden, projected, *args):
-        observed.append((module, projected))
+    def execute(module, hidden, projected, *args, prefill):
+        observed.append((module, projected, prefill))
         return projected[..., :1]
 
     monkeypatch.setattr(kernels, "paged_index", execute)
-    result = indexer(None, None, None, None, None, None, None, None, query=query)
-    assert observed == [(indexer, query)]
+    result = indexer(
+        None, None, None, None, None, None, None, None, query=query, prefill=prefill
+    )
+    assert observed == [(indexer, query, prefill)]
     assert result.shape == (2, 5, 1)
 
 

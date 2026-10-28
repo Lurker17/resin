@@ -209,7 +209,10 @@ def test_full_index_source_store_uses_full_metadata_before_query_compaction(
     assert torch.equal(kwargs["out_args"][1], frame.slot_mapping_store_ca[1].flatten())
 
 
-def test_compact_index_query_does_not_overwrite_pre_stored_full_source(monkeypatch):
+@pytest.mark.parametrize("prefill", [False, True])
+def test_compact_index_query_does_not_overwrite_pre_stored_full_source(
+    monkeypatch, prefill
+):
     import sys
 
     from resin_models_cuda.deepseek_v41 import indexer as operations
@@ -218,7 +221,11 @@ def test_compact_index_query_does_not_overwrite_pre_stored_full_source(monkeypat
     positions = torch.tensor([[0, 1]])
     metadata = cache.row(0).prepare_metadata(positions)
     writes = []
-    monkeypatch.setattr(operations, "store_index_kv", lambda *args: writes.append(args))
+    monkeypatch.setattr(
+        operations,
+        "store_index_kv",
+        lambda *args, prefill: writes.append((args, prefill)),
+    )
     monkeypatch.setitem(
         sys.modules,
         "deep_gemm",
@@ -282,7 +289,17 @@ def test_compact_index_query_does_not_overwrite_pre_stored_full_source(monkeypat
         if stored:
             runtime["full_index_kv_stored"] = {20}
         output = operations.paged_index(
-            indexer, hidden, query, None, positions, 2, fake_cache, freqs, runtime
+            indexer,
+            hidden,
+            query,
+            None,
+            positions,
+            2,
+            fake_cache,
+            freqs,
+            runtime,
+            prefill=prefill,
         )
         assert output.shape == (1, 2, 1)
     assert len(writes) == 1
+    assert writes[0][1] == prefill

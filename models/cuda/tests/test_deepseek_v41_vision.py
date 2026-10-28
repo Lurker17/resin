@@ -209,12 +209,14 @@ def test_prefill_injects_embeddings_and_masks_engram_but_decode_stays_text(
     model.embed = lambda ids: torch.zeros(*ids.shape, 3)
     masks = []
     contributions = []
+    projection_phases = []
 
     class Layer(nn.Module):
         layer_id = 0
 
-        def engram(self, hidden, *, token_mask, embed_hook):
+        def engram(self, hidden, *, token_mask, embed_hook, prefill):
             contributions.append(token_mask)
+            projection_phases.append(prefill)
             return hidden
 
         def forward(self, hidden, pre, ids, attention, **kwargs):
@@ -237,6 +239,7 @@ def test_prefill_injects_embeddings_and_masks_engram_but_decode_stays_text(
     model._run(ids[:, :1], positions[:, :1], 3, cache)
     assert masks[1] is None
     assert contributions[1] is None
+    assert projection_phases == [True, False]
 
 
 @pytest.mark.parametrize("lazy", [False, True])

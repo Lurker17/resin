@@ -6,6 +6,7 @@ Revision: 774ce244b87cc0eb8d4b94ab9f5de2ab22049f01.
 Engram and DSpark taps materialize the residual before observing its streams.
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import cache
 from importlib import import_module
@@ -22,6 +23,83 @@ class HCLazyPost:
     pre: Tensor
     post: Tensor
     comb: Tensor
+
+
+def prefill_hc_tactics(
+    hidden: int, num_sms: int, max_rows: int, *, deterministic: bool = False
+) -> tuple[tuple[int, int], ...]:
+    """Representative (rows, splits) for the pinned Mega mHC heuristic.
+
+    DeepGEMM 1fc9c669 csrc/apis/mega_mhc.hpp selects splits from 64-row
+    tiles. Its sm100_mega_mhc template specializes splits, not the row count.
+    Once the cap reaches 16 it stays constant, regardless of context length.
+    """
+    if hidden <= 0 or hidden % 1024:
+        raise ValueError("Mega mHC hidden size must be a positive multiple of 1024")
+    if num_sms <= 0 or not 0 < max_rows <= 1 << 20:
+        raise ValueError("Mega mHC needs positive SMs and 1 to 1048576 rows")
+    if deterministic:
+        return ((1, 16),)
+    k_blocks = hidden // 64
+    max_m_blocks = min((max_rows + 63) // 64, num_sms // 16 + 1)
+    representatives: dict[int, int] = {}
+    for m_blocks in range(1, max_m_blocks + 1):
+        cap = min(64, max(16, num_sms // m_blocks))
+        k_per_split = (k_blocks + cap - 1) // cap
+        splits = (k_blocks + k_per_split - 1) // k_per_split
+        representatives.setdefault(splits, (m_blocks - 1) * 64 + 1)
+    return tuple((rows, splits) for splits, rows in representatives.items())
+
+
+def warm_prefill_hc(
+    block, max_rows: int, *, deterministic: bool = False
+) -> tuple[tuple[int, int], ...]:
+    """Warm finite BF16-output HC tactics using only scratch residual state.
+
+    Call before graph capture on one loaded target block. Attention and FFN
+    prefill transitions share this kernel signature; weight values are runtime
+    arguments. No KV cache, model residual, collective or FFN workspace is used.
+    The pinned DeepGEMM exposes no deterministic getter: callers that explicitly
+    enabled that mode may pass True. Leaving False is also safe in that mode,
+    but can launch the same 16-split kernel more than once. Never change its mode.
+    """
+    import deep_gemm
+
+    args = block.args
+    if args.hc_mult != 4:
+        raise ValueError("Mega mHC requires four residual streams")
+    device = block.hc_attn_fn.device
+    with (
+        torch.cuda.device(device) if device.type == "cuda" else nullcontext(),
+        torch.inference_mode(),
+    ):
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("HC tactic warmup must run before CUDA graph capture")
+        tactics = prefill_hc_tactics(
+            args.dim, deep_gemm.get_num_sms(), max_rows, deterministic=deterministic
+        )
+        for rows, _ in tactics:
+            output = torch.zeros(
+                (1, rows, args.dim), device=device, dtype=torch.bfloat16
+            )
+            residual = torch.zeros(
+                (1, rows, args.hc_mult, args.dim), device=device, dtype=torch.bfloat16
+            )
+            mixes = torch.full(
+                (1, rows, args.hc_mult),
+                1 / args.hc_mult,
+                device=device,
+                dtype=torch.float32,
+            )
+            comb = torch.eye(args.hc_mult, device=device, dtype=torch.float32)
+            state = HCLazyPost(
+                residual,
+                mixes,
+                mixes.clone(),
+                comb.expand(1, rows, args.hc_mult, args.hc_mult).clone(),
+            )
+            mega_transition(block, output, state, "attn", prepare_ffn=False)
+    return tactics
 
 
 @cache
