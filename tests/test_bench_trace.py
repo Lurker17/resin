@@ -27,7 +27,7 @@ def test_trace_preserves_cpu_diagnostics_but_rejects_missing_cuda(
     trace = perfetto_trace(
         tmp_path,
         3,
-        {"git_commit": "qualified-source", "overlap": overlap},
+        {"git_commit": "qualified-source", "overlap": overlap, "escape_token": '<|"|>'},
         decode_passes=2 + int(overlap),
     )
     assert getattr(trace, "decode_passes") == 2 + int(overlap)
@@ -45,6 +45,7 @@ def test_trace_preserves_cpu_diagnostics_but_rejects_missing_cuda(
     with gzip.open(target, "rt") as stream:
         data = json.load(stream)
     assert data["resin_benchmark"]["git_commit"] == "qualified-source"
+    assert data["resin_benchmark"]["escape_token"] == '<|"|>'
     assert data["resin_benchmark"]["case"]["batch_size"] == 256
     assert data["resin_benchmark"]["trace_passes"] == passes
     unit = "decode completions" if phase == "decode" else "prefill cohorts"
@@ -106,4 +107,6 @@ def test_trace_stages_raw_export_locally_and_cleans_up(tmp_path, monkeypatch, ou
         target = output / "decode-ctx8192-b8-rank002.json.gz"
         assert list(output.iterdir()) == [target]
         with gzip.open(target, "rt") as stream:
-            assert json.load(stream) == payload
+            data = json.load(stream)
+        assert data["traceEvents"] == payload["traceEvents"]
+        assert data["resin_benchmark"]["case"]["phase"] == "decode"

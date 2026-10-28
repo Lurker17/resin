@@ -6,6 +6,24 @@ use the same model registry, runner construction, measurements, and JSONL schema
 `scripts/plot_bench.py` renders charts, and `scripts/merge_bench_traces.py` combines
 rank traces for Perfetto. `deploy/modal_bench.py` is a thin remote adapter.
 
+## Prompt workloads
+
+Benchmarks default to chat-templated ShareGPT conversations from a saved token
+artifact. Prepare one on CPU with `python -m resin.bench_prompts prepare --help`,
+then pass `--prompt-corpus PATH` or set `RESIN_BENCH_PROMPT_CORPUS=PATH`. Artifacts
+pin the corpus, tokenizer, chat template and exact token IDs. Missing artifacts
+fail before GPU dispatch. Use `--prompt-source synthetic` for random-token
+controls, and keep those results separate from ShareGPT measurements.
+
+Sampling defaults to greedy. Set `--temperature`, `--top-p`, `--top-k` and `--seed`
+explicitly for sampled runs, for example `--temperature 1.0 --top-p 0.95
+--top-k 64 --seed 41`. Resin applies top-p before top-k. Natural draft acceptance
+remains the default.
+
+Gemma models default to 8,192-token prefill chunks with breakable prefill graphs
+and full decode graphs. Override these with `--prefill-chunk-size`,
+`--prefill-graph` and `--decode-graph`.
+
 ## Run a sweep
 
 Download pinned weights on a Modal CPU worker, then sweep prefill and decode:
@@ -53,6 +71,11 @@ take precedence. Choose a sweep that fits the model and available cache memory.
 Use `--decode-batch-sizes 1,2,4,8` for a smaller initial sweep, then extend through
 16/32/64 to find the throughput plateau and its interactivity cost. Cache
 preflight rejects an oversized cohort instead of silently measuring fewer users.
+`--skip-capacity-exceeded` records and skips cases that cannot fit, while keeping
+the requested engine capacity. Prefill cohorts are capped at 131,072 input tokens
+by default: `context_length * batch_size` per attention replica. Adjust this with
+`--max-prefill-tokens`; zero disables the cap. Budget exclusions are recorded
+separately from KV-capacity failures.
 One resident sweep shares a context capacity large enough for its longest case
 plus generation headroom; records include `context_capacity`. Run the full
 prefill curve and the 8K decode curve separately when a larger sparse-index or
@@ -78,15 +101,19 @@ independent of a smaller serving chunk chosen for prefix reuse or scheduling.
 Use `--prefill-chunk-size 4096` or `8192` to compare chunk policies where supported;
 each plotted latency still covers the **whole prompt**, including every chunk.
 The default graph policies are breakable prefill and
-full decode. Each point uses five warmup steps and twenty measured steps unless
-overridden with `--warmup-steps` and `--measure-steps`.
+full decode. Decode uses five warmup steps and twenty measured steps unless
+overridden with `--warmup-steps` and `--measure-steps`. Prefill separately uses
+one complete warmup cohort and three complete measured cohorts, controlled by
+`--prefill-warmup-steps` and `--prefill-measure-steps`. These prefill options count
+whole cohorts, independently of how many Engine chunks each cohort needs.
 
 ## Timing and synthetic workloads
 
 Each sweep loads the model once per GPU and keeps it resident across cases.
 Startup, weight loading, graph capture, and request admission are untimed.
-Prefill processes complete request cohorts at each context length, even when
-chunking requires more than the requested minimum step count. Its latency is
+Prefill processes complete request cohorts at each context length. The low-level
+`run_sweep` API also retains the legacy minimum-step mode when no explicit
+prefill cohort counts are supplied. Prefill latency is
 the sum of timed Engine steps for a complete cohort, excluding admission and
 between-step benchmark reductions. Prefill throughput counts actual new input
 tokens, excluding attention-TP/CP replication and any reused prefix.

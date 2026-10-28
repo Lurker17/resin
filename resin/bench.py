@@ -10,17 +10,29 @@ from __future__ import annotations
 
 import gzip
 import json
-import shutil
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import nullcontext
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from resin import BatchPhase, BatchPlan, SamplingParams
 from resin.backend.speculative import SpeculativeStats
+
+_TRACE_HOST_SCOPES = ContextVar("resin_benchmark_trace_host_scopes", default=False)
+
+
+def _host_scope(name: str):
+    """Annotate only untimed profiler callbacks; normal sweeps need no Torch."""
+    if not _TRACE_HOST_SCOPES.get():
+        return nullcontext()
+    import torch
+
+    return torch.profiler.record_function(name)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -118,6 +130,13 @@ def perfetto_trace(
         target = directory / f"{name}.json.gz"
         passes = decode_passes if case.phase == "decode" else 2
         unit = "decode completions" if case.phase == "decode" else "prefill cohorts"
+        trace_metadata = {
+            **(metadata or {}),
+            "case": asdict(case),
+            "trace_passes": passes,
+            "trace_unit": unit,
+            "host_scope_policy": "untimed-perfetto-callbacks-only",
+        }
         torch.cuda.synchronize()
         with torch.profiler.profile(
             activities=[
@@ -129,28 +148,26 @@ def perfetto_trace(
             profiler.add_metadata(
                 "resin_timing", f"{passes} untimed {unit} after measurement"
             )
-            profiler.add_metadata_json(
-                "resin_benchmark",
-                json.dumps(
-                    {
-                        **(metadata or {}),
-                        "case": asdict(case),
-                        "trace_passes": passes,
-                        "trace_unit": unit,
-                    }
-                ),
-            )
             with torch.profiler.record_function(f"resin.{name}"):
                 for _ in range(passes):
-                    run_pass()
+                    token = _TRACE_HOST_SCOPES.set(True)
+                    try:
+                        with _host_scope("benchmark.trace_callback"):
+                            run_pass()
+                    finally:
+                        _TRACE_HOST_SCOPES.reset(token)
                 torch.cuda.synchronize()
         with tempfile.TemporaryDirectory(prefix="resin-bench-trace-") as staging:
             raw = Path(staging) / f"{name}.json"
             profiler.export_chrome_trace(str(raw))
-            with raw.open("rb") as source, gzip.open(target, "wb") as destination:
-                shutil.copyfileobj(source, destination)
             with raw.open() as source:
                 data = json.load(source)
+            # Kineto rewrites backslashes in add_metadata_json values, which
+            # corrupts escaped quotes in token strings. Add structured metadata
+            # with Python's JSON encoder after the profiler export instead.
+            data["resin_benchmark"] = trace_metadata
+            with gzip.open(target, "wt") as destination:
+                json.dump(data, destination)
             kernels = sum(event.get("cat") == "kernel" for event in data["traceEvents"])
         print(
             f"[bench-trace] rank={rank} case={name} CUDA kernel events={kernels}",
@@ -176,10 +193,13 @@ class _ObservedCompletion:
         return self._completion.feedback
 
     def result(self):
-        output = self._completion.result()
-        self._runner._observe(self._plan)
-        self._runner._completed_positions = getattr(self._completion, "positions", None)
-        return output
+        with _host_scope("benchmark.runner.result"):
+            output = self._completion.result()
+            self._runner._observe(self._plan)
+            self._runner._completed_positions = getattr(
+                self._completion, "positions", None
+            )
+            return output
 
 
 class BenchmarkRunner:
@@ -279,40 +299,56 @@ class BenchmarkRunner:
                 counts[f"{mode}.fallback.{reason}"] = value
         return counts
 
+    def runner_counts(self):
+        """Optional host-only monotonic backend counters, read outside timing."""
+        counts = dict(getattr(self.runner, "benchmark_counters", {}))
+        if any(
+            not isinstance(name, str) or type(value) is not int or value < 0
+            for name, value in counts.items()
+        ):
+            raise ValueError(
+                "benchmark_counters must map names to nonnegative integers"
+            )
+        return counts
+
     def forward(self, plan):
-        self._observe(plan)
-        return self.runner.forward(plan)
+        with _host_scope("benchmark.runner.forward"):
+            self._observe(plan)
+            return self.runner.forward(plan)
 
     def forward_distributed(self, plan, context, *, prepared=None):
-        self._observe(plan)
-        return (
-            self.runner.forward_distributed(plan, context)
-            if prepared is None
-            else self.runner.forward_distributed(plan, context, prepared=prepared)
-        )
+        with _host_scope("benchmark.runner.forward_distributed"):
+            self._observe(plan)
+            return (
+                self.runner.forward_distributed(plan, context)
+                if prepared is None
+                else self.runner.forward_distributed(plan, context, prepared=prepared)
+            )
 
     def enqueue(self, plan, *, feedback=None):
-        enqueue = getattr(self.runner, "enqueue", None)
-        if enqueue is None:
-            return self.forward(plan)
-        output = enqueue(plan, feedback=feedback)
-        if callable(getattr(output, "result", None)):
-            return _ObservedCompletion(self, plan, output)
-        self._observe(plan)
-        return output
+        with _host_scope("benchmark.runner.enqueue"):
+            enqueue = getattr(self.runner, "enqueue", None)
+            if enqueue is None:
+                return self.forward(plan)
+            output = enqueue(plan, feedback=feedback)
+            if callable(getattr(output, "result", None)):
+                return _ObservedCompletion(self, plan, output)
+            self._observe(plan)
+            return output
 
     def enqueue_distributed(self, plan, context, *, prepared=None, feedback=None):
-        enqueue = getattr(self.runner, "enqueue_distributed", None)
-        if enqueue is None:
-            return self.forward_distributed(plan, context, prepared=prepared)
-        kwargs = {"feedback": feedback}
-        if prepared is not None:
-            kwargs["prepared"] = prepared
-        output = enqueue(plan, context, **kwargs)
-        if callable(getattr(output, "result", None)):
-            return _ObservedCompletion(self, plan, output)
-        self._observe(plan)
-        return output
+        with _host_scope("benchmark.runner.enqueue_distributed"):
+            enqueue = getattr(self.runner, "enqueue_distributed", None)
+            if enqueue is None:
+                return self.forward_distributed(plan, context, prepared=prepared)
+            kwargs = {"feedback": feedback}
+            if prepared is not None:
+                kwargs["prepared"] = prepared
+            output = enqueue(plan, context, **kwargs)
+            if callable(getattr(output, "result", None)):
+                return _ObservedCompletion(self, plan, output)
+            self._observe(plan)
+            return output
 
     def speculation(self):
         stats = getattr(self.runner, "_speculation", None)
@@ -348,6 +384,18 @@ def distributed_reducer(groups):
                 key: sum(v.get("graph_counts", {}).get(key, 0) for v in values)
                 for key in {key for v in values for key in v.get("graph_counts", {})}
             },
+            **(
+                {
+                    "runner_counts": {
+                        key: sum(v.get("runner_counts", {}).get(key, 0) for v in values)
+                        for key in {
+                            key for v in values for key in v.get("runner_counts", {})
+                        }
+                    }
+                }
+                if any(v.get("runner_counts") for v in values)
+                else {}
+            ),
             "overlap_counts": {
                 key: sum(v.get("overlap_counts", {}).get(key, 0) for v in values)
                 for key in ("enqueues", "continuations")
@@ -372,9 +420,13 @@ def run_sweep(
     cases: Iterable[BenchCase],
     *,
     runner: BenchmarkRunner,
-    prompt_tokens: Sequence[int],
+    prompt_tokens: Sequence[int] | None = None,
+    prompt_batches: Mapping[int, Sequence[Sequence[int]]] | None = None,
+    sampling: Mapping[str, Any] | None = None,
     warmup_steps: int = 5,
     measure_steps: int = 20,
+    prefill_warmup_cohorts: int | None = None,
+    prefill_measure_cohorts: int | None = None,
     gpu_count: int = 1,
     attn_dp: int = 1,
     synchronize: Callable[[], None] = lambda: None,
@@ -407,6 +459,12 @@ def run_sweep(
     continuation guard; cache-page boundaries can still interrupt overlap.
     """
 
+    sampling = dict[str, Any]({"temperature": 0.0, **(sampling or {})})
+    if set(sampling) - {"temperature", "top_p", "top_k", "seed"}:
+        raise ValueError(
+            "benchmark sampling accepts temperature, top_p, top_k and seed"
+        )
+    SamplingParams(max_output_tokens=1, stop_token_ids=[], **sampling)
     for name, value, minimum in (
         ("warmup_steps", warmup_steps, 0),
         ("measure_steps", measure_steps, 1),
@@ -415,12 +473,21 @@ def run_sweep(
     ):
         if type(value) is not int or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
+    for name, value, minimum in (
+        ("prefill_warmup_cohorts", prefill_warmup_cohorts, 0),
+        ("prefill_measure_cohorts", prefill_measure_cohorts, 1),
+    ):
+        if value is not None and (type(value) is not int or value < minimum):
+            raise ValueError(f"{name} must be an integer >= {minimum}")
     if gpu_count % attn_dp:
         raise ValueError("gpu_count must be divisible by attn_dp")
     if attn_dp > 1 and reduce_step is None:
         raise ValueError("attention-DP benchmarks require a step reducer")
-    if not len(prompt_tokens):
-        raise ValueError("prompt_tokens must not be empty")
+    if prompt_batches is None:
+        if prompt_tokens is None or not len(prompt_tokens):
+            raise ValueError("prompt_tokens must not be empty")
+    elif prompt_tokens is not None:
+        raise ValueError("provide prompt_batches or prompt_tokens, not both")
     local = getattr(engine, "local", engine)
     overlap = bool(getattr(local, "overlap", False)) and callable(
         getattr(runner.runner, "enqueue", None)
@@ -456,6 +523,7 @@ def run_sweep(
         nonlocal previous_completion
         before_drafts, before_accepted = runner.speculation()
         before_graphs = runner.graph_counts()
+        before_counters = runner.runner_counts()
         before_overlap = getattr(local, "overlap_stats", (0, 0))
         runner._plan = None
         if not overlap:
@@ -468,7 +536,8 @@ def run_sweep(
         # Filling an empty pipeline produces no host result. Include any such
         # submission in the next completion interval, including boundary bubbles.
         while True:
-            events = engine.step()
+            with _host_scope("benchmark.engine.step"):
+                events = engine.step()
             if runner._plan is not None:
                 break
             if not getattr(local, "overlap_pending", False):
@@ -478,71 +547,102 @@ def run_sweep(
         finished = time.perf_counter()
         elapsed = finished - started
         previous_completion = finished
-        plan = runner._plan
-        if plan is None:
-            raise RuntimeError("Engine must use the supplied BenchmarkRunner")
-        drafts, accepted = runner.speculation()
-        graph_counts = runner.graph_counts()
-        after_overlap = getattr(local, "overlap_stats", (0, 0))
-        starts = getattr(
-            runner, "completed_context_lengths", plan.context_lengths
-        ).tolist()
-        if plan.phase == BatchPhase.PREFILL:
-            offsets = plan.token_indptr.tolist()
-            ends = [start + b - a for start, a, b in zip(starts, offsets, offsets[1:])]
-        else:
-            counts = Counter(event.request_id for event in events)
-            ends = [
-                start + counts[int(sequence)]
-                for start, sequence in zip(starts, plan.sequence_ids)
-            ]
-        measured = {
-            "seconds": elapsed,
-            "input_tokens": runner.observation["input_tokens"],
-            "sequences": runner.observation["sequences"],
-            "replica_sequences": [runner.observation["sequences"]],
-            "committed_tokens": len(events),
-            "drafts": drafts - before_drafts,
-            "accepted": accepted - before_accepted,
-            "context_start_min": min(starts),
-            "context_start_max": max(starts),
-            "context_end_min": min(ends),
-            "context_end_max": max(ends),
-            "device_phase_ms": (
-                getattr(runner, "last_dspark_phase_ms", None) or {}
-                if plan.phase == BatchPhase.DECODE
-                else {}
-            ),
-            "graph_counts": {
-                key: value - before_graphs.get(key, 0)
-                for key, value in graph_counts.items()
-            },
-            "overlap_counts": dict(
-                zip(
-                    ("enqueues", "continuations"),
-                    (
-                        after - before
-                        for before, after in zip(before_overlap, after_overlap)
-                    ),
-                    strict=True,
-                )
-            ),
-        }
-        return measured if defer_reduce else reduce(measured)
+        with _host_scope("benchmark.post_timer_bookkeeping"):
+            plan = runner._plan
+            if plan is None:
+                raise RuntimeError("Engine must use the supplied BenchmarkRunner")
+            drafts, accepted = runner.speculation()
+            graph_counts = runner.graph_counts()
+            counters = runner.runner_counts()
+            counter_deltas = {
+                key: value - before_counters.get(key, 0)
+                for key, value in counters.items()
+            }
+            if set(before_counters) - set(counters) or any(
+                value < 0 for value in counter_deltas.values()
+            ):
+                raise ValueError("benchmark_counters must be monotonic during a sweep")
+            after_overlap = getattr(local, "overlap_stats", (0, 0))
+            starts = getattr(
+                runner, "completed_context_lengths", plan.context_lengths
+            ).tolist()
+            if plan.phase == BatchPhase.PREFILL:
+                offsets = plan.token_indptr.tolist()
+                ends = [
+                    start + b - a for start, a, b in zip(starts, offsets, offsets[1:])
+                ]
+            else:
+                counts = Counter(event.request_id for event in events)
+                ends = [
+                    start + counts[int(sequence)]
+                    for start, sequence in zip(starts, plan.sequence_ids)
+                ]
+            measured = {
+                "seconds": elapsed,
+                "input_tokens": runner.observation["input_tokens"],
+                "sequences": runner.observation["sequences"],
+                "replica_sequences": [runner.observation["sequences"]],
+                "committed_tokens": len(events),
+                "drafts": drafts - before_drafts,
+                "accepted": accepted - before_accepted,
+                "context_start_min": min(starts),
+                "context_start_max": max(starts),
+                "context_end_min": min(ends),
+                "context_end_max": max(ends),
+                "device_phase_ms": (
+                    getattr(runner, "last_dspark_phase_ms", None) or {}
+                    if plan.phase == BatchPhase.DECODE
+                    else {}
+                ),
+                "graph_counts": {
+                    key: value - before_graphs.get(key, 0)
+                    for key, value in graph_counts.items()
+                },
+                **({"runner_counts": counter_deltas} if counter_deltas else {}),
+                "overlap_counts": dict(
+                    zip(
+                        ("enqueues", "continuations"),
+                        (
+                            after - before
+                            for before, after in zip(before_overlap, after_overlap)
+                        ),
+                        strict=True,
+                    )
+                ),
+            }
+            return measured if defer_reduce else reduce(measured)
 
     for case in cases:
         if case.batch_size > local.max_running_requests:
             raise ValueError("batch_size exceeds the engine request capacity")
         if case.context_length >= local.context_length:
             raise ValueError("context_length leaves no space for generated tokens")
-        tokens = (
-            list(prompt_tokens)
-            * ((case.context_length + len(prompt_tokens) - 1) // len(prompt_tokens))
-        )[: case.context_length]
+        cohort = None
+        if prompt_batches is not None:
+            cohort = prompt_batches.get(case.context_length)
+            if cohort is None or len(cohort) < case.batch_size:
+                raise ValueError("prompt corpus does not cover the requested cohort")
+            cohort = cohort[: case.batch_size]
+            if any(len(tokens) != case.context_length for tokens in cohort):
+                raise ValueError("corpus prompts must match the exact context length")
+            tokens = list(cohort[0])
+            if case.shared_prefix_tokens and any(
+                list(row[: case.shared_prefix_tokens])
+                != tokens[: case.shared_prefix_tokens]
+                for row in cohort
+            ):
+                raise ValueError("corpus prompts do not share the requested prefix")
+        else:
+            assert prompt_tokens is not None
+            tokens = (
+                list(prompt_tokens)
+                * ((case.context_length + len(prompt_tokens) - 1) // len(prompt_tokens))
+            )[: case.context_length]
         leases = []
         samples = []
         prefill_seconds = []
         warmed = 0
+        warmed_cohorts = 0
         result = None
         nonce = 0
         cached_tokens = []
@@ -553,14 +653,14 @@ def run_sweep(
             if not shared:
                 local.clear_prefix_cache()
             leases.clear()
-            for _ in range(case.batch_size):
-                request_tokens = tokens
+            for index in range(case.batch_size):
+                request_tokens = tokens if cohort is None else cohort[index]
                 if shared:
                     if nonce >= runner.vocab_size:
                         raise ValueError(
                             "shared-prefix sweep exhausted distinct private tokens"
                         )
-                    request_tokens = tokens.copy()
+                    request_tokens = list(request_tokens)
                     request_tokens[shared] = nonce
                     nonce += 1
                 lease = engine.submit(
@@ -568,7 +668,7 @@ def run_sweep(
                     sampling_params=SamplingParams(
                         max_output_tokens=max_output_tokens,
                         stop_token_ids=[],
-                        temperature=0.0,
+                        **sampling,
                     ),
                 )
                 leases.append(lease)
@@ -590,14 +690,29 @@ def run_sweep(
                     engine.submit(
                         tokens[:shared],
                         sampling_params=SamplingParams(
-                            max_output_tokens=1, stop_token_ids=[], temperature=0.0
+                            max_output_tokens=1, stop_token_ids=[], **sampling
                         ),
                     )
                 )
                 while not leases[0].done:
                     step()  # Seed the one shared prefix outside warmup/measurement.
             if case.phase == "prefill":
-                for target, measured in ((warmup_steps, False), (measure_steps, True)):
+                for target, measured, complete_cohorts in (
+                    (
+                        prefill_warmup_cohorts
+                        if prefill_warmup_cohorts is not None
+                        else warmup_steps,
+                        False,
+                        prefill_warmup_cohorts is not None,
+                    ),
+                    (
+                        prefill_measure_cohorts
+                        if prefill_measure_cohorts is not None
+                        else measure_steps,
+                        True,
+                        prefill_measure_cohorts is not None,
+                    ),
+                ):
                     count = 0
                     while count < target:
                         admit(1)
@@ -606,14 +721,19 @@ def run_sweep(
                             result = step()
                             if runner.observation["phase"] != "prefill":
                                 raise RuntimeError("prefill benchmark entered decode")
-                            count += 1
+                            if not complete_cohorts:
+                                count += 1
+                            if not measured:
+                                warmed += 1
                             if measured:
                                 samples.append(result)
                                 cohort_seconds += result["seconds"]
                         if measured:
                             prefill_seconds.append(cohort_seconds)
-                        if not measured:
-                            warmed = count
+                        else:
+                            warmed_cohorts += 1
+                        if complete_cohorts:
+                            count += 1
             else:
                 maximum = decode_output_budget(
                     warmup_steps=warmup_steps,
@@ -699,7 +819,15 @@ def run_sweep(
                     "warmup_steps": warmed,
                     "measure_steps": len(samples),
                     "step_seconds": seconds,
-                    **({"prefill_seconds": prefill_seconds} if prefill_seconds else {}),
+                    **(
+                        {
+                            "prefill_seconds": prefill_seconds,
+                            "prefill_warmup_cohorts": warmed_cohorts,
+                            "prefill_measure_cohorts": len(prefill_seconds),
+                        }
+                        if prefill_seconds
+                        else {}
+                    ),
                     **(
                         {
                             "device_phase_ms": [
@@ -719,6 +847,23 @@ def run_sweep(
                         key: sum(s["graph_counts"].get(key, 0) for s in samples)
                         for key in {key for s in samples for key in s["graph_counts"]}
                     },
+                    **(
+                        {
+                            "runner_counts": {
+                                key: sum(
+                                    s.get("runner_counts", {}).get(key, 0)
+                                    for s in samples
+                                )
+                                for key in {
+                                    key
+                                    for s in samples
+                                    for key in s.get("runner_counts", {})
+                                }
+                            }
+                        }
+                        if any(s.get("runner_counts") for s in samples)
+                        else {}
+                    ),
                     "overlap_counts": {
                         key: sum(
                             s.get("overlap_counts", {}).get(key, 0) for s in samples

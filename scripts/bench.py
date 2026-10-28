@@ -36,6 +36,29 @@ from resin.bench import decode_output_budget, perfetto_trace
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _prefill_budget(cases, maximum):
+    """Bound complete prefill cohorts without reducing the decode sweep."""
+    if type(maximum) is not int or maximum < 0:
+        raise ValueError("max_prefill_tokens must be an integer >= 0")
+    retained, skipped = [], []
+    for case in cases:
+        tokens = case["context_length"] * case["batch_size"]
+        if maximum and case["phase"] == "prefill" and tokens > maximum:
+            skipped.append(
+                dict(
+                    **case,
+                    reason="prefill_token_budget",
+                    input_tokens=tokens,
+                    max_prefill_tokens=maximum,
+                )
+            )
+        else:
+            retained.append(case)
+    if cases and not retained:
+        raise ValueError("no benchmark cases fit max_prefill_tokens")
+    return retained, skipped
+
+
 def _runner(model, checkpoint, *, device, groups, cases, options, context_capacity):
     spec = get_model(model)
     batches = sorted({case.batch_size for case in cases})
@@ -108,7 +131,7 @@ def _cache_preflight(raw, cases, options, groups=None):
     """Reject a partial decode cohort before spending time on capture or prefill."""
     plan = getattr(raw, "cache_capacity_plan", None)
     if plan is None:
-        return
+        return cases, []
     layout = raw.cache_layout
     requirements = []
     for case in cases:
@@ -155,6 +178,36 @@ def _cache_preflight(raw, cases, options, groups=None):
         for row in requirements
         if row["required_parents"] > layout.parent_capacity
     ]
+    if options.get("skip_capacity_exceeded", False):
+        rejected = {
+            index: dict(rank=rank, **row, capacity=layout.parent_capacity)
+            for index, row in enumerate(requirements)
+            if row["required_parents"] > layout.parent_capacity
+        }
+        peers = [rejected]
+        if groups is not None and groups.domain.size > 1:
+            peers = [None] * groups.domain.size
+            groups.distributed.all_gather_object(
+                peers, rejected, group=groups.domain.handle
+            )
+        rejected_indices = {index for peer in peers for index in peer}
+        skipped = [
+            dict(
+                **asdict(case),
+                reason="kv_cache_capacity",
+                rank_requirements=[peer[index] for peer in peers if index in peer],
+            )
+            for index, case in enumerate(cases)
+            if index in rejected_indices
+        ]
+        retained = [
+            case for index, case in enumerate(cases) if index not in rejected_indices
+        ]
+        if not retained:
+            raise ValueError("no benchmark cases fit the resident KV cache")
+        if rank == 0 and skipped:
+            print("[bench-capacity-skips] " + json.dumps(skipped), flush=True)
+        return retained, skipped
     errors = [failures]
     if groups is not None and groups.domain.size > 1:
         errors = [None] * groups.domain.size
@@ -164,6 +217,7 @@ def _cache_preflight(raw, cases, options, groups=None):
     failures = [failure for values in errors if values for failure in values]
     if failures:
         raise ValueError("benchmark cache preflight failed: " + "; ".join(failures))
+    return cases, []
 
 
 def _rank(
@@ -203,6 +257,25 @@ def _rank(
         )
         groups = ParallelGroups.create(topology)
     cases = [BenchCase(**case) for case in case_values]
+    prompt_batches = None
+    prompt_metadata = {"prompt_source_id": "deterministic-token-ids-v1"}
+    if options.get("prompt_source", "sharegpt") == "sharegpt":
+        from resin.bench_prompts import load_prompt_artifact
+
+        if not options.get("prompt_corpus"):
+            raise ValueError("ShareGPT benchmarks require a saved --prompt-corpus")
+        artifact = load_prompt_artifact(options["prompt_corpus"])
+        prompt_metadata = artifact.metadata
+        replica = 0 if groups is None else groups.attn_dp.local_rank
+        prompt_batches = {}
+        for context in {case.context_length for case in cases}:
+            batch = max(
+                case.batch_size for case in cases if case.context_length == context
+            )
+            rows = artifact.cohort(context, batch * topology.attn_dp)
+            # At every smaller B, the replicas must collectively consume the
+            # first B * attention-DP rows, not separated max-batch blocks.
+            prompt_batches[context] = rows[replica :: topology.attn_dp]
     prefill_budget = (
         max(case.batch_size for case in cases) * options["prefill_chunk_size"]
     )
@@ -224,7 +297,7 @@ def _rank(
     # A batch is a cohort per attention replica; never exceed the runner's
     # supported flattened row count when prefill spans several requests.
     prefill_budget = min(prefill_budget, raw.runner_config.max_batch_tokens)
-    _cache_preflight(raw, cases, options, groups)
+    cases, capacity_skips = _cache_preflight(raw, cases, options, groups)
     observed = BenchmarkRunner(
         raw,
         accepted_drafts=options["accepted_drafts"],
@@ -247,6 +320,8 @@ def _rank(
     metadata = {
         **options["metadata"],
         "model": model,
+        "implementation": "resin",
+        "implementation_version": resin.__version__,
         "checkpoint": str(checkpoint),
         "hardware": torch.cuda.get_device_name(rank),
         "parallelism": {
@@ -267,7 +342,19 @@ def _rank(
         "prefill_chunk_size": options["prefill_chunk_size"],
         "context_capacity": capacity,
         "max_batch_tokens": prefill_budget,
+        "capacity_skipped_cases": capacity_skips,
+        "max_prefill_tokens": options.get("max_prefill_tokens", 131072),
+        "budget_skipped_cases": options.get("budget_skipped_cases", []),
+        "prompt_workload": prompt_metadata,
+        "sampling": options.get("sampling", {"temperature": 0.0}),
+        "sampling_filter_order": "top-p-then-top-k",
     }
+    spec = get_model(model)
+    if options["draft_tokens"] and spec.assistant is not None:
+        metadata.update(
+            assistant_repo_id=spec.assistant.repo_id,
+            assistant_revision=spec.assistant.revision,
+        )
     engine_options: dict[str, Any] = dict(
         max_running_requests=max(case.batch_size for case in cases),
         context_length=capacity,
@@ -288,19 +375,25 @@ def _rank(
         else DistributedEngine(worker, **engine_options)
     )
     try:
-        # A seeded synthetic prompt avoids tokenization overhead and special
-        # token stops. Every replica has distinct, reproducible input tokens.
-        generator = torch.Generator().manual_seed(41 + rank)
-        prompt = torch.randint(
-            1000, min(30_000, raw.vocab_size), (capacity,), generator=generator
-        ).tolist()
+        prompt = None
+        if prompt_batches is None:
+            # Synthetic requests are an explicit reproducibility mode. Primary
+            # natural-MTP curves use saved, chat-templated ShareGPT cohorts.
+            generator = torch.Generator().manual_seed(41 + rank)
+            prompt = torch.randint(
+                1000, min(30_000, raw.vocab_size), (capacity,), generator=generator
+            ).tolist()
         run_sweep(
             engine,
             cases,
             runner=observed,
             prompt_tokens=prompt,
+            prompt_batches=prompt_batches,
+            sampling=options.get("sampling"),
             warmup_steps=options["warmup_steps"],
             measure_steps=options["measure_steps"],
+            prefill_warmup_cohorts=options.get("prefill_warmup_cohorts", 1),
+            prefill_measure_cohorts=options.get("prefill_measure_cohorts", 3),
             gpu_count=topology.world_size,
             attn_dp=topology.attn_dp,
             synchronize=torch.cuda.synchronize,
@@ -333,6 +426,20 @@ def _validate_configuration(model, cases, topology, options):
     from resin.bench import BenchCase
 
     spec = get_model(model)
+    from resin import SamplingParams
+
+    sampling: dict[str, Any] = options.get("sampling") or {"temperature": 0.0}
+    if set(sampling) - {"temperature", "top_p", "top_k", "seed"}:
+        raise ValueError(
+            "benchmark sampling accepts temperature, top_p, top_k and seed"
+        )
+    SamplingParams(max_output_tokens=1, stop_token_ids=[], **sampling)
+    if options.get("prompt_source", "sharegpt") not in {"sharegpt", "synthetic"}:
+        raise ValueError("prompt_source must be sharegpt or synthetic")
+    if options.get("prompt_source", "sharegpt") == "synthetic" and options.get(
+        "prompt_corpus"
+    ):
+        raise ValueError("synthetic prompts cannot be combined with a ShareGPT corpus")
     draft_tokens = options["draft_tokens"]
     accepted_drafts = options["accepted_drafts"]
     expert_backend = options["expert_backend"]
@@ -341,10 +448,20 @@ def _validate_configuration(model, cases, topology, options):
     for name, minimum in (
         ("warmup_steps", 0),
         ("measure_steps", 1),
+        ("prefill_warmup_cohorts", 0),
+        ("prefill_measure_cohorts", 1),
+        ("max_prefill_tokens", 0),
         ("prefill_chunk_size", 1),
         ("draft_tokens", 0),
     ):
-        value = options[name]
+        value = options.get(
+            name,
+            {
+                "prefill_warmup_cohorts": 1,
+                "prefill_measure_cohorts": 3,
+                "max_prefill_tokens": 131072,
+            }.get(name),
+        )
         if type(value) is not int or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
     if accepted_drafts is not None and type(accepted_drafts) is not int:
@@ -362,7 +479,7 @@ def _validate_configuration(model, cases, topology, options):
         raise ValueError(
             "Inkling requires one GPU, five draft tokens, and prefill_chunk_size=4096"
         )
-    if spec.family in {"gemma4", "qwen3_5"} and prefill_chunk_size > 4096:
+    if spec.family == "qwen3_5" and prefill_chunk_size > 4096:
         raise ValueError(f"{model} supports prefill chunks up to 4096 tokens")
     if spec.family == "glm5_3_flash":
         if (
@@ -402,9 +519,12 @@ def _validate_configuration(model, cases, topology, options):
     if spec.family in {"gpt_oss", "gemma4"} and options["decode_graph"] != "disabled":
         from resin.backend.cuda.graphs import DEFAULT_MAX_NUM_SEQS
 
-        if max(case["batch_size"] for case in cases) > DEFAULT_MAX_NUM_SEQS:
+        graph_capacity = (
+            spec.max_batch_size if model == "gemma4-e2b" else DEFAULT_MAX_NUM_SEQS
+        )
+        if max(case["batch_size"] for case in cases) > graph_capacity:
             raise ValueError(
-                f"{model} decode graph batch capacity is {DEFAULT_MAX_NUM_SEQS}; disable decode graphs for larger cohorts"
+                f"{model} decode graph batch capacity is {graph_capacity}; disable decode graphs for larger cohorts"
             )
     if (
         draft_tokens < 0
@@ -437,7 +557,11 @@ def run_benchmark(
     balanced_experts: bool = False,
     warmup_steps: int = 5,
     measure_steps: int = 20,
-    prefill_chunk_size: int = 4096,
+    prefill_warmup_cohorts: int = 1,
+    prefill_measure_cohorts: int = 3,
+    max_prefill_tokens: int = 131072,
+    budget_skipped_cases: list[dict] | None = None,
+    prefill_chunk_size: int | None = None,
     prefill_graph: str = "breakable",
     decode_graph: str = "full",
     gpu_memory_utilization: float = 0.9,
@@ -449,6 +573,10 @@ def run_benchmark(
     trace_dir: str | None = None,
     assistant_checkpoint: str | Path | None = None,
     progress_path: str | Path | None = None,
+    skip_capacity_exceeded: bool = False,
+    prompt_source: str = "sharegpt",
+    prompt_corpus: str | Path | None = None,
+    sampling: dict | None = None,
 ) -> list[dict]:
     """One load and graph catalog for all compatible points in this sweep.
 
@@ -457,6 +585,9 @@ def run_benchmark(
     outside timing; successful results also include worker NUMA placement.
     """
     spec = get_model(model)
+    cases, skipped = _prefill_budget(cases, max_prefill_tokens)
+    if prefill_chunk_size is None:
+        prefill_chunk_size = spec.prefill_chunk_size
     topology = parallelism or Parallelism()
     draft_tokens = spec.draft_tokens if draft_tokens is None else draft_tokens
     expert_backend = spec.expert_backend if expert_backend is None else expert_backend
@@ -466,6 +597,10 @@ def run_benchmark(
         balanced_experts=balanced_experts,
         warmup_steps=warmup_steps,
         measure_steps=measure_steps,
+        prefill_warmup_cohorts=prefill_warmup_cohorts,
+        prefill_measure_cohorts=prefill_measure_cohorts,
+        max_prefill_tokens=max_prefill_tokens,
+        budget_skipped_cases=[*(budget_skipped_cases or []), *skipped],
         prefill_chunk_size=prefill_chunk_size,
         prefill_graph=prefill_graph,
         decode_graph=decode_graph,
@@ -479,6 +614,16 @@ def run_benchmark(
         assistant_checkpoint=None
         if assistant_checkpoint is None
         else str(assistant_checkpoint),
+        skip_capacity_exceeded=skip_capacity_exceeded,
+        prompt_source=prompt_source,
+        prompt_corpus=None if prompt_corpus is None else str(prompt_corpus),
+        sampling={
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": None,
+            "seed": 41,
+            **(sampling or {}),
+        },
     )
     _validate_configuration(model, cases, topology, options)
     if torch.cuda.device_count() < topology.world_size:
@@ -570,6 +715,18 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", choices=MODEL_SPECS, required=True)
     parser.add_argument("--backend", choices=("local", "modal"), default="local")
     parser.add_argument(
+        "--prompt-source",
+        choices=("sharegpt", "synthetic"),
+        default="sharegpt",
+        help="primary workload is saved chat-templated ShareGPT; synthetic reproduces older controls",
+    )
+    parser.add_argument(
+        "--prompt-corpus",
+        type=Path,
+        default=os.environ.get("RESIN_BENCH_PROMPT_CORPUS"),
+        help="saved ShareGPT token artifact prepared with python -m resin.bench_prompts",
+    )
+    parser.add_argument(
         "--checkpoint",
         type=Path,
         help="local checkpoint directory; required for local runs",
@@ -616,6 +773,10 @@ def argument_parser() -> argparse.ArgumentParser:
         help="decode batches (default: 1,2,4,8,16,32,64)",
     )
     parser.add_argument("--shared-prefix-tokens", type=int, default=0)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int)
+    parser.add_argument("--seed", type=int, default=41)
     parser.add_argument(
         "--draft-tokens",
         type=int,
@@ -634,6 +795,26 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measure-steps", type=int, default=20)
     parser.add_argument(
+        "--prefill-warmup-steps",
+        dest="prefill_warmup_cohorts",
+        type=int,
+        default=1,
+        help="complete prefill cohorts to warm up (independent of decode steps)",
+    )
+    parser.add_argument(
+        "--prefill-measure-steps",
+        dest="prefill_measure_cohorts",
+        type=int,
+        default=3,
+        help="complete prefill cohorts to measure (independent of decode steps)",
+    )
+    parser.add_argument(
+        "--max-prefill-tokens",
+        type=int,
+        default=131072,
+        help="maximum context × batch per prefill cohort per attention replica; 0 disables the cap",
+    )
+    parser.add_argument(
         "--prefill-chunk-size",
         type=int,
         help="execution chunk size, separate from prompt length (default: model preset, at least 4096; subject to kernel limits)",
@@ -647,6 +828,11 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-memory-utilization", type=float)
     parser.add_argument("--expert-backend", choices=("flashinfer", "deepgemm"))
     parser.add_argument("--profile-graph-phases", action="store_true")
+    parser.add_argument(
+        "--skip-capacity-exceeded",
+        action="store_true",
+        help="measure fitting cohorts and record KV-capacity skips instead of aborting the sweep",
+    )
     parser.add_argument(
         "--overlap", action=argparse.BooleanOptionalAction, default=True
     )
@@ -721,6 +907,7 @@ def _configuration(args):
         for context in contexts[phase]
         for batch in batches[phase]
     ]
+    cases, budget_skips = _prefill_budget(cases, args.max_prefill_tokens)
     chunk = (
         max(4096, spec.prefill_chunk_size)
         if args.prefill_chunk_size is None
@@ -745,6 +932,10 @@ def _configuration(args):
         balanced_experts=args.balanced_experts,
         warmup_steps=args.warmup_steps,
         measure_steps=args.measure_steps,
+        prefill_warmup_cohorts=args.prefill_warmup_cohorts,
+        prefill_measure_cohorts=args.prefill_measure_cohorts,
+        max_prefill_tokens=args.max_prefill_tokens,
+        budget_skipped_cases=budget_skips,
         prefill_chunk_size=chunk,
         prefill_graph=args.prefill_graph,
         decode_graph=args.decode_graph,
@@ -757,6 +948,15 @@ def _configuration(args):
         profile_graph_phases=args.profile_graph_phases,
         overlap=args.overlap,
         numa=args.numa,
+        skip_capacity_exceeded=args.skip_capacity_exceeded,
+        prompt_source=args.prompt_source,
+        prompt_corpus=args.prompt_corpus,
+        sampling=dict(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            seed=args.seed,
+        ),
     )
     _validate_configuration(spec.name, cases, parallelism, options)
     return spec, cases, parallelism, options
@@ -796,6 +996,25 @@ def main(argv=None) -> None:
     except (ValueError, TypeError) as error:
         parser.error(str(error))
     options["metadata"] = source_metadata()
+    if args.prompt_source == "sharegpt":
+        from resin.bench_prompts import load_prompt_artifact
+
+        if args.prompt_corpus is None:
+            parser.error(
+                "ShareGPT benchmarks require --prompt-corpus; prepare it with python -m resin.bench_prompts"
+            )
+        try:
+            artifact = load_prompt_artifact(args.prompt_corpus)
+            for case in cases:
+                artifact.cohort(
+                    case["context_length"], case["batch_size"] * topology.attn_dp
+                )
+            if artifact.metadata["tokenizer"]["revision"] != spec.revision:
+                raise ValueError(
+                    "prompt artifact must use the pinned checkpoint tokenizer revision"
+                )
+        except (OSError, KeyError, ValueError) as error:
+            parser.error(str(error))
     if args.backend == "modal":
         from uuid import uuid4
 
@@ -806,6 +1025,13 @@ def main(argv=None) -> None:
         remote_trace_dir = f"/bench-traces/{uuid4().hex}" if args.trace_dir else None
         options["trace_dir"] = remote_trace_dir
         with modal.enable_output(), modal_bench.app.run():
+            if args.prompt_source == "sharegpt":
+                remote_corpus = (
+                    f"/prompt-corpora/{artifact.digest}/{artifact.path.name}"
+                )
+                with modal_bench.TRACE_VOLUME.batch_upload(force=True) as upload:
+                    upload.put_file(artifact.path, remote_corpus)
+                options["prompt_corpus"] = "/bench-traces" + remote_corpus
             records = modal_bench.sweep.with_options(
                 gpu=f"{args.gpu or spec.gpu}:{topology.world_size}"
             ).remote(
