@@ -150,8 +150,23 @@ pub struct RunnerConfig {
     pub max_batch_tokens: Option<NonZeroU32>,
     pub prefill_chunk_size: Option<NonZeroU32>,
     pub continuation_prefill: bool,
+    /// Maximum additional committed outputs from one decode invocation.
     pub cache_write_lookahead_tokens: u32,
+    /// Preferred decode write span reserved before dispatch, including the input
+    /// token. Zero retains the single-step reservation and same-page overlap
+    /// contract. A nonzero span opts into immutable, cross-page continuation
+    /// tables; the runner must resolve actual GPU positions within those tables.
+    /// Cohorts too close to an output/context limit reserve one step instead.
+    pub cache_write_reservation_tokens: u32,
     pub cache_layout: Option<KvLayout>,
+}
+
+impl RunnerConfig {
+    fn decode_reservation_lookahead(&self) -> u32 {
+        self.cache_write_reservation_tokens
+            .checked_sub(1)
+            .unwrap_or(self.cache_write_lookahead_tokens)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -538,6 +553,32 @@ impl<P: Clone> EngineCore<P> {
                 "cache_write_lookahead_tokens requires cache_layout",
             ));
         }
+        if runner_config.cache_write_reservation_tokens > 0 {
+            if runner_config.cache_layout.is_none() {
+                return Err(Error::invalid(
+                    "cache_write_reservation_tokens requires cache_layout",
+                ));
+            }
+            if u64::from(runner_config.cache_write_reservation_tokens)
+                < 2 * (u64::from(runner_config.cache_write_lookahead_tokens) + 1)
+            {
+                return Err(Error::invalid(
+                    "cache_write_reservation_tokens must cover two maximum decode steps",
+                ));
+            }
+            if runner_config
+                .cache_layout
+                .as_ref()
+                .expect("reservation has a layout")
+                .groups()
+                .iter()
+                .any(|group| group.is_recurrent())
+            {
+                return Err(Error::invalid(
+                    "cross-page decode reservations require token-addressed cache groups",
+                ));
+            }
+        }
         let kv_resources = runner_config
             .cache_layout
             .as_ref()
@@ -552,10 +593,10 @@ impl<P: Clone> EngineCore<P> {
         if let Some(limit) = kv_resources
             .as_ref()
             .and_then(PagedKvResources::max_write_tokens)
-            && u64::from(runner_config.cache_write_lookahead_tokens) + 1 > u64::from(limit.get())
+            && u64::from(runner_config.decode_reservation_lookahead()) + 1 > u64::from(limit.get())
         {
             return Err(Error::invalid(
-                "decode cache write lookahead exceeds the Window read/write capacity",
+                "decode cache write reservation exceeds the Window read/write capacity",
             ));
         }
         let new_token_ratio = scheduler_config.initial_new_token_ratio();
@@ -1022,11 +1063,37 @@ impl<P: Clone> EngineCore<P> {
                 .cache_layout
                 .as_ref()
                 .is_some_and(|layout| {
-                    layout.groups().iter().all(|group| {
-                        plan.context_lengths.iter().all(|&start| {
-                            let block = u64::from(group.block_tokens().get());
-                            u64::from(start) / block == (u64::from(start) + 2 * maximum - 1) / block
-                        })
+                    layout.groups().iter().enumerate().all(|(index, group)| {
+                        plan.context_lengths
+                            .iter()
+                            .enumerate()
+                            .all(|(row, &start)| {
+                                let block = u64::from(group.block_tokens().get());
+                                if self.runner_config.cache_write_reservation_tokens == 0 {
+                                    u64::from(start) / block
+                                        == (u64::from(start) + 2 * maximum - 1) / block
+                                } else {
+                                    // The page table is the frozen lease envelope,
+                                    // not a promise that new pages may be allocated.
+                                    // Full-page leases permit further continuations
+                                    // only until the last already-pinned page ends.
+                                    let table = &plan.cache_groups[index];
+                                    let first = u64::from(table.block_table_start_indices[row]);
+                                    let count = u64::from(
+                                        table.block_indptr[row + 1] - table.block_indptr[row],
+                                    );
+                                    let earliest_read = group
+                                        .read_window_tokens()
+                                        .map_or(0, |window| start.saturating_sub(window.get() - 1));
+                                    let lease_end = (first + count) * block;
+                                    !group.is_recurrent()
+                                        && u64::from(earliest_read) / block >= first
+                                        && u64::from(start) + 2 * maximum <= lease_end
+                                        && group.max_write_tokens().is_none_or(|limit| {
+                                            lease_end - u64::from(start) <= u64::from(limit.get())
+                                        })
+                                }
+                            })
                     })
                 });
         self.continuation = allowed.then(|| plan.clone());
@@ -1060,12 +1127,20 @@ impl<P: Clone> EngineCore<P> {
                 .expect("continuation keeps resources")
                 .groups(),
         ) {
-            for (offset, &position) in group
-                .append_block_offsets
-                .iter_mut()
-                .zip(&plan.context_lengths)
-            {
-                *offset = position % layout.block_tokens().get();
+            for (row, &position) in plan.context_lengths.iter().enumerate() {
+                group.append_block_offsets[row] = position % layout.block_tokens().get();
+                if self.runner_config.cache_write_reservation_tokens > 0 {
+                    let logical = position / layout.block_tokens().get();
+                    let relative = logical
+                        .checked_sub(group.block_table_start_indices[row])
+                        .ok_or_else(|| Error::internal("continuation precedes its KV lease"))?;
+                    let address = group.block_indptr[row] + relative;
+                    if address >= group.block_indptr[row + 1] {
+                        return Err(Error::internal("continuation exceeds its KV lease"));
+                    }
+                    group.append_slab_ids[row] = group.block_slab_ids[address as usize];
+                    group.append_slotnums[row] = group.block_slotnums[address as usize];
+                }
             }
         }
         Ok(Some(plan))
@@ -1134,7 +1209,7 @@ impl<P: Clone> EngineCore<P> {
             return Ok(None);
         }
 
-        let (scheduled_rows, selection) = {
+        let (scheduled_rows, selection, mut decode_reservation_lookahead) = {
             let (selected_requests, mut selection) = self.selected_cohort()?;
             if selected_requests.is_empty() {
                 return Ok(None);
@@ -1164,7 +1239,28 @@ impl<P: Clone> EngineCore<P> {
                 ));
             }
             selection.truncate(scheduled_rows.len());
-            (scheduled_rows, selection)
+            let maximum = u64::from(self.runner_config.cache_write_lookahead_tokens) + 1;
+            let reserve_continuation = self.runner_config.cache_write_reservation_tokens > 0
+                && scheduled_rows
+                    .iter()
+                    .zip(&selected_requests)
+                    .all(|(row, request)| {
+                        row.phase == Phase::Decode
+                            && request
+                                .max_output_tokens
+                                .saturating_sub(request.generated.len())
+                                as u64
+                                > 2 * maximum
+                            && u64::from(row.token_start())
+                                + u64::from(self.runner_config.cache_write_reservation_tokens)
+                                <= u64::from(self.context_length.get())
+                    });
+            let lookahead = if reserve_continuation {
+                self.runner_config.decode_reservation_lookahead()
+            } else {
+                self.runner_config.cache_write_lookahead_tokens
+            };
+            (scheduled_rows, selection, lookahead)
         };
         let batch_id = self.next_batch_id;
         self.next_batch_id = self
@@ -1175,15 +1271,41 @@ impl<P: Clone> EngineCore<P> {
             let end = row
                 .token_end()
                 .ok_or_else(|| Error::invalid("scheduled token range overflows u32"))?;
-            if row.phase == Phase::Decode
-                && end
-                    .checked_add(self.runner_config.cache_write_lookahead_tokens)
-                    .is_none()
+            if row.phase == Phase::Decode && end.checked_add(decode_reservation_lookahead).is_none()
             {
                 return Err(Error::invalid("decode cache write lookahead overflows u32"));
             }
         }
         let mut scheduled = self.scheduler.take_selected(selection);
+
+        if decode_reservation_lookahead > self.runner_config.cache_write_lookahead_tokens {
+            let resources = self.kv_resources.as_ref().expect("reservation has a cache");
+            let requests = scheduled
+                .iter()
+                .zip(&scheduled_rows)
+                .map(|(request, row)| {
+                    (
+                        request
+                            .cache
+                            .as_ref()
+                            .expect("managed request has cache state"),
+                        row.token_start(),
+                        row.token_end().expect("validated scheduled range")
+                            + decode_reservation_lookahead,
+                    )
+                })
+                .collect::<Vec<_>>();
+            match resources.can_ensure_contexts(&requests) {
+                Ok(true) => {}
+                Ok(false) => {
+                    decode_reservation_lookahead = self.runner_config.cache_write_lookahead_tokens
+                }
+                Err(error) => {
+                    self.scheduler.restore_rejected(scheduled);
+                    return Err(Error::from(error));
+                }
+            }
+        }
 
         let growth_error = if let Some(resources) = self.kv_resources.as_mut() {
             let mut growth_error = None;
@@ -1191,7 +1313,7 @@ impl<P: Clone> EngineCore<P> {
                 let scheduled_end = row.token_end().expect("validated scheduled range");
                 let context = if row.phase == Phase::Decode {
                     scheduled_end
-                        .checked_add(self.runner_config.cache_write_lookahead_tokens)
+                        .checked_add(decode_reservation_lookahead)
                         .expect("validated decode lookahead")
                 } else {
                     scheduled_end
@@ -1231,11 +1353,7 @@ impl<P: Clone> EngineCore<P> {
                             .expect("managed requests keep their cache state"),
                     })
                     .collect::<Vec<_>>();
-                match resources.acquire(
-                    &requests,
-                    &scheduled_rows,
-                    self.runner_config.cache_write_lookahead_tokens,
-                ) {
+                match resources.acquire(&requests, &scheduled_rows, decode_reservation_lookahead) {
                     Ok(acquired) => Some(acquired),
                     Err(error) => {
                         self.scheduler.restore_rejected(scheduled);
@@ -2077,8 +2195,13 @@ impl<P: Clone> EngineCore<P> {
             }
             let maximum = u64::from(self.runner_config.cache_write_lookahead_tokens) + 1;
             if row.request.cache.is_some() && tokens.len() as u64 > maximum {
+                let limit = if self.runner_config.cache_write_reservation_tokens > 0 {
+                    format!("declared output maximum is {maximum}")
+                } else {
+                    format!("leased cache space for at most {maximum}")
+                };
                 return Err(Error::internal(format!(
-                    "runner returned {} decode tokens but leased cache space for at most {maximum}",
+                    "runner returned {} decode tokens but {limit}",
                     tokens.len(),
                 )));
             }

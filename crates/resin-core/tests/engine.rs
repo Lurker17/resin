@@ -722,6 +722,422 @@ fn unsafe_decode_boundaries_fall_back_before_enqueuing_a_continuation() {
     }
 }
 
+fn cross_page_engine(prefix_cache: bool) -> EngineCore<&'static str> {
+    EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    64,
+                    vec![
+                        KvGroupLayout::new(4, 2, KvRetention::FullContext).unwrap(),
+                        KvGroupLayout::new(
+                            4,
+                            1,
+                            KvRetention::SlidingWindow {
+                                tokens: NonZeroU32::new(15).unwrap(),
+                            },
+                        )
+                        .unwrap()
+                        .with_read_window_tokens(4)
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+            ),
+            cache_write_lookahead_tokens: 3,
+            cache_write_reservation_tokens: 8,
+            continuation_prefill: true,
+            ..Default::default()
+        },
+        4,
+        256,
+        SchedulerConfig::default(),
+        prefix_cache,
+    )
+    .unwrap()
+}
+
+#[test]
+fn cross_page_continuation_reserves_pages_and_updates_physical_append_addresses() {
+    let mut engine = cross_page_engine(false);
+    let mut model = Model::default();
+    let requests: Vec<_> = [31, 32]
+        .into_iter()
+        .map(|length| engine.submit(input(vec![1; length], 40)).unwrap())
+        .collect();
+    while engine.next_phase().unwrap() == Some(resin_core::Phase::Prefill) {
+        engine.step(&mut model).unwrap();
+    }
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert_eq!(plan.context_lengths, [31, 32]);
+    assert!(engine.retain_continuation(&plan));
+    let next = engine.continuation_plan().unwrap().unwrap();
+    assert_eq!(next.context_lengths, [35, 36]);
+    for (old, new) in plan.cache_groups.iter().zip(&next.cache_groups) {
+        assert_eq!(old.block_indptr, new.block_indptr);
+        assert_eq!(old.block_slab_ids, new.block_slab_ids);
+        assert_eq!(old.block_slotnums, new.block_slotnums);
+        assert_eq!(old.block_table_start_indices, new.block_table_start_indices);
+        for (row, &position) in next.context_lengths.iter().enumerate() {
+            let logical = position / 4;
+            let index =
+                (old.block_indptr[row] + logical - old.block_table_start_indices[row]) as usize;
+            assert_eq!(new.append_slab_ids[row], old.block_slab_ids[index]);
+            assert_eq!(new.append_slotnums[row], old.block_slotnums[index]);
+            assert_eq!(new.append_block_offsets[row], position % 4);
+            assert_ne!(
+                (new.append_slab_ids[row], new.append_slotnums[row]),
+                (old.append_slab_ids[row], old.append_slotnums[row])
+            );
+            // The earliest query's complete four-token local window and all
+            // eight possible writes are in this immutable physical lease.
+            assert!(old.block_table_start_indices[row] <= (plan.context_lengths[row] - 3) / 4);
+            assert!(
+                old.block_table_start_indices[row] + old.block_indptr[row + 1]
+                    - old.block_indptr[row]
+                    >= (plan.context_lengths[row] + 8).div_ceil(4)
+            );
+        }
+    }
+    let leased = engine.cache_free_parent_count();
+    // Different accepted lengths keep the same dense row/page ownership. The
+    // next two-step envelope no longer fits row one's local table, so the
+    // already-enqueued successor completes before normal reacquisition.
+    engine
+        .complete_continuing_step_with(&mut model, TokenRows::new(&[3, 4, 5, 6, 7], &[0, 1, 5]), Ok)
+        .unwrap();
+    assert_eq!(engine.cache_free_parent_count(), leased);
+    assert!(!engine.has_continuation());
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[8, 9], &[0, 1, 2]), Ok)
+        .unwrap();
+    let refreshed = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert_eq!(refreshed.context_lengths, [33, 37]);
+    assert!(engine.retain_continuation(&refreshed));
+    engine
+        .complete_step_with(&mut model, Err(Error::rejected("not launched")), Ok)
+        .unwrap_err();
+    engine.close(&mut model).unwrap();
+    assert_eq!(model.released.len(), requests.len());
+    assert_eq!(engine.cache_free_parent_count(), Some(64));
+}
+
+#[test]
+fn wider_decode_reservation_does_not_increase_the_committed_output_limit() {
+    let mut engine = cross_page_engine(false);
+    let mut model = Model::default();
+    engine.submit(input(vec![1; 31], 40)).unwrap();
+    while engine.next_phase().unwrap() == Some(resin_core::Phase::Prefill) {
+        engine.step(&mut model).unwrap();
+    }
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert!(engine.retain_continuation(&plan));
+    let error = engine
+        .complete_step_with(&mut model, TokenRows::new(&[3, 4, 5, 6, 7], &[0, 5]), Ok)
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Internal);
+    assert!(error.to_string().contains("declared output maximum is 4"));
+}
+
+#[test]
+fn stopped_cross_page_successor_keeps_its_full_lease_until_physical_completion() {
+    for stop in [3, 4, 5, 6] {
+        let mut engine = cross_page_engine(true);
+        let mut model = Model::default();
+        let mut submission = input(vec![1; 31], 40);
+        submission.stop_token_ids = vec![stop];
+        let request = engine.submit(submission).unwrap();
+        while engine.next_phase().unwrap() == Some(resin_core::Phase::Prefill) {
+            engine.step(&mut model).unwrap();
+        }
+        let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+        assert!(engine.retain_continuation(&plan));
+        engine.continuation_plan().unwrap().unwrap();
+        let leased = engine.cache_free_parent_count();
+        engine
+            .complete_continuing_step_with(&mut model, TokenRows::new(&[3, 4, 5, 6], &[0, 4]), Ok)
+            .unwrap();
+        assert!(request.done());
+        assert_eq!(
+            request.take_result().unwrap(),
+            (2..=stop).collect::<Vec<_>>()
+        );
+        assert!(model.released.is_empty());
+        assert_eq!(engine.cache_free_parent_count(), leased);
+        assert!(engine.cancel(&mut model, &request).is_err());
+        engine
+            .complete_step_with(&mut model, TokenRows::new(&[90, 91, 92, 93], &[0, 4]), Ok)
+            .unwrap();
+        assert_eq!(model.released, [request.id()]);
+        // A cached prefix may retain pages after retirement; closing evicts it.
+        engine.close(&mut model).unwrap();
+        assert_eq!(engine.cache_free_parent_count(), Some(64));
+    }
+}
+
+#[test]
+fn decode_reservation_requires_two_steps_and_sufficient_window_guard_capacity() {
+    for reservation in [1, 7, 9] {
+        let layout = KvLayout::new(
+            8,
+            vec![
+                KvGroupLayout::new(
+                    4,
+                    1,
+                    KvRetention::SlidingWindow {
+                        tokens: NonZeroU32::new(11).unwrap(),
+                    },
+                )
+                .unwrap()
+                .with_read_window_tokens(4)
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let error = EngineCore::<&str>::new(
+            RunnerConfig {
+                cache_layout: Some(layout),
+                cache_write_lookahead_tokens: 3,
+                cache_write_reservation_tokens: reservation,
+                ..Default::default()
+            },
+            4,
+            256,
+            SchedulerConfig::default(),
+            false,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind, ErrorKind::InvalidInput);
+    }
+    let state = KvLayout::new(
+        8,
+        vec![
+            KvGroupLayout::new_with_family(4, 1, KvRetention::FullContext, KvGroupFamily::State)
+                .unwrap(),
+        ],
+    )
+    .unwrap();
+    assert!(
+        EngineCore::<&str>::new(
+            RunnerConfig {
+                cache_layout: Some(state),
+                cache_write_lookahead_tokens: 3,
+                cache_write_reservation_tokens: 8,
+                ..Default::default()
+            },
+            4,
+            256,
+            SchedulerConfig::default(),
+            false,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn rounded_reservation_tail_cannot_exceed_a_windows_declared_write_guard() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    32,
+                    vec![
+                        KvGroupLayout::new(
+                            4,
+                            1,
+                            KvRetention::SlidingWindow {
+                                tokens: NonZeroU32::new(11).unwrap(),
+                            },
+                        )
+                        .unwrap()
+                        .with_read_window_tokens(4)
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            cache_write_lookahead_tokens: 3,
+            cache_write_reservation_tokens: 8,
+            ..Default::default()
+        },
+        4,
+        256,
+        SchedulerConfig::default(),
+        false,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    engine.submit(input(vec![1; 31], 40)).unwrap();
+    while engine.next_phase().unwrap() == Some(resin_core::Phase::Prefill) {
+        engine.step(&mut model).unwrap();
+    }
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    // P31..39 is a safe eight-token reservation. The pages end at40, but
+    // advertising that rounded ninth write would exceed the declared guard8.
+    assert!(!engine.retain_continuation(&plan));
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[3, 4, 5, 6], &[0, 4]), Ok)
+        .unwrap();
+    engine.close(&mut model).unwrap();
+    assert_eq!(engine.cache_free_parent_count(), Some(32));
+}
+
+fn bounded_reservation_engine(
+    capacity: u32,
+    context: u32,
+    reservation: u32,
+) -> EngineCore<&'static str> {
+    EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    capacity,
+                    vec![KvGroupLayout::new(4, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            cache_write_lookahead_tokens: 3,
+            cache_write_reservation_tokens: reservation,
+            ..Default::default()
+        },
+        4,
+        context,
+        SchedulerConfig {
+            schedule_conservativeness: 0.0,
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap()
+}
+
+#[test]
+fn optional_reservation_preserves_near_context_final_short_output_capacity() {
+    for reservation in [0, 8, 72] {
+        let mut engine = bounded_reservation_engine(16, 64, reservation);
+        let mut model = Model::default();
+        let request = engine.submit(input(vec![1; 60], 4)).unwrap();
+        engine.step(&mut model).unwrap();
+        let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+        assert_eq!(plan.context_lengths, [60]);
+        assert_eq!(plan.cache_groups[0].block_indptr, [0, 16]);
+        assert!(!engine.retain_continuation(&plan));
+        engine
+            .complete_step_with(&mut model, TokenRows::new(&[3, 4, 5], &[0, 3]), Ok)
+            .unwrap();
+        assert_eq!(request.take_result().unwrap(), [2, 3, 4, 5]);
+        assert_eq!(engine.cache_free_parent_count(), Some(16));
+    }
+}
+
+#[test]
+fn one_short_row_downshifts_the_whole_cohort_without_overallocating_long_rows() {
+    let mut engine = bounded_reservation_engine(32, 256, 8);
+    let mut model = Model::default();
+    let short = engine.submit(input(vec![1; 60], 4)).unwrap();
+    let long = engine.submit(input(vec![10; 60], 40)).unwrap();
+    engine.step(&mut model).unwrap();
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert_eq!(plan.sequence_ids, [short.id(), long.id()]);
+    assert_eq!(plan.cache_groups[0].block_indptr, [0, 16, 32]);
+    assert!(!engine.retain_continuation(&plan));
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[3, 4, 5, 12], &[0, 3, 4]), Ok)
+        .unwrap();
+    assert_eq!(short.take_result().unwrap(), [2, 3, 4, 5]);
+    assert!(!long.done());
+    engine.close(&mut model).unwrap();
+    assert_eq!(engine.cache_free_parent_count(), Some(32));
+}
+
+#[test]
+fn optional_wide_cohort_capacity_is_checked_before_any_partial_growth() {
+    let mut engine = bounded_reservation_engine(32, 256, 72);
+    let mut model = Model::default();
+    engine.submit(input(vec![1; 60], 40)).unwrap();
+    engine.submit(input(vec![10; 60], 40)).unwrap();
+    engine.step(&mut model).unwrap();
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    // Both ordinary four-token spans fit exactly. Growing the first row's
+    // optional72 span before discovering the second doesn't fit would strand
+    // capacity and force a needless retraction/failure.
+    assert_eq!(plan.cache_groups[0].block_indptr, [0, 16, 32]);
+    assert!(!engine.retain_continuation(&plan));
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[3, 12], &[0, 1, 2]), Ok)
+        .unwrap();
+    engine.close(&mut model).unwrap();
+    assert_eq!(engine.cache_free_parent_count(), Some(32));
+}
+
+#[test]
+fn seventy_two_token_reservation_chains_without_allocating_or_inflating_outputs() {
+    let mut engine = bounded_reservation_engine(64, 256, 72);
+    let mut model = Model::default();
+    let request = engine.submit(input(vec![1; 3], 100)).unwrap();
+    engine.step(&mut model).unwrap();
+    let mut plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert_eq!(plan.cache_groups[0].block_indptr, [0, 19]);
+    let leased = engine.cache_free_parent_count();
+    let mut token = 3;
+    let mut continuations = 0;
+    while engine.retain_continuation(&plan) {
+        let next = engine.continuation_plan().unwrap().unwrap();
+        engine
+            .complete_continuing_step_with(
+                &mut model,
+                TokenRows::new(&[token, token + 1, token + 2, token + 3], &[0, 4]),
+                Ok,
+            )
+            .unwrap();
+        assert_eq!(engine.cache_free_parent_count(), leased);
+        continuations += 1;
+        token += 4;
+        // core updates the anchor from actual committed output. In this test
+        // all four were accepted, so the conservative successor is exact.
+        plan = next;
+    }
+    assert!(continuations >= 16);
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[token], &[0, 1]), Ok)
+        .unwrap();
+    engine.close(&mut model).unwrap();
+    assert_eq!(request.take_result().unwrap().len(), 2 + 4 * continuations);
+    assert_eq!(engine.cache_free_parent_count(), Some(64));
+}
+
+#[test]
+fn falling_back_after_a_wide_lease_preserves_unused_owned_pages() {
+    let mut engine = bounded_reservation_engine(40, 256, 8);
+    let mut model = Model::default();
+    let request = engine.submit(input(vec![1; 58], 11)).unwrap();
+    engine.step(&mut model).unwrap();
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert_eq!(plan.cache_groups[0].block_indptr, [0, 17]);
+    assert!(engine.retain_continuation(&plan));
+    engine.continuation_plan().unwrap().unwrap();
+    engine
+        .complete_continuing_step_with(&mut model, TokenRows::new(&[3], &[0, 1]), Ok)
+        .unwrap();
+    // Drain early as a runtime could request. Two minimal accepted blocks move
+    // the next anchor to60. A normal span now ends64, before the old wide end66.
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[4], &[0, 1]), Ok)
+        .unwrap();
+    let next = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert_eq!(next.context_lengths, [60]);
+    assert_eq!(next.cache_groups[0].block_indptr, [0, 16]);
+    assert!(!engine.retain_continuation(&next));
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[5], &[0, 1]), Ok)
+        .unwrap();
+    engine.close(&mut model).unwrap();
+    assert_eq!(request.take_result().unwrap(), [2, 3, 4, 5]);
+    assert_eq!(engine.cache_free_parent_count(), Some(40));
+}
+
 fn stop_overlap_engine() -> EngineCore<&'static str> {
     EngineCore::new(
         RunnerConfig {

@@ -183,6 +183,7 @@ class CudaRunner(Runner):
             self.cuda_graph_prefill,
             self.cuda_graph_decode,
             self.runner_config.cache_write_lookahead_tokens,
+            self.runner_config.cache_write_reservation_tokens,
             request,
             catalog,
         )

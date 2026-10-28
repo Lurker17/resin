@@ -25,6 +25,7 @@ pub(crate) struct RunnerConfig {
     pub(super) prefill_chunk_size: Option<NonZeroU32>,
     pub(super) continuation_prefill: bool,
     pub(super) cache_write_lookahead_tokens: u32,
+    pub(super) cache_write_reservation_tokens: u32,
     pub(super) cache_layout: Option<Py<CacheLayout>>,
 }
 
@@ -35,6 +36,7 @@ impl RunnerConfig {
             prefill_chunk_size: self.prefill_chunk_size,
             continuation_prefill: self.continuation_prefill,
             cache_write_lookahead_tokens: self.cache_write_lookahead_tokens,
+            cache_write_reservation_tokens: self.cache_write_reservation_tokens,
             cache_layout: self
                 .cache_layout
                 .as_ref()
@@ -52,6 +54,7 @@ impl RunnerConfig {
         prefill_chunk_size = None,
         continuation_prefill = false,
         cache_write_lookahead_tokens = 0,
+        cache_write_reservation_tokens = 0,
         cache_layout = None
     ))]
     fn new(
@@ -60,6 +63,7 @@ impl RunnerConfig {
         prefill_chunk_size: Option<u32>,
         continuation_prefill: bool,
         cache_write_lookahead_tokens: u32,
+        cache_write_reservation_tokens: u32,
         cache_layout: Option<Py<CacheLayout>>,
     ) -> PyResult<Self> {
         if cache_write_lookahead_tokens > 0 && cache_layout.is_none() {
@@ -67,11 +71,26 @@ impl RunnerConfig {
                 "cache_write_lookahead_tokens requires cache_layout",
             ));
         }
+        if cache_write_reservation_tokens > 0 {
+            if cache_layout.is_none() {
+                return Err(PyValueError::new_err(
+                    "cache_write_reservation_tokens requires cache_layout",
+                ));
+            }
+            if u64::from(cache_write_reservation_tokens)
+                < 2 * (u64::from(cache_write_lookahead_tokens) + 1)
+            {
+                return Err(PyValueError::new_err(
+                    "cache_write_reservation_tokens must cover two maximum decode steps",
+                ));
+            }
+        }
         Ok(Self {
             max_batch_tokens: positive_u32("max_batch_tokens", max_batch_tokens)?,
             prefill_chunk_size: positive_u32("prefill_chunk_size", prefill_chunk_size)?,
             continuation_prefill,
             cache_write_lookahead_tokens,
+            cache_write_reservation_tokens,
             cache_layout,
         })
     }
@@ -97,6 +116,11 @@ impl RunnerConfig {
     }
 
     #[getter]
+    fn cache_write_reservation_tokens(&self) -> u32 {
+        self.cache_write_reservation_tokens
+    }
+
+    #[getter]
     fn cache_layout(&self, py: Python<'_>) -> Option<Py<CacheLayout>> {
         self.cache_layout
             .as_ref()
@@ -105,11 +129,12 @@ impl RunnerConfig {
 
     fn __repr__(&self) -> String {
         format!(
-            "RunnerConfig(max_batch_tokens={:?}, prefill_chunk_size={:?}, continuation_prefill={}, cache_write_lookahead_tokens={}, cache={})",
+            "RunnerConfig(max_batch_tokens={:?}, prefill_chunk_size={:?}, continuation_prefill={}, cache_write_lookahead_tokens={}, cache_write_reservation_tokens={}, cache={})",
             self.max_batch_tokens(),
             self.prefill_chunk_size(),
             self.continuation_prefill,
             self.cache_write_lookahead_tokens,
+            self.cache_write_reservation_tokens,
             self.cache_layout.is_some(),
         )
     }

@@ -201,7 +201,21 @@ impl PagedKvResources {
         context: u32,
     ) -> Result<(), CachePoolError> {
         self.validate_write_span(token_start, context)?;
-        let demands = self.demands(context);
+        // A previous wide lease can end beyond this step's ordinary span.
+        // Keep its idle spare pages; grow_request must never shrink owners.
+        let demands = self
+            .layout
+            .groups()
+            .iter()
+            .zip(state.groups())
+            .enumerate()
+            .map(|(index, (group, table))| {
+                GroupDemand::new(
+                    GroupId::new(index as u32),
+                    (group.active_blocks(context).1 as usize).max(table.pages().len()),
+                )
+            })
+            .collect::<Vec<_>>();
         loop {
             match self.pool.grow_request(state, &demands) {
                 Ok(()) => break,
@@ -263,6 +277,40 @@ impl PagedKvResources {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Check optional cohort growth/COW before changing any request. Prefix
+    /// eviction is deliberately excluded: overlap is optional under pressure.
+    pub(crate) fn can_ensure_contexts(
+        &self,
+        requests: &[(&RequestPages, u32, u32)],
+    ) -> Result<bool, CachePoolError> {
+        let mut allocations = Vec::with_capacity(requests.len());
+        for &(state, start, context) in requests {
+            self.validate_write_span(start, context)?;
+            let mut additions = Vec::with_capacity(self.layout.groups().len());
+            for (index, group) in self.layout.groups().iter().copied().enumerate() {
+                let pages = state.groups()[index].pages();
+                let (_, wanted) = group.active_blocks(context);
+                let page_count = (wanted as usize).max(pages.len());
+                let mut extra = page_count - pages.len();
+                let first = start / group.block_tokens().get();
+                let count = context
+                    .div_ceil(group.block_tokens().get())
+                    .saturating_sub(first)
+                    .min(page_count as u32);
+                for logical in first..first + count {
+                    let address = page_index(group, page_count, logical)
+                        .ok_or(CachePoolError::StaleHandle)?;
+                    if pages.get(address).is_some_and(|page| !page.is_writable()) {
+                        extra += 1;
+                    }
+                }
+                additions.push(GroupDemand::new(GroupId::new(index as u32), extra));
+            }
+            allocations.push((state, additions));
+        }
+        self.pool.can_allocate_request_pages(&allocations)
     }
 
     /// Attach the longest aligned cached prefix and return its resident token

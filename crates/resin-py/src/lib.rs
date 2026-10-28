@@ -1251,28 +1251,38 @@ impl Engine {
         self.core.raise_if_open().map_err(core_error)?;
         let mut events = Vec::new();
         if self.pending.is_some() {
-            let next = if self.overlap
+            let feedback = if self.overlap
                 && allow_overlap
                 && phase.is_none_or(|phase| matches!(phase, BatchPhase::Decode))
+                && self.core.has_continuation()
             {
-                self.core.continuation_plan().map_err(core_error)?
-            } else {
-                None
-            };
-            if let Some(next) = next {
-                let next_plan = Py::new(py, planning::from_core(next))?;
                 let previous = self.pending.as_ref().expect("pending execution");
-                let feedback = match previous.completion.bind(py).getattr("feedback") {
-                    Ok(feedback) => feedback,
+                match previous.completion.bind(py).getattr("feedback") {
+                    Ok(feedback) if feedback.is_none() => None,
+                    Ok(feedback) => Some(feedback),
                     Err(error) => {
                         self.core.poison_message(format!(
                             "accepted completion feedback failed: {error}"
                         ));
                         return Err(error);
                     }
-                };
+                }
+            } else {
+                None
+            };
+            // A runner may explicitly drain this completion when its runtime
+            // cannot safely launch the next reserved position (for example a
+            // small-batch attention plan). Inspect before consuming a batch ID
+            // or constructing conservative continuation metadata.
+            let next = if feedback.is_some() {
+                self.core.continuation_plan().map_err(core_error)?
+            } else {
+                None
+            };
+            if let Some(next) = next {
+                let next_plan = Py::new(py, planning::from_core(next))?;
                 let kwargs = pyo3::types::PyDict::new(py);
-                kwargs.set_item("feedback", feedback)?;
+                kwargs.set_item("feedback", feedback.expect("continuation has feedback"))?;
                 let enqueue = self
                     .runner_enqueue
                     .as_ref()
@@ -1541,6 +1551,7 @@ impl Engine {
                 prefill_chunk_size: config.prefill_chunk_size,
                 continuation_prefill: config.continuation_prefill,
                 cache_write_lookahead_tokens: config.cache_write_lookahead_tokens,
+                cache_write_reservation_tokens: config.cache_write_reservation_tokens,
                 cache_layout: config
                     .cache_layout
                     .as_ref()
@@ -1737,8 +1748,19 @@ impl Engine {
     }
 
     #[getter]
-    fn overlap_ready(&self) -> bool {
-        !self.pending.is_some() || self.core.has_continuation()
+    fn overlap_ready(&self, py: Python<'_>) -> bool {
+        let Some(pending) = &self.pending else {
+            return true;
+        };
+        self.core.has_continuation()
+            && pending
+                .completion
+                .bind(py)
+                .getattr("feedback")
+                // Only an explicit None is a normal drain. Attribute errors
+                // must reach step_once's existing fail-closed path instead of
+                // silently bypassing the completion contract.
+                .map_or(true, |feedback| !feedback.is_none())
     }
 
     #[getter]

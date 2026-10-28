@@ -173,10 +173,36 @@ detect stale recurrent state or a bad ring offset.
 
 Speculative decoding belongs inside the runner. Set
 `cache_write_lookahead_tokens` to cover the maximum additional cache writes
-beyond the scheduled decode anchor. The Engine leases the anchor plus this
-lookahead and bounds returned token rows by that capacity. Write drafts only into
-leased destinations, commit exactly the accepted prefix, and clear or logically
-hide rejected recurrent/SWA state before the next step.
+beyond the scheduled decode anchor. The Engine reserves these writes and limits
+each returned row to `cache_write_lookahead_tokens + 1` tokens, before applying
+stop or length limits. Write drafts only into leased destinations, commit exactly
+the accepted prefix, and clear or logically hide rejected recurrent/SWA state
+before the next step.
+
+An overlap-capable runner may opt into `cache_write_reservation_tokens`, a
+preferred total write span including the anchor. Its default, zero, preserves
+the ordinary reservation and same-page continuation guard. A nonzero span must
+cover at least two maximum decode steps and fit the sliding-window read/write
+guard; recurrent-state groups do not support it. For example, lookahead 3 and
+reservation 72 still permit at most four returned tokens per invocation. The
+Engine uses the ordinary one-step reservation for the whole cohort if any row
+is too close to its output/context limit or the optional span cannot fit the
+available cache. Runners must accept both ordinary and wider envelopes.
+
+The Engine allocates, copies on write, and leases the complete envelope before
+enqueueing work. Its physical page tables remain immutable until all accepted
+consumers finish, including consumers of stopped or cancelled rows. A reserved
+table may contain unwritten future pages: derive actual readable CSR ranges,
+last-page lengths, and physical append page IDs from accepted GPU positions.
+Updating only append offsets is insufficient at page crossings. Qualify the
+attention plan with changing page counts; do not read the full reserved extent
+as though it were committed history. The Engine drains before another maximum
+step would leave the lease or violate its read/write guard.
+
+An `enqueue` completion may publish `feedback=None` to decline its next
+continuation. The Engine reports `overlap_ready=False` and harvests that work
+normally before preparing another batch. Missing or throwing feedback attributes
+remain contract failures; they are not a normal drain signal.
 
 Track acceptance rate and time draft, target verification, commit, and sampling
 separately. Always report output-token throughput as well as block latency: a

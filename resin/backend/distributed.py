@@ -70,6 +70,7 @@ def _runner_signature(config: RunnerConfig):
         config.prefill_chunk_size,
         config.continuation_prefill,
         config.cache_write_lookahead_tokens,
+        config.cache_write_reservation_tokens,
         geometry,
     )
 

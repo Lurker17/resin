@@ -956,8 +956,55 @@ impl CachePool {
         }
     }
 
+    /// Simulate additional cohort pages without changing allocator ownership.
+    pub(crate) fn can_allocate_request_pages(
+        &self,
+        requests: &[(&RequestPages, Vec<GroupDemand>)],
+    ) -> Result<bool, CachePoolError> {
+        let mut totals = vec![0usize; self.group_packings.len()];
+        for (_, demands) in requests {
+            for demand in demands {
+                let total = totals
+                    .get_mut(demand.group.index() as usize)
+                    .ok_or(CachePoolError::StaleHandle)?;
+                *total = total
+                    .checked_add(demand.blocks)
+                    .ok_or(CachePoolError::DemandOverflow)?;
+            }
+        }
+        let total_blocks = totals.iter().try_fold(0usize, |sum, &blocks| {
+            sum.checked_add(blocks)
+                .ok_or(CachePoolError::DemandOverflow)
+        })?;
+        // Free parents alone are a cheap sufficient bound. Only a pressured
+        // pool needs the exact same placement simulation as real allocation.
+        let free_parent_bound: usize = totals
+            .iter()
+            .zip(&self.group_packings)
+            .map(|(&blocks, packing)| blocks.div_ceil(packing.get() as usize))
+            .sum();
+        if free_parent_bound <= self.free_parents.len() {
+            return Ok(true);
+        }
+        let mut plan =
+            PlacementPlan::new(self.group_packings.len(), total_blocks, self.parents.len())?;
+        for (request, demands) in requests {
+            self.validate_request_idle(request)?;
+            for &demand in demands {
+                let mut pages = Vec::new();
+                pages
+                    .try_reserve_exact(demand.blocks)
+                    .map_err(|_| CachePoolError::MetadataAllocation)?;
+                match self.plan_partition(&mut plan, request.writer, demand, &mut pages) {
+                    Err(CachePoolError::InsufficientCapacity { .. }) => return Ok(false),
+                    other => other?,
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Grow an executable request to the supplied total block counts.
-    ///
     /// Placement is all-or-nothing. Existing pages and request identity stay
     /// unchanged on failure.
     pub fn grow_request(
