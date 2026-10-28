@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -12,6 +12,11 @@ import torch
 
 from resin import BatchPhase, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
+from resin.backend.cuda.completion import (
+    DeviceCompletion,
+    DeviceFeedback,
+    accepted_block,
+)
 from resin.backend.cuda.graphs import (
     CudaGraphMode,
     CudaGraphStep,
@@ -54,6 +59,7 @@ from resin_models_cuda.qwen3_5.attention import (
     PagedAttentionRuntime,
 )
 from resin_models_cuda.qwen3_5.cache import (
+    PAGE_TOKENS,
     PREFILL_CHUNK_SIZE,
     CacheArena,
     CacheGeometry,
@@ -94,6 +100,60 @@ def _one_draft_verification(drafts, targets, *, accepted_drafts=None):
         torch.stack((drafts, targets[:, 1]), dim=1) if accepted_drafts else targets
     )
     return accepted, mtp_inputs
+
+
+@dataclass(frozen=True, slots=True)
+class _Feedback(DeviceFeedback):
+    """Device continuation inputs; the one-draft MTP path also carries drafts."""
+
+    draft_ids: torch.Tensor | None = None
+
+    def restrict(self, rows):
+        DeviceFeedback.restrict(self, rows)
+        if self.draft_ids is not None:
+            self.draft_ids[rows:].zero_()
+        return self
+
+    def inputs(self):
+        inputs = {
+            "token_ids": self.token_ids,
+            "positions": self.positions,
+            "sampling_offsets": (self.positions + 1) * SAMPLING_OFFSET_STRIDE,
+        }
+        if self.draft_ids is not None:
+            inputs["draft_ids"] = self.draft_ids
+        return inputs
+
+
+class _Completion(DeviceCompletion):
+    """Shared device completion that also harvests the next MTP drafts on the host."""
+
+    def __init__(self, runner, sequence_ids, next_drafts, *args, **kwargs):
+        # Queue the draft copy before the base class records its completion event.
+        self._draft_stager = TensorStager(runner.device)
+        self._next_drafts = (
+            None
+            if next_drafts is None
+            else self._draft_stager.output("next_drafts", next_drafts)
+        )
+        self._runner = runner
+        self._sequence_ids = sequence_ids
+        super().__init__(*args, **kwargs)
+
+    def result(self):
+        fresh = self._result is None
+        output = super().result()
+        if not fresh:
+            return output
+        runner = self._runner
+        if self._next_drafts is not None:
+            for sequence, draft in zip(
+                self._sequence_ids,
+                self._next_drafts[: self._rows].tolist(),
+                strict=True,
+            ):
+                runner._drafts[sequence] = int(draft)
+        return output
 
 
 class Qwen3_5CudaRunner(CudaRunner):
@@ -501,6 +561,21 @@ class Qwen3_5CudaRunner(CudaRunner):
             self._graph_attention[shape] = runtime
         return runtime
 
+    def _refresh_page_lengths(self, attention, positions: torch.Tensor) -> None:
+        """Recompute last-page lengths on the device from the step's positions.
+
+        Device-feedback continuations keep page ownership fixed (the Engine drains
+        at page boundaries) but advance positions on the GPU, so the host plan's
+        last-page lengths may be stale; page counts and indices are unchanged.
+        """
+        page = PAGE_TOKENS
+        rows = positions.shape[0]
+        for call in attention.calls:
+            lengths = positions + call.spec.sequence_offset
+            call.last_page_lengths[:rows].copy_(
+                ((lengths - 1) % page + 1).to(torch.int32)
+            )
+
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         batch_size, graph_seq_len = shape
         attention = self._graph_attention_for(shape)
@@ -526,6 +601,7 @@ class Qwen3_5CudaRunner(CudaRunner):
 
         def ordinary_launch() -> None:
             attention.reset()
+            self._refresh_page_lengths(attention, positions)
             # GDN recurrent and convolution state update in place in the arena.
             previous = (positions - 1).clamp_min(0)
             hidden, _, _ = self._target_forward(
@@ -687,6 +763,7 @@ class Qwen3_5CudaRunner(CudaRunner):
             if phase_timing is not None:
                 phase_timing.mark(0)
             attention.reset()
+            self._refresh_page_lengths(attention, positions)
             config = self.attention_config
             previous = (positions - 1).clamp_min(0)
             pool = replace(
@@ -787,8 +864,13 @@ class Qwen3_5CudaRunner(CudaRunner):
         )
 
     def _graph_forward(
-        self, plan: BatchPlan, cache_plan: PagedCachePlan
-    ) -> ForwardOutput | None:
+        self,
+        plan: BatchPlan,
+        cache_plan: PagedCachePlan,
+        *,
+        enqueue: bool = False,
+        feedback=None,
+    ):
         if plan.needs_logprobs:
             self._cuda_graph_fallback("decode", "logprobs")
             return None
@@ -834,6 +916,30 @@ class Qwen3_5CudaRunner(CudaRunner):
                     dtype=np.int64,
                 ),
                 (0, padding),
+            )
+        if enqueue:
+            if feedback is not None:
+                inputs.update(feedback.inputs())
+                positions = feedback.positions
+            else:
+                positions = torch.as_tensor(
+                    inputs["positions"], device=self.device, dtype=torch.long
+                )
+            output = self._run_cuda_graph("decode", shape, inputs)
+            draft_width = 1 if self._fast_speculation else 0
+            tokens, counts, base = accepted_block(
+                output[:, : 2 * draft_width + 1], positions, draft_width
+            )
+            next_drafts = output[:, 3].clone() if self._fast_speculation else None
+            return _Completion(
+                self,
+                sequence_ids,
+                next_drafts,
+                tokens,
+                counts,
+                _Feedback(base.token_ids, base.positions, next_drafts),
+                rows=batch_size,
+                device=self.device,
             )
         output = self._run_cuda_graph("decode", shape, inputs)[:batch_size]
         if not self.speculative_tokens:
@@ -1284,6 +1390,30 @@ class Qwen3_5CudaRunner(CudaRunner):
                 if self.speculative_tokens:
                     return self._speculative_decode(plan, cache, token_ids, positions)
                 return self._ordinary_decode(plan, cache, token_ids, positions)
+
+    @observe_execution
+    def enqueue(self, plan: BatchPlan, *, feedback=None):
+        """Device-feedback decode for plain and one-draft MTP graphs; else forward()."""
+        if (
+            plan.phase != BatchPhase.DECODE
+            or plan.needs_logprobs
+            or plan.needs_prompt_logprobs
+            or self.speculative_tokens not in (0, 1)
+        ):
+            return self.forward(plan)
+        self._check_cuda_graphs(plan.phase)
+        self._validate_plan(plan)
+        lookahead = self.speculative_tokens + 1 if self.speculative_tokens else 0
+        cache_plan = PagedCachePlan.from_plan(
+            plan, self.cache_layout, decode_lookahead=lookahead
+        )
+        with self._cuda_failure, torch.inference_mode():
+            result = self._graph_forward(
+                plan, cache_plan, enqueue=True, feedback=feedback
+            )
+        if result is None and feedback is not None:
+            raise RuntimeError("a device continuation requires a captured graph")
+        return self.forward(plan) if result is None else result
 
     def release(self, sequence_ids: list[int]) -> None:
         """Release request-local image embeddings after Engine retirement."""
