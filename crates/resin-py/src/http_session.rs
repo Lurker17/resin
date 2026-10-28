@@ -268,6 +268,22 @@ impl Session {
             &mut self.active,
         );
     }
+    /// Submit a request whose prompt was rendered on another thread.
+    pub fn admit_rendered(&mut self, job: GenerationJob, rendered: RenderedJob) {
+        if let Some(metrics) = &self.metrics {
+            metrics.observe_queue_time(job.enqueued_at.elapsed().as_secs_f64());
+        }
+        admit_rendered(
+            &self.engine,
+            &self.stop_token_ids,
+            job,
+            rendered,
+            &mut self.active,
+        );
+    }
+    pub fn recipe(&self) -> &Py<PyAny> {
+        &self.recipe
+    }
     pub fn cancel_disconnected(&mut self) -> Result<(), String> {
         cancel_disconnected(&self.engine, &mut self.active)
     }
@@ -485,17 +501,16 @@ fn process(
     Ok(())
 }
 
-fn admit(
-    engine: &Py<Engine>,
-    recipe: &Py<PyAny>,
-    stop_token_ids: &[u32],
-    job: GenerationJob,
-    active: &mut HashMap<u64, ActiveRequest>,
-) {
-    if job.events.is_closed() {
-        return;
-    }
-    let result = Python::attach(|py| {
+/// Recipe output for one request: prompt IDs, prepared media and its parser.
+pub(crate) type RenderedJob = PyResult<(Vec<u32>, Option<Py<PyAny>>, Py<PyAny>)>;
+
+/// Render a request's prompt and media without touching the Engine.
+///
+/// Media preparation (decode, resize, patchify) dominates admission for large
+/// images. It releases the GIL, so callers may render on worker threads and
+/// submit the result on the engine thread.
+pub(crate) fn render_job(recipe: &Py<PyAny>, job: &GenerationJob) -> RenderedJob {
+    Python::attach(|py| {
         // JSON is an HTTP concern; both native and custom recipes receive the
         // same typed conversation. Native recipes stay inside Rust here.
         let messages = job
@@ -521,12 +536,11 @@ fn admit(
             "reasoning_effort": job.request.reasoning_effort,
             "extra": job.request.extra,
         }))?;
-        let (token_ids, media, parser) = if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>()
-        {
+        if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
             let native = native.borrow();
             let rendered = native.render(py, messages, tools, Some(&options))?;
             let parser = Py::new(py, native.create_parser(py, &rendered)?)?.into_any();
-            (rendered.token_ids, rendered.media, parser)
+            Ok((rendered.token_ids, rendered.media, parser))
         } else {
             let kwargs = PyDict::new(py);
             kwargs.set_item("tools", tools)?;
@@ -541,12 +555,41 @@ fn admit(
             let prompt = rendered.cast::<RenderedPrompt>()?.borrow();
             // Custom recipes also return the native prompt container, so media
             // and token ownership cross one well-defined admission boundary.
-            (
+            Ok((
                 prompt.token_ids.clone(),
                 prompt.media.as_ref().map(|value| value.clone_ref(py)),
                 parser,
-            )
-        };
+            ))
+        }
+    })
+}
+
+fn admit(
+    engine: &Py<Engine>,
+    recipe: &Py<PyAny>,
+    stop_token_ids: &[u32],
+    job: GenerationJob,
+    active: &mut HashMap<u64, ActiveRequest>,
+) {
+    if job.events.is_closed() {
+        return;
+    }
+    let rendered = render_job(recipe, &job);
+    admit_rendered(engine, stop_token_ids, job, rendered, active);
+}
+
+fn admit_rendered(
+    engine: &Py<Engine>,
+    stop_token_ids: &[u32],
+    job: GenerationJob,
+    rendered: RenderedJob,
+    active: &mut HashMap<u64, ActiveRequest>,
+) {
+    if job.events.is_closed() {
+        return;
+    }
+    let result = Python::attach(|py| {
+        let (token_ids, media, parser) = rendered?;
         if token_ids.is_empty() {
             return Err(PyValueError::new_err(
                 "recipe.render returned an empty token_ids sequence",

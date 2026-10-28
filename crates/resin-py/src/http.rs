@@ -1,8 +1,9 @@
 use std::{
     net::{IpAddr, SocketAddr},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -16,9 +17,11 @@ use resin_http::{GenerationJob, MetricsEndpoint, RouteConfig};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::Engine;
-use crate::http_session::Session;
+use crate::http_session::{RenderedJob, Session, render_job};
 
 pub(crate) const MAX_ACTIVE_REQUESTS: usize = 128;
+/// Threads that render prompts and prepare media off the engine thread.
+const RENDER_WORKERS: usize = 8;
 pub(crate) const ADMISSIONS_PER_STEP: usize = 4;
 
 #[pyclass(name = "_HttpServer", module = "resin._resin")]
@@ -284,6 +287,31 @@ fn engine_actor(
         Python::attach(|py| Session::new(py, engine.clone_ref(py), recipe, stream_interval))
             .map_err(|error| format_python_error("HTTP session preparation failed", error))?;
     session.metrics = metrics.clone();
+    let (render_jobs, render_queue) = std_mpsc::channel::<GenerationJob>();
+    let render_queue = Arc::new(Mutex::new(render_queue));
+    let (rendered_jobs, rendered_queue) = std_mpsc::channel::<(GenerationJob, RenderedJob)>();
+    for worker in 0..RENDER_WORKERS {
+        let queue = render_queue.clone();
+        let results = rendered_jobs.clone();
+        let recipe = Python::attach(|py| session.recipe().clone_ref(py));
+        thread::Builder::new()
+            .name(format!("resin-render-{worker}"))
+            .spawn(move || {
+                loop {
+                    let job = match queue.lock().unwrap_or_else(|p| p.into_inner()).recv() {
+                        Ok(job) => job,
+                        Err(_) => return,
+                    };
+                    let rendered = render_job(&recipe, &job);
+                    if results.send((job, rendered)).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(|error| format!("failed to start a render worker: {error}"))?;
+    }
+    drop(rendered_jobs);
+    let mut rendering = 0usize;
     let mut next_metrics = Instant::now();
     let mut disconnected = false;
     loop {
@@ -305,17 +333,35 @@ fn engine_actor(
                 next_metrics = Instant::now() + Duration::from_secs(1);
             }
         }
-        for _ in 0..ADMISSIONS_PER_STEP {
-            if disconnected || *shutdown.borrow() || session.active_count() >= MAX_ACTIVE_REQUESTS {
+        loop {
+            if disconnected
+                || *shutdown.borrow()
+                || session.active_count() + rendering >= MAX_ACTIVE_REQUESTS
+            {
                 break;
             }
             match jobs.try_recv() {
-                Ok(job) => session.admit(job),
+                Ok(job) => {
+                    rendering += 1;
+                    if let Err(std_mpsc::SendError(job)) = render_jobs.send(job) {
+                        rendering -= 1;
+                        session.admit(job);
+                    }
+                }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     disconnected = true;
                     break;
                 }
+            }
+        }
+        for _ in 0..ADMISSIONS_PER_STEP * 8 {
+            match rendered_queue.try_recv() {
+                Ok((job, rendered)) => {
+                    rendering -= 1;
+                    session.admit_rendered(job, rendered);
+                }
+                Err(_) => break,
             }
         }
         if disconnected || *shutdown.borrow() {
@@ -329,6 +375,7 @@ fn engine_actor(
         }
         session.cancel_disconnected()?;
         if session.active_count() == 0 && !engine_has_work(&engine)? {
+            // Rendering requests arrive through the worker queue.
             thread::sleep(Duration::from_millis(1));
             continue;
         }
