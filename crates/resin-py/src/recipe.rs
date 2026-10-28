@@ -458,6 +458,7 @@ pub(crate) struct NativeRecipe {
     id: u64,
     stop_token_ids: OnceLock<Vec<u32>>,
     media_config: Option<MediaConfig>,
+    media_preparation_cache: Mutex<media_preprocess::PreparationCache>,
 }
 impl NativeRecipe {
     pub(crate) fn resolved_stop_token_ids(&self) -> PyResult<&[u32]> {
@@ -535,19 +536,46 @@ impl NativeRecipe {
         request: Value,
         sources: MediaSources,
     ) -> PyResult<RenderedPrompt> {
-        let sources = media_preprocess::sources(py, sources)?;
+        // Native tokenizer/processor configurations are immutable snapshots.
+        // Python fallback tokenizers may change their special IDs between calls.
+        let key = if self.tokenizer.is_native() {
+            media_preprocess::cache_key(py, &sources)?
+        } else {
+            None
+        };
+        let cached = key.and_then(|key| {
+            self.media_preparation_cache
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(key)
+        });
+        // This lookup precedes image decoding as well as resizing/patchifying.
+        let sources = if cached.is_some() {
+            Vec::new()
+        } else {
+            media_preprocess::sources(py, sources)?
+        };
         let (token_ids, preparation, placements) = py.detach(|| -> PyResult<_> {
-            let preparation = if sources.is_empty() {
+            let preparation = if let Some(prepared) = cached {
+                Some(prepared)
+            } else if sources.is_empty() {
                 None
             } else {
                 let config = self
                     .media_config
                     .as_ref()
                     .ok_or_else(|| PyValueError::new_err("this recipe does not support media"))?;
-                Some(
+                let prepared = Arc::new(
                     media_preprocess::process(config, sources, self.encoder.as_ref())
                         .map_err(recipe_error)?,
-                )
+                );
+                if let Some(key) = key {
+                    self.media_preparation_cache
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .insert(key, prepared.clone());
+                }
+                Some(prepared)
             };
             let prompt = self.recipe.render(&request).map_err(recipe_error)?;
             let expansions = preparation
@@ -556,7 +584,9 @@ impl NativeRecipe {
                 .unwrap_or(&[]);
             let (ids, placements) = recipe_media::encode(prompt, expansions, self.encoder.as_ref())
                 .map_err(recipe_error)?;
-            Ok((ids, preparation, placements))
+            // Each bound payload owns independent read-only NumPy buffers. Clone
+            // cached tensors outside the GIL; oversized/uncached values move.
+            Ok((ids, preparation.map(Arc::unwrap_or_clone), placements))
         })?;
         let media = preparation
             .map(|p| p.bind(py, &token_ids, &placements))
@@ -575,6 +605,15 @@ impl NativeRecipe {
 }
 #[pymethods]
 impl NativeRecipe {
+    fn _media_preparation_cache_info(&self) -> HashMap<&'static str, usize> {
+        self.media_preparation_cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .info()
+            .into_iter()
+            .collect()
+    }
+
     #[getter]
     fn tokenizer(&self) -> RecipeTokenizer {
         self.tokenizer.clone()
@@ -778,5 +817,6 @@ pub(crate) fn get_native_recipe(
         id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         stop_token_ids: stop_token_ids.map(OnceLock::from).unwrap_or_default(),
         media_config,
+        media_preparation_cache: Mutex::default(),
     })
 }

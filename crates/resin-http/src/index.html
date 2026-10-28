@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="resin-dp-size" content="1">
   <title>Resin</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.css">
   <script defer src="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.js"></script>
@@ -118,6 +119,8 @@ const topP=document.querySelector('#top-p'),maxOutputTokens=document.querySelect
 const attach=document.querySelector('#attach'),imageInput=document.querySelector('#image-input'),attachments=document.querySelector('#attachments');
 const supportedImageTypes=new Set(['image/avif','image/bmp','image/gif','image/jpeg','image/png','image/tiff','image/webp']);
 const maxImages=4,maxImageBytes=8*1024*1024;let history=[],pendingImages=[];
+const replicaCount=Math.max(1,Number(document.querySelector('meta[name="resin-dp-size"]').content)||1);
+const conversationRank=crypto.getRandomValues(new Uint32Array(1))[0]%replicaCount;
 fetch('/v1/models').then(r=>r.json()).then(x=>modelEl.textContent=x.data?.[0]?.id||'');
 function chatViewportBottom(){return window.innerHeight-footerEl.offsetHeight}
 function atChatBottom(){return chat.getBoundingClientRect().bottom-chatViewportBottom()<48}
@@ -183,16 +186,16 @@ form.addEventListener('submit',async e=>{
   const historyLength=history.length;history.push({role:'user',content});
   const box=turn('assistant'),thinking=document.createElement('details'),summary=document.createElement('summary'),reasonBox=document.createElement('div');
   reasonBox.className='markdown';thinking.className='pending';thinking.open=true;thinking.append(summary,reasonBox);box.before(thinking);
-  const requestStartedAt=performance.now();let pendingLabel='Starting model';
-  const updatePending=()=>{if(thinking.isConnected&&thinking.classList.contains('pending'))summary.textContent=`${pendingLabel}… ${((performance.now()-requestStartedAt)/1000).toFixed(1)}s`};
+  const requestStartedAt=performance.now();
+  const updatePending=()=>{if(thinking.isConnected&&thinking.classList.contains('pending'))summary.textContent=`Waiting for first token… ${((performance.now()-requestStartedAt)/1000).toFixed(1)}s`};
   updatePending();const statusTimer=setInterval(updatePending,250);
   let answer='',reason='',generationStartedAt=null,finishReason=null;
   try {
     const request={model:modelEl.textContent,messages:history,temperature:Number(temperature.value),top_p:Number(topP.value),max_completion_tokens:Number(maxOutputTokens.value),stream:true,stream_options:{include_usage:true}};
+    request.routed_dp_rank=conversationRank;
     if(reasoningEffort.value)request.reasoning_effort=reasoningEffort.value;
     const response=await fetch('/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(request)});
     if(!response.ok)throw new Error((await response.json()).error?.message||response.statusText);
-    pendingLabel='Preparing prompt';updatePending();
     const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='',completed=false;
     while(!completed){const {value,done}=await reader.read();buffer+=decoder.decode(value||new Uint8Array(),{stream:!done});buffer=parseSse(buffer,data=>{
       if(data==='[DONE]'){completed=true;return}const event=JSON.parse(data);if(event.error)throw new Error(event.error.message||'The inference request failed');const delta=event.choices?.[0]?.delta||{};

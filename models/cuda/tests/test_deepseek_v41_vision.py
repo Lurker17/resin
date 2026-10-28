@@ -10,6 +10,7 @@ from test_deepseek_v41_model import implementation as implementation
 from torch import nn
 
 from resin import BatchPhase, BatchPlan
+from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.recipe import (
     DeepSeekV41Image,
     DeepSeekV41Media,
@@ -76,6 +77,7 @@ def media_fixture():
 def runner_fixture():
     runner = object.__new__(DeepSeekV41CudaRunner)
     runner._media_features = {}
+    runner._vision_feature_cache = VisionFeatureCache()
     runner.device = torch.device("cpu")
     runner.max_batch_size, runner.prefill_chunk_size = 8, 128
     calls = []
@@ -141,7 +143,7 @@ def test_image_embeddings_reuse_features_across_chunks_and_prefix_restore():
     runner._validate_plan(plan)
     result = runner._media_embeddings(plan, 0, torch.tensor([media.token_ids[7:12]]))
     torch.testing.assert_close(result[0], expected[7:12])
-    assert len(calls) == 2
+    assert len(calls) == 1
     text = plan_for(media, 10, 12)
     assert runner._media_embeddings(text, 0, torch.tensor([[9, 10]])) is None
     changed = DeepSeekV41Media(

@@ -23,6 +23,7 @@ from resin.server import HttpServer
         ("gpt-oss-120b", 1, None),
         ("deepseek-v41", 0, None),
         ("deepseek-v41", 3, None),
+        ("glm-5.3-flash", 3, None),
         ("gemma4", 0, None),
         ("qwen3_5", 0, None),
         ("inkling", 0, None),
@@ -93,7 +94,7 @@ def test_rank_warms_then_serves_and_closes_on_failure(monkeypatch, name, rank, f
             signature(Engine.submit).bind(self, **options)
             assert options["sampling_params"].stop_token_ids == (7, 8)
             assert options["sampling_params"].temperature == 0
-            assert rank == 0
+            assert rank == 0 or (spec.image_warmup and "media" in options)
             if "media" in options:
                 assert options["media"] is media and spec.image_warmup
                 calls.append("media")
@@ -174,7 +175,9 @@ def test_rank_warms_then_serves_and_closes_on_failure(monkeypatch, name, rank, f
             assert calls.count("media") == spec.image_warmup
             assert calls.index("warmup_done") < calls.index("http")
         if rank != 0:
-            assert "text" not in calls and "warmup_done" not in calls
+            assert "text" not in calls
+            assert calls.count("media") == spec.image_warmup
+            assert calls.count("warmup_done") == spec.image_warmup
 
 
 def test_selected_model_owns_download_and_serving_volume(monkeypatch):

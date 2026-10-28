@@ -47,6 +47,7 @@ from resin.backend.cuda.sampling import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
+from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.plans import BatchView, PagedCachePlan
 from resin.backend.sampling import (
     PromptScores,
@@ -131,6 +132,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
         self._media_features: dict[
             int, tuple[DeepSeekV41Media, dict[int, torch.Tensor]]
         ] = {}
+        self._vision_feature_cache = VisionFeatureCache()
         if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, int):
             raise ValueError("max_seq_len must be a positive integer")
         if max_seq_len <= 0:
@@ -415,6 +417,12 @@ class DeepSeekV41CudaRunner(CudaRunner):
         )
         hidden = self._model.embed(input_ids)
         for index, image in overlaps:
+            key = media.digest, index
+            if index not in features:
+                cached = self._vision_feature_cache.get(key)
+                if cached is not None:
+                    assert cached[0] is not None
+                    features[index] = cached[0]
             if index not in features:
                 patches = torch.from_numpy(image.patches).to(
                     self.device, dtype=torch.bfloat16
@@ -434,7 +442,9 @@ class DeepSeekV41CudaRunner(CudaRunner):
                         if token_type == kind
                     ]
                     span[indices] = value
-                features[index] = span
+                (owned,) = self._vision_feature_cache.put(key, (span,))
+                assert owned is not None
+                features[index] = owned
             lower, upper = (
                 max(start, image.start),
                 min(end, image.start + len(image.types)),

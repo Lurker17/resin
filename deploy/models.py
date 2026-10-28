@@ -145,6 +145,7 @@ MODEL_SPECS.update(
             max_batch_size=8,
             prefill_chunk_size=8192,
             gpu_memory_utilization=0.65,
+            image_warmup=True,
         ),
         "deepseek-v41": ModelSpec(
             name="deepseek-v41",
@@ -175,6 +176,7 @@ MODEL_SPECS.update(
             prefill_chunk_size=8192,
             draft_tokens=3,
             gpu_memory_utilization=0.85,
+            image_warmup=True,
             expert_backend="deepgemm",
         ),
         "gemma4": ModelSpec(

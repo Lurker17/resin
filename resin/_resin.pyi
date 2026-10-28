@@ -687,6 +687,11 @@ class Gemma4Media:
     def video_position_ids(self, /) -> npt.NDArray[np.int64] | None: ...
     @property
     def video_positions(self, /) -> tuple[int, ...]: ...
+    @property
+    def vision_digest(self, /) -> str:
+        """
+        Image/video tensor identity, independent of conversational text positions.
+        """
 
 @final
 class Glm53FlashMedia:
@@ -800,6 +805,7 @@ class NativeRecipe(Recipe):
     """
     A native model recipe constructed by get_native_recipe.
     """
+    def _media_preparation_cache_info(self, /) -> dict[str, int]: ...
     def create_parser(self, /, prompt: RenderedPrompt) -> _NativeResponseParser: ...
     def debug_render_text(
         self,

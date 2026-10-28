@@ -41,6 +41,10 @@ class MediaInput(Protocol):
     one prefill row when a model uses bidirectional attention within media.
     Both properties are required at admission; use an empty tuple for spans
     when all prompt positions may be split across prefill chunks.
+
+    The payload must remain consistent with its content identity. Native media
+    owns immutable snapshots and exposes read-only arrays; construct a new
+    payload to change pixels or geometry instead of mutating an existing one.
     """
 
     @property

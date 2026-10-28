@@ -24,12 +24,13 @@ pub(crate) fn array<T: numpy::Element>(
     py: Python<'_>,
     tensor: Tensor<T>,
 ) -> PyResult<Py<PyArrayDyn<T>>> {
-    Ok(
-        ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&tensor.shape), tensor.data)
-            .map_err(error)?
-            .into_pyarray(py)
-            .unbind(),
-    )
+    let array = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&tensor.shape), tensor.data)
+        .map_err(error)?
+        .into_pyarray(py);
+    // Content digests and prefix/vision caches describe this snapshot. Exposing
+    // writable pixels or geometry would let them diverge from that identity.
+    array.readwrite().make_nonwriteable();
+    Ok(array.unbind())
 }
 
 pub(crate) fn f32_tensor(value: &Bound<'_, PyAny>) -> PyResult<Tensor<f32>> {
@@ -321,6 +322,9 @@ impl Glm53FlashMedia {
 #[pyclass(frozen, module = "resin._resin")]
 pub(crate) struct Gemma4Media {
     identity: Identity,
+    /// Image/video tensor identity, independent of conversational text positions.
+    #[pyo3(get)]
+    vision_digest: String,
     types: Vec<u8>,
     #[pyo3(get, name = "pixel_values")]
     pixels: Option<Py<PyArrayDyn<f32>>>,
@@ -468,6 +472,8 @@ impl Gemma4Media {
         let mut hash = Sha256::new();
         Digest::update(&mut hash, b"resin.gemma.media.v2");
         Digest::update(&mut hash, &types);
+        let mut vision_hash = Sha256::new();
+        Digest::update(&mut vision_hash, b"resin.gemma.vision.v1");
         for (name, tensor, rank) in [
             ("pixel_values", &pixels, 3),
             ("pixel_values_videos", &video_pixels, 4),
@@ -477,6 +483,7 @@ impl Gemma4Media {
                     return Err(error(format!("{name} must have rank {rank}")));
                 }
                 f32_hash(&mut hash, name, t);
+                f32_hash(&mut vision_hash, name, t);
             }
         }
         for (name, tensor, rank) in [
@@ -488,6 +495,7 @@ impl Gemma4Media {
                     return Err(error(format!("{name} must have rank {rank}")));
                 }
                 i64_hash(&mut hash, name, t);
+                i64_hash(&mut vision_hash, name, t);
             }
         }
         let visual = types
@@ -497,6 +505,11 @@ impl Gemma4Media {
             .collect::<Vec<_>>();
         Ok(Self {
             identity: Identity::new(tokens, &visual, hash)?,
+            vision_digest: vision_hash
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
             types,
             pixels: pixels.map(|p| array(py, p)).transpose()?,
             positions: positions.map(|p| array(py, p)).transpose()?,

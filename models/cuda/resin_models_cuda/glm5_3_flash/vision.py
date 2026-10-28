@@ -7,12 +7,14 @@ The tower retains the checkpoint's BF16 weights; NVFP4 applies to the text MoE.
 
 from bisect import bisect_left
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, fields
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 @dataclass(frozen=True)
@@ -132,10 +134,17 @@ class VisionAttention(nn.Module):
         q, k, v = self.qkv(x).reshape(x.shape[0], 3, self.heads, -1).unbind(1)
         q = apply_rotary(self.q_norm(q), cos, sin)
         k = apply_rotary(self.k_norm(k), cos, sin)
-        out = F.scaled_dot_product_attention(
-            q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
-        )
-        return self.proj(out.transpose(0, 1).reshape(x.shape[0], -1))
+        # Keep the image batch axis explicit so CUDA can select fused SDPA.
+        # Avoid cuDNN's first-use plan build for each new image geometry.
+        with (
+            sdpa_kernel(SDPBackend.FLASH_ATTENTION) if x.is_cuda else nullcontext()
+        ):
+            out = F.scaled_dot_product_attention(
+                q.transpose(0, 1).unsqueeze(0),
+                k.transpose(0, 1).unsqueeze(0),
+                v.transpose(0, 1).unsqueeze(0),
+            )
+        return self.proj(out.squeeze(0).transpose(0, 1).reshape(x.shape[0], -1))
 
 
 class VisionBlock(nn.Module):

@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use crate::{
     AppState,
     protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error},
-    ui::INDEX_HTML,
+    ui::index_html,
 };
 
 pub(crate) type RequestResult<T> = Result<T, Box<Response>>;
@@ -115,8 +115,8 @@ const fn default_top_p() -> f64 {
     1.0
 }
 
-pub async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+pub async fn index(State(state): State<AppState>) -> Html<String> {
+    Html(index_html(state.routed_dp_size))
 }
 
 pub async fn health(State(state): State<AppState>) -> Response {

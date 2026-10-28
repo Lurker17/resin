@@ -7,6 +7,7 @@ use resin_recipe::{Encoder, Error, Prompt, PromptSpan};
 /// Explicit media IDs replacing one trusted template placeholder.
 ///
 /// Prefix and suffix are ordinary text and share BPE boundaries with nearby text.
+#[derive(Clone)]
 pub(crate) struct MediaTokens {
     placeholder: String,
     token_ids: Vec<u32>,
@@ -14,6 +15,13 @@ pub(crate) struct MediaTokens {
     suffix: String,
 }
 impl MediaTokens {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.placeholder.capacity()
+            + self.token_ids.capacity() * std::mem::size_of::<u32>()
+            + self.prefix.capacity()
+            + self.suffix.capacity()
+    }
+
     pub(crate) fn from_parts(
         placeholder: &str,
         token_ids: Vec<u32>,

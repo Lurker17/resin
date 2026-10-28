@@ -53,6 +53,7 @@ impl Default for Config {
     }
 }
 
+#[derive(Clone)]
 pub struct Prepared {
     pub pixel_values: Tensor<f32>,
     pub token_counts: Vec<usize>,

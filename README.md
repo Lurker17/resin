@@ -206,6 +206,14 @@ prompt rendering and incremental response parsing live in the independent
 protocol as application-provided recipes. Stock image/video preprocessing also
 runs in Rust; the model runner performs the GPU vision encoder.
 
+Native recipes reuse preparation for repeated immutable encoded images, with an
+LRU limited to 8 image sets and 128 MiB per recipe. CUDA vision runners separately
+retain up to 64 encoded feature sets and 256 MiB per runner. Both caches use
+content identities; prompt positions are rebuilt for each request. Mutable image
+arrays and video inputs bypass the CPU preparation cache. Prepared native media
+exposes read-only snapshots, so pixels and geometry cannot diverge from their
+cache identity; render a new payload when changing an input image.
+
 The bridge bounds queued jobs with `HttpServer(request_queue_capacity=1024)`.
 This shared intake queue absorbs bursts while requests await engine admission;
 it does not reserve GPU cache or change the engine's active batch size. Active
@@ -256,15 +264,18 @@ coordinator. For example, DeepSeek uses attention DP and expert parallelism,
 while GPT-OSS 120B uses attention and expert tensor parallelism. Requests are
 routed round-robin across attention-DP replicas unless `routed_dp_rank` in the
 JSON body or `resin-routed-dp-rank` in the header selects a replica. Single-rank
-deployments use a local Engine through the same HTTP frontend.
+deployments use a local Engine through the same HTTP frontend. The built-in chat
+page chooses one replica per page session and keeps later turns there so they can
+reuse its prefix and image caches. API clients can select a stable rank likewise.
 
 Each deployed URL serves `/`, `/health`, `/v1/models`,
 `/v1/chat/completions`, and `/v1/responses`; model configuration controls
 `/v1/messages` support. The functions
 scale to zero after 15 idle minutes and are capped at one GPU container apiece.
 The chat demo renders Markdown and TeX math and requests up to 16,384 output
-tokens by default. Model loading, CUDA graph capture, and one real prompt
-warmup all complete before the endpoint starts accepting traffic.
+tokens by default. Model loading, CUDA graph capture, and prompt warmup all
+complete before the endpoint starts accepting traffic. Models with image warmup
+enabled also warm the vision path on every attention replica.
 Because `requires_proxy_auth=False`, anyone with a URL can submit inference
 requests and incur GPU usage; remove the deployment when it is no longer
 needed.

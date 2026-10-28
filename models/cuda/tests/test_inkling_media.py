@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.recipe import InklingMedia
 
 
@@ -55,6 +56,7 @@ def test_runner_converts_native_pixels_once_and_reuses_features() -> None:
     runner.config = SimpleNamespace(hidden_size=3)
     runner._model = SimpleNamespace(vision=vision)
     runner._media_features = {}
+    runner._vision_feature_cache = VisionFeatureCache()
     media = InklingMedia(
         token_ids=(7, 200054, 9),
         image_token_id=200054,

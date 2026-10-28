@@ -38,6 +38,7 @@ from resin.backend.cuda.runner import (
     graph_sample_block,
     pad_sampling_inputs,
 )
+from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import (
     SAMPLING_OFFSET_STRIDE,
@@ -378,6 +379,7 @@ class Gemma4CudaRunner(CudaRunner):
             for _ in range(2)
         )
         self._media_features: dict[int, _MediaFeatures] = {}
+        self._vision_feature_cache = VisionFeatureCache()
         self._target_hidden: dict[int, Tensor] = {}
         self._build_attention_wrappers()
         self._prefill_feed_forward = self._configure_prefill_graphs(
@@ -538,25 +540,33 @@ class Gemma4CudaRunner(CudaRunner):
             image_token_id=self.config.image_token_id,
             video_token_id=self.config.video_token_id,
         )
-        with torch.inference_mode():
-            image = None
-            if media.pixel_values is not None:
-                assert media.image_position_ids is not None
-                image = self._model.get_image_features(
-                    torch.from_numpy(media.pixel_values).to(
-                        self.device, dtype=torch.bfloat16
-                    ),
-                    torch.from_numpy(media.image_position_ids).to(self.device),
-                )
-            video = None
-            if media.pixel_values_videos is not None:
-                assert media.video_position_ids is not None
-                video = self._model.get_video_features(
-                    torch.from_numpy(media.pixel_values_videos).to(
-                        self.device, dtype=torch.bfloat16
-                    ),
-                    torch.from_numpy(media.video_position_ids).to(self.device),
-                )
+        cached = self._vision_feature_cache.get(media.vision_digest)
+        if cached is None:
+            with torch.inference_mode():
+                image = None
+                if media.pixel_values is not None:
+                    assert media.image_position_ids is not None
+                    image = self._model.get_image_features(
+                        torch.from_numpy(media.pixel_values).to(
+                            self.device, dtype=torch.bfloat16
+                        ),
+                        torch.from_numpy(media.image_position_ids).to(self.device),
+                    )
+                video = None
+                if media.pixel_values_videos is not None:
+                    assert media.video_position_ids is not None
+                    video = self._model.get_video_features(
+                        torch.from_numpy(media.pixel_values_videos).to(
+                            self.device, dtype=torch.bfloat16
+                        ),
+                        torch.from_numpy(media.video_position_ids).to(self.device),
+                    )
+            if image is not None and len(image) != len(media.image_positions):
+                raise ValueError("vision features do not match image placeholder count")
+            if video is not None and len(video) != len(media.video_positions):
+                raise ValueError("vision features do not match video placeholder count")
+            cached = self._vision_feature_cache.put(media.vision_digest, (image, video))
+        image, video = cached
         if image is not None and len(image) != len(media.image_positions):
             raise ValueError("vision features do not match image placeholder count")
         if video is not None and len(video) != len(media.video_positions):

@@ -35,6 +35,7 @@ from resin.backend.cuda.sampling import (
     SAMPLING_OFFSET_STRIDE,
 )
 from resin.backend.cuda.staging import TensorStager
+from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import (
     PromptScores,
@@ -180,6 +181,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         vision_config = self.raw_config.get("vision_config") or {}
         self.spatial_merge_size = int(vision_config.get("spatial_merge_size", 1))
         self._media_features: dict[int, tuple[Qwen35Media, torch.Tensor]] = {}
+        self._vision_feature_cache = VisionFeatureCache()
         self.weight_quantization = (
             "modelopt-fp8-nvfp4" if is_modelopt_nvfp4(self.raw_config) else "bfloat16"
         )
@@ -345,17 +347,24 @@ class Qwen3_5CudaRunner(CudaRunner):
             if existing[0] is not media:
                 raise ValueError("a live Qwen sequence changed its media object")
             return existing[1]
-        visual = self._model.visual
-        if visual is None:
-            raise RuntimeError("Qwen checkpoint did not load a visual tower")
-        with torch.inference_mode():
-            output = visual(
-                torch.from_numpy(media.pixel_values).to(
-                    self.device, dtype=torch.bfloat16
-                ),
-                torch.from_numpy(media.image_grid_thw).to(self.device),
-            )
-            features = output.pooler_output.detach()
+        cached = self._vision_feature_cache.get(media.digest)
+        if cached is None:
+            visual = self._model.visual
+            if visual is None:
+                raise RuntimeError("Qwen checkpoint did not load a visual tower")
+            with torch.inference_mode():
+                output = visual(
+                    torch.from_numpy(media.pixel_values).to(
+                        self.device, dtype=torch.bfloat16
+                    ),
+                    torch.from_numpy(media.image_grid_thw).to(self.device),
+                )
+                features = output.pooler_output.detach()
+            if features.shape != (len(media.image_positions), self.config.hidden_size):
+                raise ValueError("Qwen vision features do not match image placeholders")
+            cached = self._vision_feature_cache.put(media.digest, (features,))
+        (features,) = cached
+        assert features is not None
         if features.shape != (len(media.image_positions), self.config.hidden_size):
             raise ValueError("Qwen vision features do not match image placeholders")
         self._media_features[sequence_id] = (media, features)

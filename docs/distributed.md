@@ -451,6 +451,12 @@ recipe, media preprocessing, incremental parser, scheduler, and cache. Client
 disconnects and stalled response channels cancel the request on its owner.
 Generated and prompt logprobs travel through the same response bridge.
 
+The built-in chat page chooses a random replica once per page session and sends
+that rank on every turn. This preserves prefix and image-cache locality for a
+conversation; it does not alter automatic routing for other clients. The page's
+first-token timer includes upload, queueing, preparation and inference, and does
+not identify any one of those phases.
+
 Set `HttpServer(..., stream_interval=N)` to batch later streaming output until N
 generated model tokens accumulate, checked at step boundaries after the first
 semantic output. Completion flushes the remainder. It defaults to 1 and must be

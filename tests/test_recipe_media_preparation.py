@@ -135,9 +135,18 @@ def test_media_transfer_snapshots_receiver_and_keeps_sender_buffers_alive():
     del media
     # The token view owns its frozen native payload, including its other arrays.
     assert buffers[0].tolist() == [2, 8]
-    restored: Any = resin._resin._media_from_buffers(metadata, buffers)
+    for buffer in buffers:
+        assert not buffer.flags.writeable
+        with pytest.raises(ValueError, match="WRITEABLE"):
+            buffer.setflags(write=True)
+    # Transport may deliver mutable buffers; the receiver snapshots those too.
+    incoming = tuple(buffer.copy() for buffer in buffers)
+    restored: Any = resin._resin._media_from_buffers(metadata, incoming)
     before = restored.pixel_values.copy()
-    buffers[1].fill(0)
+    incoming[1].fill(0)
+    assert not restored.pixel_values.flags.writeable
+    with pytest.raises(ValueError, match="read-only"):
+        restored.pixel_values.fill(0)
     np.testing.assert_array_equal(restored.pixel_values, before)
 
 

@@ -373,6 +373,22 @@ fn recording_router(ranks: usize) -> axum::Router {
 }
 
 #[tokio::test]
+async fn demo_exposes_attention_replica_count() {
+    for ranks in [1, 4] {
+        let response = recording_router(ranks)
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains(&format!("name=\"resin-dp-size\" content=\"{ranks}\"")));
+    }
+}
+
+#[tokio::test]
 async fn output_token_limits_preserve_omission_and_explicit_values() {
     for (path, input, cases) in [
         (

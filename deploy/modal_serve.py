@@ -65,16 +65,14 @@ def _warmup(engine, recipe, spec, rank: int) -> None:
     from resin import SamplingParams
     from resin.recipe import Image, Message, Role, Text
 
-    content = [
-        Text(
-            "Count from 1 to 100."
-            if spec.family == "deepseek_v41"
-            else "Reply with one word."
-        )
-    ]
+    # Exercise several decode steps, rather than ending after a one-word reply.
+    content = [Text("Count from 1 to 100.")]
     for image_input in (False, True) if spec.image_warmup else (False,):
         lease = None
-        if rank == 0:
+        # This function runs only on attention replica drivers. Warm each
+        # replica's image tower; round-robin or sticky HTTP routing may use any
+        # of them immediately after startup.
+        if rank == 0 or image_input:
             parts = content
             if image_input:
                 axis = np.linspace(0, 1, 96, dtype=np.float32)
@@ -92,7 +90,7 @@ def _warmup(engine, recipe, spec, rank: int) -> None:
             lease = engine.submit(
                 **inputs,
                 sampling_params=SamplingParams(
-                    max_output_tokens=64 if spec.family == "deepseek_v41" else 2,
+                    max_output_tokens=64,
                     stop_token_ids=recipe.stop_token_ids,
                     temperature=0.0,
                 ),

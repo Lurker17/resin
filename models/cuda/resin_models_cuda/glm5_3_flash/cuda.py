@@ -27,6 +27,7 @@ from resin.backend.cuda.runner import (
 )
 from resin.backend.cuda.slab import graph_scratch_parent_count
 from resin.backend.cuda.staging import TensorStager
+from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import format_output, prompt_scores, token_output
 from resin.backend.speculative import SpeculativeStats
@@ -98,6 +99,7 @@ class Glm53FlashCudaRunner(CudaRunner):
             speculative_tokens,
         )
         self._media_features = {}
+        self._vision_feature_cache = VisionFeatureCache()
         self._speculation = SpeculativeStats(speculative_tokens)
         if profile_graph_phases:
             self.configure_metrics(enabled=True)
@@ -531,15 +533,27 @@ class Glm53FlashCudaRunner(CudaRunner):
             if stored is not None and stored[0] != media.digest:
                 raise ValueError("GLM image payload changed during a request")
             if stored is None:
-                vision = self._model.vision
-                if vision is None:
-                    raise ValueError("GLM checkpoint has no vision encoder")
-                pixels = torch.as_tensor(
-                    np.array(media.pixel_values),
-                    device=self.device,
-                    dtype=torch.bfloat16,
-                )
-                features = vision.encode(pixels, media.image_grid_thw.tolist())
+                cached = self._vision_feature_cache.get(media.digest)
+                if cached is None:
+                    vision = self._model.vision
+                    if vision is None:
+                        raise ValueError("GLM checkpoint has no vision encoder")
+                    pixels = torch.as_tensor(
+                        np.array(media.pixel_values),
+                        device=self.device,
+                        dtype=torch.bfloat16,
+                    )
+                    features = vision.encode(pixels, media.image_grid_thw.tolist())
+                    if features.shape != (
+                        len(media.image_positions),
+                        embeddings.shape[-1],
+                    ):
+                        raise ValueError(
+                            "GLM vision features do not match image placeholders"
+                        )
+                    cached = self._vision_feature_cache.put(media.digest, (features,))
+                (features,) = cached
+                assert features is not None
                 stored = media.digest, features
                 self._media_features[sequence_id] = stored
             start, end = int(plan.token_indptr[row]), int(plan.token_indptr[row + 1])

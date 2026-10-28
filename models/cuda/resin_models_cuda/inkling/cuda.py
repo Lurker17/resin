@@ -31,6 +31,7 @@ from resin.backend.cuda.sampling import (
     SAMPLING_OFFSET_STRIDE,
 )
 from resin.backend.cuda.staging import TensorStager
+from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import (
     PromptScores,
@@ -133,6 +134,7 @@ class InklingCudaRunner(CudaRunner):
         self._speculation = SpeculativeStats(self.speculative_tokens)
         self._graph_device_caches: dict[GraphShape, DeviceCache] = {}
         self._media_features: dict[int, tuple[InklingMedia, torch.Tensor]] = {}
+        self._vision_feature_cache = VisionFeatureCache()
 
         with use_default_dtype(torch.bfloat16), torch.device(self.device):
             self._model = InklingForCausalLM(
@@ -454,12 +456,19 @@ class InklingCudaRunner(CudaRunner):
             if existing[0] is not media:
                 raise ValueError("a live Inkling sequence changed its media object")
             return existing[1]
-        pixels = media.pixel_values
-        if pixels is None:
-            raise ValueError("Inkling image placeholders require pixel_values")
-        features = self._model.vision(
-            torch.tensor(pixels, device=self.device, dtype=torch.bfloat16)
-        ).detach()
+        cached = self._vision_feature_cache.get(media.digest)
+        if cached is None:
+            pixels = media.pixel_values
+            if pixels is None:
+                raise ValueError("Inkling image placeholders require pixel_values")
+            features = self._model.vision(
+                torch.tensor(pixels, device=self.device, dtype=torch.bfloat16)
+            ).detach()
+            if features.shape != (len(media.image_positions), self.config.hidden_size):
+                raise ValueError("Inkling vision features do not match placeholders")
+            cached = self._vision_feature_cache.put(media.digest, (features,))
+        (features,) = cached
+        assert features is not None
         if features.shape != (len(media.image_positions), self.config.hidden_size):
             raise ValueError("Inkling vision features do not match placeholders")
         self._media_features[sequence_id] = (media, features)

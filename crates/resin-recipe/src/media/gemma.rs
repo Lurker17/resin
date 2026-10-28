@@ -73,17 +73,17 @@ pub struct Config {
     pub video_processor: VideoConfig,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Frame {
     pub timestamp: Option<String>,
     pub token_count: usize,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Expansion {
     pub is_video: bool,
     pub frames: Vec<Frame>,
 }
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Prepared {
     pub pixel_values: Option<Tensor<f32>>,
     pub image_position_ids: Option<Tensor<i64>>,

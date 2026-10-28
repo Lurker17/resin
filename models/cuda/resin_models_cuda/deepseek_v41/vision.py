@@ -3,11 +3,13 @@
 # 1bae0e1088993b9b82de08f59de5be5a34e42170/inference/vision.py
 """Checkpoint-shaped vision encoder and 3x3 patch-to-language projection."""
 
+from contextlib import nullcontext
 from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 @lru_cache(8)
@@ -68,10 +70,19 @@ class Attention(nn.Module):
         )
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
-        o = F.scaled_dot_product_attention(
-            q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
-        )
-        return self.wo(o.transpose(0, 1).reshape(n, -1))
+        # SDPA's fused CUDA backends require [batch, heads, tokens, channels].
+        # One image is one batch; these views preserve full image attention.
+        # cuDNN builds shape-specific plans on first use. Flash consumes new
+        # image lengths without that per-geometry planning/compilation stall.
+        with (
+            sdpa_kernel(SDPBackend.FLASH_ATTENTION) if x.is_cuda else nullcontext()
+        ):
+            o = F.scaled_dot_product_attention(
+                q.transpose(0, 1).unsqueeze(0),
+                k.transpose(0, 1).unsqueeze(0),
+                v.transpose(0, 1).unsqueeze(0),
+            )
+        return self.wo(o.squeeze(0).transpose(0, 1).reshape(n, -1))
 
 
 class MLP(nn.Module):

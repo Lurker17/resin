@@ -1,9 +1,11 @@
 //! Native recipe media preparation. Python is only the input/output buffer boundary.
 
+use std::{collections::VecDeque, mem::size_of, sync::Arc};
+
 use numpy::{PyReadonlyArrayDyn, PyUntypedArrayMethods};
 use pyo3::{
     prelude::*,
-    types::{PyDict, PyTuple},
+    types::{PyBytes, PyDict, PyString, PyTuple},
 };
 use pythonize::depythonize;
 use resin_recipe::{
@@ -11,6 +13,7 @@ use resin_recipe::{
     media::{self, RgbImage, Source, Video},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::{
     media_payload::{
@@ -21,6 +24,7 @@ use crate::{
     recipe_types::MediaSources,
 };
 
+#[derive(Clone)]
 enum Payload {
     DeepSeek(media::deepseek::Prepared, u32),
     Gemma(media::gemma::Prepared, u32, u32),
@@ -28,9 +32,137 @@ enum Payload {
     Qwen(media::qwen::Prepared, usize, u32),
     Glm(media::qwen::Prepared, usize, u32),
 }
+#[derive(Clone)]
 pub(crate) struct Prepared {
     pub(crate) expansions: Vec<MediaTokens>,
     payload: Payload,
+}
+
+pub(crate) type CacheKey = [u8; 32];
+
+struct CacheEntry {
+    key: CacheKey,
+    prepared: Arc<Prepared>,
+    bytes: usize,
+}
+
+/// Owned by one immutable native recipe, so processor/tokenizer configuration is
+/// implicit in the key. No Python object, source string, or conversation survives
+/// in this cache. Cache the ordered image set because its prepared tensors may
+/// share padded batch dimensions; bind positions against each new prompt.
+pub(crate) struct PreparationCache {
+    entries: VecDeque<CacheEntry>,
+    retained_bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+    hits: usize,
+    misses: usize,
+}
+
+impl Default for PreparationCache {
+    fn default() -> Self {
+        Self::new(8, 128 * 1024 * 1024)
+    }
+}
+
+impl PreparationCache {
+    fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            retained_bytes: 0,
+            max_entries,
+            max_bytes,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    pub(crate) fn get(&mut self, key: CacheKey) -> Option<Arc<Prepared>> {
+        let Some(index) = self.entries.iter().position(|entry| entry.key == key) else {
+            self.misses = self.misses.saturating_add(1);
+            return None;
+        };
+        self.hits = self.hits.saturating_add(1);
+        let entry = self.entries.remove(index).unwrap();
+        let prepared = entry.prepared.clone();
+        self.entries.push_back(entry);
+        Some(prepared)
+    }
+
+    pub(crate) fn insert(&mut self, key: CacheKey, prepared: Arc<Prepared>) {
+        // Include tensor capacities, metadata, Arc counters, and entry storage.
+        let bytes = prepared.retained_bytes() + 2 * size_of::<usize>() + size_of::<CacheEntry>();
+        if self.max_entries == 0 || bytes > self.max_bytes {
+            return;
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            self.retained_bytes -= self.entries.remove(index).unwrap().bytes;
+        }
+        while self.entries.len() >= self.max_entries || bytes > self.max_bytes - self.retained_bytes
+        {
+            self.retained_bytes -= self.entries.pop_front().unwrap().bytes;
+        }
+        self.retained_bytes += bytes;
+        self.entries.push_back(CacheEntry {
+            key,
+            prepared,
+            bytes,
+        });
+    }
+
+    pub(crate) fn info(&self) -> [(&'static str, usize); 4] {
+        [
+            ("entries", self.entries.len()),
+            ("retained_bytes", self.retained_bytes),
+            ("hits", self.hits),
+            ("misses", self.misses),
+        ]
+    }
+}
+
+fn hash_field(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_le_bytes());
+    hash.update(value);
+}
+
+/// Hash encoded immutable sources before decoding. Mutable arrays/bytearrays and
+/// videos follow the uncached path; object identity is never a content key.
+pub(crate) fn cache_key(py: Python<'_>, sources: &MediaSources) -> PyResult<Option<CacheKey>> {
+    if sources.is_empty() || sources.iter().any(|(kind, _)| *kind != "image") {
+        return Ok(None);
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"resin.native-image-preparation.v1");
+    hash.update((sources.len() as u64).to_le_bytes());
+    for (_, source) in sources {
+        let source = source.bind(py);
+        if let Ok(value) = source.cast::<PyString>() {
+            hash.update([0]);
+            hash_field(&mut hash, value.to_str()?.as_bytes());
+        } else if let Ok(pair) = source.cast::<PyTuple>()
+            && pair.len() == 2
+        {
+            let data = pair.get_item(0)?;
+            let mime = pair.get_item(1)?;
+            let (Ok(data), Ok(mime)) = (data.cast::<PyBytes>(), mime.cast::<PyString>()) else {
+                return Ok(None);
+            };
+            hash.update([1]);
+            hash_field(&mut hash, mime.to_str()?.as_bytes());
+            hash_field(&mut hash, data.as_bytes());
+        } else {
+            return Ok(None);
+        }
+    }
+    Ok(Some(hash.finalize().into()))
+}
+
+fn vector_bytes<T>(values: &Vec<T>) -> usize {
+    values.capacity() * size_of::<T>()
+}
+
+fn tensor_bytes<T>(tensor: &media::Tensor<T>) -> usize {
+    vector_bytes(&tensor.shape) + vector_bytes(&tensor.data)
 }
 
 pub(crate) fn config_of(owner: &Bound<'_, PyAny>, name: &str) -> PyResult<Value> {
@@ -159,6 +291,56 @@ pub(crate) fn process(
     })
 }
 impl Prepared {
+    fn retained_bytes(&self) -> usize {
+        let payload = match &self.payload {
+            Payload::DeepSeek(data, _) => {
+                vector_bytes(&data.images)
+                    + data
+                        .images
+                        .iter()
+                        .map(|image| tensor_bytes(&image.patches) + vector_bytes(&image.types))
+                        .sum::<usize>()
+            }
+            Payload::Gemma(data, _, _) => {
+                data.pixel_values.as_ref().map_or(0, tensor_bytes)
+                    + data.image_position_ids.as_ref().map_or(0, tensor_bytes)
+                    + data.pixel_values_videos.as_ref().map_or(0, tensor_bytes)
+                    + data.video_position_ids.as_ref().map_or(0, tensor_bytes)
+                    + vector_bytes(&data.expansions)
+                    + data
+                        .expansions
+                        .iter()
+                        .map(|expansion| {
+                            vector_bytes(&expansion.frames)
+                                + expansion
+                                    .frames
+                                    .iter()
+                                    .map(|frame| {
+                                        frame.timestamp.as_ref().map_or(0, String::capacity)
+                                    })
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>()
+            }
+            Payload::Inkling(data, _) => {
+                tensor_bytes(&data.pixel_values) + vector_bytes(&data.token_counts)
+            }
+            Payload::Qwen(data, _, _) | Payload::Glm(data, _, _) => {
+                tensor_bytes(&data.pixel_values)
+                    + tensor_bytes(&data.image_grid_thw)
+                    + vector_bytes(&data.token_counts)
+            }
+        };
+        size_of::<Self>()
+            + vector_bytes(&self.expansions)
+            + self
+                .expansions
+                .iter()
+                .map(MediaTokens::heap_bytes)
+                .sum::<usize>()
+            + payload
+    }
+
     pub(crate) fn bind(
         self,
         py: Python<'_>,
@@ -368,4 +550,77 @@ pub(crate) fn image_token_types(
         ));
     }
     Ok(PyTuple::new(py, media::deepseek::image_token_types(height, width))?.unbind())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prepared(capacity: usize) -> Arc<Prepared> {
+        let mut data = Vec::with_capacity(capacity);
+        data.push(1.0);
+        Arc::new(Prepared {
+            expansions: vec![MediaTokens::from_parts(
+                "image",
+                vec![1],
+                String::new(),
+                String::new(),
+            )],
+            payload: Payload::Inkling(
+                media::inkling::Prepared {
+                    pixel_values: media::Tensor::new(vec![1], data).unwrap(),
+                    token_counts: vec![1],
+                },
+                1,
+            ),
+        })
+    }
+
+    #[test]
+    fn preparation_cache_evicts_least_recently_used_entry() {
+        let mut cache = PreparationCache::new(2, usize::MAX);
+        let a = prepared(1);
+        let b = prepared(1);
+        let weak_b = Arc::downgrade(&b);
+        cache.insert([1; 32], a.clone());
+        cache.insert([2; 32], b);
+        assert!(Arc::ptr_eq(&cache.get([1; 32]).unwrap(), &a));
+        cache.insert([3; 32], prepared(1));
+        assert!(weak_b.upgrade().is_none());
+        assert!(cache.get([2; 32]).is_none());
+        assert!(cache.get([1; 32]).is_some());
+        assert!(cache.get([3; 32]).is_some());
+        assert_eq!(cache.entries.len(), 2);
+    }
+
+    #[test]
+    fn preparation_cache_bounds_bytes_and_replacement_does_not_accumulate() {
+        let value = prepared(8);
+        let bytes = value.retained_bytes() + 2 * size_of::<usize>() + size_of::<CacheEntry>();
+        let mut cache = PreparationCache::new(8, bytes);
+        cache.insert([1; 32], value.clone());
+        cache.insert([1; 32], value.clone());
+        assert_eq!(cache.retained_bytes, bytes);
+        assert_eq!(cache.entries.len(), 1);
+        cache.insert([2; 32], value.clone());
+        assert!(cache.get([1; 32]).is_none());
+        assert!(cache.get([2; 32]).is_some());
+        cache.insert([3; 32], prepared(1024));
+        assert!(cache.get([3; 32]).is_none());
+        assert_eq!(cache.retained_bytes, bytes);
+        let mut disabled = PreparationCache::new(0, usize::MAX);
+        disabled.insert([1; 32], value);
+        assert_eq!(disabled.retained_bytes, 0);
+    }
+
+    #[test]
+    fn preparation_cache_accounts_for_tensor_spare_capacity_and_metadata() {
+        let small = prepared(1);
+        let large = prepared(1024);
+        assert!(large.retained_bytes() >= 1024 * size_of::<f32>() + size_of::<Prepared>());
+        assert_eq!(
+            large.retained_bytes() - small.retained_bytes(),
+            1023 * size_of::<f32>()
+        );
+    }
 }
