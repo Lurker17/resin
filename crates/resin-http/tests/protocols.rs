@@ -373,6 +373,118 @@ fn recording_router(ranks: usize) -> axum::Router {
 }
 
 #[tokio::test]
+async fn output_token_limits_preserve_omission_and_explicit_values() {
+    for (path, input, cases) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "hi"}]}),
+            vec![
+                (json!({}), Value::Null),
+                (
+                    json!({"max_completion_tokens": null, "max_tokens": null}),
+                    Value::Null,
+                ),
+                (json!({"max_tokens": 7}), json!(7)),
+                (json!({"max_completion_tokens": 5}), json!(5)),
+                (
+                    json!({"max_completion_tokens": 5, "max_tokens": 7}),
+                    json!(5),
+                ),
+                (
+                    json!({"max_completion_tokens": null, "max_tokens": 7}),
+                    json!(7),
+                ),
+            ],
+        ),
+        (
+            "/v1/responses",
+            json!({"input": "hi"}),
+            vec![
+                (json!({}), Value::Null),
+                (json!({"max_output_tokens": null}), Value::Null),
+                (json!({"max_output_tokens": 9}), json!(9)),
+            ],
+        ),
+        (
+            "/v1/messages",
+            json!({"messages": [{"role": "user", "content": "hi"}]}),
+            vec![(json!({"max_tokens": 11}), json!(11))],
+        ),
+    ] {
+        for (limits, expected) in cases {
+            let mut body = input.clone();
+            body["model"] = json!("test-model");
+            body.as_object_mut()
+                .unwrap()
+                .extend(limits.as_object().unwrap().clone());
+            let (status, response) = json_response(
+                recording_router(1),
+                Request::post(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            let content = match path {
+                "/v1/chat/completions" => &response["choices"][0]["message"]["content"],
+                "/v1/responses" => &response["output"][0]["content"][0]["text"],
+                _ => &response["content"][0]["text"],
+            };
+            let normalized: Value = serde_json::from_str(content.as_str().unwrap()).unwrap();
+            assert_eq!(normalized["max_output_tokens"], expected, "{path}: {body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_zero_output_limit_requires_prompt_logprobs() {
+    for (path, input, limits) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "hi"}]}),
+            json!({"max_tokens": 0}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "hi"}]}),
+            json!({"max_completion_tokens": 0, "max_tokens": 7}),
+        ),
+        (
+            "/v1/responses",
+            json!({"input": "hi"}),
+            json!({"max_output_tokens": 0}),
+        ),
+    ] {
+        for prompt_logprobs in [false, true] {
+            let mut body = input.clone();
+            body["model"] = json!("test-model");
+            body["prompt_logprobs"] = json!(prompt_logprobs);
+            body.as_object_mut()
+                .unwrap()
+                .extend(limits.as_object().unwrap().clone());
+            let (status, _) = json_response(
+                recording_router(1),
+                Request::post(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                if prompt_logprobs {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                "{path}: {body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn routing_metadata_uses_only_explicit_body_or_resin_header() {
     for (path, body) in [
         (

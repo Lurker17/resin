@@ -560,9 +560,11 @@ fn admit(
         let sampling_params = Py::new(
             py,
             SamplingParams::new(
-                Some(u32::try_from(job.request.max_output_tokens).map_err(|_| {
-                    PyValueError::new_err("max_output_tokens must fit in a uint32")
-                })?),
+                job.request
+                    .max_output_tokens
+                    .map(u32::try_from)
+                    .transpose()
+                    .map_err(|_| PyValueError::new_err("max_output_tokens must fit in a uint32"))?,
                 stop_token_ids.to_vec(),
                 job.request.temperature,
                 job.request.top_p,

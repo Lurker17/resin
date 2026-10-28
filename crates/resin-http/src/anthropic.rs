@@ -136,7 +136,7 @@ fn conversation_request(
         model: body.model,
         messages,
         tools,
-        max_output_tokens: body.max_tokens,
+        max_output_tokens: Some(body.max_tokens),
         temperature: body.temperature,
         top_p: body.top_p,
         top_k: body.top_k,

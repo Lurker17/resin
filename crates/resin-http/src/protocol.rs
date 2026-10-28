@@ -10,7 +10,8 @@ pub struct ConversationRequest {
     pub model: String,
     pub messages: Vec<Value>,
     pub tools: Vec<Value>,
-    pub max_output_tokens: usize,
+    /// Omission lets the engine use the context budget left by the rendered prompt.
+    pub max_output_tokens: Option<usize>,
     pub temperature: f64,
     pub top_p: f64,
     pub top_k: Option<u32>,

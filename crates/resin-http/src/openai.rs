@@ -182,11 +182,8 @@ fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<Conversati
     if body.n.unwrap_or(1) != 1 {
         return Err(invalid_request("Resin currently supports only n=1"));
     }
-    let max_output_tokens = body
-        .max_completion_tokens
-        .or(body.max_tokens)
-        .unwrap_or(16_384);
-    if max_output_tokens == 0 && !body.prompt_logprobs {
+    let max_output_tokens = body.max_completion_tokens.or(body.max_tokens);
+    if max_output_tokens == Some(0) && !body.prompt_logprobs {
         return Err(invalid_request(
             "max_completion_tokens must be positive unless prompt_logprobs is enabled",
         ));
@@ -404,8 +401,8 @@ fn responses_request(
     if messages.is_empty() {
         return Err(invalid_request("input must not be empty"));
     }
-    let max_output_tokens = body.max_output_tokens.unwrap_or(16_384);
-    if max_output_tokens == 0 && !body.prompt_logprobs {
+    let max_output_tokens = body.max_output_tokens;
+    if max_output_tokens == Some(0) && !body.prompt_logprobs {
         return Err(invalid_request(
             "max_output_tokens must be positive unless prompt_logprobs is enabled",
         ));

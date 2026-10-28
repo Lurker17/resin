@@ -72,11 +72,11 @@ def request_body(content="fast", *, stream=False, max_tokens=2):
 
 
 @contextmanager
-def running_server(runner, recipe=None, **options):
+def running_server(runner, recipe=None, *, engine_options=None, **options):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    engine = Engine(runner)
+    engine = Engine(runner, **(engine_options or {}))
     server = HttpServer(engine, recipe=recipe or Recipe(), model="test", **options)
     errors = []
 

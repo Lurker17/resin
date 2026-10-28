@@ -33,6 +33,9 @@ class HttpServer:
     request_queue_capacity bounds requests waiting for engine admission across
     all replicas. It does not change the engine's active batch size. A full
     queue returns HTTP 429 so clients can retry with backoff.
+
+    OpenAI chat and Responses requests without an output-token limit use the
+    engine's remaining context budget after rendering and tokenizing the prompt.
     """
 
     def __init__(
