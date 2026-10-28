@@ -21,6 +21,7 @@ from resin.backend.cuda.slab import (
 from resin.backend.plans import PagedCachePlan
 from resin.backend.resources import CachePoolBinding
 from resin.models.qwen3_5.config import Qwen35Config
+from resin_models_cuda.qwen3_5.gdn_decode import RecurrentStatePool
 
 PAGE_TOKENS = 128
 PREFILL_CHUNK_SIZE = 4096
@@ -182,6 +183,66 @@ class DeviceCache(SlabDeviceCache):
             self.convolution_states[indices],
             self.target_hidden_states[indices],
         )
+
+    def state_offsets(self, positions: Tensor) -> Tensor:
+        """Element offsets of each row's layer-zero recurrent state slot."""
+        slabs, slots, _ = self.locations(
+            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+        )
+        stride = self.recurrent_states.stride()
+        return slabs[:, 0].long() * stride[0] + slots[:, 0].long() * stride[1]
+
+    def recurrent_pool(
+        self, read_positions: Tensor, write_positions: Tensor
+    ) -> RecurrentStatePool:
+        read = self.state_offsets(read_positions)
+        write = self.state_offsets(write_positions)
+        stride = self.recurrent_states.stride()
+        conv = self.convolution_states.stride()
+
+        # Same (slab, slot) addressing, rescaled to the BF16 convolution view.
+        def convolution(offsets: Tensor) -> Tensor:
+            slabs = torch.div(offsets, stride[0], rounding_mode="floor")
+            slots = torch.div(
+                offsets - slabs * stride[0], stride[1], rounding_mode="floor"
+            )
+            # Kernel pointers already include the view's storage offset.
+            return slabs * conv[0] + slots * conv[1]
+
+        return RecurrentStatePool(
+            self.recurrent_states,
+            read,
+            write,
+            stride[2],
+            convolution_states=self.convolution_states,
+            convolution_source=convolution(read),
+            convolution_destination=convolution(write),
+            convolution_layer_stride=conv[2],
+        )
+
+    def convolution_at(self, positions: Tensor) -> Tensor:
+        slabs, slots, _ = self.locations(
+            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+        )
+        return self.convolution_states[slabs[:, 0].long(), slots[:, 0].long()]
+
+    def store_hidden(self, positions: Tensor, target_hidden: Tensor) -> None:
+        slabs, slots, _ = self.locations(
+            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+        )
+        self.target_hidden_states[slabs[:, 0].long(), slots[:, 0].long()] = (
+            target_hidden
+        )
+
+    def store_convolution(
+        self, positions: Tensor, convolution: Tensor, target_hidden: Tensor
+    ) -> None:
+        slabs, slots, _ = self.locations(
+            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+        )
+        indices = slabs[:, 0].long(), slots[:, 0].long()
+        self.convolution_states[indices] = convolution
+        self.target_hidden_states[indices] = target_hidden
 
     def store_state(
         self,
