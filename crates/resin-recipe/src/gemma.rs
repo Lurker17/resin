@@ -226,6 +226,9 @@ impl Grammar for Gemma4Grammar {
 pub struct Gemma4RecipeParams {
     pub add_generation_prompt: Option<bool>,
     pub enable_thinking: Option<bool>,
+    /// Older 31B templates close an empty thought channel in the generation
+    /// prefix. The original Edge checkpoints instead end at the model header.
+    pub empty_thought_prefix: Option<bool>,
     #[serde(skip_serializing)]
     pub media_config: Option<crate::media::gemma::Config>,
 }
@@ -422,7 +425,11 @@ impl crate::Recipe for Gemma4Recipe {
             && !matches!(previous_kind, Some("tool_response" | "tool_call"))
         {
             prompt.special("<|turn>").text("model\n");
-            if !enable_thinking {
+            if !enable_thinking
+                && option(request, "empty_thought_prefix")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+            {
                 prompt
                     .special("<|channel>")
                     .text("thought\n")
