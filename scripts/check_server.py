@@ -1,6 +1,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["httpx>=0.28,<1"]
+# [tool.ty.environment]
+# root = [".."]
 # ///
 """Check a deployed Resin server through its public chat-completions API.
 
