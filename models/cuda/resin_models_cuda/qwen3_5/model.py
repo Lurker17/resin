@@ -17,7 +17,12 @@ from resin_models_cuda.qwen3_5.attention import (
     PreparedPagedAttention,
     append_kv,
 )
-from resin_models_cuda.qwen3_5.cache import MTP_GROUP, TARGET_GROUP, DeviceCache
+from resin_models_cuda.qwen3_5.cache import (
+    MTP_GROUP,
+    TARGET_GROUP,
+    DeviceCache,
+    RecurrentStatePool,
+)
 from resin_models_cuda.qwen3_5.quantization import ModelOptFp8Linear
 
 if TYPE_CHECKING:
@@ -154,13 +159,54 @@ class Qwen35GatedDeltaNet(nn.Module):
             self.value_dim, config.hidden_size, quantized=quantized
         )
 
+    def _pooled_recurrence(
+        self, hidden: Tensor, mixed: Tensor, pool: RecurrentStatePool, layer: int
+    ) -> Tensor:
+        from resin_models_cuda.qwen3_5.gdn_decode import gdn_decode
+
+        batch, tokens = mixed.shape[:2]
+        return gdn_decode(
+            mixed.reshape(batch, tokens, self.conv_dim).contiguous(),
+            self.in_proj_a(hidden).reshape(batch, tokens, -1),
+            self.in_proj_b(hidden).reshape(batch, tokens, -1),
+            self.A_log,
+            self.dt_bias,
+            pool,
+            layer,
+            num_key_heads=self.config.linear_num_key_heads,
+            num_value_heads=self.config.linear_num_value_heads,
+            key_dim=self.config.linear_key_head_dim,
+            value_dim=self.config.linear_value_head_dim,
+        ).reshape(-1, self.config.linear_value_head_dim)
+
     def forward(
         self,
         hidden: Tensor,
         recurrent_state: Tensor | None,
         convolution_state: Tensor | None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        state_pool: tuple[RecurrentStatePool, int] | None = None,
+    ) -> tuple[Tensor, Tensor | None, Tensor | None]:
+        """With ``state_pool``, recurrent (and for one token, convolution) state
+        is read from and written to the cache arena in place."""
         batch, tokens = hidden.shape[:2]
+        if (
+            state_pool is not None
+            and tokens == 1
+            and state_pool[0].convolution_states is not None
+        ):
+            from resin_models_cuda.qwen3_5.gdn_decode import conv_decode
+
+            pool, linear_layer = state_pool
+            mixed = conv_decode(
+                self.in_proj_qkv(hidden).reshape(batch, self.conv_dim),
+                self.conv1d.weight,
+                pool,
+                linear_layer,
+            )
+            core = self._pooled_recurrence(hidden, mixed[:, None], pool, linear_layer)
+            gate = self.in_proj_z(hidden).reshape_as(core)
+            core = self.norm(core, gate).view(batch, tokens, self.value_dim)
+            return self.out_proj(core), None, None
         mixed = self.in_proj_qkv(hidden).transpose(1, 2)
         state_length = self.config.linear_conv_kernel_dim - 1
         if convolution_state is None:
@@ -174,6 +220,13 @@ class Qwen35GatedDeltaNet(nn.Module):
         convolution_input = torch.cat((convolution_state, mixed), dim=-1)
         mixed = F.silu(self.conv1d(convolution_input)).transpose(1, 2)
         convolution_state = convolution_input[..., -state_length:]
+        if state_pool is not None and hidden.is_cuda:
+            # Multi-token verification: the commit selects the accepted window.
+            pool, linear_layer = state_pool
+            core = self._pooled_recurrence(hidden, mixed, pool, linear_layer)
+            gate = self.in_proj_z(hidden).reshape_as(core)
+            core = self.norm(core, gate).view(batch, tokens, self.value_dim)
+            return self.out_proj(core), None, convolution_input
 
         query, key, value = torch.split(
             mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1
@@ -481,7 +534,8 @@ class Qwen35TextModel(nn.Module):
         input_embeddings: Tensor | None = None,
         attention_runtime: PagedAttentionRuntime | None = None,
         rotary_positions: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        recurrent_pool: RecurrentStatePool | None = None,
+    ) -> tuple[Tensor, Tensor | None, Tensor | None]:
         hidden = (
             self.embed_tokens(token_ids)
             if input_embeddings is None
@@ -525,7 +579,10 @@ class Qwen35TextModel(nn.Module):
                     else convolution_states[:, linear_index]
                 )
                 mixed, recurrent, convolution = layer.linear_attn(
-                    normalized, recurrent, convolution
+                    normalized,
+                    recurrent,
+                    convolution,
+                    None if recurrent_pool is None else (recurrent_pool, linear_index),
                 )
                 recurrent_out.append(recurrent)
                 convolution_out.append(convolution)
@@ -545,8 +602,8 @@ class Qwen35TextModel(nn.Module):
             hidden = hidden + (layer.prefill_ffn or layer.feed_forward)(hidden)
         return (
             self.norm(hidden),
-            torch.stack(recurrent_out, dim=1),
-            torch.stack(convolution_out, dim=1),
+            None if recurrent_pool is not None else torch.stack(recurrent_out, dim=1),
+            None if convolution_out[0] is None else torch.stack(convolution_out, dim=1),
         )
 
 

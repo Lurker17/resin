@@ -33,6 +33,26 @@ FP32_BYTES = 4
 
 
 @dataclass(frozen=True, slots=True)
+class RecurrentStatePool:
+    """Arena base plus per-row element offsets of layer zero's state."""
+
+    states: Tensor  # FP32 strided view whose data_ptr is the arena start
+    source: Tensor  # [B] int64 element offsets read
+    destination: Tensor  # [B] int64 element offsets written
+    layer_stride: int
+    # Speculative verification only: [layers, B, T-1, HV, K + V + 2] FP32.
+    pending: Tensor | None = None
+    # Single-token decode: convolution windows updated in place.
+    convolution_states: Tensor | None = None
+    convolution_source: Tensor | None = None
+    convolution_destination: Tensor | None = None
+    convolution_layer_stride: int = 0
+
+    def for_layer(self, linear_layer: int) -> tuple[Tensor, Tensor, int]:
+        return self.source, self.destination, linear_layer * self.layer_stride
+
+
+@dataclass(frozen=True, slots=True)
 class CacheGeometry:
     """Common slab geometry for unequal Qwen cache resources."""
 
@@ -182,6 +202,66 @@ class DeviceCache(SlabDeviceCache):
             self.convolution_states[indices],
             self.target_hidden_states[indices],
         )
+
+    def state_offsets(self, positions: Tensor) -> Tensor:
+        """Element offsets of each row's layer-zero recurrent state slot."""
+        slabs, slots, _ = self.locations(
+            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+        )
+        stride = self.recurrent_states.stride()
+        return slabs[:, 0].long() * stride[0] + slots[:, 0].long() * stride[1]
+
+    def recurrent_pool(
+        self, read_positions: Tensor, write_positions: Tensor
+    ) -> RecurrentStatePool:
+        read = self.state_offsets(read_positions)
+        write = self.state_offsets(write_positions)
+        stride = self.recurrent_states.stride()
+        conv = self.convolution_states.stride()
+
+        # Same (slab, slot) addressing, rescaled to the BF16 convolution view.
+        def convolution(offsets: Tensor) -> Tensor:
+            slabs = torch.div(offsets, stride[0], rounding_mode="floor")
+            slots = torch.div(
+                offsets - slabs * stride[0], stride[1], rounding_mode="floor"
+            )
+            # Kernel pointers already include the view's storage offset.
+            return slabs * conv[0] + slots * conv[1]
+
+        return RecurrentStatePool(
+            self.recurrent_states,
+            read,
+            write,
+            stride[2],
+            convolution_states=self.convolution_states,
+            convolution_source=convolution(read),
+            convolution_destination=convolution(write),
+            convolution_layer_stride=conv[2],
+        )
+
+    def convolution_at(self, positions: Tensor) -> Tensor:
+        slabs, slots, _ = self.locations(
+            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+        )
+        return self.convolution_states[slabs[:, 0].long(), slots[:, 0].long()]
+
+    def store_hidden(self, positions: Tensor, target_hidden: Tensor) -> None:
+        slabs, slots, _ = self.locations(
+            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+        )
+        self.target_hidden_states[slabs[:, 0].long(), slots[:, 0].long()] = (
+            target_hidden
+        )
+
+    def store_convolution(
+        self, positions: Tensor, convolution: Tensor, target_hidden: Tensor
+    ) -> None:
+        slabs, slots, _ = self.locations(
+            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+        )
+        indices = slabs[:, 0].long(), slots[:, 0].long()
+        self.convolution_states[indices] = convolution
+        self.target_hidden_states[indices] = target_hidden
 
     def store_state(
         self,
@@ -343,6 +423,7 @@ __all__ = [
     "MTP_GROUP",
     "PAGE_TOKENS",
     "PREFILL_CHUNK_SIZE",
+    "RecurrentStatePool",
     "STATE_GROUP",
     "TARGET_GROUP",
 ]

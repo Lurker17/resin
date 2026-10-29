@@ -44,6 +44,17 @@ def test_tp_cache_restores_local_recurrent_state_and_replicated_mtp_hidden(
     assert arena.values.shape == arena.keys.shape
     assert len(cache.groups) == 3  # Target KV, recurrent state, and MTP KV.
 
+    pool = cache.recurrent_pool(torch.tensor([4095]), torch.tensor([4096]))
+    assert pool.states is arena.recurrent_states
+    assert pool.source.item() == arena.recurrent_states.stride(0)
+    assert pool.destination.item() == 2 * arena.recurrent_states.stride(0)
+    assert pool.layer_stride == arena.recurrent_states.stride(2)
+    assert pool.convolution_source is not None
+    assert pool.convolution_destination is not None
+    assert pool.convolution_source.item() == arena.convolution_states.stride(0)
+    assert pool.convolution_destination.item() == 2 * arena.convolution_states.stride(0)
+    assert pool.convolution_layer_stride == arena.convolution_states.stride(2)
+
     recurrent = torch.randn(
         1,
         config.linear_layer_count,
