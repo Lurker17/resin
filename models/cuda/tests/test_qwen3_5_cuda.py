@@ -201,7 +201,7 @@ def test_fast_graph_commit_depth_mtp_repair_stats_and_timing_on_cpu(
     )
     runner._graph_device_caches = {(2, 8192): cache}
     runner._graph_attention_for = lambda shape: SimpleNamespace(
-        reset=lambda: None, graph_inputs=lambda: {}
+        reset=lambda: None, refresh=lambda positions: None, graph_inputs=lambda: {}
     )
     runner._new_phase_timing = lambda *categories: Timing(categories)
     runner._target_forward = lambda *args, **kwargs: (hidden, None, windows)
@@ -246,3 +246,204 @@ def test_fast_graph_commit_depth_mtp_repair_stats_and_timing_on_cpu(
     assert isinstance(timing, Timing)
     assert timing.categories == ("target_verify", "decode", "draft")
     assert timing.marks == [0, 1, 2, 3]
+
+
+@pytest.fixture
+def _cpu_completion_events(monkeypatch):
+    from types import SimpleNamespace
+
+    from resin.backend.cuda.staging import TensorStager
+
+    def host_buffer(self, name, shape, dtype):
+        value = self.host_tensors.get(name)
+        if value is None or value.shape != shape or value.dtype != dtype:
+            with torch.inference_mode(False):
+                value = torch.empty(shape, dtype=dtype, device="cpu")
+            self.host_tensors[name] = value
+        return value
+
+    # Exercise real staging/copy semantics without CUDA's pinned allocator.
+    monkeypatch.setattr(TensorStager, "_host_buffer", host_buffer)
+    monkeypatch.setattr(
+        torch.cuda,
+        "Event",
+        lambda *args, **kwargs: SimpleNamespace(
+            record=lambda *args: None, synchronize=lambda: None
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: None)
+
+
+@pytest.mark.parametrize(
+    "forced,wanted",
+    [(None, [[9], [7, 13]]), (0, [[9], [7]]), (1, [[5, 11], [7, 13]])],
+)
+def test_async_completion_preserves_outputs_drafts_and_shared_stats(
+    forced, wanted, _cpu_completion_events
+):
+    from types import SimpleNamespace
+
+    from resin.backend.speculative import SpeculativeStats
+
+    runner = cast(Any, object.__new__(Qwen3_5CudaRunner))
+    runner.device, runner.speculative_tokens = torch.device("cpu"), 1
+    runner.runner_config = SimpleNamespace(cache_write_lookahead_tokens=2)
+    runner._speculation = SpeculativeStats(1, benchmark_accepted_drafts=forced)
+    runner._drafts, runner._media_features = {}, {}
+    graph_output = torch.tensor(
+        [[5, 9, 11, 17], [7, 7, 13, 19], [0, 0, 0, 21], [0, 0, 0, 22]]
+    )
+    runner._run_cuda_graph = lambda *args: graph_output
+    plan = BatchPlan(
+        sequence_ids=[101, 202],
+        context_lengths=[127, 254],
+        token_ids=[3, 4],
+        token_indptr=[0, 1, 2],
+        phase=BatchPhase.DECODE,
+    )
+    completion = runner._enqueue_graph_output(
+        plan, (4, 8192), {"positions": np.asarray([127, 254, 1, 1])}
+    )
+    feedback = completion.feedback
+    assert feedback.sequence_ids == (101, 202) and feedback.shape == (4, 8192)
+    torch.testing.assert_close(
+        feedback.positions[:2],
+        torch.tensor([127 + len(wanted[0]), 254 + len(wanted[1])]),
+    )
+    torch.testing.assert_close(feedback.positions[2:], torch.ones(2, dtype=torch.long))
+    torch.testing.assert_close(feedback.draft_ids, torch.tensor([17, 19, 0, 0]))
+    assert runner.speculative_stats["blocks"] == 0  # Counters advance at harvest.
+    graph_output.zero_()  # A later replay may reuse every graph output buffer.
+    output = completion.result()
+    actual = [
+        output.token_ids[start:end].tolist()
+        for start, end in zip(output.token_indptr, output.token_indptr[1:])
+    ]
+    assert actual == wanted
+    assert runner.speculative_stats == {
+        "draft_tokens": 1,
+        "blocks": 2,
+        "drafts": 2,
+        "accepted": sum(map(len, wanted)) - 2,
+        "emitted": sum(map(len, wanted)),
+        "acceptance_rate": (sum(map(len, wanted)) - 2) / 2,
+    }
+    assert runner._drafts == {101: 17, 202: 19}
+    runner.release([101])
+    assert completion.result() is output
+    assert runner._drafts == {202: 19}  # Repeated harvest cannot resurrect release.
+
+
+@pytest.mark.parametrize(
+    "start,shapes,drain",
+    [
+        (124, [(1, 126), (2, 256)], True),
+        (124, [(1, 126)], True),
+        (127, [(2, 8192)], False),
+    ],
+)
+def test_owned_feedback_crosses_kv_page_and_drains_graph_limits(
+    monkeypatch, start, shapes, drain, _cpu_completion_events
+):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import resin_models_cuda.qwen3_5.cuda as runtime
+    from resin.backend.cuda.staging import TensorStager
+    from resin.backend.sampling import token_output
+    from resin.backend.speculative import SpeculativeStats
+
+    seen: dict[str, Any] = {"stages": 0, "positions": [], "fallback": 0}
+    runner = cast(Any, object.__new__(Qwen3_5CudaRunner))
+    runner.device, runner.speculative_tokens = torch.device("cpu"), 0
+    runner.config = SimpleNamespace(vocab_size=32)
+    runner.vocab_size = 32
+    runner.runner_config = SimpleNamespace(
+        cache_write_lookahead_tokens=0, cache_write_reservation_tokens=136
+    )
+    runner.cache_layout = None
+    runner._speculation, runner._drafts = SpeculativeStats(0), {}
+    runner._cuda_failure = nullcontext()
+    runner._check_cuda_graphs = lambda phase: None
+    runner._validate_plan = lambda plan: None
+    runner._host_rope_deltas = lambda plan: np.zeros(1, dtype=np.int64)
+    runner._sampler = None
+    runner._select_cuda_graph = lambda mode, match: next(
+        (shape for shape in shapes if match(shape)), None
+    )
+    runner._graph_device_caches = dict.fromkeys(shapes)
+    runner._graph_attention = {
+        shape: SimpleNamespace(plan=lambda *args: {}) for shape in shapes
+    }
+    runner._feedback_graph_inputs = {
+        shape: {
+            name: torch.zeros(shape[0], dtype=torch.long)
+            for name in ("token_ids", "positions", "rope_deltas", "sampling_offsets")
+        }
+        for shape in shapes
+    }
+    outputs = {shape: torch.empty(shape[0], 1, dtype=torch.long) for shape in shapes}
+
+    def stage(*args):
+        seen["stages"] += 1
+        return {}
+
+    def run(mode, shape, inputs):
+        buffers = runner._feedback_graph_inputs[shape]
+        TensorStager("cpu").copy_into(buffers, inputs)
+        seen["positions"].append(int(buffers["positions"][0]))
+        outputs[shape][:, 0].copy_(buffers["token_ids"] + 1)
+        return outputs[shape]
+
+    def forward(plan):
+        seen["fallback"] += 1
+        return token_output([[int(plan.token_ids[0]) + 1]])
+
+    runner._cache = SimpleNamespace(graph_plan_inputs=stage)
+    runner._run_cuda_graph, runner.forward = run, forward
+    cache_plan = SimpleNamespace(
+        groups=(
+            SimpleNamespace(block_indptr=np.asarray([0, 1])),
+            SimpleNamespace(block_indptr=np.asarray([0, 1])),
+        )
+    )
+    monkeypatch.setattr(
+        runtime.PagedCachePlan, "from_plan", lambda *args, **kwargs: cache_plan
+    )
+    monkeypatch.setattr(
+        runtime,
+        "pad_sampling_inputs",
+        lambda sampler, plan, vocab, padding: {
+            "sampling_offsets": np.zeros(1 + padding, dtype=np.int64)
+        },
+    )
+
+    def plan(position, token):
+        return BatchPlan(
+            sequence_ids=[101],
+            context_lengths=[position],
+            token_ids=[token],
+            token_indptr=[0, 1],
+            phase=BatchPhase.DECODE,
+        )
+
+    first = runner._graph_forward(plan(start, 7), cache_plan, enqueue=True)
+    second = runner.enqueue(plan(start + 1, 7), feedback=first.feedback)
+    assert seen["stages"] == 1  # Continuations retain their original dense tables.
+    assert runner.benchmark_counters == {
+        "async.enqueues": 2,
+        "async.continuations": 1,
+        "host.attention_plans": 1,
+    }
+    assert first.result().token_ids.tolist() == [8]
+    assert second.result().token_ids.tolist() == [9]
+    assert seen["positions"] == [start, start + 1]
+    if drain:
+        assert second.feedback is None
+        third = runner.enqueue(plan(start + 2, 9))
+        output = third.result() if callable(getattr(third, "result", None)) else third
+        assert output.token_ids.tolist() == [10]
+        assert seen["fallback"] == (len(shapes) == 1)
+    else:
+        assert first.feedback.positions[0] == 128  # Crossed a128-token KV page.
+        assert second.feedback is not None

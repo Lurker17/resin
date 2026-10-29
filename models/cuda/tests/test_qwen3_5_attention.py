@@ -8,6 +8,7 @@ import torch
 from resin.backend.cuda.paged_kv import SlabPagedKvCache
 from resin.backend.plans import CacheGroupView
 from resin_models_cuda.qwen3_5.attention import (
+    GraphAttentionSpec,
     GraphPagedAttentionRuntime,
     PreparedPagedAttention,
 )
@@ -120,3 +121,32 @@ def test_host_page_tables_match_reference(graph_rows, retained_pages, extra_page
     for result, reference in zip(actual, expected, strict=True):
         assert result.dtype == np.int32
         np.testing.assert_array_equal(result, reference)
+
+
+def test_graph_plan_only_validates_the_immutable_lease():
+    runtime = object.__new__(GraphPagedAttentionRuntime)
+    runtime.cache = cast(
+        SlabPagedKvCache,
+        SimpleNamespace(
+            groups=(SimpleNamespace(slab_ids=torch.zeros(4, 4)),),
+            page_tokens=128,
+        ),
+    )
+    runtime.calls = cast(
+        Any,
+        (SimpleNamespace(spec=GraphAttentionSpec(0, 3, 2, 2)),),
+    )
+    # Row zero owns future pages past both possible accepted positions. Nothing
+    # in host planning may expose those pages or replan a captured wrapper.
+    group = SimpleNamespace(
+        block_table_start_indices=np.array([0, 0]),
+        block_indptr=np.array([0, 3, 5]),
+    )
+    plan = SimpleNamespace(rows=2, groups=(group,))
+    for positions in ([126, 253], [128, 254]):
+        assert runtime.plan(plan, positions) == {}
+        assert runtime.graph_inputs() == {}
+    with pytest.raises(ValueError, match="exceeds its cache lease"):
+        runtime.plan(plan, [383, 255])
+    with pytest.raises(ValueError, match="requires retained queries"):
+        runtime.plan(plan, [-1, 255])
