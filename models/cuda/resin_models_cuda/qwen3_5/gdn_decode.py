@@ -17,32 +17,14 @@ committed token matches ordinary decode and no per-step state copies exist.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from typing import Any, cast
 
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
 
-
-@dataclass(frozen=True, slots=True)
-class RecurrentStatePool:
-    """Arena base plus per-row element offsets of layer zero's state."""
-
-    states: Tensor  # FP32 strided view whose data_ptr is the arena start
-    source: Tensor  # [B] int64 element offsets read
-    destination: Tensor  # [B] int64 element offsets written
-    layer_stride: int
-    # Speculative verification only: [layers, B, T-1, HV, K + V + 2] FP32.
-    pending: Tensor | None = None
-    # Single-token decode: convolution windows updated in place.
-    convolution_states: Tensor | None = None
-    convolution_source: Tensor | None = None
-    convolution_destination: Tensor | None = None
-    convolution_layer_stride: int = 0
-
-    def for_layer(self, linear_layer: int) -> tuple[Tensor, Tensor, int]:
-        return self.source, self.destination, linear_layer * self.layer_stride
+from resin_models_cuda.qwen3_5.cache import RecurrentStatePool
 
 
 @triton.jit
@@ -179,25 +161,33 @@ def _conv_decode_kernel(
     i_c = tl.program_id(0)
     i_n = tl.program_id(1)
     o_c = i_c * BC + tl.arange(0, BC)
+    valid = o_c < C
     src = states + tl.load(source + i_n) + layer_offset + o_c * (W - 1)
     dst = states + tl.load(destination + i_n) + layer_offset + o_c * (W - 1)
     tl.static_assert(W == 4, "chandra-2 uses a width-4 convolution")
-    b_x = tl.load(x + i_n.to(tl.int64) * C + o_c)
-    s0 = tl.load(src)
-    s1 = tl.load(src + 1)
-    s2 = tl.load(src + 2)
-    acc = s0.to(tl.float32) * tl.load(weight + o_c * W).to(tl.float32)
-    acc += s1.to(tl.float32) * tl.load(weight + o_c * W + 1).to(tl.float32)
-    acc += s2.to(tl.float32) * tl.load(weight + o_c * W + 2).to(tl.float32)
-    acc += b_x.to(tl.float32) * tl.load(weight + o_c * W + 3).to(tl.float32)
+    b_x = tl.load(x + i_n.to(tl.int64) * C + o_c, valid, other=0)
+    s0 = tl.load(src, valid, other=0)
+    s1 = tl.load(src + 1, valid, other=0)
+    s2 = tl.load(src + 2, valid, other=0)
+    acc = s0.to(tl.float32) * tl.load(weight + o_c * W, valid, other=0).to(tl.float32)
+    acc += s1.to(tl.float32) * tl.load(weight + o_c * W + 1, valid, other=0).to(
+        tl.float32
+    )
+    acc += s2.to(tl.float32) * tl.load(weight + o_c * W + 2, valid, other=0).to(
+        tl.float32
+    )
+    acc += b_x.to(tl.float32) * tl.load(weight + o_c * W + 3, valid, other=0).to(
+        tl.float32
+    )
     tl.debug_barrier()
-    tl.store(dst, s1)
-    tl.store(dst + 1, s2)
-    tl.store(dst + 2, b_x)
+    tl.store(dst, s1, valid)
+    tl.store(dst + 1, s2, valid)
+    tl.store(dst + 2, b_x, valid)
     acc = acc.to(tl.bfloat16).to(tl.float32)
     tl.store(
         out + i_n.to(tl.int64) * C + o_c,
         (acc * tl.sigmoid(acc)).to(out.dtype.element_ty),
+        valid,
     )
 
 
@@ -210,7 +200,7 @@ def conv_decode(
     x = x.contiguous()
     out = torch.empty((batch, channels), dtype=x.dtype, device=x.device)
     block = 1024
-    _conv_decode_kernel[(channels // block, batch)](
+    cast(Any, _conv_decode_kernel)[(triton.cdiv(channels, block), batch)](
         x,
         weight,
         pool.convolution_states,
@@ -259,7 +249,7 @@ def gdn_decode(
             raise ValueError("multi-token GDN decode requires a pending buffer")
         pending = pool.pending[linear_layer]
     grid = (value_dim // block_v, batch * num_value_heads)
-    _gdn_decode_kernel[grid](
+    cast(Any, _gdn_decode_kernel)[grid](
         mixed,
         mixed.stride(0),
         mixed.stride(1),
@@ -312,7 +302,7 @@ def gdn_commit(
     tokens = pool.pending.shape[2] + 1
     grid = (value_dim // block_v, batch * num_value_heads)
     for layer in range(linear_layers):
-        _gdn_commit_kernel[grid](
+        cast(Any, _gdn_commit_kernel)[grid](
             pool.states,
             stored,
             committed,

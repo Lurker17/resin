@@ -17,11 +17,11 @@ from resin_models_cuda.qwen3_5.attention import (
     PreparedPagedAttention,
     append_kv,
 )
-from resin_models_cuda.qwen3_5.cache import MTP_GROUP, TARGET_GROUP, DeviceCache
-from resin_models_cuda.qwen3_5.gdn_decode import (
+from resin_models_cuda.qwen3_5.cache import (
+    MTP_GROUP,
+    TARGET_GROUP,
+    DeviceCache,
     RecurrentStatePool,
-    conv_decode,
-    gdn_decode,
 )
 from resin_models_cuda.qwen3_5.quantization import ModelOptFp8Linear
 
@@ -162,6 +162,8 @@ class Qwen35GatedDeltaNet(nn.Module):
     def _pooled_recurrence(
         self, hidden: Tensor, mixed: Tensor, pool: RecurrentStatePool, layer: int
     ) -> Tensor:
+        from resin_models_cuda.qwen3_5.gdn_decode import gdn_decode
+
         batch, tokens = mixed.shape[:2]
         return gdn_decode(
             mixed.reshape(batch, tokens, self.conv_dim).contiguous(),
@@ -192,6 +194,8 @@ class Qwen35GatedDeltaNet(nn.Module):
             and tokens == 1
             and state_pool[0].convolution_states is not None
         ):
+            from resin_models_cuda.qwen3_5.gdn_decode import conv_decode
+
             pool, linear_layer = state_pool
             mixed = conv_decode(
                 self.in_proj_qkv(hidden).reshape(batch, self.conv_dim),

@@ -21,7 +21,6 @@ from resin.backend.cuda.slab import (
 from resin.backend.plans import PagedCachePlan
 from resin.backend.resources import CachePoolBinding
 from resin.models.qwen3_5.config import Qwen35Config
-from resin_models_cuda.qwen3_5.gdn_decode import RecurrentStatePool
 
 PAGE_TOKENS = 128
 PREFILL_CHUNK_SIZE = 4096
@@ -31,6 +30,26 @@ MTP_GROUP = 2
 
 BF16_BYTES = 2
 FP32_BYTES = 4
+
+
+@dataclass(frozen=True, slots=True)
+class RecurrentStatePool:
+    """Arena base plus per-row element offsets of layer zero's state."""
+
+    states: Tensor  # FP32 strided view whose data_ptr is the arena start
+    source: Tensor  # [B] int64 element offsets read
+    destination: Tensor  # [B] int64 element offsets written
+    layer_stride: int
+    # Speculative verification only: [layers, B, T-1, HV, K + V + 2] FP32.
+    pending: Tensor | None = None
+    # Single-token decode: convolution windows updated in place.
+    convolution_states: Tensor | None = None
+    convolution_source: Tensor | None = None
+    convolution_destination: Tensor | None = None
+    convolution_layer_stride: int = 0
+
+    def for_layer(self, linear_layer: int) -> tuple[Tensor, Tensor, int]:
+        return self.source, self.destination, linear_layer * self.layer_stride
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,6 +423,7 @@ __all__ = [
     "MTP_GROUP",
     "PAGE_TOKENS",
     "PREFILL_CHUNK_SIZE",
+    "RecurrentStatePool",
     "STATE_GROUP",
     "TARGET_GROUP",
 ]

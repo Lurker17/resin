@@ -65,7 +65,6 @@ from resin_models_cuda.qwen3_5.checkpoint import (
     load_model,
     resolve_model_path,
 )
-from resin_models_cuda.qwen3_5.gdn_decode import gdn_commit
 from resin_models_cuda.qwen3_5.model import Qwen35DecoderLayer
 
 if TYPE_CHECKING:
@@ -82,6 +81,19 @@ def _accepted_verification_state(states, accepted):
     for step, state in enumerate(states[1:], start=1):
         selected = torch.where((accepted >= step).reshape(shape), state, selected)
     return selected
+
+
+def _one_draft_verification(drafts, targets, *, accepted_drafts=None):
+    """Choose the real commit depth and MTP inputs for natural or forced acceptance."""
+    if accepted_drafts is None:
+        return (drafts == targets[:, 0]).long(), targets
+    if type(accepted_drafts) is not int or accepted_drafts not in (0, 1):
+        raise ValueError("benchmark accepted drafts must be zero or one")
+    accepted = torch.full_like(drafts, accepted_drafts)
+    mtp_inputs = (
+        torch.stack((drafts, targets[:, 1]), dim=1) if accepted_drafts else targets
+    )
+    return accepted, mtp_inputs
 
 
 class Qwen3_5CudaRunner(CudaRunner):
@@ -269,8 +281,6 @@ class Qwen3_5CudaRunner(CudaRunner):
         # One-draft MTP: the next cycle's draft per sequence, and pending
         # (key, value, decay, beta) GDN updates of the verified draft token.
         self._drafts: dict[int, int] = {}
-        self._fast_blocks = 0
-        self._fast_accepted = 0
         self._pair_offsets = torch.arange(2, device=self.device)[None]
         self._window_offsets = torch.arange(3, device=self.device)
         geometry = self.attention_config
@@ -321,13 +331,6 @@ class Qwen3_5CudaRunner(CudaRunner):
 
     @property
     def speculative_stats(self) -> dict[str, int | float]:
-        if self._fast_speculation:
-            return {
-                "draft_tokens": 1,
-                "blocks": self._fast_blocks,
-                "accepted": self._fast_accepted,
-                "acceptance_rate": self._fast_accepted / max(1, self._fast_blocks),
-            }
         return self._speculation.snapshot(include_draft_tokens=True)
 
     @staticmethod
@@ -512,11 +515,14 @@ class Qwen3_5CudaRunner(CudaRunner):
             (batch_size, output_width), dtype=torch.long, device=self.device
         )
 
-        phase_timing = (
-            self._new_phase_timing("decode", "draft", "target_verify", "decode")
-            if self.speculative_tokens
-            else None
-        )
+        if self._fast_speculation:
+            phase_timing = self._new_phase_timing("target_verify", "decode", "draft")
+        elif self.speculative_tokens:
+            phase_timing = self._new_phase_timing(
+                "decode", "draft", "target_verify", "decode"
+            )
+        else:
+            phase_timing = None
 
         def ordinary_launch() -> None:
             attention.reset()
@@ -670,8 +676,16 @@ class Qwen3_5CudaRunner(CudaRunner):
                 phase_timing.mark(4)
 
         def fast_speculative_launch() -> None:
+            from resin_models_cuda.qwen3_5.gdn_decode import gdn_commit
+
             # Verify [anchor, draft] in one target forward, commit the accepted
             # prefix of GDN/conv state, then draft the next token with MTP.
+            if self._pending is None:
+                raise RuntimeError(
+                    "one-draft verification requires a pending state buffer"
+                )
+            if phase_timing is not None:
+                phase_timing.mark(0)
             attention.reset()
             config = self.attention_config
             previous = (positions - 1).clamp_min(0)
@@ -698,7 +712,13 @@ class Qwen3_5CudaRunner(CudaRunner):
             targets = graph_sample_block(
                 self._sampler, self._model.logits(hidden), sampling, start_step=0
             )
-            accepted = (draft_ids == targets[:, 0]).long()
+            accepted, mtp_inputs = _one_draft_verification(
+                draft_ids,
+                targets,
+                accepted_drafts=self._speculation.benchmark_accepted_drafts,
+            )
+            if phase_timing is not None:
+                phase_timing.mark(1)
             gdn_commit(
                 pool,
                 config.linear_layer_count,
@@ -715,9 +735,11 @@ class Qwen3_5CudaRunner(CudaRunner):
                 1, accepted[:, None, None].expand(-1, 1, hidden.shape[-1])
             ).squeeze(1)
             cache.store_convolution(positions + accepted, convolution, selected)
+            if phase_timing is not None:
+                phase_timing.mark(2)
             mtp_hidden = self._mtp_forward(
                 cache,
-                targets,
+                mtp_inputs,
                 hidden,
                 pair_positions,
                 attention_runtime=attention,
@@ -734,6 +756,8 @@ class Qwen3_5CudaRunner(CudaRunner):
             output_ids[:, 0].copy_(draft_ids)
             output_ids[:, 1:3].copy_(targets)
             output_ids[:, 3].copy_(next_draft)
+            if phase_timing is not None:
+                phase_timing.mark(3)
 
         if self._fast_speculation:
             launch = fast_speculative_launch
@@ -815,16 +839,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         if not self.speculative_tokens:
             return token_output(output[:, 0])
         if self._fast_speculation:
-            rows = output.cpu().tolist()
-            committed = []
-            for sequence, (proposed, first, second, draft, *_) in zip(
-                sequence_ids, rows, strict=True
-            ):
-                self._drafts[sequence] = draft
-                committed.append([first, second] if proposed == first else [first])
-            self._fast_blocks += len(rows)
-            self._fast_accepted += sum(row[0] == row[1] for row in rows)
-            return token_output(committed)
+            return self._fast_speculative_output(sequence_ids, output.cpu().tolist())
         output = output.cpu().tolist()
         drafts = [row[1 : self.speculative_tokens + 1] for row in output]
         targets = [row[self.speculative_tokens + 1 :] for row in output]
@@ -835,6 +850,14 @@ class Qwen3_5CudaRunner(CudaRunner):
                 for row, tokens in zip(output, accepted.token_rows, strict=True)
             ]
         )
+
+    def _fast_speculative_output(self, sequence_ids, rows) -> ForwardOutput:
+        acceptance = self._speculation.accept(
+            [[row[0]] for row in rows], [row[1:3] for row in rows]
+        )
+        for sequence, row in zip(sequence_ids, rows, strict=True):
+            self._drafts[sequence] = row[3]
+        return token_output(acceptance.token_rows)
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
         return validate_hybrid_plan(
@@ -888,8 +911,8 @@ class Qwen3_5CudaRunner(CudaRunner):
         cache: DeviceCache,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        recurrent: torch.Tensor,
-        convolution: torch.Tensor,
+        recurrent: torch.Tensor | None,
+        convolution: torch.Tensor | None,
         *,
         attention_runtime: object | None = None,
         max_sequence_length: int | None = None,

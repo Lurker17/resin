@@ -2,13 +2,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from resin_models_cuda.qwen3_5.gdn_decode import RecurrentStatePool, gdn_decode
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA")
 
 
 def test_in_place_decode_matches_fla_recurrence():
     from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
+
+    from resin_models_cuda.qwen3_5.gdn_decode import RecurrentStatePool, gdn_decode
 
     torch.manual_seed(0)
     B, H, HV, K, V, L = 5, 16, 32, 128, 128, 3
@@ -66,11 +66,12 @@ def test_in_place_decode_matches_fla_recurrence():
     torch.testing.assert_close(states[6], untouched)
 
 
-def test_conv_decode_matches_torch_and_shifts_window():
-    from resin_models_cuda.qwen3_5.gdn_decode import conv_decode
+@pytest.mark.parametrize("channels", [512, 2560, 8192])
+def test_conv_decode_matches_torch_and_shifts_window(channels):
+    from resin_models_cuda.qwen3_5.gdn_decode import RecurrentStatePool, conv_decode
 
     torch.manual_seed(1)
-    B, C, W, L, slots = 4, 8192, 4, 3, 9
+    B, C, W, L, slots = 4, channels, 4, 3, 9
     conv_states = torch.randn(slots, L, C, W - 1, device="cuda", dtype=torch.bfloat16)
     layer = 2
     source = torch.tensor([1, 2, 3, 4], device="cuda")
@@ -89,17 +90,38 @@ def test_conv_decode_matches_torch_and_shifts_window():
     )
     x = torch.randn(B, C, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(C, 1, W, device="cuda", dtype=torch.bfloat16)
+    untouched_slot = conv_states[5].clone()
+    untouched_layers = conv_states[:, :layer].clone()
     window = torch.cat((conv_states[source, layer], x[:, :, None]), dim=-1)
     ref = F.silu(F.conv1d(window, weight, groups=C))[:, :, 0]
     out = conv_decode(x, weight, pool, layer)
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(conv_states[destination, layer], window[..., 1:])
+    torch.testing.assert_close(
+        conv_states[destination, layer], window[..., 1:], atol=0, rtol=0
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = conv_decode(x, weight, pool, layer)
+    x.copy_(torch.randn_like(x))
+    window = torch.cat((conv_states[source, layer], x[:, :, None]), dim=-1)
+    expected = F.silu(F.conv1d(window, weight, groups=C))[:, :, 0]
+    graph.replay()
+    torch.testing.assert_close(replayed, expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        conv_states[destination, layer], window[..., 1:], atol=0, rtol=0
+    )
+    torch.testing.assert_close(conv_states[5], untouched_slot, atol=0, rtol=0)
+    torch.testing.assert_close(conv_states[:, :layer], untouched_layers, atol=0, rtol=0)
 
 
 def test_two_token_verify_and_commit_match_sequential_recurrence():
     from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
-    from resin_models_cuda.qwen3_5.gdn_decode import gdn_commit
+    from resin_models_cuda.qwen3_5.gdn_decode import (
+        RecurrentStatePool,
+        gdn_commit,
+        gdn_decode,
+    )
 
     torch.manual_seed(4)
     B, H, HV, K, V, L, T = 4, 16, 32, 128, 128, 2, 2
