@@ -372,47 +372,6 @@ class GraphPagedAttentionRuntime:
         # CSR and base pages are graph outputs of refresh(), not staged inputs.
         return {}
 
-    @staticmethod
-    def _host_pages(
-        group: Any,
-        *,
-        rows: int,
-        graph_rows: int,
-        graph_width: int,
-        sequence_lengths: Any,
-        layer_count: int,
-        slab_units: int,
-        page_tokens: int,
-    ) -> tuple[Any, Any, Any]:
-        """Vectorized CSR page tables; padding rows get one null page."""
-        import numpy as np
-
-        logical = np.zeros(graph_rows * graph_width, dtype=np.int32)
-        last = np.ones(graph_rows, dtype=np.int32)
-        pages_per_slab = slab_units // layer_count
-        retained = group.block_table_start_indices[:rows].astype(np.int64) * page_tokens
-        used = np.asarray(sequence_lengths[:rows], dtype=np.int64) - retained
-        if np.any(used <= 0):
-            raise ValueError("Qwen3.5 graph attention requires retained context")
-        count = (used + page_tokens - 1) // page_tokens
-        table = group.block_indptr.astype(np.int64)
-        if np.any(count > table[1 : rows + 1] - table[:rows]) or np.any(
-            count > graph_width
-        ):
-            raise ValueError("Qwen3.5 graph attention exceeds its cache lease")
-        total = int(count.sum())
-        starts = np.cumsum(count) - count
-        source = np.repeat(table[:rows] - starts, count) + np.arange(total)
-        logical[:total] = group.block_slab_ids[source].astype(
-            np.int64
-        ) * pages_per_slab + group.block_slotnums[source].astype(np.int64)
-        last[:rows] = (used - 1) % page_tokens + 1
-        counts = np.ones(graph_rows, dtype=np.int64)
-        counts[:rows] = count
-        indptr = np.zeros(graph_rows + 1, dtype=np.int32)
-        indptr[1:] = np.cumsum(counts)
-        return logical, indptr, last
-
     def plan(self, cache_plan: Any, positions: Any) -> dict[str, object]:
         """Validate a newly acquired lease; retain the fixed no-split plans.
 

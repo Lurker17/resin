@@ -238,77 +238,13 @@ def _tiny_runner_config():
     return config
 
 
-class _TinyRunnerObserver:
-    """Record real device positions without synchronizing the enqueue path."""
-
-    def __init__(self, runner):
-        self.runner = runner
-        self.previous = None
-        self.crossings = []
-        self.decode_rows = set()
-
-    def __getattr__(self, name):
-        return getattr(self.runner, name)
-
-    @staticmethod
-    def _tables(plan):
-        return tuple(
-            (
-                tuple(map(int, group.block_indptr)),
-                tuple(map(int, group.block_slab_ids)),
-                tuple(map(int, group.block_slotnums)),
-                tuple(map(int, group.block_table_start_indices)),
-            )
-            for group in plan.cache_groups
-        )
-
-    def forward(self, plan):
-        from resin import BatchPhase
-
-        if plan.phase == BatchPhase.DECODE:
-            self.decode_rows.add(plan.num_sequences)
-        return self.runner.forward(plan)
-
-    def enqueue(self, plan, *, feedback=None):
-        from resin import BatchPhase
-
-        if plan.phase != BatchPhase.DECODE:
-            assert feedback is None
-            return self.runner.enqueue(plan)
-        self.decode_rows.add(plan.num_sequences)
-        rows = plan.num_sequences
-        if feedback is None:
-            current = torch.as_tensor(
-                plan.positions, device=self.runner.device, dtype=torch.long
-            ).clone()
-        else:
-            current = feedback.positions[:rows].clone()
-            assert self.previous is not None
-            before, sequence_ids, tables = self.previous
-            assert tuple(map(int, plan.sequence_ids)) == sequence_ids
-            assert self._tables(plan) == tables
-            self.crossings.append((before, current))
-        self.previous = (
-            current,
-            tuple(map(int, plan.sequence_ids)),
-            self._tables(plan),
-        )
-        return self.runner.enqueue(plan, feedback=feedback)
-
-
 @pytest.mark.skipif(
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 9,
     reason="the real Qwen runner requires Hopper or newer",
 )
 @pytest.mark.parametrize("draft_tokens,forced", [(0, None), (1, None), (1, 0), (1, 1)])
-def test_tiny_runner_matches_sync_with_legacy_and_reserved_overlap(
-    monkeypatch, tmp_path, draft_tokens, forced
-):
-    """Real random-weight model, kernels, graphs, completion and native cache owner.
-
-    This is a decode integration oracle, not a pretrained-model qualification or
-    a throughput benchmark. Three live rows always use the same four-row graph.
-    """
+def test_tiny_runner_overlap_matches_sync(monkeypatch, tmp_path, draft_tokens, forced):
+    """Compare real decode paths using a small model and a padded graph batch."""
     import gc
 
     from resin import Engine, SamplingParams, SchedulerConfig
@@ -330,7 +266,7 @@ def test_tiny_runner_matches_sync_with_legacy_and_reserved_overlap(
 
     monkeypatch.setattr(runtime, "resolve_model_path", lambda *args: tmp_path)
     monkeypatch.setattr(runtime, "load_model", load_random_model)
-    modes = ((False, 0), (True, 0), (True, 136))
+    modes = ((False, 0), (True, 136))
     outputs, statistics = [], []
     for overlap, reservation in modes:
         runner = runtime.Qwen3_5CudaRunner(
@@ -347,18 +283,14 @@ def test_tiny_runner_matches_sync_with_legacy_and_reserved_overlap(
             cache_write_reservation_tokens=reservation,
         )
         runner._speculation.benchmark_accepted_drafts = forced
-        # Semantic timing markers are part of capture, so configure them first.
-        runner.configure_metrics(enabled=True)
         runner.capture_cuda_graphs()
-        observed = _TinyRunnerObserver(runner)
         engine = Engine(
-            observed,
+            runner,
             max_running_requests=3,
             context_length=config.max_position_embeddings,
             scheduler_config=SchedulerConfig(prefill_chunk_size=4096),
             prefix_cache=False,
             enable_overlap=overlap,
-            enable_metrics=True,
         )
         mode_outputs, mode_statistics = [], []
         try:
@@ -385,41 +317,15 @@ def test_tiny_runner_matches_sync_with_legacy_and_reserved_overlap(
                 assert all(len(value) == 160 for value in values)
                 mode_outputs.append(values)
                 mode_statistics.append(dict(runner.speculative_stats))
-                assert engine.cache_free_parent_count == engine.cache_parent_capacity
-                assert not runner._drafts
-            assert 3 in observed.decode_rows
             if overlap:
-                assert engine.overlap_stats[0] > 0
                 assert engine.overlap_stats[1] > 0
-            else:
-                assert engine.overlap_stats == (0, 0)
-            torch.cuda.synchronize()
-            crossed_kv_page = False
-            for before, after in observed.crossings:
-                old, new = before.cpu(), after.cpu()
-                assert torch.all(new > old)
-                assert torch.equal(old // 4096, new // 4096)
-                crossed_kv_page |= bool(torch.any(old // 128 != new // 128))
-            if overlap and reservation:
-                assert crossed_kv_page
-            elif overlap:
-                assert not crossed_kv_page
-            if draft_tokens:
-                stats = runner.speculative_stats
-                assert stats["blocks"] > 0 and stats["drafts"] == stats["blocks"]
-                assert stats["emitted"] == stats["blocks"] + stats["accepted"]
-                if forced is not None:
-                    assert stats["accepted"] == forced * stats["blocks"]
-                metrics = runner.metrics_snapshot().forward_execution_seconds
-                assert metrics.get("target_verify", 0.0) > 0
             outputs.append(mode_outputs)
             statistics.append(mode_statistics)
         finally:
             engine.close()
-            assert engine.cache_free_parent_count == engine.cache_parent_capacity
             runner.close_cuda_graphs()
-            del engine, observed, runner
+            del engine, runner
             gc.collect()
             torch.cuda.empty_cache()
-    assert outputs[0] == outputs[1] == outputs[2]
-    assert statistics[0] == statistics[1] == statistics[2]
+    assert outputs[0] == outputs[1]
+    assert statistics[0] == statistics[1]

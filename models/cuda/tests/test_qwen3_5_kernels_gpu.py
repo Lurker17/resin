@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import math
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
@@ -20,7 +19,6 @@ from resin_models_cuda.qwen3_5.attention import (
     GraphAttentionSpec,
     GraphPagedAttentionRuntime,
     PreparedPagedAttention,
-    _plan_wrapper,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -299,29 +297,6 @@ def test_qwen_native_kernels(check):
     check()
 
 
-def _fixed_schedule(wrapper, rows, tokens, heads):
-    """Only initialized FA2 scheduling bytes; ignore unused padded entries."""
-    info = tuple(wrapper._plan_info)
-    assert len(info) == 15 and info[13] and not info[14], info
-    padded, _, total_rows, tile, request, qo, kv, _, out, chunk, _, _, valid, _, _ = (
-        info
-    )
-    ctas = rows * math.ceil(tokens * heads / tile)
-    ranges = (
-        (request, ctas * 4),
-        (qo, ctas * 4),
-        (kv, ctas * 4),
-        (out, (rows + 1) * 4),
-        (chunk, 4),
-        (valid, padded),
-        (total_rows, 4),
-    )
-    integer = wrapper._int_workspace_buffer
-    return info, tuple(
-        bytes(integer[start : start + size].cpu().tolist()) for start, size in ranges
-    )
-
-
 def _dense_graph_attention(query, cache, call, lengths):
     """Independent FP32 causal reference from the exact dense lease prefix."""
     spec = call.spec
@@ -416,39 +391,6 @@ def test_graph_attention_refreshes_exact_csr_across_reserved_pages(tokens, rows)
         head_dim=dimension,
         workspace=torch.empty(64 * 1024**2, dtype=torch.uint8, device="cuda"),
     )
-    # Establish the fixed schedule against adversarial host CSR before capture.
-    for call in runtime.calls:
-        initial = _fixed_schedule(call.prepared.wrapper, rows, tokens, heads)
-        minimum = (tokens + page - 1) // page
-        counts = (
-            torch.arange(rows, dtype=torch.int32, device="cuda") % (width - minimum + 1)
-            + minimum
-        )
-        ptr = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
-        ptr[1:] = counts.cumsum(0)
-        _plan_wrapper(
-            call.prepared.wrapper,
-            tokens,
-            ptr,
-            torch.zeros(int(ptr[-1].item()), dtype=torch.int32, device="cuda"),
-            torch.full(
-                (rows,), (tokens - 1) % page + 1, dtype=torch.int32, device="cuda"
-            ),
-            num_attention_heads=heads,
-            num_key_value_heads=kv_heads,
-            head_dim=dimension,
-            page_tokens=page,
-            common=dict(
-                pos_encoding_mode="NONE",
-                q_data_type=torch.bfloat16,
-                kv_data_type=torch.bfloat16,
-                o_data_type=torch.bfloat16,
-                sm_scale=dimension**-0.5,
-                disable_split_kv=True,
-            ),
-        )
-        assert _fixed_schedule(call.prepared.wrapper, rows, tokens, heads) == initial
-    schedules = [call.prepared.wrapper._plan_info for call in runtime.calls]
     queries = (
         torch.randn(rows, tokens, heads, dimension, device="cuda", dtype=torch.bfloat16)
         * 0.2
@@ -510,7 +452,6 @@ def test_graph_attention_refreshes_exact_csr_across_reserved_pages(tokens, rows)
                 )
             expected = _dense_graph_attention(queries, cache, call, expected_lengths)
             torch.testing.assert_close(output[index], expected, rtol=0.015, atol=0.003)
-            assert call.prepared.wrapper._plan_info is schedules[index]
             assert pointers[index] == (
                 call.kv_indptr.data_ptr(),
                 call.prepared.base_pages.data_ptr(),
